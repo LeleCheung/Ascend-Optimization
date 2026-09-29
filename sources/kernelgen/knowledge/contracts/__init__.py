@@ -1,0 +1,78 @@
+"""Public knowledge contracts.
+
+The original ``knowledge.models`` module remains the compatibility import path.
+Runtime-only contracts live here so storage and framework details do not leak
+into the core schema models.
+"""
+
+from kernelgen.knowledge.models import (
+    CandidateConcept,
+    CandidateDraft,
+    Concept,
+    ConceptEvidence,
+    GitSourceEntry,
+    GitSourceManifest,
+    KnowledgeBundle,
+    KnowledgeUsageScope,
+    KnowledgeUsageSummary,
+    OperatorSignature,
+    ObservationRecord,
+    QueryContext,
+    RuntimeCandidate,
+    SourcePackage,
+    SourceReference,
+    SourceSelectionRule,
+    StaticIngestionPlan,
+    StaticKnowledgeEntry,
+    TargetContext,
+)
+from kernelgen.knowledge.contracts.runtime import (
+    KnowledgeDocument,
+    PublishResult,
+    QueryRecord,
+    RetrievalRecord,
+    RoundSearchHit,
+    RoundSearchResult,
+    ScopeMatch,
+    SearchHit,
+    SearchRoute,
+    SourceDocument,
+    SourceSearchHit,
+    SourceSearchResult,
+    WorkspaceKnowledgeState,
+)
+
+__all__ = [
+    "CandidateConcept",
+    "CandidateDraft",
+    "Concept",
+    "ConceptEvidence",
+    "GitSourceEntry",
+    "GitSourceManifest",
+    "KnowledgeBundle",
+    "KnowledgeUsageScope",
+    "KnowledgeUsageSummary",
+    "KnowledgeDocument",
+    "OperatorSignature",
+    "ObservationRecord",
+    "PublishResult",
+    "QueryContext",
+    "QueryRecord",
+    "RetrievalRecord",
+    "RuntimeCandidate",
+    "RoundSearchHit",
+    "RoundSearchResult",
+    "ScopeMatch",
+    "SearchHit",
+    "SearchRoute",
+    "SourceDocument",
+    "SourceSearchHit",
+    "SourceSearchResult",
+    "SourcePackage",
+    "SourceReference",
+    "SourceSelectionRule",
+    "StaticIngestionPlan",
+    "StaticKnowledgeEntry",
+    "TargetContext",
+    "WorkspaceKnowledgeState",
+]

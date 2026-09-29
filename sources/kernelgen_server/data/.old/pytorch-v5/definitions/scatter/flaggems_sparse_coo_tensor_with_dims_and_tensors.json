@@ -1,0 +1,18 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems_sparse_coo_tensor_with_dims_and_tensors",
+  "description": "Construct a sparse COO tensor with the given sparse_dim, dense_dim, size, indices and values (aten::_sparse_coo_tensor_with_dims_and_tensors); reference returns the dense materialization (scatter of values at indices into a zero tensor).",
+  "inputs": [
+    "sparse_dim",
+    "dense_dim",
+    "size",
+    "indices",
+    "values"
+  ],
+  "outputs": [
+    "output"
+  ],
+  "reference": "import torch\n\n\ndef gen_inputs(ctx, device):\n    sparse_dim = ctx['sparse_dim']\n    dense_dim = ctx['dense_dim']\n    size = [int(s) for s in ctx['size']]\n    values_shape = tuple(int(v) for v in ctx['values__shape'])\n    indices_dtype = getattr(torch, ctx['indices__dtype'])\n    values_dtype = getattr(torch, ctx['values__dtype'])\n    nnz = values_shape[0]\n    sparse_size = size[:sparse_dim]\n    total = 1\n    for s in sparse_size:\n        total *= s\n    nse = min(nnz, total)\n    if total > 0:\n        if nse * 2 >= total:\n            chosen = torch.randperm(total, device=device)[:nse].sort().values\n        else:\n            num = min(total, max(nse * 2, 256))\n            chosen = torch.unique(torch.randint(0, total, (num,), device=device))[:nse]\n            for _ in range(8):\n                if chosen.numel() >= nse:\n                    break\n                num = min(total, max((nse - chosen.numel()) * 2, 256))\n                chosen = torch.unique(torch.cat([\n                    chosen,\n                    torch.randint(0, total, (num,), device=device),\n                ]))[:nse]\n            chosen = chosen.sort().values\n        idx_cols = []\n        for k in range(sparse_dim):\n            stride = 1\n            for j in range(k + 1, sparse_dim):\n                stride *= sparse_size[j]\n            idx_cols.append((chosen // stride) % sparse_size[k])\n        indices = torch.stack(idx_cols, dim=0).to(indices_dtype)\n    else:\n        indices = torch.empty((sparse_dim, 0), dtype=indices_dtype, device=device)\n    values = torch.randn((nse,) + tuple(values_shape[1:]), dtype=values_dtype, device=device)\n    return {'indices': indices, 'values': values}\n\n\ndef run(sparse_dim, dense_dim, size, indices, values):\n    size = [int(s) for s in size]\n    dense = torch.zeros(size, dtype=values.dtype, device=values.device)\n    if indices.shape[1] > 0:\n        dense[tuple(indices[i] for i in range(sparse_dim))] = values\n    return dense\n",
+  "reference_device": "target",
+  "custom_inputs_entrypoint": "gen_inputs"
+}

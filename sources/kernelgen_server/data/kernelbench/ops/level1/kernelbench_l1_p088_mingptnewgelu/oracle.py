@@ -1,0 +1,36 @@
+REFERENCE_DEVICE = 'target'
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+# From https://github.com/karpathy/minGPT/blob/master/mingpt/model.py
+
+class Model(nn.Module):
+    """
+    Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
+    Reference: Gaussian Error Linear Units (GELU) paper: https://arxiv.org/abs/1606.08415
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+
+    def forward(self, x):
+        return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
+
+batch_size = 8192
+dim = 8192
+
+
+_reference_model = None
+
+
+def run(x):
+    global _reference_model
+    if _reference_model is None:
+        torch.manual_seed(42)
+        _reference_model = Model(*([])).to(
+            device=x.device, dtype=torch.float32
+        )
+    with torch.no_grad():
+        return _reference_model(x)

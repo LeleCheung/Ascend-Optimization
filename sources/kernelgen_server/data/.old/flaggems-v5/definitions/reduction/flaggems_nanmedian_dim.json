@@ -1,0 +1,18 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems_nanmedian_dim",
+  "description": "Dim nanmedian reduction: torch.nanmedian(x, dim, keepdim) ignoring NaNs, returning (values, indices). Indices are validated via gather since ties permit multiple valid argmedians. Extracted from FlagGems test_nanmedian_dim.",
+  "inputs": [
+    "x",
+    "dim",
+    "keepdim"
+  ],
+  "outputs": [
+    "values",
+    "indices"
+  ],
+  "reference": "import torch\n\n\ndef run(x, dim, keepdim):\n    return torch.nanmedian(x, dim=dim, keepdim=keepdim)\n\n\ndef gen_inputs(ctx, device):\n    import torch\n    shape = ctx[\"x__shape\"]\n    dtype = getattr(torch, ctx[\"x__dtype\"])\n    if dtype is torch.uint8:\n        inp = torch.randint(0, 101, shape, dtype=dtype, device=\"cpu\").to(device)\n    elif not dtype.is_floating_point:\n        inp = torch.randint(-100, 101, shape, dtype=dtype, device=\"cpu\").to(device)\n    else:\n        inp = torch.randn(shape, dtype=dtype, device=device)\n        if inp.numel() > 0:\n            inp.reshape(-1)[::7] = float(\"nan\")\n    return {\"x\": inp}\n\n\ndef valid(ref_outputs, sol_outputs, inputs, ctx):\n    import torch\n    ref_values = ref_outputs[0].detach().to(\"cpu\")\n    sol_values = sol_outputs[0].detach().to(\"cpu\")\n    sol_indices = sol_outputs[1].detach().to(\"cpu\")\n    inp = inputs[0].detach().to(\"cpu\")\n    dim = inputs[1]\n    keepdim = inputs[2]\n    dtype = ref_values.dtype\n    if ref_values.shape != sol_values.shape:\n        return {\"passed\": False, \"message\": \"values shape mismatch\", \"metrics\": {}}\n\n    def values_close(a, b):\n        if dtype.is_floating_point:\n            r = a.to(torch.float64)\n            s = b.to(torch.float64)\n            rtol = {torch.float16: 1e-3, torch.bfloat16: 1.6e-2, torch.float32: 1.3e-6, torch.float64: 1e-7}.get(dtype, 1e-3)\n            both_nan = torch.isnan(r) & torch.isnan(s)\n            finite = torch.isfinite(r) & torch.isfinite(s)\n            close = torch.zeros_like(r, dtype=torch.bool)\n            close[finite] = (r[finite] - s[finite]).abs() <= 1e-4 + rtol * r[finite].abs()\n            return bool((close | both_nan).all().item())\n        return bool(torch.equal(a, b))\n\n    if not values_close(ref_values, sol_values):\n        return {\"passed\": False, \"message\": \"values mismatch\", \"metrics\": {}}\n    d = dim % inp.ndim\n    if sol_indices.numel() != 0:\n        if not bool(torch.all(sol_indices >= 0).item()) or not bool(torch.all(sol_indices < inp.shape[d]).item()):\n            return {\"passed\": False, \"message\": \"indices out of range\", \"metrics\": {}}\n        gather_indices = sol_indices if keepdim else sol_indices.unsqueeze(d)\n        gathered = torch.gather(inp, d, gather_indices)\n        if not keepdim:\n            gathered = gathered.squeeze(d)\n        if not values_close(gathered, sol_values):\n            return {\"passed\": False, \"message\": \"gathered index values mismatch\", \"metrics\": {}}\n    return {\"passed\": True, \"message\": \"\", \"metrics\": {}}\n",
+  "reference_device": "target",
+  "custom_inputs_entrypoint": "gen_inputs",
+  "custom_valid_entrypoint": "valid"
+}

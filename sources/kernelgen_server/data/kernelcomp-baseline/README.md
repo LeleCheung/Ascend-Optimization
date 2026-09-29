@@ -1,0 +1,3 @@
+# Kernel-comp baseline v6.2 native catalog
+
+Deterministically converted from the kernel-competition baseline repository at commit `4e3d7199b143072a0ef21fc095392247a24fca84`. The frozen SGLang kernels behind it are pinned by the source repository's `baseline_freeze.json`. Each operator's `oracle.py` is the problem's pure-torch `reference_torch.py` (cross-imports inlined); the source `correctness.jsonl`/`timing.jsonl` express the shared `cases.py` grids as declarative v6.2 recipes or the custom build-DSL, with the harness per-dtype tolerance written explicitly. Complete grids are retained as `*_full.jsonl`; active files are capped at 200 per phase with `input-value-pairwise-greedy-v1`.

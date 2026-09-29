@@ -1,0 +1,20 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems_nll_loss_backward",
+  "description": "Extracted from FlagGems nll_loss_backward.",
+  "inputs": [
+    "grad_output",
+    "self_input",
+    "target",
+    "weight",
+    "reduction",
+    "ignore_index",
+    "total_weight"
+  ],
+  "outputs": [
+    "out"
+  ],
+  "reference": "import torch\n\ndef run(grad_output, self_input, target, weight, reduction, ignore_index, total_weight):\n    ri = reduction\n    nd = self_input.dim()\n    if nd <= 2:\n        return torch.ops.aten.nll_loss_backward(grad_output, self_input, target, weight, ri, ignore_index, total_weight)\n    C = self_input.shape[1]\n    s2 = self_input.permute(0, *range(2, nd), 1).reshape(-1, C)\n    t2 = target.reshape(-1)\n    go = grad_output.reshape(-1) if ri == 0 else grad_output\n    g2 = torch.ops.aten.nll_loss_backward(go, s2, t2, weight, ri, ignore_index, total_weight)\n    N = self_input.shape[0]\n    g = g2.reshape((N, *self_input.shape[2:], C))\n    inv = (0, nd - 1, *range(1, nd - 1))\n    return g.permute(inv).contiguous()\n\ndef _dtype_from_context(ctx, name):\n    return getattr(torch, ctx[f\"{name}__dtype\"])\n\ndef gen_inputs(ctx, device):\n    self_shape = ctx[\"self_input__shape\"]\n    dtype = _dtype_from_context(ctx, \"self_input\")\n    classes = self_shape[1]\n    target_shape = ctx[\"target__shape\"]\n    target = torch.randint(\n        0, classes, target_shape, dtype=_dtype_from_context(ctx, \"target\"), device=device\n    )\n    self_input = torch.randn(self_shape, dtype=dtype, device=device)\n    if \"weight__shape\" in ctx:\n        weight = torch.randn(\n            ctx[\"weight__shape\"], dtype=_dtype_from_context(ctx, \"weight\"), device=device\n        )\n        selected_weight = weight[target]\n    else:\n        weight = None\n        selected_weight = torch.ones(target_shape, dtype=dtype, device=device)\n    mask = (target != ctx[\"ignore_index\"]).to(dtype)\n    total_weight = (selected_weight * mask).sum()\n    grad_output = torch.randn(\n        ctx[\"grad_output__shape\"],\n        dtype=_dtype_from_context(ctx, \"grad_output\"),\n        device=device,\n    )\n    result = {\n        \"grad_output\": grad_output,\n        \"self_input\": self_input,\n        \"target\": target,\n        \"total_weight\": total_weight,\n    }\n    if weight is not None:\n        result[\"weight\"] = weight\n    return result\n",
+  "reference_device": "target",
+  "custom_inputs_entrypoint": "gen_inputs"
+}

@@ -1,0 +1,32 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems_scaled_dot_product_cudnn_attention_backward",
+  "description": "Backward pass of the cuDNN scaled dot product attention (aten._scaled_dot_product_cudnn_attention_backward). Inputs are produced by a consistent cuDNN forward pass over uniform-initialized Q/K/V (bhsd layout), matching tests/test_flash_attention_backward.py::test_scaled_dot_product_cudnn_attention_backward. Returns grad_query, grad_key, grad_value in bhsd layout.",
+  "inputs": [
+    "dOut",
+    "Q",
+    "K",
+    "V",
+    "out",
+    "lse",
+    "philox_seed",
+    "philox_offset",
+    "attn_bias",
+    "cum_seq_q",
+    "cum_seq_k",
+    "max_q",
+    "max_k",
+    "dropout_p",
+    "is_causal",
+    "scale"
+  ],
+  "outputs": [
+    "grad_query",
+    "grad_key",
+    "grad_value"
+  ],
+  "reference": "import torch\n\n\ndef run(dOut, Q, K, V, out, lse, philox_seed, philox_offset, attn_bias, cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal, scale):\n    dQ, dK, dV = torch.ops.aten._scaled_dot_product_cudnn_attention_backward(\n        dOut, Q, K, V, out, lse,\n        philox_seed, philox_offset, attn_bias,\n        cum_seq_q, cum_seq_k, max_q, max_k, dropout_p, is_causal,\n        scale=scale,\n    )\n    return dQ, dK, dV\n\n\ndef gen_inputs(ctx, device):\n    import torch\n    from flag_gems.runtime import torch_device_fn\n    from flag_gems.utils.random_utils import set_philox_state\n\n    q_shape = ctx[\"Q__shape\"]\n    k_shape = ctx[\"K__shape\"]\n    batch, num_head, q_seq_len, head_size = q_shape\n    kv_seq_len = k_shape[2]\n    dtype = getattr(torch, ctx[\"Q__dtype\"])\n    is_causal = ctx[\"is_causal\"]\n    scale = ctx[\"scale\"]\n\n    dev = torch_device_fn.current_device()\n    set_philox_state(1234567890, 0, dev)\n    Q = torch.empty(batch, q_seq_len, num_head, head_size, dtype=dtype, device=device).uniform_(-0.05, 0.05)\n    K = torch.empty(batch, kv_seq_len, num_head, head_size, dtype=dtype, device=device).uniform_(-0.05, 0.05)\n    V = torch.empty(batch, kv_seq_len, num_head, head_size, dtype=dtype, device=device).uniform_(-0.05, 0.05)\n    dOut = torch.randn(batch, q_seq_len, num_head, head_size, dtype=dtype, device=device)\n\n    attn_bias = None\n    if \"attn_bias__shape\" in ctx:\n        attn_bias = torch.randn(batch, num_head, q_seq_len, kv_seq_len, dtype=dtype, device=device) * 0.1\n\n    Qf = Q.permute(0, 2, 1, 3).contiguous()\n    Kf = K.permute(0, 2, 1, 3).contiguous()\n    Vf = V.permute(0, 2, 1, 3).contiguous()\n    results = torch.ops.aten._scaled_dot_product_cudnn_attention(\n        Qf, Kf, Vf, attn_bias, compute_log_sumexp=True, dropout_p=0.0,\n        is_causal=is_causal, return_debug_mask=False, scale=scale,\n    )\n    out_bhsd_fwd = results[0]\n    lse_4d = results[1]\n    philox_seed = results[2]\n    philox_offset = results[3]\n    out = out_bhsd_fwd.permute(0, 2, 1, 3).contiguous()\n    lse = lse_4d.squeeze(-1).float()\n\n    Q_bhsd = Q.permute(0, 2, 1, 3).contiguous()\n    K_bhsd = K.permute(0, 2, 1, 3).contiguous()\n    V_bhsd = V.permute(0, 2, 1, 3).contiguous()\n    out_bhsd = out.permute(0, 2, 1, 3).contiguous()\n    dOut_bhsd = dOut.permute(0, 2, 1, 3).contiguous()\n\n    res = {\n        \"dOut\": dOut_bhsd,\n        \"Q\": Q_bhsd,\n        \"K\": K_bhsd,\n        \"V\": V_bhsd,\n        \"out\": out_bhsd,\n        \"lse\": lse,\n        \"philox_seed\": philox_seed,\n        \"philox_offset\": philox_offset,\n    }\n    if attn_bias is not None:\n        res[\"attn_bias\"] = attn_bias\n    return res\n\n\ndef valid(ref_outputs, sol_outputs, inputs, ctx):\n    import torch\n    RES = {torch.float16: 1e-3, torch.bfloat16: 0.016, torch.float32: 1.3e-6, torch.float64: 1e-7}\n    for ref_t, sol_t in zip(ref_outputs, sol_outputs):\n        ref = ref_t.detach().to(\"cpu\").to(torch.float64)\n        sol = sol_t.detach().to(\"cpu\").to(torch.float64)\n        if ref.shape != sol.shape:\n            return {\"passed\": False, \"message\": \"shape mismatch\", \"metrics\": {}}\n        rtol = RES.get(sol_t.dtype, 1e-3)\n        atol = 1e-4\n        both_nan = torch.isnan(ref) & torch.isnan(sol)\n        both_posinf = torch.isposinf(ref) & torch.isposinf(sol)\n        both_neginf = torch.isneginf(ref) & torch.isneginf(sol)\n        finite = torch.isfinite(ref) & torch.isfinite(sol)\n        close = torch.zeros_like(ref, dtype=torch.bool)\n        close[finite] = (ref[finite] - sol[finite]).abs() <= atol + rtol * ref[finite].abs()\n        ok = (close | both_nan | both_posinf | both_neginf).all().item()\n        if not ok:\n            return {\"passed\": False, \"message\": \"value mismatch\", \"metrics\": {}}\n    return {\"passed\": True, \"message\": \"\", \"metrics\": {}}\n",
+  "reference_device": "target",
+  "custom_inputs_entrypoint": "gen_inputs",
+  "custom_valid_entrypoint": "valid"
+}

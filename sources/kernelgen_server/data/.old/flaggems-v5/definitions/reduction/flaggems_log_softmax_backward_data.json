@@ -1,0 +1,18 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems_log_softmax_backward_data",
+  "description": "Faithfully extracted from FlagGems test_log_softmax_backward_data and its benchmark. Correctness uses two independent torch.randn tensors and validates against the source's FP64-upcast oracle; timing obtains output from log_softmax(inp, dim=-1) before generating grad_output.",
+  "inputs": [
+    "grad_output",
+    "output",
+    "dim",
+    "input_dtype"
+  ],
+  "outputs": [
+    "grad_input"
+  ],
+  "reference": "import torch\nimport torch.nn.functional as F\n\n\ndef gen_inputs(ctx, device):\n    if ctx[\"dim\"] != -1:\n        return {}\n    shape = tuple(ctx[\"output__shape\"])\n    dtype = getattr(torch, ctx[\"output__dtype\"])\n    inp = torch.randn(shape, dtype=dtype, device=device)\n    output = F.log_softmax(inp, dim=-1)\n    grad_output = torch.randn_like(output)\n    return {\"grad_output\": grad_output, \"output\": output}\n\n\ndef run(grad_output, output, dim, input_dtype):\n    return torch.ops.aten._log_softmax_backward_data(\n        grad_output, output, dim, getattr(torch, input_dtype)\n    )\n\n\ndef valid(ref_outputs, sol_outputs, inputs, ctx):\n    if len(sol_outputs) != 1:\n        return {\"passed\": False, \"message\": \"expected one grad_input\", \"metrics\": {}}\n    grad_output, output, dim, input_dtype = inputs\n    expected = torch.ops.aten._log_softmax_backward_data(\n        grad_output.to(torch.float64),\n        output.to(torch.float64),\n        dim,\n        torch.float64,\n    )\n    actual = sol_outputs[0]\n    expected_dtype = getattr(torch, input_dtype)\n    if actual.dtype != expected_dtype:\n        return {\"passed\": False, \"message\": \"grad_input dtype mismatch\", \"metrics\": {}}\n    rtol = {\n        torch.float16: 1e-3,\n        torch.bfloat16: 0.016,\n        torch.float32: 1.3e-6,\n        torch.float64: 1e-7,\n    }.get(actual.dtype, 1.3e-6)\n    reduce_dim = grad_output.shape[dim]\n    try:\n        torch.testing.assert_close(\n            actual,\n            expected.to(actual.dtype),\n            rtol=rtol,\n            atol=1e-4 * reduce_dim,\n        )\n    except AssertionError as exc:\n        return {\"passed\": False, \"message\": str(exc), \"metrics\": {}}\n    return {\"passed\": True, \"message\": \"\", \"metrics\": {}}\n",
+  "reference_device": "target",
+  "custom_inputs_entrypoint": "gen_inputs",
+  "custom_valid_entrypoint": "valid"
+}

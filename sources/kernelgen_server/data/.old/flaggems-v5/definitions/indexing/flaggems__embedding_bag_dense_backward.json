@@ -1,0 +1,23 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems__embedding_bag_dense_backward",
+  "description": "复刻 FlagGems _embedding_bag_dense_backward pytest/benchmark：indices、offset2bag、bag_size、maximum_indices 和 grad 均由同一次 _embedding_bag forward 及其 output 派生；correctness 覆盖 pytest 的 mode=0、per_sample_weights 和 mode=1 分支，timing 独立使用 benchmark 的规则 offsets 与 mode=0 配置。",
+  "inputs": [
+    "grad",
+    "indices",
+    "offset2bag",
+    "bag_size",
+    "maximum_indices",
+    "num_weights",
+    "scale_grad_by_freq",
+    "mode",
+    "per_sample_weights",
+    "padding_idx"
+  ],
+  "outputs": [
+    "grad_weight"
+  ],
+  "reference": "import torch\n\n\ndef _pytest_offsets(num_bags, num_samples, device):\n    bag_sizes = []\n    remaining = num_samples\n    for _ in range(num_bags - 1):\n        size = max(1, remaining // 2)\n        bag_sizes.append(min(size, remaining - num_bags + 1))\n        remaining -= bag_sizes[-1]\n    bag_sizes.append(remaining)\n    starts = [0] + list(torch.cumsum(torch.tensor(bag_sizes), dim=0).tolist())[:-1]\n    return torch.tensor(starts, dtype=torch.long, device=device)\n\n\ndef gen_inputs(ctx, device):\n    num_bags, embedding_dim = tuple(ctx[\"grad__shape\"])\n    num_samples = ctx[\"indices__shape\"][0]\n    num_weights = ctx[\"num_weights\"]\n    dtype = getattr(torch, ctx[\"grad__dtype\"])\n    samples_per_bag = num_samples // num_bags\n\n    is_correctness = samples_per_bag == 3\n    weight = torch.randn(\n        num_weights,\n        embedding_dim,\n        dtype=dtype,\n        device=device,\n        requires_grad=is_correctness,\n    )\n    indices = torch.randint(\n        0, num_weights, (num_samples,), dtype=torch.long, device=device\n    )\n    if is_correctness:\n        offsets = _pytest_offsets(num_bags, num_samples, device)\n    else:\n        offsets = torch.arange(\n            0,\n            num_samples + 1,\n            samples_per_bag,\n            dtype=torch.long,\n            device=device,\n        )[:num_bags]\n\n    per_sample_weights = None\n    if \"per_sample_weights__shape\" in ctx:\n        per_sample_weights = torch.rand(\n            tuple(ctx[\"per_sample_weights__shape\"]), dtype=dtype, device=device\n        )\n\n    output, offset2bag, bag_size, maximum_indices = torch.ops.aten._embedding_bag(\n        weight,\n        indices,\n        offsets,\n        False,\n        ctx[\"mode\"],\n        False,\n        per_sample_weights,\n        False,\n        -1,\n    )\n    values = {\n        \"grad\": torch.randn_like(output),\n        \"indices\": indices,\n        \"offset2bag\": offset2bag,\n        \"bag_size\": bag_size,\n        \"maximum_indices\": maximum_indices,\n    }\n    if per_sample_weights is not None:\n        values[\"per_sample_weights\"] = per_sample_weights\n    return values\n\n\ndef run(grad, indices, offset2bag, bag_size, maximum_indices, num_weights,\n        scale_grad_by_freq, mode, per_sample_weights, padding_idx):\n    return torch.ops.aten._embedding_bag_dense_backward(\n        grad,\n        indices,\n        offset2bag,\n        bag_size,\n        maximum_indices,\n        num_weights,\n        scale_grad_by_freq,\n        mode,\n        per_sample_weights,\n        padding_idx,\n    )\n",
+  "reference_device": "target",
+  "custom_inputs_entrypoint": "gen_inputs"
+}

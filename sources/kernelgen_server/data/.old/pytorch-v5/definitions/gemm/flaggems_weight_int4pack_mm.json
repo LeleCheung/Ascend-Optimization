@@ -1,0 +1,17 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems_weight_int4pack_mm",
+  "description": "Weight-only int4 quantized matrix multiplication: computes self @ dequantize(mat2).T where self is a bf16 activation [m, k], mat2 is the int32 int4-packed weight [n/8, k/(innerKTiles*16), 32, innerKTiles/2], qGroupSize in {32,64,128,256}, and qScaleAndZeros [k/qGroupSize, n, 2] holds per-group scale (index 0) and zero (index 1) in bf16. Dequant: v = int4 * scale + zero; output is bf16 [m, n].",
+  "inputs": [
+    "self",
+    "mat2",
+    "qGroupSize",
+    "qScaleAndZeros"
+  ],
+  "outputs": [
+    "output"
+  ],
+  "reference": "import torch\n\ndef run(self, mat2, qGroupSize, qScaleAndZeros):\n    return torch.ops.aten._weight_int4pack_mm(self, mat2, qGroupSize, qScaleAndZeros)\n\n\ndef gen_inputs(ctx, device):\n    import torch\n    n = ctx['mat2__shape'][0] * 8\n    inner_k_tiles = ctx['mat2__shape'][3] * 2\n    k = ctx['mat2__shape'][1] * inner_k_tiles * 16\n    m = ctx['self__shape'][0]\n    n_groups = ctx['qScaleAndZeros__shape'][0]\n    q_group_size = k // n_groups\n    w_uint8 = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device=device)\n    packed_weight = torch.ops.aten._convert_weight_to_int4pack(w_uint8, inner_k_tiles)\n    activation = torch.randn(m, k, dtype=torch.bfloat16, device=device)\n    scale = torch.rand(n_groups, n, 1, dtype=torch.bfloat16, device=device) * 0.01 + 0.0001\n    zero = (torch.rand(n_groups, n, 1, dtype=torch.bfloat16, device=device) - 0.5) * 8\n    q_scale_and_zeros = torch.cat([scale, zero], dim=-1).contiguous()\n    return {\n        'self': activation,\n        'mat2': packed_weight,\n        'qGroupSize': q_group_size,\n        'qScaleAndZeros': q_scale_and_zeros,\n    }\n",
+  "reference_device": "target",
+  "custom_inputs_entrypoint": "gen_inputs"
+}

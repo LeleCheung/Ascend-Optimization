@@ -1,0 +1,15 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems_poisson",
+  "description": "Extracted from FlagGems poisson: sample from a Poisson distribution with per-element rate given by input (constant lambda=5.0 case, plus benchmark timing).",
+  "inputs": [
+    "input"
+  ],
+  "outputs": [
+    "output"
+  ],
+  "reference": "import torch\n\n\ndef run(input):\n    return torch.poisson(input)\n\n\ndef gen_inputs(ctx, device):\n    import torch\n    shape = tuple(ctx[\"input__shape\"])\n    dtype = getattr(torch, ctx[\"input__dtype\"])\n    if len(shape) == 2:\n        # benchmark timing distribution: torch.rand\n        inp = torch.rand(shape, dtype=dtype, device=device)\n    else:\n        # correctness distribution: constant rate lambda = 5.0\n        inp = torch.full(shape, 5.0, dtype=dtype, device=device)\n    return {\"input\": inp}\n\n\ndef valid(ref_outputs, sol_outputs, inputs, ctx):\n    import torch\n    sol = sol_outputs[0].detach().to(\"cpu\").to(torch.float64)\n    inp = inputs[0].detach().to(\"cpu\").to(torch.float64)\n    if bool((sol < 0).any().item()):\n        return {\"passed\": False, \"message\": \"poisson output has negative values\", \"metrics\": {}}\n    if not bool(torch.isfinite(sol).all().item()):\n        return {\"passed\": False, \"message\": \"poisson output has non-finite values\", \"metrics\": {}}\n    lam_min = float(inp.min().item())\n    lam_max = float(inp.max().item())\n    if lam_max == 0.0:\n        ok = bool((sol == 0).all().item())\n        return {\"passed\": ok, \"message\": \"\" if ok else \"zero-rate output not all zero\", \"metrics\": {}}\n    if abs(lam_max - lam_min) < 1e-6:\n        lam = lam_min\n        mean = float(sol.mean().item())\n        var = float(sol.var().item())\n        if abs(lam - 5.0) < 1e-3:\n            mean_tol, var_tol = 0.3, 0.5\n        elif abs(lam - 50.0) < 1e-3:\n            mean_tol, var_tol = 1.0, 5.0\n        else:\n            n = max(sol.numel(), 1)\n            mean_tol = max(0.3, 6.0 * (lam / n) ** 0.5)\n            var_tol = max(0.5, 8.0 * lam * (2.0 / n) ** 0.5)\n        if abs(mean - lam) >= mean_tol:\n            return {\"passed\": False, \"message\": f\"mean {mean} deviates from lam {lam}\", \"metrics\": {\"mean\": mean, \"var\": var}}\n        if abs(var - lam) >= var_tol:\n            return {\"passed\": False, \"message\": f\"var {var} deviates from lam {lam}\", \"metrics\": {\"mean\": mean, \"var\": var}}\n        return {\"passed\": True, \"message\": \"\", \"metrics\": {\"mean\": mean, \"var\": var}}\n    return {\"passed\": True, \"message\": \"\", \"metrics\": {}}\n",
+  "reference_device": "target",
+  "custom_inputs_entrypoint": "gen_inputs",
+  "custom_valid_entrypoint": "valid"
+}

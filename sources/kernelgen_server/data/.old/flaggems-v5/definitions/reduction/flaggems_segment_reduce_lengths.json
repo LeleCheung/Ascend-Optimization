@@ -1,0 +1,20 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems_segment_reduce_lengths",
+  "description": "torch.segment_reduce with lengths-based segments extracted from FlagGems segment_reduce tests and benchmark.",
+  "inputs": [
+    "data",
+    "reduce",
+    "lengths",
+    "axis",
+    "unsafe",
+    "initial"
+  ],
+  "outputs": [
+    "output"
+  ],
+  "reference": "import torch\n\nCORR_LENGTHS = {\n    (5,): [2, 0, 3],\n    (2, 3): [[1, 1, 1], [1, 1, 1]],\n    (2, 3, 4): [[1, 2], [2, 1]],\n    (2, 3, 5): [[[2, 3], [1, 4], [3, 2]], [[5, 0], [2, 3], [4, 1]]],\n}\n\n\ndef _make_data(shape, dtype, device):\n    numel = 1\n    for s in shape:\n        numel *= s\n    values = torch.arange(1, 1 + numel, device=device).reshape(shape).to(torch.float32)\n    values = (values.remainder(17) - 8) / 5\n    values = values + 0.25\n    return values.to(dtype)\n\n\ndef _make_lengths(shape, axis, device):\n    size_axis = shape[axis]\n    segment_count = min(64, size_axis)\n    base_length = size_axis // segment_count\n    remainder = size_axis % segment_count\n    lengths = torch.full((segment_count,), base_length, dtype=torch.int64)\n    if remainder:\n        lengths[:remainder] += 1\n    outer_shape = tuple(shape[:axis])\n    if outer_shape:\n        lengths = lengths.expand(*outer_shape, segment_count).clone()\n    return lengths.to(device)\n\n\ndef run(data, reduce, lengths, axis, unsafe, initial):\n    return torch.segment_reduce(\n        data, reduce, lengths=lengths, axis=axis, unsafe=unsafe, initial=initial\n    )\n\n\ndef gen_inputs(ctx, device):\n    shape = tuple(ctx['data__shape'])\n    dtype = getattr(torch, ctx['data__dtype'])\n    axis = ctx['axis']\n    if shape in CORR_LENGTHS:\n        data = _make_data(shape, dtype, device)\n        lengths = torch.tensor(CORR_LENGTHS[shape], dtype=torch.int64, device=device)\n    else:\n        data = torch.randn(shape, dtype=dtype, device=device)\n        lengths = _make_lengths(shape, axis, device)\n    return {'data': data, 'lengths': lengths}\n\n\ndef valid(ref_outputs, sol_outputs, inputs, ctx):\n    ref = ref_outputs[0].detach().to('cpu').to(torch.float64)\n    sol = sol_outputs[0].detach().to('cpu').to(torch.float64)\n    if ref.shape != sol.shape:\n        return {'passed': False, 'message': 'shape mismatch', 'metrics': {}}\n    rtol = 1.3e-6\n    atol = 1e-4\n    both_nan = torch.isnan(ref) & torch.isnan(sol)\n    both_posinf = torch.isposinf(ref) & torch.isposinf(sol)\n    both_neginf = torch.isneginf(ref) & torch.isneginf(sol)\n    finite = torch.isfinite(ref) & torch.isfinite(sol)\n    close = torch.zeros_like(ref, dtype=torch.bool)\n    close[finite] = (ref[finite] - sol[finite]).abs() <= atol + rtol * ref[finite].abs()\n    ok = (close | both_nan | both_posinf | both_neginf).all().item()\n    return {'passed': bool(ok), 'message': '', 'metrics': {}}\n",
+  "reference_device": "target",
+  "custom_inputs_entrypoint": "gen_inputs",
+  "custom_valid_entrypoint": "valid"
+}
