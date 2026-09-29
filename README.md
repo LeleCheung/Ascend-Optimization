@@ -8,7 +8,7 @@
 - `third_party/FlagGems/`：实验固定版本的 FlagGems 源码。
 - `sources/kernelgen/`：KernelGen 6.7.0 解压源码。
 - `sources/kernelgen_server/`：KernelGen Server 6.5.0 源码。
-- `runtime/catalogs/`：实验使用的 Catalog；运行日志和大型临时文件不在仓库中。
+- `runtime/catalogs/`：可复现所需的最小 Catalog；虚拟环境、Claude 二进制和原始运行日志留在 910B 本机，不提交到 Git。
 - `manifests/`：组件提交号、镜像和软件版本。
 
 ## 目标
@@ -25,15 +25,22 @@
 
 ### 第 1 步：最小算子复现
 
-1. 使用 `runtime/catalogs/catalog-square` 跑通一个简单算子的 Definition、编译、正确性、设备计时和最终复验。
-2. 同时验证 `kg definition`、`kg run`、KGS HTTP 服务和 Claude MCP 调用链路。
+1. 先使用 `runtime/catalogs/catalog-square` 跑通一个手工构造的 Native Catalog 算子，验证编译、正确性、设备计时、最终复验、KGS HTTP 服务和 Claude MCP 调用链路。
+2. 这一步只是 KG+KGS 的烟雾测试。`square` 不是导师所说的 Gems Definition 目录算子，也不能作为后续性能优化目标。
 3. 保存运行请求、事件日志、逐用例结果和失败原因，确认新工作区可以独立重跑。
+
+### 第 1.5 步：Gems Definition 流程
+
+1. 先阅读 `sources/kernelgen/docs/ONBOARDING.md` 和 `sources/kernelgen/docs/design/workflows/operator_optimization.md`。
+2. 在 `sources/kernelgen_server/data/flaggems-adapter-definitions/` 中选择一个已有算子名，使用 `GemsAdapterDefinitionWorkflow`（`kg definition`）导出 Definition。
+3. 用 `OperatorOptimizeWorkflow`（`kg run`）完成测试审核、KernelGen 优化和代码审核。Native Catalog 已经准备好的算子可以直接进入 `kg run`，不必重复导出 Definition。
+4. 给 Claude Code 的最小启动提示可以写成：`请先阅读 docs/ONBOARDING.md 和 docs/design/workflows/operator_optimization.md，然后从 kernelgen_server/data/flaggems-adapter-definitions 中选择一个算子，完成 kg definition 和 kg run 的最小闭环。` 实际运行时还要补充目标设备、Catalog 路径、模型、预算和工作区。
 
 ### 第 2 步：筛选代表性算子
 
-1. 读取 `project/Ascend-Optimization-v1/验收看板_结果表.xlsx` 的华为 Ascend910B 列。
+1. 读取 `project/Ascend-Optimization-v1/验收看板_结果表.xlsx` 的华为 Ascend910B 列，并在 FlagGems 华为后端找到对应实现。
 2. 过滤掉精度失败、没有有效计时、数据不完整的记录。
-3. 从正确性达标但加速比不理想的算子中选择一个代表性算子，固定其 FlagGems 入口、华为实现、测试、benchmark、shape、dtype 和完整 workload。
+3. 从正确性达标但加速比不理想的算子中选择一个代表性算子。优先选择 `flaggems-adapter-definitions` 中已有 Definition 的算子；若只有 Native Catalog，则记录来源和转换方式。固定其 FlagGems 入口、华为实现、测试、benchmark、shape、dtype 和完整 workload。
 
 ### 第 3 步：建立基线
 
@@ -54,6 +61,8 @@
 3. 围绕 Roofline、访存带宽、计算吞吐、流水线空泡、Kernel 启动开销、缓存和资源冲突判断受限类型。
 4. 将指令映射回 LLVM IR，再关联到 Triton 源码；无法精确映射时保留证据和不确定性。
 5. 参考 `KernelFlow-ops/cuda-optimized-skill` 的分析流程，但适配 CANN、Ascend 910B 和 Msopprof 数据格式。
+
+导师要求这个分析器先作为独立 workflow：输入算子、编译产物、workload 和 profiling 数据，输出结构化体检报告；稳定后再与 KernelGen 融合。profiling 默认使用 `msprof`，`metrics` 用于硬件指标，`instruction` 才会使用模拟器。两种模式由 agent 根据分析问题选择。
 
 ### 第 6 步：反馈优化与结论
 
