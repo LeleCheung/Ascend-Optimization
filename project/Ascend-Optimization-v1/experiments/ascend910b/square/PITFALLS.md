@@ -7,7 +7,7 @@
 - 910B 上的 Git 仓库：`/data/hanle/ascend-optimization/KernelGen`。
 - 容器内的隔离运行时：`/data/hanle/ascend-optimization/runtime/kg-controller`。
 - 专用 KGS：`http://127.0.0.1:19650`；KG 6.7.0、KGS 6.5.0，仅使用 `npu:0`。
-- 私有 Catalog：`$root/catalog-square`；源码快照位于 `/data/hanle/ascend-optimization/sources/kernelgen_server-6.5.0-archive`。
+- 仓库内 Catalog：`/data/hanle/ascend-optimization/Ascend-Optimization/runtime/catalogs/catalog-square`；运行环境仍位于 `$root`。
 - 运行工作区：`$root/runs/square-private-1` 和 `$root/runs/square-private-2`。
 
 下文的 `$root` 指 `/data/hanle/ascend-optimization/runtime/kg-controller`。运行时虚拟环境使用 Python 3.11.15、torch 2.9.0+cpu、torch-npu 2.9.0.post2、flagtree 0.6.0+ascend.gitc286cba6、CANN 9.0.0 和驱动 25.2.0。请沿用现有虚拟环境和服务，不要向共享的系统 Python 安装依赖。
@@ -23,7 +23,7 @@ KG 为 Claude 注册本地标准输入输出方式的 MCP 服务 `kernelgen.mcp_
 ## 复现步骤
 
 1. 执行 `docker exec tle_yy curl -s http://127.0.0.1:19650/status`，确认 KGS 为 6.5.0、设备为 `npu:0` 且设备槽健康，并留意其他用户的负载。
-2. 确认 `$root/catalog-square` 只包含 square 算子。若目录不存在，先核对 `prepare-square-catalog.py` 的源码路径，再在容器内运行它。
+2. 确认仓库内的 `runtime/catalogs/catalog-square` 只包含 square 算子。若目录不存在，先核对 `scripts/prepare-square-catalog.py` 的源码路径，再在容器内运行它。
 3. 在 `tle_yy` 内运行 `bash /data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/experiments/ascend910b/square/run.sh "$root/runs/square-<新编号>"`，每次使用**新**工作区。脚本默认每组计时三次；KG 返回 `SUBMITTED` 和 Worker PID 后会在后台继续运行。
 4. 查看 `$workspace/.kernelgen/run-progress.json`、`run-events.jsonl` 和 `runner.log`；再核对 `stages/optimize/work/.kernelgen/evals/round-0001/result.json`、`stages/optimize/work/optimize_definition_output.json`、最终复验 JSON 及 `stages/optimize/attempts/01/result.json`。完整工作流还需要代码审核阶段成功，不能仅凭预检通过判断成功。
 
