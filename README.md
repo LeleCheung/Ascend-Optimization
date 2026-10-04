@@ -82,3 +82,7 @@
 仓库中的压缩包和测试二进制由 Git LFS 管理。Windows 等开发机克隆后需要安装 Git LFS 并执行 `git lfs pull`。910B 上的展开源码已经可以直接使用；如果需要读取这些大文件，再安装 Git LFS 或使用 `project/KernelGen` 中的原始文件。
 
 FlagGems、KernelGen 和 KGS 的源码目录均为导出副本，不包含上游仓库的 `.git` 元数据；版本和来源记录在清单中。这样克隆本仓库后可以直接查看和构建全部源码，同时不会产生嵌套 Git 仓库。
+
+## narrow_copy 最新实验
+
+2026-10-05 已在 910B 上完成 `narrow_copy` 的隔离 FlagGems case API 适配、专用 KGS `19652`、Claude Code 驱动的 KernelGen 正式正确性和 walltime 计时闭环。33/33 个正确性 workload 与 15/15 个计时 workload 通过，整体生命周期成功；本轮相对 PyTorch 的加速比几何平均值为 `0.3532×`，因此仍需继续优化。运行产物、补丁和踩坑说明见 [narrow_copy 实验记录](project/Ascend-Optimization-v1/reports/ascend910b/narrow-copy-20261005/README.md)。

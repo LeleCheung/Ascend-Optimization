@@ -1,0 +1,445 @@
+{
+  "definition_name": "narrow_copy",
+  "op_type": "",
+  "status": "PASSED",
+  "best_geo_mean": 0.3815796148032372,
+  "best_code": "\"\"\"Triton implementation of ``torch.narrow_copy(inp, dim, start, length)``.\n\nFor a tensor with plain row-major storage the narrowed slab is a set of\n``pre = prod(shape[:dim])`` contiguous runs of ``chunk = length * prod(shape[dim+1:])``\nelements, and the result is a freshly allocated contiguous tensor, so the whole\noperator is a pure block copy:\n\n    out[p * chunk + i] = inp[p * dim_size * post + start * post + i]\n\nNo per-element division is needed (the flag_gems reference performs two integer\ndivisions/modulos by runtime divisors for every element).  Three shapes of the\nproblem are handled:\n\n* ``pre == 1`` -- the slab is one contiguous block: a flat copy kernel, either\n  straight-line (one program per block) or, for very large counts, a\n  grid-striding persistent loop that keeps every core streaming through many\n  blocks.\n* ``pre > 1`` -- a run-copy kernel stepping the run base by the input row stride\n  (still no per-element index arithmetic).\n* non row-major input -- a rank-generic strided gather kernel.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n_BLOCK_FLAT = 4096\n_BLOCK_MAX = 16384\n_PERSIST_THRESHOLD = 128  # block count from which the persistent loop is used\n_PERSIST_ITERS = 13  # target blocks handled per program (steady streaming)\n_PERSIST_GRID_MIN = 40\n_PERSIST_GRID_CAP = 256\n_BLOCK_RUNS = 2048\n_BLOCK_STRIDED = 1024\n\n\n@triton.jit\ndef _narrow_copy_flat_kernel(\n    out_ptr,\n    in_ptr,\n    base_in,\n    n,\n    BLOCK: tl.constexpr,\n    EVEN: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    if EVEN:\n        vals = tl.load(in_ptr + base_in + offs)\n        tl.store(out_ptr + offs, vals)\n    else:\n        mask = offs < n\n        vals = tl.load(in_ptr + base_in + offs, mask=mask)\n        tl.store(out_ptr + offs, vals, mask=mask)\n\n\n@triton.jit\ndef _narrow_copy_flat_persistent_kernel(\n    out_ptr,\n    in_ptr,\n    base_in,\n    n,\n    nblocks,\n    BLOCK: tl.constexpr,\n    EVEN: tl.constexpr,\n):\n    grid = tl.num_programs(0)\n    for blk in tl.range(tl.program_id(0), nblocks, grid):\n        offs = blk * BLOCK + tl.arange(0, BLOCK)\n        if EVEN:\n            vals = tl.load(in_ptr + base_in + offs)\n            tl.store(out_ptr + offs, vals)\n        else:\n            mask = offs < n\n            vals = tl.load(in_ptr + base_in + offs, mask=mask)\n            tl.store(out_ptr + offs, vals, mask=mask)\n\n\n@triton.jit\ndef _narrow_copy_runs_kernel(\n    out_ptr,\n    in_ptr,\n    base_in,\n    chunk,\n    sp,\n    nblocks,\n    BLOCK: tl.constexpr,\n    EVEN: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    row = pid // nblocks\n    blk = pid - row * nblocks\n    offs = blk * BLOCK + tl.arange(0, BLOCK)\n    src = in_ptr + row * sp + base_in + offs\n    dst = out_ptr + row * chunk + offs\n    if EVEN:\n        vals = tl.load(src)\n        tl.store(dst, vals)\n    else:\n        mask = offs < chunk\n        vals = tl.load(src, mask=mask)\n        tl.store(dst, vals, mask=mask)\n\n\n@triton.jit\ndef _narrow_copy_strided_kernel(\n    out_ptr,\n    in_ptr,\n    base_in,\n    n,\n    SHAPE: tl.constexpr,\n    STRIDES: tl.constexpr,\n    RANK: tl.constexpr,\n    BLOCK: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    rem = offs\n    src = tl.zeros([BLOCK], dtype=tl.int64) + base_in\n    for i in tl.static_range(RANK):\n        c = rem % SHAPE[RANK - 1 - i]\n        rem = rem // SHAPE[RANK - 1 - i]\n        src += c.to(tl.int64) * STRIDES[RANK - 1 - i]\n    mask = offs < n\n    vals = tl.load(in_ptr + src, mask=mask)\n    tl.store(out_ptr + offs, vals, mask=mask)\n\n\ndef _flat_block(count):\n    \"\"\"Element count per program: bigger tiles amortize per-program setup.\"\"\"\n    if count <= _BLOCK_FLAT:\n        blk = triton.next_power_of_2(count)\n        if blk > _BLOCK_FLAT:\n            blk = _BLOCK_FLAT\n        if blk < 16:\n            blk = 16\n        return blk\n    if count <= 65536:\n        return _BLOCK_FLAT\n    return _BLOCK_MAX\n\n\ndef run(inp, dim, start, length):\n    if type(dim) is not int:\n        dim = int(dim)\n    if type(start) is not int:\n        start = int(start)\n    if type(length) is not int:\n        length = int(length)\n\n    ndim = inp.dim()\n    if dim < 0:\n        dim += ndim\n    shape = inp.shape\n    dim_size = shape[dim]\n    if start < 0:\n        start %= dim_size\n    if start + length > dim_size:\n        length = dim_size - start\n\n    out_shape = list(shape)\n    out_shape[dim] = length\n    out = torch.empty(out_shape, dtype=inp.dtype, device=inp.device)\n    n = out.numel()\n    if n == 0:\n        return out\n\n    strides = inp.stride()\n\n    # Canonical row-major layout?  Compared against the exact stride expected\n    # for the full shape so size-1 dimensions with exotic strides fall through.\n    exp = 1\n    canonical = True\n    for k in range(ndim - 1, -1, -1):\n        if strides[k] != exp:\n            canonical = False\n            break\n        exp *= shape[k]\n\n    if canonical:\n        post = 1\n        for k in range(dim + 1, ndim):\n            post *= shape[k]\n        base_in = start * post\n        if dim == 0:\n            pre = 1\n        else:\n            pre = 1\n            for k in range(dim):\n                pre *= shape[k]\n\n        if pre == 1:\n            blk = _flat_block(n)\n            nblocks = (n + blk - 1) // blk\n            even = n == nblocks * blk\n            if nblocks >= _PERSIST_THRESHOLD:\n                grid = nblocks // _PERSIST_ITERS\n                if grid < _PERSIST_GRID_MIN:\n                    grid = _PERSIST_GRID_MIN\n                if grid > _PERSIST_GRID_CAP:\n                    grid = _PERSIST_GRID_CAP\n                _narrow_copy_flat_persistent_kernel[(grid,)](\n                    out,\n                    inp,\n                    base_in,\n                    n,\n                    nblocks,\n                    BLOCK=blk,\n                    EVEN=even,\n                )\n            else:\n                _narrow_copy_flat_kernel[(nblocks,)](\n                    out,\n                    inp,\n                    base_in,\n                    n,\n                    BLOCK=blk,\n                    EVEN=even,\n                )\n        else:\n            chunk = length * post\n            blk = _BLOCK_RUNS\n            if chunk < blk:\n                blk = triton.next_power_of_2(chunk)\n                if blk < 16:\n                    blk = 16\n            nblocks = (chunk + blk - 1) // blk\n            _narrow_copy_runs_kernel[(pre * nblocks,)](\n                out,\n                inp,\n                base_in,\n                chunk,\n                dim_size * post,\n                nblocks,\n                BLOCK=blk,\n                EVEN=(chunk == nblocks * blk),\n            )\n    else:\n        blk = _BLOCK_STRIDED\n        _narrow_copy_strided_kernel[(triton.cdiv(n, blk),)](\n            out,\n            inp,\n            start * strides[dim],\n            n,\n            SHAPE=tuple(out_shape),\n            STRIDES=tuple(strides),\n            RANK=ndim,\n            BLOCK=blk,\n        )\n    return out\n",
+  "search_best_geo_mean": 0.3532118892325604,
+  "final_verification": {
+    "status": "PASSED",
+    "reason_code": "VERIFIED",
+    "geo_mean": 0.3815796148032372,
+    "measured_geo_mean": 0.3815796148032372,
+    "comparisons": [
+      {
+        "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::0",
+        "axes": {
+          "dtype": "float16",
+          "shape_detail": [
+            [
+              64,
+              64
+            ],
+            0,
+            16,
+            32
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.039163954220213064,
+          "latency_ms": 0.1659393310546875
+        },
+        "after": {
+          "reference_latency_ms": 0.038191002217968506,
+          "latency_ms": 0.16236305236816406
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9751569518038502,
+          "latency_ms": 0.978448275862069
+        }
+      },
+      {
+        "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::1",
+        "axes": {
+          "dtype": "float16",
+          "shape_detail": [
+            [
+              256,
+              256
+            ],
+            0,
+            64,
+            128
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.048571377877385136,
+          "latency_ms": 0.11020898818969727
+        },
+        "after": {
+          "reference_latency_ms": 0.03748848324730283,
+          "latency_ms": 0.09655218857985276
+        },
+        "ratios": {
+          "reference_latency_ms": 0.7718225194669119,
+          "latency_ms": 0.8760827058285143
+        }
+      },
+      {
+        "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::2",
+        "axes": {
+          "dtype": "float16",
+          "shape_detail": [
+            [
+              1024,
+              1024
+            ],
+            0,
+            256,
+            512
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.02272356124151321,
+          "latency_ms": 0.09847378385239754
+        },
+        "after": {
+          "reference_latency_ms": 0.021624819663920013,
+          "latency_ms": 0.09652796913595761
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9516474743586438,
+          "latency_ms": 0.9802402767486166
+        }
+      },
+      {
+        "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::3",
+        "axes": {
+          "dtype": "float16",
+          "shape_detail": [
+            [
+              4096,
+              4096
+            ],
+            0,
+            1024,
+            2048
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.02206054911281695,
+          "latency_ms": 0.10110056677529979
+        },
+        "after": {
+          "reference_latency_ms": 0.02107848859813115,
+          "latency_ms": 0.1005047843569801
+        },
+        "ratios": {
+          "reference_latency_ms": 0.955483405709279,
+          "latency_ms": 0.9941070318661631
+        }
+      },
+      {
+        "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::4",
+        "axes": {
+          "dtype": "float16",
+          "shape_detail": [
+            [
+              1024,
+              65536
+            ],
+            0,
+            256,
+            512
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.08726804592785019,
+          "latency_ms": 0.10494731354597889
+        },
+        "after": {
+          "reference_latency_ms": 0.0975953174156355,
+          "latency_ms": 0.09484946156462161
+        },
+        "ratios": {
+          "reference_latency_ms": 1.1183396669191321,
+          "latency_ms": 0.9037817011205983
+        }
+      },
+      {
+        "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::0",
+        "axes": {
+          "dtype": "float32",
+          "shape_detail": [
+            [
+              64,
+              64
+            ],
+            0,
+            16,
+            32
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.040169838255485604,
+          "latency_ms": 0.11143359270962802
+        },
+        "after": {
+          "reference_latency_ms": 0.0430290013143461,
+          "latency_ms": 0.10744561540319565
+        },
+        "ratios": {
+          "reference_latency_ms": 1.071176862617067,
+          "latency_ms": 0.964212072773924
+        }
+      },
+      {
+        "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::1",
+        "axes": {
+          "dtype": "float32",
+          "shape_detail": [
+            [
+              256,
+              256
+            ],
+            0,
+            64,
+            128
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.043025804222176924,
+          "latency_ms": 0.12671505963360824
+        },
+        "after": {
+          "reference_latency_ms": 0.044320038442635164,
+          "latency_ms": 0.09935873526114006
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0300804190381907,
+          "latency_ms": 0.7841114982578397
+        }
+      },
+      {
+        "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::2",
+        "axes": {
+          "dtype": "float32",
+          "shape_detail": [
+            [
+              1024,
+              1024
+            ],
+            0,
+            256,
+            512
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.024216102831291428,
+          "latency_ms": 0.10371580719947815
+        },
+        "after": {
+          "reference_latency_ms": 0.025213427013821073,
+          "latency_ms": 0.10020117605886152
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0411843387632518,
+          "latency_ms": 0.9661128690455362
+        }
+      },
+      {
+        "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::3",
+        "axes": {
+          "dtype": "float32",
+          "shape_detail": [
+            [
+              4096,
+              4096
+            ],
+            0,
+            1024,
+            2048
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.02404054005940755,
+          "latency_ms": 0.10844823476430532
+        },
+        "after": {
+          "reference_latency_ms": 0.02436726181595414,
+          "latency_ms": 0.10357251981409585
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0135904499540864,
+          "latency_ms": 0.95504108517021
+        }
+      },
+      {
+        "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::4",
+        "axes": {
+          "dtype": "float32",
+          "shape_detail": [
+            [
+              1024,
+              65536
+            ],
+            0,
+            256,
+            512
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.21832933028539023,
+          "latency_ms": 0.2175097797006209
+        },
+        "after": {
+          "reference_latency_ms": 0.2177047486207923,
+          "latency_ms": 0.21356749909086378
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9971392681698721,
+          "latency_ms": 0.9818753868668193
+        }
+      },
+      {
+        "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::0",
+        "axes": {
+          "dtype": "bfloat16",
+          "shape_detail": [
+            [
+              64,
+              64
+            ],
+            0,
+            16,
+            32
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.03878206686089315,
+          "latency_ms": 0.10976337251209078
+        },
+        "after": {
+          "reference_latency_ms": 0.04398956959381764,
+          "latency_ms": 0.10885261907810118
+        },
+        "ratios": {
+          "reference_latency_ms": 1.1342760495876407,
+          "latency_ms": 0.9917025742454362
+        }
+      },
+      {
+        "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::1",
+        "axes": {
+          "dtype": "bfloat16",
+          "shape_detail": [
+            [
+              256,
+              256
+            ],
+            0,
+            64,
+            128
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.03878205561275192,
+          "latency_ms": 0.09991544665712299
+        },
+        "after": {
+          "reference_latency_ms": 0.04420635548043758,
+          "latency_ms": 0.09790272779867683
+        },
+        "ratios": {
+          "reference_latency_ms": 1.1398662289036092,
+          "latency_ms": 0.9798557788031199
+        }
+      },
+      {
+        "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::2",
+        "axes": {
+          "dtype": "bfloat16",
+          "shape_detail": [
+            [
+              1024,
+              1024
+            ],
+            0,
+            256,
+            512
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.02236078343791709,
+          "latency_ms": 0.099336183988131
+        },
+        "after": {
+          "reference_latency_ms": 0.024665230067341854,
+          "latency_ms": 0.09751651022169326
+        },
+        "ratios": {
+          "reference_latency_ms": 1.1030575085091663,
+          "latency_ms": 0.9816816622767072
+        }
+      },
+      {
+        "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::3",
+        "axes": {
+          "dtype": "bfloat16",
+          "shape_detail": [
+            [
+              4096,
+              4096
+            ],
+            0,
+            1024,
+            2048
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.02272230476978965,
+          "latency_ms": 0.10322464836968316
+        },
+        "after": {
+          "reference_latency_ms": 0.024046216692243303,
+          "latency_ms": 0.10038881885762117
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0582648607113947,
+          "latency_ms": 0.9725275933912034
+        }
+      },
+      {
+        "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::4",
+        "axes": {
+          "dtype": "bfloat16",
+          "shape_detail": [
+            [
+              1024,
+              65536
+            ],
+            0,
+            256,
+            512
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.08747135241007067,
+          "latency_ms": 0.09907668350727358
+        },
+        "after": {
+          "reference_latency_ms": 0.09706036356471529,
+          "latency_ms": 0.09647393837953225
+        },
+        "ratios": {
+          "reference_latency_ms": 1.1096245901136956,
+          "latency_ms": 0.9737299934191856
+        }
+      }
+    ],
+    "drift": [],
+    "drift_factor": 2.0,
+    "compared_to": "original_round",
+    "attempt_path": ".kernelgen/retests/c31ed578ad12fb75957f44e0388210c9f3c4753c523de851e062f5afc7e4a99a/6e6a7cb0cfabfd854316305bd307cf7113f63edab67d81d9e92affdc85dce847/attempt-0001.json",
+    "round_num": 1,
+    "solution_sha256": "c31ed578ad12fb75957f44e0388210c9f3c4753c523de851e062f5afc7e4a99a"
+  },
+  "rounds": 1,
+  "summary": "Evaluated the provided best-so-far seed (contiguous flat/run-copy Triton kernels with a persistent fallback and a rank-generic strided fallback) as the baseline round: all 33 correctness workloads passed and all 15 timing workloads ran, yielding geo_mean 0.3532 with min_speedup 0.2182 on float16 case 3. Measurements show a ~0.10 ms per-call floor that is nearly independent of transferred bytes for small shapes, so the bottleneck is fixed per-call host/launch overhead rather than achieved HBM bandwidth (large contiguous copies reach ~1.3 TB/s and 0.83-1.00x of the reference, while small shapes are 3-4x slower). The optimization loop was stopped by the lifecycle verdict (max round limit 1/1) before any follow-up round could be measured.",
+  "workspace": "/data/hanle/ascend-optimization/runtime/kg-controller/runs/narrow-copy-kg-20261005-10/stages/optimize/work"
+}

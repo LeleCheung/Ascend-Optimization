@@ -1,0 +1,57 @@
+diff --git a/benchmark/conftest.py b/benchmark/conftest.py
+index 5a452b38..bada8c8c 100644
+--- a/benchmark/conftest.py
++++ b/benchmark/conftest.py
+@@ -375,6 +375,10 @@ def pytest_configure(config):
+     mode_value = config.getoption(
+         "--mode" if vendor_name != "kunlunxin" else "--fg_mode"
+     )
++    # KernelGen's FlagGems evaluator can request wall-clock operator timing
++    # for benchmark subprocesses without passing benchmark-only pytest flags
++    # to the separate correctness suite.
++    mode_value = os.environ.get("KERNELGEN_FLAGGEMS_MODE", mode_value)
+     Config.mode = consts.BenchMode(mode_value)
+ 
+     Config.query = config.getoption("--query")
+diff --git a/benchmark/test_narrow_copy.py b/benchmark/test_narrow_copy.py
+index 0f10afa4..0d1302b5 100644
+--- a/benchmark/test_narrow_copy.py
++++ b/benchmark/test_narrow_copy.py
+@@ -39,12 +39,24 @@ class TensorSelectBenchmark(base.GenericBenchmark2DOnly):
+         return shapes
+ 
+ 
+-def narrow_copy_input_fn(shape, cur_dtype, device):
+-    inp = utils.generate_tensor_input(shape, cur_dtype, device)
++def narrow_copy_case_fn(shape, dtype):
++    # Mirror the legacy narrow_copy_input_fn planning stage: one case per shape,
++    # slicing dim 0 from its first quarter for half its extent.
++    del dtype
+     dim = 0
+     start = shape[dim] // 4
+     length = shape[dim] // 2
+-    yield inp, dim, start, length
++    yield base.BenchmarkCasePlan(
++        shape={"input": tuple(shape)},
++        params={"dim": dim, "start": start, "length": length},
++        builder_args=(shape, dim, start, length),
++    )
++
++
++def narrow_copy_build_inputs(plan, dtype, device):
++    shape, dim, start, length = plan.builder_args
++    inp = utils.generate_tensor_input(shape, dtype, device)
++    return inp, dim, start, length
+ 
+ 
+ def narrow_copy_gbps(bench_fn_args, latency):
+@@ -60,7 +72,8 @@ def test_narrow_copy_perf():
+     bench = TensorSelectBenchmark(
+         op_name="narrow_copy",
+         torch_op=torch.narrow_copy,
+-        input_fn=narrow_copy_input_fn,
++        case_fn=narrow_copy_case_fn,
++        build_inputs_fn=narrow_copy_build_inputs,
+         dtypes=consts.FLOAT_DTYPES,
+         get_gbps=narrow_copy_gbps,
+     )

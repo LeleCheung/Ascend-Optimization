@@ -97,3 +97,8 @@ FlagGems 建议独立放在服务器的同级目录，例如：
 ## 当前状态
 
 已完成 910B 上的隔离 KG 6.7.0 / KGS 6.5.0 部署和 `square` 算子的生成、编译、正确性与设备计时。首次运行的最终复验因计时漂移停在 `NEEDS_RETEST`，不能作为稳定加速结论；三次计时的第二轮在优化阶段取消，未完成正式候选评测。复现路径和踩坑记录见 [square 交接文档](experiments/ascend910b/square/PITFALLS.md)，首次结果见 [运行报告](reports/ascend910b/square-private-1/README.md)。代表性 FlagGems 算子和 profiler 对照实验尚未开始。
+
+
+## narrow_copy 阶段结果
+
+910B 已完成隔离 FlagGems case API 适配、专用 KGS 19652 和正式 KernelGen 正确性及 walltime 计时闭环。33/33 个正确性 workload、15/15 个计时 workload 通过；相对 PyTorch 的几何平均加速比为 0.3532×，仍需继续优化。证据与踩坑见 [narrow_copy 实验记录](reports/ascend910b/narrow-copy-20261005/README.md)。
