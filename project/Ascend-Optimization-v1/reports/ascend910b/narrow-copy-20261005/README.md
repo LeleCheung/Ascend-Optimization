@@ -33,3 +33,18 @@
 下一轮应在固定 PyTorch 基线和同一 walltime 口径下，先降低小 shape 约 `0.10 ms` 的固定调用开销，再考虑 profiler 引导的完整优化实验。现有候选对部分大拷贝接近 PyTorch，但总体尚未超过 PyTorch。
 
 本轮 profiling 已完成 metrics 和 instruction 两级采集。结构化原始证据见 `profiling-metrics.json`、`profiling-instruction.json`，中文诊断见 [分析报告](分析报告.md)，可注入 Claude 的紧凑提示见 `profiling-agent-prompt.md`。提示由 [独立 profiling agent](../../../../scripts/ascend_profiling_agent.py) 根据原始 JSON 生成，明确区分 msprof/simulator 诊断时间与正式 KGS walltime。
+
+## profile-enabled KernelGen A/B
+
+在同一隔离 FlagGems 副本、同一 KGS `19652`、同一 PyTorch baseline 和同一 workload 下，使用 `kg run --profile` 启动新 workspace `narrow-copy-kg-profile-20261005-3`，共运行两轮。Claude 的 profiling 反馈在 round 2 完成后由 KGS 对 5/15 个 timing workload 采集 `msprof metrics`，并生成 `.kernelgen/profile-analysis/round-0002.json`；报告明确标注 profiler 采集时间不能替代 eval walltime。
+
+| 项目 | 无 profiling seed | 有 profiling round 2 | 最终独立复验 |
+| --- | ---: | ---: | ---: |
+| correctness | 33/33 | 33/33（其中 18 个主 correctness） | PASSED |
+| timing workload | 15/15 | 15/15 | PASSED |
+| 几何平均 speedup | 0.3396× | 0.4708× | 0.4615× |
+| 最差 speedup | 0.1925× | 0.2860× | 以逐 case 结果为准 |
+
+profile-enabled 候选保存在 [narrow_copy_profiled.py](narrow_copy_profiled.py)，round 1/2 的完整结果、profile analysis、ledger 和最终复验分别见 `profiled-round-0001.json`、`profiled-round-0002.json`、`profile-analysis-round-0002.json`、`profiled-ledger.json` 和 `profiled-final-verification.json`。候选通过按完整 launch signature 缓存已编译 launcher，round 2 相对 seed 在 host-bound workload 上减少约 `0.037–0.050 ms`；`::4` 大拷贝接近带宽边界，约 `1.01×`，总体仍低于 PyTorch。
+
+这次实验的结论是：profiling 能正确揭示 narrow_copy 的 host launch 瓶颈并指导有效改进，但 Triton wrapper 的剩余 C-level launcher、device/stream 查询和输出分配开销仍高于 PyTorch native dispatch；在当前设备、软件版本和 workload 下，不能宣称 Triton 已打赢 PyTorch。
