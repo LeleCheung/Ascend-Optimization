@@ -31,3 +31,5 @@
 5. 复现前确认端口 `19652` 的 `/status` 为 `ok`、`timing=walltime`、`workers=1`、`KGS_FLAGGEMS_ROOT` 指向隔离副本，并等待其调度队列空闲。使用 `--seed-code-path` 指向本目录的候选源码，在**新 workspace** 中运行同样的 `kg run --mode simple_opt --definition narrow_copy --catalog-name flaggems-adapter-definitions --eval-server http://127.0.0.1:19652 --runtime claude --no-profile --max-round 1`。准确的模型、预算和参数见 `run-progress.json` 对应的服务器 workspace 中 `.kernelgen/run-request.json`。
 
 下一轮应在固定 PyTorch 基线和同一 walltime 口径下，先降低小 shape 约 `0.10 ms` 的固定调用开销，再考虑 profiler 引导的完整优化实验。现有候选对部分大拷贝接近 PyTorch，但总体尚未超过 PyTorch。
+
+本轮 profiling 已完成 metrics 和 instruction 两级采集。结构化原始证据见 `profiling-metrics.json`、`profiling-instruction.json`，中文诊断见 [分析报告](分析报告.md)，可注入 Claude 的紧凑提示见 `profiling-agent-prompt.md`。提示由 [独立 profiling agent](../../../../scripts/ascend_profiling_agent.py) 根据原始 JSON 生成，明确区分 msprof/simulator 诊断时间与正式 KGS walltime。
