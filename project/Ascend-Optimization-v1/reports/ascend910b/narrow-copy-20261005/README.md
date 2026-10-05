@@ -32,11 +32,11 @@
 
 下一轮应在固定 PyTorch 基线和同一 walltime 口径下，先降低小 shape 约 `0.10 ms` 的固定调用开销，再考虑 profiler 引导的完整优化实验。现有候选对部分大拷贝接近 PyTorch，但总体尚未超过 PyTorch。
 
-本轮 profiling 已完成 metrics 和 instruction 两级采集。结构化原始证据见 `profiling-metrics.json`、`profiling-instruction.json`，中文诊断见 [分析报告](分析报告.md)，可注入 Claude 的紧凑提示见 `profiling-agent-prompt.md`。提示由 [独立 profiling agent](../../../../scripts/ascend_profiling_agent.py) 根据原始 JSON 生成，明确区分 msprof/simulator 诊断时间与正式 KGS walltime。
+本轮 profiling 已完成 metrics 和 instruction 两级采集。结构化原始证据见 `profiling-metrics.json`、`profiling-instruction.json`，对应请求体也已保留。中文诊断见 [分析报告](分析报告.md)，旧版紧凑提示见 `profiling-agent-prompt.md`。新版 [独立 profiling 分析器](../../../scripts/ascend_profiling_agent.py) 将同一个 case 的正式 Eval、真机 msprof、simulator 指令及候选源码关联并校验请求体，输出 `profiling-agent-case.md/json`；不会把不同采集的耗时相减，也不会在缺少可信上限时编造 Roofline。
 
-## profile-enabled KernelGen A/B
+## 先前 profile-enabled KernelGen 运行
 
-在同一隔离 FlagGems 副本、同一 KGS `19652`、同一 PyTorch baseline 和同一 workload 下，使用 `kg run --profile` 启动新 workspace `narrow-copy-kg-profile-20261005-3`，共运行两轮。Claude 的 profiling 反馈在 round 2 完成后由 KGS 对 5/15 个 timing workload 采集 `msprof metrics`，并生成 `.kernelgen/profile-analysis/round-0002.json`；报告明确标注 profiler 采集时间不能替代 eval walltime。
+在同一隔离 FlagGems 副本、KGS `19652`、PyTorch baseline 和 workload 下，使用 `kg run --profile` 启动 workspace `narrow-copy-kg-profile-20261005-3`，共运行两轮。KGS 在 **round 2 候选评测后** 对 5/15 个 timing workload 采集 `msprof metrics`，并生成 `.kernelgen/profile-analysis/round-0002.json`。这证明 profile 链路可用，但本次正式 profile 结果没有进入 round 2 的代码决策；旧 `--no-profile` 任务也只有一轮，不能把两个旧任务称为严格 A/B。
 
 | 项目 | 无 profiling seed | 有 profiling round 2 | 最终独立复验 |
 | --- | ---: | ---: | ---: |
@@ -47,4 +47,18 @@
 
 profile-enabled 候选保存在 [narrow_copy_profiled.py](narrow_copy_profiled.py)，round 1/2 的完整结果、profile analysis、ledger 和最终复验分别见 `profiled-round-0001.json`、`profiled-round-0002.json`、`profile-analysis-round-0002.json`、`profiled-ledger.json` 和 `profiled-final-verification.json`。候选通过按完整 launch signature 缓存已编译 launcher，round 2 相对 seed 在 host-bound workload 上减少约 `0.037–0.050 ms`；`::4` 大拷贝接近带宽边界，约 `1.01×`，总体仍低于 PyTorch。
 
-这次实验的结论是：profiling 能正确揭示 narrow_copy 的 host launch 瓶颈并指导有效改进，但 Triton wrapper 的剩余 C-level launcher、device/stream 查询和输出分配开销仍高于 PyTorch native dispatch；在当前设备、软件版本和 workload 下，不能宣称 Triton 已打赢 PyTorch。
+这次实验表明 launcher 缓存能降低部分 host launch 开销，但不能证明正式 KGS profiling 反馈导致了该改进。候选整体仍低于 PyTorch native。严格 A/B 另以 [配对脚本](../../../scripts/run-narrow-copy-ab-910b.sh) 在新 workspace 执行，两组共用 [中性提示](../../../experiments/ascend910b/narrow_copy/ab-prompt.md)，只切换 `--profile`；必须检查第一轮分析记录早于第二轮改码，才可讨论 profiling 对优化的贡献。
+
+Excel `验收看板_结果表.xlsx` 的 `narrow_copy` 位于第 29 行，华为列 `G29=0.0138`。该工作簿没有为此单元格提供 baseline、shape/dtype 集合、聚合方法或计时口径，因此不能与本实验的 PyTorch baseline 直接比较，也不能计算跨实验提升倍数。
+
+## 两轮配对 A/B（2026-10-06 完成）
+
+使用 [配对脚本](../../../scripts/run-narrow-copy-ab-910b.sh) 顺序运行两组独立 workspace：`narrow-copy-ab-20261005-no-profile` 和 `narrow-copy-ab-20261005-profile`。两组的 KG 参数、模型、两轮预算、workload、KGS `19652`、seed 和提示文件相同，仅切换 profiling 开关；归档 seed 的 SHA-256 为 `d7d243738cb72a27a1786d2078552cef4221f95230c5d63fb1e3d6f11d33141c`。PyTorch reference 在各组中重新测量，数字不强制相同。第一轮最终候选的源码哈希在两组恰好相同。
+
+当次运行使用 `runtime/kg-controller` 中同内容的 seed、提示和脚本副本，精确路径见两份 `ab-*-run-request.json`。仓库版脚本改为直接读取本目录的 `ab-shared-seed.py` 和仓库中的 `ab-prompt.md`；重跑前仍需按仓库说明启动专用 KGS、准备 KG venv/Claude 环境，并将脚本中的 workspace 名换成新的实验编号。
+
+无 profiler 组两轮均通过，geo mean 分别为 `0.3443×` 和 `0.3592×`，最终独立复验 `PASSED / 0.3580×`。有 profiler 组第一轮 `PASSED / 0.3772×`，对 4 个代表性 workload 采集真机 `msprof metrics`，并成功记录第一轮分析。第二轮的 launch-plan 缓存候选 15/15 timing case 通过，但 18 个 correctness case 中有 9 个发生运行错误，状态为 `PARTIAL_PASS`，没有有效的整体 geo mean；KG 回退到第一轮候选，最终独立复验 `PASSED / 0.3498×`。完整逐 case 表及原始 JSON 见 [配对报告](ab-report.md)。
+
+服务器 `runner.log` 中，`record_profile_analysis` 首次因引用未登记的证据路径失败，重试后第 2324 行返回 `recorded=true, round_num=1, status=completed`；第二轮首次改写 `tmp/main.py` 在第 3715 行。因此本次确实走通了“先分析，再修改”的反馈顺序。分析指出小中型 case 的设备 kernel 仅约 `1.5–8 µs`，调用的固定开销占主导；target-side 自检显示修改后部分调用约 `85–91 µs`，但它仍未通过正式正确性。该改动不能作为可交付的优化版本，也不能说 profiling 提高了最终性能。
+
+下一轮应先复现并修复第二轮 runs-kernel 的 9 个 correctness 运行错误，再以相同 15 case 和完整正确性重新评测缓存方案；随后重复配对运行以估计波动。现阶段只可得出：在此次 910B、walltime、两轮预算和既定 workload 下，最终有效 Triton 候选总体仍慢于 PyTorch `torch.narrow_copy`。Excel 的 `0.0138` 仍仅用于选题，不参与加速比换算。

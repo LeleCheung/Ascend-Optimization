@@ -1,0 +1,2117 @@
+{
+  "schema_version": "3.0",
+  "definition_name": "narrow_copy",
+  "target_hardware": "Ascend910B",
+  "implementation_language": "triton",
+  "best_geo_mean": 0.3591768018094782,
+  "best_round": 2,
+  "best_code": "\"\"\"Triton implementation of ``torch.narrow_copy(inp, dim, start, length)``.\n\nFor a tensor with plain row-major storage the narrowed slab is a set of\n``pre = prod(shape[:dim])`` contiguous runs of ``chunk = length * prod(shape[dim+1:])``\nelements, and the result is a freshly allocated contiguous tensor, so the whole\noperator is a pure block copy:\n\n    out[p * chunk + i] = inp[p * dim_size * post + start * post + i]\n\nNo per-element division is needed (the flag_gems reference performs two integer\ndivisions/modulos by runtime divisors for every element).  Three shapes of the\nproblem are handled:\n\n* ``pre == 1`` -- the slab is one contiguous block: a flat copy kernel, either\n  straight-line (one program per block) or, for very large counts, a\n  grid-striding persistent loop that keeps every core streaming through many\n  blocks.\n* ``pre > 1`` -- a run-copy kernel stepping the run base by the input row stride\n  (still no per-element index arithmetic).\n* non row-major input -- a rank-generic strided gather kernel.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n_BLOCK_FLAT = 4096\n_BLOCK_MAX = 16384\n# Dispatch rule for the large contiguous slab (pre == 1).  On the target an\n# Ascend 910B launch with a preallocated destination measured:\n#   8.4M elems: 512 flat blocks 0.0688 ms  vs  persistent grid 40 0.0714 ms\n#   33.5M elems: 2048 flat blocks 0.0984 ms vs persistent grid 160 0.0910 ms\n# so the straight-line kernel wins until the block count is large, and beyond\n# that a single capped persistent grid keeps every core streaming.\n_PERSIST_THRESHOLD = 513  # block count from which the persistent loop is used\n_PERSIST_GRID_CAP = 160  # cap on the persistent grid for very large slabs\n_BLOCK_RUNS = 2048\n_BLOCK_STRIDED = 1024\n\n\n@triton.jit\ndef _narrow_copy_flat_kernel(\n    out_ptr,\n    in_ptr,\n    base_in,\n    n,\n    BLOCK: tl.constexpr,\n    EVEN: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    if EVEN:\n        vals = tl.load(in_ptr + base_in + offs)\n        tl.store(out_ptr + offs, vals)\n    else:\n        mask = offs < n\n        vals = tl.load(in_ptr + base_in + offs, mask=mask)\n        tl.store(out_ptr + offs, vals, mask=mask)\n\n\n@triton.jit\ndef _narrow_copy_flat_persistent_kernel(\n    out_ptr,\n    in_ptr,\n    base_in,\n    n,\n    nblocks,\n    BLOCK: tl.constexpr,\n    EVEN: tl.constexpr,\n):\n    grid = tl.num_programs(0)\n    for blk in tl.range(tl.program_id(0), nblocks, grid):\n        offs = blk * BLOCK + tl.arange(0, BLOCK)\n        if EVEN:\n            vals = tl.load(in_ptr + base_in + offs)\n            tl.store(out_ptr + offs, vals)\n        else:\n            mask = offs < n\n            vals = tl.load(in_ptr + base_in + offs, mask=mask)\n            tl.store(out_ptr + offs, vals, mask=mask)\n\n\n@triton.jit\ndef _narrow_copy_runs_kernel(\n    out_ptr,\n    in_ptr,\n    base_in,\n    chunk,\n    sp,\n    nblocks,\n    BLOCK: tl.constexpr,\n    EVEN: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    row = pid // nblocks\n    blk = pid - row * nblocks\n    offs = blk * BLOCK + tl.arange(0, BLOCK)\n    src = in_ptr + row * sp + base_in + offs\n    dst = out_ptr + row * chunk + offs\n    if EVEN:\n        vals = tl.load(src)\n        tl.store(dst, vals)\n    else:\n        mask = offs < chunk\n        vals = tl.load(src, mask=mask)\n        tl.store(dst, vals, mask=mask)\n\n\n@triton.jit\ndef _narrow_copy_strided_kernel(\n    out_ptr,\n    in_ptr,\n    base_in,\n    n,\n    SHAPE: tl.constexpr,\n    STRIDES: tl.constexpr,\n    RANK: tl.constexpr,\n    BLOCK: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    rem = offs\n    src = tl.zeros([BLOCK], dtype=tl.int64) + base_in\n    for i in tl.static_range(RANK):\n        c = rem % SHAPE[RANK - 1 - i]\n        rem = rem // SHAPE[RANK - 1 - i]\n        src += c.to(tl.int64) * STRIDES[RANK - 1 - i]\n    mask = offs < n\n    vals = tl.load(in_ptr + src, mask=mask)\n    tl.store(out_ptr + offs, vals, mask=mask)\n\n\ndef _flat_block(count):\n    \"\"\"Element count per program: bigger tiles amortize per-program setup.\"\"\"\n    if count <= _BLOCK_FLAT:\n        blk = triton.next_power_of_2(count)\n        if blk > _BLOCK_FLAT:\n            blk = _BLOCK_FLAT\n        if blk < 16:\n            blk = 16\n        return blk\n    if count <= 65536:\n        return _BLOCK_FLAT\n    return _BLOCK_MAX\n\n\ndef run(inp, dim, start, length):\n    if type(dim) is not int:\n        dim = int(dim)\n    if type(start) is not int:\n        start = int(start)\n    if type(length) is not int:\n        length = int(length)\n\n    ndim = inp.dim()\n    if dim < 0:\n        dim += ndim\n    shape = inp.shape\n    dim_size = shape[dim]\n    if start < 0:\n        start %= dim_size\n    if start + length > dim_size:\n        length = dim_size - start\n\n    out_shape = list(shape)\n    out_shape[dim] = length\n    out = torch.empty(out_shape, dtype=inp.dtype, device=inp.device)\n    n = out.numel()\n    if n == 0:\n        return out\n\n    strides = inp.stride()\n\n    # Canonical row-major layout?  Compared against the exact stride expected\n    # for the full shape so size-1 dimensions with exotic strides fall through.\n    exp = 1\n    canonical = True\n    for k in range(ndim - 1, -1, -1):\n        if strides[k] != exp:\n            canonical = False\n            break\n        exp *= shape[k]\n\n    if canonical:\n        post = 1\n        for k in range(dim + 1, ndim):\n            post *= shape[k]\n        base_in = start * post\n        if dim == 0:\n            pre = 1\n        else:\n            pre = 1\n            for k in range(dim):\n                pre *= shape[k]\n\n        if pre == 1:\n            blk = _flat_block(n)\n            nblocks = (n + blk - 1) // blk\n            even = n == nblocks * blk\n            if nblocks >= _PERSIST_THRESHOLD:\n                grid = nblocks if nblocks < _PERSIST_GRID_CAP else _PERSIST_GRID_CAP\n                _narrow_copy_flat_persistent_kernel[(grid,)](\n                    out,\n                    inp,\n                    base_in,\n                    n,\n                    nblocks,\n                    BLOCK=blk,\n                    EVEN=even,\n                )\n            else:\n                _narrow_copy_flat_kernel[(nblocks,)](\n                    out,\n                    inp,\n                    base_in,\n                    n,\n                    BLOCK=blk,\n                    EVEN=even,\n                )\n        else:\n            chunk = length * post\n            blk = _BLOCK_RUNS\n            if chunk < blk:\n                blk = triton.next_power_of_2(chunk)\n                if blk < 16:\n                    blk = 16\n            nblocks = (chunk + blk - 1) // blk\n            _narrow_copy_runs_kernel[(pre * nblocks,)](\n                out,\n                inp,\n                base_in,\n                chunk,\n                dim_size * post,\n                nblocks,\n                BLOCK=blk,\n                EVEN=(chunk == nblocks * blk),\n            )\n    else:\n        blk = _BLOCK_STRIDED\n        _narrow_copy_strided_kernel[(triton.cdiv(n, blk),)](\n            out,\n            inp,\n            start * strides[dim],\n            n,\n            SHAPE=tuple(out_shape),\n            STRIDES=tuple(strides),\n            RANK=ndim,\n            BLOCK=blk,\n        )\n    return out\n",
+  "rounds": [
+    {
+      "round_num": 1,
+      "experiment_parent_round_num": null,
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Submit the provided seed implementation unchanged to obtain the baselines.",
+        "code_changes": "None; tmp/main.py is byte-identical to the provided seed implementation (flat/persistent/flat-run/strided Triton kernels).",
+        "hypothesis": "The unmodified seed is the correct reference point; no change is under test in this round.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "Establish the authoritative measured walltime baseline for the seed before any change."
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {},
+        "knowledge_uses": []
+      },
+      "solution": {
+        "sha256": "c31ed578ad12fb75957f44e0388210c9f3c4753c523de851e062f5afc7e4a99a",
+        "snapshot_path": ".kernelgen/evals/round-0001",
+        "candidate_path": "tmp/main.py",
+        "code": "\"\"\"Triton implementation of ``torch.narrow_copy(inp, dim, start, length)``.\n\nFor a tensor with plain row-major storage the narrowed slab is a set of\n``pre = prod(shape[:dim])`` contiguous runs of ``chunk = length * prod(shape[dim+1:])``\nelements, and the result is a freshly allocated contiguous tensor, so the whole\noperator is a pure block copy:\n\n    out[p * chunk + i] = inp[p * dim_size * post + start * post + i]\n\nNo per-element division is needed (the flag_gems reference performs two integer\ndivisions/modulos by runtime divisors for every element).  Three shapes of the\nproblem are handled:\n\n* ``pre == 1`` -- the slab is one contiguous block: a flat copy kernel, either\n  straight-line (one program per block) or, for very large counts, a\n  grid-striding persistent loop that keeps every core streaming through many\n  blocks.\n* ``pre > 1`` -- a run-copy kernel stepping the run base by the input row stride\n  (still no per-element index arithmetic).\n* non row-major input -- a rank-generic strided gather kernel.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n_BLOCK_FLAT = 4096\n_BLOCK_MAX = 16384\n_PERSIST_THRESHOLD = 128  # block count from which the persistent loop is used\n_PERSIST_ITERS = 13  # target blocks handled per program (steady streaming)\n_PERSIST_GRID_MIN = 40\n_PERSIST_GRID_CAP = 256\n_BLOCK_RUNS = 2048\n_BLOCK_STRIDED = 1024\n\n\n@triton.jit\ndef _narrow_copy_flat_kernel(\n    out_ptr,\n    in_ptr,\n    base_in,\n    n,\n    BLOCK: tl.constexpr,\n    EVEN: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    if EVEN:\n        vals = tl.load(in_ptr + base_in + offs)\n        tl.store(out_ptr + offs, vals)\n    else:\n        mask = offs < n\n        vals = tl.load(in_ptr + base_in + offs, mask=mask)\n        tl.store(out_ptr + offs, vals, mask=mask)\n\n\n@triton.jit\ndef _narrow_copy_flat_persistent_kernel(\n    out_ptr,\n    in_ptr,\n    base_in,\n    n,\n    nblocks,\n    BLOCK: tl.constexpr,\n    EVEN: tl.constexpr,\n):\n    grid = tl.num_programs(0)\n    for blk in tl.range(tl.program_id(0), nblocks, grid):\n        offs = blk * BLOCK + tl.arange(0, BLOCK)\n        if EVEN:\n            vals = tl.load(in_ptr + base_in + offs)\n            tl.store(out_ptr + offs, vals)\n        else:\n            mask = offs < n\n            vals = tl.load(in_ptr + base_in + offs, mask=mask)\n            tl.store(out_ptr + offs, vals, mask=mask)\n\n\n@triton.jit\ndef _narrow_copy_runs_kernel(\n    out_ptr,\n    in_ptr,\n    base_in,\n    chunk,\n    sp,\n    nblocks,\n    BLOCK: tl.constexpr,\n    EVEN: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    row = pid // nblocks\n    blk = pid - row * nblocks\n    offs = blk * BLOCK + tl.arange(0, BLOCK)\n    src = in_ptr + row * sp + base_in + offs\n    dst = out_ptr + row * chunk + offs\n    if EVEN:\n        vals = tl.load(src)\n        tl.store(dst, vals)\n    else:\n        mask = offs < chunk\n        vals = tl.load(src, mask=mask)\n        tl.store(dst, vals, mask=mask)\n\n\n@triton.jit\ndef _narrow_copy_strided_kernel(\n    out_ptr,\n    in_ptr,\n    base_in,\n    n,\n    SHAPE: tl.constexpr,\n    STRIDES: tl.constexpr,\n    RANK: tl.constexpr,\n    BLOCK: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    rem = offs\n    src = tl.zeros([BLOCK], dtype=tl.int64) + base_in\n    for i in tl.static_range(RANK):\n        c = rem % SHAPE[RANK - 1 - i]\n        rem = rem // SHAPE[RANK - 1 - i]\n        src += c.to(tl.int64) * STRIDES[RANK - 1 - i]\n    mask = offs < n\n    vals = tl.load(in_ptr + src, mask=mask)\n    tl.store(out_ptr + offs, vals, mask=mask)\n\n\ndef _flat_block(count):\n    \"\"\"Element count per program: bigger tiles amortize per-program setup.\"\"\"\n    if count <= _BLOCK_FLAT:\n        blk = triton.next_power_of_2(count)\n        if blk > _BLOCK_FLAT:\n            blk = _BLOCK_FLAT\n        if blk < 16:\n            blk = 16\n        return blk\n    if count <= 65536:\n        return _BLOCK_FLAT\n    return _BLOCK_MAX\n\n\ndef run(inp, dim, start, length):\n    if type(dim) is not int:\n        dim = int(dim)\n    if type(start) is not int:\n        start = int(start)\n    if type(length) is not int:\n        length = int(length)\n\n    ndim = inp.dim()\n    if dim < 0:\n        dim += ndim\n    shape = inp.shape\n    dim_size = shape[dim]\n    if start < 0:\n        start %= dim_size\n    if start + length > dim_size:\n        length = dim_size - start\n\n    out_shape = list(shape)\n    out_shape[dim] = length\n    out = torch.empty(out_shape, dtype=inp.dtype, device=inp.device)\n    n = out.numel()\n    if n == 0:\n        return out\n\n    strides = inp.stride()\n\n    # Canonical row-major layout?  Compared against the exact stride expected\n    # for the full shape so size-1 dimensions with exotic strides fall through.\n    exp = 1\n    canonical = True\n    for k in range(ndim - 1, -1, -1):\n        if strides[k] != exp:\n            canonical = False\n            break\n        exp *= shape[k]\n\n    if canonical:\n        post = 1\n        for k in range(dim + 1, ndim):\n            post *= shape[k]\n        base_in = start * post\n        if dim == 0:\n            pre = 1\n        else:\n            pre = 1\n            for k in range(dim):\n                pre *= shape[k]\n\n        if pre == 1:\n            blk = _flat_block(n)\n            nblocks = (n + blk - 1) // blk\n            even = n == nblocks * blk\n            if nblocks >= _PERSIST_THRESHOLD:\n                grid = nblocks // _PERSIST_ITERS\n                if grid < _PERSIST_GRID_MIN:\n                    grid = _PERSIST_GRID_MIN\n                if grid > _PERSIST_GRID_CAP:\n                    grid = _PERSIST_GRID_CAP\n                _narrow_copy_flat_persistent_kernel[(grid,)](\n                    out,\n                    inp,\n                    base_in,\n                    n,\n                    nblocks,\n                    BLOCK=blk,\n                    EVEN=even,\n                )\n            else:\n                _narrow_copy_flat_kernel[(nblocks,)](\n                    out,\n                    inp,\n                    base_in,\n                    n,\n                    BLOCK=blk,\n                    EVEN=even,\n                )\n        else:\n            chunk = length * post\n            blk = _BLOCK_RUNS\n            if chunk < blk:\n                blk = triton.next_power_of_2(chunk)\n                if blk < 16:\n                    blk = 16\n            nblocks = (chunk + blk - 1) // blk\n            _narrow_copy_runs_kernel[(pre * nblocks,)](\n                out,\n                inp,\n                base_in,\n                chunk,\n                dim_size * post,\n                nblocks,\n                BLOCK=blk,\n                EVEN=(chunk == nblocks * blk),\n            )\n    else:\n        blk = _BLOCK_STRIDED\n        _narrow_copy_strided_kernel[(triton.cdiv(n, blk),)](\n            out,\n            inp,\n            start * strides[dim],\n            n,\n            SHAPE=tuple(out_shape),\n            STRIDES=tuple(strides),\n            RANK=ndim,\n            BLOCK=blk,\n        )\n    return out\n"
+      },
+      "evaluation": {
+        "evaluated_at": "2026-10-05T15:53:52.563159Z",
+        "api_version": "v6.2",
+        "status": "PASSED",
+        "is_hack": false,
+        "hack_reason": "",
+        "geo_mean": 0.3442888614518653,
+        "min_speedup": 0.20187867216084845,
+        "worst_workload_uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::3",
+        "latency_ms": 0.10344882806142171,
+        "max_abs_error": null,
+        "max_rel_error": null,
+        "num_workloads": 33,
+        "num_passed": 33,
+        "timing_skipped": false,
+        "requested_hardware": "Ascend910B",
+        "server_backend": "npu",
+        "log": "",
+        "workloads": [
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype0-shape0]",
+            "axes": {
+              "dtype": "torch.float16",
+              "shape": [
+                16,
+                32,
+                64
+              ]
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype0-shape1]",
+            "axes": {
+              "dtype": "torch.float16",
+              "shape": [
+                32,
+                64
+              ]
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype0-shape2]",
+            "axes": {
+              "dtype": "torch.float16",
+              "shape": [
+                64
+              ]
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype1-shape0]",
+            "axes": {
+              "dtype": "torch.float32",
+              "shape": [
+                16,
+                32,
+                64
+              ]
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype1-shape1]",
+            "axes": {
+              "dtype": "torch.float32",
+              "shape": [
+                32,
+                64
+              ]
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype1-shape2]",
+            "axes": {
+              "dtype": "torch.float32",
+              "shape": [
+                64
+              ]
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype2-shape0]",
+            "axes": {
+              "dtype": "torch.bfloat16",
+              "shape": [
+                16,
+                32,
+                64
+              ]
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype2-shape1]",
+            "axes": {
+              "dtype": "torch.bfloat16",
+              "shape": [
+                32,
+                64
+              ]
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype2-shape2]",
+            "axes": {
+              "dtype": "torch.bfloat16",
+              "shape": [
+                64
+              ]
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_negative_start[dtype0]",
+            "axes": {
+              "dtype": "torch.float16"
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_negative_start[dtype1]",
+            "axes": {
+              "dtype": "torch.float32"
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_negative_start[dtype2]",
+            "axes": {
+              "dtype": "torch.bfloat16"
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_full_slice[dtype0]",
+            "axes": {
+              "dtype": "torch.float16"
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_full_slice[dtype1]",
+            "axes": {
+              "dtype": "torch.float32"
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_full_slice[dtype2]",
+            "axes": {
+              "dtype": "torch.bfloat16"
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_1d[dtype0]",
+            "axes": {
+              "dtype": "torch.float16"
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_1d[dtype1]",
+            "axes": {
+              "dtype": "torch.float32"
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_1d[dtype2]",
+            "axes": {
+              "dtype": "torch.bfloat16"
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::0",
+            "axes": {
+              "dtype": "float16",
+              "shape_detail": [
+                [
+                  64,
+                  64
+                ],
+                0,
+                16,
+                32
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.1659393310546875,
+            "reference_latency_ms": 0.03940017536433056,
+            "speedup": 0.23743769105334397,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::1",
+            "axes": {
+              "dtype": "float16",
+              "shape_detail": [
+                [
+                  256,
+                  256
+                ],
+                0,
+                64,
+                128
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.09951224693885216,
+            "reference_latency_ms": 0.03883405165238814,
+            "speedup": 0.3902445560474094,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::2",
+            "axes": {
+              "dtype": "float16",
+              "shape_detail": [
+                [
+                  1024,
+                  1024
+                ],
+                0,
+                256,
+                512
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.09956567183784817,
+            "reference_latency_ms": 0.02144404820033482,
+            "speedup": 0.2153767083256136,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::3",
+            "axes": {
+              "dtype": "float16",
+              "shape_detail": [
+                [
+                  4096,
+                  4096
+                ],
+                0,
+                1024,
+                2048
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.1026696937028752,
+            "reference_latency_ms": 0.02082044719367899,
+            "speedup": 0.2027913609521154,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::4",
+            "axes": {
+              "dtype": "float16",
+              "shape_detail": [
+                [
+                  1024,
+                  65536
+                ],
+                0,
+                256,
+                512
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.09826505237471328,
+            "reference_latency_ms": 0.08657339847449101,
+            "speedup": 0.8810193276285918,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::0",
+            "axes": {
+              "dtype": "float32",
+              "shape_detail": [
+                [
+                  64,
+                  64
+                ],
+                0,
+                16,
+                32
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.10939354592181266,
+            "reference_latency_ms": 0.038503429510270214,
+            "speedup": 0.35197226663228676,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::1",
+            "axes": {
+              "dtype": "float32",
+              "shape_detail": [
+                [
+                  256,
+                  256
+                ],
+                0,
+                64,
+                128
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.0985562801361084,
+            "reference_latency_ms": 0.038484899269766504,
+            "speedup": 0.39048714265497503,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::2",
+            "axes": {
+              "dtype": "float32",
+              "shape_detail": [
+                [
+                  1024,
+                  1024
+                ],
+                0,
+                256,
+                512
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.09959084647042411,
+            "reference_latency_ms": 0.021097484541816945,
+            "speedup": 0.21184239420881867,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::3",
+            "axes": {
+              "dtype": "float32",
+              "shape_detail": [
+                [
+                  4096,
+                  4096
+                ],
+                0,
+                1024,
+                2048
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.10344882806142171,
+            "reference_latency_ms": 0.02088403223350295,
+            "speedup": 0.20187867216084845,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::4",
+            "axes": {
+              "dtype": "float32",
+              "shape_detail": [
+                [
+                  1024,
+                  65536
+                ],
+                0,
+                256,
+                512
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.21241997818812688,
+            "reference_latency_ms": 0.21749946671694062,
+            "speedup": 1.0239124689725194,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::0",
+            "axes": {
+              "dtype": "bfloat16",
+              "shape_detail": [
+                [
+                  64,
+                  64
+                ],
+                0,
+                16,
+                32
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.11139330656632133,
+            "reference_latency_ms": 0.03890613805576365,
+            "speedup": 0.34926876962506465,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::1",
+            "axes": {
+              "dtype": "bfloat16",
+              "shape_detail": [
+                [
+                  256,
+                  256
+                ],
+                0,
+                64,
+                128
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.09908088266033016,
+            "reference_latency_ms": 0.03837147641436485,
+            "speedup": 0.3872748875120713,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::2",
+            "axes": {
+              "dtype": "bfloat16",
+              "shape_detail": [
+                [
+                  1024,
+                  1024
+                ],
+                0,
+                256,
+                512
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.09900079646580656,
+            "reference_latency_ms": 0.021060464571840586,
+            "speedup": 0.21273104914877808,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::3",
+            "axes": {
+              "dtype": "bfloat16",
+              "shape_detail": [
+                [
+                  4096,
+                  4096
+                ],
+                0,
+                1024,
+                2048
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.10190691266741071,
+            "reference_latency_ms": 0.021281099532196066,
+            "speedup": 0.20882958861379392,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::4",
+            "axes": {
+              "dtype": "bfloat16",
+              "shape_detail": [
+                [
+                  1024,
+                  65536
+                ],
+                0,
+                256,
+                512
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.09878667673670259,
+            "reference_latency_ms": 0.08672402590440005,
+            "speedup": 0.8778920496165874,
+            "abs_err": null,
+            "rel_err": null
+          }
+        ],
+        "comparison": {
+          "performance_baseline_round_num": null,
+          "geo_mean_before": null,
+          "geo_mean_after": 0.3442888614518653,
+          "geo_mean_delta_pct": null,
+          "workloads": []
+        },
+        "fingerprint": "d9df1efe73a744db09830bceff042726d9d51c5378805aa149daf530e1ac93eb"
+      },
+      "profile": {
+        "required": false,
+        "status": "not_required",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "Baseline established: all 33 frozen workloads (18 correctness + 15 timing) pass with the unmodified seed. The measured timing profile shows a size-independent latency floor of about 0.098-0.104 ms for n from 32768 to 33554432 elements, versus a torch reference floor of about 0.021-0.039 ms, which points to fixed per-invocation cost rather than device bandwidth as the dominant bottleneck on four of five core shapes.",
+        "perf_gap_analysis": "No previous measurement to compare. Seed baseline measured geo_mean 0.3443 with min_speedup 0.2019 (float32 [4096,4096] dim0). All five timing shapes produce a near-identical latency (~0.098-0.104 ms) across n from 32768 to 33554432 elements, and the small single-program case (n=2048) is the slowest at 0.166 ms while the reference on the same cases is 0.021-0.039 ms. A latency floor that is flat in problem size indicates fixed per-invocation overhead (host path plus launch/scheduling) dominates the small and medium shapes, not memory throughput; only the largest shapes approach the reference.",
+        "next_suggestion": "Run one bounded target-side Debug Job that separates host-side call/launch overhead from device kernel time on the five core timing shapes (event-based timing of a preallocated minimal @triton.jit copy launch vs the full run() path vs torch.narrow_copy), then pick exactly one change for round 2 based on that split.",
+        "optimization_level": "L1_architecture",
+        "debug_lesson": "",
+        "strategy_evolution": "Seed accepted as the round-1 baseline; no code change was made.",
+        "knowledge_assessments": []
+      },
+      "next_verdict": {
+        "should_continue": true,
+        "code": "continue",
+        "reason": "no stop trigger"
+      }
+    },
+    {
+      "round_num": 2,
+      "experiment_parent_round_num": 1,
+      "plan": {
+        "kind": "performance",
+        "strategy": "Retune only the flat-versus-persistent dispatch rule for the pre==1 canonical slab path, using the on-device block/grid sweep as the basis.",
+        "code_changes": "Only the dispatch rule for the large contiguous-slab path changed: _PERSIST_THRESHOLD 128 -> 513, _PERSIST_GRID_CAP 256 -> 160, and the persistent grid is now min(nblocks, 160) instead of nblocks//13 clamped to [40, 256]. The flat kernel, the run-copy kernel, and the strided gather kernel are unchanged.",
+        "hypothesis": "The seed's persistent-loop heuristic (grid = nblocks//13 clamped to [40,256]) is a poor fit for this target: an on-device sweep with a preallocated destination measured 512 straight-line blocks at 0.0688 ms versus a 40-block persistent loop at 0.0714 ms for n=8.4M, while for n=33.5M a persistent grid of 160 (0.0910 ms) beats 2048 straight-line blocks (0.0984 ms). Choosing flat up to 512 blocks and capping the persistent grid at 160 should lower the device time of the two largest shapes.",
+        "expected_effect": {
+          "metric": "min_speedup",
+          "direction": "decrease",
+          "mechanism": "Removing the persistent loop for medium block counts (where 512 straight-line blocks beat a 40-block persistent loop) and raising the persistent grid for very large slabs shortens the device time of the two largest core shapes without adding launches."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": null
+        },
+        "key_params": {
+          "_BLOCK_MAX": 16384,
+          "_PERSIST_GRID_CAP": 160,
+          "_PERSIST_THRESHOLD": 513
+        },
+        "knowledge_uses": []
+      },
+      "solution": {
+        "sha256": "8122396ab873c33217dbd0800fda0582cedef3783254c5e86a42b19f8e4d6966",
+        "snapshot_path": ".kernelgen/evals/round-0002",
+        "candidate_path": "tmp/main.py",
+        "code": "\"\"\"Triton implementation of ``torch.narrow_copy(inp, dim, start, length)``.\n\nFor a tensor with plain row-major storage the narrowed slab is a set of\n``pre = prod(shape[:dim])`` contiguous runs of ``chunk = length * prod(shape[dim+1:])``\nelements, and the result is a freshly allocated contiguous tensor, so the whole\noperator is a pure block copy:\n\n    out[p * chunk + i] = inp[p * dim_size * post + start * post + i]\n\nNo per-element division is needed (the flag_gems reference performs two integer\ndivisions/modulos by runtime divisors for every element).  Three shapes of the\nproblem are handled:\n\n* ``pre == 1`` -- the slab is one contiguous block: a flat copy kernel, either\n  straight-line (one program per block) or, for very large counts, a\n  grid-striding persistent loop that keeps every core streaming through many\n  blocks.\n* ``pre > 1`` -- a run-copy kernel stepping the run base by the input row stride\n  (still no per-element index arithmetic).\n* non row-major input -- a rank-generic strided gather kernel.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n_BLOCK_FLAT = 4096\n_BLOCK_MAX = 16384\n# Dispatch rule for the large contiguous slab (pre == 1).  On the target an\n# Ascend 910B launch with a preallocated destination measured:\n#   8.4M elems: 512 flat blocks 0.0688 ms  vs  persistent grid 40 0.0714 ms\n#   33.5M elems: 2048 flat blocks 0.0984 ms vs persistent grid 160 0.0910 ms\n# so the straight-line kernel wins until the block count is large, and beyond\n# that a single capped persistent grid keeps every core streaming.\n_PERSIST_THRESHOLD = 513  # block count from which the persistent loop is used\n_PERSIST_GRID_CAP = 160  # cap on the persistent grid for very large slabs\n_BLOCK_RUNS = 2048\n_BLOCK_STRIDED = 1024\n\n\n@triton.jit\ndef _narrow_copy_flat_kernel(\n    out_ptr,\n    in_ptr,\n    base_in,\n    n,\n    BLOCK: tl.constexpr,\n    EVEN: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    if EVEN:\n        vals = tl.load(in_ptr + base_in + offs)\n        tl.store(out_ptr + offs, vals)\n    else:\n        mask = offs < n\n        vals = tl.load(in_ptr + base_in + offs, mask=mask)\n        tl.store(out_ptr + offs, vals, mask=mask)\n\n\n@triton.jit\ndef _narrow_copy_flat_persistent_kernel(\n    out_ptr,\n    in_ptr,\n    base_in,\n    n,\n    nblocks,\n    BLOCK: tl.constexpr,\n    EVEN: tl.constexpr,\n):\n    grid = tl.num_programs(0)\n    for blk in tl.range(tl.program_id(0), nblocks, grid):\n        offs = blk * BLOCK + tl.arange(0, BLOCK)\n        if EVEN:\n            vals = tl.load(in_ptr + base_in + offs)\n            tl.store(out_ptr + offs, vals)\n        else:\n            mask = offs < n\n            vals = tl.load(in_ptr + base_in + offs, mask=mask)\n            tl.store(out_ptr + offs, vals, mask=mask)\n\n\n@triton.jit\ndef _narrow_copy_runs_kernel(\n    out_ptr,\n    in_ptr,\n    base_in,\n    chunk,\n    sp,\n    nblocks,\n    BLOCK: tl.constexpr,\n    EVEN: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    row = pid // nblocks\n    blk = pid - row * nblocks\n    offs = blk * BLOCK + tl.arange(0, BLOCK)\n    src = in_ptr + row * sp + base_in + offs\n    dst = out_ptr + row * chunk + offs\n    if EVEN:\n        vals = tl.load(src)\n        tl.store(dst, vals)\n    else:\n        mask = offs < chunk\n        vals = tl.load(src, mask=mask)\n        tl.store(dst, vals, mask=mask)\n\n\n@triton.jit\ndef _narrow_copy_strided_kernel(\n    out_ptr,\n    in_ptr,\n    base_in,\n    n,\n    SHAPE: tl.constexpr,\n    STRIDES: tl.constexpr,\n    RANK: tl.constexpr,\n    BLOCK: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    rem = offs\n    src = tl.zeros([BLOCK], dtype=tl.int64) + base_in\n    for i in tl.static_range(RANK):\n        c = rem % SHAPE[RANK - 1 - i]\n        rem = rem // SHAPE[RANK - 1 - i]\n        src += c.to(tl.int64) * STRIDES[RANK - 1 - i]\n    mask = offs < n\n    vals = tl.load(in_ptr + src, mask=mask)\n    tl.store(out_ptr + offs, vals, mask=mask)\n\n\ndef _flat_block(count):\n    \"\"\"Element count per program: bigger tiles amortize per-program setup.\"\"\"\n    if count <= _BLOCK_FLAT:\n        blk = triton.next_power_of_2(count)\n        if blk > _BLOCK_FLAT:\n            blk = _BLOCK_FLAT\n        if blk < 16:\n            blk = 16\n        return blk\n    if count <= 65536:\n        return _BLOCK_FLAT\n    return _BLOCK_MAX\n\n\ndef run(inp, dim, start, length):\n    if type(dim) is not int:\n        dim = int(dim)\n    if type(start) is not int:\n        start = int(start)\n    if type(length) is not int:\n        length = int(length)\n\n    ndim = inp.dim()\n    if dim < 0:\n        dim += ndim\n    shape = inp.shape\n    dim_size = shape[dim]\n    if start < 0:\n        start %= dim_size\n    if start + length > dim_size:\n        length = dim_size - start\n\n    out_shape = list(shape)\n    out_shape[dim] = length\n    out = torch.empty(out_shape, dtype=inp.dtype, device=inp.device)\n    n = out.numel()\n    if n == 0:\n        return out\n\n    strides = inp.stride()\n\n    # Canonical row-major layout?  Compared against the exact stride expected\n    # for the full shape so size-1 dimensions with exotic strides fall through.\n    exp = 1\n    canonical = True\n    for k in range(ndim - 1, -1, -1):\n        if strides[k] != exp:\n            canonical = False\n            break\n        exp *= shape[k]\n\n    if canonical:\n        post = 1\n        for k in range(dim + 1, ndim):\n            post *= shape[k]\n        base_in = start * post\n        if dim == 0:\n            pre = 1\n        else:\n            pre = 1\n            for k in range(dim):\n                pre *= shape[k]\n\n        if pre == 1:\n            blk = _flat_block(n)\n            nblocks = (n + blk - 1) // blk\n            even = n == nblocks * blk\n            if nblocks >= _PERSIST_THRESHOLD:\n                grid = nblocks if nblocks < _PERSIST_GRID_CAP else _PERSIST_GRID_CAP\n                _narrow_copy_flat_persistent_kernel[(grid,)](\n                    out,\n                    inp,\n                    base_in,\n                    n,\n                    nblocks,\n                    BLOCK=blk,\n                    EVEN=even,\n                )\n            else:\n                _narrow_copy_flat_kernel[(nblocks,)](\n                    out,\n                    inp,\n                    base_in,\n                    n,\n                    BLOCK=blk,\n                    EVEN=even,\n                )\n        else:\n            chunk = length * post\n            blk = _BLOCK_RUNS\n            if chunk < blk:\n                blk = triton.next_power_of_2(chunk)\n                if blk < 16:\n                    blk = 16\n            nblocks = (chunk + blk - 1) // blk\n            _narrow_copy_runs_kernel[(pre * nblocks,)](\n                out,\n                inp,\n                base_in,\n                chunk,\n                dim_size * post,\n                nblocks,\n                BLOCK=blk,\n                EVEN=(chunk == nblocks * blk),\n            )\n    else:\n        blk = _BLOCK_STRIDED\n        _narrow_copy_strided_kernel[(triton.cdiv(n, blk),)](\n            out,\n            inp,\n            start * strides[dim],\n            n,\n            SHAPE=tuple(out_shape),\n            STRIDES=tuple(strides),\n            RANK=ndim,\n            BLOCK=blk,\n        )\n    return out\n"
+      },
+      "evaluation": {
+        "evaluated_at": "2026-10-05T16:06:18.879139Z",
+        "api_version": "v6.2",
+        "status": "PASSED",
+        "is_hack": false,
+        "hack_reason": "",
+        "geo_mean": 0.3591768018094782,
+        "min_speedup": 0.212073487381001,
+        "worst_workload_uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::2",
+        "latency_ms": 0.10164695627549115,
+        "max_abs_error": null,
+        "max_rel_error": null,
+        "num_workloads": 33,
+        "num_passed": 33,
+        "timing_skipped": false,
+        "requested_hardware": "Ascend910B",
+        "server_backend": "npu",
+        "log": "",
+        "workloads": [
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype0-shape0]",
+            "axes": {
+              "dtype": "torch.float16",
+              "shape": [
+                16,
+                32,
+                64
+              ]
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype0-shape1]",
+            "axes": {
+              "dtype": "torch.float16",
+              "shape": [
+                32,
+                64
+              ]
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype0-shape2]",
+            "axes": {
+              "dtype": "torch.float16",
+              "shape": [
+                64
+              ]
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype1-shape0]",
+            "axes": {
+              "dtype": "torch.float32",
+              "shape": [
+                16,
+                32,
+                64
+              ]
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype1-shape1]",
+            "axes": {
+              "dtype": "torch.float32",
+              "shape": [
+                32,
+                64
+              ]
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype1-shape2]",
+            "axes": {
+              "dtype": "torch.float32",
+              "shape": [
+                64
+              ]
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype2-shape0]",
+            "axes": {
+              "dtype": "torch.bfloat16",
+              "shape": [
+                16,
+                32,
+                64
+              ]
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype2-shape1]",
+            "axes": {
+              "dtype": "torch.bfloat16",
+              "shape": [
+                32,
+                64
+              ]
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype2-shape2]",
+            "axes": {
+              "dtype": "torch.bfloat16",
+              "shape": [
+                64
+              ]
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_negative_start[dtype0]",
+            "axes": {
+              "dtype": "torch.float16"
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_negative_start[dtype1]",
+            "axes": {
+              "dtype": "torch.float32"
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_negative_start[dtype2]",
+            "axes": {
+              "dtype": "torch.bfloat16"
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_full_slice[dtype0]",
+            "axes": {
+              "dtype": "torch.float16"
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_full_slice[dtype1]",
+            "axes": {
+              "dtype": "torch.float32"
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_full_slice[dtype2]",
+            "axes": {
+              "dtype": "torch.bfloat16"
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_1d[dtype0]",
+            "axes": {
+              "dtype": "torch.float16"
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_1d[dtype1]",
+            "axes": {
+              "dtype": "torch.float32"
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_1d[dtype2]",
+            "axes": {
+              "dtype": "torch.bfloat16"
+            },
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::0",
+            "axes": {
+              "dtype": "float16",
+              "shape_detail": [
+                [
+                  64,
+                  64
+                ],
+                0,
+                16,
+                32
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.17070770263671875,
+            "reference_latency_ms": 0.041496933569469895,
+            "speedup": 0.2430880892877477,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::1",
+            "axes": {
+              "dtype": "float16",
+              "shape_detail": [
+                [
+                  256,
+                  256
+                ],
+                0,
+                64,
+                128
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.0999696326978279,
+            "reference_latency_ms": 0.04119597948514499,
+            "speedup": 0.41208552202160764,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::2",
+            "axes": {
+              "dtype": "float16",
+              "shape_detail": [
+                [
+                  1024,
+                  1024
+                ],
+                0,
+                256,
+                512
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.1033159402700571,
+            "reference_latency_ms": 0.022395817256065164,
+            "speedup": 0.21677096022577547,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::3",
+            "axes": {
+              "dtype": "float16",
+              "shape_detail": [
+                [
+                  4096,
+                  4096
+                ],
+                0,
+                1024,
+                2048
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.095455958370418,
+            "reference_latency_ms": 0.021656291985586516,
+            "speedup": 0.22687289162463334,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::4",
+            "axes": {
+              "dtype": "float16",
+              "shape_detail": [
+                [
+                  1024,
+                  65536
+                ],
+                0,
+                256,
+                512
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.10773208406236436,
+            "reference_latency_ms": 0.096344443225356,
+            "speedup": 0.8942967606558849,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::0",
+            "axes": {
+              "dtype": "float32",
+              "shape_detail": [
+                [
+                  64,
+                  64
+                ],
+                0,
+                16,
+                32
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.11242429415384929,
+            "reference_latency_ms": 0.042753574276758625,
+            "speedup": 0.38028823369287235,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::1",
+            "axes": {
+              "dtype": "float32",
+              "shape_detail": [
+                [
+                  256,
+                  256
+                ],
+                0,
+                64,
+                128
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.1015342883209684,
+            "reference_latency_ms": 0.04174732345567658,
+            "speedup": 0.41116536127351744,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::2",
+            "axes": {
+              "dtype": "float32",
+              "shape_detail": [
+                [
+                  1024,
+                  1024
+                ],
+                0,
+                256,
+                512
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.1031020108391257,
+            "reference_latency_ms": 0.022084589498451504,
+            "speedup": 0.21420210816935764,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::3",
+            "axes": {
+              "dtype": "float32",
+              "shape_detail": [
+                [
+                  4096,
+                  4096
+                ],
+                0,
+                1024,
+                2048
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.09688116791251733,
+            "reference_latency_ms": 0.021797966886344933,
+            "speedup": 0.224997745756469,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::4",
+            "axes": {
+              "dtype": "float32",
+              "shape_detail": [
+                [
+                  1024,
+                  65536
+                ],
+                0,
+                256,
+                512
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.21586051354041466,
+            "reference_latency_ms": 0.21512228615429935,
+            "speedup": 0.9965800737151287,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::0",
+            "axes": {
+              "dtype": "bfloat16",
+              "shape_detail": [
+                [
+                  64,
+                  64
+                ],
+                0,
+                16,
+                32
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.11255682968511814,
+            "reference_latency_ms": 0.04149434572443403,
+            "speedup": 0.36865296379810786,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::1",
+            "axes": {
+              "dtype": "bfloat16",
+              "shape_detail": [
+                [
+                  256,
+                  256
+                ],
+                0,
+                64,
+                128
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.10120334909923041,
+            "reference_latency_ms": 0.041189107668018414,
+            "speedup": 0.4069941097326853,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::2",
+            "axes": {
+              "dtype": "bfloat16",
+              "shape_detail": [
+                [
+                  1024,
+                  1024
+                ],
+                0,
+                256,
+                512
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.10164695627549115,
+            "reference_latency_ms": 0.021556545706356275,
+            "speedup": 0.212073487381001,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::3",
+            "axes": {
+              "dtype": "bfloat16",
+              "shape_detail": [
+                [
+                  4096,
+                  4096
+                ],
+                0,
+                1024,
+                2048
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.09647779071314067,
+            "reference_latency_ms": 0.021751137085405475,
+            "speedup": 0.22545307452957064,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::4",
+            "axes": {
+              "dtype": "bfloat16",
+              "shape_detail": [
+                [
+                  1024,
+                  65536
+                ],
+                0,
+                256,
+                512
+              ],
+              "benchmark_level": "core"
+            },
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.10607300735101467,
+            "reference_latency_ms": 0.09545984194260236,
+            "speedup": 0.8999448053002589,
+            "abs_err": null,
+            "rel_err": null
+          }
+        ],
+        "comparison": {
+          "performance_baseline_round_num": 1,
+          "geo_mean_before": 0.3442888614518653,
+          "geo_mean_after": 0.3591768018094782,
+          "geo_mean_delta_pct": 4.324258500501719,
+          "workloads": [
+            {
+              "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype0-shape0]",
+              "axes": {
+                "dtype": "torch.float16",
+                "shape": [
+                  16,
+                  32,
+                  64
+                ]
+              },
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype0-shape1]",
+              "axes": {
+                "dtype": "torch.float16",
+                "shape": [
+                  32,
+                  64
+                ]
+              },
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype0-shape2]",
+              "axes": {
+                "dtype": "torch.float16",
+                "shape": [
+                  64
+                ]
+              },
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype1-shape0]",
+              "axes": {
+                "dtype": "torch.float32",
+                "shape": [
+                  16,
+                  32,
+                  64
+                ]
+              },
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype1-shape1]",
+              "axes": {
+                "dtype": "torch.float32",
+                "shape": [
+                  32,
+                  64
+                ]
+              },
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype1-shape2]",
+              "axes": {
+                "dtype": "torch.float32",
+                "shape": [
+                  64
+                ]
+              },
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype2-shape0]",
+              "axes": {
+                "dtype": "torch.bfloat16",
+                "shape": [
+                  16,
+                  32,
+                  64
+                ]
+              },
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype2-shape1]",
+              "axes": {
+                "dtype": "torch.bfloat16",
+                "shape": [
+                  32,
+                  64
+                ]
+              },
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy[dtype2-shape2]",
+              "axes": {
+                "dtype": "torch.bfloat16",
+                "shape": [
+                  64
+                ]
+              },
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_negative_start[dtype0]",
+              "axes": {
+                "dtype": "torch.float16"
+              },
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_negative_start[dtype1]",
+              "axes": {
+                "dtype": "torch.float32"
+              },
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_negative_start[dtype2]",
+              "axes": {
+                "dtype": "torch.bfloat16"
+              },
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_full_slice[dtype0]",
+              "axes": {
+                "dtype": "torch.float16"
+              },
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_full_slice[dtype1]",
+              "axes": {
+                "dtype": "torch.float32"
+              },
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_full_slice[dtype2]",
+              "axes": {
+                "dtype": "torch.bfloat16"
+              },
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_1d[dtype0]",
+              "axes": {
+                "dtype": "torch.float16"
+              },
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_1d[dtype1]",
+              "axes": {
+                "dtype": "torch.float32"
+              },
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "flaggems::tests/test_narrow_copy.py::test_narrow_copy_1d[dtype2]",
+              "axes": {
+                "dtype": "torch.bfloat16"
+              },
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::0",
+              "axes": {
+                "dtype": "float16",
+                "shape_detail": [
+                  [
+                    64,
+                    64
+                  ],
+                  0,
+                  16,
+                  32
+                ],
+                "benchmark_level": "core"
+              },
+              "before_latency_ms": 0.1659393310546875,
+              "after_latency_ms": 0.17070770263671875,
+              "latency_delta_ms": 0.00476837158203125,
+              "latency_delta_pct": 2.8735632183908044,
+              "before_speedup": 0.23743769105334397,
+              "after_speedup": 0.2430880892877477,
+              "speedup_delta": 0.00565039823440372,
+              "speedup_delta_pct": 2.379739378923741
+            },
+            {
+              "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::1",
+              "axes": {
+                "dtype": "float16",
+                "shape_detail": [
+                  [
+                    256,
+                    256
+                  ],
+                  0,
+                  64,
+                  128
+                ],
+                "benchmark_level": "core"
+              },
+              "before_latency_ms": 0.09951224693885216,
+              "after_latency_ms": 0.0999696326978279,
+              "latency_delta_ms": 0.0004573857589757341,
+              "latency_delta_pct": 0.45962760669728064,
+              "before_speedup": 0.3902445560474094,
+              "after_speedup": 0.41208552202160764,
+              "speedup_delta": 0.021840965974198268,
+              "speedup_delta_pct": 5.596738157071149
+            },
+            {
+              "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::2",
+              "axes": {
+                "dtype": "float16",
+                "shape_detail": [
+                  [
+                    1024,
+                    1024
+                  ],
+                  0,
+                  256,
+                  512
+                ],
+                "benchmark_level": "core"
+              },
+              "before_latency_ms": 0.09956567183784817,
+              "after_latency_ms": 0.1033159402700571,
+              "latency_delta_ms": 0.0037502684322089225,
+              "latency_delta_pct": 3.766627958194847,
+              "before_speedup": 0.2153767083256136,
+              "after_speedup": 0.21677096022577547,
+              "speedup_delta": 0.0013942519001618747,
+              "speedup_delta_pct": 0.6473550046340196
+            },
+            {
+              "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::3",
+              "axes": {
+                "dtype": "float16",
+                "shape_detail": [
+                  [
+                    4096,
+                    4096
+                  ],
+                  0,
+                  1024,
+                  2048
+                ],
+                "benchmark_level": "core"
+              },
+              "before_latency_ms": 0.1026696937028752,
+              "after_latency_ms": 0.095455958370418,
+              "latency_delta_ms": -0.0072137353324571996,
+              "latency_delta_pct": -7.02615842347174,
+              "before_speedup": 0.2027913609521154,
+              "after_speedup": 0.22687289162463334,
+              "speedup_delta": 0.024081530672517948,
+              "speedup_delta_pct": 11.875027890465343
+            },
+            {
+              "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::4",
+              "axes": {
+                "dtype": "float16",
+                "shape_detail": [
+                  [
+                    1024,
+                    65536
+                  ],
+                  0,
+                  256,
+                  512
+                ],
+                "benchmark_level": "core"
+              },
+              "before_latency_ms": 0.09826505237471328,
+              "after_latency_ms": 0.10773208406236436,
+              "latency_delta_ms": 0.009467031687651076,
+              "latency_delta_pct": 9.634179658858294,
+              "before_speedup": 0.8810193276285918,
+              "after_speedup": 0.8942967606558849,
+              "speedup_delta": 0.013277433027293117,
+              "speedup_delta_pct": 1.5070535470579867
+            },
+            {
+              "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::0",
+              "axes": {
+                "dtype": "float32",
+                "shape_detail": [
+                  [
+                    64,
+                    64
+                  ],
+                  0,
+                  16,
+                  32
+                ],
+                "benchmark_level": "core"
+              },
+              "before_latency_ms": 0.10939354592181266,
+              "after_latency_ms": 0.11242429415384929,
+              "latency_delta_ms": 0.003030748232036626,
+              "latency_delta_pct": 2.7705000386428704,
+              "before_speedup": 0.35197226663228676,
+              "after_speedup": 0.38028823369287235,
+              "speedup_delta": 0.02831596706058559,
+              "speedup_delta_pct": 8.044942668783591
+            },
+            {
+              "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::1",
+              "axes": {
+                "dtype": "float32",
+                "shape_detail": [
+                  [
+                    256,
+                    256
+                  ],
+                  0,
+                  64,
+                  128
+                ],
+                "benchmark_level": "core"
+              },
+              "before_latency_ms": 0.0985562801361084,
+              "after_latency_ms": 0.1015342883209684,
+              "latency_delta_ms": 0.0029780081848600065,
+              "latency_delta_pct": 3.0216320875212737,
+              "before_speedup": 0.39048714265497503,
+              "after_speedup": 0.41116536127351744,
+              "speedup_delta": 0.02067821861854241,
+              "speedup_delta_pct": 5.29549282415508
+            },
+            {
+              "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::2",
+              "axes": {
+                "dtype": "float32",
+                "shape_detail": [
+                  [
+                    1024,
+                    1024
+                  ],
+                  0,
+                  256,
+                  512
+                ],
+                "benchmark_level": "core"
+              },
+              "before_latency_ms": 0.09959084647042411,
+              "after_latency_ms": 0.1031020108391257,
+              "latency_delta_ms": 0.0035111643687015803,
+              "latency_delta_pct": 3.5255894423432825,
+              "before_speedup": 0.21184239420881867,
+              "after_speedup": 0.21420210816935764,
+              "speedup_delta": 0.002359713960538967,
+              "speedup_delta_pct": 1.1139007229180644
+            },
+            {
+              "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::3",
+              "axes": {
+                "dtype": "float32",
+                "shape_detail": [
+                  [
+                    4096,
+                    4096
+                  ],
+                  0,
+                  1024,
+                  2048
+                ],
+                "benchmark_level": "core"
+              },
+              "before_latency_ms": 0.10344882806142171,
+              "after_latency_ms": 0.09688116791251733,
+              "latency_delta_ms": -0.006567660148904378,
+              "latency_delta_pct": -6.3487042550205555,
+              "before_speedup": 0.20187867216084845,
+              "after_speedup": 0.224997745756469,
+              "speedup_delta": 0.023119073595620543,
+              "speedup_delta_pct": 11.451964364616106
+            },
+            {
+              "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float32::4",
+              "axes": {
+                "dtype": "float32",
+                "shape_detail": [
+                  [
+                    1024,
+                    65536
+                  ],
+                  0,
+                  256,
+                  512
+                ],
+                "benchmark_level": "core"
+              },
+              "before_latency_ms": 0.21241997818812688,
+              "after_latency_ms": 0.21586051354041466,
+              "latency_delta_ms": 0.003440535352287777,
+              "latency_delta_pct": 1.6196853900628467,
+              "before_speedup": 1.0239124689725194,
+              "after_speedup": 0.9965800737151287,
+              "speedup_delta": -0.02733239525739073,
+              "speedup_delta_pct": -2.6694074040155376
+            },
+            {
+              "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::0",
+              "axes": {
+                "dtype": "bfloat16",
+                "shape_detail": [
+                  [
+                    64,
+                    64
+                  ],
+                  0,
+                  16,
+                  32
+                ],
+                "benchmark_level": "core"
+              },
+              "before_latency_ms": 0.11139330656632133,
+              "after_latency_ms": 0.11255682968511814,
+              "latency_delta_ms": 0.0011635231187968054,
+              "latency_delta_pct": 1.0445179828682678,
+              "before_speedup": 0.34926876962506465,
+              "after_speedup": 0.36865296379810786,
+              "speedup_delta": 0.019384194173043212,
+              "speedup_delta_pct": 5.549936283696903
+            },
+            {
+              "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::1",
+              "axes": {
+                "dtype": "bfloat16",
+                "shape_detail": [
+                  [
+                    256,
+                    256
+                  ],
+                  0,
+                  64,
+                  128
+                ],
+                "benchmark_level": "core"
+              },
+              "before_latency_ms": 0.09908088266033016,
+              "after_latency_ms": 0.10120334909923041,
+              "latency_delta_ms": 0.002122466438900253,
+              "latency_delta_pct": 2.142155360259061,
+              "before_speedup": 0.3872748875120713,
+              "after_speedup": 0.4069941097326853,
+              "speedup_delta": 0.019719222220614008,
+              "speedup_delta_pct": 5.0917895418662695
+            },
+            {
+              "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::2",
+              "axes": {
+                "dtype": "bfloat16",
+                "shape_detail": [
+                  [
+                    1024,
+                    1024
+                  ],
+                  0,
+                  256,
+                  512
+                ],
+                "benchmark_level": "core"
+              },
+              "before_latency_ms": 0.09900079646580656,
+              "after_latency_ms": 0.10164695627549115,
+              "latency_delta_ms": 0.0026461598096845923,
+              "latency_delta_pct": 2.6728671931427717,
+              "before_speedup": 0.21273104914877808,
+              "after_speedup": 0.212073487381001,
+              "speedup_delta": -0.0006575617677770651,
+              "speedup_delta_pct": -0.30910474536191707
+            },
+            {
+              "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::3",
+              "axes": {
+                "dtype": "bfloat16",
+                "shape_detail": [
+                  [
+                    4096,
+                    4096
+                  ],
+                  0,
+                  1024,
+                  2048
+                ],
+                "benchmark_level": "core"
+              },
+              "before_latency_ms": 0.10190691266741071,
+              "after_latency_ms": 0.09647779071314067,
+              "latency_delta_ms": -0.005429121954270047,
+              "latency_delta_pct": -5.327530598428433,
+              "before_speedup": 0.20882958861379392,
+              "after_speedup": 0.22545307452957064,
+              "speedup_delta": 0.016623485915776726,
+              "speedup_delta_pct": 7.960311575635928
+            },
+            {
+              "uuid": "benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::bfloat16::4",
+              "axes": {
+                "dtype": "bfloat16",
+                "shape_detail": [
+                  [
+                    1024,
+                    65536
+                  ],
+                  0,
+                  256,
+                  512
+                ],
+                "benchmark_level": "core"
+              },
+              "before_latency_ms": 0.09878667673670259,
+              "after_latency_ms": 0.10607300735101467,
+              "latency_delta_ms": 0.007286330614312081,
+              "latency_delta_pct": 7.375823192972097,
+              "before_speedup": 0.8778920496165874,
+              "after_speedup": 0.8999448053002589,
+              "speedup_delta": 0.022052755683671488,
+              "speedup_delta_pct": 2.512012233543163
+            }
+          ]
+        },
+        "fingerprint": "5e936e77ea5d7823f6abb8bc9da0363d031a627acb348d07bd9c3daa44c83102"
+      },
+      "profile": {
+        "required": false,
+        "status": "not_required",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "partially_met",
+        "root_cause": "The seed's persistent-loop heuristic (grid = nblocks//13 clamped to [40,256]) only pays off far beyond 512 blocks. On this target a straight-line grid of 512 blocks beats a 40-block persistent loop at 8.4M elements, so the two largest-core-block-count timing shapes were being dispatched to the slower kernel; at 33.5M elements the persistent loop is still the right choice but the grid was already adequate, so that shape was unaffected.",
+        "perf_gap_analysis": "Frozen expectation was an increase in min_speedup from the new dispatch rule. Observed: min_speedup 0.2019 -> 0.2121 and geo_mean 0.3443 -> 0.3592 (+4.3%), all 33 workloads still passing, and the worst workload moved from float32::3 to bfloat16::2. The first half of the mechanism was confirmed: the 8.4M-element shape left the persistent path and dropped from 0.1027/0.1034/0.1019 ms (fp16/fp32/bf16) to 0.0955/0.0969/0.0965 ms, about -7%. The second half was neutral: the 33.5M-element shape kept a persistent kernel (grid 157 -> 160) and its latency went 0.0983 -> 0.1077 ms (fp16) while its own reference also drifted 0.0866 -> 0.0963 ms, giving a slightly better ratio (0.881 -> 0.894); no config change there was expected to help. Block/grid choice is therefore no longer the lever: across a same-session sweep, all shapes sit at a size-independent ~0.065-0.10 ms floor set by per-invocation host and launch cost, not by device work.",
+        "next_suggestion": "Stop tuning block/grid choices and target the per-invocation host path instead: on-device probes show a size-independent ~56-58 us Triton launch cost plus a ~20 us allocator/launch interaction, so the remaining headroom is in reducing wrapper work (for example removing redundant per-call host arithmetic and specialization churn), not in further tile tuning.",
+        "optimization_level": "L3_parameter",
+        "debug_lesson": "",
+        "strategy_evolution": "Round 1 accepted the seed unchanged and established that latency is flat in problem size (about 0.098-0.104 ms from n=32768 to n=33554432) against a 0.021-0.039 ms reference floor, which pointed at fixed per-invocation cost. Three bounded on-device Debug Jobs then split that cost (host enqueue ~= synchronized wall, ~56-58 us size- and grid-independent Triton launch, ~7 us allocation, ~20 us alloc+launch interaction), swept BLOCK/grid for every core shape, and A/B'd three complete run() variants. Round 2 therefore applied the one change that had consistent device-side support: dispatch the pre==1 slab to the straight-line kernel up to 512 blocks and cap the persistent grid at 160 instead of using nblocks//13 clamped to 40.",
+        "knowledge_assessments": []
+      },
+      "next_verdict": {
+        "should_continue": false,
+        "code": "max_round_reached",
+        "reason": "maximum round limit reached: 2/2"
+      }
+    }
+  ],
+  "rounds_without_improvement": 0
+}
