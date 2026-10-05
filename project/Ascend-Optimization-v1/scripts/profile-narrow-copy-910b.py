@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import urllib.error
 import urllib.request
@@ -32,7 +33,12 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--iterations", type=int, default=2)
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--aic-metrics", help="真机 msopprof --aic-metrics，如 Roofline")
+    parser.add_argument("--op-metrics", help="仅 instruction 级别使用的 msopprof op 指标")
+    parser.add_argument("--download-artifacts", action="store_true")
     args = parser.parse_args()
+    if args.op_metrics and args.level != "instruction":
+        parser.error("KGS 仅在 instruction 级别执行 msopprof op，metrics 级别不能使用 --op-metrics")
 
     binding = {"catalog_name": "flaggems-adapter-definitions", "definition": "narrow_copy"}
     inspect = request_json(
@@ -61,6 +67,13 @@ def main() -> None:
             "timeout_sec": args.timeout,
         },
     }
+    npu_options = {}
+    if args.aic_metrics:
+        npu_options["aic_metrics"] = args.aic_metrics
+    if args.op_metrics:
+        npu_options["op_metrics"] = args.op_metrics
+    if npu_options:
+        payload["options"]["backend_options"] = {"npu": npu_options}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     (args.output.parent / (args.output.stem + "-request.json")).write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -72,6 +85,32 @@ def main() -> None:
     args.output.write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+    if args.download_artifacts and result.get("artifacts"):
+        artifact_dir = args.output.parent / (args.output.stem + "-artifacts")
+        artifact_dir.mkdir(exist_ok=False)
+        downloaded = []
+        selected = {"profile_log", "vendor_report", "vendor_kernel_report", "op_summary",
+                    "performance_counters", "execution_timeline",
+                    "vendor_instruction_report", "instruction_listing"}
+        for artifact in result.get("artifacts", []):
+            if artifact.get("kind") not in selected:
+                continue
+            url = artifact.get("download_url", "")
+            if not url.startswith("/profile_artifacts/"):
+                raise ValueError(f"意外的 artifact URL: {url}")
+            destination = artifact_dir / f"{artifact['id']}-{Path(artifact['filename']).name}"
+            with urllib.request.urlopen(args.server + url, timeout=60) as response:
+                content = response.read()
+            if len(content) != artifact["size_bytes"]:
+                raise ValueError(f"artifact 大小不符: {artifact['id']}")
+            destination.write_bytes(content)
+            downloaded.append({"id": artifact["id"], "kind": artifact["kind"],
+                               "path": str(destination), "size_bytes": len(content),
+                               "sha256": hashlib.sha256(content).hexdigest()})
+        (artifact_dir / "manifest.json").write_text(
+            json.dumps({"profile_id": result["profile_id"], "artifacts": downloaded},
+                       ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
     print(json.dumps({key: result.get(key) for key in ("status", "error", "summary", "warnings")}, ensure_ascii=False))
 
 

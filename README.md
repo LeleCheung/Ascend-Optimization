@@ -15,6 +15,19 @@
 
 本项目针对华为昇腾 910B 上 FlagGems 的 Triton 算子开展性能优化。只选择正确性已经达标、但加速比不理想的代表性算子；精度失败的算子不进入优化流程。每个结论都必须绑定设备、软件版本、形状、数据类型、计时口径和完整 workload。
 
+### 当前交付目标：narrow_copy 诊断到优化闭环
+
+首个正式案例是 `narrow_copy`。最终交付不是一次 profiler 截图或单轮加速比，而是以下可复核的材料：
+
+1. 依据 910B/CANN 官方资料、仓库 `docs/` 和实际 KG/KGS 源码，说明真机 `metrics`、模拟器 `instruction`、host 计时、编译 IR 各自能证明什么；记录 KG 原生分析的缺口。参考 [独立 Profiling Workflow 设计](docs/ascend-profiling-workflow.md)及固定版本的 `cuda-optimized-skill`，只迁移证据门禁、单项假设和消融方法，不照搬 CUDA 指标或峰值。
+2. 交付可独立运行的 Profiling Agent：输入固定算子、候选源码、workload、KGS 评测、原始 `msprof` 产物及可用 IR；校验 case、源码和产物身份；输出逐 case 中文诊断、证据来源和置信度、受限类型、一个可证伪的修改建议。缺少同范围数据时明确标记 Roofline 或源码映射不可用。
+3. 在隔离的 910B 工作区，以相同的 18 个 correctness、15 个 timing workload 和边界用例验证至少一项由诊断驱动的候选；保留失败尝试及重复测量波动，逐 case 对照 PyTorch、FlagGems、KG 无/有 profiler 和前一版候选。正确性失败的计时不得参与最优候选选择。
+4. 提交候选源码、运行命令、环境版本、原始证据、中文报告和局限性，并同步 Windows、910B 新工作树与 GitHub。若仍低于 PyTorch，只给出限定设备、软件、workload 和实验预算的结论，不声称 Triton 的理论上限。
+
+当前独立 workflow 入口是 `project/Ascend-Optimization-v1/scripts/ascend_profiling_workflow.py`。它会校验候选源码 SHA、Definition benchmark fingerprint、case UUID、profile 级别和每个原始 artifact 的大小/SHA，然后输出 Markdown 与 JSON 体检报告；`--profile RESPONSE REQUEST ARTIFACT_DIR` 可重复传入多个 case 的 `metrics` 或 `instruction` 采集。真实归档的运行示例和结果见 [narrow_copy 独立体检](project/Ascend-Optimization-v1/reports/ascend910b/narrow-copy-combined-20261006/独立体检.md)，拒绝篡改源码和 artifact 的测试见 `scripts/test_ascend_profiling_workflow.py`。
+
+体检提出的第一项可证伪修改是把 persistent copy 的 `_PERSIST_ITERS` 从 `13` 改成 `8`。该候选正确性 `33/33`，但 geo mean 为 `0.5112×`，低于原候选首轮 `0.5349×`，已按门禁回退；失败尝试和证据见 [persist8 消融记录](project/Ascend-Optimization-v1/reports/ascend910b/narrow-copy-combined-20261006/诊断消融-persist8.md)。
+
 ## 分步计划
 
 ### 第 0 步：固定环境
@@ -92,3 +105,5 @@ FlagGems、KernelGen 和 KGS 的源码目录均为导出副本，不包含上游
 随后在开启 profiling 的一次两轮运行中，候选按完整 launch signature 缓存已编译 launcher，geo mean 从该运行 round 1 的 `0.3396×` 提升到 round 2 的 `0.4708×`，最终独立复验为 `0.4615×`；完整 correctness 与 15/15 timing 通过，但整体仍低于 PyTorch native。KGS 对 5/15 个 timing case 的 `msprof metrics` 分析是在 round 2 候选评测**之后**完成的，不能将上述提升归因于这次正式分析；原先单轮 `--no-profile` 运行也不构成同预算对照。新的两轮配对 A/B 见 [narrow_copy 实验记录](project/Ascend-Optimization-v1/reports/ascend910b/narrow-copy-20261005/README.md)。Excel 第 29 行 `G29=0.0138` 缺少 baseline、workload 和统计口径，不能与本次加速比直接比较。
 
 新的配对 A/B 已完成：有 profiler 组在第一轮正式分析 `recorded=true` 后才修改第二轮候选，但第二轮有 9/18 个 correctness case 运行错误，KG 回退到第一轮。两组最终独立复验分别为无 profiler `0.3580×`、有 profiler `0.3498×`，均通过正确性且均未超过 PyTorch。逐 case 结果、失败边界和下一步见 [中文配对报告](project/Ascend-Optimization-v1/reports/ascend910b/narrow-copy-20261005/ab-report.md)。
+
+2026-10-06 已修复上述第二轮候选少传 `EVEN` 参数的问题，并把 launch-plan 与已编译 launcher 缓存合并成新候选。新候选在专用 KGS 上三次独立评测均通过 18/18 correctness、15/15 timing，geo mean 分别为 `0.5349×`、`0.5120×`、`0.5152×`，原始结果见 [合并候选评测](project/Ascend-Optimization-v1/reports/ascend910b/narrow-copy-combined-20261006/)。它仍低于 PyTorch；三次运行使用不同 NPU，尚不能将与历史候选的差异视为严格同卡消融，也不能据此宣称独立 Profiling Agent 已完成。
