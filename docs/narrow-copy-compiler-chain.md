@@ -40,6 +40,8 @@ Triton Python
 
 这些 host probe 不是 KGS walltime，不能把两列直接相减当作精确设备时间；但它们足以证明：小 case 的分配和 launcher 路径占主要比例，大 case 还叠加了实际搬运时间。
 
+同一批归档的独立 `msprof` 采集显示：小尺寸 float16 kernel 的设备平均时间约 `2.44 us`，大尺寸 float16 persistent kernel 约 `89.56 us`，后者 MTE2/MTE3 比例分别为 `0.916/0.7125`。这些采集与 host probe 不是同一次计时，不能相减；它们只用于确认 NPU kernel 本身的量级。编译缓存验证还记录了第一次 `compiled=1, hits=0`，随后五次保持 `compiled=1`、`hits=5`、`disabled=0`，见 [cache-verification](../project/Ascend-Optimization-v1/reports/ascend910b/narrow-copy-combined-20261006/cache-verification.json)。
+
 编译缓存里的低层 runner 可以在拿到精确 specialization key、并传入候选自身的 `BLOCK/EVEN` constexpr 参数后调用；v5 的 `direct_launcher_kind` 为 `compiled_cache`，小 case launcher wall 约 `87.2 us`，大 case 约 `253.0 us`。早期少传 constexpr 时曾得到：
 
 ```text
