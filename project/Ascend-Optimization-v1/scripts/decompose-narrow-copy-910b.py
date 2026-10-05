@@ -61,10 +61,16 @@ def measure_case(module, source, shape, dtype, dim, start, length, repeats):
     # 编译缓存中的对象是已经绑定 grid/编译选项的低层 launcher。若后端
     # 暴露该对象，优先测它；否则退回 JIT wrapper，并在结果中注明。
     cached_launcher = None
-    for value in getattr(module, "_COMPILED", {}).values():
-        if callable(value):
-            cached_launcher = value
-            break
+    # _COMPILED 的 key 含 shape/dtype、device 和输入/输出地址低位；不能
+    # 随意取第一个 specialization，否则大 case 会误用小 case 的 runner。
+    try:
+        probe_output = source.new_empty(output_shape)
+        cache_key = ((dim, start, length, tuple(source.shape), tuple(source.stride()), source.dtype),
+                     source.device.index, source.data_ptr() & 15, probe_output.data_ptr() & 15)
+        cached_launcher = getattr(module, "_COMPILED", {}).get(cache_key)
+        del probe_output
+    except Exception:
+        cached_launcher = None
     cached_launcher_error = None
     direct_kind = "compiled_cache" if cached_launcher is not None else "jit_wrapper"
 
@@ -91,7 +97,9 @@ def measure_case(module, source, shape, dtype, dim, start, length, repeats):
                 direct = cached_launcher or launcher
                 try:
                     if cached_launcher is not None:
-                        direct(output, source, *args)
+                        # run() 自身也会把 BLOCK/EVEN 作为 constexpr 参数传给
+                        # compiled runner；缺少这两个参数会制造假的 ABI 错误。
+                        direct(output, source, *args, block, even)
                     elif len(args) == 2:
                         direct(output, source, args[0], args[1], block, even)
                     elif len(args) == 3:

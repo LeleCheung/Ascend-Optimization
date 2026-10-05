@@ -31,22 +31,22 @@ Triton Python
 
 ## 分层实测
 
-来自 910B `tle_yy` 容器的同进程测量见 [分解结果](../project/Ascend-Optimization-v1/reports/ascend910b/narrow-copy-combined-20261006/decompose-narrow-copy-v3.json)：
+来自 910B `tle_yy` 容器的同进程测量见 [分解结果](../project/Ascend-Optimization-v1/reports/ascend910b/narrow-copy-combined-20261006/decompose-narrow-copy-v5.json)：
 
 | case | 首次调用 | warm 完整调用 wall | 仅 `new_empty` wall | PyTorch wall |
 | --- | ---: | ---: | ---: | ---: |
-| 64×64 float32 | 约 570.7 ms | 115.8 us | 40.6 us | 113.4 us |
-| 1024×65536 float16 | 约 7.9 ms | 251.8 us | 38.7 us | 118.6 us |
+| 64×64 float32 | 约 554.8 ms | 111.8 us | 40.0 us | 100.6 us |
+| 1024×65536 float16 | 约 7.8 ms | 242.1 us | 39.3 us | 116.9 us |
 
 这些 host probe 不是 KGS walltime，不能把两列直接相减当作精确设备时间；但它们足以证明：小 case 的分配和 launcher 路径占主要比例，大 case 还叠加了实际搬运时间。
 
-在尝试直接调用编译缓存里的低层 runner 时，FlagTree 返回：
+编译缓存里的低层 runner 可以在拿到精确 specialization key、并传入候选自身的 `BLOCK/EVEN` constexpr 参数后调用；v5 的 `direct_launcher_kind` 为 `compiled_cache`，小 case launcher wall 约 `87.2 us`，大 case 约 `253.0 us`。早期少传 constexpr 时曾得到：
 
 ```text
 TypeError: function takes exactly 15 arguments (13 given)
 ```
 
-大 case 为 14 个参数。这个对象的参数由内部 packed metadata、stream、函数句柄等组成，不能当作稳定的 Python/C ABI，也不能安全地当作“内联汇编入口”。证据保存在分解结果的 `compiled_launcher_error` 字段。
+大 case 的参数数量也随 specialization 变化。这个对象依赖私有 `_COMPILED` 字典、地址对齐 key 和内部 packed metadata，不能当作稳定的 Python/C ABI，也不能安全地当作“内联汇编入口”。
 
 ## 低级入口验证
 
