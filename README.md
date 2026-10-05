@@ -86,3 +86,5 @@ FlagGems、KernelGen 和 KGS 的源码目录均为导出副本，不包含上游
 ## narrow_copy 最新实验
 
 2026-10-05 已在 910B 上完成 `narrow_copy` 的隔离 FlagGems case API 适配、专用 KGS `19652`、Claude Code 驱动的 KernelGen 正式正确性和 walltime 计时闭环。33/33 个正确性 workload 与 15/15 个计时 workload 通过，整体生命周期成功；本轮相对 PyTorch 的加速比几何平均值为 `0.3532×`，因此仍需继续优化。运行产物、补丁和踩坑说明见 [narrow_copy 实验记录](project/Ascend-Optimization-v1/reports/ascend910b/narrow-copy-20261005/README.md)。
+
+随后完成同一 workload/baseline 下的 profile-enabled A/B：round 2 使用 KGS `19652` 的 `msprof metrics` 对 5/15 个 timing case 采集反馈，并将分析写入 KernelGen profile analysis。按完整 launch signature 缓存已编译 launcher 后，geo mean 从无 profiling seed 的 `0.3396×` 提升到 `0.4708×`，最终独立复验为 `0.4615×`；18/18 主 correctness 与 15/15 timing 通过，但整体仍低于 PyTorch native。该结果证明 profiling 指导有效，同时确认剩余 C-level launcher、device/stream 查询和输出分配开销仍是主要差距。完整证据仍集中在 [narrow_copy 实验记录](project/Ascend-Optimization-v1/reports/ascend910b/narrow-copy-20261005/README.md)。
