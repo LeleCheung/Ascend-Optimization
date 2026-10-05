@@ -75,6 +75,8 @@
 
 `Ascend-Optimization` 是当前主仓库。`project/Ascend-Optimization-v1` 是其中的实验项目目录，不是新的 Git 仓库。原来的 Windows `workplace` 和 GitHub `KernelGen` 仓库暂时保留，作为历史基线和故障回溯依据；等第 1 步在 910B 上能从新仓库独立复现并完成一次验收后，再考虑归档它们。
 
+910B 上与本仓库当前提交同步的工作树是 `/data/hanle/ascend-optimization/Ascend-Optimization-current`。旧 `/data/hanle/ascend-optimization/Ascend-Optimization` 停在历史提交，含未跟踪实验文件，暂时保留且未覆盖。910B 的 GitHub SSH 暂不可用；本次通过 Windows 生成 Git bundle 导入新提交。容器内的 Git LFS 3.0.2 可执行文件位于 `/data/hanle/ascend-optimization/runtime/kg-controller/git-lfs-package/usr/bin/git-lfs`，使用时把该目录加入 `PATH`；新工作树的 LFS 文件已从本地对象缓存恢复。
+
 ## 复现原则
 
 本仓库不提交 Python 虚拟环境、容器层或 Claude 原生二进制。它们依赖机器架构和驱动，无法作为跨机器的可靠复现材料。请按照 `manifests/components.lock.yaml` 创建环境，并使用 `project/Ascend-Optimization-v1/experiments/` 下的脚本运行实验。
