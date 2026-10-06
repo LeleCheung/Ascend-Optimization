@@ -73,7 +73,7 @@ class SmoothL1LossBackwardBenchmark(base.Benchmark):
             )
 
     def build_inputs(self, case):
-        shape = case.builder_args[0]
+        shape = case.builder_args[0].builder_args[0]
         inp = torch.randn(shape, device=self.device, dtype=case.dtype)
         target = torch.randn(shape, device=self.device, dtype=case.dtype)
         grad_output = torch.randn((), device=self.device, dtype=case.dtype)
