@@ -331,3 +331,35 @@ def run(inp, dim, start, length):
         _remember_compiled(plan[5], cache_key, plan[6],
                            (out, inp, *args), plan[3], plan[4])
     return out
+
+
+def run_into(out, inp, dim, start, length):
+    """实验性预分配接口；不属于 FlagGems 固定 Definition ABI。"""
+    shape = inp.shape
+    strides = inp.stride()
+    key = (int(dim), int(start), int(length), shape, strides, inp.dtype)
+    plan = _PLANS.get(key)
+    if plan is None:
+        plan = _make_plan(key[0], key[1], key[2], shape, strides, len(shape))
+        _PLANS[key] = plan
+    if tuple(out.shape) != tuple(plan[0]) or out.dtype != inp.dtype or out.device != inp.device:
+        raise ValueError("预分配 output 的 descriptor 不匹配")
+    launcher = plan[1]
+    if launcher is None or launcher is _GENERIC:
+        raise ValueError("run_into 仅用于连续内存 kernel 消融")
+    args = plan[2]
+    cache_key = (key, inp.device.index, inp.data_ptr() & 15, out.data_ptr() & 15)
+    direct = _COMPILED.get(cache_key)
+    if direct is None:
+        launcher = plan[1]
+    else:
+        launcher = direct
+    if len(args) == 2:
+        launcher(out, inp, args[0], args[1], plan[3], plan[4])
+    elif len(args) == 3:
+        launcher(out, inp, args[0], args[1], args[2], plan[3], plan[4])
+    else:
+        launcher(out, inp, args[0], args[1], args[2], args[3], plan[3], plan[4])
+    if direct is None:
+        _remember_compiled(plan[5], cache_key, plan[6], (out, inp, *args), plan[3], plan[4])
+    return out
