@@ -60,6 +60,25 @@ class SmoothL1LossBackwardBenchmark(base.Benchmark):
     ]
     DEFAULT_SHAPE_DESC = "(B), M, N"
 
+    def get_case_iter(self, dtype):
+        for ordinal, shape in enumerate(self.shapes):
+            yield self._case_from_plan(
+                dtype,
+                ordinal,
+                base.BenchmarkCasePlan(
+                    shape={"input": shape},
+                    params={"beta": 1, "reduction": 1},
+                    builder_args=(shape,),
+                ),
+            )
+
+    def build_inputs(self, case):
+        shape = case.builder_args[0]
+        inp = torch.randn(shape, device=self.device, dtype=case.dtype)
+        target = torch.randn(shape, device=self.device, dtype=case.dtype)
+        grad_output = torch.randn((), device=self.device, dtype=case.dtype)
+        return grad_output, inp, target, 1, 1.0
+
     def get_input_iter(self, dtype):
         for shape in self.shapes:
             inp = torch.randn(shape, device=self.device, dtype=dtype)
