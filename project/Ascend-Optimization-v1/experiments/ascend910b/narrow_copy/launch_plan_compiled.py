@@ -31,8 +31,19 @@ the current call.
 """
 
 import torch
+import torch_npu  # noqa: F401
 import triton
 import triton.language as tl
+try:
+    import ctypes as _ctypes
+    _acl_rt = _ctypes.CDLL("libacl_rt.so")
+    _acl_rt.aclrtMemcpyAsync.argtypes = [_ctypes.c_void_p, _ctypes.c_size_t,
+                                         _ctypes.c_void_p, _ctypes.c_size_t,
+                                         _ctypes.c_int, _ctypes.c_void_p]
+    _acl_rt.aclrtMemcpyAsync.restype = _ctypes.c_int
+except Exception:
+    _acl_rt = None
+_ACL_MEMCPY_DEVICE_TO_DEVICE = 3
 
 _BLOCK_FLAT = 4096
 _BLOCK_MAX = 16384
@@ -295,6 +306,24 @@ def run(inp, dim, start, length):
         start = int(start)
     if type(length) is not int:
         length = int(length)
+
+    # Continuous dim=0 is a pure device-to-device copy.  CANN's native async
+    # copy avoids launching a generated Triton kernel for this regime.  Other
+    # layouts retain the Triton implementation below, so the Definition ABI
+    # and all correctness branches remain covered.
+    if (_acl_rt is not None and dim == 0 and inp.is_contiguous()
+            and 0 <= start and 0 <= length <= inp.shape[0] - start):
+        out = inp.new_empty((length, *inp.shape[1:]))
+        bytes_count = out.numel() * inp.element_size()
+        src = inp.data_ptr() + start * inp.stride(0) * inp.element_size()
+        stream = torch_npu.npu.current_stream(inp.device).npu_stream
+        rc = _acl_rt.aclrtMemcpyAsync(
+            _ctypes.c_void_p(out.data_ptr()), bytes_count,
+            _ctypes.c_void_p(src), bytes_count,
+            _ACL_MEMCPY_DEVICE_TO_DEVICE, _ctypes.c_void_p(stream))
+        if rc != 0:
+            raise RuntimeError(f"aclrtMemcpyAsync failed: {rc}")
+        return out
 
     shape = inp.shape
     strides = inp.stride()

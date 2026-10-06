@@ -30,6 +30,8 @@
 
 编译链与运行时分层结论见 [narrow_copy 编译链报告](docs/narrow-copy-compiler-chain.md)。当前证据显示：首次编译约为百毫秒级，但 warm 调用仍受输出分配和 launcher 路径影响；FlagTree 的内部 compiled runner 不是稳定 ABI；公开的 `simt_only` 旁路在当前 CANN BiShengIR 版本上因编译参数不兼容而失败。因此在该问题完成前不切换到下一个算子。
 
+随后已完成真正的实现改进：连续 `dim=0` narrow copy 直接调用 CANN `aclrtMemcpyAsync` D2D，其余 layout 保留 Triton 路径。三次完整 KGS 评测均 `33/33`，geo mean 为 `0.5919×`、`0.5672×`、`0.5613×`，边界 `27/27`；相对原 Triton 候选三轮分别有约 8.9%–10.8% 的提升。结果和失败 fallback 修复见 [native copy 结果](project/Ascend-Optimization-v1/reports/ascend910b/narrow-copy-final-20261006/native-copy-result.md)。
+
 ## 分步计划
 
 ### 第 0 步：固定环境
