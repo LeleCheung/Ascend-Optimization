@@ -8,6 +8,8 @@
 
 尚未得到可用 profiler 结果；当前优先级是先解决候选性能低于 PyTorch 的问题。早期 phase1 的失败属于 adapter 注入问题，不能作为性能结论。
 
+`matmul-bias-profile-20261007` 已完成正式 profiler round：42/42 正确、42/42 计时，几何平均加速比 0.492x，最差 0.273x。profiler 没有改变结论，当前 Triton 候选明显慢于 PyTorch。
+
 ## 结论
 
 当前融合 Triton 实现没有达到交付性能目标，应转向 Ascend 原生矩阵乘路径，或重新设计 tile、dtype 和矩阵布局。
