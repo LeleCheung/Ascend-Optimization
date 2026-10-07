@@ -21,6 +21,8 @@ Triton 候选可以算对，但没有打过 Ascend 原生实现。现有设备�
 
 后续已修正候选返回的统计量形状（保留 normalized 维的 singleton 轴），但使用 native catalog 重跑时，KG worker 在进入 eval 前因 `AttributeError: 'list' object has no attribute 'get'` 退出；这是 native catalog/worker 的基础设施兼容问题，尚未形成新的正式 profile round。
 
+为隔离该 worker 问题，已直接调用 910B KGS `/evaluate` 接口评测修正候选：20/20 correctness、20/20 timing 通过，几何平均加速比 0.2336x，最差 0.2269x。结果保存在 `runtime/kg-controller/runs/native-layer-norm-profile-fix-20261007/direct-evaluate/result.json`。这确认候选 ABI 已正确，但 Triton 仍明显慢于原生实现。
+
 ## 结论
 
 在当前 KernelGen Ascend backend 和 Triton 生成路径下，native_layer_norm 的瓶颈是编译链生成的 kernel/launch 组织方式。若要继续突破，应改进 backend 的融合与 launch 组织，或下沉到 Ascend 更低层 IR/CANN 自定义算子；继续调 Triton block 参数无法弥补当前数量级差距。
