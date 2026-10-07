@@ -23,6 +23,20 @@ from . import base, consts, utils
 
 
 class PreluBenchmark(base.Benchmark):
+    def get_case_iter(self, dtype):
+        for ordinal, shape in enumerate(self.shapes):
+            yield self._case_from_plan(
+                dtype,
+                ordinal,
+                base.BenchmarkCasePlan(shape={"input": shape}, params={}, builder_args=(shape,)),
+            )
+
+    def build_inputs(self, case):
+        shape = case.builder_args[0].builder_args[0]
+        x = utils.generate_tensor_input(shape, case.dtype, self.device)
+        w = torch.randn(() if len(shape) == 1 else (shape[1],), dtype=case.dtype, device=self.device)
+        return x, w
+
     def get_input_iter(self, dtype) -> Generator:
         for shape in self.shapes:
             x = utils.generate_tensor_input(shape, dtype, self.device)

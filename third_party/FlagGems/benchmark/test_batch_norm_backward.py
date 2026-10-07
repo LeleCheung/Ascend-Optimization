@@ -35,6 +35,23 @@ class NormBenchmark(base.GenericBenchmark):
             (16, 8, 128, 128),
         ]
 
+    def get_case_iter(self, dtype):
+        for ordinal, shape in enumerate(self.shapes):
+            yield self._case_from_plan(dtype, ordinal, base.BenchmarkCasePlan(shape={"input": shape}, params={}, builder_args=(shape,)))
+
+    def build_inputs(self, case):
+        shape = case.builder_args[0].builder_args[0]
+        dtype = case.dtype
+        c = shape[1]
+        inp = torch.randn(shape, dtype=dtype, device=self.device)
+        weight = torch.randn((c,), dtype=dtype, device=self.device)
+        grad_output = torch.randn_like(inp)
+        running_mean = torch.zeros(c, dtype=dtype, device=self.device)
+        running_var = torch.ones(c, dtype=dtype, device=self.device)
+        save_mean = torch.randn(c, dtype=torch.float32, device=self.device)
+        save_invstd = torch.randn(c, dtype=torch.float32, device=self.device)
+        return grad_output, inp, weight, running_mean, running_var, save_mean, save_invstd, True, 1e-5, [True, True, True]
+
 
 def batchnorm_input_fn(shape, dtype, device):
     C = shape[1]

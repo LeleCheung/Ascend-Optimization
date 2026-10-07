@@ -21,6 +21,15 @@ from . import base, consts, utils
 
 
 class TCopyBenchmark(base.Benchmark):
+    def get_case_iter(self, dtype):
+        for ordinal, shape in enumerate(self.shapes):
+            if len(shape) == 2:
+                yield self._case_from_plan(dtype, ordinal, base.BenchmarkCasePlan(shape={"input": shape}, params={}, builder_args=(shape,)))
+
+    def build_inputs(self, case):
+        shape = case.builder_args[0].builder_args[0]
+        return (utils.generate_tensor_input(shape, case.dtype, self.device),)
+
     def get_input_iter(self, dtype) -> Generator:
         for shape in self.shapes:
             if len(shape) == 2:
