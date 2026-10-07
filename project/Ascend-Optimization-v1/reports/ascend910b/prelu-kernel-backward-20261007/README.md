@@ -15,6 +15,10 @@
 - 正式结果：`stages/optimize/work/1R/agent0/.kernelgen/evals/round-0001/result.json`
 - 结果状态：`PASSED`，`num_workloads=30`，`num_passed=30`，`geo_mean=2.7974668629`，`min_speedup=1.9841713328`。
 
+## profiler 版本
+
+`prelu-underscore-profile-20261007b` 启用 `--profile` 后正式通过 30/30 正确性和 30/30 计时，几何平均加速比 2.835x，最差 1.960x。结果文件位于该工作区的 `stages/optimize/work/1R/agent0/.kernelgen/evals/round-0001/result.json`。
+
 ## 测试修正
 
 原测试的 per-channel weight 使用了 `shape[-1]`，而 Ascend 原生算子要求权重长度为 1 或 `shape[1]`。这会使 reference 在候选尚未调用前直接报错，造成零 workload 的基础设施失败。已改为 `shape[1]`，随后重新生成 catalog 快照并完成正式评测。
