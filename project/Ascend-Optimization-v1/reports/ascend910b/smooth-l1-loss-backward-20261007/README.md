@@ -15,3 +15,13 @@
 ## 判断
 
 候选的常规 elementwise 路径已通过绝大多数形状、dtype、reduction 和广播组合。当前阻塞点是 beta=0 边界的 NaN 语义，需要先修正候选或测试契约，再重新进行完整评测；不能根据本轮结果宣称性能优劣。
+
+## 修复后结果
+
+phase2 使用修正后的 beta=0 等值分支重新评测，正式通过全部 `303/303` 个 workload。几何平均加速比为 `3.515x`，最差 workload 为 `1.867x`，说明该 elementwise 候选在当前 KG device-time 口径下已经取得稳定加速。
+
+- phase2b workspace：`runtime/kg-controller/runs/smooth-l1-backward-phase2b/`
+- eval：`PASSED`
+- 正确性与计时：`303/303`
+- 几何平均加速比：`3.515x`
+- 最差加速比：`1.867x`
