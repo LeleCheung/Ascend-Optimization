@@ -1,21 +1,16 @@
-# mse_loss_backward 优化报告
+﻿# `mse_loss_backward`：Ascend 910B 阶段报告
 
-## 结论
+## KG 无 profiler
 
-在 Ascend 910B 上，KG 无 profiler 正式闭环通过。候选在 `42/42` 个 workload 上通过正确性和计时评测，几何平均加速比为 `1.326x`，最差 workload 为 `1.064x`，候选状态为 `KEEP`。
+正式运行通过 42/42 workload，几何平均加速比 1.326x，最差 1.064x。候选为融合的 Triton elementwise kernel，按输入规模选择 block，并保留非连续输入 fallback。
 
-## 方法
+## profiler 版本
 
-连续同形状输入使用融合的 Triton elementwise kernel，在 host 端折叠 `2/numel`，按输入规模选择 block，并缓存已验证的 compiled-kernel launcher。广播、非连续、标量梯度和任意 rank 输入走通用 fallback。
+正式运行：`mse-loss-backward-profile-20261007`。结果为 42/42 正确、42/42 计时，几何平均加速比 1.243x，最差 0.937x。说明 profiler 流程下总体略快，但最慢 workload 仍低于 PyTorch。
 
-## 证据
+## 复现证据
 
-- 910B workspace：`runtime/kg-controller/runs/mse-loss-backward-noprofile-63c4721c/`
-- Definition revision：`63c4721c5febf2ff563e6ea3627617fb809abc2e`
-- 正确性：27/27
-- 计时：15/15
-- 阶段状态：`SUCCEEDED / COMPLETED`
-
-## 限制
-
-本报告是无 profiler 结果；尚未完成该算子的 profiler 运行及独立 profiling 改进版。
+- 无 profiler：`runtime/kg-controller/runs/mse-loss-backward-noprofile-63c4721c`
+- profiler：`runtime/kg-controller/runs/mse-loss-backward-profile-20261007`
+- profiler 正式结果：`stages/optimize/work/1R/agent0/.kernelgen/evals/round-0001/result.json`
+- profiler 运行请求启用了 `--profile`，设备为 Ascend 910B。
