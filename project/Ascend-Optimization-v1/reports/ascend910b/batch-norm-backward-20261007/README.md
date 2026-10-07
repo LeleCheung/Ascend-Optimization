@@ -14,6 +14,10 @@
 - 正式结果：`stages/optimize/work/1R/agent0/.kernelgen/evals/round-0001/result.json`
 - 结果状态：`PASSED`，`num_workloads=45`，`num_passed=45`，`geo_mean=4.9373094682`，`min_speedup=2.1493979821`。
 
+## profiler 尝试
+
+`batch-norm-profile-20261007` 已提交 `--profile` 流程，但 19654 在提交阶段响应超时，状态为基础设施失败，未产生可用性能结论；正式无 profiler 结果不受影响。
+
 ## 测试修正
 
 原测试用 `torch.randn(C)` 生成 saved variance，负值会使 reference 和候选同时产生 NaN，而断言使用 `equal_nan=False`，导致无意义的 correctness 失败。已改为正方差 `torch.rand(C) + 0.5`，保持 batch norm 的有效输入域后重新生成快照并完成正式评测。
