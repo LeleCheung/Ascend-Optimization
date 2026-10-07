@@ -48,6 +48,25 @@ def test_t_copy():
 
 
 class TCopyOutBenchmark(base.Benchmark):
+    def get_case_iter(self, dtype):
+        for ordinal, shape in enumerate(self.shapes):
+            if len(shape) == 2:
+                yield self._case_from_plan(
+                    dtype,
+                    ordinal,
+                    base.BenchmarkCasePlan(
+                        shape={"input": shape, "out": (shape[1], shape[0])},
+                        params={},
+                        builder_args=(shape,),
+                    ),
+                )
+
+    def build_inputs(self, case):
+        shape = case.builder_args[0].builder_args[0]
+        inp = utils.generate_tensor_input(shape, case.dtype, self.device)
+        out = torch.empty((shape[1], shape[0]), dtype=case.dtype, device=self.device)
+        return inp, {"out": out}
+
     def get_input_iter(self, dtype) -> Generator:
         for shape in self.shapes:
             if len(shape) == 2:
