@@ -78,12 +78,21 @@ def render_definition_block(
         for name, value in definition.axes.items()
     )
     inputs = "\n".join(
-        f"  {name}: {value.get('shape', [])} ({value.get('dtype', '')})"
+        (
+            f"  {name}: {value.get('shape', [])} ({value.get('dtype', '')})"
+            if isinstance(value, dict)
+            else f"  {name}: {value!r} ({type(value).__name__})"
+        )
         for name, value in definition.inputs.items()
+    )
+    output_items = (
+        definition.outputs.items()
+        if isinstance(definition.outputs, dict)
+        else ((name, {}) for name in definition.outputs)
     )
     outputs = "\n".join(
         f"  {name}: {value.get('shape', [])} ({value.get('dtype', '')})"
-        for name, value in definition.outputs.items()
+        for name, value in output_items
     )
     reference = textwrap.indent(definition.reference.strip(), "  ")
     if definition.run_signature:

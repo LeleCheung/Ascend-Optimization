@@ -98,6 +98,29 @@ def test_v4_uses_workload_metadata_without_torch(monkeypatch):
     assert "resolved_inputs" not in workloads[0]["workload"]
 
 
+def test_list_and_scalar_workload_inputs_are_preserved(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch", None)
+    workloads = [{
+        "definition": "native_layer_norm",
+        "workload": {
+            "uuid": "native-0",
+            "axes": {},
+            "inputs": {
+                "input": {"type": "random", "shape": [2, 4], "dtype": "float32"},
+                "normalized_shape": [4],
+                "eps": 1e-5,
+            },
+        },
+    }]
+
+    out = enrich_workloads_with_shapes({"reference": ""}, workloads)
+
+    assert out[0]["workload"]["inputs"] == workloads[0]["workload"]["inputs"]
+    assert out[0]["workload"]["resolved_inputs"] == {
+        "input": {"shape": [2, 4], "dtype": "float32"}
+    }
+
+
 def test_no_gen_inputs_degrades(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch", _install_fake_torch())
     d = dict(DEFN, reference="import torch\ndef run(x):\n    return x\n")

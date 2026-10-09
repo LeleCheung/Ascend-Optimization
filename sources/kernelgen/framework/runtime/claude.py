@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import re
 import tempfile
 import time
@@ -150,8 +151,16 @@ class ClaudeRuntime(CLIRuntime):
         self._active_agent = agent
         self._mcp_startup_timeout_ms = None
         model = self.model if self.model and self.model != "inherit" else None
+        claude_executable = shutil.which("claude")
+        if claude_executable is None:
+            for candidate in ("/usr/local/bin/claude", "/usr/bin/claude"):
+                if os.access(candidate, os.X_OK):
+                    claude_executable = candidate
+                    break
+        if claude_executable is None:
+            claude_executable = "/usr/local/bin/claude"
         cmd = [
-            "claude", "-p",
+            claude_executable, "-p",
             "--output-format", "stream-json",
             "--include-partial-messages",
             "--verbose",

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import traceback
 import time
 import uuid
 from pathlib import Path
@@ -250,6 +251,7 @@ def execute_request(request: RunRequest, *, resume: bool = False) -> int:
             level="ERROR",
         )
         print(f"kg worker failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         exit_code = 2
     finally:
         if acquired:

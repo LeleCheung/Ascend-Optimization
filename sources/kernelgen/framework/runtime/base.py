@@ -318,7 +318,16 @@ class CLIRuntime(Runtime, ABC):
             "KERNELGEN_WORKSPACE",
             "CLAUDE_PROJECT_DIR",
         }
-        return {k: v for k, v in os.environ.items() if k not in blocked}
+        env = {k: v for k, v in os.environ.items() if k not in blocked}
+        settings_path = Path.home() / ".claude" / "settings.json"
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            for key, value in settings.get("env", {}).items():
+                if isinstance(value, str):
+                    env.setdefault(key, value)
+        except (OSError, ValueError, TypeError):
+            pass
+        return env
 
     def _spawn(self, cmd: List[str], prompt: str) -> subprocess.Popen:
         proc = subprocess.Popen(

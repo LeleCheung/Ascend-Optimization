@@ -42,7 +42,15 @@ def enrich_workloads_with_shapes(
         item = copy.deepcopy(wl)
         target = item.get("workload", item)
         resolved: Dict[str, Any] = {}
-        for input_name, spec in (target.get("inputs") or {}).items():
+        inputs = target.get("inputs") or {}
+        if not isinstance(inputs, dict):
+            enriched.append(item)
+            continue
+        for input_name, spec in inputs.items():
+            # Lists and scalar literals are valid Definition inputs, but they do
+            # not carry tensor metadata to normalize for the coder prompt.
+            if not isinstance(spec, dict):
+                continue
             if spec.get("type") not in {"random", "custom"}:
                 continue
             if spec.get("shape") is not None and spec.get("dtype"):

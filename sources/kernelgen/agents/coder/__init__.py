@@ -188,17 +188,26 @@ class CoderAgent(BaseAgent):
             for k, v in d.axes.items()
         )
         inputs_str = "\n".join(
-            f"  {k}: "
-            + (
-                "non-tensor"
-                if v.get("shape") is None
-                else str(v.get("shape", []))
+            (
+                f"  {k}: "
+                + (
+                    "non-tensor"
+                    if v.get("shape") is None
+                    else str(v.get("shape", []))
+                )
+                + f" ({v.get('dtype','')})"
+                if isinstance(v, dict)
+                else f"  {k}: {v!r} ({type(v).__name__})"
             )
-            + f" ({v.get('dtype','')})"
             for k, v in d.inputs.items()
         )
+        # Native Catalogs may declare outputs as a list of names without
+        # per-output shape metadata. Keep prompt rendering protocol-tolerant.
+        output_items = d.outputs.items() if isinstance(d.outputs, dict) else (
+            (name, {}) for name in d.outputs
+        )
         outputs_str = "\n".join(
-            f"  {k}: {v.get('shape', [])} ({v.get('dtype','')})" for k, v in d.outputs.items()
+            f"  {k}: {v.get('shape', [])} ({v.get('dtype','')})" for k, v in output_items
         )
         run_param_count = len(d.inputs)
         if inp.destination_passing_style:

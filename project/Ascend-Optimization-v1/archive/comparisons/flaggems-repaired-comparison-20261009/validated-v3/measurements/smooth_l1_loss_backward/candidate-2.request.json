@@ -1,0 +1,25 @@
+{
+  "api_version": "v6.2",
+  "binding": {
+    "bundle_id": "sha256:fb6bb1f3bb38d761e1cb23d57fde0d960489c3c8810ea7a990d89531d1c28c50",
+    "definition": "smooth_l1_loss_backward"
+  },
+  "implementation": {
+    "name": "smooth_l1_loss_backward-candidate-2",
+    "definition": "smooth_l1_loss_backward",
+    "language": "triton",
+    "entrypoint": "main.py::run",
+    "sources": [
+      {
+        "path": "main.py",
+        "content": "\"\"\"Triton implementation of ``smooth_l1_loss_backward`` for Ascend 910B.\n\nElementwise backward of the smooth-L1 (Huber with ``beta``) loss::\n\n    s   = 1 / numel(input)   when reduction == 'mean' else 1\n    out[i] = (grad_output[i] * s) * phi(input[i] - target[i])\n    phi(d) = d / beta   if |d| < beta\n           = sign(d)    otherwise\n\nSemantics mirror the reference exactly: the reduction scale is applied to the\ngradient operand before the elementwise product (not after), ``grad_output`` is\na scalar operand for the reduced modes, and the output has the shape/dtype of\n``input``.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n_BLOCK = 4096\n_REDUCTION_STR = {\"none\": 0, \"mean\": 1, \"sum\": 2}\n_MEAN = 1\n\n\n@triton.jit\ndef _smooth_l1_loss_backward_kernel(\n    grad_output_ptr,\n    input_ptr,\n    target_ptr,\n    out_ptr,\n    n_elements,\n    inv_n,\n    INV_BETA: tl.constexpr,\n    BETA_ZERO: tl.constexpr,\n    REDUCTION: tl.constexpr,\n    GRAD_SCALAR: tl.constexpr,\n    BLOCK_SIZE: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)\n    mask = offs < n_elements\n\n    x = tl.load(input_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    t = tl.load(target_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    diff = x - t\n\n    if BETA_ZERO:\n        # reference behaviour for beta == 0: explicit +1/-1 with exactly 0.0 at\n        # the kink (d == 0 must store 0.0, never NaN)\n        grad = tl.where(diff > 0.0, 1.0, tl.where(diff < 0.0, -1.0, 0.0))\n    else:\n        scaled = diff * INV_BETA\n        grad = tl.where(scaled < -1.0, -1.0, tl.where(scaled > 1.0, 1.0, scaled))\n\n    if GRAD_SCALAR:\n        grad_out = tl.load(grad_output_ptr).to(tl.float32)\n    else:\n        grad_out = tl.load(grad_output_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n\n    if REDUCTION == 1:\n        grad_out = grad_out * inv_n\n\n    tl.store(out_ptr + offs, grad * grad_out, mask=mask)\n\n\ndef run(grad_output, input, target, reduction, beta):\n    if isinstance(reduction, str):\n        red = _REDUCTION_STR.get(reduction, -1)\n        if red < 0:\n            raise ValueError(\"reduction must be one of 'none', 'mean', or 'sum'\")\n    elif isinstance(reduction, int) and 0 <= reduction <= 2:\n        red = reduction\n    else:\n        raise ValueError(\"reduction must be one of 'none', 'mean', or 'sum'\")\n\n    beta = float(beta)\n    if beta < 0:\n        raise RuntimeError(\"smooth_l1_loss does not support negative values for beta.\")\n\n    # reduction_elements is captured before any broadcast, as in the reference\n    reduction_elements = input.numel()\n    n_elements = reduction_elements\n    if input.shape != target.shape:\n        input, target = torch.broadcast_tensors(input, target)\n        n_elements = input.numel()\n    if not (input.is_contiguous() and target.is_contiguous()):\n        input = input.contiguous()\n        target = target.contiguous()\n\n    grad_scalar = grad_output.numel() == 1\n    if not grad_scalar:\n        if grad_output.shape != input.shape:\n            grad_output = torch.broadcast_to(grad_output, input.shape)\n        if not grad_output.is_contiguous():\n            grad_output = grad_output.contiguous()\n\n    out = torch.empty_like(input)\n    if n_elements == 0:\n        return out\n\n    inv_n = (1.0 / reduction_elements) if red == _MEAN else 1.0\n    grid = ((n_elements + _BLOCK - 1) // _BLOCK,)\n    _smooth_l1_loss_backward_kernel[grid](\n        grad_output,\n        input,\n        target,\n        out,\n        n_elements,\n        inv_n,\n        INV_BETA=(0.0 if beta == 0.0 else 1.0 / beta),\n        BETA_ZERO=(beta == 0.0),\n        REDUCTION=red,\n        GRAD_SCALAR=grad_scalar,\n        BLOCK_SIZE=_BLOCK,\n    )\n    return out\n"
+      }
+    ]
+  },
+  "settings": {
+    "warmup_ms": 1000,
+    "benchmark_ms": 100,
+    "num_trials": 1,
+    "timeout_seconds": 1500
+  }
+}

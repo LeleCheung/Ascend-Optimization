@@ -31,7 +31,7 @@ Triton Python
 
 ## 分层实测
 
-来自 910B `tle_yy` 容器的同进程测量见 [分解结果](../project/Ascend-Optimization-v1/reports/ascend910b/narrow-copy-combined-20261006/decompose-narrow-copy-v5.json)：
+来自 910B `tle_yy` 容器的同进程测量见 [分解结果](../project/Ascend-Optimization-v1/operators/narrow_copy/reports/narrow-copy-combined-20261006/decompose-narrow-copy-v5.json)：
 
 | case | 首次调用 | warm 完整调用 wall | 仅 `new_empty` wall | PyTorch wall |
 | --- | ---: | ---: | ---: | ---: |
@@ -40,7 +40,7 @@ Triton Python
 
 这些 host probe 不是 KGS walltime，不能把两列直接相减当作精确设备时间；但它们足以证明：小 case 的分配和 launcher 路径占主要比例，大 case 还叠加了实际搬运时间。
 
-同一批归档的独立 `msprof` 采集显示：小尺寸 float16 kernel 的设备平均时间约 `2.44 us`，大尺寸 float16 persistent kernel 约 `89.56 us`，后者 MTE2/MTE3 比例分别为 `0.916/0.7125`。这些采集与 host probe 不是同一次计时，不能相减；它们只用于确认 NPU kernel 本身的量级。编译缓存验证还记录了第一次 `compiled=1, hits=0`，随后五次保持 `compiled=1`、`hits=5`、`disabled=0`，见 [cache-verification](../project/Ascend-Optimization-v1/reports/ascend910b/narrow-copy-combined-20261006/cache-verification.json)。
+同一批归档的独立 `msprof` 采集显示：小尺寸 float16 kernel 的设备平均时间约 `2.44 us`，大尺寸 float16 persistent kernel 约 `89.56 us`，后者 MTE2/MTE3 比例分别为 `0.916/0.7125`。这些采集与 host probe 不是同一次计时，不能相减；它们只用于确认 NPU kernel 本身的量级。编译缓存验证还记录了第一次 `compiled=1, hits=0`，随后五次保持 `compiled=1`、`hits=5`、`disabled=0`，见 [cache-verification](../project/Ascend-Optimization-v1/operators/narrow_copy/reports/narrow-copy-combined-20261006/cache-verification.json)。
 
 编译缓存里的低层 runner 可以在拿到精确 specialization key、并传入候选自身的 `BLOCK/EVEN` constexpr 参数后调用；v5 的 `direct_launcher_kind` 为 `compiled_cache`，小 case launcher wall 约 `87.2 us`，大 case 约 `253.0 us`。早期少传 constexpr 时曾得到：
 
@@ -62,9 +62,9 @@ TypeError: function takes exactly 15 arguments (13 given)
 --shared-mem-dynamic-size=122880
 ```
 
-当前 `bishengir-compile 1.1.0`（LLVM `19.1.7`，commit `428ab8fdab46`）全部报告 unknown argument；它只提示了不同的参数名，例如 `--enable-triton-kernel-compile`。原始失败 JSON 见 [compile-mode 探针](../project/Ascend-Optimization-v1/reports/ascend910b/narrow-copy-combined-20261006/probe-ascend-compile-mode.json)。
+当前 `bishengir-compile 1.1.0`（LLVM `19.1.7`，commit `428ab8fdab46`）全部报告 unknown argument；它只提示了不同的参数名，例如 `--enable-triton-kernel-compile`。原始失败 JSON 见 [compile-mode 探针](../project/Ascend-Optimization-v1/operators/narrow_copy/reports/narrow-copy-combined-20261006/probe-ascend-compile-mode.json)。
 
-实际 cache 中确实保存了一个 flat kernel specialization 的 `.source`、`.ttir`、`.ttadapter`、`.mlirbc`、`.bcmlir`、`.npubin` 和 metadata；样本及 SHA manifest 见 [narrow-copy-ir](../project/Ascend-Optimization-v1/reports/ascend910b/narrow-copy-combined-20261006/narrow-copy-ir/)。这些文件证明中间产物存在，但不等于它们构成稳定的外部编程接口；当前报告没有修改或替换这些内部产物。
+实际 cache 中确实保存了一个 flat kernel specialization 的 `.source`、`.ttir`、`.ttadapter`、`.mlirbc`、`.bcmlir`、`.npubin` 和 metadata；样本及 SHA manifest 见 [narrow-copy-ir](../project/Ascend-Optimization-v1/operators/narrow_copy/reports/narrow-copy-combined-20261006/narrow-copy-ir)。这些文件证明中间产物存在，但不等于它们构成稳定的外部编程接口；当前报告没有修改或替换这些内部产物。
 
 因此当前结论是：
 

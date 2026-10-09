@@ -72,6 +72,27 @@ def test_run_returns_coder_report():
     assert "8.9x" in out.summary
 
 
+def test_coder_prompt_accepts_native_list_and_scalar_inputs():
+    definition = {
+        **_BASE["definition"],
+        "name": "native_layer_norm",
+        "inputs": {
+            "input": {"shape": [2, 4], "dtype": "float32"},
+            "normalized_shape": [4],
+            "eps": 1e-5,
+        },
+    }
+    rt = _rt()
+
+    CoderAgent().run(
+        {**_BASE, "definition": definition, "catalog_name": ""}, rt
+    )
+
+    prompt = rt.calls[0]["prompt"]
+    assert "normalized_shape: [4] (list)" in prompt
+    assert "eps: 1e-05 (float)" in prompt
+
+
 def test_input_rejects_removed_trace_fields():
     for legacy_field in ("trace_root", "trace_set_key"):
         try:

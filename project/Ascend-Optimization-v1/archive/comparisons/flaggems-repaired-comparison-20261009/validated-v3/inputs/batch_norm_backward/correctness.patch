@@ -1,0 +1,82 @@
+--- original.py
++++ repaired.py
+@@ -218,13 +218,17 @@
+     input_grad_mask: tl.constexpr,
+     weight_grad_mask: tl.constexpr,
+     bias_grad_mask: tl.constexpr,
++    EPS: tl.constexpr,
++    TRAIN: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+ ):
+     feat_pid = tl.program_id(axis=0)
+ 
+     mean = tl.load(feat_pid + mean_pointer).to(tl.float32)
+-    inv_std = tl.load(feat_pid + inv_std_pointer).to(tl.float32)
++    # 当前 torch_npu 保存统计量参数实际为方差。
++    variance = tl.load(feat_pid + inv_std_pointer).to(tl.float32)
++    inv_std = rsqrt(variance + EPS)
+ 
+     term1 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+     term2 = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+@@ -314,11 +318,13 @@
+                 curr_output_grad_pointer,
+                 mask=batch_mask[:, None] & spatial_mask[None, :],
+             ).to(tl.float32)
+-            curr_input_grad = (
+-                inv_std
+-                * weight
+-                * (curr_output_grad - (term1 * curr_pre_lin + term2) / count)
+-            )
++            if TRAIN:
++                curr_input_grad = (
++                    inv_std * weight
++                    * (curr_output_grad - (term1 * curr_pre_lin + term2) / count)
++                )
++            else:
++                curr_input_grad = inv_std * weight * curr_output_grad
+             tl.store(
+                 curr_input_grad_pointer,
+                 curr_input_grad,
+@@ -385,6 +391,8 @@
+     output_mask=None,
+ ):
+     logger.debug("GEMS BATCHNORM BACKWARD")
++    if output_mask is None:
++        output_mask = (True, True, True)
+     input_3d = make_3d_for_bn(input)
+     output_grad_3d = make_3d_for_bn(grad_out)
+ 
+@@ -408,8 +416,8 @@
+         batch_norm_backward_kernel[(feat_dim,)](
+             output_grad_3d,
+             input_3d,
+-            save_mean,
+-            save_invstd,
++            save_mean if train else running_mean,
++            save_invstd if train else running_var,
+             weight,
+             input_grad,
+             weight_grad,
+@@ -418,14 +426,19 @@
+             spatial_dim,
+             *output_grad_3d.stride(),
+             *input_3d.stride(),
+-            *input_grad.stride(),
++            *(input_grad.stride() if input_grad is not None else input_3d.stride()),
+             *output_mask,
++            EPS=float(eps),
++            TRAIN=bool(train),
+         )
+ 
+     # Pads output with None because a gradient is necessary for
+     # all input arguments.
+     return (
+-        input_grad.view_as(input),
++        input_grad.view_as(input) if input_grad is not None else None,
+         weight_grad,
+         bias_grad,
+     )
++
++
++run = batch_norm_backward
