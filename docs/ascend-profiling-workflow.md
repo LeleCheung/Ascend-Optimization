@@ -26,6 +26,10 @@ KG/KGS 原生能力不能概括成“没有 profiler”。KGS 的 Ascend 后端�
 
 Roofline 仅在 FLOPs、实际搬运 Bytes、设备执行时间和 roof 对应同一 kernel/range 且来源明确时计算。`narrow_copy` 的 `2 × 输出元素数 × dtype 字节数` 只是逻辑读写量，不能代替物理 GM/HBM Bytes；纯拷贝也不适合用计算 FLOPs 屋顶判断。当前独立报告应保持 `roofline.status=unavailable`，直到验证当前 CANN 生成的官方 Roofline 原始数据、对应范围和 roof 来源。仓库的 [Roofline 数据契约](<Roofline 分析.md>)要求 `manifest.json + points.jsonl`；不满足时不生成伪点。
 
+当前 workflow schema 1.3 已从正式 benchmark 合同计算逐 case 的语义工作量：`amin` 的输出数 ×（归约长度 − 1）次比较，GEMM 的 `2MNK` FLOPs，以及切片拷贝的一读一写逻辑字节。min 比较次数不冒充 GEMM FLOPs，融合 GEMM 的 FLOPs 仅计矩阵乘；转置、多阶段临时张量、tile 重读及物理 HBM/GM 字节须另行采证。模型保留 `physical_bytes=null`、`roofline_usable=false`，因此可辅助选择采集方向，但不能直接算屋顶利用率。
+
+流水线判断也按语义分流：amin 检查 AIV MTE2、Vector、Scalar，提出归约分块、连续列搬运及中间类型实验；矩阵乘检查 AIC 搬运和控制；仅 narrow_copy 使用拷贝规则。当前阈值是生成下一项实验的启发式，多个流水线可以重叠，并非严格瓶颈证明；最终仍看同口径完整复验是否更快。Windows 的 13 项检查覆盖真实归档绑定、设备计时不得推断 host 差距、三类工作量、非法合同及归约分类。
+
 ## 从 CUDA 方法迁移
 
 已复核 `KernelFlow-ops/cuda-optimized-skill` 的 `cuda-kernel-optimizer`，HEAD `114a6cba4c194e18d3fe23a4fc2251c982f34309`。可迁移的是：环境/硬件门禁，正确性和稳定计时先于优化，先 profile 当前 best，单项假设与预期指标，失败停止或回退，以及同口径消融。其 `near_peak` 仅在三类差距、可信 workload model 都已知时才允许；910B 缺少这些量时不声称接近上限。

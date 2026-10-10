@@ -87,6 +87,56 @@ class KernelSelectionTest(unittest.TestCase):
             workflow.select_kernel(report, "matmul_bias_activation", "mba_pipeline_kernel")
 
 
+class SemanticModelTest(unittest.TestCase):
+    def test_amin_actual_middle_axis_contract(self):
+        axes = {"dtype": "bfloat16", "shape_detail": [[1024, 1024, 1024], 1]}
+        model = workflow.workload_model("amin", axes)
+        self.assertEqual(model["output_elements"], 1024 ** 2)
+        self.assertEqual(model["minimum_comparisons"], 1024 ** 2 * 1023)
+        self.assertEqual(model["logical_bytes"], 2 * (1024 ** 3 + 1024 ** 2))
+        self.assertIsNone(model["flops"])
+        self.assertIsNone(model["physical_bytes"])
+        self.assertFalse(model["roofline_usable"])
+
+    def test_negative_axis_and_global_reduction(self):
+        negative = workflow.workload_model("amin", {"dtype": "float32", "shape_detail": [[3, 4, 5], -2]})
+        self.assertEqual(negative["minimum_comparisons"], 15 * 3)
+        global_model = workflow.workload_model("amin", {"dtype": "float16", "shape_detail": [[1048576]]})
+        self.assertEqual(global_model["output_elements"], 1)
+        self.assertEqual(global_model["minimum_comparisons"], 1048575)
+
+    def test_gemm_non_square_and_slice_bytes(self):
+        gemm = workflow.workload_model("matmul_bias_activation", {
+            "dtype": "float32", "shape_detail": [[15, 160], [160, 1024], [1024]]})
+        self.assertEqual(gemm["flops"], 2 * 15 * 160 * 1024)
+        self.assertEqual(gemm["logical_bytes"], 4 * (15 * 160 + 160 * 1024 + 1024 + 15 * 1024))
+        copy = workflow.workload_model("narrow_copy", {
+            "dtype": "float16", "shape_detail": [[64, 64], 0, 16, 32]})
+        self.assertEqual(copy["logical_bytes"], 2 * 32 * 64 * 2)
+        self.assertEqual(copy["flops"], 0)
+
+    def test_malformed_contract_cannot_create_workload_estimate(self):
+        for operator, detail in (("amin", [[3, 4], 2]), ("amin", [[3, 0], 1]),
+                                 ("matmul_bias_activation", [[3, 4], [5, 6], [6]]),
+                                 ("narrow_copy", [[3, 4], 0, 2, 2])):
+            with self.subTest(operator=operator):
+                self.assertEqual(workflow.workload_model(operator, {
+                    "dtype": "float16", "shape_detail": detail})["status"], "unavailable")
+
+    def test_reduction_is_not_classified_as_copy(self):
+        case = {"operator": "amin", "timing_scope": "device_kernel",
+                "walltime": {"candidate_us": 3000},
+                "metrics": {"device_duration_us": 3100, "aiv_mte2_ratio": 0.9,
+                            "aiv_mte3_ratio": 0.6, "aiv_vec_ratio": 0.5}}
+        self.assertEqual(workflow.diagnose(case)["bound"], "reduction_data_pipeline")
+        case["metrics"]["aiv_mte2_ratio"] = 0.2
+        case["metrics"]["aiv_vec_ratio"] = 0.8
+        self.assertEqual(workflow.diagnose(case)["bound"], "reduction_vector_pipeline")
+        case["metrics"]["aiv_vec_ratio"] = 0.3
+        case["metrics"]["aiv_scalar_ratio"] = 0.7
+        self.assertEqual(workflow.diagnose(case)["bound"], "reduction_control_pipeline")
+
+
 class MasterMatmulEvidenceTest(unittest.TestCase):
     def setUp(self):
         self.root = PROJECT / "operators" / "matmul_bias_activation" / "reports" / "master-20261010"

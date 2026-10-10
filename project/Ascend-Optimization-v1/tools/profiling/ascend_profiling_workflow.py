@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
 import statistics
 from pathlib import Path
@@ -76,6 +77,73 @@ def mapped_lines(profile: dict, source_name: str, line_count: int) -> list[int]:
                    if 1 <= int(line) <= line_count})
 
 
+def workload_model(operator: str, axes: dict) -> dict:
+    """只计算语义上的工作量；逻辑字节不替代硬件搬运计数。"""
+    dtype = str(axes.get("dtype", "")).removeprefix("torch.")
+    element_bytes = {"float16": 2, "bfloat16": 2, "float32": 4}.get(dtype)
+    detail = axes.get("shape_detail")
+    unavailable = {"status": "unavailable", "reason": "缺少可识别的 dtype/shape_detail"}
+    if element_bytes is None or not isinstance(detail, list) or not detail:
+        return unavailable
+
+    def shape(value):
+        if not isinstance(value, list) or not value or any(type(n) is not int or n <= 0 for n in value):
+            raise ValueError("形状须为正整数列表")
+        return value
+
+    try:
+        dims = shape(detail[0])
+        inputs = math.prod(dims)
+        if operator == "amin":
+            if len(detail) == 1:
+                reduction, outputs, axis = inputs, 1, None
+            else:
+                axis = detail[1]
+                if type(axis) is not int or not -len(dims) <= axis < len(dims):
+                    return unavailable
+                axis %= len(dims)
+                reduction, outputs = dims[axis], inputs // dims[axis]
+            data = {"semantic": "最小值归约", "compute_path": "AIV Vector",
+                    "input_elements": inputs, "output_elements": outputs,
+                    "reduction_axis": axis, "reduction_length": reduction,
+                    "minimum_comparisons": outputs * (reduction - 1),
+                    "flops": None, "logical_bytes": (inputs + outputs) * element_bytes,
+                    "note": "比较次数不是 GEMM FLOPs；单次读输入、写输出的逻辑模型不含转置和多阶段临时张量。"}
+        elif operator == "matmul_bias_activation":
+            rhs = shape(detail[1])
+            if len(dims) != 2 or len(rhs) != 2 or dims[1] != rhs[0]:
+                return unavailable
+            m, k = dims
+            n = rhs[1]
+            bias = shape(detail[2])
+            data = {"semantic": "矩阵乘、bias 与 ReLU 融合", "compute_path": "AIC Cube + AIV Vector",
+                    "m": m, "n": n, "k": k, "flops": 2 * m * n * k,
+                    "logical_bytes": (m * k + k * n + math.prod(bias) + m * n) * element_bytes,
+                    "note": "FLOPs 仅计矩阵乘，FMA 计两次；逻辑字节按输入各读一次与输出写一次，不含 tile 重读。"}
+        elif operator == "narrow_copy":
+            axis, start, length = detail[1:4]
+            if (type(axis) is not int or not -len(dims) <= axis < len(dims)
+                    or type(start) is not int or type(length) is not int or length < 0):
+                return unavailable
+            axis %= len(dims)
+            if start < 0:
+                start %= dims[axis]
+            if not 0 <= start <= dims[axis] or length > dims[axis] - start:
+                return unavailable
+            outputs = inputs // dims[axis] * length
+            data = {"semantic": "切片并复制到独立输出", "compute_path": "AIV MTE2/MTE3 或 D2D",
+                    "input_elements": inputs, "output_elements": outputs,
+                    "flops": 0, "logical_bytes": 2 * outputs * element_bytes,
+                    "note": "只计所选元素的一读一写；非连续输入的预处理和实际物理搬运另测。"}
+        else:
+            return {"status": "unavailable", "reason": "尚无该算子的工作量模型"}
+    except (IndexError, ValueError, TypeError):
+        return unavailable
+    return {"status": "algorithm_estimate", "dtype": dtype, "element_bytes": element_bytes,
+            "byte_source": "logical_minimum", "physical_bytes": None,
+            "roofline_usable": False, **data}
+
+
 def diagnose(case: dict) -> dict:
     wall = case["walltime"]
     metrics = case.get("metrics")
@@ -94,6 +162,24 @@ def diagnose(case: dict) -> dict:
                 "falsifier": "分项 host 测量没有可重复差距，或完整评测未改善。"}
     aic_mte2 = metrics.get("aic_mte2_ratio")
     aic_scalar = metrics.get("aic_scalar_ratio")
+    if case.get("operator") == "amin":
+        vec = metrics.get("aiv_vec_ratio")
+        scalar = metrics.get("aiv_scalar_ratio")
+        if isinstance(mte2, (int, float)) and mte2 >= 0.7:
+            return {"bound": "reduction_data_pipeline", "confidence": "medium",
+                    "inference": f"最小值归约的 AIV MTE2 活跃比例为 {mte2:.1%}。优先检查连续列搬运粒度、归约分块及中间类型；该比例不等于 HBM 带宽利用率。",
+                    "next_experiment": "比较连续宽列分块和 bf16 minimum 后显式恢复类型，与 PyTorch 逐值比较后完整复验；记录设备延迟和 MTE2/Vector 变化。",
+                    "falsifier": "搬运粒度或类型修改没有改善设备延迟，或任一正确性用例失败。"}
+        if isinstance(vec, (int, float)) and vec >= 0.7:
+            return {"bound": "reduction_vector_pipeline", "confidence": "medium",
+                    "inference": f"最小值归约的 Vector 活跃比例为 {vec:.1%}。优先检查类型转换与归约指令，不能将它解释为 Cube GEMM 算力已达峰值。",
+                    "next_experiment": "固定布局与分块，比较 fp32 累积和可编译的输入精度 min，保存 IR/指标并完整复验。",
+                    "falsifier": "向量流水线变化不伴随延迟改善，或类型变化破坏 min 的结果。"}
+        if isinstance(scalar, (int, float)) and scalar >= 0.5:
+            return {"bound": "reduction_control_pipeline", "confidence": "medium",
+                    "inference": f"最小值归约的 Scalar 活跃比例为 {scalar:.1%}，应检查归约循环、地址计算和 program 覆盖。",
+                    "next_experiment": "增大单次归约片，减少循环次数，并测量 UB 容量与完整性能。",
+                    "falsifier": "循环减少却使搬运或 UB 压力增加，整体延迟没有改善。"}
     if case.get("operator") == "matmul_bias_activation" and isinstance(aic_mte2, (int, float)) and aic_mte2 >= 0.7:
         return {"bound": "gemm_data_pipeline", "confidence": "medium",
                 "inference": f"矩阵乘的 AIC MTE2 活跃比例为 {aic_mte2:.1%}，Scalar 为 {aic_scalar}。优先增加 K 分块、减少循环和地址计算，再重叠搬运与计算。流水线比例不等于 HBM 带宽利用率，各比例不能相加。",
@@ -104,10 +190,10 @@ def diagnose(case: dict) -> dict:
                 "inference": "小矩阵的 Scalar 活跃比例超过一半，原 tile 的 program 数较少；循环控制和并行覆盖应优先优化。",
                 "next_experiment": "用较小 M/N tile 覆盖更多核，同时增大 K 分块以减少循环；完整复验。",
                 "falsifier": "更高 program 数反而增加搬运，或总延迟没有改善。"}
-    if isinstance(mte2, (int, float)) and mte2 >= 0.7 and isinstance(mte3, (int, float)) and mte3 >= 0.4:
+    if case.get("operator") == "narrow_copy" and isinstance(mte2, (int, float)) and mte2 >= 0.7 and isinstance(mte3, (int, float)) and mte3 >= 0.4:
         return {"bound": "device_copy_pipeline_hypothesis", "confidence": "medium",
                 "inference": "该 kernel 的 MTE2/MTE3 活跃比例较高，值得测试搬运分块和并行度；比例不等于 HBM 带宽利用率或已达峰值。",
-                "next_experiment": "仅调整持续拷贝 kernel 的每 program 分块数，比较同卡设备指标与完整 15 case walltime。",
+                "next_experiment": "仅调整持续拷贝 kernel 的每 program 分块数，比较同卡设备指标与完整性能评测；计时范围沿用该合同。",
                 "falsifier": "MTE2/MTE3 指标和完整评测没有稳定改善，或任一正确性用例失败。"}
     return {"bound": "inconclusive", "confidence": "low",
             "inference": "现有指标不足以区分设备计算、搬运或 host 路径。",
@@ -191,7 +277,7 @@ def analyze(operator: str, source_path: Path, eval_path: Path, eval_request_path
                 "speedup": row["speedup"], "source": str(eval_path),
                 "scope": "完整调用 walltime" if timing_scope == "walltime" else "FlagGems Ascend 设备 kernel 计时"}
         record = {"case_id": case_id, "operator": operator, "timing_scope": timing_scope,
-                  "axes": entry["axes"], "walltime": wall,
+                  "axes": entry["axes"], "workload_model": workload_model(operator, entry["axes"]), "walltime": wall,
                   "metrics": ({"kernel": op.get("op_name"),
                                "device_duration_us": op.get("avg_duration_us"),
                                "aiv_mte2_ratio": op.get("aiv_mte2_ratio"),
@@ -208,7 +294,7 @@ def analyze(operator: str, source_path: Path, eval_path: Path, eval_request_path
         record["diagnosis"] = diagnose(record)
         result_cases.append(record)
     covered = sum(bool(case["profiles"]) for case in result_cases)
-    return {"schema_version": "1.2", "operator": operator, "timing_scope": timing_scope,
+    return {"schema_version": "1.3", "operator": operator, "timing_scope": timing_scope,
             "kernel_prefix": kernel_prefix,
             "candidate": {"path": str(source_path), "sha256": source_hash},
             "evaluation": {"path": str(eval_path), "request": str(eval_request_path),
@@ -240,6 +326,17 @@ def render(report: dict) -> str:
         device = f"{m['device_duration_us']:.2f}" if m and isinstance(m["device_duration_us"], (int, float)) else "—"
         lines.append(f"| {'/'.join(short)} | {w['pytorch_us']:.2f} | {w['candidate_us']:.2f} | "
                      f"{w['speedup']:.3f}× | {device} | {d['bound']} | {d['confidence']} |")
+    lines.extend(["", "## 语义与逻辑工作量", "",
+                  "以下由合同中的形状与 dtype 计算，不是硬件计数；逻辑字节不能代替物理 HBM/GM 搬运量或作为数值 Roofline 点。", "",
+                  "| case | 语义 | 逻辑字节 | GEMM FLOPs / min 比较次数 |",
+                  "| --- | --- | ---: | ---: |"])
+    for case in report["cases"]:
+        model = case["workload_model"]
+        if model.get("status") != "algorithm_estimate":
+            continue
+        work = (f"min 比较 {model['minimum_comparisons']}" if model.get("flops") is None
+                else str(model["flops"]))
+        lines.append(f"| {'/'.join(case['case_id'].split('::')[-2:])} | {model['semantic']} | {model['logical_bytes']} | {work} |")
     lines.extend(["", "## 逐 case 判断", ""])
     for case in report["cases"]:
         if not case["profiles"]:
