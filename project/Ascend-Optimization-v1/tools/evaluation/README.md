@@ -76,6 +76,6 @@ KG 使用原生后台 worker，启动脚本等待其终态，可由 tmux 托管�
 
 amin 的 `probe-native-reduction.py` 检查原生精度 min 与浮点扩展、连续宽列和多行分块；matmul 的 `probe-wide-tiles.py` 检查更宽 tile、多缓冲与 UB 节省。两者用 `do_bench_npu` 的设备计时筛选，v5 生成器只使用数值检查通过的配置，随后重新运行完整套件。分块诊断和事件计时不能替代完整评测。最终保留完整通过且整体最快的候选，失败版本作为原始证据留存。
 
-`collect-optimized-profiles.py` 从指定的完整通过结果和实际 case ID 采集 `PipeUtilization` 真机指标，绑定源码 SHA、合同和原始附件，自动生成中文体检报告。`run-grouped-v6-910b.sh` 在两组 KG 及首次独立复验完成后，串行采集 amin 的大输入指标、测试 matmul 的分组调度与较小输出 tile、完整复验新候选，再采集固定 v5 的指标。narrow campaign 等这批任务结束后才启动同卡服务。
+`collect-optimized-profiles.py` 从指定的完整通过结果和实际 case ID 采集 `PipeUtilization` 真机指标，绑定源码 SHA、合同和原始附件，自动生成中文体检报告。`run-grouped-v6-910b.sh` 在两组 KG 及首次独立复验完成后，串行采集 amin 的大输入指标、测试 matmul 的分组调度与较小输出 tile、完整复验新候选，再采集固定 v5 的指标。随后 `run-bf16-v6-910b.sh` 验证 amin 的 bf16 循环类型修复，与 PyTorch 和 v5 逐值比较后执行完整 27 项评测。narrow campaign 等这些任务结束后才启动同卡服务。各新版本仅在完整通过且整体更快时替换当前最佳候选。
 
 已完成结果：amin v5 为 0.916×，27/27 通过；matmul v5 为 0.772×，42/42 通过。二者相对兼容 master/master 分别为 3.11×、1.75×。这些是我们的候选结果，四版本对照待 KG 两组独立复验完成。

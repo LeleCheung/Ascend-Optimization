@@ -79,7 +79,8 @@ matmul_bias_activation = run
         'diagnostic_sha256': hashlib.sha256(args.diagnostic.read_bytes()).hexdigest(),
         'candidate_sha256': hashlib.sha256(target.read_bytes()).hexdigest(),
         'selected': list(selected.values()),
-        'verification': '诊断与 v4 最大绝对差为零，待完整 42 项评测。',
+        'verification': ('诊断与 v4 最大绝对差为零，待完整 42 项评测。' if default
+                         else '诊断与父候选 ' + args.parent + ' 最大绝对差为零，待完整 42 项评测。'),
     }
     target.with_suffix('.provenance.json').write_text(
         json.dumps(provenance, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')

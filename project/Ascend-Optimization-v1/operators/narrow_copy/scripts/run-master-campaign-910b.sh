@@ -15,7 +15,8 @@ sessions=(kg-master-continue-v2-20261010 kg-master-no-profile-recovery-20261010
           kg-matmul-v3-eval-20261010 kg-finalize-master-20261010
           kg-roofline-and-global-20261010 kg-matmul-tuning-20261010
           kg-amin-grid-master-20261010 kg-matmul-v4-eval-20261010
-          kg-amin-direct-tiles-20261010 kg-matmul-grouped-v6-20261010)
+          kg-amin-direct-tiles-20261010 kg-matmul-grouped-v6-20261010
+          kg-amin-bf16-v6-20261010)
 while true; do
   running=0
   for session in "${sessions[@]}"; do
