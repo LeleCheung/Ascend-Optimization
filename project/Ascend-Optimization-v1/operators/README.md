@@ -5,8 +5,8 @@
 | 算子 | Excel 位置与加速比 | 当前记录 | 下一步 |
 |---|---|---|---|
 | [narrow_copy](narrow_copy/README.md) | G29：0.0138× | D2D 混合候选约 0.56～0.59×，未达标 | 新 master 基线复测后决定是否继续 |
-| [matmul_bias_activation](matmul_bias_activation/README.md) | G611：0.5408× | 历史候选约 0.49× | 新 master 基线复测 |
-| [amin](amin/README.md) | G92：0.5536× | 新 master 已固定，inspect 通过，基线评测中 | 两组 KG 后采集并分析 profiling，交付第三版本 |
+| [matmul_bias_activation](matmul_bias_activation/README.md) | G611：0.5408× | 固定 master 0.443×；我们的 v5 为 0.772×，相对 master 1.75×，42/42 通过 | 改善大矩阵流水线，完成两组 KG 独立复验 |
+| [amin](amin/README.md) | G92：0.5536× | 启动兼容基线 0.296×；我们的 v5 为 0.916×，相对该基线 3.11×，27/27 通过 | 恢复 KG 两组，完成四版本对照 |
 
 一个算子一个目录，README 串起候选、专用脚本和报告。新对象只在正式复测时创建目录；通用工具见 [tools](../tools/README.md)。
 

@@ -52,9 +52,18 @@ def check_artifacts(response: dict, directory: Path) -> list[dict]:
     return checked
 
 
-def select_kernel(profile: dict, operator: str) -> dict | None:
-    ops = [op for op in profile.get("metrics", {}).get("ops", [])
-           if operator.lower() in op.get("op_name", "").lower()]
+def select_kernel(profile: dict, operator: str, kernel_prefix: str | None = None) -> dict | None:
+    entries = profile.get("metrics", {}).get("ops", [])
+    if kernel_prefix is not None:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", kernel_prefix):
+            raise ValueError("kernel 前缀须为实际内核符号")
+        # 优化版的符号可能不含算子名；按明确符号及编译后缀边界匹配。
+        pattern = re.compile(re.escape(kernel_prefix) + r"(?:_|$)")
+        ops = [op for op in entries if pattern.match(op.get("op_name", ""))]
+        if len({op.get("op_name") for op in ops}) > 1:
+            raise ValueError("kernel 前缀匹配多个符号，须指定更完整的符号")
+    else:
+        ops = [op for op in entries if operator.lower() in op.get("op_name", "").lower()]
     if not ops:
         return None
     return max(ops, key=lambda op: op.get("avg_duration_us") or 0)
@@ -109,7 +118,8 @@ def diagnose(case: dict) -> dict:
 def analyze(operator: str, source_path: Path, eval_path: Path, eval_request_path: Path,
             inspect_path: Path, profiles: list[tuple[Path, Path, Path]],
             ir_paths: tuple[Path, ...] = (), *, timing_scope: str = "walltime",
-            evaluation_provenance: Path | None = None) -> dict:
+            evaluation_provenance: Path | None = None,
+            kernel_prefix: str | None = None) -> dict:
     if timing_scope not in {"walltime", "device_kernel"}:
         raise ValueError("计时范围必须为 walltime 或 device_kernel")
     source = source_path.read_text(encoding="utf-8-sig")
@@ -156,7 +166,7 @@ def analyze(operator: str, source_path: Path, eval_path: Path, eval_request_path
         entry = cases.setdefault(case_id, {"axes": timing[case_id].get("axes", {}), "profiles": {}})
         if level in entry["profiles"]:
             raise ValueError(f"重复的 case/level: {case_id} {level}")
-        op = select_kernel(response, operator)
+        op = select_kernel(response, operator, kernel_prefix)
         entry["profiles"][level] = {
             "profile_id": response["profile_id"], "device": response.get("device"),
             "software": response.get("hardware", {}).get("software"),
@@ -198,7 +208,8 @@ def analyze(operator: str, source_path: Path, eval_path: Path, eval_request_path
         record["diagnosis"] = diagnose(record)
         result_cases.append(record)
     covered = sum(bool(case["profiles"]) for case in result_cases)
-    return {"schema_version": "1.1", "operator": operator, "timing_scope": timing_scope,
+    return {"schema_version": "1.2", "operator": operator, "timing_scope": timing_scope,
+            "kernel_prefix": kernel_prefix,
             "candidate": {"path": str(source_path), "sha256": source_hash},
             "evaluation": {"path": str(eval_path), "request": str(eval_request_path),
                            "inspect": str(inspect_path), "benchmark_fingerprint": fingerprint,
@@ -262,10 +273,11 @@ def main() -> None:
     parser.add_argument("--ir", type=Path, action="append", default=[])
     parser.add_argument("--timing-scope", choices=["walltime", "device_kernel"], default="walltime")
     parser.add_argument("--evaluation-provenance", type=Path)
+    parser.add_argument("--kernel-prefix", help="优化内核实际符号，如 mba_pipeline_kernel；匹配不唯一时拒绝分析")
     args = parser.parse_args()
     report = analyze(args.operator, args.source, args.evaluation, args.evaluation_request,
                      args.inspect, args.profile, tuple(args.ir), timing_scope=args.timing_scope,
-                     evaluation_provenance=args.evaluation_provenance)
+                     evaluation_provenance=args.evaluation_provenance, kernel_prefix=args.kernel_prefix)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(render(report), encoding="utf-8")
     args.output.with_suffix(".json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n",

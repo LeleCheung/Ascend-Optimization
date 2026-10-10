@@ -23,6 +23,10 @@ def main():
         str(args.workspace), args.operator, str(exported),
     ], check=True)
     subprocess.run([
+        sys.executable, str(tools / "archive-kg-evidence.py"),
+        str(args.workspace), str(args.output / "native-evidence"),
+    ], check=True)
+    subprocess.run([
         sys.executable, str(tools / "evaluate-operator.py"),
         "--operator", args.operator, "--source", str(exported / "main.py"),
         "--output", str(args.output / "independent"), "--label", args.label,

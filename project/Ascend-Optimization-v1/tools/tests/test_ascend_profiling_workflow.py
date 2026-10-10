@@ -68,6 +68,25 @@ class EvidenceWorkflowTest(unittest.TestCase):
                              for case in report["cases"]))
 
 
+class KernelSelectionTest(unittest.TestCase):
+    def test_explicit_optimized_symbol_excludes_other_kernels(self):
+        selected = {"op_name": "mba_pipeline_kernel_hash_mix_aic", "avg_duration_us": 20}
+        report = {"metrics": {"ops": [
+            {"op_name": "matmul_bias_activation_reference", "avg_duration_us": 100},
+            {"op_name": "mba_pipeline_kernel_extra_notselected", "avg_duration_us": 300},
+            selected]}}
+        self.assertIs(workflow.select_kernel(report, "matmul_bias_activation",
+                                            "mba_pipeline_kernel_hash"), selected)
+        self.assertIsNone(workflow.select_kernel(report, "matmul_bias_activation", "mba_wide_pipeline_kernel"))
+
+    def test_ambiguous_kernel_prefix_is_rejected(self):
+        report = {"metrics": {"ops": [
+            {"op_name": "mba_pipeline_kernel_first"},
+            {"op_name": "mba_pipeline_kernel_second"}]}}
+        with self.assertRaisesRegex(ValueError, "多个符号"):
+            workflow.select_kernel(report, "matmul_bias_activation", "mba_pipeline_kernel")
+
+
 class MasterMatmulEvidenceTest(unittest.TestCase):
     def setUp(self):
         self.root = PROJECT / "operators" / "matmul_bias_activation" / "reports" / "master-20261010"

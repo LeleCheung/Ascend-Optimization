@@ -4,15 +4,20 @@ import argparse
 import hashlib
 import json
 import math
+import re
 from pathlib import Path
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('diagnostic', type=Path)
+    parser.add_argument('--parent', default='profiling-k256-dotacc-v4-20261010')
+    parser.add_argument('--name', default='profiling-kwide-v5-20261010')
+    parser.add_argument('--expected-groups', type=int, default=9)
     args = parser.parse_args()
+    assert all(re.fullmatch(r'[a-z0-9-]+', name) for name in (args.parent, args.name))
     root = Path(__file__).resolve().parent.parent
-    source = root / 'candidates/profiling-k256-dotacc-v4-20261010.py'
+    source = root / ('candidates/' + args.parent + '.py')
     rows = json.loads(args.diagnostic.read_text(encoding='utf-8'))
     selected = {}
     for row in rows:
@@ -24,15 +29,20 @@ def main():
         key = row['dtype'], row['n']
         if key not in selected or latency < selected[key]['device_kernel_ms']:
             selected[key] = row
-    assert len(selected) == 6, '需要三个 dtype × 两个矩阵尺寸的有效真机数据'
+    sizes = (1024, 2048, 4096) if args.expected_groups == 9 else (2048, 4096)
+    expected = {(dtype, size) for dtype in ('torch.float16', 'torch.float32', 'torch.bfloat16') for size in sizes}
+    assert args.expected_groups in (6, 9) and set(selected) == expected, '需要每个 dtype × 矩阵尺寸的有效真机数据'
     probe = root / 'scripts/probe-pipeline-tiles.py'
     kernel = '@triton.jit' + probe.read_text(encoding='utf-8').split('@triton.jit', 1)[1].split('\ndef main():', 1)[0]
-    kernel = kernel.replace('def tuned_pipeline(', 'def mba_wide_pipeline_kernel(')
+    suffix = args.name.replace('-', '_')
+    default = args.name == 'profiling-kwide-v5-20261010'
+    symbol = 'mba_wide_pipeline_kernel' if default else 'mba_selected_' + suffix + '_kernel'
+    kernel = kernel.replace('def tuned_pipeline(', 'def ' + symbol + '(')
     table = {key: (*row['config'], row['multibuffer'], row['enable_ubuf_saving'], row['group'])
              for key, row in sorted(selected.items())}
-    text = source.read_text(encoding='utf-8') + '\n\n' + kernel
-    text += '\n_v4_mba = run\n_WIDE_TILES = ' + repr(table) + '\n'
-    text += '''
+    generated = '\n\n' + kernel
+    generated += '\n_v4_mba = run\n_WIDE_TILES = ' + repr(table) + '\n'
+    generated += '''
 
 def run(input, weight, bias):
     m, k = input.shape
@@ -54,7 +64,12 @@ def run(input, weight, bias):
 
 matmul_bias_activation = run
 '''
-    target = root / 'candidates/profiling-kwide-v5-20261010.py'
+    # 父候选可能已含上一轮的分发表与内核；每轮使用独立符号，避免覆盖。
+    if not default:
+        generated = generated.replace('_v4_mba', '_parent_' + suffix).replace('_WIDE_TILES', '_TILES_' + suffix)
+    generated = generated.replace('mba_wide_pipeline_kernel[', symbol + '[')
+    text = source.read_text(encoding='utf-8') + generated
+    target = root / ('candidates/' + args.name + '.py')
     compile(text, str(target), 'exec')
     assert not target.exists() or target.read_bytes() == text.encode('utf-8')
     target.write_bytes(text.encode('utf-8'))
