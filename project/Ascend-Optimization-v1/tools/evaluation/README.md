@@ -29,6 +29,8 @@ curl --noproxy '*' -fsS http://127.0.0.1:19655/status
 
 工具保存 server 状态、inspect、源码快照、SHA、请求和逐 case 结果。`amin` 必须完整通过 27 项、matmul 完整通过 42 项，不能只运行性能测试。amin 未修改 master 会在大输入遇到 `coreDim=131072` 启动超限，因此其可运行对照明确命名为“master 加启动兼容修复”，两组 KG 都从这份同一源码开始。
 
+`.gitattributes` 将项目 Python/shell 源码固定为 LF，reports 下的原始证据禁止 Git 文本换行转换。下载后的源码、JSON 和 profiler 附件按原字节保存，跨平台 clone 后仍须通过 SHA 校验；不要用编辑器批量格式化这些证据。
+
 ## 3. 运行原生 KG 两组
 
 确认前一组及其评测已经结束，再运行下一组。下面命令需要新的 workspace 后缀，不可直接覆盖正在运行或已有的 workspace。

@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 from pathlib import Path
 
 MASTER = 'd6a8eec473517a3d68157b208eb9c057eb1d4c50'
@@ -61,8 +62,13 @@ def audit(project):
         for stored, row in zip(closure, recomputed):
             if row['correctness_count'] != correctness or row['timing_count'] != timing:
                 raise ValueError(operator + ' 完整用例数与合同不一致')
-            for key in ('source_sha256', 'result_sha256', 'relative_pytorch', 'relative_master'):
+            for key in ('source_sha256', 'result_sha256'):
                 if stored.get(key) != row[key]:
+                    raise ValueError(operator + ' 比较摘要与原始证据不一致：' + key)
+            for key in ('relative_pytorch', 'relative_master'):
+                value = stored.get(key)
+                if (type(value) not in (float, int) or not math.isfinite(value)
+                        or not math.isclose(value, row[key], rel_tol=1e-12, abs_tol=0.0)):
                     raise ValueError(operator + ' 比较摘要与原始证据不一致：' + key)
             row['result_path'] = Path(row['result_path']).resolve().relative_to(project.resolve()).as_posix()
         operators.append({'operator': operator, 'excel_cell': cell, 'excel_speedup': excel,

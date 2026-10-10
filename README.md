@@ -12,7 +12,7 @@
 |---|---:|---|
 | [narrow_copy](project/Ascend-Optimization-v1/operators/narrow_copy/README.md) | G29：0.0138× | 历史 D2D 候选约 0.56～0.59×，仍未达标，保留在主线 |
 | [matmul_bias_activation](project/Ascend-Optimization-v1/operators/matmul_bias_activation/README.md) | G611：0.5408× | 固定 master 0.443×；候选 v5 为 0.772×，相对 master 1.75×，完整测试 42/42；KG 无 profiler/原生 profiler 两组均正常结束，最佳轮次分别 0.741×/0.697×，待独立复验；继续改善大矩阵流水线 |
-| [amin](project/Ascend-Optimization-v1/operators/amin/README.md) | G92：0.5536× | 启动兼容修复基线 0.296×；候选 v5 为 0.916×，相对该基线 3.11×，完整测试 27/27；超过 0.8×，KG 无 profiler 已恢复并运行第二轮，有 profiler 排队；bf16 类型修复诊断排在两组之后 |
+| [amin](project/Ascend-Optimization-v1/operators/amin/README.md) | G92：0.5536× | 启动兼容修复基线 0.296×；候选 v5 为 0.916×，相对该基线 3.11×，完整测试 27/27；KG 无 profiler 正常结束，最佳轮次 0.742×，待独立复验；profiler 组已恢复运行，bf16 类型修复诊断排在两组之后 |
 
 此前按颜色误选的 MSE backward、PReLU backward、t_copy、SmoothL1 backward、BatchNorm backward、native_layer_norm，Excel 数值均已超过 0.8×，已移入 [历史归档](project/Ascend-Optimization-v1/archive/README.md)。原结果保留为流程和优化方法参考，不计入新目标的成果。
 

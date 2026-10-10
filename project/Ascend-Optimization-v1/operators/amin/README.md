@@ -31,7 +31,7 @@ KGS inspect 已成功。性能范围为 15 个 case：float16/float32/bfloat16�
 
 后续 70 组归约诊断使用设备 kernel 计时筛选配置，并在逐值一致后生成 v5。v5 完整 **27/27 通过、相对 PyTorch 0.916×、相对启动兼容基线 3.11×**，达到本阶段 0.8× 目标。PyTorch 基线几何平均变化为 0.994×。主要改进是连续布局直接归约、多行/宽列分块，以及对对应分支关闭多缓冲。float16 的原生精度归约有 14 组诊断成功，v5 的三个 float16 专用分支采用这种配置；bfloat16 原生 `minimum` 则在当前编译器中隐式提升到 float32，导致循环变量类型不一致，v5 的 bfloat16 分支因此仍用 float32 累积。失败配置没有计入成果；文件名中的 `native` 不代表所有 dtype 都采用原生精度。
 
-候选和逐 case 证据见 [v5 报告](reports/direct-axis-native-v5-20261010/版本对比.md)及 [精简汇报](reports/direct-axis-native-v5-20261010/精简汇报.md)。截至 2026-10-10 22:04，原生 KG 无 profiler 已恢复并进入优化，有 profiler 组串行等待；两组仍须独立完整复验，四版本闭环尚未完成。
+候选和逐 case 证据见 [v5 报告](reports/direct-axis-native-v5-20261010/版本对比.md)及 [精简汇报](reports/direct-axis-native-v5-20261010/精简汇报.md)。截至 2026-10-10 22:53，原生 KG 无 profiler 已正常结束，第二轮完整 27/27 通过、0.742×，最佳源码 SHA 为 `fac3bca3b3b48a9f77d1837f6f4c4ac289d03c1fae5b46278b534f28753bc8ba`；profiler 组已恢复。两组仍须独立完整复验，四版本闭环尚未完成。
 
 后续 `probe-bf16-cast.py` 将验证 `minimum` 后显式转回 bf16 是否能保持循环类型并改善延迟，同时测量 float32 累积对照。每个配置先与 PyTorch、v5 逐值比较，`build-bf16-v6.py` 仅从通过的真机配置生成新候选；`run-bf16-v6-910b.sh` 排在原生 KG、独立复验及矩阵分组诊断之后，随后执行完整 27 项测试。该实验尚未运行，没有新增性能结论。
 
