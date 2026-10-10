@@ -11,12 +11,12 @@
 | 对象 | Excel 华为列 | 状态 |
 |---|---:|---|
 | [narrow_copy](project/Ascend-Optimization-v1/operators/narrow_copy/README.md) | G29：0.0138× | 历史 D2D 候选约 0.56～0.59×，仍未达标，保留在主线 |
-| [matmul_bias_activation](project/Ascend-Optimization-v1/operators/matmul_bias_activation/README.md) | G611：0.5408× | 保留历史实验；新一轮先复测 master |
-| amin | G92：0.5536× | 建议的下一项，尚未开始 master 复测或新优化 |
+| [matmul_bias_activation](project/Ascend-Optimization-v1/operators/matmul_bias_activation/README.md) | G611：0.5408× | 固定 master 复测 0.443×；流水候选 v4 为 0.759×，相对 master 1.71×，完整测试 42/42；KG 原生 profiler 第二轮 0.697×，待独立复验，两组尚未闭环 |
+| [amin](project/Ascend-Optimization-v1/operators/amin/README.md) | G92：0.5536× | 原版大输入超过 coreDim 启动上限；启动兼容修复基线 0.296×，直接归约候选 v3 为 0.626×，两者均完整通过 27/27；继续调优 |
 
 此前按颜色误选的 MSE backward、PReLU backward、t_copy、SmoothL1 backward、BatchNorm backward、native_layer_norm，Excel 数值均已超过 0.8×，已移入 [历史归档](project/Ascend-Optimization-v1/archive/README.md)。原结果保留为流程和优化方法参考，不计入新目标的成果。
 
-现有 narrow_copy 分析使用过 msprof 指标、模拟器指令及编译产物；**尚未得到可用的 Roofline 结果，也未完成独立分析器在新目标上的三版本闭环。**
+现有 narrow_copy 分析使用过 msprof 指标、模拟器指令及编译产物。matmul 的 Msopprof 官方 Roofline 文本给出 `memory caused`，已核验 kernel、case 和物理卡身份；计数缩放与硬件 roof 尚未核实，数值 Roofline 仍待建立。新目标的完整四版本闭环尚未完成。
 
 ## 目录
 
@@ -90,4 +90,4 @@ square 的 KG+KGS 烟雾测试已完成，记录见 [烟雾测试归档](project
 
 压缩包等大文件由 Git LFS 管理；克隆后安装 Git LFS 并执行 `git lfs pull`。KG/KGS 原包位于 `sources/archives/`。导出源码不含嵌套 `.git`，版本见清单。
 
-2026-10-09 本次目录整理只在 Windows 完成，尚未提交 GitHub 或同步 910B。历史报告记录当时的绝对路径、端口与版本；使用新入口前需同步目录并检查服务器配置。
+目录整理已提交至 `a349822b`。2026-10-10 在 910B 新建独立实验副本 `/data/hanle/ascend-optimization/goal-20261010/Ascend-Optimization`，使用该提交并固定新的 FlagGems master；本轮新增工具、候选与评测结果待验证后提交同步。历史报告中的绝对路径、端口与版本是当时快照。

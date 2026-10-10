@@ -12,9 +12,12 @@ Ascend-Optimization-v1/
 │   │   ├── candidates/     实验候选、验证代码和提示词
 │   │   ├── scripts/        该算子的专用运行、采集与分析工具
 │   │   └── reports/        按批次保存结果、原始请求及源码快照
+│   ├── amin/               启动兼容基线、直接归约候选与 KG 两组
 │   └── matmul_bias_activation/
 │       ├── README.md
-│       └── reports/        已有历史实验；新一轮尚未开始
+│       ├── candidates/     固定 master 和流水候选
+│       ├── scripts/        分块、Roofline 采集与解读
+│       └── reports/        新 master 复测、优化结果和历史证据
 ├── tools/                  多个算子共用的工具
 ├── archive/                退出当前主线的实验与历史对照
 └── 验收看板_结果表.xlsx
@@ -39,4 +42,4 @@ Ascend-Optimization-v1/
 
 原始评测 JSON、日志、压缩包、源码快照与 Excel 保留原内容；只更新可维护的运行入口、测试定位和 Markdown 路径。KG/KGS 源码在根目录 `sources/`，历史 FlagGems 源码在 `third_party/FlagGems/`。
 
-仓库内旧 `runtime/` 和空 `kernels/` 已移除。910B 仓库外运行环境保持原状。2026-10-09 本次整理仅在 Windows 完成，尚未提交或同步服务器。
+仓库内旧 `runtime/` 和空 `kernels/` 已移除，目录整理已提交。910B 新实验在 `/data/hanle/ascend-optimization/goal-20261010/` 使用独立副本；仓库外旧运行环境保持原状。新实验状态见 [amin](operators/amin/README.md)。

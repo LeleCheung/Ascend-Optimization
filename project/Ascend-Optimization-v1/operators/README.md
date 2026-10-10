@@ -6,7 +6,7 @@
 |---|---|---|---|
 | [narrow_copy](narrow_copy/README.md) | G29：0.0138× | D2D 混合候选约 0.56～0.59×，未达标 | 新 master 基线复测后决定是否继续 |
 | [matmul_bias_activation](matmul_bias_activation/README.md) | G611：0.5408× | 历史候选约 0.49× | 新 master 基线复测 |
-| amin | G92：0.5536× | 尚未开展新实验 | 建议优先复测正确性与基线，再正式立项 |
+| [amin](amin/README.md) | G92：0.5536× | 新 master 已固定，inspect 通过，基线评测中 | 两组 KG 后采集并分析 profiling，交付第三版本 |
 
 一个算子一个目录，README 串起候选、专用脚本和报告。新对象只在正式复测时创建目录；通用工具见 [tools](../tools/README.md)。
 

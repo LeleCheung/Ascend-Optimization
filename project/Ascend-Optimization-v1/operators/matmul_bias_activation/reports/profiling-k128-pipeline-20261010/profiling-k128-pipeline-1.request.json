@@ -1,0 +1,25 @@
+{
+  "api_version": "v6.2",
+  "binding": {
+    "catalog_name": "flaggems-adapter-definitions",
+    "definition": "matmul_bias_activation"
+  },
+  "implementation": {
+    "name": "matmul_bias_activation-profiling-k128-pipeline-1",
+    "definition": "matmul_bias_activation",
+    "language": "triton",
+    "entrypoint": "main.py::run",
+    "sources": [
+      {
+        "path": "main.py",
+        "content": "# Copyright 2026 FlagOS Contributors\n# SPDX-License-Identifier: Apache-2.0\n\"\"\"根据 910B 真机 MTE2/Scalar 占用提出的 K 分块与流水重叠候选。\"\"\"\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef mba_pipeline_kernel(\n    A, B, Bias, C, M, N, K,\n    SAM: tl.constexpr, SAK: tl.constexpr,\n    SBK: tl.constexpr, SBN: tl.constexpr, SBIAS: tl.constexpr,\n    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,\n    EVEN_M: tl.constexpr, EVEN_N: tl.constexpr, EVEN_K: tl.constexpr,\n):\n    rm = tl.program_id(0) * BM + tl.arange(0, BM)\n    rn = tl.program_id(1) * BN + tl.arange(0, BN)\n    rk = tl.arange(0, BK)\n    acc = tl.zeros((BM, BN), tl.float32)\n    for start in range(tl.cdiv(K, BK)):\n        ks = start * BK + rk\n        ap = A + rm[:, None] * SAM + ks[None, :] * SAK\n        bp = B + ks[:, None] * SBK + rn[None, :] * SBN\n        if EVEN_M and EVEN_K:\n            a = tl.load(ap)\n        else:\n            a = tl.load(ap, (rm[:, None] < M) & (ks[None, :] < K), 0)\n        if EVEN_N and EVEN_K:\n            b = tl.load(bp)\n        else:\n            b = tl.load(bp, (ks[:, None] < K) & (rn[None, :] < N), 0)\n        acc += tl.dot(a, b, allow_tf32=False)\n    bias = tl.load(Bias + rn * SBIAS, rn < N, 0)\n    acc += bias[None, :]\n    acc = tl.maximum(acc, tl.full((BM, BN), 0, tl.float32))\n    tl.store(C + rm[:, None] * N + rn[None, :], acc,\n             (rm[:, None] < M) & (rn[None, :] < N))\n\n\ndef run(input, weight, bias):\n    assert input.ndim == 2 and weight.ndim == 2\n    m, k = input.shape\n    assert weight.shape[0] == k\n    n = weight.shape[1]\n    assert bias.numel() == n\n    bias = bias.reshape(-1)\n    out = torch.empty((m, n), device=input.device, dtype=input.dtype)\n    bm, bn, bk = 64 if m <= 512 else 128, 128, 128\n    with torch.npu.device(input.device):\n        mba_pipeline_kernel[(triton.cdiv(m, bm), triton.cdiv(n, bn))](\n            input, weight, bias, out, m, n, k,\n            input.stride(0), input.stride(1),\n            weight.stride(0), weight.stride(1), bias.stride(0),\n            bm, bn, bk, m % bm == 0, n % bn == 0, k % bk == 0,\n            multibuffer=True, unit_flag=True, sync_solver=False,\n        )\n    return out\n\n\nmatmul_bias_activation = run\n"
+      }
+    ]
+  },
+  "settings": {
+    "warmup_ms": 1000,
+    "benchmark_ms": 100,
+    "num_trials": 3,
+    "timeout_seconds": 1800
+  }
+}

@@ -61,6 +61,51 @@ class EvidenceWorkflowTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "artifact SHA"):
                 workflow.analyze(*self.inputs((self.small()[0], self.small()[1], copied)))
 
+    def test_device_timing_cannot_diagnose_host_gap(self):
+        # 同一份真实证据只改变计时范围，设备计时不可推出 host 开销。
+        report = workflow.analyze(*self.inputs(self.small()), timing_scope="device_kernel")
+        self.assertFalse(any(case["diagnosis"]["bound"] == "host_or_launch_hypothesis"
+                             for case in report["cases"]))
+
+
+class MasterMatmulEvidenceTest(unittest.TestCase):
+    def setUp(self):
+        self.root = PROJECT / "operators" / "matmul_bias_activation" / "reports" / "master-20261010"
+
+    def analyze(self, provenance=None):
+        profiles = []
+        for name in ("profile-metrics-float16-0", "profile-metrics-float16-2",
+                     "profile-instruction-float16-0"):
+            directory = self.root / name
+            profiles.append((directory / "response.json", directory / "request.json",
+                             directory / "artifacts"))
+        return workflow.analyze(
+            "matmul_bias_activation", self.root / "flaggems-master.py",
+            self.root / "flaggems-master-1.result.json",
+            self.root / "flaggems-master-1.request.json", self.root / "inspect.json",
+            profiles, timing_scope="device_kernel",
+            evaluation_provenance=provenance or self.root / "flaggems-master.provenance.json")
+
+    def test_real_master_provenance_and_matmul_diagnosis(self):
+        report = self.analyze()
+        self.assertEqual(report["evaluation"]["num_passed"], 42)
+        self.assertEqual(report["coverage"], {"timing_cases": 15, "profiled_cases": 2})
+        bounds = {case["diagnosis"]["bound"] for case in report["cases"]}
+        self.assertIn("gemm_control_and_parallelism", bounds)
+        self.assertIn("gemm_data_pipeline", bounds)
+        self.assertNotIn("host_or_launch_hypothesis", bounds)
+
+    def test_tampered_provenance_is_rejected(self):
+        for key, value, error in (("source_sha256", "0" * 64, "SHA 不匹配"),
+                                  ("binding", {"definition": "amin"}, "binding 不匹配")):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as directory:
+                provenance = workflow.read_json(self.root / "flaggems-master.provenance.json")
+                provenance[key] = value
+                path = Path(directory) / "provenance.json"
+                path.write_text(json.dumps(provenance), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, error):
+                    self.analyze(path)
+
 
 if __name__ == "__main__":
     unittest.main()

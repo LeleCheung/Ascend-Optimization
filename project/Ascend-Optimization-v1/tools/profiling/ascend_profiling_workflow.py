@@ -78,11 +78,23 @@ def diagnose(case: dict) -> dict:
     device_us = metrics.get("device_duration_us")
     mte2 = metrics.get("aiv_mte2_ratio")
     mte3 = metrics.get("aiv_mte3_ratio")
-    if isinstance(device_us, (int, float)) and device_us < 10 and wall["candidate_us"] > 30:
+    if case.get("timing_scope", "walltime") == "walltime" and isinstance(device_us, (int, float)) and device_us < 10 and wall["candidate_us"] > 30:
         return {"bound": "host_or_launch_hypothesis", "confidence": "low",
                 "inference": "独立 msprof 采集中的设备 kernel 很短，而正式 walltime 较长；host 分配、调度或同步值得单独测量。两次计时不能相减为 host 开销。",
                 "next_experiment": "同卡固定输入，分别测量输出分配、已编译 launcher 调用和同步，并只改变一项 host 路径操作后完整复验。",
                 "falsifier": "分项 host 测量没有可重复差距，或完整评测未改善。"}
+    aic_mte2 = metrics.get("aic_mte2_ratio")
+    aic_scalar = metrics.get("aic_scalar_ratio")
+    if case.get("operator") == "matmul_bias_activation" and isinstance(aic_mte2, (int, float)) and aic_mte2 >= 0.7:
+        return {"bound": "gemm_data_pipeline", "confidence": "medium",
+                "inference": f"矩阵乘的 AIC MTE2 活跃比例为 {aic_mte2:.1%}，Scalar 为 {aic_scalar}。优先增加 K 分块、减少循环和地址计算，再重叠搬运与计算。流水线比例不等于 HBM 带宽利用率，各比例不能相加。",
+                "next_experiment": "增大 K 分块至 128/256，按 shape 调整 M/N tile，测试 multibuffer/unit_flag；完整正确性与所有 timing case 复验。",
+                "falsifier": "MTE2 和总延迟不改善，或新增分块导致精度失败。"}
+    if case.get("operator") == "matmul_bias_activation" and isinstance(aic_scalar, (int, float)) and aic_scalar >= 0.5:
+        return {"bound": "gemm_control_and_parallelism", "confidence": "medium",
+                "inference": "小矩阵的 Scalar 活跃比例超过一半，原 tile 的 program 数较少；循环控制和并行覆盖应优先优化。",
+                "next_experiment": "用较小 M/N tile 覆盖更多核，同时增大 K 分块以减少循环；完整复验。",
+                "falsifier": "更高 program 数反而增加搬运，或总延迟没有改善。"}
     if isinstance(mte2, (int, float)) and mte2 >= 0.7 and isinstance(mte3, (int, float)) and mte3 >= 0.4:
         return {"bound": "device_copy_pipeline_hypothesis", "confidence": "medium",
                 "inference": "该 kernel 的 MTE2/MTE3 活跃比例较高，值得测试搬运分块和并行度；比例不等于 HBM 带宽利用率或已达峰值。",
@@ -96,7 +108,10 @@ def diagnose(case: dict) -> dict:
 
 def analyze(operator: str, source_path: Path, eval_path: Path, eval_request_path: Path,
             inspect_path: Path, profiles: list[tuple[Path, Path, Path]],
-            ir_paths: tuple[Path, ...] = ()) -> dict:
+            ir_paths: tuple[Path, ...] = (), *, timing_scope: str = "walltime",
+            evaluation_provenance: Path | None = None) -> dict:
+    if timing_scope not in {"walltime", "device_kernel"}:
+        raise ValueError("计时范围必须为 walltime 或 device_kernel")
     source = source_path.read_text(encoding="utf-8-sig")
     source_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
     evaluated = read_json(eval_path)
@@ -105,7 +120,13 @@ def analyze(operator: str, source_path: Path, eval_path: Path, eval_request_path
     binding = eval_request.get("binding", {})
     if binding.get("definition") != operator or source_in(eval_request) != source:
         raise ValueError("评测请求的算子或候选源码不匹配")
-    if evaluated.get("candidate_sha256") != source_hash or evaluated.get("status") != "PASSED":
+    evaluated_hash = evaluated.get("candidate_sha256")
+    if evaluated_hash is None and evaluation_provenance is not None:
+        provenance = read_json(evaluation_provenance)
+        if provenance.get("binding") != binding:
+            raise ValueError("评测 provenance 的 binding 不匹配")
+        evaluated_hash = provenance.get("source_sha256")
+    if evaluated_hash != source_hash or evaluated.get("status") != "PASSED":
         raise ValueError("正式评测未通过或候选源码 SHA 不匹配")
     fingerprint = inspect.get("benchmark_fingerprint")
     if not fingerprint:
@@ -151,27 +172,33 @@ def analyze(operator: str, source_path: Path, eval_path: Path, eval_request_path
         row = timing[case_id]
         if not all(isinstance(row.get(key), (int, float)) and row[key] > 0
                    for key in ("latency_ms", "reference_latency_ms")):
-            raise ValueError(f"缺少正式 walltime: {case_id}")
+            raise ValueError(f"缺少正式计时: {case_id}")
         entry = cases.get(case_id, {"axes": row.get("axes", {}), "profiles": {}})
         metric_profile = entry["profiles"].get("metrics")
         op = metric_profile["kernel"] if metric_profile else None
         wall = {"candidate_us": row["latency_ms"] * 1000,
                 "pytorch_us": row["reference_latency_ms"] * 1000,
                 "speedup": row["speedup"], "source": str(eval_path),
-                "scope": "KGS 独立正式评测 walltime"}
-        record = {"case_id": case_id, "axes": entry["axes"], "walltime": wall,
+                "scope": "完整调用 walltime" if timing_scope == "walltime" else "FlagGems Ascend 设备 kernel 计时"}
+        record = {"case_id": case_id, "operator": operator, "timing_scope": timing_scope,
+                  "axes": entry["axes"], "walltime": wall,
                   "metrics": ({"kernel": op.get("op_name"),
                                "device_duration_us": op.get("avg_duration_us"),
                                "aiv_mte2_ratio": op.get("aiv_mte2_ratio"),
                                "aiv_mte3_ratio": op.get("aiv_mte3_ratio"),
                                "aiv_scalar_ratio": op.get("aiv_scalar_ratio"),
                                "aiv_vec_ratio": op.get("aiv_vec_ratio"),
+                               "aic_mte2_ratio": op.get("aic_mte2_ratio"),
+                               "aic_mte1_ratio": op.get("aic_mte1_ratio"),
+                               "aic_scalar_ratio": op.get("aic_scalar_ratio"),
+                               "aic_mac_ratio": op.get("aic_mac_ratio"),
+                               "cube_utilization_pct": op.get("cube_utilization_pct"),
                                "scope": "独立真机 msprof 采集"} if op else None),
                   "profiles": entry["profiles"]}
         record["diagnosis"] = diagnose(record)
         result_cases.append(record)
     covered = sum(bool(case["profiles"]) for case in result_cases)
-    return {"schema_version": "1.0", "operator": operator,
+    return {"schema_version": "1.1", "operator": operator, "timing_scope": timing_scope,
             "candidate": {"path": str(source_path), "sha256": source_hash},
             "evaluation": {"path": str(eval_path), "request": str(eval_request_path),
                            "inspect": str(inspect_path), "benchmark_fingerprint": fingerprint,
@@ -181,10 +208,10 @@ def analyze(operator: str, source_path: Path, eval_path: Path, eval_request_path
             "cases": result_cases,
             "ir": [{"path": str(path), "sha256": sha256(path), "status": "unmapped",
                     "reason": "尚无经验证的 PC 到该 IR 的对应关系"} for path in ir_paths],
-            "roofline": {"status": "unavailable", "reason": "未验证同一 kernel/range 的 FLOPs、实际搬运 Bytes、执行时间和硬件 roof；拷贝算子不能用计算 Roofline 推断上限"},
-            "limitations": ["profile 与正式 Eval 是独立采集，device 时间不得从 walltime 中相减",
+            "roofline": {"status": "unavailable", "reason": "未验证同一 kernel/range 的 FLOPs、实际搬运 Bytes、执行时间和硬件 roof"},
+            "limitations": ["profile 与正式 Eval 是独立采集，不能相减推断精确 host 开销",
                             "profile evaluation_id 不是正式 Eval ID；通过 Definition 指纹、case 与完整候选源码绑定",
-                            "未采集的 case 只保留 walltime，不推广其他 case 的瓶颈结论"]}
+                            "未采集的 case 只保留正式计时，不推广其他 case 的瓶颈结论"]}
 
 
 def render(report: dict) -> str:
@@ -193,6 +220,7 @@ def render(report: dict) -> str:
              f"候选 SHA-256：`{report['candidate']['sha256']}`；KGS 正式评测 "
              f"{ev['num_passed']}/{ev['num_workloads']}，geo mean {ev['geo_mean']:.4f}×；"
              f"{cov['profiled_cases']}/{cov['timing_cases']} 个 timing case 有独立采集。", "",
+             f"计时范围：`{report['timing_scope']}`。", "",
              "| case | PyTorch us | 候选 us | 加速比 | 真机 kernel us | 诊断 | 置信度 |",
              "| --- | ---: | ---: | ---: | ---: | --- | --- |"]
     for case in report["cases"]:
@@ -232,9 +260,12 @@ def main() -> None:
     parser.add_argument("--profile", type=Path, nargs=3, action="append", default=[],
                         metavar=("RESPONSE", "REQUEST", "ARTIFACT_DIR"))
     parser.add_argument("--ir", type=Path, action="append", default=[])
+    parser.add_argument("--timing-scope", choices=["walltime", "device_kernel"], default="walltime")
+    parser.add_argument("--evaluation-provenance", type=Path)
     args = parser.parse_args()
     report = analyze(args.operator, args.source, args.evaluation, args.evaluation_request,
-                     args.inspect, args.profile, tuple(args.ir))
+                     args.inspect, args.profile, tuple(args.ir), timing_scope=args.timing_scope,
+                     evaluation_provenance=args.evaluation_provenance)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(render(report), encoding="utf-8")
     args.output.with_suffix(".json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n",
