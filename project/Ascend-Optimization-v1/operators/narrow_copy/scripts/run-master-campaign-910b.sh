@@ -75,6 +75,19 @@ baseline=$p/operators/narrow_copy/reports/master-case-adapter-20261010
  --source "$p/operators/narrow_copy/candidates/contiguous-copy-20261010.py" \
  --server "http://127.0.0.1:$port" --output "$p/operators/narrow_copy/reports/contiguous-copy-20261010" \
  --label contiguous-copy --timeout 1800 || echo 'CONTIGUOUS_COPY_FAILED'
+"$py" "$p/tools/evaluation/debug-operator.py" \
+ --script "$p/operators/narrow_copy/scripts/probe-current-timing.py" \
+ --file "$p/operators/narrow_copy/candidates/contiguous-copy-20261010.py" \
+ --server "http://127.0.0.1:$port" \
+ --output "$r/diagnostics/narrow-current-timing-20261010" --timeout 900 \
+ || echo 'NARROW_TIMING_SCOPE_DIAGNOSTIC_FAILED'
+"$py" "$p/tools/evaluation/collect-optimized-profiles.py" narrow_copy \
+ "$p/operators/narrow_copy/reports/contiguous-copy-20261010/contiguous-copy-1.result.json" \
+ "$p/operators/narrow_copy/reports/optimized-profile-20261010" \
+ --server "http://127.0.0.1:$port" --kernel-prefix narrow_copy_contiguous_kernel \
+ --case-id 'benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::0' \
+ --case-id 'benchmark/test_narrow_copy.py::test_narrow_copy_perf::core::float16::4' \
+ || echo 'NARROW_OPTIMIZED_PROFILE_FAILED'
 export KG_RUN_ROOT="$r/kg-runs" KG_SOURCE_ROOT="$r/Ascend-Optimization/sources"
 export KG_WALLTIME_PORT=$port KG_PROFILE_PORT=$port
 for arm in no-profile profile; do

@@ -2,6 +2,12 @@
 
 验收看板华为列 G29 为 0.0138×，符合低于 0.8× 的筛选条件。历史连续 dim=0 CANN D2D 混合候选三轮为 0.5919×、0.5672×、0.5613×，每轮正确性通过，仍未达标。
 
+## 本轮固定 master 复验
+
+2026-10-10 campaign 使用固定 master `d6a8eec473517a3d68157b208eb9c057eb1d4c50`，仅适配 benchmark case API，算子源码保持原样。专用 KGS 19656 使用物理卡 7，在 amin、matmul 原生 KG 与分析候选任务结束后才启动。四版本为 master、KG 无 profiler、KG 原生 profiler、连续复制快路径；新合同下完整范围为 18 个正确性与 15 个性能 case，最终以实际独立结果核验。
+
+`probe-current-timing.py` 使用本轮快路径候选，对三个 dtype 的小/大输入分别采设备 kernel 计时、host enqueue、同步调用和预分配输出后的 JIT 启动；分配时间也独立测量。各范围保持分开，不能把两个独立采集耗时相减当作准确 host 开销。campaign 还将采集 float16 小/大输入的 `PipeUtilization`，由独立 workflow 输出中文体检。历史“host/launch 开销主导”应由本轮分解重新核查，不能用于解释默认设备 kernel 加速比。当前任务排队中，尚无新结果。
+
 ## 文件入口
 
 | 路径 | 内容 |
