@@ -70,6 +70,15 @@ KG 使用原生后台 worker，启动脚本等待其终态，可由 tmux 托管�
 
 输出包含中文 Markdown、汇总 JSON 和逐 case CSV。相对 PyTorch 是逐 case 加速比的几何平均；相对 master 使用两份候选的实际延迟计算，并附 PyTorch 参考漂移。当前 FlagGems core 实际是设备 kernel 计时，KGS 的 `walltime` 服务标签不能据此解释为完整 Python 调用耗时。
 
+三个算子的独立四版本结果齐全后运行总审计：
+
+```bash
+"$py" "$project/tools/evaluation/summarize-master-goal.py" "$project" \
+  "$project/operators/低于0.8算子四版本闭环-20261010.md"
+```
+
+该工具重算原始结果，检查来源 commit、master 候选 SHA、同合同和完整用例数，并确认原生 KG 两组来自独立复验目录。任何一组缺失、路径越界或摘要与原始证据不同，均在写入总表之前停止。narrow campaign 最后会自动执行它。阶段成绩仍由各算子 README 单独记录。
+
 ## 5. 分析并继续优化
 
 `profile-operator.py` 从完整通过的源码与同一性能 case 采集真机指标/指令，保存并校验原始附件。`../profiling/ascend_profiling_workflow.py` 绑定源码、合同和证据后生成中文分析；优化内核改名时使用 `--kernel-prefix mba_pipeline_kernel` 等实际符号，匹配不唯一时须补全符号。

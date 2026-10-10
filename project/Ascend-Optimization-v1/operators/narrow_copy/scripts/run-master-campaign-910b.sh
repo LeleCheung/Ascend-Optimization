@@ -95,3 +95,5 @@ done
  --output "$p/operators/narrow_copy/reports/master-closure-20261010/版本对比.md" \
  || { echo 'NARROW_CLOSURE_INCOMPLETE'; exit 1; }
 echo 'NARROW_FOUR_VERSIONS_PASSED'
+"$py" "$p/tools/evaluation/summarize-master-goal.py" "$p" \
+ "$p/operators/低于0.8算子四版本闭环-20261010.md"
