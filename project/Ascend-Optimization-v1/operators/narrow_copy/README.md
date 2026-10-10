@@ -14,6 +14,10 @@
 
 大输入诊断对纯 Triton 快路径和每次最多 8192 program 的 master 兼容候选，分别验证三个 dtype，均同步完成、逐值正确。因此最终回到 KGS 19657 的设备任务计时，使用 `flaggems-master-grid-compatible-20261010.py` 作为两组 KG 的同一起点：保留 master 索引计算、动态除数和 1024 分块，只增加 program 基址并分批启动。该列必须标为 **master 加启动兼容修复**。完整四版本范围仍为 18 项正确性、15 项性能；纯 Triton 与小输入 DMA/大输入 Triton 混合候选分别评测。入口为 `run-grid-compatible-campaign-910b.sh`。
 
+该兼容基线已完成 **33/33**，相对 PyTorch **0.0103×**。三个 dtype 的最小输入约 26～29 μs，而 PyTorch DMA 约 0.6 μs；最大输入约 20～23 ms，而 PyTorch 约 103～217 μs。这是设备任务耗时的实际差距，需要优化内核与调度，不能直接解释为 Python 或 host 开销。
+
+纯 Triton 连续复制版完整 **33/33、0.582×**，相对兼容 master **56.61×**；小输入 DMA、大输入 Triton 的混合版完整 **33/33、0.874×**，相对兼容 master **84.37×**，超过 0.8×。混合版是 CANN DMA + Triton，输出仍重新分配并实际复制。见 [三候选对比](reports/small-dma-grid-device-20261010/版本对比.md)。KG 两组以兼容 master 开始、独立运行，尚未收齐最终复验。进一步测试全尺寸连续片段 DMA 的入口为 `run-contiguous-dma-campaign-910b.sh`。
+
 `probe-current-timing.py` 使用本轮快路径候选，对三个 dtype 的小/大输入分别采设备 kernel 计时、host enqueue、同步调用和预分配输出后的 JIT 启动；分配时间也独立测量。各范围保持分开，不能把两个独立采集耗时相减当作准确 host 开销。历史“host/launch 开销主导”应由本轮分解重新核查，不能用于解释默认设备 kernel 加速比。两组原生 KG 尚未开始。
 
 ## 文件入口

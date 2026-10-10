@@ -10,7 +10,7 @@
 
 | 对象 | Excel 华为列 | 状态 |
 |---|---:|---|
-| [narrow_copy](project/Ascend-Optimization-v1/operators/narrow_copy/README.md) | G29：0.0138× | 本轮固定 master 在 PyTorch 参考计时阶段失败，正在核查内存复制事件；历史 D2D 候选约 0.56～0.59× |
+| [narrow_copy](project/Ascend-Optimization-v1/operators/narrow_copy/README.md) | G29：0.0138× | 兼容 master 0.0103×、纯 Triton 0.582×、小输入 DMA + 大输入 Triton 0.874×，均 33/33；混合版已超过 0.8×，KG 两组运行中 |
 | [matmul_bias_activation](project/Ascend-Optimization-v1/operators/matmul_bias_activation/README.md) | G611：0.5408× | 四版本独立评测均 42/42：master 0.443×、KG 无 profiler 0.740×、KG 原生 profiler 0.710×、我们的 v6 0.773×（相对 master 1.74×）；v7 为 0.748×，最终保留 v6，仍低于 0.8× |
 | [amin](project/Ascend-Optimization-v1/operators/amin/README.md) | G92：0.5536× | 四版本独立评测均 27/27：启动兼容基线 0.296×、KG 无 profiler 0.769×、KG 原生 profiler 0.499×、我们的 v5 0.916×（相对兼容基线 3.11×）；bf16 v6 为 0.914×，最终保留 v5 |
 

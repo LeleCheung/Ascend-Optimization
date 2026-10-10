@@ -12,6 +12,8 @@ import torch
 import triton
 from triton.backends.ascend.testing import do_bench_npu
 
+DEVICE_SCOPE = 'device_kernel'
+
 
 def device_us(function):
     value = do_bench_npu(function, warmup=5, active=30)
@@ -36,7 +38,8 @@ def main():
     spec.loader.exec_module(candidate)
     output = Path(os.environ['KGS_DEBUG_ARTIFACTS']) / 'timing-scopes.json'
     result = {'source_sha256': hashlib.sha256(source.read_bytes()).hexdigest(),
-              'scope': '设备 kernel 和独立 host 同步采样；两者不相减推导 host 开销', 'cases': []}
+              'device_scope': DEVICE_SCOPE,
+              'scope': '设备侧计时和独立 host 同步采样；两者不相减推导 host 开销', 'cases': []}
     torch.manual_seed(20261010)
     for dtype in (torch.float16, torch.float32, torch.bfloat16):
         for shape in ((64, 64), (1024, 65536)):
@@ -63,7 +66,7 @@ def main():
                    'length': length, 'equal': True,
                    'logical_bytes': 2 * total * x.element_size(), 'host': {}}
             for name in ('candidate', 'pytorch', 'allocated_jit_launch'):
-                row[name + '_device_kernel_us'] = device_us(functions[name])
+                row[name + '_' + DEVICE_SCOPE + '_us'] = device_us(functions[name])
             samples = {name: [] for name in functions}
             for iteration in range(25):
                 names = list(functions)

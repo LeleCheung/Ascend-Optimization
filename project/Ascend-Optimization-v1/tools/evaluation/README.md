@@ -2,6 +2,8 @@
 
 本轮正式对象为 `amin`、`matmul_bias_activation`、`narrow_copy`，均来自验收看板华为列低于 0.8× 的条目。四版本分别是固定 FlagGems master、原生 KG 无 profiler、原生 KG 有 profiler、我们根据分析修改的候选。原生 KG 两组使用同一基线、模型和两轮预算；我们的建议仅进入第四组。
 
+从新仓库准备环境、评测适配和服务的完整步骤见 [复现与交接](复现与交接-20261010.md)。
+
 ## 1. 确认实验环境
 
 当前独立实验目录为 `/data/hanle/ascend-optimization/goal-20261010`，FlagGems 固定在 `d6a8eec473517a3d68157b208eb9c057eb1d4c50`。控制器复用 `/data/hanle/ascend-optimization/runtime/kg-controller` 的 venv 和 Claude，执行时通过 `KG_SOURCE_ROOT` 显式选择新仓库源码。KGS 在 `tle_yy` 容器内使用物理卡 7，服务中为 `npu:0`。
@@ -110,3 +112,5 @@ narrow_copy 的小连续输入在 PyTorch 中是 DMA 复制。task CSV 的 `kern
 修复 CSV 后，master 的 18 项正确性通过，但设备 profiler 同步卡住；原生堆栈和停止记录归档。上游 `BenchMode.OPERATOR` 的独立副本同样停在大输入 `[1024,65536]` 候选同步，故不是单纯计时模式问题。将 master 大网格拆为每次最多 8192 program 后，单次大输入的三个 dtype 均同步完成、逐值一致，最终回到设备任务计时，入口为 `run-grid-compatible-campaign-910b.sh`，两组 KG 从同一启动兼容基线开始。兼容基线保留原 master 索引计算与 1024 分块，必须与未修改 master 分开标注。
 
 `evaluate-operator.py --timing-scope` 仅记录 benchmark 实际设置，不切换计时器。比较工具拒绝混合 device_kernel/device_task/walltime，设备指标报告与总表按各算子实际口径标注。
+
+启动兼容 narrow master 已完成 33/33、0.0103×；连续复制纯 Triton 为 0.582×，小 DMA + 大 Triton 混合版为 0.874×，均完整通过。两组 KG 正在独立运行；完整四版本与最终候选以对应独立复验和总审计为准。

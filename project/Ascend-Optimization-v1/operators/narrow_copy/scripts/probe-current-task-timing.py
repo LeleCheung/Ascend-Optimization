@@ -19,6 +19,7 @@ def main():
     original = load('scopes', 'probe-current-timing.py')
     # 只修改当前诊断模块的引用，包本身与其他任务不变。
     original.do_bench_npu = helper.make_device_task_timer(testing)
+    original.DEVICE_SCOPE = 'device_task'
     original.main()
 
 
