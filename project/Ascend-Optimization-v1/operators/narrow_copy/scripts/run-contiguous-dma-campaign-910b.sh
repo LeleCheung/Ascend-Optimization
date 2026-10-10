@@ -12,3 +12,4 @@ done
  --server http://127.0.0.1:19657 \
  --output "$p/operators/narrow_copy/reports/contiguous-dma-grid-device-20261010" \
  --label contiguous-dma-hybrid --repeats 2 --timeout 1800 --timing-scope device_task
+"$py" "$p/operators/narrow_copy/scripts/finalize-grid-delivery.py" "$p"

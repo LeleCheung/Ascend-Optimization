@@ -33,7 +33,9 @@ Ascend-Optimization-v1/
 
 | 入口 | 用途 |
 |---|---|
-| [主线算子](operators/README.md) | narrow_copy、matmul_bias_activation 与下一对象 |
+| [主线算子](operators/README.md) | amin、matmul_bias_activation、narrow_copy 的四版本闭环 |
+| [本阶段精简汇报](operators/本阶段精简汇报-20261010.md) | 最终成绩、关键优化与达标情况 |
+| [复现与交接](tools/evaluation/复现与交接-20261010.md) | 真机复测、KG 两组及离线证据核验 |
 | [公共工具](tools/README.md) | 环境、KG/KGS 评测和独立 profiling workflow |
 | [历史归档](archive/README.md) | 六个误选对象及保留原因、联合复测与烟雾测试 |
 | [独立 workflow 设计](../../docs/ascend-profiling-workflow.md) | 已有证据分析与后续 Roofline 工作 |
@@ -42,4 +44,4 @@ Ascend-Optimization-v1/
 
 原始评测 JSON、日志、压缩包、源码快照与 Excel 保留原内容；只更新可维护的运行入口、测试定位和 Markdown 路径。KG/KGS 源码在根目录 `sources/`，历史 FlagGems 源码在 `third_party/FlagGems/`。
 
-仓库内旧 `runtime/` 和空 `kernels/` 已移除，目录整理已提交。910B 新实验在 `/data/hanle/ascend-optimization/goal-20261010/` 使用独立副本；仓库外旧运行环境保持原状。新实验状态见 [amin](operators/amin/README.md)。
+仓库内旧 `runtime/` 和空 `kernels/` 已移除，目录整理已提交。910B 本轮实验在 `/data/hanle/ascend-optimization/goal-20261010/` 使用独立副本。三个算子四版本完整通过，amin 和 narrow_copy 超过 0.8×，matmul_bias_activation 为 0.785×；最终数据见 [成果表](operators/本阶段精简汇报-20261010.md)。

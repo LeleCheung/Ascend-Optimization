@@ -34,7 +34,7 @@ KGS inspect 已成功。性能范围为 15 个 case：float16/float32/bfloat16�
 
 启动兼容基线已完整通过 **27/27、相对 PyTorch 0.296×**。按相同 case 的候选延迟计算，v3 相对该兼容基线提高 **2.13×**，不是相对未修改上游的加速比。见 [同合同对比](reports/direct-axis-global-v3-20261010/版本对比.md)。
 
-两组 KG 首次均在 `prepare_catalog` 读取 `/operator-contract` 时遇到 60 秒超时，尚未进入 Coder。KGS 6.5.0 的合同读取和长诊断共享单线程执行器，合同请求排队超时。已保留失败工作区，安排在其他本轮任务结束后用 `kg resume` 原位恢复；没有修改测试、服务源码或原生组提示词。
+两组 KG 首次均在 `prepare_catalog` 读取 `/operator-contract` 时遇到 60 秒超时，未进入 Coder。KGS 6.5.0 的合同读取和长诊断共享单线程执行器，合同请求排队超时。随后在诊断任务结束后用 `kg resume` 原位恢复，两组已完成并通过独立复验；失败日志保留在各组报告的 `startup-failure/runner.log`。
 
 72 组真机分块筛选已经完成。多行末轴分块明显快于旧配置，但更大的分块存在明确 UB 溢出。v4 完整 **27/27 通过、相对 PyTorch 0.789×**。
 

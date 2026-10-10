@@ -2,7 +2,7 @@
 
 本仓库用于优化华为昇腾 910B 上的 FlagGems 算子，并保存 KG/KGS 源码、实验候选、评测证据和复现方法。
 
-**当前目标：从验收看板华为列选择加速比低于 0.8×、正确性通过的代表性算子，使用 FlagGems `master` 的固定提交建立基线，完成三版本优化对照，争取超过 0.8×。**
+**当前目标：从验收看板华为列选择加速比低于 0.8×、正确性通过的代表性算子，使用 FlagGems `master` 的固定提交建立基线，完成固定 master 加三种优化版本的对照，争取超过 0.8×。**
 
 2026-10-09 导师确认：Excel 数字是加速比，绿色验收门槛为大于 0.8×，FlagGems 使用 `master`。筛选依据是华为列实际数字；黄色底色不作为立项依据。旧实验锁定的版本不是新的 master 基线。
 
@@ -10,13 +10,13 @@
 
 | 对象 | Excel 华为列 | 状态 |
 |---|---:|---|
-| [narrow_copy](project/Ascend-Optimization-v1/operators/narrow_copy/README.md) | G29：0.0138× | 兼容 master 0.0103×、纯 Triton 0.582×、小输入 DMA + 大输入 Triton 0.874×，均 33/33；混合版已超过 0.8×，KG 两组运行中 |
-| [matmul_bias_activation](project/Ascend-Optimization-v1/operators/matmul_bias_activation/README.md) | G611：0.5408× | 四版本独立评测均 42/42：master 0.443×、KG 无 profiler 0.740×、KG 原生 profiler 0.710×、我们的 v6 0.773×（相对 master 1.74×）；v7 为 0.748×，最终保留 v6，仍低于 0.8× |
-| [amin](project/Ascend-Optimization-v1/operators/amin/README.md) | G92：0.5536× | 四版本独立评测均 27/27：启动兼容基线 0.296×、KG 无 profiler 0.769×、KG 原生 profiler 0.499×、我们的 v5 0.916×（相对兼容基线 3.11×）；bf16 v6 为 0.914×，最终保留 v5 |
+| [narrow_copy](project/Ascend-Optimization-v1/operators/narrow_copy/README.md) | G29：0.0138× | 四版本 0.010×、0.495×、0.806×、1.102×，均 33/33；最终相对 master 108.23× |
+| [matmul_bias_activation](project/Ascend-Optimization-v1/operators/matmul_bias_activation/README.md) | G611：0.5408× | 四版本 0.443×、0.740×、0.710×、0.785×，均 42/42；最终相对 master 1.77× |
+| [amin](project/Ascend-Optimization-v1/operators/amin/README.md) | G92：0.5536× | 四版本 0.296×、0.769×、0.499×、0.916×，均 27/27；最终相对 master 3.11× |
 
 此前按颜色误选的 MSE backward、PReLU backward、t_copy、SmoothL1 backward、BatchNorm backward、native_layer_norm，Excel 数值均已超过 0.8×，已移入 [历史归档](project/Ascend-Optimization-v1/archive/README.md)。原结果保留为流程和优化方法参考，不计入新目标的成果。
 
-现有 narrow_copy 分析使用过 msprof 指标、模拟器指令及编译产物。matmul 的 Msopprof 官方 Roofline 文本给出 `memory caused`，已核验 kernel、case 和物理卡身份；计数缩放与硬件 roof 尚未核实，数值 Roofline 仍待建立。新目标的完整四版本闭环尚未完成。
+现有 narrow_copy 分析使用过 msprof 指标、模拟器指令及编译产物。matmul 的 Msopprof 官方 Roofline 文本给出 `memory caused`，已核验 kernel、case 和物理卡身份；计数缩放与硬件 roof 尚未核实，数值 Roofline 仍待建立。三个正式算子的完整四版本闭环已完成；[精简成果表](project/Ascend-Optimization-v1/operators/本阶段精简汇报-20261010.md)和[复现步骤](project/Ascend-Optimization-v1/tools/evaluation/复现与交接-20261010.md)可直接用于汇报与交接。
 
 ## 目录
 
@@ -70,7 +70,7 @@ square 的 KG+KGS 烟雾测试已完成，记录见 [烟雾测试归档](project
 
 `--no-profile` 关闭优化反馈，设备计时仍可能使用 NPU profiler。必须写清设备侧 kernel 计时还是完整调用计时，不能把历史 `timing=walltime` 请求直接解释为端到端耗时。
 
-### 第 4 步：独立 Profiling Agent 与第三版本
+### 第 4 步：独立 Profiling workflow 与分析优化版本
 
 1. 调研当前 KG/KGS 的 Ascend 采集与反馈代码。导师说明默认使用 `msprof`，`metrics` 用于真机指标，`instruction` 使用模拟器，由 agent 根据问题选择。
 2. 先做独立 workflow：输入算子语义、候选、workload 和原始 profiling 产物，输出中文体检报告；公共入口见 [tools/profiling](project/Ascend-Optimization-v1/tools/README.md)。

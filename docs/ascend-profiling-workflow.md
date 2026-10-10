@@ -2,9 +2,9 @@
 
 ## 目标与当前事实
 
-当前正式优化对象按验收看板华为列加速比低于 0.8× 筛选，并复测 FlagGems master；本文的 narrow_copy 是已有方法案例，完整任务见 [总 README](../README.md)。
+当前正式优化对象按验收看板华为列加速比低于 0.8× 筛选，为 amin、matmul_bias_activation、narrow_copy。使用固定 FlagGems master 建立四版本对照，完整任务见 [总 README](../README.md)。
 
-目标不是重复打印 KGS 的 `msprof` 报表，而是为固定的算子、候选源码和 workload 建立可追溯的诊断，再用完整正确性和统一计时验证一项修改。首例为 `narrow_copy`。其配对实验已证明 KG 的 `metrics` 采集和反馈顺序可工作；profile 组第二轮的 launch-plan 缓存候选因 runs 分支少传 `EVEN` 参数而出现 9 个 `TypeError`，不能将其 timing 视作有效优化结果。
+目标是为固定算子、源码和 workload 建立可追溯的诊断，再用完整正确性和同口径计时验证修改。早期 narrow_copy 配对实验中的 `EVEN` 参数错误已保留在历史报告；本轮重新从固定 master 的启动兼容版本运行原生 KG 两组，并独立复验最佳候选。
 
 KG/KGS 原生能力不能概括成“没有 profiler”。KGS 的 Ascend 后端提供真机 `metrics` 和模拟器 `instruction` 两级，`msprof op` 还可采集 `Default,BasicInfo`、Memory、PipeUtilization 等原始 CSV。KGS `ascend_report.py` 的职责是格式化事实，明确不诊断瓶颈；KG 的 `kernel-profile-analyzer` 则根据这些事实输出推断和下一轮实验。本项目要补强的是证据选择、host/设备边界、逐 case 结构化比较、编译产物映射与优化后的强制复验，而非替换采集器。
 
@@ -28,17 +28,19 @@ Roofline 仅在 FLOPs、实际搬运 Bytes、设备执行时间和 roof 对应�
 
 当前 workflow schema 1.3 已从正式 benchmark 合同计算逐 case 的语义工作量：`amin` 的输出数 ×（归约长度 − 1）次比较，GEMM 的 `2MNK` FLOPs，以及切片拷贝的一读一写逻辑字节。min 比较次数不冒充 GEMM FLOPs，融合 GEMM 的 FLOPs 仅计矩阵乘；转置、多阶段临时张量、tile 重读及物理 HBM/GM 字节须另行采证。模型保留 `physical_bytes=null`、`roofline_usable=false`，因此可辅助选择采集方向，但不能直接算屋顶利用率。
 
-流水线判断也按语义分流：amin 检查 AIV MTE2、Vector、Scalar，提出归约分块、连续列搬运及中间类型实验；矩阵乘检查 AIC 搬运和控制；仅 narrow_copy 使用拷贝规则。当前阈值是生成下一项实验的启发式，多个流水线可以重叠，并非严格瓶颈证明；最终仍看同口径完整复验是否更快。Windows 的 13 项检查覆盖真实归档绑定、设备计时不得推断 host 差距、三类工作量、非法合同及归约分类。
+流水线判断按语义分流：amin 检查 AIV MTE2、Vector、Scalar，提出归约分块、连续列搬运及中间类型实验；矩阵乘检查 AIC 搬运和控制；narrow_copy 使用拷贝规则。阈值用于选择下一项实验，最终看完整复验是否更快。测试覆盖真实归档绑定、计时范围、三类工作量、非法合同及归约分类。
 
 ## 从 CUDA 方法迁移
 
 已复核 `KernelFlow-ops/cuda-optimized-skill` 的 `cuda-kernel-optimizer`，HEAD `114a6cba4c194e18d3fe23a4fc2251c982f34309`。可迁移的是：环境/硬件门禁，正确性和稳定计时先于优化，先 profile 当前 best，单项假设与预期指标，失败停止或回退，以及同口径消融。其 `near_peak` 仅在三类差距、可信 workload model 都已知时才允许；910B 缺少这些量时不声称接近上限。
 
-NCU 指标名、SASS、`sm_arch`、NVIDIA 峰值表及其 CUDA 实现脚本不能直接迁移。Ascend 对应证据是 msprof CSV、simulator 指令、Triton/LLVM IR 和实际 910B/CANN 版本。正反候选需在同一 18 个 correctness、15 个 timing case 上复测；任一正确性失败的 timing 只作诊断，不参与 best 选择。
+NCU 指标名、SASS、`sm_arch`、NVIDIA 峰值表及其 CUDA 实现脚本不能直接迁移。Ascend 对应证据是 msprof CSV、simulator 指令、Triton/LLVM IR 和实际 910B/CANN 版本。正反候选使用同一完整合同：amin 为 12 项正确性加 15 项性能，矩阵乘为 27 加 15，narrow_copy 为 18 加 15；正确性失败的 timing 不参与 best 选择。
 
-## 待验证的工具能力
+## 官方工具实测
 
-华为官方 msopprof 文档的当前版本列有 `--aic-metrics=Roofline`、`TimelineDetail`，并说明 Atlas A2/A3 的若干采集和 MindStudio Insight 可视化路径。910B 容器中的 `msopprof --help` 也列出这些参数，但这只证明 CLI 暴露选项；是否能对本次 Triton kernel 导出可分析的 Roofline/流水图，须以真实产物、适用范围及当前 CANN 9.0.0 的运行结果判定。老师材料中“Insight 当时仅支持仿真和 950 上板”应标记为当时工具版本结论，不与当前官方文档混为一谈。
+本轮已对矩阵乘的 1024³ fp16 case 实测 `--aic-metrics=Roofline`，保存官方 CSV、设备信息和报告；文本结论为 `memory caused`。原始 FOP 计数与算法 FLOPs 相差 128 倍，计数缩放和硬件 roof 尚未核实，因而尚未生成数值 Roofline 点。详见 [官方采集解读](../project/Ascend-Optimization-v1/operators/matmul_bias_activation/reports/diagnostics-20261010/matmul-roofline-20261010/官方Roofline解读.md)。
+
+真机 PipeUtilization 用于归约和矩阵乘的流水线诊断。narrow_copy 另采设备任务、host 发射、同步调用和实际 DMA/kernel trace，避免把小输入的设备任务差距统称为 Python 开销。老师材料中的 Insight 支持范围保留为当时版本信息。
 
 ## 来源
 

@@ -1,10 +1,27 @@
 # narrow_copy
 
-验收看板华为列 G29 为 0.0138×，符合低于 0.8× 的筛选条件。历史连续 dim=0 CANN D2D 混合候选三轮为 0.5919×、0.5672×、0.5613×，每轮正确性通过，仍未达标。
+验收看板华为列 G29 为 0.0138×。本轮固定 FlagGems master `d6a8eec473517a3d68157b208eb9c057eb1d4c50`，完整范围为 18 项正确性与 15 项性能，三个 dtype。
 
-## 本轮固定 master 复验
+## 最终四版本
 
-2026-10-10 campaign 使用固定 master `d6a8eec473517a3d68157b208eb9c057eb1d4c50`，仅适配 benchmark case API，算子源码保持原样。专用 KGS 19656 使用物理卡 7，在 amin、matmul 原生 KG 与分析候选任务结束后才启动。四版本为 master、KG 无 profiler、KG 原生 profiler、连续复制快路径；新合同下完整范围为 18 个正确性与 15 个性能 case，最终以实际独立结果核验。
+| 版本 | 相对 PyTorch | 相对兼容 master | 完整测试 |
+| --- | ---: | ---: | --- |
+| master 加启动兼容修复 | 0.010× | 1.00× | 33/33 |
+| KG 无 profiler | 0.495× | 48.68× | 33/33 |
+| KG 原生 profiler | 0.806× | 81.37× | 33/33 |
+| 分析指导混合优化版 | 1.102× | 108.23× | 33/33 |
+
+最终源码：[candidates/profile-small-dma-hybrid-20261010.py](candidates/profile-small-dma-hybrid-20261010.py)。实现类型：**小输入 CANN DMA + KG profiler 循环复制 Triton**。输出重新分配并实际复制；同源码重复评测取较慢轮，详细选择见 [最终候选](reports/master-closure-20261010/最终候选.json)。
+
+性能为包括 DMA 与 AIV kernel 的设备任务计时，排除 host 发射间隙。KG 两组同一起点、模型和两轮预算；分析优化版独立标注。
+
+关键改进是简化复制索引、消除逐元素动态除法，并按连续布局与输入大小选择 DMA 或 Triton 路径。
+
+真机耗时分解表明：小输入的 Triton 设备任务本身慢于 PyTorch DMA，大输入连续复制已接近 PyTorch 设备耗时。旧“主要是 host/launch 开销”的判断不适用于本轮完整合同；具体任务与耗时见 [真机诊断](reports/master-closure-20261010/真机诊断.md)。
+
+报告入口：[精简汇报](reports/master-closure-20261010/精简汇报.md)、[逐 case 四版本对比](reports/master-closure-20261010/版本对比.md)、[复现步骤](../../tools/evaluation/复现与交接-20261010.md)。
+
+## master 兼容修复与计时合同
 
 固定 master 首次完整评测在 PyTorch 参考计时阶段失败，尚未调用候选。`probe-pytorch-copy-timing.py` 已对三个 dtype 的小/大输入采集 trace 与原始 task CSV：小输入是 `MEMCPY_ASYNC`，`kernel_name=N/A` 被 pandas 解析为浮点空值，原计时器的 `.str` 调用崩溃；大输入是 `TensorMove` AIV kernel，原计时器能正常工作。原始失败保留于 `reports/master-case-adapter-20261010/`，完整诊断见 [复制计时证据](reports/diagnostics-20261010/narrow-pytorch-copy-timing-v2-20261010/artifacts/pytorch-copy-timing.json)。
 
@@ -16,22 +33,11 @@
 
 该兼容基线已完成 **33/33**，相对 PyTorch **0.0103×**。三个 dtype 的最小输入约 26～29 μs，而 PyTorch DMA 约 0.6 μs；最大输入约 20～23 ms，而 PyTorch 约 103～217 μs。这是设备任务耗时的实际差距，需要优化内核与调度，不能直接解释为 Python 或 host 开销。
 
-纯 Triton 连续复制版完整 **33/33、0.582×**，相对兼容 master **56.61×**；小输入 DMA、大输入 Triton 的混合版完整 **33/33、0.874×**，相对兼容 master **84.37×**，超过 0.8×。混合版是 CANN DMA + Triton，输出仍重新分配并实际复制。见 [三候选对比](reports/small-dma-grid-device-20261010/版本对比.md)。KG 两组以兼容 master 开始、独立运行，尚未收齐最终复验。进一步测试全尺寸连续片段 DMA 的入口为 `run-contiguous-dma-campaign-910b.sh`。
-
-`probe-current-timing.py` 使用本轮快路径候选，对三个 dtype 的小/大输入分别采设备 kernel 计时、host enqueue、同步调用和预分配输出后的 JIT 启动；分配时间也独立测量。各范围保持分开，不能把两个独立采集耗时相减当作准确 host 开销。历史“host/launch 开销主导”应由本轮分解重新核查，不能用于解释默认设备 kernel 加速比。两组原生 KG 尚未开始。
 
 ## 文件入口
 
-| 路径 | 内容 |
-|---|---|
-| [candidates/](candidates/) | Triton、launcher 缓存、D2D 候选、边界验证和配对提示词 |
-| [scripts/](scripts/) | 专用运行、预分配、host 分解、msprof 采集、编译 IR 与 D2D 探针 |
-| [reports/](reports/README.md) | 各阶段结果与原始证据 |
+- `candidates/`：固定 master 兼容候选、纯 Triton、混合候选及来源清单。
+- `scripts/`：适配、完整评测、真机诊断与择优汇总工具。
+- `reports/`：各批次原始请求、源码快照、逐 case 数据和附件 SHA。
 
-`launch_plan_compiled.py` 为混合 D2D 路径候选；`launch_plan_fixed.py` 为早期 Triton 候选；`launch_plan_compiled_persist8.py` 为失败性能尝试。评测批次中的源码快照代表当次实际运行版本，不能用后来修改的候选替换。
-
-已分析 msprof 和模拟器信息，Roofline 尚无可用结果。编译链分析见 [报告](../../../../docs/narrow-copy-compiler-chain.md)。下一轮应先固定 FlagGems master、复测完整 workload，再决定继续优化的切入点。
-
-## 历史配对入口
-
-`scripts/run-narrow-copy-ab-910b.sh` 的候选与提示词路径已更新。它仍使用历史 KGS 端口、模型和运行目录，重跑前检查服务配置并指定新的实验工作区；新正式算子优先使用 [公共运行工具](../../tools/README.md)。
+历史编译链探索见 [报告](../../../../docs/narrow-copy-compiler-chain.md)；历史版本与本轮新合同分别保存。

@@ -2,6 +2,18 @@
 
 验收看板华为列 G611 为 0.5408×，符合低于 0.8× 的筛选条件，因此保留在当前主线。
 
+## 最终交付
+
+| 固定 master | KG 无 profiler | KG 原生 profiler | 分析优化版 | 完整测试 |
+| ---: | ---: | ---: | ---: | --- |
+| 0.443× | 0.740× | 0.710× | 0.785× | 四版本均 42/42 |
+
+最终选择 **v8**，源码为 [candidates/profiling-dual-dispatch-v8-20261010.py](candidates/profiling-dual-dispatch-v8-20261010.py)；相对固定 master **1.77×**。v8 双 tile 分流候选进行了两轮完整复验，同源码取较慢轮，与 v6 比较后选择；见 [最终候选](reports/master-closure-20261010/最终候选.json)。
+
+交付：[精简汇报](reports/master-closure-20261010/精简汇报.md)、[四版本逐 case 对比](reports/master-closure-20261010/版本对比.md)、[复现步骤](../../tools/evaluation/复现与交接-20261010.md)。
+
+## 优化过程记录
+
 2026-10-10 固定 FlagGems master 为 `d6a8eec473517a3d68157b208eb9c057eb1d4c50`，使用独立 KGS 19655、物理卡 7、单 worker。完整范围为 27 个正确性用例和 15 个性能用例，float16/float32/bfloat16。
 
 | 版本 | 相对 PyTorch | 相对 master | 完整测试 |
@@ -22,9 +34,9 @@ v5 根据三个 dtype、1024/2048/4096 三个尺寸的设备计时选择配置�
 
 原生 KG profiler 组第二轮为 **0.697×**；无 profiler 组第二轮为 **0.741×**。随后独立复验均 **42/42** 通过，成绩分别为 **0.710×** 和 **0.740×**。四版本数据已经收齐，见 [独立四版本对比](reports/master-closure-20261010/版本对比.md)及同名 CSV。原生组自行分析和选择参数，没有接受我们的优化建议。
 
-分组 v6 已通过完整 42 项，结果 **0.773×**，与 v5 的 0.772× 基本持平；2048 方阵采用 GROUP=4，4096 方阵保留 GROUP=0。编译流水线 v7 完成 108 组诊断，从逐值一致且设备计时更快的结果中选出 5 个配置，完整复验 **42/42、0.748×**，没有超过 v6，最终保留 v6。去掉规则矩阵 mask、ND→NZ 转换路径及缓冲选项未带来整体突破。当前 backend 暴露 `enable_preload`，但 CANN 9.0.0 的 BiSheng 不接受对应 `--enable-preload=True` 参数；关闭子块绑定的部分配置超出 UB。失败原文与逐配置数据见 [编译诊断](reports/diagnostics-20261010/matmul-compiler-pipeline-20261010/artifacts/compiler-pipeline.json)，完整结果见 [v7](reports/profiling-kcompiler-v7-20261010/profiling-kcompiler-v7-1.result.json)。
+分组 v6 已通过完整 42 项，结果 **0.773×**，与 v5 的 0.772× 基本持平；2048 方阵采用 GROUP=4，4096 方阵保留 GROUP=0。编译流水线 v7 完成 108 组诊断，从逐值一致且设备计时更快的结果中选出 5 个配置，完整复验 **42/42、0.748×**，没有超过 v6，当时保留 v6。去掉规则矩阵 mask、ND→NZ 转换路径及缓冲选项未带来整体突破。当前 backend 暴露 `enable_preload`，但 CANN 9.0.0 的 BiSheng 不接受对应 `--enable-preload=True` 参数；关闭子块绑定的部分配置超出 UB。失败原文与逐配置数据见 [编译诊断](reports/diagnostics-20261010/matmul-compiler-pipeline-20261010/artifacts/compiler-pipeline.json)，完整结果见 [v7](reports/profiling-kcompiler-v7-20261010/profiling-kcompiler-v7-1.result.json)。
 
-候选通过完整测试，但整体仍低于 0.8×，继续优化。主要短板是半精度大矩阵，当前相对 PyTorch 约 0.55～0.62×。性能是设备 kernel 计时；原版与候选的 PyTorch 参考延迟几何均值漂移约 -0.22%。原始记录见 [master](reports/master-20261010/flaggems-master-1.result.json)、[v3](reports/profiling-k128-pipeline-v3-20261010/profiling-k128-pipeline-v3-1.result.json)。
+v6 候选通过完整测试，但当时仍低于 0.8×。v6 阶段主要短板是半精度大矩阵，当时相对 PyTorch 约 0.55～0.62×。性能是设备 kernel 计时；原版与候选的 PyTorch 参考延迟几何均值漂移约 -0.22%。原始记录见 [master](reports/master-20261010/flaggems-master-1.result.json)、[v3](reports/profiling-k128-pipeline-v3-20261010/profiling-k128-pipeline-v3-1.result.json)。
 
 v1 未通过正确性；v2 在完整测试中卡住，停止本轮对应测试进程后记录为 HTTP_ERROR。失败记录保留，不能作为成果。v3 已绕开该路径，但卡住的具体编译或运行时原因仍未证实。
 

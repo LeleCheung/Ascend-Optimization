@@ -15,7 +15,7 @@ py=/usr/local/python3.11.15/bin/python3.11
 curl --noproxy '*' -fsS http://127.0.0.1:19655/status
 ```
 
-`19655` 用于 amin 和 matmul；`19656` 是后续 narrow 的独立服务，使用只适配 case API 的 FlagGems 副本。新服务由 narrow campaign 在前序任务全部结束、队列空闲时启动，不覆盖旧服务。正式实验保持单卡串行，尤其不要在长诊断时启动新的 KG：KGS 的合同读取和诊断共用一个执行器，合同读取可能排队超过 60 秒。
+`19655` 用于 amin 和 matmul；`19657` 是 narrow 的正式设备任务计时服务，使用适配 case API 与 DMA CSV 空名称解析的独立 FlagGems 副本；19656/19658 分别保留旧 case API 和 OPERATOR 计时探索。正式实验保持单卡串行，尤其不要在长诊断时启动新的 KG：KGS 的合同读取和诊断共用一个执行器，合同读取可能排队超过 60 秒。
 
 只读检查后台进度：
 
@@ -25,7 +25,7 @@ curl --noproxy '*' -fsS http://127.0.0.1:19655/status
 tmux list-sessions
 ```
 
-工具列出 KG 终态、轮次成绩、独立完整结果和服务队列。`recorded_operations` 是本地记录，KG 结束后可能残留历史条目；实际占用以服务队列为准。narrow 专用服务启动后可再加 `--server http://127.0.0.1:19656`。
+工具列出 KG 终态、轮次成绩、独立完整结果和服务队列。`recorded_operations` 是本地记录，KG 结束后可能残留历史条目；实际占用以服务队列为准。narrow 专用服务启动后可再加 `--server http://127.0.0.1:19657`。
 
 ## 2. 完整评测固定候选
 
@@ -93,7 +93,7 @@ KG 原始 profiling 附件由 `archive-kg-evidence.py` 平铺到 `native-evidenc
   "$project/operators/低于0.8算子四版本闭环-20261010.md"
 ```
 
-该工具重算原始结果，检查来源 commit、master 候选 SHA、同合同和完整用例数，并确认原生 KG 两组来自独立复验目录。任何一组缺失、路径越界或摘要与原始证据不同，均在写入总表之前停止。narrow campaign 最后会自动执行它。阶段成绩仍由各算子 README 单独记录。
+该工具重算原始结果，检查来源 commit、master 候选 SHA、同合同和完整用例数，并确认原生 KG 两组来自独立复验目录。任何一组缺失、路径越界或摘要与原始证据不同，均在写入总表之前停止。narrow campaign 最后会自动执行它。本轮完整结果已通过审计；精简报告由 `render-master-delivery.py` 从原始结果重算生成。
 
 ## 5. 分析并继续优化
 
@@ -105,7 +105,7 @@ amin 的 `probe-native-reduction.py` 检查原生精度 min 与浮点扩展、�
 
 矩阵乘的 `run-compiler-v7-910b.sh` 排在 narrow campaign 之后，测试规则矩阵的 mask 和后端搬运/缓冲选项。诊断仅接受与 v5 数值一致的配置；生成候选后完整复验、重新择优，并重建三算子总表。它使用本轮独立 tmux 会话和输出目录。
 
-已完成结果：amin 四版本全部 27/27，依次为 0.296×、0.769×、0.499×、0.916×，bf16 v6 为 0.914×，保留 v5。matmul 四版本全部 42/42，依次为 0.443×、0.740×、0.710×、0.773×，编译流水线 v7 为 0.748×，保留 v6。
+最终结果：amin 四版本全部 27/27，依次为 0.296×、0.769×、0.499×、0.916×；matmul 四版本全部 42/42，依次为 0.443×、0.740×、0.710×、0.785×，最终采用 v8。源码、逐 case 和历史候选见各算子 README。
 
 narrow_copy 的小连续输入在 PyTorch 中是 DMA 复制。task CSV 的 `kernel_name=N/A` 被 pandas 当作浮点空值，原计时器在 `.str` 过滤时崩溃。独立副本通过 `ascend-copy-timer.py` 只修复这一列的类型解析，保留设备任务耗时、采样与聚合；安装包与其他算子不变。KGS 19657 使用 `FlagGems-narrow-device-timing`，对应快照在 `operators/narrow_copy/reports/device-timing-contract-20261010/`。四版本共用 `--timing-scope device_task`，包括 DMA 与 AIV kernel。`run-device-timing-campaign-910b.sh` 执行 baseline、纯 Triton 快路径及原生 KG 两组；`finalize-device-campaign-910b.sh` 随后评测 DMA+Triton 混合候选、采集指标与分项计时，并生成最终四版本表。
 
@@ -113,4 +113,4 @@ narrow_copy 的小连续输入在 PyTorch 中是 DMA 复制。task CSV 的 `kern
 
 `evaluate-operator.py --timing-scope` 仅记录 benchmark 实际设置，不切换计时器。比较工具拒绝混合 device_kernel/device_task/walltime，设备指标报告与总表按各算子实际口径标注。
 
-启动兼容 narrow master 已完成 33/33、0.0103×；连续复制纯 Triton 为 0.582×，小 DMA + 大 Triton 混合版为 0.874×，均完整通过。两组 KG 正在独立运行；完整四版本与最终候选以对应独立复验和总审计为准。
+narrow_copy 四版本全部 33/33，依次为 0.010×、0.495×、0.806×、1.102×。最终实现为 小输入 CANN DMA + KG profiler 循环复制 Triton，重复评测采用较慢轮。完整对照与诊断见 [交接步骤](复现与交接-20261010.md)。
