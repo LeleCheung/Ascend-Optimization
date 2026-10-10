@@ -10,8 +10,9 @@
 | 我们的 K128 流水候选 v3 | 0.747× | 1.69× | 42/42 |
 | 我们的 K256 流水候选 v4 | 0.759× | 1.71× | 42/42 |
 | 我们的设备计时选块候选 v5 | 0.772× | 1.75× | 42/42 |
-| KG 无 profiler | 待完成 | 待完成 | 待独立复验 |
-| KG 原生 profiler | 待完成 | 待完成 | 待独立复验 |
+| 我们的分组调度候选 v6 | 0.773× | 1.74× | 42/42 |
+| KG 无 profiler（独立复验） | 0.740× | 1.67× | 42/42 |
+| KG 原生 profiler（独立复验） | 0.710× | 1.59× | 42/42 |
 
 候选将 K 分块由 32 增大到 128，启用多缓冲和流水调度；规则矩阵走优化路径，非整齐矩阵保留 master。Msopprof 官方 Roofline 文本对 1024³ fp16 case 给出 `memory caused`，CSV 与基本信息已核验；原始 FOP 计数与算法 FLOPs 相差 128 倍，数值 Roofline 需要先核实计数缩放和 roof。见 [官方采集解读](reports/diagnostics-20261010/matmul-roofline-20261010/官方Roofline解读.md)。
 
@@ -19,7 +20,9 @@ v4 使用 dot 的累加器参数，并将规则低精度大矩阵 K 分块增加
 
 v5 根据三个 dtype、1024/2048/4096 三个尺寸的设备计时选择配置，并重新完成 **42/42** 评测，相对 PyTorch **0.772×**、相对 master **1.746×**。诊断共 72 组，其中 15 组编译运行成功。128×256/256×128 输出 tile 仍超出 UB，fp32 的 BK512 超出 CBUF；不采用失败配置。当前选中的均为 128×128、BK256，变化包括 fp32 大矩阵扩大 K 分块，以及方阵改为单维 grid 和指针递增。见 [v5 对比](reports/profiling-kwide-v5-20261010/版本对比.md)。
 
-原生 KG profiler 组第二轮已得到完整通过的 **0.697×** 候选；无 profiler 组第二轮为 **0.741×**、完整 42/42 通过。截至 2026-10-10 22:04，两组工作区均正常结束，待独立复验。上述为 KG 轮次结果，最终四版本表使用独立复验数据。原生组自行分析和选择参数，没有接受我们的优化建议。
+原生 KG profiler 组第二轮为 **0.697×**；无 profiler 组第二轮为 **0.741×**。随后独立复验均 **42/42** 通过，成绩分别为 **0.710×** 和 **0.740×**。四版本数据已经收齐，见 [独立四版本对比](reports/master-closure-20261010/版本对比.md)及同名 CSV。原生组自行分析和选择参数，没有接受我们的优化建议。
+
+分组 v6 已通过完整 42 项，结果 **0.773×**，与 v5 的 0.772× 基本持平；2048 方阵采用 GROUP=4，4096 方阵保留 GROUP=0。编译流水线 v7 完成 108 组诊断，从逐值一致且设备计时更快的结果中选出 5 个配置，完整复验 **42/42、0.748×**，没有超过 v6，最终保留 v6。去掉规则矩阵 mask、ND→NZ 转换路径及缓冲选项未带来整体突破。当前 backend 暴露 `enable_preload`，但 CANN 9.0.0 的 BiSheng 不接受对应 `--enable-preload=True` 参数；关闭子块绑定的部分配置超出 UB。失败原文与逐配置数据见 [编译诊断](reports/diagnostics-20261010/matmul-compiler-pipeline-20261010/artifacts/compiler-pipeline.json)，完整结果见 [v7](reports/profiling-kcompiler-v7-20261010/profiling-kcompiler-v7-1.result.json)。
 
 候选通过完整测试，但整体仍低于 0.8×，继续优化。主要短板是半精度大矩阵，当前相对 PyTorch 约 0.55～0.62×。性能是设备 kernel 计时；原版与候选的 PyTorch 参考延迟几何均值漂移约 -0.22%。原始记录见 [master](reports/master-20261010/flaggems-master-1.result.json)、[v3](reports/profiling-k128-pipeline-v3-20261010/profiling-k128-pipeline-v3-1.result.json)。
 

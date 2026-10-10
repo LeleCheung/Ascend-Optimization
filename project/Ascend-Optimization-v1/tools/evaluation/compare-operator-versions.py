@@ -48,7 +48,14 @@ def load_result(path):
     expected = {case['case_id'] for case in inspect['case_list']['cases']}
     if set(timing) != expected:
         raise ValueError(f'性能 case 未完整覆盖 inspect：{path}')
+    scope = provenance.get('timing_scope')
+    # 历史批次已核验是上游默认 kernel 模式，保留其原始 provenance 字节。
+    if scope == 'FlagGems core 默认计时模式；以 master benchmark 源码为准':
+        scope = 'device_kernel'
+    if scope not in ('device_kernel', 'device_task', 'walltime'):
+        raise ValueError(f'没有可核验的计时范围：{path}')
     return {'path': str(path), 'result_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+            'timing_scope': scope,
             'source_sha256': digest, 'binding': request['binding'],
             'fingerprint': inspect['benchmark_fingerprint'], 'device': result.get('device'),
             'timing': timing, 'rows': {row['uuid']: row for row in rows},
@@ -59,7 +66,7 @@ def compare(versions):
     master = versions[0][1]
     output = []
     for name, current in versions:
-        for key in ('binding', 'fingerprint', 'device'):
+        for key in ('binding', 'fingerprint', 'device', 'timing_scope'):
             if current[key] != master[key]:
                 raise ValueError(f'{name} 与 master 的 {key} 不同')
         if set(current['rows']) != set(master['rows']):
@@ -75,6 +82,7 @@ def compare(versions):
         drift = [r['reference_latency_ms'] / master['timing'][case]['reference_latency_ms']
                  for case, r in timing.items()]
         output.append({'version': name, 'relative_pytorch': statistics.geometric_mean(torch_ratios),
+                       'timing_scope': current['timing_scope'],
                        'relative_master': statistics.geometric_mean(master_ratios),
                        'reference_drift_geomean': statistics.geometric_mean(drift),
                        'reference_drift_min': min(drift), 'reference_drift_max': max(drift),
@@ -94,8 +102,11 @@ def main():
         parser.error('版本名称不能重复')
     versions = [(name, load_result(Path(path))) for name, path in args.version]
     summary = compare(versions)
+    scope_text = {'device_kernel': '设备 kernel 计时',
+                  'device_task': '设备任务计时（包括 DMA 复制与 AIV kernel，排除 host 发射间隙）',
+                  'walltime': '批量调用前后同步的平均完整算子计时，包含 host 发射与设备执行'}[versions[0][1]['timing_scope']]
     lines = ['# 同合同版本性能对比', '',
-             '以下为已提供并通过独立完整评测的版本。计时为 FlagGems core 设备 kernel 计时；数值为逐 case 加速比的几何平均。', '',
+             f'以下为已提供并通过独立完整评测的版本。计时为 FlagGems core {scope_text}；数值为逐 case 加速比的几何平均。', '',
              '| 版本 | 正确性 | 性能 case | 相对 PyTorch | 相对固定 master | PyTorch 基线变化 |',
              '| --- | ---: | ---: | ---: | ---: | ---: |']
     for row in summary:

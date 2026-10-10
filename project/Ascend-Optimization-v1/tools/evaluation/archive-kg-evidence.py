@@ -30,17 +30,22 @@ def main():
     assert sum(path.stat().st_size for path, _ in selected) <= 512 * 1024 * 1024, '采集超过 512MiB，须单独检查归档范围'
     args.output.mkdir(parents=True, exist_ok=False)
     records = []
-    for source, relative in selected:
+    for index, (source, relative) in enumerate(selected, 1):
         data = source.read_bytes()
-        target = args.output / relative
+        # KG 原路径含多个完整 SHA 和 profile ID，在 Windows 超过路径上限。
+        # 附件按编号平铺，原路径和哈希保留在清单中，内容不改写。
+        archived = Path('files') / (f'{index:05d}-' + source.name)
+        target = args.output / archived
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
-        records.append({'source_path': str(source.relative_to(work)),
-                        'archived_path': relative.as_posix(), 'size_bytes': len(data),
+        records.append({'source_path': source.relative_to(work).as_posix(),
+                        'original_archive_path': relative.as_posix(),
+                        'archived_path': archived.as_posix(), 'size_bytes': len(data),
                         'sha256': hashlib.sha256(data).hexdigest()})
     (args.output / 'archive-manifest.json').write_text(json.dumps({
         'workspace': str(workspace), 'state': progress['state'], 'files': records,
-        'note': '原始分析和 manifest 字节保持不变；其中旧绝对路径可通过 source_path 映射到 archived_path。',
+        'format_version': 2,
+        'note': '原始分析和 manifest 字节保持不变；附件使用短路径平铺，旧绝对路径可通过 source_path 映射到 archived_path。',
     }, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     print('ARCHIVED_KG_PROFILE_EVIDENCE', len(records), sum(x['size_bytes'] for x in records), flush=True)
 

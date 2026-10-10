@@ -14,6 +14,7 @@ def main():
     parser.add_argument("--label", required=True)
     parser.add_argument("--server", default="http://127.0.0.1:19655")
     parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument("--timing-scope", choices=("device_kernel", "device_task", "walltime"), default="device_kernel")
     args = parser.parse_args()
     tools = Path(__file__).resolve().parent
     exported = args.output / "export"
@@ -31,6 +32,7 @@ def main():
         "--operator", args.operator, "--source", str(exported / "main.py"),
         "--output", str(args.output / "independent"), "--label", args.label,
         "--server", args.server, "--timeout", str(args.timeout),
+        "--timing-scope", args.timing_scope,
     ], check=True)
     print("KG_INDEPENDENT_VALIDATION_PASSED", args.operator, args.label, flush=True)
 

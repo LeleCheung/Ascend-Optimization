@@ -48,6 +48,8 @@ def main() -> None:
     p.add_argument("--label", required=True)
     p.add_argument("--repeats", type=int, default=1)
     p.add_argument("--timeout", type=int, default=1800)
+    p.add_argument("--timing-scope", choices=("device_kernel", "device_task", "walltime"), default="device_kernel",
+                   help="记录 benchmark 已固定的实际计时口径，不修改 KGS 或 benchmark")
     a = p.parse_args()
     a.output.mkdir(parents=True, exist_ok=True)
     source = a.source.read_text(encoding="utf-8")
@@ -65,7 +67,7 @@ def main() -> None:
         "operator": a.operator, "source_path": str(a.source.resolve()),
         "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
         "server": a.server, "binding": binding,
-        "timing_scope": "FlagGems core 默认计时模式；以 master benchmark 源码为准",
+        "timing_scope": a.timing_scope,
     })
     for index in range(1, a.repeats + 1):
         name = f"{a.label}-{index}"

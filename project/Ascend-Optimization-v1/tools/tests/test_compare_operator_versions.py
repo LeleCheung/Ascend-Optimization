@@ -23,9 +23,11 @@ class CompareTests(unittest.TestCase):
 
     def test_different_fingerprint_and_workloads_rejected(self):
         master = MODULE.load_result(REPORT / 'flaggems-master-1.result.json')
-        for field in ('fingerprint', 'rows'):
+        for field in ('fingerprint', 'rows', 'timing_scope'):
             different = copy.deepcopy(master)
-            if field == 'fingerprint':
+            if field == 'timing_scope':
+                different[field] = 'walltime'
+            elif field == 'fingerprint':
                 different[field] = 'tampered'
             else:
                 different[field].pop(next(iter(different[field])))

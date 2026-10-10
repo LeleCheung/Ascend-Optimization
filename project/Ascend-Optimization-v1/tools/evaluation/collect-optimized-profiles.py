@@ -15,6 +15,7 @@ def main():
     parser.add_argument('--case-id', action='append', required=True)
     parser.add_argument('--kernel-prefix', required=True)
     parser.add_argument('--server', default='http://127.0.0.1:19655')
+    parser.add_argument('--timing-scope', choices=('device_kernel', 'device_task', 'walltime'), default='device_kernel')
     args = parser.parse_args()
     result = json.loads(args.evaluation.read_text(encoding='utf-8'))
     assert result.get('status') == 'PASSED' and not result.get('is_hack')
@@ -31,7 +32,7 @@ def main():
     tools = Path(__file__).resolve().parent
     analyze = [sys.executable, str(tools.parent / 'profiling/ascend_profiling_workflow.py'),
                args.operator, str(source), str(args.evaluation), str(request), str(inspect),
-               str(args.output / '体检报告.md'), '--timing-scope', 'device_kernel',
+               str(args.output / '体检报告.md'), '--timing-scope', args.timing_scope,
                '--evaluation-provenance', str(provenance), '--kernel-prefix', args.kernel_prefix]
     for index, case in enumerate(args.case_id):
         output = args.output / ('case-' + str(index))

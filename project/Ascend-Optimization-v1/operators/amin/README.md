@@ -15,7 +15,16 @@
 
 KGS inspect 已成功。性能范围为 15 个 case：float16/float32/bfloat16，各自覆盖 `[1048576]`、`[64,64]`、`[4096,4096]`、`[64,512,512]`、`[1024,1024,1024]`；多维输入沿 dim=1 归约。完整正确性使用固定 master 的 `tests/test_amin.py`，不裁剪用例。
 
-**已确认原版失败原因，并取得首个完整通过的优化候选；KG 两组未完成。** master 对整数 `dim` 的入口问题由转列表解决。性能套件第 10 次计时的大输入 `[1024,1024,1024]` 沿 dim=1 归约，转置后输出有 1,048,576 行；autotune 的 BLOCK_M=8 需要启动 131072 个 program，超过 Ascend `coreDim <= 65535`。日志明确报 `KernelLaunch failed ... coreDim ... 131072`，随后出现计时错误和空 CSV，最终触发 pandas `.str` 错误。独立完整正确性 exit=0，性能 exit=1，因此不能把失败归结为通用计时环境问题。
+**四版本已完成独立完整评测，我们的 v5 达到 0.916×。** master 对整数 `dim` 的入口问题由转列表解决。性能套件第 10 次计时的大输入 `[1024,1024,1024]` 沿 dim=1 归约，转置后输出有 1,048,576 行；autotune 的 BLOCK_M=8 需要启动 131072 个 program，超过 Ascend `coreDim <= 65535`。日志明确报 `KernelLaunch failed ... coreDim ... 131072`，随后出现计时错误和空 CSV，最终触发 pandas `.str` 错误。独立完整正确性 exit=0，性能 exit=1，因此不能把失败归结为通用计时环境问题。
+
+| 版本 | 相对 PyTorch | 相对兼容基线 | 完整测试 |
+| --- | ---: | ---: | --- |
+| master 加启动兼容修复 | 0.296× | 1.000× | 27/27 |
+| KG 无 profiler（独立复验） | 0.769× | 2.577× | 27/27 |
+| KG 原生 profiler（独立复验） | 0.499× | 1.688× | 27/27 |
+| 我们的 v5 | 0.916× | 3.110× | 27/27 |
+
+完整独立四版本与逐 case 数据见 [版本对比](reports/master-closure-20261010/版本对比.md)及同名 CSV。bf16 v6 已完成 27/27，结果为 0.914×，没有超过 v5，最终保留 v5。
 
 原始证据在 [诊断产物](reports/diagnostics-20261010/amin-full-pytest-timer-v2-20261010/raw-artifacts/benchmark.stdout.txt)。该 debug job 最终还因附件数量超过 32 被标为 FAILED；原始测试输出已从容器单独保存，并记录哈希。
 
@@ -31,9 +40,9 @@ KGS inspect 已成功。性能范围为 15 个 case：float16/float32/bfloat16�
 
 后续 70 组归约诊断使用设备 kernel 计时筛选配置，并在逐值一致后生成 v5。v5 完整 **27/27 通过、相对 PyTorch 0.916×、相对启动兼容基线 3.11×**，达到本阶段 0.8× 目标。PyTorch 基线几何平均变化为 0.994×。主要改进是连续布局直接归约、多行/宽列分块，以及对对应分支关闭多缓冲。float16 的原生精度归约有 14 组诊断成功，v5 的三个 float16 专用分支采用这种配置；bfloat16 原生 `minimum` 则在当前编译器中隐式提升到 float32，导致循环变量类型不一致，v5 的 bfloat16 分支因此仍用 float32 累积。失败配置没有计入成果；文件名中的 `native` 不代表所有 dtype 都采用原生精度。
 
-候选和逐 case 证据见 [v5 报告](reports/direct-axis-native-v5-20261010/版本对比.md)及 [精简汇报](reports/direct-axis-native-v5-20261010/精简汇报.md)。截至 2026-10-10 22:53，原生 KG 无 profiler 已正常结束，第二轮完整 27/27 通过、0.742×，最佳源码 SHA 为 `fac3bca3b3b48a9f77d1837f6f4c4ac289d03c1fae5b46278b534f28753bc8ba`；profiler 组已恢复。两组仍须独立完整复验，四版本闭环尚未完成。
+候选和逐 case 证据见 [v5 报告](reports/direct-axis-native-v5-20261010/版本对比.md)及 [精简汇报](reports/direct-axis-native-v5-20261010/精简汇报.md)。原生无 profiler 第二轮完整 27/27 通过、0.742×，源码 SHA 为 `fac3bca3b3b48a9f77d1837f6f4c4ac289d03c1fae5b46278b534f28753bc8ba`；profiler 第二轮完整 27/27 通过、0.512×。截至 2026-10-11 00:03，两组都正常结束并通过独立 27 项复验，分别为 **0.769×** 和 **0.499×**。profiler 版在中间轴有所改善，但全归约仍走旧路径、末轴分块也更慢，见 [逐路径分析](reports/kg-round2-analysis-20261010.md)。
 
-后续 `probe-bf16-cast.py` 将验证 `minimum` 后显式转回 bf16 是否能保持循环类型并改善延迟，同时测量 float32 累积对照。每个配置先与 PyTorch、v5 逐值比较，`build-bf16-v6.py` 仅从通过的真机配置生成新候选；`run-bf16-v6-910b.sh` 排在原生 KG、独立复验及矩阵分组诊断之后，随后执行完整 27 项测试。该实验尚未运行，没有新增性能结论。
+`probe-bf16-cast.py` 已验证 `minimum` 后显式转回 bf16 可以保持循环类型，但没有改善整体性能。大输入最佳配置仍接近 float32 累积对照，扩大分块的部分配置超出 UB。`build-bf16-v6.py` 从与 PyTorch、v5 逐值一致的配置生成候选，完整复验 27/27 通过、0.914×；v5 为 0.916×，因此保留 v5。原始诊断与失败配置见 [bf16 诊断](reports/diagnostics-20261010/amin-bf16-cast-20261010/artifacts/bf16-cast.json)，完整结果见 [v6](reports/direct-axis-bf16-v6-20261010/direct-axis-bf16-v6-1.result.json)。
 
 ## 实验顺序
 

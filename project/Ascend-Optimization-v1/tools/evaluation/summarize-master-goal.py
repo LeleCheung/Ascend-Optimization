@@ -14,8 +14,8 @@ OPERATORS = {
              'grid-master-20261010'),
     'matmul_bias_activation': ('G611', 0.5408, 42, 27, 15, 'master',
                              'master-20261010/flaggems-master-1.result.json', 'master-20261010'),
-    'narrow_copy': ('G29', 0.0138, 33, 18, 15, 'master',
-                    'master-case-adapter-20261010/flaggems-master-1.result.json', 'master-20261010'),
+    'narrow_copy': ('G29', 0.0138, 33, 18, 15, 'master-compatible',
+                    'master-grid-device-20261010/flaggems-master-grid-1.result.json', 'grid-device-master-20261010'),
 }
 
 
@@ -50,8 +50,9 @@ def audit(project):
         if paths[:3] != [p.resolve() for p in expected]:
             raise ValueError(operator + ' 基线或原生组未使用固定独立复验结果')
         versions = [(name, comparison.load_result(path)) for name, path in zip(expected_names, paths)]
-        candidate_name = ('flaggems-master-grid-adapter-20261010' if operator == 'amin'
-                          else 'flaggems-master-20261010')
+        candidate_name = {'amin': 'flaggems-master-grid-adapter-20261010',
+                          'narrow_copy': 'flaggems-master-grid-compatible-20261010',
+                          'matmul_bias_activation': 'flaggems-master-20261010'}[operator]
         candidate = project / 'operators' / operator / 'candidates' / (candidate_name + '.py')
         origin = json.loads(candidate.with_suffix('.provenance.json').read_text(encoding='utf-8'))
         if (origin.get('upstream_commit') != MASTER
@@ -59,6 +60,9 @@ def audit(project):
                 or hashlib.sha256(candidate.read_bytes()).hexdigest() != versions[0][1]['source_sha256']):
             raise ValueError(operator + ' 固定 master 候选来源或 SHA 不匹配')
         recomputed = comparison.compare(versions)
+        timing_scope = 'device_task' if operator == 'narrow_copy' else 'device_kernel'
+        if any(row['timing_scope'] != timing_scope for row in recomputed):
+            raise ValueError(operator + ' 计时范围与本轮合同不一致')
         for stored, row in zip(closure, recomputed):
             if row['correctness_count'] != correctness or row['timing_count'] != timing:
                 raise ValueError(operator + ' 完整用例数与合同不一致')
@@ -72,14 +76,15 @@ def audit(project):
                     raise ValueError(operator + ' 比较摘要与原始证据不一致：' + key)
             row['result_path'] = Path(row['result_path']).resolve().relative_to(project.resolve()).as_posix()
         operators.append({'operator': operator, 'excel_cell': cell, 'excel_speedup': excel,
+                          'timing_scope': timing_scope,
                           'total_cases': count, 'versions': recomputed})
-    return {'upstream_commit': MASTER, 'timing_scope': 'FlagGems core device_kernel',
+    return {'upstream_commit': MASTER, 'timing_scope': '按算子标注的 FlagGems core 计时',
             'aggregation': '逐性能 case 加速比的几何平均', 'operators': operators}
 
 
 def render(data):
     lines = ['# 低于 0.8× 算子四版本闭环', '',
-             '全部数值由同一固定合同的完整独立评测重算。性能口径为设备 kernel 计时，逐 case 加速比取几何平均。', '',
+             '每个算子的四版本使用同一固定合同并通过完整独立评测。amin 和矩阵乘为设备 kernel 计时；narrow_copy 为设备任务计时，包括 DMA 与 AIV kernel，仅修复 CSV 的 N/A 名称解析。数值排除 host 发射间隙，逐 case 加速比取几何平均。', '',
              '| 算子 | Excel 历史记录 | 固定 master | KG 无 profiler | KG 原生 profiler | 我们的优化版 | 相对 master | 正确性与性能 |',
              '| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |']
     for op in data['operators']:
@@ -89,7 +94,7 @@ def render(data):
         lines.append(f"| {op['operator']} | {op['excel_cell']}：{op['excel_speedup']:.4f}× | {values} | "
                      f"{optimized['relative_master']:.3f}× | {op['total_cases']}/{op['total_cases']} 全通过 |")
     lines += ['', 'amin 的固定 master 列指保留原内核与 autotune 的启动兼容修复基线；未修改版本的大输入启动超限失败记录保留。',
-              'narrow_copy 只适配 benchmark case API，算子代码仍来自固定 master。Excel 历史数据不与本轮合同数据混算。', '',
+              'narrow_copy 基线保留 master 内核与 1024 分块，将大网格拆分为每次最多 8192 program，标为启动兼容修复。原版大输入同步卡住与计时 CSV 解析失败的证据保留。最终候选的纯 Triton/混合实现类型以各算子报告标注为准。Excel 历史数据不与本轮合同混算。', '',
               '## 复现入口', '', f"FlagGems commit：`{data['upstream_commit']}`。", '']
     for op in data['operators']:
         lines += [f"### {op['operator']}", '']

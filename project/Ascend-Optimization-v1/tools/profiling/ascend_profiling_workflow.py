@@ -206,8 +206,8 @@ def analyze(operator: str, source_path: Path, eval_path: Path, eval_request_path
             ir_paths: tuple[Path, ...] = (), *, timing_scope: str = "walltime",
             evaluation_provenance: Path | None = None,
             kernel_prefix: str | None = None) -> dict:
-    if timing_scope not in {"walltime", "device_kernel"}:
-        raise ValueError("计时范围必须为 walltime 或 device_kernel")
+    if timing_scope not in {"walltime", "device_kernel", "device_task"}:
+        raise ValueError("计时范围必须为 walltime、device_kernel 或 device_task")
     source = source_path.read_text(encoding="utf-8-sig")
     source_hash = hashlib.sha256(source.encode("utf-8")).hexdigest()
     evaluated = read_json(eval_path)
@@ -275,7 +275,8 @@ def analyze(operator: str, source_path: Path, eval_path: Path, eval_request_path
         wall = {"candidate_us": row["latency_ms"] * 1000,
                 "pytorch_us": row["reference_latency_ms"] * 1000,
                 "speedup": row["speedup"], "source": str(eval_path),
-                "scope": "完整调用 walltime" if timing_scope == "walltime" else "FlagGems Ascend 设备 kernel 计时"}
+                "scope": {"walltime": "完整调用 walltime", "device_kernel": "FlagGems Ascend 设备 kernel 计时",
+                          "device_task": "设备任务计时，包括 DMA 与 kernel"}[timing_scope]}
         record = {"case_id": case_id, "operator": operator, "timing_scope": timing_scope,
                   "axes": entry["axes"], "workload_model": workload_model(operator, entry["axes"]), "walltime": wall,
                   "metrics": ({"kernel": op.get("op_name"),
@@ -368,7 +369,7 @@ def main() -> None:
     parser.add_argument("--profile", type=Path, nargs=3, action="append", default=[],
                         metavar=("RESPONSE", "REQUEST", "ARTIFACT_DIR"))
     parser.add_argument("--ir", type=Path, action="append", default=[])
-    parser.add_argument("--timing-scope", choices=["walltime", "device_kernel"], default="walltime")
+    parser.add_argument("--timing-scope", choices=["walltime", "device_kernel", "device_task"], default="walltime")
     parser.add_argument("--evaluation-provenance", type=Path)
     parser.add_argument("--kernel-prefix", help="优化内核实际符号，如 mba_pipeline_kernel；匹配不唯一时拒绝分析")
     args = parser.parse_args()
