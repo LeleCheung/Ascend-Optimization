@@ -155,14 +155,39 @@ def files(directory):
                 yield p
 
 
+def git_arguments(target):
+    metadata = target / '.git'
+    if metadata.is_file():
+        text = metadata.read_text().strip()
+        prefix = (ROOT / 'Ascend-Optimization/.git/worktrees').as_posix() + '/'
+        if not text.startswith('gitdir: ' + prefix):
+            raise RuntimeError('未知 worktree 元数据，拒绝清理：' + str(target))
+        name = text[len('gitdir: ' + prefix):]
+        actual = bound(JOURNAL / 'old-Ascend-Optimization/.git/worktrees' / name)
+        if not actual.is_dir():
+            raise RuntimeError('缺少旧 worktree 的 Git 元数据')
+        return ['git', '--git-dir=' + str(actual), '-C', str(target)]
+    return ['git', '-C', str(target)]
+
+
 def compact():
-    assert (JOURNAL / 'validated.json').is_file(), '先完成正式服务和三算子复验'
     repo = ROOT / 'Ascend-Optimization'
+    validation = json.loads((JOURNAL / 'validated.json').read_text())
+    expected = {'amin': 27, 'matmul_bias_activation': 42, 'narrow_copy': 33}
+    if {r['operator']: r['count'] for r in validation['operators'] if r['status'] == 'PASSED'} != expected:
+        raise RuntimeError('先完成三个算子的完整复验')
+    project = repo / 'project/Ascend-Optimization-v1'
+    for row in validation['operators']:
+        result = project / row['result_path']
+        result.resolve().relative_to(project.resolve())
+        if digest(result) != row['result_sha256']:
+            raise RuntimeError('复验结果在核验后改变')
     targets = [JOURNAL / 'old-Ascend-Optimization', ROOT / 'Ascend-Optimization-current',
                ROOT / 'KernelGen', ROOT / 'FlagGems', ROOT / 'sources']
     targets += [ROOT / 'runs/20261010' / n for n in ('FlagGems', 'FlagGems-case-adapter',
                  'FlagGems-narrow-device-timing', 'FlagGems-narrow-operator-timing')]
     targets.append(ROOT / 'runs/legacy-pre-master/runtime-files/flagggems-narrow-copy')
+    targets.append(JOURNAL / 'narrow-runtime-before-git')
     # 只清理列表内的旧副本；每个独有文件先写入归档并逐字节校验。
     index = {}
     for p in files(repo):
@@ -182,9 +207,14 @@ def compact():
             if (target / '.git').exists():
                 name = target.name + '-' + hashlib.sha256(str(target).encode()).hexdigest()[:8]
                 bundle = JOURNAL / (name + '.bundle')
-                run('git', '-C', str(target), 'bundle', 'create', str(bundle), '--all')
-                run('git', '-C', str(target), 'bundle', 'verify', str(bundle), stderr=subprocess.DEVNULL)
-            for p in files(target):
+                arguments = git_arguments(target)
+                run(*arguments, 'bundle', 'create', str(bundle), '--all', 'HEAD')
+                run(*arguments, 'bundle', 'verify', str(bundle), stderr=subprocess.DEVNULL)
+            selected = list(files(target))
+            lfs_objects = target / '.git/lfs/objects'
+            if lfs_objects.is_dir():
+                selected.extend(files(lfs_objects))
+            for p in selected:
                 name = str(p.relative_to(ROOT))
                 if p.is_symlink():
                     archive.add(p, arcname=name, recursive=False)
@@ -220,6 +250,21 @@ def compact():
         if target.exists():
             shutil.rmtree(bound(target))
             print('REMOVED_VERIFIED_COPY', str(target.relative_to(ROOT)), flush=True)
+    transferred = list((JOURNAL / 'loose-files').glob('ascend-optimization-*.bundle'))
+    transferred += list((ROOT / 'runs/20261010').glob('ascend-*.bundle'))
+    pruned = []
+    for bundle in transferred:
+        bound(bundle)
+        heads = run('git', 'bundle', 'list-heads', str(bundle)).decode().splitlines()
+        commits = [line.split()[0] for line in heads]
+        present = all(subprocess.run(['git', '-C', str(repo), 'merge-base', '--is-ancestor', sha, 'HEAD'],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+                      for sha in commits)
+        if commits and present:
+            pruned.append({'path': str(bundle.relative_to(ROOT)), 'sha256': digest(bundle),
+                           'size': bundle.stat().st_size, 'commits': commits})
+            bundle.unlink()
+    save('removed-transfer-bundles.json', {'bundles': pruned})
     save('compacted.json', {'files_checked': len(rows), 'unique_files': sum(r['storage'] == 'archive' for r in rows)})
 
 

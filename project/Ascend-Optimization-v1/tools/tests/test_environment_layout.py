@@ -36,8 +36,31 @@ class LayoutTests(unittest.TestCase):
     def test_cleanup_requires_completed_verification(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(organize, 'JOURNAL', Path(directory)):
-                with self.assertRaises(AssertionError):
+                with self.assertRaises(FileNotFoundError):
                     organize.compact()
+
+    def test_known_worktree_uses_preserved_git_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            journal = root / 'runs/migration'
+            target = root / 'Ascend-Optimization-current'
+            target.mkdir()
+            original = root / 'Ascend-Optimization/.git/worktrees/old'
+            actual = journal / 'old-Ascend-Optimization/.git/worktrees/old'
+            actual.mkdir(parents=True)
+            (target / '.git').write_text('gitdir: ' + original.as_posix(), encoding='utf-8')
+            with patch.object(organize, 'ROOT', root), patch.object(organize, 'JOURNAL', journal):
+                self.assertEqual(organize.git_arguments(target)[1], '--git-dir=' + str(actual))
+
+    def test_foreign_worktree_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / 'old'
+            target.mkdir()
+            (target / '.git').write_text('gitdir: /another-project/.git/worktrees/old', encoding='utf-8')
+            with patch.object(organize, 'ROOT', root):
+                with self.assertRaises(RuntimeError):
+                    organize.git_arguments(target)
 
 
 if __name__ == '__main__':

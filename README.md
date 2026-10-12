@@ -88,6 +88,8 @@ square 的 KG+KGS 烟雾测试已完成，记录见 [烟雾测试归档](project
 
 ## 复现与同步
 
+2026-10-12 已完成服务器目录收敛与三个最终候选完整复验，记录见 [目录整理验收](docs/910B目录整理验收-20261012.md)。
+
 虚拟环境、容器层和 Claude 二进制在服务器运行环境中；源码和评测证据在本仓库。910B 收敛为唯一主仓库 `/data/hanle/ascend-optimization/Ascend-Optimization/`，运行环境在同级 `runtime/`，KG 工作区、日志和诊断在同级 `runs/`。完整目录、启动命令和历史恢复方式见 [910B 目录与复现](docs/910B目录与复现.md)。
 
 压缩包等大文件由 Git LFS 管理；克隆后安装 Git LFS 并执行 `git lfs pull`。KG/KGS 原包位于 `sources/archives/`。导出源码不含嵌套 `.git`，版本见清单。
