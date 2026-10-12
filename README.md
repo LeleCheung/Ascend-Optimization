@@ -11,12 +11,14 @@
 | 对象 | Excel 华为列 | 状态 |
 |---|---:|---|
 | [narrow_copy](project/Ascend-Optimization-v1/operators/narrow_copy/README.md) | G29：0.0138× | 四版本 0.010×、0.495×、0.806×、1.102×，均 33/33；最终相对 master 108.23× |
-| [matmul_bias_activation](project/Ascend-Optimization-v1/operators/matmul_bias_activation/README.md) | G611：0.5408× | 四版本 0.443×、0.740×、0.710×、0.785×，均 42/42；最终相对 master 1.77× |
+| [matmul_bias_activation](project/Ascend-Optimization-v1/operators/matmul_bias_activation/README.md) | G611：0.5408× | 四版本 0.443×、0.743×、0.706×、0.884×，均 42/42；v9 两次复验 0.886×、0.884×，相对 master 2.00× |
 | [amin](project/Ascend-Optimization-v1/operators/amin/README.md) | G92：0.5536× | 四版本 0.296×、0.769×、0.499×、0.916×，均 27/27；最终相对 master 3.11× |
 
 此前按颜色误选的 MSE backward、PReLU backward、t_copy、SmoothL1 backward、BatchNorm backward、native_layer_norm，Excel 数值均已超过 0.8×，已移入 [历史归档](project/Ascend-Optimization-v1/archive/README.md)。原结果保留为流程和优化方法参考，不计入新目标的成果。
 
-现有 narrow_copy 分析使用过 msprof 指标、模拟器指令及编译产物。matmul 的 Msopprof 官方 Roofline 文本给出 `memory caused`，已核验 kernel、case 和物理卡身份；计数缩放与硬件 roof 尚未核实，数值 Roofline 仍待建立。三个正式算子的完整四版本闭环已完成；[精简成果表](project/Ascend-Optimization-v1/operators/本阶段精简汇报-20261010.md)和[复现步骤](project/Ascend-Optimization-v1/tools/evaluation/复现与交接-20261010.md)可直接用于汇报与交接。
+三个正式算子现均超过 0.8×。2026-10-12 矩阵乘 v9 在双 tile 数据复用基础上启用点积累加器与 Ascend 多缓冲流水，两次完整复验达标；三组对照源码也在同合同下重新评测。见 [最新四版本表](project/Ascend-Optimization-v1/operators/低于0.8算子四版本闭环-20261012.md)、[矩阵乘精简汇报](project/Ascend-Optimization-v1/operators/matmul_bias_activation/reports/master-closure-20261012/精简汇报.md)和[复现步骤](project/Ascend-Optimization-v1/tools/evaluation/复现与交接-20261010.md)。
+
+现有 narrow_copy 分析使用过 msprof 指标、模拟器指令及编译产物。matmul 原版的 Msopprof 官方 Roofline 文本给出 `memory caused`，已核验 kernel、case 和物理卡身份；计数缩放与硬件 roof 尚未核实，数值 Roofline 仍待建立。
 
 ## 目录
 

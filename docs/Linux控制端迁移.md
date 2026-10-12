@@ -54,7 +54,7 @@ python3 "$project/tools/evaluation/verify-master-evidence.py" "$project"
 
 继续阅读 [精简成果表](../project/Ascend-Optimization-v1/operators/本阶段精简汇报-20261010.md)和 [复现与交接](../project/Ascend-Optimization-v1/tools/evaluation/复现与交接-20261010.md)。原始 JSON 中的 Windows/910B 绝对路径是历史采集记录，不批量改写；总审计能将记录中的结果路径解析到本地仓库。
 
-本轮最终结果：amin 0.916×，matmul_bias_activation 0.785×，narrow_copy 1.102×，完整范围分别为 27、42、33 项。下一步重点是矩阵乘半精度大矩阵；数值 Roofline 尚未建立。
+当前最终结果：amin 0.916×，matmul_bias_activation v9 0.884×（两次复验 0.886×、0.884×），narrow_copy 1.102×，完整范围分别为 27、42、33 项，三个算子均超过 0.8×。矩阵乘最新证据见 `project/Ascend-Optimization-v1/operators/matmul_bias_activation/reports/master-closure-20261012/`；数值 Roofline 尚未建立。
 
 ## 第 4 步：接续控制与实验
 
