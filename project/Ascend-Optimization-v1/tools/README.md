@@ -5,11 +5,12 @@
 | 目录 | 用途 | 主要入口 |
 |---|---|---|
 | `environment/` | Claude 包装、配置、Python 探针、KGS 启动 | `start-kgs-19654.sh`、`bin-claude` |
+| [`control/`](control/README.md) | Windows/Linux 控制端的 SSH 执行、状态、上传和证据下载 | `control.py` |
 | `evaluation/` | KG 运行、FlagGems 对照、历史汇总 | `run-kg-operator-910b.sh`、`compare-flaggems-910b.py`、`summarize-flaggems-comparison.py` |
 | `profiling/` | 独立证据分析与体检报告 | `ascend_profiling_workflow.py`、`ascend_profiling_agent.py` |
 | `tests/` | 证据绑定和拒绝条件验证 | `test_ascend_profiling_workflow.py`、`test_ascend_profiling_agent.py` |
 
-设备实验在 910B 执行，纯 JSON 汇总与证据验证可在 Windows 执行。各运行工具仍包含服务器实际环境路径，运行前检查 KGS、模型、Catalog、设备和工作区。`run-kg-operator-910b.sh` 默认两轮并带 `--skip-review`，正式实验应按项目计划明确预算与审核策略。
+设备实验在 910B 执行，纯 JSON 汇总与证据验证可在 Windows 或 Linux 控制端执行。控制端工具通过参数指定主机和实验目录；910B 运行脚本仍包含服务器实际环境路径，运行前检查 KGS、模型、Catalog、设备和工作区。`run-kg-operator-910b.sh` 默认两轮并带 `--skip-review`，正式实验应按项目计划明确预算与审核策略。
 
 `compare-flaggems-910b.py` 当前内置五个历史算子与对应服务器运行目录，是联合复测工具，不会自动完成新目标的 master 基线或三版本闭环。`tests/verify-phase1-case-api-910b.sh` 也只用于旧阶段验证。
 
@@ -33,4 +34,4 @@ python -B project/Ascend-Optimization-v1/tools/evaluation/summarize-flaggems-com
 
 汇总脚本会重写该批次的汇总文件，验证时可先复制至临时目录。原始数据归档保持原样。
 
-`--no-profile` 关闭优化反馈，设备计时仍可能使用 NPU profiler。当前独立分析器已用历史证据测试；Roofline 尚未获得可用结果。三项修复报告、归档索引与所需工具在本次远端实验目录的 delivery/ 下提供独立快照；服务器 Git checkout 的全量目录迁移另行处理。
+`--no-profile` 关闭优化反馈，设备计时仍可能使用 NPU profiler。独立分析器与正式三算子闭环已完成本轮验证；数值 Roofline 尚未建立。当前完整成果和迁移入口见 [复现与交接](evaluation/复现与交接-20261010.md)与 [控制工具](control/README.md)。

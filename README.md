@@ -35,6 +35,8 @@ Ascend-Optimization/
 
 [项目索引](project/Ascend-Optimization-v1/README.md)说明文件归属与历史状态。候选和专用脚本跟随算子保存，公共工具由多个算子复用；评测批次中的源码快照用于证明当次实际测了什么，继续保留。
 
+控制端迁移与资料入口：[Linux 控制端迁移](docs/Linux控制端迁移.md)、[控制工具](project/Ascend-Optimization-v1/tools/control/README.md)、[导师要求原始记录](docs/项目要求与导师沟通.md)、[模型接入](docs/模型接入说明.md)、[服务器清单](docs/服务器清单.md)。这些内容已纳入仓库，不再依赖 Windows 外层临时文件。
+
 ## 分步计划
 
 ### 第 0 步：准备独立环境

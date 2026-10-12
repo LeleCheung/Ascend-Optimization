@@ -40,6 +40,8 @@ NCU 指标名、SASS、`sm_arch`、NVIDIA 峰值表及其 CUDA 实现脚本不�
 
 本轮已对矩阵乘的 1024³ fp16 case 实测 `--aic-metrics=Roofline`，保存官方 CSV、设备信息和报告；文本结论为 `memory caused`。原始 FOP 计数与算法 FLOPs 相差 128 倍，计数缩放和硬件 roof 尚未核实，因而尚未生成数值 Roofline 点。详见 [官方采集解读](../project/Ascend-Optimization-v1/operators/matmul_bias_activation/reports/diagnostics-20261010/matmul-roofline-20261010/官方Roofline解读.md)。
 
+本轮读取的官方性能字段和 Roofline/PMU 公式源码已保存在 [固定版本调研资料](msopprof-research/README.md)，供后续核查计数缩放，不再依赖控制端临时 checkout。
+
 真机 PipeUtilization 用于归约和矩阵乘的流水线诊断。narrow_copy 另采设备任务、host 发射、同步调用和实际 DMA/kernel trace，避免把小输入的设备任务差距统称为 Python 开销。老师材料中的 Insight 支持范围保留为当时版本信息。
 
 ## 来源
