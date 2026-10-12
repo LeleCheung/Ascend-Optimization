@@ -2,11 +2,11 @@
 
 `control.py` 使用 Python 3.11 标准库和 OpenSSH，可在 Windows、Linux 上运行。默认项目路径从脚本位置定位，不依赖当前工作目录。它替代旧 `.goal-transfer/` 中可复用的 SSH 调用、上传、状态与证据下载功能。
 
-下面从仓库根目录运行。`root` 是远端实验目录，内部包含 `Ascend-Optimization/`、`kg-runs/`、`campaign-logs/` 和 `diagnostics/`；它不是控制器 venv 路径。当前批次示例为：
+下面从仓库根目录运行。`root` 是远端项目根目录，内部包含唯一 `Ascend-Optimization/` 仓库与 `runs/`；批次产物位于 `runs/<批次>/`。工具也兼容旧的独立实验目录；`root` 不是控制器 venv 路径。当前示例为：
 
 ```bash
 ctl=project/Ascend-Optimization-v1/tools/control/control.py
-root=/data/hanle/ascend-optimization/goal-20261010
+root=/data/hanle/ascend-optimization
 ```
 
 Windows 可将 Bash 变量换成 PowerShell 变量，并使用 `python`；参数和 Python 工具相同。
@@ -36,7 +36,7 @@ python3 "$ctl" --host baai-910b --remote-root "$root" upload \
  operators/amin/scripts/probe-native-reduction.py
 ```
 
-路径相对 `project/Ascend-Optimization-v1/`。保持源文件字节，远端校验 SHA；已有不同内容先备份到实验目录的 `script-backups/control/`。上传适用于明确的开发文件，不会提交 Git 或更新远端分支。仓库级同步使用 Git。
+路径相对 `project/Ascend-Optimization-v1/`。保持源文件字节，远端校验 SHA；已有不同内容先备份到 `runs/control-backups/`，旧目录仍使用 `script-backups/control/`。上传适用于明确的开发文件，不会提交 Git 或更新远端分支。仓库级同步使用 Git。
 
 ## 下载实验原始证据
 

@@ -42,6 +42,6 @@ Ascend-Optimization-v1/
 
 ## 整理边界
 
-原始评测 JSON、日志、压缩包、源码快照与 Excel 保留原内容；只更新可维护的运行入口、测试定位和 Markdown 路径。KG/KGS 源码在根目录 `sources/`，历史 FlagGems 源码在 `third_party/FlagGems/`。
+原始评测 JSON、日志、压缩包、源码快照与 Excel 保留原内容；只更新可维护的运行入口、测试定位和 Markdown 路径。KG/KGS 源码在根目录 `sources/`，本轮固定 master 的 FlagGems 源码在 `third_party/FlagGems/`；历史完整源码从总仓库 Git 历史恢复。
 
-仓库内旧 `runtime/` 和空 `kernels/` 已移除，目录整理已提交。910B 本轮实验在 `/data/hanle/ascend-optimization/goal-20261010/` 使用独立副本。三个算子四版本完整通过，amin 和 narrow_copy 超过 0.8×，matmul_bias_activation 为 0.785×；最终数据见 [成果表](operators/本阶段精简汇报-20261010.md)。
+仓库内旧 `runtime/` 和空 `kernels/` 已移除。910B 唯一仓库路径为 `/data/hanle/ascend-optimization/Ascend-Optimization/`，同级 `runtime/` 保存运行环境，`runs/20261010/` 保存本轮实际工作区；见 [目录与复现](../../docs/910B目录与复现.md)。三个算子四版本完整通过，amin 和 narrow_copy 超过 0.8×，matmul_bias_activation 为 0.785×；最终数据见 [成果表](operators/本阶段精简汇报-20261010.md)。

@@ -8,11 +8,13 @@ max_round=${4:-2}
 seed=${5:-}
 catalog_path=${KG_CATALOG_PATH:-}
 
+repo=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
 base=${KG_CONTROLLER_ROOT:-/data/hanle/ascend-optimization/runtime/kg-controller}
-run_root=${KG_RUN_ROOT:-$base/runs}
+run_root=${KG_RUN_ROOT:-/data/hanle/ascend-optimization/runs/current/kg-runs}
+export KG_SOURCE_ROOT=${KG_SOURCE_ROOT:-$repo/sources}
 case "$arm" in
-  no-profile) profile_flag=--no-profile; port=${KG_WALLTIME_PORT:-19652} ;;
-  profile) profile_flag=--profile; port=${KG_PROFILE_PORT:-19652} ;;
+  no-profile) profile_flag=--no-profile; port=${KG_WALLTIME_PORT:-19655} ;;
+  profile) profile_flag=--profile; port=${KG_PROFILE_PORT:-19655} ;;
   *) echo "unknown arm: $arm" >&2; exit 2 ;;
 esac
 
@@ -23,7 +25,7 @@ if test -e "$workspace"; then
 fi
 
 curl --noproxy '*' -fsS "http://127.0.0.1:$port/status" >/dev/null
-source /data/yy/kgen/kernelgen/env.sh
+source "${KG_CANN_ENV:-/usr/local/Ascend/cann-9.0.0/set_env.sh}"
 export PATH="$base/bin:$base/venv/bin:/usr/local/python3.11.15/bin:$PATH"
 # 每次实验显式选择源码，避免 editable install 指向旧仓库。
 if test -n "${KG_SOURCE_ROOT:-}"; then

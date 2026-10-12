@@ -4,7 +4,7 @@
 
 | 目录 | 用途 | 主要入口 |
 |---|---|---|
-| `environment/` | Claude 包装、配置、Python 探针、KGS 启动 | `start-kgs-19654.sh`、`bin-claude` |
+| `environment/` | 运行环境、固定源码导入、评测副本生成、KGS 启动 | `start-project-services.sh`、`prepare-narrow-runtime.py`、`bin-claude` |
 | [`control/`](control/README.md) | Windows/Linux 控制端的 SSH 执行、状态、上传和证据下载 | `control.py` |
 | `evaluation/` | KG 运行、FlagGems 对照、历史汇总 | `run-kg-operator-910b.sh`、`compare-flaggems-910b.py`、`summarize-flaggems-comparison.py` |
 | `profiling/` | 独立证据分析与体检报告 | `ascend_profiling_workflow.py`、`ascend_profiling_agent.py` |

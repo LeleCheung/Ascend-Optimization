@@ -28,7 +28,7 @@ Ascend-Optimization/
 │   ├── archive/            误选算子、联合对照、烟雾测试和旧阶段记录
 │   └── 验收看板_结果表.xlsx
 ├── sources/                KG 6.7.0、KGS 6.5.0 源码及原始压缩包
-├── third_party/FlagGems/    历史固定版本的源码副本
+├── third_party/FlagGems/    本轮固定 master 源码，随总仓库提供
 ├── manifests/              组件版本与环境清单
 └── docs/                   架构、profiling 资料和方法设计
 ```
@@ -50,7 +50,7 @@ square 的 KG+KGS 烟雾测试已完成，记录见 [烟雾测试归档](project
 ### 第 1 步：筛选并固定正式对象
 
 1. 读取 [验收看板](project/Ascend-Optimization-v1/验收看板_结果表.xlsx)华为 Ascend910B 列，筛选有效加速比低于 0.8× 的算子；精度失败、无有效计时的记录不进入优化。
-2. 拉取 FlagGems `master`，固定具体提交号。仓库内 `third_party/FlagGems/` 是历史源码副本，不能直接当作最新 master。
+2. 本轮固定 FlagGems `master` 提交 `d6a8eec473517a3d68157b208eb9c057eb1d4c50`，源码已纳入 `third_party/FlagGems/`，逐文件 SHA 见 `manifests/flaggems-master-files.json`。下一轮更新上游时重新固定提交，不静默追随 master。
 3. 在 `operators/<算子>/` 建立一个入口 README，记录 Excel 行号与数值、上游提交、实际调用实现、shape、dtype 和完整 workload。
 4. 复测 master 的正确性和性能。若在相同评测范围已超过 0.8×，记录原因后选下一项；正确性失败的对象不进入本轮性能优化。
 
@@ -88,8 +88,8 @@ square 的 KG+KGS 烟雾测试已完成，记录见 [烟雾测试归档](project
 
 ## 复现与同步
 
-虚拟环境、容器层和 Claude 二进制在服务器运行环境中；源码和评测证据在本仓库。910B 仓库外的 `/data/hanle/ascend-optimization/runtime/kg-controller/` 不受本次本地目录整理影响。
+虚拟环境、容器层和 Claude 二进制在服务器运行环境中；源码和评测证据在本仓库。910B 收敛为唯一主仓库 `/data/hanle/ascend-optimization/Ascend-Optimization/`，运行环境在同级 `runtime/`，KG 工作区、日志和诊断在同级 `runs/`。完整目录、启动命令和历史恢复方式见 [910B 目录与复现](docs/910B目录与复现.md)。
 
 压缩包等大文件由 Git LFS 管理；克隆后安装 Git LFS 并执行 `git lfs pull`。KG/KGS 原包位于 `sources/archives/`。导出源码不含嵌套 `.git`，版本见清单。
 
-目录整理已提交至 `a349822b`。2026-10-10 在 910B 新建独立实验副本 `/data/hanle/ascend-optimization/goal-20261010/Ascend-Optimization`，使用该提交并固定新的 FlagGems master；首批工具、候选与评测结果已提交至 `3ae37ec`，后续完整结果分批同步。运行中副本只同步明确审核的文件，不对旧工作区执行 pull/reset。历史报告中的绝对路径、端口与版本是当时快照。
+2026-10-10 的完整实验副本原位于 `goal-20261010/Ascend-Optimization`；本次整理将其作为唯一主仓库，原批次运行产物迁入 `runs/20261010/`。19655、19657 分别服务 amin/矩阵乘和 narrow 设备任务计时，当前均使用物理卡 7，评测串行执行。历史报告中的绝对路径、端口与版本是当时快照。旧 FlagGems 完整源码可从总仓库提交 `0008e8a8` 的 Git 历史恢复，无需额外保留完整历史 checkout。

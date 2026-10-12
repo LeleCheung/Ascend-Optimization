@@ -11,11 +11,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('root', type=Path)
     parser.add_argument('--server', action='append', default=[])
+    parser.add_argument('--batch', default='20261010')
     args = parser.parse_args()
     root = args.root.resolve()
     data = {'checked_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
             'root': str(root), 'kg': [], 'evaluations': [], 'servers': []}
-    for path in sorted((root / 'kg-runs').glob('*/.kernelgen/run-progress.json')):
+    batch_root = root / 'runs' / args.batch
+    if not batch_root.is_dir():
+        batch_root = root
+    for path in sorted((batch_root / 'kg-runs').glob('*/.kernelgen/run-progress.json')):
         progress = json.loads(path.read_text(encoding='utf-8'))
         workspace = path.parent.parent
         row = {'workspace': workspace.name,

@@ -6,16 +6,16 @@
 
 ## 1. 确认实验环境
 
-当前独立实验目录为 `/data/hanle/ascend-optimization/goal-20261010`，FlagGems 固定在 `d6a8eec473517a3d68157b208eb9c057eb1d4c50`。控制器复用 `/data/hanle/ascend-optimization/runtime/kg-controller` 的 venv 和 Claude，执行时通过 `KG_SOURCE_ROOT` 显式选择新仓库源码。KGS 在 `tle_yy` 容器内使用物理卡 7，服务中为 `npu:0`。
+唯一仓库在 `/data/hanle/ascend-optimization/Ascend-Optimization`，FlagGems 固定在 `d6a8eec473517a3d68157b208eb9c057eb1d4c50`，源码随仓库提供。控制器复用同级 `runtime/kg-controller` 的 venv 和 Claude，运行器默认选择自身所在仓库源码。KGS 在 `tle_yy` 容器内使用物理卡 7，服务中为 `npu:0`。原批次产物保存在 `runs/20261010/`。
 
 ```bash
-root=/data/hanle/ascend-optimization/goal-20261010
+root=/data/hanle/ascend-optimization
 project=$root/Ascend-Optimization/project/Ascend-Optimization-v1
 py=/usr/local/python3.11.15/bin/python3.11
 curl --noproxy '*' -fsS http://127.0.0.1:19655/status
 ```
 
-`19655` 用于 amin 和 matmul；`19657` 是 narrow 的正式设备任务计时服务，使用适配 case API 与 DMA CSV 空名称解析的独立 FlagGems 副本；19656/19658 分别保留旧 case API 和 OPERATOR 计时探索。正式实验保持单卡串行，尤其不要在长诊断时启动新的 KG：KGS 的合同读取和诊断共用一个执行器，合同读取可能排队超过 60 秒。
+`19655` 用于 amin 和 matmul；`19657` 是 narrow 的正式设备任务计时服务，使用从仓库生成的 case API 与 DMA CSV 适配副本。旧 19656/19658 服务已停用，探索证据仍保留。正式实验保持单卡串行，尤其不要在长诊断时启动新的 KG：KGS 的合同读取和诊断共用一个执行器，合同读取可能排队超过 60 秒。
 
 只读检查后台进度：
 
@@ -48,7 +48,7 @@ tmux list-sessions
 确认前一组及其评测已经结束，再运行下一组。下面命令需要新的 workspace 后缀，不可直接覆盖正在运行或已有的 workspace。
 
 ```bash
-export KG_RUN_ROOT="$root/kg-runs"
+export KG_RUN_ROOT="$root/runs/新批次/kg-runs"
 export KG_SOURCE_ROOT="$root/Ascend-Optimization/sources"
 export KG_WALLTIME_PORT=19655 KG_PROFILE_PORT=19655
 seed=$project/operators/matmul_bias_activation/candidates/flaggems-master-20261010.py
@@ -66,7 +66,7 @@ KG 使用原生后台 worker，启动脚本等待其终态，可由 tmux 托管�
 
 ```bash
 "$py" "$project/tools/evaluation/finalize-kg-arm.py" \
-  "$root/kg-runs/matmul_bias_activation-profile-新批次" matmul_bias_activation \
+  "$root/runs/新批次/kg-runs/matmul_bias_activation-profile-新批次" matmul_bias_activation \
   "$project/operators/matmul_bias_activation/reports/kg-profile-新批次" \
   --label kg-profile
 ```

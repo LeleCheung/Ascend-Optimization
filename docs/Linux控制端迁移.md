@@ -60,14 +60,14 @@ python3 "$project/tools/evaluation/verify-master-evidence.py" "$project"
 
 ```bash
 ctl="$project/tools/control/control.py"
-root=/data/hanle/ascend-optimization/goal-20261010
+root=/data/hanle/ascend-optimization
 python3 "$ctl" --host baai-910b --remote-root "$root" status \
  --batch 20261010 --ports 19655 19657
 ```
 
 检查 KGS 队列、真实任务状态和设备占用，再安排新批次。保持同卡串行，使用新的 workspace 和报告目录。当前物理卡 7 在服务中为逻辑 `npu:0`；19655 用于 amin/矩阵乘，19657 用于 narrow_copy 设备任务计时。
 
-控制工具示例见 [tools/control](../project/Ascend-Optimization-v1/tools/control/README.md)。KG 启动脚本仍在 910B 上运行，其中 `/data/yy/kgen/kernelgen/env.sh`、controller venv 和 Python 路径是该服务器的实际环境路径，不能直接在控制端执行。
+控制工具示例见 [tools/control](../project/Ascend-Optimization-v1/tools/control/README.md)。KG 启动脚本仍在 910B 上运行，读取 CANN 官方 `set_env.sh` 并使用 controller venv 和服务器 Python，不能直接在控制端执行。唯一仓库、运行目录与评测副本说明见 [910B 目录与复现](910B目录与复现.md)。
 
 需要整夜运行时，在 910B 使用 tmux 托管运行脚本；控制端可断开。调用 `control.py exec` 时，脚本中的命令会在远端执行，工具本身不自动启动或恢复 KG。
 
@@ -76,9 +76,9 @@ python3 "$ctl" --host baai-910b --remote-root "$root" status \
 下载证据、离线核验、审阅变更后，在控制端提交并推送。远端工作树干净时，用以下命令同步已提交源码：
 
 ```bash
-ssh baai-910b 'git -C /data/hanle/ascend-optimization/goal-20261010/Ascend-Optimization fetch origin'
-ssh baai-910b 'git -C /data/hanle/ascend-optimization/goal-20261010/Ascend-Optimization merge --ff-only origin/main'
-ssh baai-910b 'git -C /data/hanle/ascend-optimization/goal-20261010/Ascend-Optimization lfs pull'
+ssh baai-910b 'git -C /data/hanle/ascend-optimization/Ascend-Optimization fetch origin'
+ssh baai-910b 'git -C /data/hanle/ascend-optimization/Ascend-Optimization merge --ff-only origin/main'
+ssh baai-910b 'git -C /data/hanle/ascend-optimization/Ascend-Optimization lfs pull'
 ```
 
 远端存在未提交修改时先审阅，不能直接覆盖。确认控制端 HEAD、GitHub main、远端 HEAD 一致，再检查 LFS 实体。使用 Git 不会自动同步仓库外的 tmux 状态、容器、运行目录和配置。

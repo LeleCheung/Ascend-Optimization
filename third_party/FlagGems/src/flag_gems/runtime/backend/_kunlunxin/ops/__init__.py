@@ -25,7 +25,7 @@ from ._embedding_bag_per_sample_weights_backward import (  # noqa: F401
     _embedding_bag_per_sample_weights_backward,
 )
 from ._euclidean_dist import _euclidean_dist
-from ._flash_attention_forward import _flash_attention_forward  # noqa: F401
+from ._flash_attention_forward import _flash_attention_forward
 from ._functional_sym_constrain_range import _functional_sym_constrain_range
 from ._functional_sym_constrain_range_for_size import (
     _functional_sym_constrain_range_for_size,
@@ -184,6 +184,7 @@ from .conv1d import conv1d
 from .conv2d import conv2d
 from .conv3d import conv3d
 from .conv_depthwise2d import _conv_depthwise2d
+from .conv_transpose1d import conv_transpose1d
 from .conv_transpose2d import conv_transpose2d
 from .copy import copy, copy_
 from .copysign import copysign, copysign_out
@@ -232,7 +233,7 @@ from .empty import empty  # noqa: F401
 from .empty_permuted import empty_permuted  # noqa: F401
 from .eq import eq, eq_, eq_scalar, eq_scalar_
 from .erf import erf, erf_, special_erf
-from .erfc import erfc, erfc_  # noqa: F401
+from .erfc import erfc, erfc_, special_erfc  # noqa: F401
 from .erfinv import erfinv
 from .erfinv_ import erfinv_  # noqa: F401
 from .exp import exp, exp_, exp_out
@@ -243,6 +244,16 @@ from .exponential import exponential  # noqa: F401
 from .exponential_ import exponential_
 from .eye import eye
 from .eye_m import eye_m
+from .fake_quantize_per_channel_affine import (  # noqa: F401
+    fake_quantize_per_channel_affine,
+)
+from .fake_quantize_per_channel_affine_cachemask import (  # noqa: F401
+    fake_quantize_per_channel_affine_cachemask,
+    fake_quantize_per_channel_affine_cachemask_out,
+)
+from .fake_quantize_per_channel_affine_cachemask_backward import (  # noqa: F401
+    fake_quantize_per_channel_affine_cachemask_backward,
+)
 from .feature_dropout import feature_dropout, feature_dropout_
 from .fill import (
     fill_scalar,
@@ -529,7 +540,6 @@ from .rsqrt import rsqrt, rsqrt_
 from .rsub import rsub, rsub_scalar, rsub_tensor
 from .safe_softmax import _safe_softmax
 from .scalar_tensor import scalar_tensor
-from .scaled_mm import scaled_mm, scaled_mm_out
 from .scaled_softmax import scaled_softmax_backward, scaled_softmax_forward
 from .scatter import scatter, scatter_
 from .scatter_add_ import scatter_add, scatter_add_
@@ -583,7 +593,6 @@ from .special_chebyshev_polynomial_w import (
     special_chebyshev_polynomial_w_out,
 )
 from .special_digamma import special_digamma
-from .special_erfc import special_erfc
 from .special_erfcx import special_erfcx
 from .special_erfinv import special_erfinv, special_erfinv_, special_erfinv_out
 from .special_exp2 import special_exp2
@@ -874,6 +883,7 @@ __all__ = [
     "conv1d",
     "conv2d",
     "conv3d",
+    "conv_transpose1d",
     "conv_transpose2d",
     "copy",
     "copy_",
@@ -938,6 +948,10 @@ __all__ = [
     "exponential_",
     "eye",
     "eye_m",
+    "fake_quantize_per_channel_affine",
+    "fake_quantize_per_channel_affine_cachemask",
+    "fake_quantize_per_channel_affine_cachemask_backward",
+    "fake_quantize_per_channel_affine_cachemask_out",
     "feature_dropout",
     "feature_dropout_",
     "fill_scalar",
@@ -1295,8 +1309,6 @@ __all__ = [
     "scaled_dot_product_attention_backward",
     "scaled_dot_product_attention_forward",
     "scaled_dot_product_efficient_attention_backward",
-    "scaled_mm",
-    "scaled_mm_out",
     "scaled_softmax_backward",
     "scaled_softmax_forward",
     "ScaleDotProductAttention",

@@ -69,14 +69,16 @@ from pathlib import Path
 import json,subprocess,urllib.request
 root=Path(parameters['root']).resolve()
 project=root/'Ascend-Optimization/project/Ascend-Optimization-v1'
+batch_root=root/'runs'/parameters['batch']
+if not batch_root.is_dir():batch_root=root
 rows={'root':str(root),'sessions':[],'runs':[],'logs':[],'services':[],'results':[]}
 tmux=subprocess.run(['tmux','list-sessions','-F','#{session_name}'],capture_output=True,text=True)
 rows['sessions']=[s for s in tmux.stdout.splitlines() if s.endswith(parameters['batch'])]
-for f in sorted((root/'kg-runs').glob('*/.kernelgen/run-progress.json')):
+for f in sorted((batch_root/'kg-runs').glob('*/.kernelgen/run-progress.json')):
  if parameters['batch'] not in f.parents[1].name:continue
  d=json.loads(f.read_text());rows['runs'].append({'workspace':f.parents[1].name,
    **{k:d.get(k) for k in ('state','stage','updated_at')}})
-for f in sorted((root/'campaign-logs').glob('*.log')):
+for f in sorted((batch_root/'campaign-logs').glob('*.log')):
  lines=f.read_text(errors='replace').splitlines()
  rows['logs'].append({'name':f.name,'last_line':lines[-1][:600] if lines else ''})
 for op in parameters['operators']:
@@ -111,7 +113,8 @@ for item in parameters['files']:
 for p,data,old,name in changes:
  if old==data:continue
  if old is not None:
-  backup=root/'script-backups/control'/hashlib.sha256(old).hexdigest()/name
+  backup_root=root/'runs/control-backups' if (root/'runs').is_dir() else root/'script-backups/control'
+  backup=backup_root/hashlib.sha256(old).hexdigest()/name
   backup.parent.mkdir(parents=True,exist_ok=True)
   assert not backup.exists() or backup.read_bytes()==old
   backup.write_bytes(old)
@@ -124,6 +127,8 @@ from pathlib import Path
 import sys,tarfile,json
 root=Path(parameters['root']).resolve()
 project=root/'Ascend-Optimization/project/Ascend-Optimization-v1'
+batch_root=root/'runs'/parameters['batch']
+if not batch_root.is_dir():batch_root=root
 assert project.is_dir(),project
 selected={}
 def collect(directory,prefix,filter_batch=False):
@@ -139,7 +144,7 @@ for op in parameters['operators']:
  directory=project/'operators'/op
  collect(directory/'candidates','operators/'+op+'/candidates/',True)
  collect(directory/'reports','operators/'+op+'/reports/',True)
-for d in sorted((root/'diagnostics').glob('*')):
+for d in sorted((batch_root/'diagnostics').glob('*')):
  if not d.is_dir() or parameters['batch'] not in d.name:continue
  op=('amin' if d.name.startswith('amin-') else 'matmul_bias_activation' if d.name.startswith('matmul-')
      else 'narrow_copy' if d.name.startswith('narrow-') else None)
@@ -221,7 +226,7 @@ def apply_download(actions, project, state):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--host', default='baai-910b', help='已配置的 SSH 主机别名')
-    parser.add_argument('--remote-root', help='910B 实验根目录，包含 Ascend-Optimization 与 kg-runs')
+    parser.add_argument('--remote-root', help='910B 项目根目录，包含 Ascend-Optimization 与 runs；兼容旧批次目录')
     commands = parser.add_subparsers(dest='command', required=True)
     execute = commands.add_parser('exec', help='执行本地 Bash 文件，去 BOM 并转为 LF')
     execute.add_argument('script', type=Path)

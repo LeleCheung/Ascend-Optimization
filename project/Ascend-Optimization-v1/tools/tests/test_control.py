@@ -29,6 +29,38 @@ def archive(rows):
 
 
 class ControlTests(unittest.TestCase):
+    def test_status_reads_canonical_batch_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            progress = root / 'runs/20261010/kg-runs/amin-profile-20261010/.kernelgen/run-progress.json'
+            progress.parent.mkdir(parents=True)
+            progress.write_text('{"state":"completed"}', encoding='utf-8')
+            parameters = {'root': str(root), 'batch': '20261010', 'operators': [], 'ports': []}
+            namespace = {'parameters': parameters}
+            from contextlib import redirect_stdout
+            output = io.StringIO()
+            with patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0, '', '')):
+                with redirect_stdout(output):
+                    exec(control.REMOTE_STATUS, namespace)
+            rows = json.loads(output.getvalue())['runs']
+            self.assertEqual(rows[0]['workspace'], 'amin-profile-20261010')
+            self.assertEqual(rows[0]['state'], 'completed')
+
+    def test_download_reads_diagnostics_from_canonical_batch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'Ascend-Optimization/project/Ascend-Optimization-v1').mkdir(parents=True)
+            diagnostic = root / 'runs/20261010/diagnostics/amin-probe-20261010'
+            diagnostic.mkdir(parents=True)
+            (diagnostic / 'response.json').write_bytes(b'{"status":"SUCCEEDED"}')
+            parameters = {'root': str(root), 'batch': '20261010', 'operators': ['amin'], 'max_bytes': 1024}
+            script = 'parameters = ' + repr(parameters) + '\n' + control.REMOTE_DOWNLOAD
+            result = subprocess.run([sys.executable, '-'], input=script.encode(), capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            with tarfile.open(fileobj=io.BytesIO(result.stdout), mode='r:gz') as archive:
+                self.assertEqual(archive.getnames(), [
+                    'operators/amin/reports/diagnostics-20261010/amin-probe-20261010/response.json'])
+
     def test_gateway_zero_exit_is_not_success(self):
         result = subprocess.CompletedProcess([], 0, b'no available gateway\r\n', b'')
         with patch.object(control.subprocess, 'run', return_value=result):
