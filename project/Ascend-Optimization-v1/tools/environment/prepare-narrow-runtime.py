@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import shutil
+import subprocess
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[4]
@@ -71,6 +72,15 @@ def narrow_copy_build_inputs(plan, cur_dtype, device):
               'patched_files': {name: hashlib.sha256(data).hexdigest() for name, data in expected.items()}}
     (target / 'ascend-evaluation-adapter.json').write_text(
         json.dumps(result, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    # KGS 会检查评测树的 Git HEAD 和源码是否干净；这里生成本机临时快照。
+    subprocess.run(['git', '-C', str(target), 'init', '-q'], check=True)
+    subprocess.run(['git', '-C', str(target), 'add', '-f', '--', '.'], check=True,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    subprocess.run(['git', '-C', str(target), '-c', 'user.name=Ascend Evaluation',
+                    '-c', 'user.email=ascend-evaluation@localhost', 'commit', '-q',
+                    '-m', 'Fixed master with archived narrow device-task adapter'], check=True)
+    result['runtime_commit'] = subprocess.check_output(
+        ['git', '-C', str(target), 'rev-parse', 'HEAD'], text=True).strip()
     return result
 
 
