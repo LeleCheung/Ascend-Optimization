@@ -34,6 +34,7 @@ Ascend-Optimization-v1/
 
 | 入口 | 用途 |
 |---|---|
+| [四算子工作流进展](operators/四算子工作流进展-20261014.md) | 最新固定源码复现、真实生成结果及剩余工作 |
 | [主线算子](operators/README.md) | amin、matmul_bias_activation、narrow_copy 的四版本闭环 |
 | [本批进展](operators/持续优化进展-20261013.md) | 新候选成绩、已完成四版本和待办 |
 | [上批四版本成果表](operators/低于0.8算子四版本闭环-20261012.md) | 2026-10-12交付成绩与源码 SHA |

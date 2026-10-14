@@ -1,0 +1,25 @@
+{
+  "api_version": "v6.2",
+  "binding": {
+    "catalog_name": "flaggems-adapter-definitions",
+    "definition": "logaddexp2"
+  },
+  "implementation": {
+    "name": "logaddexp2-trial-1",
+    "definition": "logaddexp2",
+    "language": "triton",
+    "entrypoint": "main.py::run",
+    "sources": [
+      {
+        "path": "main.py",
+        "content": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\nimport logging\n\nimport torch\nimport triton\nimport triton.language as tl\n\nfrom flag_gems.utils import pointwise_dynamic\n\nlogger = logging.getLogger(__name__)\n\n\n@pointwise_dynamic(is_tensor=[True, True], promotion_methods=[(0, 1, \"DEFAULT\")])\n@triton.jit\ndef logaddexp2_func(x, y):\n    # log2(2**x + 2**y) = m + log2(1 + 2**(-|x - y|)), m = max(x, y)\n    x_f32 = x.to(tl.float32)\n    y_f32 = y.to(tl.float32)\n    m = tl.maximum(x_f32, y_f32)\n    delta = x_f32 - y_f32\n    res = m + tl.log2(1.0 + tl.exp2(-tl.abs(delta)))\n    # `delta` is NaN when x and y are equal infinities (inf - inf); the result\n    # is then m, e.g. logaddexp2(inf, inf) = inf, logaddexp2(-inf, -inf) = -inf.\n    res = tl.where(delta != delta, m, res)\n    # Genuine NaN inputs must still propagate NaN.\n    is_nan = (x_f32 != x_f32) | (y_f32 != y_f32)\n    return tl.where(is_nan, float(\"nan\"), res)\n\n\n@triton.jit\ndef _logaddexp2_flat_kernel(\n    x_ptr,\n    y_ptr,\n    out_ptr,\n    n_elements,\n    TILE: tl.constexpr,\n    VIEW: tl.constexpr,\n):\n    # Flat 1-D kernel for contiguous, same-shape, same-dtype inputs.\n    # Each program walks VIEW consecutive tiles with a bounded grid.\n    pid = tl.program_id(0)\n    base = pid * (TILE * VIEW)\n    for i in tl.static_range(VIEW):\n        offs = base + i * TILE + tl.arange(0, TILE)\n        mask = offs < n_elements\n        x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n        y = tl.load(y_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n        m = tl.maximum(x, y)\n        delta = x - y\n        d = tl.where(delta != delta, 0.0, delta)\n        # Clamp keeps exp2 underflowing to 0 instead of overflow/NaN for large |d|.\n        d = tl.minimum(tl.abs(d), 200.0)\n        res = m + tl.log2(1.0 + tl.exp2(-d))\n        res = tl.where(delta != delta, m, res)\n        is_nan = (x != x) | (y != y)\n        res = tl.where(is_nan, float(\"nan\"), res)\n        tl.store(out_ptr + offs, res, mask=mask)\n\n\ndef _flat_params(dtype, n_elements):\n    # (TILE, VIEW, num_stages): bounded grid, each program covers TILE*VIEW\n    # elements. num_stages=1 for the tight-loop half precision path so that the\n    # loop-carried dependency (device work) is not stalled by double buffering,\n    # the verified half-precision setting; fp32 uses num_stages=2.\n    if dtype == torch.float16 or dtype == torch.bfloat16:\n        if n_elements >= 1 << 26:\n            return 4096, 64, 2\n        return 8192, 4, 1\n    else:\n        if n_elements >= 1 << 26:\n            return 4096, 16, 2\n        return 4096, 4, 2\n\n\ndef _is_same_contiguous(a, b):\n    if not (isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor)):\n        return False\n    if a.shape != b.shape or a.dtype != b.dtype or a.device != b.device:\n        return False\n    if a.device.type != \"npu\":\n        return False\n    if not (a.is_contiguous() and b.is_contiguous()):\n        return False\n    if a.dtype not in (torch.float16, torch.bfloat16, torch.float32):\n        return False\n    return True\n\n\ndef logaddexp2(self, other):\n    logger.debug(\"GEMS LOGADDEXP2\")\n    if _is_same_contiguous(self, other):\n        n = self.numel()\n        if n > 0:\n            out = torch.empty_like(self)\n            tile, view, stages = _flat_params(self.dtype, n)\n            span = tile * view\n            grid = ((n + span - 1) // span,)\n            # Bounded grid: Triton launches must stay within [1, 65535].\n            if len(grid) == 1 and 1 <= grid[0] <= 65535:\n                _logaddexp2_flat_kernel[grid](\n                    self, other, out, n, TILE=tile, VIEW=view, num_stages=stages\n                )\n                return out\n    return logaddexp2_func(self, other)\n\n\ndef logaddexp2_out(self, other, out):\n    logger.debug(\"GEMS LOGADDEXP2_OUT\")\n    logaddexp2_func(self, other, out0=out)\n    return out\n\n\nrun = logaddexp2\n"
+      }
+    ]
+  },
+  "settings": {
+    "warmup_ms": 1000,
+    "benchmark_ms": 100,
+    "num_trials": 3,
+    "timeout_seconds": 1800
+  }
+}

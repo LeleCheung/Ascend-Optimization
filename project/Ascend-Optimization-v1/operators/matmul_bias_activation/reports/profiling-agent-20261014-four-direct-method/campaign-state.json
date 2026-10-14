@@ -1,0 +1,71 @@
+{
+  "operator": "matmul_bias_activation",
+  "seed_sha256": "125aa897fbe00ba74224b47b0786d670978bf960db00bba1b8755239593c95f6",
+  "status": "completed",
+  "history": [
+    {
+      "round": 1,
+      "parent_result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/matmul_bias_activation/reports/profiling-agent-20261014-four-direct-method/seed-evaluation/seed-1.result.json",
+      "parent_score": 0.8707021663617351,
+      "hypothesis": "本轮只改一处：把 v8 的“一次 K 步复用 A 面板、并行计算两个相邻 N tile”的双 N tile 结构从半精度扩展到 fp32 规则方阵（1024/2048/4096）。当前源码里 fp32 全部落到 v6（单 N tile、GROUP=4/GROUP=0 的 mba_selected_profiling_kgroup_v6_20261010_kernel），这正是三个 fp32 方阵明显落后的原因：1024→69.95us(0.717×)、2048→357.6us(0.792×)、4096→2326.0us(0.979×)，而 fp16 同形状已经是 30.0/132.3/790.5us，说明 fp32 路径的循环与寻址开销没有按同样的方式被摊薄。具体修改：新增 mba_dual_ntile_v9_kernel，保留 v8 的双累加器结构（acc0/acc1）、每次 K 迭代只加载一次 A、两个 B tile，并在规则形状下走无 mask 的 EVEN 分支；fp32 使用 BM=BN=128、BK=128（fp32 元素 4 字节，BK=256 的 A 面板字节数是 fp16 的两倍，按历史已采纳的 fp32 K 分块保持 128；用 min(256, 512//element_size) 的规则表达），半精度仍然转发到已验证的 v8，参数完全不变，因此 fp16/bf16 的 6 个 case 行为逐字节一致。grid 为 (m/128)*(n/256)，4096 时为 32*16=512 个 program，远小于 65535。预期 1024 fp32 与 2048 fp32 受益最大（A 复用把每 K 步的 A 搬运与地址计算减半，MTE2 与 scalar 开销同步下降），4096 fp32 已有 0.979×，回收的地址计算与 MTE2 压力应使其回到 1.0× 以上。风险：如果 fp32 的 cube 受限主要来自 MAC 而非取数，增益会变小；此时 v8 半精度路径与全部回退路径不变，不会比当前回归。",
+      "expected_effect": "预期 fp32 三个规则方阵 case 一起改善：1024 从 69.95us（0.717×）降到 55-60us 区间（约 0.85-0.91×），2048 从 357.6us（0.792×）降到 300us 以内（约 0.94× 以上），4096 从 2326us（0.979×）提升到 1.0× 以上。384 小方阵与所有非方阵、非连续、bias 非一维形状仍走原 v6/v4/master 回退，行为不变。fp16/bf16 的 6 个 case 因转发到未修改的 v8 路径，时间应保持在当前水平（384→9.9us、1024→30.0us、2048→132.3us、4096→790.5us 附近）。整体几何平均预期从当前约 0.82× 提升到 0.85× 以上，且不牺牲任何已验证通过的路径。",
+      "source_sha256": "210f603fd20c2d6c9bf2ae51dc79fa0e6936176ecbb6688bd1b49cddb35e2146",
+      "status": "PASSED",
+      "score": 0.796492681843334,
+      "result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/matmul_bias_activation/reports/profiling-agent-20261014-four-direct-method/round-01/evaluation/trial-1.result.json",
+      "accepted": false
+    },
+    {
+      "round": 2,
+      "parent_result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/matmul_bias_activation/reports/profiling-agent-20261014-four-direct-method/seed-evaluation/seed-1.result.json",
+      "parent_score": 0.8707021663617351,
+      "hypothesis": "本轮只改一处：把已经采纳在 v8 里的“一次 K 步复用 A 面板、并行算两个相邻 N tile”的双累加器结构从半精度扩展到 fp32 规则方阵。当前源码里 fp32 方阵全部落到 v6（_TILES_profiling_kgroup_v6_20261010 的 2048→BK256、4096→BK256），这正是 fp32 三个方阵落后的原因：1024→69.95us(0.717×)、2048→357.6us(0.792×)，而同形状半精度只要 30.0/132.3us。1024 已经有真机指标 aic_mte2_ratio=0.552、aic_mac_ratio=0.6325、cube_utilization=71.7%，说明 fp32 路径的取数/寻址压力没有像半精度那样被摊薄，MAC 没被喂饱。具体修改：新增 mba_dual_ntile_v9_kernel（与 v8 完全相同的双累加器结构、相同的无 mask 加载、相同的 bias+ReLU 收尾），只把 BLOCK_SIZE_K 从 256 降到 128——因为 fp32 的 A 面板每个 K 步字节数是 fp16 的两倍，BK=256 会让单个 K tile 的 A/B 面板占用和同步气泡过大，BK=128 才是按字节对齐到半精度 BK=256 的分块（这也与历史已采纳的“FP32 用 BK128、半精度用 BK256”一致）。调度上 fp32 在 v9 里用 pid_m=pid%num_pid_m、pid_n=pid//num_pid_m，让同一列相邻的 M tile 连续发射，A 面板在 L2 上更容易被后续 program 复用。分流条件为 input.dtype==torch.float32 且 m==n==k 且 m%256==0、k%128==0、三者连续、bias.numel()==n，即只接管 1024/2048/4096 三个 fp32 方阵（384 不满足 m%256==0，保持原来的 master 路径）；半精度分支、非方阵、stride 与广播形状全部保持不变，逐字节回退到原有实现。grid 为 (m/128)*(n/256)：4096 时 32*16=512 个 program，远小于 65535。注意历史第 1 轮失败的是给 fp32 用 BK=256 的 v9，本轮改用 BK=128，这是与失败配置不同的关键点。预期 1024 与 2048 受益最大（每 K 步的 A 搬运与地址计算减半），4096 已有 0.979×，回收的 MTE2 与标量压力应使其回到 1.0× 附近；风险是若 fp32 cube 已由 MAC 饱和，增益会小于预期，此时半精度与全部回退路径不变，不会比当前回归。",
+      "expected_effect": "预期 fp32 三个规则方阵 case 一起改善：1024 从 69.95us(0.717×) 降到 55-60us 区间（约 0.85-0.91×），2048 从 357.6us(0.792×) 降到 300us 以内（约 0.94× 以上），4096 从 2326us(0.979×) 提升到 1.0× 以上。384 fp32 与所有非方阵、非连续、bias 非一维形状仍走原路径，行为不变。fp16/bf16 的 6 个 case 因先落到未修改的半精度 v8 分支，时间保持不变（384→9.9us、1024→30.0us、2048→132.3us、4096→790.5us 附近）。整体几何平均预期从当前约 0.82× 提升到 0.85× 以上，且不牺牲任何已验证通过的路径。",
+      "source_sha256": "fea2733347ee672de796aa3d39926f36c327cf37d5105b0f071001db178a47df",
+      "status": "PASSED",
+      "score": 0.908833490373748,
+      "result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/matmul_bias_activation/reports/profiling-agent-20261014-four-direct-method/round-02/evaluation/trial-1.result.json",
+      "accepted": true
+    },
+    {
+      "round": 3,
+      "parent_result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/matmul_bias_activation/reports/profiling-agent-20261014-four-direct-method/round-02/evaluation/trial-1.result.json",
+      "parent_score": 0.908833490373748,
+      "hypothesis": "本轮只改 v8/v9 的分块几何，不引入新的取数模式。真机证据（bf16 2048 与 fp16 2048 采集）显示 kernel 为 mba_dual_dispatch_v8_kernel，aic_mte2_ratio 0.832-0.838、aic_mac_ratio 0.685-0.687、cube_utilization 73.3-73.7%、aic_scalar_ratio 0.244-0.248，即双 N tile 的路径已经被 AIC 的 MTE2 搬运与标量寻址主导，而 2048 只有 0.779×/0.738×、4096 只有 0.810×/0.780×。现有 v8/v9 每个 program 只做 1 个 M tile × 2 个 N tile，A 面每 K 步搬一次但 B 面（两个 tile）每个 program 都要重搬一遍：对 4096 方阵，A 面板被重复搬运 4096/128=32 次、B 面板被重复 4096/256=16 次注 16 次，总逻辑面板量约 (32*4096*4096*4B 的 A)+(16*... 的 B)，这正是 MTE2 比例高企的来源。修改：新增 mba_wide_ntile_v10_kernel，把每个 program 的工作面扩成 2 个 M tile × 2 个 N tile（4 个累加器 a00/a01/a10/a11），同一次 K 循环里只加载一次 B 面板（b0/b1）和两条 A 面板（a0/a1），做 4 次 tl.dot。相对 v8/v9：B 面的搬运次数减半（每个 program 覆盖的 N 宽度不变，但覆盖 2 个 M tile），A 面仍是每 program 两条；同时标量开销（每个 K 步的指针推进从 v8 的 3 条 a/b0/b1 变成 v10 的 4 条 a0/a1/b0/b1，但摊到 4 个输出 tile 上，每 tile 的地址计算从 1.5 条降到 1.0 条），循环体总数也随 program 数减半。grid 相应从 (m/128)*(n/256) 改为 (m/256)*(n/256)：4096 时 16*16=256、2048 时 8*8=64、1024 时 4*4=16，全部远小于 65535，且保持一维 grid 形式（不触发历史上第 2 轮的 int-grid TypeError）。分流条件：半精度分支把 m%256==0 改成 m%256==0（原 v8 是 m%128==0）——即 1024/2048/4096 走 v10，384 因 m%256!=0 落到 v6 原路径；fp32 分支保持 m==n==k、m%256==0、k%128==0，同样只覆盖 1024/2048/4096。BK 不变：半精度 256、fp32 128，与历史已采纳的结论一致，避免重复历史第 1 轮（fp32 BK256）与第 6 轮（半精度 BK128）的失败配置。所有非方阵、非连续、bias 非一维、以及 384 小方阵的 case 原样走 v6→pipeline→master 回退链，行为逐字节不变。",
+      "expected_effect": "受益 case 是慢的 6 个大方阵：bf16 2048（127.7us，0.779×）、bf16 4096（785.9us，0.810×）、fp16 2048（128.3us，0.738×）、fp16 4096（785.0us，0.780×）、fp32 2048（329.1us，0.861×）、fp32 4096（2218.1us，1.024×）。其中 2048/4096 的 B 面 MTE2 流量减半、program 数减半（2048 从 128 个 program 降到 64 个，4096 从 512 降到 256），预期 2048 两个 dtype 从 128us 降到 110-120us 区间（约 0.83-0.88×），4096 从 785us 降到 700-750us（约 0.85-0.90×），fp32 4096 从 2218us 保持或略升到 1.0-1.05×，fp32 2048 从 329us 降到 300us 附近（约 0.94×）。1024 方阵（29.2/29.4/57.0us）因 program 数只有 16 个，核占用可能变差，是主要风险点，若退化仍优于当前 0.78-0.88× 的概率不保证，但该分支与 v9 只差分块几何、且失败会被评测直接淘汰。384 三个 case（9.5/9.6/10.7us，1.23-1.26×）因 m%256!=0 依旧走 v6/v4/master 回退，时间与正确性不变。整体几何平均预期从 0.909× 提升到 0.93-0.95×。",
+      "source_sha256": "38601f38448f5982e4d1ca6fc85d32f1868f5c4817cba3fe077127d08ef8b829",
+      "status": "FAILED",
+      "error": "命令失败 1，见 /data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/matmul_bias_activation/reports/profiling-agent-20261014-four-direct-method/round-03/evaluation.log",
+      "evaluation_status": "RUNTIME_ERROR",
+      "failure_detail": "qyjr30/candidate/main.py\":409:0): error: Failed to run BiShengHIR pipeline\nE           \nE           loc(\"/tmp/kernelgen-isolated-ds1daur5/kernelgen-flaggems-evaluate-snqyjr30/candidate/main.py\":409:0): error: ub overflow, requires 1851648 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nE           loc(\"/tmp/kernelgen-isolated-ds1daur5/kernelgen-flaggems-evaluate-snqyjr30/candidate/main.py\":409:0): error: cbuf overflow, requires 4198400 bits while 4194304 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nE           loc(\"/tmp/kernelgen-isolated-ds1daur5/kernelgen-flaggems-evaluate-snqyjr30/candidate/main.py\":409:0): error: Failed to run BiShengHIR pipeline\nE           \nE           loc(\"/tmp/kernelgen-isolated-ds1daur5/kernelgen-flaggems-evaluate-snqyjr30/candidate/main.py\":409:0): error: ub overflow, requires 1851648 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nE           loc(\"/tmp/kernelgen-isolated-ds1daur5/kernelgen-flaggems-evaluate-snqyjr30/candidate/main.py\":409:0): error: cbuf overflow, requires 4198400 bits while 4194304 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nE           loc(\"/tmp/kernelgen-isolated-ds1daur5/kernelgen-flaggems-evaluate-snqyjr30/candidate/main.py\":409:0): error: Failed to run BiShengHIR pipeline\nE           \nE           loc(\"/tmp/kernelgen-isolated-ds1daur5/kernelgen-flaggems-evaluate-snqyjr30/candidate/main.py\":409:0): error: ub overflow, requires 1851648 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nE           loc(\"/tmp/kernelgen-isolated-ds1daur5/kernelgen-flaggems-evaluate-snqyjr30/candidate/main.py\":409:0): error: cbuf overflow, requires 4198400 bits while 4194304 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nE           [ERROR] Failed to run BiShengIR pipeline\nE           \nE           \nE           [INFO]: The compiled kernel cache is in /root/.triton/cache/EDJUTMCB5H5WDTBC55V3U2OTA4VJGORW6SJHHWYBCCQ5CQWI2VEA\nE           \nE           ///------------------[ERROR][Triton][END]------------------\n\nbenchmark/base.py:801: Failed\n=============================== warnings summary ===============================\n../../../../../../usr/local/python3.11.15/lib/python3.11/site-packages/torch_npu/npu/__init__.py:539\n  /usr/local/python3.11.15/lib/python3.11/site-packages/torch_npu/npu/__init__.py:539: UserWarning: You can set the device capability via the environment variable TORCH_NPU_DEVICE_CAPABILITY. The return value of get_device_capability is only for compatibility with PyTorch and does not represent the actual capability of the NPU device.\n    warnings.warn(f\"You can set the device capability via the environment variable TORCH_NPU_DEVICE_CAPABILITY. {warning_str}\")\n\nsrc/flag_gems/utils/device_info.py:58\n  /data/hanle/ascend-optimization/Ascend-Optimization/third_party/FlagGems/src/flag_gems/utils/device_info.py:58: UserWarning: [device_info] torch_device_fn.get_device_capability returned None for device_id=0, fallback to (0, 0).\n    warnings.warn(\n\n../../../../../../usr/local/python3.11.15/lib/python3.11/site-packages/torch/backends/__init__.py:46\n  /usr/local/python3.11.15/lib/python3.11/site-packages/torch/backends/__init__.py:46: UserWarning: Please use the new API settings to control TF32 behavior, such as torch.backends.cudnn.conv.fp32_precision = 'tf32' or torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, torch.backends.cuda.matmul.allow_tf32 = True, torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and allowTF32CuBLAS() will be deprecated after Pytorch 2.9. Please see https://pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:80.)\n    self.setter(val)\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n=========================== short test summary info ============================\nFAILED benchmark/test_matmul_bias_activation.py::test_matmul_bias_activation\n1 failed, 3 warnings in 4.90s\n[W1014 18:47:24.100709347 ToKernelNpu.cpp:41] Warning: Device do not support double dtype now, dtype cast replace with float. (function operator())\n",
+      "failed_cases": []
+    }
+  ],
+  "best": {
+    "result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/matmul_bias_activation/reports/profiling-agent-20261014-four-direct-method/round-02/evaluation/trial-1.result.json",
+    "score": 0.908833490373748
+  },
+  "configuration": {
+    "server": "http://127.0.0.1:19655",
+    "model": "deepseek-flash",
+    "claude": "/data/hanle/ascend-optimization/runtime/kg-controller/claude",
+    "profile_cases": 2,
+    "knowledge_sha256": "8ace5abc0d8239fae9fb78cad8f62a8d0cb7c586a3de826fadd009a17a964479",
+    "knowledge_snapshot_required": true,
+    "provider_thinking": "disabled",
+    "provider_base_url": "https://api.deepseek.com/anthropic",
+    "generation_format": "plain-json",
+    "max_output_tokens": 16384
+  },
+  "repo_commit": "514c343bd383debb43d15c0628b52f4f11cdb826",
+  "current_error": null,
+  "seed_result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/matmul_bias_activation/reports/profiling-agent-20261014-four-direct-method/seed-evaluation/seed-1.result.json",
+  "current_round": 3,
+  "stage": "completed",
+  "final_scores": [
+    0.8925882764506232,
+    0.8912414973627283
+  ],
+  "final_score": 0.8912414973627283,
+  "final_source_sha256": "fea2733347ee672de796aa3d39926f36c327cf37d5105b0f071001db178a47df"
+}

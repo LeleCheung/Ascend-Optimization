@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 import urllib.parse
 
-from optimization_campaign import checked, digest, parse_candidate
+from optimization_campaign import checked, digest, implementation_digest, parse_candidate
 from ascend_profiling_workflow import check_artifacts, source_in
 
 
@@ -63,15 +63,33 @@ def verify(root):
         if not (root / 'knowledge.md').is_file() or digest((root / 'knowledge.md').read_text(encoding='utf-8')) != configuration['knowledge_sha256']:
             raise ValueError('知识快照SHA不匹配')
     best_digest = contract['source_sha256']
+    best_source = source_in(read(seed_path.with_name('seed-1.request.json')))
+    if digest(best_source) != best_digest:
+        raise ValueError('起点评测请求源码与结果不一致')
     if best_digest != state['seed_sha256']:
         raise ValueError('起点源码 SHA 不一致')
-    rounds, artifacts = set(), 0
+    rounds, artifacts, generated_sources = set(), 0, 0
+    rejected_sources = {}
     for row in state['history']:
         index = row['round']
         if index in rounds:
             raise ValueError('重复优化轮次')
         rounds.add(index)
         directory = root / f'round-{index:02d}'
+        source_review = directory / 'source-review.json'
+        if source_review.exists():
+            review = read(source_review)
+            reviewed_sha = digest((directory / 'candidate.py').read_text(encoding='utf-8'))
+            if review['candidate_sha256'] != reviewed_sha:
+                raise ValueError('独立源码审查与候选SHA不匹配')
+            if review.get('status') == 'REJECTED_SEMANTIC':
+                rejected_sources[reviewed_sha] = review.get('reason', '')
+            elif review.get('status') == 'NO_IMPLEMENTATION_CHANGE':
+                candidate_source = (directory / 'candidate.py').read_text(encoding='utf-8')
+                if (review.get('parent_sha256') != best_digest
+                        or implementation_digest(candidate_source) != implementation_digest(best_source)
+                        or review.get('implementation_sha256') != implementation_digest(candidate_source)):
+                    raise ValueError('未改实现的独立审查与实际源码不匹配')
         if not math.isclose(row['parent_score'], best_score, rel_tol=1e-10):
             raise ValueError('历史起点分数不一致')
         diagnosis_path = directory / 'profiles/diagnosis.json'
@@ -101,6 +119,11 @@ def verify(root):
                     or row.get('source_sha256') != best_digest or not diagnosis_path.exists()
                     or not (directory / '给CC的提示词.md').exists()):
                 raise ValueError('历史复现轮缺少身份、源码绑定或方法记录')
+        if configuration.get('provider_thinking') == 'disabled' and row.get('source_sha256'):
+            if digest((directory / 'candidate.py').read_text(encoding='utf-8')) != row['source_sha256']:
+                raise ValueError('生成候选源码与记录不一致')
+            verify_generation(directory, row['source_sha256'])
+            generated_sources += 1
         if row['status'] != 'PASSED':
             continue
         result, score = checked(directory / 'evaluation/trial-1.result.json', contract)
@@ -108,15 +131,16 @@ def verify(root):
                 or digest((directory / 'candidate.py').read_text(encoding='utf-8')) != row['source_sha256']
                 or not math.isclose(score, row['score'], rel_tol=1e-10)):
             raise ValueError('候选源码、结果或分数不一致')
-        if configuration.get('provider_thinking') == 'disabled':
-            verify_generation(directory, row['source_sha256'])
         accepted = score > best_score * 1.005
         if bool(row['accepted']) != accepted:
             raise ValueError('最佳选择不符合0.5%门槛')
         if accepted:
             best_score, best_digest = score, result['source_sha256']
+            best_source = (directory / 'candidate.py').read_text(encoding='utf-8')
     if best_digest != state['final_source_sha256'] or not math.isclose(best_score, state['best']['score'], rel_tol=1e-10):
         raise ValueError('最终选择未对应历史最佳')
+    if best_digest in rejected_sources:
+        raise ValueError('最终源码有已确认语义错误：' + rejected_sources[best_digest])
     if digest((root / 'final.py').read_text(encoding='utf-8')) != best_digest:
         raise ValueError('最终源码 SHA 不一致')
     scores = []
@@ -131,7 +155,8 @@ def verify(root):
         raise ValueError('缺少真机原始采集附件')
     return {'operator': state['operator'], 'status': 'VERIFIED', 'rounds': len(rounds),
             'full_tests': len(contract['rows']), 'artifact_count': artifacts,
-            'final_scores': scores, 'source_sha256': best_digest}
+            'final_scores': scores, 'source_sha256': best_digest, 'verified_generated_sources': generated_sources,
+            'semantically_rejected_sources': len(rejected_sources)}
 
 
 def main():

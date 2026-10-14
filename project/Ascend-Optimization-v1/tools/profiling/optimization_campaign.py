@@ -38,10 +38,44 @@ def digest(text):
     return hashlib.sha256(text.encode('utf-8')).hexdigest()
 
 
-def knowledge_for(operator, common):
+def implementation_digest(source):
+    """忽略注释、排版和字面量分块表调序，识别未改实现的候选。"""
+    tree = ast.parse(source)
+    # 仅规范顶层的字面量配置表；函数中dict顺序可能属于输出语义。
+    def canonical(node):
+        if isinstance(node, ast.AST):
+            return {'node':type(node).__name__, 'fields':{name:canonical(value)
+                    for name,value in ast.iter_fields(node)
+                    if value is not None and not (isinstance(value,list) and not value)}}
+        if isinstance(node, list):
+            return [canonical(value) for value in node]
+        if node is None or isinstance(node, (str,int,float,bool)):
+            return node
+        # ctypes实现可能有bytes常量，AST也支持complex与Ellipsis。
+        return {'literal_type':type(node).__name__, 'repr':repr(node)}
+
+    for node in tree.body:
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Dict):
+            continue
+        try:
+            value = ast.literal_eval(node.value)
+        except (ValueError, TypeError, SyntaxError):
+            continue
+        if len(value) != len(node.value.keys):
+            continue
+        entries = sorted(zip(node.value.keys, node.value.values),
+                         key=lambda pair: json.dumps(canonical(pair[0]), sort_keys=True, ensure_ascii=False))
+        node.value.keys = [pair[0] for pair in entries]
+        node.value.values = [pair[1] for pair in entries]
+    # Python3.12新增空type_params，3.13调整ast.dump的空字段展示；不能直接
+    # 用ast.dump作为跨Windows3.14 / 910B3.11的持久化指纹。
+    return digest(json.dumps(canonical(tree), sort_keys=True, ensure_ascii=False, separators=(',', ':')))
+
+
+def knowledge_for(operator, common, *, complete_snapshot=False):
     text = common.read_text(encoding='utf-8')
     specific = PROJECT / 'operators' / operator / '优化知识.md'
-    if specific.is_file():
+    if not complete_snapshot and specific.is_file():
         text += '\n\n' + specific.read_text(encoding='utf-8')
     return text
 
@@ -202,7 +236,52 @@ def profile_best(operator, evaluation, directory, server, count, *, timing_scope
     return report
 
 
-def parse_candidate(response):
+def validate_implementation_change(source, original_source):
+    """新生成门禁；历史响应仍按原规则解析，不改写旧实验。"""
+    tree = ast.parse(source)
+    original = ast.parse(original_source)
+    if implementation_digest(source) == implementation_digest(original_source):
+        raise ValueError('候选与当前起点实现结构一致；只改注释、排版或字面量配置表顺序不计优化，请执行知识中的实际kernel修改')
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and any(
+                isinstance(value, ast.Constant) and value.value is Ellipsis
+                for value in list(node.args) + [item.value for item in node.keywords]):
+            raise ValueError('候选调用参数含 ... 占位符，必须返回完整可运行实现')
+    original_functions = {node.name for node in original.body
+                          if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    new_functions = {node.name for node in tree.body
+                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                     and node.name not in original_functions}
+    original_targets = {node.id for node in ast.walk(original)
+                        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+    def core(module, remove_new=False):
+        body = []
+        for node in module.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            if remove_new and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in new_functions:
+                continue
+            if remove_new and isinstance(node, ast.Assign) and all(
+                    isinstance(target, ast.Name) and target.id not in original_targets for target in node.targets):
+                try:
+                    ast.literal_eval(node.value)
+                except (ValueError, TypeError, SyntaxError):
+                    pass
+                else:
+                    continue
+            body.append(node)
+        return body
+    old_body, remaining = core(original), core(tree, True)
+    old_text = '\n'.join(ast.unparse(node) for node in old_body)
+    new_text = '\n'.join(ast.unparse(node) for node in remaining)
+    references = {node.id for statement in remaining for node in ast.walk(statement)
+                  if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+    if (new_functions and not references.intersection(new_functions)
+            and implementation_digest(old_text) == implementation_digest(new_text)):
+        raise ValueError('仅新增未被原执行路径引用的函数，run 仍执行原实现；必须将优化接入实际调用路径')
+
+
+def parse_candidate(response, original_source=None):
     # CC 会在 JSON 前输出 unknown-model 信息；只接受末尾完整 result 对象。
     try:
         value = json.loads(response)
@@ -250,6 +329,8 @@ def parse_candidate(response):
                 raise ValueError('候选包含系统或网络模块')
         if isinstance(node, ast.ImportFrom) and (node.module or '').split('.')[0] in {'os', 'subprocess', 'socket'}:
             raise ValueError('候选包含系统或网络模块')
+    if original_source is not None:
+        validate_implementation_change(source, original_source)
     return structured
 
 
@@ -296,6 +377,8 @@ def main():
     parser.add_argument('--rounds', type=int, default=6)
     parser.add_argument('--profile-cases', type=int, default=2)
     parser.add_argument('--knowledge', type=Path, required=True)
+    parser.add_argument('--knowledge-snapshot', action='store_true',
+                        help='--knowledge为已归档完整快照，直接使用全文，不再拼接当前算子知识')
     parser.add_argument('--plain-json', action='store_true',
                         help='要求CC直接返回JSON文本，避免部分模型把结构化工具参数填成占位符')
     parser.add_argument('--thinking-budget', type=int,
@@ -329,10 +412,14 @@ def main():
             'operator': a.operator, 'seed_sha256': digest(a.seed.read_text(encoding='utf-8')),
             'status': 'running', 'history': [], 'best': None}
         assert state['operator'] == a.operator and state['seed_sha256'] == digest(a.seed.read_text(encoding='utf-8'))
-        knowledge = knowledge_for(a.operator, a.knowledge)
+        knowledge = knowledge_for(a.operator, a.knowledge, complete_snapshot=a.knowledge_snapshot)
         configuration = {'server': a.server, 'model': a.model, 'claude': a.claude,
                          'profile_cases': a.profile_cases,
                          'knowledge_sha256': digest(knowledge)}
+        if 'configuration' not in state or state['configuration'].get('generation_noop_guard'):
+            configuration['generation_noop_guard'] = True
+        if a.knowledge_snapshot:
+            configuration['complete_knowledge_snapshot'] = True
         if 'configuration' not in state or state['configuration'].get('knowledge_snapshot_required'):
             configuration['knowledge_snapshot_required'] = True
         if a.timing_scope != 'device_kernel':
@@ -438,7 +525,8 @@ def main():
                                 run(command, response, prompt=prompt, timeout=1200, cwd=directory,
                                     env=generation_env)
                         try:
-                            proposal = parse_candidate(response.read_text(encoding='utf-8'))
+                            proposal = parse_candidate(response.read_text(encoding='utf-8'),
+                                                       source if configuration.get('generation_noop_guard') else None)
                             break
                         except (ValueError, KeyError, SyntaxError, TypeError) as error:
                             if attempt == 2:

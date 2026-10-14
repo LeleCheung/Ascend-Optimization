@@ -1,5 +1,6 @@
 """验证模型输出、真实合同及故障状态保存，避免错误候选进入最佳版本。"""
 import importlib.util
+import ast
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,64 @@ spec.loader.exec_module(campaign)
 
 
 class CampaignTests(unittest.TestCase):
+    def test_unused_new_kernel_does_not_count_as_optimization(self):
+        original = 'def op(x): return x + 1\nrun = op\n'
+        candidate = original + '\nBLOCK = 4096\ndef fast(x): return x + 2\n'
+        with self.assertRaisesRegex(ValueError, '原执行路径'):
+            campaign.validate_implementation_change(candidate, original)
+        connected = candidate.replace('def op(x): return x + 1', 'def op(x): return fast(x)')
+        campaign.validate_implementation_change(connected, original)
+        # 改动已存在配置仍可能影响真实路径，不能按新增死函数拒绝。
+        campaign.validate_implementation_change('BLOCK = 8192\n'+candidate, 'BLOCK = 1024\n'+original)
+
+    def test_call_placeholders_rejected_but_slice_ellipsis_allowed(self):
+        with self.assertRaisesRegex(ValueError, '占位符'):
+            campaign.validate_implementation_change('def run(x): return kernel(...)', 'def run(x): return x')
+        campaign.validate_implementation_change('def run(x): return x[..., 0]', 'def run(x): return x')
+
+    def test_real_logadd_unused_placeholder_candidate_is_rejected(self):
+        root = PROJECT / 'operators/logaddexp2/reports/profiling-agent-20261014-logadd-method-retry-method'
+        candidate = root / 'round-03/candidate.py'
+        if not candidate.exists():
+            self.skipTest('此 checkout 未包含历史重试证据')
+        request = json.loads((root / 'seed-evaluation/seed-1.request.json').read_text(encoding='utf-8'))
+        with self.assertRaisesRegex(ValueError, '占位符'):
+            campaign.validate_implementation_change(candidate.read_text(encoding='utf-8'),
+                                                   request['implementation']['sources'][0]['content'])
+
+    def test_generation_rejects_formatting_and_tile_table_reordering_only(self):
+        original = "_TILES = {'a': (8, 16), 'b': (16, 32)}\ndef run(x):\n    return x + 1\n"
+        unchanged = "# 新优化说明\n_TILES = {'b': (16,32), 'a': (8,16)}\n\ndef run(x): return x+1\n"
+        response = json.dumps({'structured_output': {'source':unchanged}})
+        with self.assertRaisesRegex(ValueError, '实现结构一致'):
+            campaign.parse_candidate(response, original)
+        changed = unchanged.replace('return x+1', 'return x+2')
+        parsed = campaign.parse_candidate(json.dumps({'structured_output':{'source':changed}}), original)
+        self.assertEqual(parsed['source'], changed)
+        # 历史归档解析不受新批次生成门禁影响。
+        self.assertEqual(campaign.parse_candidate(response)['source'], unchanged)
+
+    def test_returned_dictionary_order_is_not_normalized_as_configuration(self):
+        first = "def run(): return {'a':1, 'b':2}"
+        second = "def run(): return {'b':2, 'a':1}"
+        self.assertNotEqual(campaign.implementation_digest(first), campaign.implementation_digest(second))
+
+    def test_implementation_fingerprint_ignores_new_empty_ast_fields(self):
+        source = 'def run(x): return x + 1'
+        expected = campaign.implementation_digest(source)
+        tree = ast.parse(source)
+        node = tree.body[0]
+        node._fields = node._fields + ('future_empty_optional',)
+        node.future_empty_optional = []
+        with patch.object(campaign.ast, 'parse', return_value=tree):
+            self.assertEqual(campaign.implementation_digest(source), expected)
+
+    def test_valid_non_json_literals_do_not_bypass_noop_check(self):
+        source = "def run(x):\n    values = (b'library', 1j, ...)\n    return x\n"
+        response = json.dumps({'structured_output':{'source':'# 说明\n'+source}})
+        with self.assertRaisesRegex(ValueError, '实现结构一致'):
+            campaign.parse_candidate(response, source)
+
     def test_history_replay_profiles_and_repeats_without_model_generation(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory)
@@ -65,6 +124,11 @@ class CampaignTests(unittest.TestCase):
                 specific.write_text('pointwise', encoding='utf-8')
                 combined = campaign.knowledge_for('logaddexp2', common)
                 self.assertEqual(combined, 'common\n\npointwise')
+                frozen = project / 'snapshot.md'
+                frozen.write_text(combined, encoding='utf-8')
+                specific.write_text('changed knowledge', encoding='utf-8')
+                self.assertEqual(campaign.knowledge_for('logaddexp2', frozen, complete_snapshot=True), combined)
+                self.assertNotEqual(campaign.knowledge_for('logaddexp2', frozen), combined)
                 self.assertNotEqual(campaign.digest(combined), campaign.digest('common'))
                 self.assertEqual(campaign.knowledge_for('amin', common), 'common')
 

@@ -1,13 +1,17 @@
-# 四算子工作流闭环
+# 四算子工作流结果
 
 批次：`20261014-four-direct`。最佳源码复现与建议驱动优化分别记录。
 
-| 算子 | 模式 | 完整测试 | 起点 | 最终两次，相对PyTorch | 较慢值 | 相对起点 | 建议产生有效优化 |
-| --- | --- | ---: | ---: | --- | ---: | ---: | --- |
-| logaddexp2 | 最佳源码复现 | 36/36 | 1.265× | 1.265× / 1.262× | 1.262× | 0.998× | — |
-| amin | 最佳源码复现 | 27/27 | 0.938× | 0.941× / 0.934× | 0.934× | 0.996× | — |
-| matmul_bias_activation | 最佳源码复现 | 42/42 | 0.891× | 0.889× / 0.890× | 0.889× | 0.998× | — |
-| narrow_copy | 最佳源码复现 | 33/33 | 1.120× | 1.105× / 1.114× | 1.105× | 0.986× | — |
+| 算子 | 模式 | 批次 | 完整测试 | 起点 | 最终两次，相对PyTorch | 较慢值 | 相对起点 | 建议产生有效优化 |
+| --- | --- | --- | ---: | ---: | --- | ---: | ---: | --- |
+| logaddexp2 | 最佳源码复现 | 20261014-four | 36/36 | 1.265× | 1.265× / 1.262× | 1.262× | 0.998× | — |
+| logaddexp2 | 建议驱动优化 | 20261014-logadd-method-retry | 36/36 | 0.232× | 0.231× / 0.230× | 0.230× | 0.992× | 本批未证实 |
+| amin | 最佳源码复现 | 20261014-four | 27/27 | 0.938× | 0.941× / 0.934× | 0.934× | 0.996× | — |
+| amin | 建议驱动优化 | 20261014-four-direct | 27/27 | 0.933× | 0.933× / 0.917× | 0.917× | 0.983× | 本批未证实 |
+| matmul_bias_activation | 最佳源码复现 | 20261014-four | 42/42 | 0.891× | 0.889× / 0.890× | 0.889× | 0.998× | — |
+| matmul_bias_activation | 建议驱动优化 | 20261014-four-direct | 42/42 | 0.871× | 0.893× / 0.891× | 0.891× | 1.024× | 是 |
+| narrow_copy | 最佳源码复现 | 20261014-four | 33/33 | 1.120× | 1.105× / 1.114× | 1.105× | 0.986× | — |
+| narrow_copy | 建议驱动优化 | 20261014-four-direct | 33/33 | 0.811× | 0.807× / 0.797× | 0.797× | 0.983× | 本批未证实 |
 
 narrow_copy使用device_task，包含DMA和kernel；其他三个使用device_kernel。性能case取几何平均，最终采用两次完整复验较慢值。
 
@@ -17,9 +21,13 @@ narrow_copy使用device_task，包含DMA和kernel；其他三个使用device_ker
 
 完整测试、源码SHA、原始附件与最佳选择已由verify-agent-campaign.py核验；失败和未采纳轮次保留在各批次。
 
-最佳复现来自`20261014-four`，建议驱动优化来自`20261014-four-direct`。各列为各自批次实测；方法改善只比较该方法批次内的起点与最终，不将跨HEAD结果当成同合同消融。
+最佳复现来自`20261014-four`；方法来源见表中批次列。各列为各自批次实测；方法改善只比较该方法批次内的起点与最终，不将跨HEAD结果当成同合同消融。
 
-- `logaddexp2` / `replay`：[证据目录](logaddexp2/reports/profiling-agent-20261014-four-replay/campaign-state.json)。
-- `amin` / `replay`：[证据目录](amin/reports/profiling-agent-20261014-four-replay/campaign-state.json)。
-- `matmul_bias_activation` / `replay`：[证据目录](matmul_bias_activation/reports/profiling-agent-20261014-four-replay/campaign-state.json)。
-- `narrow_copy` / `replay`：[证据目录](narrow_copy/reports/profiling-agent-20261014-four-replay/campaign-state.json)。
+- `logaddexp2` / `replay` / `20261014-four`：[证据目录](logaddexp2/reports/profiling-agent-20261014-four-replay/campaign-state.json)。
+- `logaddexp2` / `method` / `20261014-logadd-method-retry`：[证据目录](logaddexp2/reports/profiling-agent-20261014-logadd-method-retry-method/campaign-state.json)。
+- `amin` / `replay` / `20261014-four`：[证据目录](amin/reports/profiling-agent-20261014-four-replay/campaign-state.json)。
+- `amin` / `method` / `20261014-four-direct`：[证据目录](amin/reports/profiling-agent-20261014-four-direct-method/campaign-state.json)。
+- `matmul_bias_activation` / `replay` / `20261014-four`：[证据目录](matmul_bias_activation/reports/profiling-agent-20261014-four-replay/campaign-state.json)。
+- `matmul_bias_activation` / `method` / `20261014-four-direct`：[证据目录](matmul_bias_activation/reports/profiling-agent-20261014-four-direct-method/campaign-state.json)。
+- `narrow_copy` / `replay` / `20261014-four`：[证据目录](narrow_copy/reports/profiling-agent-20261014-four-replay/campaign-state.json)。
+- `narrow_copy` / `method` / `20261014-four-direct`：[证据目录](narrow_copy/reports/profiling-agent-20261014-four-direct-method/campaign-state.json)。

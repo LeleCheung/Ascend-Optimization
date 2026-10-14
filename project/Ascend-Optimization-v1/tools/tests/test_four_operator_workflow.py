@@ -13,6 +13,39 @@ import optimization_campaign as campaign
 
 
 class FourOperatorTests(unittest.TestCase):
+    def test_delivery_requires_every_named_operator_and_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            (project / 'operators').mkdir()
+            items = queue.registry()
+            with patch.object(queue, 'PROJECT', project):
+                with self.assertRaisesRegex(ValueError, 'narrow_copy/method: missing'):
+                    queue.summarize(items, 'delivery', ('replay', 'method'), require_complete=True)
+                self.assertFalse((project / 'operators/四算子闭环-delivery.json').exists())
+                rows = queue.summarize(items, 'progress', ('replay', 'method'))
+            self.assertEqual(len(rows), 8)
+            self.assertEqual({row['status'] for row in rows}, {'missing'})
+
+    def test_method_retry_selection_keeps_replay_and_other_methods_separate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            (project / 'operators').mkdir()
+            items = queue.registry()
+            replay_root = project/'operators/logaddexp2/reports/profiling-agent-replay-original-replay'
+            retry_root = project/'operators/logaddexp2/reports/profiling-agent-logadd-retry-method'
+            for root in (replay_root, retry_root):
+                root.mkdir(parents=True)
+                (root/'campaign-state.json').write_text('{"status":"running"}')
+            with patch.object(queue, 'PROJECT', project):
+                rows = queue.summarize(items, 'original', ('replay', 'method'),
+                                       replay_batch='replay-original', method_batches={'logaddexp2':'logadd-retry'})
+            logadd = [row for row in rows if row['operator']=='logaddexp2']
+            self.assertEqual([(r['mode'],r['batch'],r['status']) for r in logadd],
+                             [('replay','replay-original','running'),('method','logadd-retry','running')])
+            amin = next(r for r in rows if r['operator']=='amin' and r['mode']=='method')
+            self.assertEqual(amin['batch'],'original')
+            self.assertIn('logadd-retry', (project/'operators/四算子闭环-original.md').read_text(encoding='utf-8'))
+
     def test_registry_binds_actual_sources_and_narrow_device_tasks(self):
         items = queue.registry()
         self.assertEqual(len(items), 4)
