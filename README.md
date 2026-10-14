@@ -8,6 +8,8 @@
 
 ## 当前状态
 
+正在统一四算子的[最佳源码复现与建议驱动优化工作流](project/Ascend-Optimization-v1/tools/profiling/四算子工作流.md)：先复验历史最佳版本，再从明确的优化前源码让CC执行固化建议，分别保存结果。新批次尚未完成，历史成绩保留如下。
+
 2026-10-14：[持续优化闭环](project/Ascend-Optimization-v1/tools/profiling/README.md)已完成矩阵乘和amin各六轮、完整评测及两次最终复验。logaddexp2历史无profiler/有profiler为1.061×/1.267×；历史方法workflow已无人值守复现，两次1.269×/1.261×，均36/36。见[本阶段交付](project/Ascend-Optimization-v1/operators/一阶段交付-20261014.md)和[历史方法](project/Ascend-Optimization-v1/tools/profiling/历史复现知识-20261014.md)。
 
 | 对象 | Excel 华为列 | 状态 |

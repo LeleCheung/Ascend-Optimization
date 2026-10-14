@@ -87,7 +87,8 @@ def check_pending_evaluation(output, label, repeats):
             raise InterruptedDeviceRequest(f'评测请求结果未知，停止自动重发：{request}')
 
 
-def evaluate(operator, source, output, label, server, repeats=1, *, offline=False):
+def evaluate(operator, source, output, label, server, repeats=1, *, offline=False,
+             timing_scope='device_kernel'):
     check_pending_evaluation(output, label, repeats)
     existing = [output / f'{label}-{index}.result.json' for index in range(1, repeats + 1)]
     if all(path.exists() for path in existing):
@@ -97,6 +98,8 @@ def evaluate(operator, source, output, label, server, repeats=1, *, offline=Fals
             result, _ = checked(path, contract)
             if result['source_sha256'] != expected_digest:
                 raise ValueError('已有评测对应不同源码，请使用新批次')
+            if result['timing_scope'] != timing_scope:
+                raise ValueError('已有评测计时范围不同，请使用新批次')
             contract = result
         return existing[0]
     if offline:
@@ -105,7 +108,7 @@ def evaluate(operator, source, output, label, server, repeats=1, *, offline=Fals
     run([sys.executable, str(EVAL_TOOLS / 'evaluate-operator.py'),
          '--operator', operator, '--source', str(source), '--output', str(output),
          '--label', label, '--server', server, '--repeats', str(repeats),
-         '--timeout', '1800', '--timing-scope', 'device_kernel'],
+         '--timeout', '1800', '--timing-scope', timing_scope],
         output.parent / (output.name + '.log'), timeout=4000 * repeats)
     return output / (label + '-1.result.json')
 
@@ -128,7 +131,7 @@ def prefixes(source):
     return result
 
 
-def profile_best(operator, evaluation, directory, server, count):
+def profile_best(operator, evaluation, directory, server, count, *, timing_scope='device_kernel'):
     loaded, _ = checked(evaluation)
     rows = sorted(loaded['timing'].values(), key=lambda r: r['speedup'])
     # 相同 dtype/shape 的重复 benchmark case 不占用新的采集名额。
@@ -171,7 +174,7 @@ def profile_best(operator, evaluation, directory, server, count):
         if data.get('status') == 'completed':
             profile_arguments.append((response, output / 'request.json', output / 'artifacts'))
     report = workflow.analyze(operator, source_path, evaluation, request_path, inspection,
-                              profile_arguments, timing_scope='device_kernel',
+                              profile_arguments, timing_scope=timing_scope,
                               evaluation_provenance=evaluation.with_name(label + '.provenance.json'))
     # 源码符号会在候选间变化；只从实际源码 jit 函数选择本次响应的 kernel。
     allowed = prefixes(source_path.read_text(encoding='utf-8'))
@@ -265,6 +268,10 @@ def prompt_for(operator, source, report, history, knowledge):
         '工作量中的逻辑字节不是 HBM 物理字节。没有可信 roof 时不声称数值 Roofline。',
         '只能把 PipeUtilization 当作相应流水活跃比例；不将 tile 逻辑字节除以全kernel时间解释为实测L1/HBM带宽，也不把片上容量估算当作已编译证明。容量与性能推测必须由完整测试验证。',
         '程序会负责完整评测和保留最佳，你只提供有根据的可运行候选。',
+        ('narrow_copy允许使用知识文件明确记载的CANN aclrtMemcpyAsync实现真实D2D复制；'
+         '必须分配独立输出、正确偏移、使用输入设备的当前stream，保留一般布局的Triton回退。'
+         'DMA与kernel均由device_task合同计时；不能返回view或调用torch.narrow_copy。'
+         if operator == 'narrow_copy' else ''),
         '算子：' + operator, '架构与既有经验：\n' + knowledge,
         '历史尝试：\n' + json.dumps(history, ensure_ascii=False),
         '当前逐case事实：\n' + json.dumps(facts, ensure_ascii=False),
@@ -278,6 +285,8 @@ def main():
     parser.add_argument('--seed', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--server', default='http://127.0.0.1:19655')
+    parser.add_argument('--timing-scope', choices=('device_kernel', 'device_task'),
+                        default='device_kernel', help='narrow_copy混合DMA实现须使用device_task')
     parser.add_argument('--claude', default='/data/hanle/ascend-optimization/runtime/kg-controller/claude')
     # 宿主包装器会把别名 deepseek-flash 映射到实际 DeepSeek 配置；直接传
     # deepseek-v4-flash[1m] 会被 Claude SDK 判为未知模型。
@@ -294,6 +303,8 @@ def main():
     parser.add_argument('--replay', action='store_true',
                         help='以历史已验证候选复现方法；最终报告明确标注复现，不宣称重新发现')
     a = parser.parse_args()
+    if a.operator == 'narrow_copy' and a.timing_scope != 'device_task':
+        parser.error('narrow_copy必须使用device_task，覆盖DMA与kernel')
     if a.thinking_budget is not None and a.thinking_budget < 1024:
         parser.error('--thinking-budget必须至少1024')
     if a.max_output_tokens is not None and a.max_output_tokens < 1024:
@@ -315,6 +326,10 @@ def main():
         configuration = {'server': a.server, 'model': a.model, 'claude': a.claude,
                          'profile_cases': a.profile_cases,
                          'knowledge_sha256': digest(knowledge)}
+        if 'configuration' not in state or state['configuration'].get('knowledge_snapshot_required'):
+            configuration['knowledge_snapshot_required'] = True
+        if a.timing_scope != 'device_kernel':
+            configuration['timing_scope'] = a.timing_scope
         if a.plain_json and ('configuration' not in state
                              or 'generation_format' in state['configuration']):
             configuration['generation_format'] = 'plain-json'
@@ -348,7 +363,8 @@ def main():
             contract, _ = checked(Path(state['seed_result']))
         else:
             seed_dir = a.output / 'seed-evaluation'
-            seed_result = evaluate(a.operator, a.seed, seed_dir, 'seed', a.server)
+            seed_result = evaluate(a.operator, a.seed, seed_dir, 'seed', a.server,
+                                   timing_scope=a.timing_scope)
             contract, score = checked(seed_result)
             state.update(seed_result=str(seed_result), best={'result': str(seed_result), 'score': score})
             save(state_path, state)
@@ -365,7 +381,8 @@ def main():
             try:
                 state.update(current_round=index, stage='profiling')
                 save(state_path, state)
-                report = profile_best(a.operator, best, directory / 'profiles', a.server, a.profile_cases)
+                report = profile_best(a.operator, best, directory / 'profiles', a.server, a.profile_cases,
+                                      timing_scope=a.timing_scope)
                 prompt = prompt_for(a.operator, source, report, state['history'], knowledge)
                 (directory / '给CC的提示词.md').write_text(prompt, encoding='utf-8')
                 if a.replay:
@@ -417,7 +434,8 @@ def main():
                 state.update(stage='evaluating')
                 save(state_path, state)
                 if not result_path.exists():
-                    evaluate(a.operator, candidate, directory / 'evaluation', 'trial', a.server)
+                    evaluate(a.operator, candidate, directory / 'evaluation', 'trial', a.server,
+                             timing_scope=a.timing_scope)
                 result, score = checked(result_path, contract)
                 row.update(status='PASSED', score=score, result=str(result_path))
                 if score > state['best']['score'] * 1.005:
@@ -461,7 +479,8 @@ def main():
         req = json.loads(best.with_name(best.name.replace('.result.json', '.request.json')).read_text(encoding='utf-8'))
         final_source = a.output / 'final.py'
         final_source.write_bytes(req['implementation']['sources'][0]['content'].encode())
-        evaluate(a.operator, final_source, final_dir, 'final', a.server, repeats=2)
+        evaluate(a.operator, final_source, final_dir, 'final', a.server, repeats=2,
+                 timing_scope=a.timing_scope)
         final_scores = [checked(final_dir / f'final-{i}.result.json', contract)[1] for i in (1, 2)]
         state.update(status='completed', stage='completed', final_scores=final_scores,
                      final_score=min(final_scores), final_source_sha256=digest(final_source.read_text(encoding='utf-8')))

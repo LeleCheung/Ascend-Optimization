@@ -19,6 +19,13 @@ def verify(root):
         raise ValueError('campaign 尚未完成')
     seed_path = root / 'seed-evaluation/seed-1.result.json'
     contract, best_score = checked(seed_path)
+    configuration = state.get('configuration', {})
+    if configuration.get('timing_scope', 'device_kernel') != contract['timing_scope']:
+        raise ValueError('配置与实际计时范围不同')
+    # 早期批次尚未保存知识全文；新格式必须验证快照，不能补造历史文件。
+    if configuration.get('knowledge_sha256') and (configuration.get('knowledge_snapshot_required') or (root / 'knowledge.md').exists()):
+        if not (root / 'knowledge.md').is_file() or digest((root / 'knowledge.md').read_text(encoding='utf-8')) != configuration['knowledge_sha256']:
+            raise ValueError('知识快照SHA不匹配')
     best_digest = contract['source_sha256']
     if best_digest != state['seed_sha256']:
         raise ValueError('起点源码 SHA 不一致')
@@ -35,7 +42,8 @@ def verify(root):
         if diagnosis_path.exists():
             diagnosis = read(diagnosis_path)
             if (diagnosis['candidate']['sha256'] != best_digest
-                    or diagnosis['evaluation']['benchmark_fingerprint'] != contract['fingerprint']):
+                    or diagnosis['evaluation']['benchmark_fingerprint'] != contract['fingerprint']
+                    or diagnosis['timing_scope'] != contract['timing_scope']):
                 raise ValueError('诊断未绑定当轮最佳候选或合同')
             source = None
             for profile in sorted((directory / 'profiles').glob('case-*')):

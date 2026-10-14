@@ -39,9 +39,10 @@ def replay_report(operator, campaign_batch):
     if digest((campaign / 'final.py').read_text(encoding='utf-8')) != state['final_source_sha256']:
         raise ValueError('最终源码文件不匹配')
     reused = state['final_source_sha256'] == state['seed_sha256']
+    scope = {'device_kernel': '设备kernel', 'device_task': '设备任务（包含DMA与kernel）'}[seed['timing_scope']]
     lines = [f'# {operator} 历史方法复现', '',
              f'完整{len(seed["rows"])}项通过。两次相对PyTorch为**{scores[0]:.3f}×、{scores[1]:.3f}×**，'
-             f'采用较慢值**{min(scores):.3f}×**，计时范围为设备kernel。', '',
+             f'采用较慢值**{min(scores):.3f}×**，计时范围为{scope}。', '',
              f'起点{seed_score:.3f}×；最终源码{"与历史起点一致" if reused else "包含增量修改"}。'
              '流程完成真机采集、中文诊断、方法/提示词保存和完整两次复验。', '',
              f'源码：[final.py](final.py)，SHA256：`{state["final_source_sha256"]}`。', '',
