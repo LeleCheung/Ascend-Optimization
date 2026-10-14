@@ -21,5 +21,5 @@ py=/usr/local/python3.11.15/bin/python3.11
 "$py" "$p/tools/profiling/verify-agent-campaign.py" \
  "$p/operators/logaddexp2/reports/profiling-agent-$ASCEND_REPLAY_BATCH"
 "$py" "$p/tools/profiling/finalize-agent-campaign.py" --operator logaddexp2 \
- --batch 20261012-agent --campaign-batch "$ASCEND_REPLAY_BATCH"
+ --campaign-batch "$ASCEND_REPLAY_BATCH" --replay-only
 RUN

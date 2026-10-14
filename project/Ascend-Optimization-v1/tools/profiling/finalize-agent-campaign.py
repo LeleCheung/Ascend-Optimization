@@ -4,18 +4,54 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 import shutil
 import statistics
 import subprocess
 import sys
 
-from optimization_campaign import PROJECT, EVAL_TOOLS, checked, evaluate, save
+from optimization_campaign import PROJECT, EVAL_TOOLS, checked, digest, evaluate, save
 
 
 def local_result(root, original):
     name = original.replace('\\', '/')
     return root / 'reports' / name.split('/reports/', 1)[1]
+
+
+def replay_report(operator, campaign_batch):
+    """报告新批次本身的复验，不与提交前的旧合同混合。"""
+    root = PROJECT / 'operators' / operator
+    campaign = root / 'reports' / ('profiling-agent-' + campaign_batch)
+    state = json.loads((campaign / 'campaign-state.json').read_text(encoding='utf-8'))
+    if state.get('status') != 'completed' or state.get('workflow_kind') != 'historical-replay':
+        raise ValueError('历史复现尚未完成')
+    seed, seed_score = checked(campaign / 'seed-evaluation/seed-1.result.json')
+    if seed['source_sha256'] != state['seed_sha256']:
+        raise ValueError('复现起点源码不匹配')
+    scores = []
+    for index in (1, 2):
+        result, score = checked(campaign / 'final-evaluation' / f'final-{index}.result.json', seed)
+        if (result['source_sha256'] != state['final_source_sha256']
+                or not math.isclose(score, state['final_scores'][index - 1], rel_tol=1e-10)):
+            raise ValueError('最终复验源码或分数不匹配')
+        scores.append(score)
+    if digest((campaign / 'final.py').read_text(encoding='utf-8')) != state['final_source_sha256']:
+        raise ValueError('最终源码文件不匹配')
+    reused = state['final_source_sha256'] == state['seed_sha256']
+    lines = [f'# {operator} 历史方法复现', '',
+             f'完整{len(seed["rows"])}项通过。两次相对PyTorch为**{scores[0]:.3f}×、{scores[1]:.3f}×**，'
+             f'采用较慢值**{min(scores):.3f}×**，计时范围为设备kernel。', '',
+             f'起点{seed_score:.3f}×；最终源码{"与历史起点一致" if reused else "包含增量修改"}。'
+             '流程完成真机采集、中文诊断、方法/提示词保存和完整两次复验。', '',
+             f'源码：[final.py](final.py)，SHA256：`{state["final_source_sha256"]}`。', '',
+             f'批次：`{campaign_batch}`；本批仓库HEAD：`{state["repo_commit"]}`；'
+             f'知识SHA256：`{state["configuration"]["knowledge_sha256"]}`。', '',
+             '本报告只使用本批完整合同。提交或环境变化后可用新批次复现，历史四版本报告继续保留在原合同下。', '']
+    path = campaign / '复现汇报.md'
+    path.write_text('\n'.join(lines), encoding='utf-8', newline='\n')
+    print('REPLAY_REPORT_COMPLETED', str(path), scores, flush=True)
+    return path
 
 
 def finalize(operator, batch, prior, *, offline=False, campaign_batch=None):
@@ -127,7 +163,11 @@ def main():
     parser.add_argument('--campaign-batch', help='续跑Agent的批次，原生KG对照仍使用--batch')
     parser.add_argument('--prior-closure', help='既有对照的报告目录名；省略时读取新算子筛查和KG独立复验')
     parser.add_argument('--offline', action='store_true', help='仅使用已下载的完整证据，不连接KGS或发起设备评测')
+    parser.add_argument('--replay-only', action='store_true', help='仅报告本次历史方法复现，不混合旧HEAD的四版本合同')
     args = parser.parse_args()
+    if args.replay_only:
+        replay_report(args.operator, args.campaign_batch or args.batch)
+        return
     finalize(args.operator, args.batch, args.prior_closure, offline=args.offline,
              campaign_batch=args.campaign_batch)
 
