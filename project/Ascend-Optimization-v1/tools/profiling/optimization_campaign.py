@@ -14,12 +14,14 @@ import statistics
 import subprocess
 import sys
 import time
+from contextlib import nullcontext
 
 PROJECT = Path(__file__).resolve().parents[2]
 EVAL_TOOLS = PROJECT / 'tools/evaluation'
 sys.path.insert(0, str(EVAL_TOOLS))
 from evaluate_operator_import import call
 import ascend_profiling_workflow as workflow
+from deepseek_request_bridge import DeepSeekRequestBridge
 
 spec = importlib.util.spec_from_file_location('comparison', EVAL_TOOLS / 'compare-operator-versions.py')
 comparison = importlib.util.module_from_spec(spec)
@@ -300,11 +302,16 @@ def main():
                         help='向CC传入MAX_THINKING_TOKENS；供应商是否严格执行需看实际响应')
     parser.add_argument('--max-output-tokens', type=int,
                         help='向CC传入CLAUDE_CODE_MAX_OUTPUT_TOKENS，给思考和完整源码设置总输出预算')
+    parser.add_argument('--provider-thinking', choices=('native', 'disabled'), default='native',
+                        help='disabled通过本机请求适配显式关闭DeepSeek思考，避免默认开启与续写')
+    parser.add_argument('--provider-base-url', default='https://api.deepseek.com/anthropic')
     parser.add_argument('--replay', action='store_true',
                         help='以历史已验证候选复现方法；最终报告明确标注复现，不宣称重新发现')
     a = parser.parse_args()
     if a.operator == 'narrow_copy' and a.timing_scope != 'device_task':
         parser.error('narrow_copy必须使用device_task，覆盖DMA与kernel')
+    if a.provider_thinking == 'disabled' and a.thinking_budget is not None:
+        parser.error('关闭供应商思考时不传thinking-budget')
     if a.thinking_budget is not None and a.thinking_budget < 1024:
         parser.error('--thinking-budget必须至少1024')
     if a.max_output_tokens is not None and a.max_output_tokens < 1024:
@@ -330,6 +337,8 @@ def main():
             configuration['knowledge_snapshot_required'] = True
         if a.timing_scope != 'device_kernel':
             configuration['timing_scope'] = a.timing_scope
+        if a.provider_thinking == 'disabled':
+            configuration.update(provider_thinking='disabled', provider_base_url=a.provider_base_url)
         if a.plain_json and ('configuration' not in state
                              or 'generation_format' in state['configuration']):
             configuration['generation_format'] = 'plain-json'
@@ -415,9 +424,19 @@ def main():
                                 generation_env['MAX_THINKING_TOKENS'] = str(a.thinking_budget)
                             if a.max_output_tokens is not None:
                                 generation_env['CLAUDE_CODE_MAX_OUTPUT_TOKENS'] = str(a.max_output_tokens)
-                            run(command,
-                                response, prompt=prompt, timeout=1200, cwd=directory,
-                                env=generation_env)
+                            adapter = (DeepSeekRequestBridge(directory / f'provider-request-{attempt}.json',
+                                                             upstream=a.provider_base_url)
+                                       if a.provider_thinking == 'disabled' else nullcontext(None))
+                            with adapter as bridge:
+                                if bridge is not None:
+                                    settings = {'disableAllHooks': True, 'alwaysThinkingEnabled': False,
+                                                'env': {'ANTHROPIC_BASE_URL': bridge.base_url}}
+                                    command[command.index('--settings') + 1] = json.dumps(settings)
+                                    command += ['--effort', 'low', '--no-session-persistence']
+                                    generation_env.update(MAX_THINKING_TOKENS='0',
+                                                          CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING='1')
+                                run(command, response, prompt=prompt, timeout=1200, cwd=directory,
+                                    env=generation_env)
                         try:
                             proposal = parse_candidate(response.read_text(encoding='utf-8'))
                             break

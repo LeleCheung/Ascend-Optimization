@@ -4,13 +4,49 @@ import argparse
 import json
 import math
 from pathlib import Path
+import urllib.parse
 
-from optimization_campaign import checked, digest
+from optimization_campaign import checked, digest, parse_candidate
 from ascend_profiling_workflow import check_artifacts, source_in
 
 
 def read(path):
     return json.loads(path.read_text(encoding='utf-8'))
+
+
+def verify_generation(directory, source_sha256):
+    """新接口模式须有实际CC源码、请求适配和无思考输出的证据。"""
+    matches = []
+    for attempt, filename in ((1, 'claude-response.json'), (2, 'claude-repair-response.json')):
+        response = directory / filename
+        if not response.exists():
+            continue
+        raw = response.read_text(encoding='utf-8')
+        try:
+            proposal = parse_candidate(raw)
+        except (ValueError, KeyError, SyntaxError, TypeError):
+            continue
+        if digest(proposal['source'].replace('\r\n', '\n')) != source_sha256:
+            continue
+        requests = read(directory / f'provider-request-{attempt}.json')['requests']
+        messages = [row for row in requests if urllib.parse.urlsplit(row['route']).path == '/v1/messages']
+        if (not messages or any(row.get('forced_thinking_type') != 'disabled' for row in messages)
+                or not any(row.get('http_status') == 200 for row in messages)):
+            raise ValueError('缺少显式关闭供应商思考的成功请求')
+        for line in raw.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            for block in event.get('message', {}).get('content', []):
+                if isinstance(block, dict) and block.get('thinking'):
+                    raise ValueError('供应商关闭模式仍输出思考')
+        matches.append(attempt)
+    if not matches:
+        raise ValueError('候选无法对应实际CC生成的完整源码')
+    return matches[-1]
 
 
 def verify(root):
@@ -72,6 +108,8 @@ def verify(root):
                 or digest((directory / 'candidate.py').read_text(encoding='utf-8')) != row['source_sha256']
                 or not math.isclose(score, row['score'], rel_tol=1e-10)):
             raise ValueError('候选源码、结果或分数不一致')
+        if configuration.get('provider_thinking') == 'disabled':
+            verify_generation(directory, row['source_sha256'])
         accepted = score > best_score * 1.005
         if bool(row['accepted']) != accepted:
             raise ValueError('最佳选择不符合0.5%门槛')

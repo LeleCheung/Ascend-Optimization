@@ -8,7 +8,7 @@
 
 ## 当前状态
 
-正在统一四算子的[最佳源码复现与建议驱动优化工作流](project/Ascend-Optimization-v1/tools/profiling/四算子工作流.md)：先复验历史最佳版本，再从明确的优化前源码让CC执行固化建议，分别保存结果。新批次尚未完成，历史成绩保留如下。
+四算子的[统一工作流](project/Ascend-Optimization-v1/tools/profiling/四算子工作流.md)已完成最佳源码复现：logaddexp2 1.262×、amin 0.934×、矩阵乘0.889×、narrow_copy 1.105×，均完整通过，两次复验及32份真机附件已核验。见[复现汇总](project/Ascend-Optimization-v1/operators/四算子闭环-20261014-four.md)。建议驱动优化另开`20261014-four-direct`，从明确的优化前源码让CC执行固化建议；生成接口的踩坑与修复见[DeepSeek说明](project/Ascend-Optimization-v1/tools/profiling/DeepSeek生成接口修复-20261014.md)。该阶段尚未完成，历史成绩保留如下。
 
 2026-10-14：[持续优化闭环](project/Ascend-Optimization-v1/tools/profiling/README.md)已完成矩阵乘和amin各六轮、完整评测及两次最终复验。logaddexp2历史无profiler/有profiler为1.061×/1.267×；历史方法workflow已无人值守复现，两次1.269×/1.261×，均36/36。见[本阶段交付](project/Ascend-Optimization-v1/operators/一阶段交付-20261014.md)和[历史方法](project/Ascend-Optimization-v1/tools/profiling/历史复现知识-20261014.md)。
 

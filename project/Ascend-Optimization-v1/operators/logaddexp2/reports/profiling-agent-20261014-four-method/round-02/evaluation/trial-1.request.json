@@ -1,0 +1,25 @@
+{
+  "api_version": "v6.2",
+  "binding": {
+    "catalog_name": "flaggems-adapter-definitions",
+    "definition": "logaddexp2"
+  },
+  "implementation": {
+    "name": "logaddexp2-trial-1",
+    "definition": "logaddexp2",
+    "language": "triton",
+    "entrypoint": "main.py::run",
+    "sources": [
+      {
+        "path": "main.py",
+        "content": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\nimport logging\n\nimport torch\nimport triton\nimport triton.language as tl\n\nfrom flag_gems.utils import pointwise_dynamic\n\nlogger = logging.getLogger(__name__)\n\n# Ascend launch bound: a single grid must stay in [1, 65535].\n_MAX_GRID_TARGET = 32768\n_MAX_GRID_HARD = 65535\n_MAX_LOOP = 64\n\n# Contiguous / same-dtype / same-shape fast path is only taken for these.\n_FAST_DTYPES = (torch.float16, torch.bfloat16, torch.float32)\n\n\n@triton.jit\ndef _logaddexp2_flat_kernel(\n    x_ptr,\n    y_ptr,\n    out_ptr,\n    n_elements,\n    BLOCK: tl.constexpr,\n    LOOP: tl.constexpr,\n    EVEN: tl.constexpr,\n):\n    # Each program owns LOOP consecutive BLOCK-wide tiles of the flattened\n    # tensor, so the grid stays bounded even for 2**30 elements.\n    pid = tl.program_id(0)\n    base = pid * (BLOCK * LOOP)\n    for i in range(LOOP):\n        offs = base + i * BLOCK + tl.arange(0, BLOCK)\n        if EVEN:\n            x = tl.load(x_ptr + offs)\n            y = tl.load(y_ptr + offs)\n        else:\n            mask = offs < n_elements\n            x = tl.load(x_ptr + offs, mask=mask, other=0.0)\n            y = tl.load(y_ptr + offs, mask=mask, other=0.0)\n\n        # log2(2**x + 2**y) = m + log2(1 + 2**(-|x - y|)), m = max(x, y)\n        x_f32 = x.to(tl.float32)\n        y_f32 = y.to(tl.float32)\n        m = tl.maximum(x_f32, y_f32)\n        delta = x_f32 - y_f32\n        res = m + tl.log2(1.0 + tl.exp2(-tl.abs(delta)))\n        # Equal infinities make `delta` NaN; the value there is exactly m,\n        # e.g. logaddexp2(inf, inf) = inf, logaddexp2(-inf, -inf) = -inf.\n        res = tl.where(delta != delta, m, res)\n        # Genuine NaN inputs must still propagate NaN.\n        is_nan = (x_f32 != x_f32) | (y_f32 != y_f32)\n        res = tl.where(is_nan, float(\"nan\"), res)\n\n        r = res.to(out_ptr.dtype.element_ty)\n        if EVEN:\n            tl.store(out_ptr + offs, r)\n        else:\n            tl.store(out_ptr + offs, r, mask=offs < n_elements)\n\n\n@pointwise_dynamic(is_tensor=[True, True], promotion_methods=[(0, 1, \"DEFAULT\")])\n@triton.jit\ndef logaddexp2_func(x, y):\n    # Generic fallback: broadcast, non-contiguous and mixed-dtype promotion.\n    x_f32 = x.to(tl.float32)\n    y_f32 = y.to(tl.float32)\n    m = tl.maximum(x_f32, y_f32)\n    delta = x_f32 - y_f32\n    res = m + tl.log2(1.0 + tl.exp2(-tl.abs(delta)))\n    res = tl.where(delta != delta, m, res)\n    is_nan = (x_f32 != x_f32) | (y_f32 != y_f32)\n    return tl.where(is_nan, float(\"nan\"), res)\n\n\ndef _can_use_flat(x, y):\n    return (\n        x.dtype == y.dtype\n        and x.dtype in _FAST_DTYPES\n        and x.shape == y.shape\n        and x.is_contiguous()\n        and y.is_contiguous()\n        and x.numel() > 0\n    )\n\n\ndef _flat_launch(x, y, out):\n    n = x.numel()\n    # BLOCK=4096 keeps the FP32 temporaries (x_f32/y_f32/m/delta/res) within\n    # the AIV unified buffer; LOOP provides coverage instead of a huge grid.\n    block = 4096\n    loop = 1\n    while (n + block * loop - 1) // (block * loop) > _MAX_GRID_TARGET and loop < _MAX_LOOP:\n        loop *= 2\n    span = block * loop\n    grid = (n + span - 1) // span\n    if grid > _MAX_GRID_HARD:\n        return None\n    even = (n % span) == 0\n    _logaddexp2_flat_kernel[grid](\n        x, y, out, n, BLOCK=block, LOOP=loop, EVEN=even\n    )\n    return out\n\n\ndef logaddexp2(self, other):\n    logger.debug(\"GEMS LOGADDEXP2\")\n    if _can_use_flat(self, other):\n        out = torch.empty_like(self)\n        if _flat_launch(self, other, out) is not None:\n            return out\n    return logaddexp2_func(self, other)\n\n\ndef logaddexp2_out(self, other, out):\n    logger.debug(\"GEMS LOGADDEXP2_OUT\")\n    if (\n        _can_use_flat(self, other)\n        and out.shape == self.shape\n        and out.dtype == self.dtype\n        and out.is_contiguous()\n    ):\n        if _flat_launch(self, other, out) is not None:\n            return out\n    logaddexp2_func(self, other, out0=out)\n    return out\n\n\nrun = logaddexp2\n"
+      }
+    ]
+  },
+  "settings": {
+    "warmup_ms": 1000,
+    "benchmark_ms": 100,
+    "num_trials": 3,
+    "timeout_seconds": 1800
+  }
+}
