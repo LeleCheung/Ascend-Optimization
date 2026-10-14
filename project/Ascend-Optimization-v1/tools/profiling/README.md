@@ -1,8 +1,8 @@
-# Ascend Profiling Agent
+# Ascend Profiling 优化工作流
 
 四算子的统一入口已加入：见[四算子工作流](四算子工作流.md)。`run-four-operator-workflow.sh <批次> all 3`先复验四个最佳源码，再让CC按各算子固化建议生成候选；narrow_copy自动使用19657和包含DMA的device_task计时。实际运行进展与本批成绩以`operators/四算子闭环-<批次>.md`为准。
 
-2026-10-14：四个最佳源码复现全部完成，本批较慢值logaddexp2 1.262×、amin 0.934×、矩阵乘0.889×、narrow_copy 1.105×。旧模型生成批次已归档停止；DeepSeek默认思考与CC参数省略问题已由显式请求适配修复，见[生成接口修复](DeepSeek生成接口修复-20261014.md)。新方法模式使用`--provider-thinking disabled`，结果须以完整设备评测为准。
+2026-10-14 本阶段完成：四个最佳源码复现、四项 CC+DeepSeek 真实生成实验、完整测试与两次最终复验均已归档。成绩见[最终交付](../../operators/四算子工作流交付-20261014.md)，运行入口以[四算子工作流](四算子工作流.md)为准。新方法模式使用 `--provider-thinking disabled`，供应商调用审计、源码快照、逐 case 结果和失败日志均保留；生成接口说明见[接口修复](DeepSeek生成接口修复-20261014.md)。以下记录此前各阶段方法，历史运行命令使用新批次名后再执行。
 
 2026-10-14状态：矩阵乘和amin新候选已完成完整闭环与两次最终复验。logaddexp2历史无profiler/有profiler为1.061×/1.267×；历史方法workflow无人值守复现两次1.269×/1.261×，均36/36、最终SHA与历史版本一致。见[阶段交付](../../operators/一阶段交付-20261014.md)、[历史方法](历史复现知识-20261014.md)与[算子入口](../../operators/logaddexp2/README.md)。
 
@@ -22,7 +22,7 @@
 
 复现脚本生成本批`复现汇报.md`，使用`finalize-agent-campaign.py --replay-only`，只比较本批起点与两次最终复验。提交后HEAD会改变合同指纹，新批次不与提交前的旧基线做严格混合对照；历史四版本表保留原合同。已完成批次可在归档提交后只读核验并复用，运行中批次仍禁止改变HEAD。
 
-当前批次：`20261012-agent`。物理卡7、KGS19655、同卡串行。矩阵乘从v9出发，随后amin从v5出发，各6轮；每轮CC有20分钟超时，完整评测有30分钟超时。不会无限生成候选；一批结束后依据结果决定续跑。
+历史批次：`20261012-agent`。物理卡7、KGS19655、同卡串行。矩阵乘从v9出发，随后amin从v5出发，各6轮；每轮CC有20分钟超时，完整评测有30分钟超时。不会无限生成候选；一批结束后依据结果决定续跑。
 
 ## 运行与查看
 
@@ -32,7 +32,7 @@
 bash /data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/tools/profiling/run-agent-campaign-20261012.sh
 ```
 
-正式批次已由tmux托管，查看：
+历史批次曾由tmux托管，旧会话可能已退出；查看命令示例：
 
 ```bash
 tmux attach -t profiling-agent-20261012

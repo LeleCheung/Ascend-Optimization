@@ -1,0 +1,59 @@
+{
+  "operator": "amin",
+  "seed_sha256": "599ede4d0d21c4e1c7fb2c5b26d2f7ab3518c6edcae46ca0491ee4abe0923eb7",
+  "status": "completed",
+  "history": [
+    {
+      "round": 1,
+      "parent_result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/amin/reports/profiling-agent-20261014-four-refined-method/seed-evaluation/seed-1.result.json",
+      "parent_score": 0.9217133052012159,
+      "hypothesis": "在既有 amin_native_middle_kernel 与 amin_native_last_kernel 上新增 MASKED: tl.constexpr 开关，并在两个既有 launch 传入 multibuffer=True；保留原有 _NATIVE_TILES 的 BC/BR/BO 分块表、grid 计算方式与 NATIVE 分支，不新增 tile 推断、不改动 BO 语义。运行时时根据公开 shape 与 tile 计算 masked：中间轴 kernel 仅在 R % BR == 0 且 I % BC == 0 时为 False，末轴 kernel 仅在 O % BO == 0 且 R % BR == 0 时为 False，其余情况一律走原有 mask 路径。现在的 _NATIVE_TILES 恰好全部满足整除：中间轴 (64,512,512) 的 I=512==BC 且 R=512%BR16==0，(1024,1024,1024) 的 I=1024==BC 且 R=1024%8==0；末轴 (4096,4096) 的 O=4096%BO8==0 且 R=4096%BR1024==0。这样慢 case 会实际改善：float32 (64,512,512) 0.578×、(4096,4096) 0.702×、(1024,1024,1024) 0.857×，float16 (64,512,512) 0.591×、(4096,4096) 0.581×，bfloat16 (4096,4096) 0.463×、(1024,1024,1024) 0.395×、(64,512,512) 0.547×——这些正是 bound=reduction_vector_pipeline、Vector 活跃 76.6%/79.2% 的归约路径，去掉按元素 AND 的布尔掩码与 other 选择能减少 Vector/Scalar 指令并让 load 走无谓词路径。multibuffer=True 让搬运与 tl.minimum 归约重叠，若某配置编译不支持则由既有回退路径承担（本分支外仍是 _v4_amin 通用实现）。NATIVE 分块与 dtype 语义完全不变，NaN/Inf 行为与输出 dtype 保持，keepdim/stride/dim 归一化沿用原逻辑。",
+      "expected_effect": "中间轴与末轴归约在全部 _NATIVE_TILES 配置下省去每元素掩码运算与 other=max_value 填充，Vector 活跃比例对应的归约指令数与标量布尔运算减少；multibuffer=True 使 MTE2 搬运与 Vector 归约重叠，从而降低 (4096,4096)、(64,512,512)、(1024,1024,1024) 上 dim=1 的耗时。目标是把这 8 个当前 0.39×—0.86× 的慢 case 推向 1.0× 以上，同时全归约 (1048576,) 与 (64,64) 的 1.33×—2.20× 快 case 因走 _v4_amin 完全不变。是否正确与是否提速由完整 27 项正确性及两次复验实测决定。",
+      "source_sha256": "03efc498e5174854388abead6aa975762faaf44ad8974f5e9fe92fba7ba5568d",
+      "status": "PASSED",
+      "score": 0.9395528254142234,
+      "result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/amin/reports/profiling-agent-20261014-four-refined-method/round-01/evaluation/trial-1.result.json",
+      "accepted": true
+    },
+    {
+      "round": 2,
+      "parent_result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/amin/reports/profiling-agent-20261014-four-refined-method/round-01/evaluation/trial-1.result.json",
+      "parent_score": 0.9395528254142234,
+      "hypothesis": "本轮只改一个可整除去 mask 的既有配置参数：_NATIVE_TILES 的 BR（归约块）整体减半、并行的 BO/BC（输出行数/输出列数）翻倍，kernel 体、grid 计算方式、MASKED 开关、multibuffer=True 与所有 dtype/stride/dim 语义完全不动。\n\n依据当前真机事实：bf16 (4096,4096) dim=1 走 amin_native_last_kernel，aiv_vec_ratio=0.7825、mte2=0.206、scalar=0.1145，bound=reduction_vector_pipeline，(4096,4096) 的 BO=8/BR=1024 时每个 program 只用 8 行输出、却把归约片拉到 R=4096 上的 4 次迭代，prologue 还要静态生成 8×1024 的 fp32 acc 全 inf 常量：Vector 常数与 minimum 都在窄行宽上执行，行方向并行度不足。改成 BO=16/BR=512 后，每次迭代的归约行数减半，prologue 常量张量由 8192 降到 8192 元素（16×512），行方向 program 内并行宽度由 8 行翻到 16 行，grid 由 512 降到 256（仍远小于 65535）。bf16 (1024,1024,1024) 的 amin_native_middle_kernel 同理：bc=1024、br 由 8 降到 4，归约片 4×1024，Vector 活跃 75.9% 的循环里每迭代 4 行而非 8 行，对外层 1024 个 outer 的 program 数不变，搬运行宽 I=1024 不变仍满足 mte2=0.362 的连续搬运粒度。\n\n为什么不是重复历史：历史第 1 轮的采纳改动是「新增 MASKED 开关 + multibuffer=True」，源码里已经存在并保持。本轮没有新增开关、没有改 kernel 逻辑，只调整分块表里 BR/BO/BC 的取值，并同步更新注释，属于该轮明确列出的「固定布局与分块，比较归约指令」后续动作。所有新分块仍满足整除去 mask 的判据（末轴 O%BO==0 且 R%BR==0；中间轴 I%BC==0 且 R%BR==0），masked 在运行时按公开 shape 计算，非整除形状自动回落到带 mask 分支，且不在 _NATIVE_TILES 内的形状仍走 _v4_amin，未删任何路径、未引入新的模块导入、未改 BO 语义为输出列数。\n\n预期慢 case 改善：bf16 (4096,4096) 0.468×、(1024,1024,1024) 0.410×、(64,512,512) 0.571×；fp16 (4096,4096) 0.595×、(64,512,512) 0.613×、(1024,1024,1024) 0.879×；fp32 (4096,4096) 0.717×、(64,512,512) 0.604×、(1024,1024,1024) 0.878×。全归约 (1048576,)、二维 (64,64) 与所有非连续/多轴/非整除形状不经过本表，保持 1.45×—2.15× 不变。正确性由完整 27 项与两次复验决定；若该配置编译失败，运行时异常会直接暴露，不以吞异常代替验证。",
+      "expected_effect": "amin_native_last_kernel 在 (4096,4096) 三个 dtype 上每 program 并行输出行数由 8 提升到 16、归约片 R 由 1024 降到 512，amin_native_middle_kernel 在 (1024,1024,1024) 上 BR 由 8/16 降到 4/8，减少 prologue 常量张量的静态 Vector 指令并缩短每次 minimum 的窄行宽，预期把 bound=reduction_vector_pipeline 的这 9 个慢 case（当前 0.41×—0.88×）向 1.0× 推进；形状不在表内的调用路径、dtype、keepdim、stride 与 NaN/Inf（float('inf') 初值 + tl.minimum）语义保持不变，正确性由 27 项完整用例验证。",
+      "source_sha256": "522a515c6059dfb1848f64e59c00ab4e272098074469e92e0ca9ddc82c82dcbd",
+      "status": "PASSED",
+      "score": 0.904732645002819,
+      "result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/amin/reports/profiling-agent-20261014-four-refined-method/round-02/evaluation/trial-1.result.json",
+      "accepted": false
+    }
+  ],
+  "best": {
+    "result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/amin/reports/profiling-agent-20261014-four-refined-method/round-01/evaluation/trial-1.result.json",
+    "score": 0.9395528254142234
+  },
+  "configuration": {
+    "server": "http://127.0.0.1:19655",
+    "model": "deepseek-flash",
+    "claude": "/data/hanle/ascend-optimization/runtime/kg-controller/claude",
+    "profile_cases": 2,
+    "knowledge_sha256": "44a7a3b7a59b19e00dc55157eccfaa5fb05bd04407362fcbe1bbdaf01a6d9e44",
+    "generation_noop_guard": true,
+    "knowledge_snapshot_required": true,
+    "provider_thinking": "disabled",
+    "provider_base_url": "https://api.deepseek.com/anthropic",
+    "generation_format": "plain-json",
+    "max_output_tokens": 16384
+  },
+  "repo_commit": "d353ee0f7f4dd0fa784960f942ee3d4ead247078",
+  "current_error": null,
+  "seed_result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/amin/reports/profiling-agent-20261014-four-refined-method/seed-evaluation/seed-1.result.json",
+  "current_round": 2,
+  "stage": "completed",
+  "final_scores": [
+    0.9470568832908642,
+    0.9271894129032311
+  ],
+  "final_score": 0.9271894129032311,
+  "final_source_sha256": "03efc498e5174854388abead6aa975762faaf44ad8974f5e9fe92fba7ba5568d"
+}

@@ -8,7 +8,7 @@
 
 ## 当前状态
 
-四算子的[统一工作流](project/Ascend-Optimization-v1/tools/profiling/四算子工作流.md)已完成最佳源码复现：logaddexp2 1.262×、amin 0.934×、矩阵乘0.889×、narrow_copy 1.105×，均完整通过，两次复验及32份真机附件已核验。见[复现汇总](project/Ascend-Optimization-v1/operators/四算子闭环-20261014-four.md)。从明确起点让CC+DeepSeek执行建议的首批已结束：矩阵乘新候选0.891×、较本轮起点提升2.36%；其他三项未产生有效提升。生成门禁及DMA知识已补充，待新批验证与交付同步。详见[最新工作流进展](project/Ascend-Optimization-v1/operators/四算子工作流进展-20261014.md)；生成接口的踩坑见[DeepSeek说明](project/Ascend-Optimization-v1/tools/profiling/DeepSeek生成接口修复-20261014.md)。历史成绩保留如下。
+四算子的[统一工作流](project/Ascend-Optimization-v1/tools/profiling/四算子工作流.md)已完成本阶段验证与交付：历史最佳源码复现为 logaddexp2 1.262×、amin 0.934×、矩阵乘 0.889×、narrow_copy 1.105×，均完整通过并完成两次复验。从明确优化前源码调用 CC+DeepSeek 的四项生成实验也已完成，3 项在最终复验中取得有效提升；失败和未采纳代码保留。生成成绩、起点与方法见[最终交付](project/Ascend-Optimization-v1/operators/四算子工作流交付-20261014.md)和[最新进展](project/Ascend-Optimization-v1/operators/四算子工作流进展-20261014.md)。源码复验与方法生成分别记账，数值 Roofline 尚未建立。历史成绩保留如下。
 
 2026-10-14：[持续优化闭环](project/Ascend-Optimization-v1/tools/profiling/README.md)已完成矩阵乘和amin各六轮、完整评测及两次最终复验。logaddexp2历史无profiler/有profiler为1.061×/1.267×；历史方法workflow已无人值守复现，两次1.269×/1.261×，均36/36。见[本阶段交付](project/Ascend-Optimization-v1/operators/一阶段交付-20261014.md)和[历史方法](project/Ascend-Optimization-v1/tools/profiling/历史复现知识-20261014.md)。
 

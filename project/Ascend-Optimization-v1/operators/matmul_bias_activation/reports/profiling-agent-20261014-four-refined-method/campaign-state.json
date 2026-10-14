@@ -1,0 +1,60 @@
+{
+  "operator": "matmul_bias_activation",
+  "seed_sha256": "125aa897fbe00ba74224b47b0786d670978bf960db00bba1b8755239593c95f6",
+  "status": "completed",
+  "history": [
+    {
+      "round": 1,
+      "parent_result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/matmul_bias_activation/reports/profiling-agent-20261014-four-refined-method/seed-evaluation/seed-1.result.json",
+      "parent_score": 0.8712240119239792,
+      "hypothesis": "本次只改 float32 规则方阵这一条分支（此前的 v9 FP32 双 N tile 未被本批起点采用）：在 v6 入口之后、v8 双 N tile 入口之前新增 `mba_fp32_panel_b_kernel`。该 kernel 用单个 fp32 累积器：一次加载 A 的 (BM, 2*BK=256) 与 B 的 (256, BN)，用 `tl.split` 把 A 按 K 切成两半做两次背靠背 `tl.dot`。改动点：调用参数 BM=128/BK=128（对照 mba_dual_dispatch_v8_kernel 的 BK=256，UB 需求由 128 行×256 + 256×256 + 2 个 fp32 累积约 224KB 降到 32KB+128KB+64KB），累加器数由 2 个 128×128 fp32 降为 1 个，同时每次迭代的 A 面板与 B 面板仍是“一次搬运、两次消费”，搬运同步开销相对 BK=128 单 N tile 减少。grid 仍为 ((m//128)*(n//128),)，1024→64、2048→256、4096→1024，均远小于 65535，不引入百万 program。每次 launch 显式 multibuffer=True、unit_flag=True、sync_solver=False。内核只用字面量常量与 constexpr，未引用模块级 Python 常量。会改善的慢 case：本次 seed 评测中最慢的 float32::2（1024 方阵 69.5us vs pytorch 50.0us）与 float32::3（2048 方阵 358.4us vs 283.2us），以及 FP32 大 K 的 float32::1/::4（4096 方阵，K 循环由 32 次单 tile 迭代变 16 次双 dot 迭代）；float32::0（384 方阵）不满足 k%256 条件，走 v8→v6 的既有回退，行为不变。半精度分支未触碰（仍由 `_fp32_v8_dispatch` 保留 v8 双 N tile 路径），bf16 K>=4096 的精度路径仍在 master 中。非 2 的幂或非 256 倍数的 K 由 `k % 256 == 0` 条件挡在回退路径，避免越界。",
+      "expected_effect": "float32 规则方阵（1024/2048/4096）的 AIC MTE2 搬运字节与 K 循环同步点减少约一半，预期 float32::2、float32::3 相比当前 0.718×、0.790× 有明显提升，float32::1、::4（当前 0.976×/0.978×）小幅提升或持平；若 UB 256 字节对齐/布局约束导致 tl.split 路径编译或数值失败，则由完整测试判定并回退到当前 v8，不影响其他 dtype、shape 与正确性。",
+      "source_sha256": "86b3a45ea4ad8c358ef38a939066b2f52f805abac2b738eed14a495502526bcc",
+      "status": "FAILED",
+      "error": "命令失败 1，见 /data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/matmul_bias_activation/reports/profiling-agent-20261014-four-refined-method/round-01/evaluation.log",
+      "evaluation_status": "RUNTIME_ERROR",
+      "failure_detail": "     metric.gbps_base = self.get_gbps(\n                            args, latency=metric.latency_base\n                        )\n                    if metric.latency is not None:\n                        metric.gbps = self.get_gbps(args, latency=metric.latency)\n                else:\n                    metric.gbps_base = self.get_gbps(args, latency=metric.latency_base)\n                    metric.gbps = self.get_gbps(args, latency=metric.latency)\n    \n            if \"tflops\" in self.to_bench_metrics:\n                metric.tflops = (\n                    self.get_tflops(self.torch_op, *args, **kwargs)\n                    / metric.latency\n                    / 1e12\n                    * 1e3\n                )\n                # utilization = metric.tflops / metric.latency / 1e12 * 1e3\n        except (RuntimeError, Exception) as e:\n            metric.error_msg = str(e)\n>           pytest.fail(str(e))  # raise exception again\n            ^^^^^^^^^^^^^^^^^^^\nE           Failed: at 34:21:\nE           \nE               offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)\nE               offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)\nE               offs_k = tl.arange(0, 2 * BLOCK_SIZE_K)\nE               a_ptrs = a_ptr + (offs_am[:, None] * K + offs_k[None, :])\nE               b_ptrs = b_ptr + (offs_k[:, None] * N + offs_bn[None, :])\nE           \nE               acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)\nE               for _ in range(0, K // (2 * BLOCK_SIZE_K)):\nE                   a = tl.load(a_ptrs)\nE                   b = tl.load(b_ptrs)\nE                   a_lo, a_hi = tl.split(tl.reshape(a, (BLOCK_SIZE_M, 2, BLOCK_SIZE_K)))\nE                                ^\nE           AssertionError()\n\nbenchmark/base.py:801: Failed\n----------------------------- Captured stdout call -----------------------------\n\nOperator: matmul_bias_activation  Performance Test (dtype=torch.float16, mode=kernel,level=core)\nStatus       Torch Latency (ms)    Gems Latency (ms)         Gems Speedup          Size Detail\n-----------------------------------------------------------------------------------------------\nSUCCESS               0.011791            0.010020               1.177          [torch.Size([384, 384]), torch.Size([384, 384]), torch.Size([384])]\nSUCCESS               0.619554            0.990914               0.625          [torch.Size([4096, 4096]), torch.Size([4096, 4096]), torch.Size([4096])]\nSUCCESS               0.023856            0.039767               0.600          [torch.Size([1024, 1024]), torch.Size([1024, 1024]), torch.Size([1024])]\nSUCCESS               0.094982            0.172595               0.550          [torch.Size([2048, 2048]), torch.Size([2048, 2048]), torch.Size([2048])]\nSUCCESS               0.622963            0.989196               0.630          [torch.Size([4096, 4096]), torch.Size([4096, 4096]), torch.Size([4096])]\n\n=============================== warnings summary ===============================\n../../../../../../usr/local/python3.11.15/lib/python3.11/site-packages/torch_npu/npu/__init__.py:539\n  /usr/local/python3.11.15/lib/python3.11/site-packages/torch_npu/npu/__init__.py:539: UserWarning: You can set the device capability via the environment variable TORCH_NPU_DEVICE_CAPABILITY. The return value of get_device_capability is only for compatibility with PyTorch and does not represent the actual capability of the NPU device.\n    warnings.warn(f\"You can set the device capability via the environment variable TORCH_NPU_DEVICE_CAPABILITY. {warning_str}\")\n\nsrc/flag_gems/utils/device_info.py:58\n  /data/hanle/ascend-optimization/Ascend-Optimization/third_party/FlagGems/src/flag_gems/utils/device_info.py:58: UserWarning: [device_info] torch_device_fn.get_device_capability returned None for device_id=0, fallback to (0, 0).\n    warnings.warn(\n\n../../../../../../usr/local/python3.11.15/lib/python3.11/site-packages/torch/backends/__init__.py:46\n  /usr/local/python3.11.15/lib/python3.11/site-packages/torch/backends/__init__.py:46: UserWarning: Please use the new API settings to control TF32 behavior, such as torch.backends.cudnn.conv.fp32_precision = 'tf32' or torch.backends.cuda.matmul.fp32_precision = 'ieee'. Old settings, e.g, torch.backends.cuda.matmul.allow_tf32 = True, torch.backends.cudnn.allow_tf32 = True, allowTF32CuDNN() and allowTF32CuBLAS() will be deprecated after Pytorch 2.9. Please see https://pytorch.org/docs/main/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices (Triggered internally at /pytorch/aten/src/ATen/Context.cpp:80.)\n    self.setter(val)\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n=========================== short test summary info ============================\nFAILED benchmark/test_matmul_bias_activation.py::test_matmul_bias_activation\n1 failed, 3 warnings in 5.57s\n[W1014 21:24:44.027578467 ToKernelNpu.cpp:41] Warning: Device do not support double dtype now, dtype cast replace with float. (function operator())\n",
+      "failed_cases": []
+    },
+    {
+      "round": 2,
+      "parent_result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/matmul_bias_activation/reports/profiling-agent-20261014-four-refined-method/seed-evaluation/seed-1.result.json",
+      "parent_score": 0.8712240119239792,
+      "hypothesis": "只改 fp32 规则方阵这一条分支，目标是当前最慢的 float32::2（1024 方阵 69.5us vs 49.96us，0.718×）和 float32::3（2048 方阵 358.4us vs 283.2us，0.790×）。这两个 case 的真机 kernel 是 mba_wide_pipeline_kernel（v8 之前的 v6 链路，单 N tile），流水为 aic_mac 0.634 / aic_mte1 0.284 / aic_mte2 0.555 / aic_scalar 0.123，MAC 已较活跃而标量与搬运存在空档；对比半精度大 shape 走 v8 双 N tile（float16::3 的 aic_mac 0.683），说明“一次取 A 面板、两次消费”的结构对 fp32 同样有收益空间。\n\n具体改动：在 v8 入口之后新增 mba_fp32_dual_v9_kernel，只由 fp32 且 m,n,k 全为 256 倍数触发（1024/2048/4096 方阵满足，384 方阵不满足，走原有回退链）。新 kernel 结构与已验证的 v8 完全同构：BM=128、BN=128、每 program 覆盖 2 个相邻 N tile（即 256 列）、BK=128；两个 128×128 的 fp32 累加器，K 循环内 a 只搬一次、b0/b1 各搬一次，两条 tl.dot 背靠背。调用参数为 grid=((m//128)*(n//256),)，1024→32、2048→128、4096→512，远低于 65535，不存在越界 launch；每次 launch 显式 multibuffer=True、unit_flag=True、sync_solver=False，与 v8 一致。\n\n与第 1 轮失败的关键区别（必须避免重复历史失败配置）：第 1 轮在同一处用了 tl.reshape(a, (BM, 2, BK)) + tl.split 在 kernel 内切 A，真机在编译期抛 AssertionError（`a_lo, a_hi = tl.split(...)` 处），属于编译器不支持该形状组合，且是把 A 面板扩到 2*BK=256 导致 UB 膨胀。本轮完全不使用 tl.reshape/tl.split，改为把 K 循环按 BK=128 直接推进，两个累加器沿 N 方向相邻而非 K 方向切分，UB 占用为 fp32 下 128×128 A（64KB 级）+ 128×128 B ×2 + 2 个 128×128 fp32 累加器，与 v8 在 fp16 下的量级可比。\n\n半精度路径未被触碰：本分支硬性要求 input.dtype == torch.float32，fp16/bf16 仍进入 v8 双 N tile；bf16 K>=4096 的 master 精度路径、不规则形状/stride 的 master 回退、bias 维度与 ReLU 表达式（tl.maximum(x, x*0.0)）全部保持原样，dtype/shape/stride 合同不变。",
+      "expected_effect": "float32::2（1024）、float32::3（2048）理论上每个 K 循环迭代少一次 A 面板搬运与一次寻址计算，K 循环次数由 K/128 与半精度 v8 的量级对齐（1024→8、2048→16），预期这两 case 的 aic_mte1/aic_scalar 空档缩小，相对于 0.718×、0.790× 有可测提升；float32::1/::4（4096 方阵，当前 0.976×/0.978×）循环由 32 次降为 32 次双 dot 结构，预期小幅提升或持平。float32::0（384）不满足 256 倍数条件，走 v8→v6 回退，行为与延迟不变。若该结构触发编译错误、UB 溢出或正确性偏差，完整评测会直接暴露，届时按既有回退链保留当前 v8 版本结果，不影响其它 dtype/shape。",
+      "source_sha256": "7d389c27411a2dab7629b80d3fc76fb1cdc0a93d1cf5bc5fe97ee5e420bf35ff",
+      "status": "PASSED",
+      "score": 0.9146657789761329,
+      "result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/matmul_bias_activation/reports/profiling-agent-20261014-four-refined-method/round-02/evaluation/trial-1.result.json",
+      "accepted": true
+    }
+  ],
+  "best": {
+    "result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/matmul_bias_activation/reports/profiling-agent-20261014-four-refined-method/round-02/evaluation/trial-1.result.json",
+    "score": 0.9146657789761329
+  },
+  "configuration": {
+    "server": "http://127.0.0.1:19655",
+    "model": "deepseek-flash",
+    "claude": "/data/hanle/ascend-optimization/runtime/kg-controller/claude",
+    "profile_cases": 2,
+    "knowledge_sha256": "4048d52089386011615f73a2ca6d6f76ad3c2c59e10e2369a912d81a2201ac29",
+    "generation_noop_guard": true,
+    "knowledge_snapshot_required": true,
+    "provider_thinking": "disabled",
+    "provider_base_url": "https://api.deepseek.com/anthropic",
+    "generation_format": "plain-json",
+    "max_output_tokens": 16384
+  },
+  "repo_commit": "d353ee0f7f4dd0fa784960f942ee3d4ead247078",
+  "current_error": null,
+  "seed_result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/matmul_bias_activation/reports/profiling-agent-20261014-four-refined-method/seed-evaluation/seed-1.result.json",
+  "current_round": 2,
+  "stage": "completed",
+  "final_scores": [
+    0.9100845324795277,
+    0.9091833236557711
+  ],
+  "final_score": 0.9091833236557711,
+  "final_source_sha256": "7d389c27411a2dab7629b80d3fc76fb1cdc0a93d1cf5bc5fe97ee5e420bf35ff"
+}
