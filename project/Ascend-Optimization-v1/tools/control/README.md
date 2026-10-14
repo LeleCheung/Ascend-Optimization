@@ -18,7 +18,7 @@ python3 "$ctl" --host baai-910b --remote-root "$root" status \
  --batch 20261010 --ports 19655 19657
 ```
 
-输出该批次的 tmux 会话、KG 进度、完整评测结果和 KGS 队列。仅查询状态，不启动或停止进程。支持用 `--operators amin` 等参数缩小范围；当前支持三个主线算子。
+输出该批次进度、完整评测结果、项目tmux会话和KGS队列；重启恢复会话的日期可以不同于原批次。仅查询状态，不启动或停止进程。支持用 `--operators amin` 等参数缩小范围；当前支持amin、matmul_bias_activation、narrow_copy、logaddexp2、acosh、add_relu。
 
 ## 执行 Bash 文件
 
@@ -28,6 +28,8 @@ python3 "$ctl" --host baai-910b exec /本地路径/check.sh --container tle_yy
 ```
 
 本地脚本通过 SSH 标准输入传输，自动去除 UTF-8 BOM、将 CRLF 转为 LF。工具确认目标 Bash 已启动，并在命令结束后输出日志；堡垒机即使返回零退出码，也不会被误判为执行成功。命令按脚本内容执行；需要持续运行的任务由远端脚本使用 tmux 托管。该入口不解析或修正脚本中的历史绝对路径。
+
+状态、上传和下载同样要求目标Python确认启动；堡垒机返回`gateway dial addr failed`时直接报告连接失败，不把零退出码或缺少JSON当作成功回执。
 
 ## 上传明确的项目文件
 
@@ -46,6 +48,8 @@ python3 "$ctl" --host baai-910b --remote-root "$root" download \
 ```
 
 下载指定批次的候选、报告和已成功完成的独立诊断。不下载 controller venv、Claude 二进制、Git 对象或容器层。单批原始文件总量限 256 MiB。下载完整检查通过后才写入；路径越界、符号链接、重复条目或原始证据字节冲突都会停止，不能覆盖冲突来伪造一致。
+
+有`campaign-state.json`的Agent目录只在`completed`时进入正式下载，避免将仍在增长的模型流或运行状态误作固定原始证据。运行中进度用`status`查询；已停止但未完成的实验先在910B归档中断状态，再单独保存失败记录。
 
 派生汇总因控制端路径而不同，可明确使用 `--replace-derived`；工具仅允许替换该批次 `master-closure-<批次>/` 下的版本对比、最终候选、精简汇报及真机诊断，旧字节先保存到仓库本地 `.control-state/download-backups/`。原始评测与附件始终拒绝覆盖。若本地仅有 CRLF/LF 差异，且远端字节与本地已提交 Git blob 完全一致，则视为已有内容，保留本地字节；不根据换行相似度直接改写证据。
 

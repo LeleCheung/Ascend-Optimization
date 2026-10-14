@@ -8,15 +8,18 @@
 
 ## 当前状态
 
+2026-10-14：[持续优化闭环](project/Ascend-Optimization-v1/tools/profiling/README.md)已完成矩阵乘和amin各六轮、完整评测及两次最终复验。logaddexp2历史无profiler/有profiler为1.061×/1.267×；历史方法workflow已无人值守复现，两次1.269×/1.261×，均36/36。见[本阶段交付](project/Ascend-Optimization-v1/operators/一阶段交付-20261014.md)和[历史方法](project/Ascend-Optimization-v1/tools/profiling/历史复现知识-20261014.md)。
+
 | 对象 | Excel 华为列 | 状态 |
 |---|---:|---|
 | [narrow_copy](project/Ascend-Optimization-v1/operators/narrow_copy/README.md) | G29：0.0138× | 四版本 0.010×、0.495×、0.806×、1.102×，均 33/33；最终相对 master 108.23× |
-| [matmul_bias_activation](project/Ascend-Optimization-v1/operators/matmul_bias_activation/README.md) | G611：0.5408× | 四版本 0.443×、0.743×、0.706×、0.884×，均 42/42；v9 两次复验 0.886×、0.884×，相对 master 2.00× |
-| [amin](project/Ascend-Optimization-v1/operators/amin/README.md) | G92：0.5536× | 四版本 0.296×、0.769×、0.499×、0.916×，均 27/27；最终相对 master 3.11× |
+| [matmul_bias_activation](project/Ascend-Optimization-v1/operators/matmul_bias_activation/README.md) | G611：0.5408× | 本批四版本 0.439×、0.751×、0.713×、0.906×，均 42/42；新候选两次 0.908×、0.906×，相对 master 2.08× |
+| [amin](project/Ascend-Optimization-v1/operators/amin/README.md) | G92：0.5536× | 本批四版本0.308×、0.742×、0.512×、0.936×，均27/27；新候选两次0.942×、0.936×，相对启动兼容master为3.04× |
+| [logaddexp2](project/Ascend-Optimization-v1/operators/logaddexp2/README.md) | G122：0.3218× | master 0.231×；历史无/有profiler 1.061×/1.267×；方法workflow复现1.269×/1.261×，均36/36 |
 
 此前按颜色误选的 MSE backward、PReLU backward、t_copy、SmoothL1 backward、BatchNorm backward、native_layer_norm，Excel 数值均已超过 0.8×，已移入 [历史归档](project/Ascend-Optimization-v1/archive/README.md)。原结果保留为流程和优化方法参考，不计入新目标的成果。
 
-三个正式算子现均超过 0.8×。2026-10-12 矩阵乘 v9 在双 tile 数据复用基础上启用点积累加器与 Ascend 多缓冲流水，两次完整复验达标；三组对照源码也在同合同下重新评测。见 [最新四版本表](project/Ascend-Optimization-v1/operators/低于0.8算子四版本闭环-20261012.md)、[矩阵乘精简汇报](project/Ascend-Optimization-v1/operators/matmul_bias_activation/reports/master-closure-20261012/精简汇报.md)和[复现步骤](project/Ascend-Optimization-v1/tools/evaluation/复现与交接-20261010.md)。
+narrow_copy、matmul_bias_activation和amin均超过0.8×。新一轮矩阵乘把双tile复用A扩展到FP32；amin去掉整除维度的边界掩码，调整归约精度与缓冲配置。见[矩阵乘最新汇报](project/Ascend-Optimization-v1/operators/matmul_bias_activation/reports/master-closure-20261012-agent/精简汇报.md)、[本批交接](project/Ascend-Optimization-v1/tools/profiling/复现与交接-20261013.md)。[2026-10-12成果表](project/Ascend-Optimization-v1/operators/低于0.8算子四版本闭环-20261012.md)保留上批数据。
 
 现有 narrow_copy 分析使用过 msprof 指标、模拟器指令及编译产物。matmul 原版的 Msopprof 官方 Roofline 文本给出 `memory caused`，已核验 kernel、case 和物理卡身份；计数缩放与硬件 roof 尚未核实，数值 Roofline 仍待建立。
 
@@ -75,6 +78,8 @@ square 的 KG+KGS 烟雾测试已完成，记录见 [烟雾测试归档](project
 `--no-profile` 关闭优化反馈，设备计时仍可能使用 NPU profiler。必须写清设备侧 kernel 计时还是完整调用计时，不能把历史 `timing=walltime` 请求直接解释为端到端耗时。
 
 ### 第 4 步：独立 Profiling workflow 与分析优化版本
+
+独立workflow的首要目的，是把此前Codex参与整理的瓶颈诊断与有效方法固化为可自动运行的流程。可从已验证候选复现历史成果，再按同一诊断接口优化；不要求重新发明候选。KG无profiler/有profiler标签表示运行开关，不表示工程没有Codex参与。复现同一源码时明确记录为复现；新增优化需提供实际修改和完整评测。
 
 1. 调研当前 KG/KGS 的 Ascend 采集与反馈代码。导师说明默认使用 `msprof`，`metrics` 用于真机指标，`instruction` 使用模拟器，由 agent 根据问题选择。
 2. 先做独立 workflow：输入算子语义、候选、workload 和原始 profiling 产物，输出中文体检报告；公共入口见 [tools/profiling](project/Ascend-Optimization-v1/tools/README.md)。

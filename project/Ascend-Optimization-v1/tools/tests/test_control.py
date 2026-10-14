@@ -29,6 +29,66 @@ def archive(rows):
 
 
 class ControlTests(unittest.TestCase):
+    def test_download_excludes_running_stream_and_includes_completed_campaign(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / 'Ascend-Optimization/project/Ascend-Optimization-v1'
+            running = project / 'operators/logaddexp2/reports/profiling-agent-20261014d-agent'
+            completed = project / 'operators/logaddexp2/reports/profiling-agent-20261014d-finished'
+            for path, status in ((running, 'running'), (completed, 'completed')):
+                path.mkdir(parents=True)
+                (path / 'campaign-state.json').write_text(json.dumps({'status': status}))
+                (path / 'claude-response.json').write_text('stream')
+            params = {'root': str(root), 'batch': '20261014d', 'operators': ['logaddexp2'], 'max_bytes': 4096}
+            result = subprocess.run([sys.executable, '-'],
+                input=('parameters = ' + repr(params) + '\n' + control.REMOTE_DOWNLOAD).encode(), capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
+            with tarfile.open(fileobj=io.BytesIO(result.stdout), mode='r:gz') as data:
+                names = data.getnames()
+            self.assertEqual(len(names), 2)
+            self.assertTrue(all('finished/' in name for name in names))
+
+    def test_batch_selection_and_requested_operator_index_can_download(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rows = [('operators/next-operator-screen-20261012-agent.json', b'[]', tarfile.REGTYPE),
+                    ('operators/logaddexp2/README.md', b'index', tarfile.REGTYPE)]
+            actions, total = control.download_actions(archive(rows), Path(directory),
+                                                      ['logaddexp2'], '20261012-agent')
+            self.assertEqual(total, 2)
+            self.assertEqual(len(actions), 2)
+
+    def test_new_operator_campaign_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / 'Ascend-Optimization/project/Ascend-Optimization-v1/operators/logaddexp2/reports/profiling-agent-20261012-agent/campaign-state.json'
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({'status': 'running', 'stage': 'evaluating',
+                'current_round': 2, 'history': [{'round': 1, 'status': 'PASSED', 'score': 0.7}]}))
+            from contextlib import redirect_stdout
+            output = io.StringIO()
+            namespace = {'parameters': {'root': str(root), 'batch': '20261012-agent',
+                                        'operators': ['logaddexp2'], 'ports': []}}
+            with patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0, '', '')):
+                with redirect_stdout(output):
+                    exec(control.REMOTE_STATUS, namespace)
+            campaign = json.loads(output.getvalue())['campaigns'][0]
+            self.assertEqual(campaign['operator'], 'logaddexp2')
+            self.assertEqual(campaign['stage'], 'evaluating')
+            self.assertEqual(campaign['rounds'][0]['score'], 0.7)
+
+    def test_recovery_session_date_can_differ_from_batch_date(self):
+        with tempfile.TemporaryDirectory() as directory:
+            from contextlib import redirect_stdout
+            output = io.StringIO()
+            namespace = {'parameters': {'root': directory, 'batch': '20261012-agent',
+                                        'operators': [], 'ports': []}}
+            result = subprocess.CompletedProcess([], 0,
+                'hanle-kgs-master\nprofiling-closure-20261013\nunrelated\n', '')
+            with patch('subprocess.run', return_value=result), redirect_stdout(output):
+                exec(control.REMOTE_STATUS, namespace)
+            self.assertEqual(json.loads(output.getvalue())['sessions'],
+                             ['hanle-kgs-master', 'profiling-closure-20261013'])
+
     def test_status_reads_canonical_batch_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -66,6 +126,18 @@ class ControlTests(unittest.TestCase):
         with patch.object(control.subprocess, 'run', return_value=result):
             with self.assertRaisesRegex(RuntimeError, 'no available gateway'):
                 control.remote_python('baai-910b', {}, 'print(1)')
+
+    def test_gateway_target_timeout_zero_exit_is_not_success(self):
+        result = subprocess.CompletedProcess([], 0,
+            b'gateway dial addr failed: ssh: rejected: connect failed (Connection timed out)', b'')
+        with patch.object(control.subprocess, 'run', return_value=result):
+            with self.assertRaisesRegex(RuntimeError, 'Connection timed out'):
+                control.remote_python('baai-910b', {}, 'print(1)')
+
+    def test_remote_python_confirms_execution_without_changing_payload(self):
+        result = subprocess.CompletedProcess([], 0, b'\x1f\x8barchive', b'CONTROL_PYTHON_STARTED\n')
+        with patch.object(control.subprocess, 'run', return_value=result):
+            self.assertEqual(control.remote_python('baai-910b', {}, 'print(1)'), result.stdout)
 
     def test_exec_requires_remote_bash_confirmation(self):
         with tempfile.TemporaryDirectory() as directory:

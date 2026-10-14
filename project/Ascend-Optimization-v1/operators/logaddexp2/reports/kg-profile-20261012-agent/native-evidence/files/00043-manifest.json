@@ -1,0 +1,238 @@
+{
+  "request": {
+    "api_version": "v6.2",
+    "evaluation_id": "17ddb3e2787c11285829421ae735fd08e385050e63fc26c3a87efeb95c465d53:round-6",
+    "binding": {
+      "catalog_name": "flaggems-adapter-definitions",
+      "bundle_id": null,
+      "definition": "logaddexp2"
+    },
+    "implementation": {
+      "name": "kernelgen-candidate-logaddexp2",
+      "definition": "logaddexp2",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Triton implementation of ``logaddexp2`` for the Ascend NPU backend.\n\n``log2(2**x + 2**y) = m + log2(1 + 2**-|x - y|)`` with ``m = max(x, y)``.  The\ncorrection term is evaluated in fp32 and the result is rounded once to the\noutput dtype (measured to be the only form that stays inside the operator's\n1e-4 / dtype-rtol tolerance budget on this target; element-dtype arithmetic\nviolates it for float16 and bfloat16).\n\nKernels:\n\n* ``_lad2_flat_even`` -- hot path for sizes that divide the program tile.\n  One program owns ``UNROLL`` consecutive ``BLOCK``-wide tiles and the loads of\n  tile ``i + 1`` are issued before the arithmetic of tile ``i``, so the GM<->UB\n  DMA overlaps the vector work; ``UNROLL`` also amortises the fixed per-program\n  cost this backend charges.\n* ``_lad2_flat_masked`` -- same structure with bounds masks for ragged sizes.\n* ``_lad2_flat_loop`` -- runtime grid-stride tile loop used for very large\n  16-bit inputs, where a small fixed program count measured 11% faster than the\n  unrolled form (64 tiles per program).  It strides by ``tl.num_programs(0)``,\n  so the geometry is derived from the launch rather than from any device\n  constant.\n* ``_lad2_strided_kernel`` -- general fallback for broadcast / non-contiguous\n  operands (rank <= 8, zero strides for broadcast).\n\nThe max is taken in the operand dtype: it is exact (no rounding), and keeping\nit out of fp32 halves the unified-buffer footprint, which is what makes the\n8192-wide 16-bit tile fit.\n\nNaN/inf semantics: ``|x - y|`` is clamped to 200, so a NaN ``|x - y|`` (NaN\noperand or equal infinities) yields an exactly zero correction, while\n``tl.maximum`` with ``PropagateNan.ALL`` keeps genuine NaN operands propagating\nthrough ``m``.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n_MAXD = 8\n\n_FLAT_BLOCK = 4096  # fp32 tile (8192 fails to compile: BiShengHIR pipeline)\n_WIDE_BLOCK = 8192  # 16-bit tile, same unified-buffer footprint as 4096 fp32\n_STRIDED_BLOCK = 1024\n_MAX_GRID = 65535  # rtKernelLaunch rejects coreDim above this\n_TARGET_GRID = 1024\n_WIDE_TARGET_GRID = 512\n_MAX_UNROLL = 8\n_LOOP_BLOCK = 4096\n_LOOP_TILES = 64  # tiles per program for the runtime grid-stride loop\n_LOOP_MIN_N = 1 << 28\n# Smaller 16-bit inputs use a wider tile with fewer tiles per program and a\n# single pipeline stage; the 1G-class geometry above prefers two stages.\n_LOOP_SMALL_BLOCK = 8192\n_LOOP_SMALL_TILES = 4\n_LOOP_SMALL_MIN_N = 1 << 20\n_LOOP_STAGES_BIG = 2\n_LOOP_STAGES_SMALL = 1\n\n\n@triton.jit\ndef _lad2_elem(x, y):\n    m = tl.maximum(x, y, propagate_nan=tl.PropagateNan.ALL)\n    xf = x.to(tl.float32)\n    yf = y.to(tl.float32)\n    t = tl.abs(xf - yf)\n    # NaN |d| (NaN operand or equal infinities) -> zero correction; NaN operands\n    # still reach the output through `m`.  200.0 is inlined: this backend cannot\n    # read module globals from inside a jitted function.\n    t = tl.where(t <= 200.0, t, 200.0)\n    # log2(1 + u) == ln(1 + u) * log2(e).  The natural log lowers to a\n    # measurably cheaper sequence than tl.log2 on this backend (12-15% of\n    # kernel time on 16-bit operands) for the same value.\n    return m.to(tl.float32) + tl.log(1.0 + tl.exp2(-t)) * 1.4426950408889634\n\n\n@triton.jit\ndef _lad2_flat_even(x_ptr, y_ptr, o_ptr, BLOCK: tl.constexpr, UNROLL: tl.constexpr):\n    base = tl.program_id(0) * (BLOCK * UNROLL)\n    offs = base + tl.arange(0, BLOCK)\n    x = tl.load(x_ptr + offs)\n    y = tl.load(y_ptr + offs)\n    for i in tl.static_range(1, UNROLL):\n        nxt = offs + i * BLOCK\n        nx = tl.load(x_ptr + nxt)\n        ny = tl.load(y_ptr + nxt)\n        tl.store(\n            o_ptr + (offs + (i - 1) * BLOCK),\n            _lad2_elem(x, y).to(o_ptr.dtype.element_ty),\n        )\n        x = nx\n        y = ny\n    tl.store(\n        o_ptr + (offs + (UNROLL - 1) * BLOCK),\n        _lad2_elem(x, y).to(o_ptr.dtype.element_ty),\n    )\n\n\n@triton.jit\ndef _lad2_flat_masked(x_ptr, y_ptr, o_ptr, n, BLOCK: tl.constexpr,\n                      UNROLL: tl.constexpr):\n    base = tl.program_id(0) * (BLOCK * UNROLL)\n    offs = base + tl.arange(0, BLOCK)\n    mask = offs < n\n    x = tl.load(x_ptr + offs, mask=mask, other=0.0)\n    y = tl.load(y_ptr + offs, mask=mask, other=0.0)\n    for i in tl.static_range(1, UNROLL):\n        nxt = offs + i * BLOCK\n        nmask = nxt < n\n        nx = tl.load(x_ptr + nxt, mask=nmask, other=0.0)\n        ny = tl.load(y_ptr + nxt, mask=nmask, other=0.0)\n        tl.store(\n            o_ptr + (offs + (i - 1) * BLOCK),\n            _lad2_elem(x, y).to(o_ptr.dtype.element_ty),\n            mask=mask,\n        )\n        x = nx\n        y = ny\n        mask = nmask\n    tl.store(\n        o_ptr + (offs + (UNROLL - 1) * BLOCK),\n        _lad2_elem(x, y).to(o_ptr.dtype.element_ty),\n        mask=mask,\n    )\n\n\n@triton.jit\ndef _lad2_flat_loop(x_ptr, y_ptr, o_ptr, tiles, BLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    step = tl.num_programs(0) * BLOCK\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    for j in range(0, tiles):\n        cur = offs + j * step\n        x = tl.load(x_ptr + cur)\n        y = tl.load(y_ptr + cur)\n        tl.store(o_ptr + cur, _lad2_elem(x, y).to(o_ptr.dtype.element_ty))\n\n\n@triton.jit\ndef _lad2_strided_kernel(\n    x_ptr, y_ptr, o_ptr, n,\n    S0, S1, S2, S3, S4, S5, S6, S7,\n    X0, X1, X2, X3, X4, X5, X6, X7,\n    Y0, Y1, Y2, Y3, Y4, Y5, Y6, Y7,\n    ND: tl.constexpr,\n    BLOCK: tl.constexpr,\n    UNROLL: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    for t in tl.static_range(UNROLL):\n        od = pid * (BLOCK * UNROLL) + t * BLOCK + tl.arange(0, BLOCK)\n        mask = od < n\n        rem = od\n        xoff = tl.zeros([BLOCK], dtype=tl.int64)\n        yoff = tl.zeros([BLOCK], dtype=tl.int64)\n        # Minor-to-major index decomposition.  This backend's frontend cannot\n        # subscript a tuple of runtime scalars, so the per-axis metadata is\n        # selected with trace-time branches instead.\n        for k in tl.static_range(ND):\n            if ND - 1 - k == 0:\n                idx = (rem % S0).to(tl.int64)\n                rem = rem // S0\n                xoff += idx * X0\n                yoff += idx * Y0\n            elif ND - 1 - k == 1:\n                idx = (rem % S1).to(tl.int64)\n                rem = rem // S1\n                xoff += idx * X1\n                yoff += idx * Y1\n            elif ND - 1 - k == 2:\n                idx = (rem % S2).to(tl.int64)\n                rem = rem // S2\n                xoff += idx * X2\n                yoff += idx * Y2\n            elif ND - 1 - k == 3:\n                idx = (rem % S3).to(tl.int64)\n                rem = rem // S3\n                xoff += idx * X3\n                yoff += idx * Y3\n            elif ND - 1 - k == 4:\n                idx = (rem % S4).to(tl.int64)\n                rem = rem // S4\n                xoff += idx * X4\n                yoff += idx * Y4\n            elif ND - 1 - k == 5:\n                idx = (rem % S5).to(tl.int64)\n                rem = rem // S5\n                xoff += idx * X5\n                yoff += idx * Y5\n            elif ND - 1 - k == 6:\n                idx = (rem % S6).to(tl.int64)\n                rem = rem // S6\n                xoff += idx * X6\n                yoff += idx * Y6\n            else:\n                idx = (rem % S7).to(tl.int64)\n                rem = rem // S7\n                xoff += idx * X7\n                yoff += idx * Y7\n        x = tl.load(x_ptr + xoff, mask=mask, other=0.0)\n        y = tl.load(y_ptr + yoff, mask=mask, other=0.0)\n        tl.store(o_ptr + od, _lad2_elem(x, y).to(o_ptr.dtype.element_ty), mask=mask)\n\n\ndef _out_dtype(self, other):\n    if self.dtype == other.dtype:\n        return self.dtype\n    return torch.result_type(self, other)\n\n\ndef _broadcast_strides(t, out_shape):\n    \"\"\"Strides of ``t`` seen inside ``out_shape`` (0 for broadcast dims).\"\"\"\n    nd = len(out_shape)\n    off = nd - t.dim()\n    strides = t.stride()\n    res = [0] * nd\n    for i in range(nd):\n        j = i - off\n        if j >= 0 and t.shape[j] != 1:\n            res[i] = strides[j]\n    return res\n\n\ndef _collapse(out_shape, xstrides, ystrides):\n    \"\"\"Merge adjacent dims while every operand stays row-major dense.\n\n    Returns ``[(size, xstride, ystride), ...]`` with the last entry varying\n    fastest; the flat output offset is then ``idx`` in that order.\n    \"\"\"\n    dims = []\n    for i in range(len(out_shape) - 1, -1, -1):\n        size = out_shape[i]\n        if size == 1:\n            continue\n        xs = xstrides[i]\n        ys = ystrides[i]\n        if dims:\n            psize, pxs, pys = dims[-1]\n            x_ok = xs == pxs * psize or (xs == 0 and pxs == 0)\n            y_ok = ys == pys * psize or (ys == 0 and pys == 0)\n            if x_ok and y_ok:\n                dims[-1] = (psize * size, pxs, pys)\n                continue\n        dims.append((size, xs, ys))\n    dims.reverse()\n    return dims\n\n\ndef _plan_prefetch(n, wide):\n    \"\"\"(BLOCK, UNROLL) for the unrolled flat path.\n\n    ``UNROLL`` is chosen so the grid stays near a target program count: the\n    measured optimum for the 16.7M-element shapes is ~1024 programs for fp32\n    and ~512 for 16-bit operands (which have the smaller unified-buffer\n    footprint and tolerate a four-tile unroll at an 8192-wide tile).  A\n    candidate is taken only when it divides the element count exactly, so the\n    unmasked kernel is used; otherwise the ragged sizes keep the one-tile-per\n    -program geometry they were validated with.\n    \"\"\"\n    block = _WIDE_BLOCK if wide else _FLAT_BLOCK\n    block = min(block, max(256, triton.next_power_of_2(n // 8)))\n    block = min(block, triton.next_power_of_2(n))\n    tiles = triton.cdiv(n, block)\n    targets = (_WIDE_TARGET_GRID, _TARGET_GRID) if wide else (_TARGET_GRID,)\n    for target in targets:\n        unroll = triton.next_power_of_2(triton.cdiv(tiles, target))\n        unroll = max(1, min(unroll, _MAX_UNROLL))\n        if n % (block * unroll) == 0:\n            return block, unroll\n    unroll = triton.next_power_of_2(triton.cdiv(tiles, _TARGET_GRID))\n    return block, max(1, min(unroll, _MAX_UNROLL))\n\n\ndef _launch_flat(x, y, out, n, wide):\n    \"\"\"Pick the grid-stride tile loop where it measured fastest, else the\n    unrolled form.  The loop needs an exact tile multiple, so anything ragged\n    keeps the masked unrolled geometry.\"\"\"\n    if wide and n >= _LOOP_SMALL_MIN_N:\n        if n >= _LOOP_MIN_N:\n            block, tiles, stages = _LOOP_BLOCK, _LOOP_TILES, _LOOP_STAGES_BIG\n        else:\n            block, tiles = _LOOP_SMALL_BLOCK, _LOOP_SMALL_TILES\n            stages = _LOOP_STAGES_SMALL\n        chunk = block * tiles\n        grid = n // chunk\n        if n % chunk == 0 and grid <= _MAX_GRID:\n            _lad2_flat_loop[(grid,)](\n                x, y, out, tiles, BLOCK=block, num_stages=stages, num_warps=4\n            )\n            return\n    block, unroll = _plan_prefetch(n, wide)\n    grid = (triton.cdiv(n, block * unroll),)\n    if n % (block * unroll) == 0:\n        _lad2_flat_even[grid](\n            x, y, out, BLOCK=block, UNROLL=unroll, num_warps=4\n        )\n    else:\n        _lad2_flat_masked[grid](\n            x, y, out, n, BLOCK=block, UNROLL=unroll, num_warps=4\n        )\n\n\ndef _launch_strided(x, y, out, n, dims):\n    nd = len(dims)\n    sizes = [d[0] for d in dims] + [1] * (_MAXD - nd)\n    xs = [d[1] for d in dims] + [0] * (_MAXD - nd)\n    ys = [d[2] for d in dims] + [0] * (_MAXD - nd)\n    block = min(_STRIDED_BLOCK, triton.next_power_of_2(n))\n    num_tiles = triton.cdiv(n, block)\n    unroll = 1\n    while triton.cdiv(num_tiles, unroll) > _MAX_GRID and unroll < 1024:\n        unroll *= 2\n    grid = (triton.cdiv(n, block * unroll),)\n    _lad2_strided_kernel[grid](\n        x, y, out, n, *sizes, *xs, *ys,\n        ND=nd, BLOCK=block, UNROLL=unroll, num_warps=4,\n    )\n\n\ndef logaddexp2(self, other):\n    out_shape = torch.broadcast_shapes(self.shape, other.shape)\n    out = torch.empty(out_shape, dtype=_out_dtype(self, other), device=self.device)\n    n = out.numel()\n    if n == 0:\n        return out\n    wide = out.element_size() <= 2\n    if n == 1:\n        _launch_flat(self, other, out, n, wide)\n        return out\n    dims = _collapse(\n        out_shape,\n        _broadcast_strides(self, out_shape),\n        _broadcast_strides(other, out_shape),\n    )\n    if len(dims) == 1 and dims[0][1] == 1 and dims[0][2] == 1:\n        _launch_flat(self, other, out, n, wide)\n    else:\n        _launch_strided(self, other, out, n, dims)\n    return out\n\n\nrun = logaddexp2\n"
+        }
+      ]
+    },
+    "benchmark_fingerprint": "sha256:89e11ee7ae0b4ffca8418502ccf9044e2230a3a653dcae24fc3dd4fb9f797bac",
+    "case_id": "benchmark/test_logaddexp2.py::test_logaddexp2::core::float16::3",
+    "expected_backend": "npu",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "identity": {
+      "solution_sha256": "fe4214c7f3084d5a62e16e37222967aa685000eea6da3c9d07b82def399b04ad",
+      "workload_sha256": "46df0c6b6c76045c5d63df0121131112e1d880c8eb978bb09975f1b4a8f9bfc1"
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "profile_id": "822498211a2343408b57337e462cba85",
+    "created_at": "2026-10-13T09:17:24.267476+00:00",
+    "status": "completed",
+    "backend": "npu",
+    "profiler": "msprof",
+    "device": "npu:0",
+    "hardware": {
+      "target": {
+        "backend": "ascend",
+        "vendor": "huawei",
+        "device": "Ascend910B4-1",
+        "architecture": "dav-c220-cube",
+        "devices": [
+          {
+            "logical_device": "npu:0",
+            "device_id": 0,
+            "name": "Ascend910B4-1",
+            "l2_cache_size": 176160768,
+            "num_sm": 20,
+            "compute_capability": "",
+            "total_memory": 65452113920
+          }
+        ]
+      },
+      "software": {
+        "language": "triton",
+        "language_version": "3.5.1",
+        "compiler": "flagtree",
+        "compiler_version": "0.6.0+ascend.gitc286cba6",
+        "runtime": "cann",
+        "runtime_version": "9.0.0",
+        "driver_version": "25.2.0"
+      },
+      "metadata": {
+        "complete": true,
+        "missing": [],
+        "sources": {
+          "target.backend": "server configuration",
+          "target.vendor": "server configuration",
+          "software.language": "server configuration",
+          "software.compiler": "python package metadata",
+          "software.runtime": "server configuration",
+          "target.device": "device probe",
+          "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+          "software.language_version": "triton module metadata",
+          "software.compiler_version": "python package metadata",
+          "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+          "software.driver_version": "/usr/local/Ascend/driver/version.info"
+        }
+      }
+    },
+    "evaluation_id": "17ddb3e2787c11285829421ae735fd08e385050e63fc26c3a87efeb95c465d53:round-6",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "capabilities": [
+      "performance_counters",
+      "kernel_profile",
+      "pipeline_utilization",
+      "execution_timeline"
+    ],
+    "summary": {
+      "avg_time_us": 116.594,
+      "operation_count": 1,
+      "top_operations": [
+        {
+          "op_name": "_lad2_flat_loop",
+          "op_type": "_lad2_flat_loop",
+          "task_type": "AI_VECTOR_CORE",
+          "measured_invocations": 100,
+          "total_duration_us": 11659.396,
+          "avg_duration_us": 116.594,
+          "min_duration_us": 116.002,
+          "max_duration_us": 123.662,
+          "aicore_time_us": 0.0,
+          "aic_total_cycles": 0.0,
+          "aic_mac_time_us": 0.0,
+          "aic_mac_ratio": 0.0,
+          "aic_scalar_time_us": 0.0,
+          "aic_scalar_ratio": 0.0,
+          "aic_mte1_time_us": 0.0,
+          "aic_mte1_ratio": 0.0,
+          "aic_mte2_time_us": 0.0,
+          "aic_mte2_ratio": 0.0,
+          "aic_fixpipe_time_us": 0.0,
+          "aic_fixpipe_ratio": 0.0,
+          "aic_icache_miss_rate": 0.0,
+          "aiv_time_us": 115.1156,
+          "aiv_total_cycles": 7480737.88,
+          "aiv_vec_time_us": 102.7063,
+          "aiv_vec_ratio": 0.8922,
+          "aiv_scalar_time_us": 7.2477,
+          "aiv_scalar_ratio": 0.0629,
+          "aiv_mte2_time_us": 23.6431,
+          "aiv_mte2_ratio": 0.2053,
+          "aiv_mte3_time_us": 10.0791,
+          "aiv_mte3_ratio": 0.0876,
+          "aiv_icache_miss_rate": 0.0,
+          "cube_utilization_pct": 0.0
+        }
+      ],
+      "stage_count": 1
+    },
+    "metrics": {
+      "avg_time_us": 116.594,
+      "ops": [
+        {
+          "op_name": "_lad2_flat_loop",
+          "op_type": "_lad2_flat_loop",
+          "task_type": "AI_VECTOR_CORE",
+          "measured_invocations": 100,
+          "total_duration_us": 11659.396,
+          "avg_duration_us": 116.594,
+          "min_duration_us": 116.002,
+          "max_duration_us": 123.662,
+          "aicore_time_us": 0.0,
+          "aic_total_cycles": 0.0,
+          "aic_mac_time_us": 0.0,
+          "aic_mac_ratio": 0.0,
+          "aic_scalar_time_us": 0.0,
+          "aic_scalar_ratio": 0.0,
+          "aic_mte1_time_us": 0.0,
+          "aic_mte1_ratio": 0.0,
+          "aic_mte2_time_us": 0.0,
+          "aic_mte2_ratio": 0.0,
+          "aic_fixpipe_time_us": 0.0,
+          "aic_fixpipe_ratio": 0.0,
+          "aic_icache_miss_rate": 0.0,
+          "aiv_time_us": 115.1156,
+          "aiv_total_cycles": 7480737.88,
+          "aiv_vec_time_us": 102.7063,
+          "aiv_vec_ratio": 0.8922,
+          "aiv_scalar_time_us": 7.2477,
+          "aiv_scalar_ratio": 0.0629,
+          "aiv_mte2_time_us": 23.6431,
+          "aiv_mte2_ratio": 0.2053,
+          "aiv_mte3_time_us": 10.0791,
+          "aiv_mte3_ratio": 0.0876,
+          "aiv_icache_miss_rate": 0.0,
+          "cube_utilization_pct": 0.0
+        }
+      ]
+    },
+    "artifacts": [
+      {
+        "id": "a001",
+        "kind": "profile_log",
+        "format": "text",
+        "filename": "msprof-base-collection.log",
+        "media_type": "text/plain",
+        "size_bytes": 7045,
+        "download_url": "/profile_artifacts/822498211a2343408b57337e462cba85/a001",
+        "local_path": "/data/hanle/ascend-optimization/runs/20261012-agent/kg-runs/logaddexp2-kg-profile-20261012-agent/stages/optimize/work/.kernelgen/profiles/round-0006/workload-03d2946fb80cfd943e0fb36dcf98e44ffe0834d8fb102015ca5221c3462580a2/37687a2ecc9f44859788baacdfc9d797/msprof-base-collection.log",
+        "download_error": null
+      },
+      {
+        "id": "a002",
+        "kind": "vendor_report",
+        "format": "msprof-tar-gz",
+        "filename": "msprof-report.tar.gz",
+        "media_type": "application/gzip",
+        "size_bytes": 170723,
+        "download_url": "/profile_artifacts/822498211a2343408b57337e462cba85/a002",
+        "local_path": "/data/hanle/ascend-optimization/runs/20261012-agent/kg-runs/logaddexp2-kg-profile-20261012-agent/stages/optimize/work/.kernelgen/profiles/round-0006/workload-03d2946fb80cfd943e0fb36dcf98e44ffe0834d8fb102015ca5221c3462580a2/37687a2ecc9f44859788baacdfc9d797/msprof-report.tar.gz",
+        "download_error": null
+      },
+      {
+        "id": "a003",
+        "kind": "op_summary",
+        "format": "csv",
+        "filename": "op_summary.csv",
+        "media_type": "text/csv",
+        "size_bytes": 39678,
+        "download_url": "/profile_artifacts/822498211a2343408b57337e462cba85/a003",
+        "local_path": "/data/hanle/ascend-optimization/runs/20261012-agent/kg-runs/logaddexp2-kg-profile-20261012-agent/stages/optimize/work/.kernelgen/profiles/round-0006/workload-03d2946fb80cfd943e0fb36dcf98e44ffe0834d8fb102015ca5221c3462580a2/37687a2ecc9f44859788baacdfc9d797/op_summary.csv",
+        "download_error": null
+      },
+      {
+        "id": "a004",
+        "kind": "execution_timeline",
+        "format": "trace-json",
+        "filename": "execution-trace.json",
+        "media_type": "application/json",
+        "size_bytes": 245961,
+        "download_url": "/profile_artifacts/822498211a2343408b57337e462cba85/a004",
+        "local_path": "/data/hanle/ascend-optimization/runs/20261012-agent/kg-runs/logaddexp2-kg-profile-20261012-agent/stages/optimize/work/.kernelgen/profiles/round-0006/workload-03d2946fb80cfd943e0fb36dcf98e44ffe0834d8fb102015ca5221c3462580a2/37687a2ecc9f44859788baacdfc9d797/execution-trace.json",
+        "download_error": null
+      }
+    ],
+    "warnings": [
+      "msprof and simulator timing is diagnostic and is not eval latency"
+    ],
+    "error": null,
+    "workload_uuid": "benchmark/test_logaddexp2.py::test_logaddexp2::core::float16::3"
+  }
+}

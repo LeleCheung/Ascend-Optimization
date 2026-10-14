@@ -120,6 +120,27 @@ def workload_model(operator: str, axes: dict) -> dict:
                     "m": m, "n": n, "k": k, "flops": 2 * m * n * k,
                     "logical_bytes": (m * k + k * n + math.prod(bias) + m * n) * element_bytes,
                     "note": "FLOPs 仅计矩阵乘，FMA 计两次；逻辑字节按输入各读一次与输出写一次，不含 tile 重读。"}
+        elif operator in {"logaddexp2", "acosh", "add_relu"}:
+            unary = operator == "acosh"
+            rhs = dims if unary else shape(detail[1])
+            if not unary:
+                padded_left = [1] * max(0, len(rhs) - len(dims)) + dims
+                padded_right = [1] * max(0, len(dims) - len(rhs)) + rhs
+                if any(a != b and a != 1 and b != 1 for a, b in zip(padded_left, padded_right)):
+                    return unavailable
+                output_dims = [max(a, b) for a, b in zip(padded_left, padded_right)]
+            else:
+                output_dims = dims
+            outputs = math.prod(output_dims)
+            semantics = {"logaddexp2": "逐元素 log2(2^x+2^y)，需数值稳定与 NaN/Inf 处理",
+                         "acosh": "逐元素反双曲余弦，需定义域与大值稳定性",
+                         "add_relu": "逐元素加法与 ReLU 融合，需保留 alpha"}
+            data = {"semantic": semantics[operator], "compute_path": "AIV Vector",
+                    "input_elements": inputs + (0 if unary else math.prod(rhs)),
+                    "output_elements": outputs, "output_shape": output_dims,
+                    "flops": None,
+                    "logical_bytes": (inputs + (0 if unary else math.prod(rhs)) + outputs) * element_bytes,
+                    "note": "按独立输入各读一次和输出写一次估计逻辑字节；广播重读、临时张量与超越函数指令另计，不把 exp/log 当作一条普通 FLOP。"}
         elif operator == "narrow_copy":
             axis, start, length = detail[1:4]
             if (type(axis) is not int or not -len(dims) <= axis < len(dims)
@@ -162,6 +183,24 @@ def diagnose(case: dict) -> dict:
                 "falsifier": "分项 host 测量没有可重复差距，或完整评测未改善。"}
     aic_mte2 = metrics.get("aic_mte2_ratio")
     aic_scalar = metrics.get("aic_scalar_ratio")
+    if case.get("operator") in {"logaddexp2", "acosh", "add_relu"}:
+        vec = metrics.get("aiv_vec_ratio")
+        scalar = metrics.get("aiv_scalar_ratio")
+        if isinstance(vec, (int, float)) and vec >= 0.7:
+            return {"bound": "pointwise_vector_pipeline", "confidence": "medium",
+                    "inference": f"逐元素 kernel 的 Vector 活跃比例为 {vec:.1%}，优先检查 exp/log/sqrt 指令、类型转换和临时向量。",
+                    "next_experiment": "按 dtype 与形状分流，比较稳定公式与本机可用指令；保持 NaN/Inf、广播和 stride 语义，完整复验。",
+                    "falsifier": "指令减少后设备延迟未改善，或任一正确性用例失败。"}
+        if isinstance(mte2, (int, float)) and mte2 >= 0.7:
+            return {"bound": "pointwise_data_pipeline", "confidence": "medium",
+                    "inference": f"逐元素 kernel 的 MTE2 活跃比例为 {mte2:.1%}，优先检查连续搬运、块大小与重复读写。该比例不等于实测 HBM 带宽。",
+                    "next_experiment": "为连续输入加入快路径并改变每 program 元素数或块数量，保持非连续 fallback；完整复验所有形状。",
+                    "falsifier": "搬运或分块变化没有降低正式延迟，或 UB 使用增加导致编译失败。"}
+        if isinstance(scalar, (int, float)) and scalar >= 0.5:
+            return {"bound": "pointwise_control_pipeline", "confidence": "medium",
+                    "inference": f"逐元素 kernel 的 Scalar 活跃比例为 {scalar:.1%}，优先检查动态广播、地址计算与 program 覆盖。",
+                    "next_experiment": "连续输入绕过动态 stride 索引；小输入调整核覆盖，大输入合并多块，完整复验。",
+                    "falsifier": "地址计算减少没有伴随设备延迟改善，或破坏广播/stride 正确性。"}
     if case.get("operator") == "amin":
         vec = metrics.get("aiv_vec_ratio")
         scalar = metrics.get("aiv_scalar_ratio")
@@ -335,8 +374,12 @@ def render(report: dict) -> str:
         model = case["workload_model"]
         if model.get("status") != "algorithm_estimate":
             continue
-        work = (f"min 比较 {model['minimum_comparisons']}" if model.get("flops") is None
-                else str(model["flops"]))
+        if model.get('minimum_comparisons') is not None:
+            work = f"min 比较 {model['minimum_comparisons']}"
+        elif model.get('flops') is not None:
+            work = str(model['flops'])
+        else:
+            work = '未换算 FLOPs（超越函数/逐元素语义）'
         lines.append(f"| {'/'.join(case['case_id'].split('::')[-2:])} | {model['semantic']} | {model['logical_bytes']} | {work} |")
     lines.extend(["", "## 逐 case 判断", ""])
     for case in report["cases"]:

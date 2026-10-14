@@ -1,0 +1,33 @@
+{
+  "api_version": "v6.2",
+  "binding": {
+    "catalog_name": "flaggems-adapter-definitions",
+    "definition": "logaddexp2"
+  },
+  "implementation": {
+    "name": "logaddexp2-trial-1",
+    "definition": "logaddexp2",
+    "language": "triton",
+    "entrypoint": "main.py::run",
+    "sources": [
+      {
+        "path": "main.py",
+        "content": "# Copyright 2026 FlagOS Contributors\n# SPDX-License-Identifier: Apache-2.0\n\"\"\"logaddexp2：保留通用广播回退；连续同形输入走无掩码、带流水循环的 AIV 向量核。\n\n相对上一版最佳候选的三处改动（仅限连续同形快速路径）：\n1) grid 收敛：大 shape 不再“每 program 只跑 1 个 tile”，让每个 program 有 4~8 次循环迭代；\n2) n 整除 BLOCK 时走 EVEN 常量分支，逐 tile 去掉掩码比较与谓词访存；\n3) 数值公式改用基底 2 内建 exp2/log2，去掉两次显式缩放乘法，缩短 FP32 临时量存活区间。\n\n非连续 / 广播 / 类型提升 / 非整除尾块仍走原通用路径与带掩码分支，语义不变。\n\"\"\"\nimport torch\nimport triton\nimport triton.language as tl\nfrom flag_gems.utils import pointwise_dynamic\n\n\n@pointwise_dynamic(is_tensor=[True, True], promotion_methods=[(0, 1, \"DEFAULT\")])\n@triton.jit\ndef logaddexp2_general(x, y):\n    xf = x.to(tl.float32)\n    yf = y.to(tl.float32)\n    m = tl.maximum(xf, yf)\n    d = xf - yf\n    r = m + tl.log2(1.0 + tl.exp2(-tl.abs(d)))\n    r = tl.where(d != d, m, r)\n    return tl.where((xf != xf) | (yf != yf), float(\"nan\"), r)\n\n\n@triton.jit\ndef logaddexp2_bounded_kernel(X, Y, O, n, BLOCK: tl.constexpr, EVEN: tl.constexpr):\n    start = tl.program_id(0) * BLOCK\n    step = tl.num_programs(0) * BLOCK\n    for base in tl.range(start, n, step):\n        offsets = base + tl.arange(0, BLOCK)\n        if EVEN:\n            xf = tl.load(X + offsets).to(tl.float32)\n            yf = tl.load(Y + offsets).to(tl.float32)\n        else:\n            mask = offsets < n\n            xf = tl.load(X + offsets, mask=mask, other=0.0).to(tl.float32)\n            yf = tl.load(Y + offsets, mask=mask, other=0.0).to(tl.float32)\n        m = tl.maximum(xf, yf)\n        d = xf - yf\n        r = m + tl.log2(1.0 + tl.exp2(-tl.abs(d)))\n        r = tl.where(d != d, m, r)\n        r = tl.where((xf != xf) | (yf != yf), float(\"nan\"), r)\n        rc = r.to(O.dtype.element_ty)\n        if EVEN:\n            tl.store(O + offsets, rc)\n        else:\n            tl.store(O + offsets, rc, mask=mask)\n\n\ndef run(self, other):\n    if (isinstance(self, torch.Tensor) and isinstance(other, torch.Tensor)\n            and self.dtype == other.dtype and self.dtype in (torch.float16, torch.bfloat16, torch.float32)\n            and self.shape == other.shape and self.device == other.device\n            and self.is_contiguous() and other.is_contiguous()\n            and self.numel() < (1 << 31)):\n        out = torch.empty_like(self)\n        n = self.numel()\n        if n:\n            if n <= 65536:\n                block = 256\n                grid = triton.cdiv(n, block)\n            else:\n                block = 4096\n                tiles = triton.cdiv(n, block)\n                # 至少保留 1024 个 program（并行度）并封顶 4096；\n                # 大 shape 让每个 program 迭代 4~8 次以复用循环流水，\n                # 与 1G case 已经体现出的更优“每元素耗时”保持一致。\n                grid = min(tiles, 4096, max(1024, tiles // 8))\n            logaddexp2_bounded_kernel[(grid,)](\n                self, other, out, n, BLOCK=block, EVEN=(n % block == 0))\n        return out\n    return logaddexp2_general(self, other)\n"
+      }
+    ]
+  },
+  "benchmark_fingerprint": "sha256:89e11ee7ae0b4ffca8418502ccf9044e2230a3a653dcae24fc3dd4fb9f797bac",
+  "case_id": "benchmark/test_logaddexp2.py::test_logaddexp2::core::float16::2",
+  "expected_backend": "npu",
+  "options": {
+    "level": "metrics",
+    "warmup": 1,
+    "iterations": 2,
+    "timeout_sec": 900,
+    "backend_options": {
+      "npu": {
+        "aic_metrics": "PipeUtilization"
+      }
+    }
+  }
+}

@@ -43,6 +43,14 @@ class EvidenceWorkflowTest(unittest.TestCase):
         self.assertEqual(small["diagnosis"]["bound"], "host_or_launch_hypothesis")
         self.assertEqual(large["diagnosis"]["bound"], "inconclusive")
 
+    def test_transcendental_workload_can_render_without_fake_flops(self):
+        report = workflow.analyze(*self.inputs(self.small()))
+        report['cases'][0]['workload_model'] = workflow.workload_model('acosh', {
+            'dtype': 'float32', 'shape_detail': [[1024, 1024]]})
+        text = workflow.render(report)
+        self.assertIn('反双曲余弦', text)
+        self.assertIn('未换算 FLOPs', text)
+
     def test_changed_profile_source_is_rejected(self):
         with tempfile.TemporaryDirectory() as folder:
             request = workflow.read_json(self.small()[1])
@@ -88,6 +96,19 @@ class KernelSelectionTest(unittest.TestCase):
 
 
 class SemanticModelTest(unittest.TestCase):
+    def test_pointwise_broadcast_work_and_vector_diagnosis(self):
+        model = workflow.workload_model('logaddexp2', {
+            'dtype': 'float32', 'shape_detail': [[8, 1], [1, 16]]})
+        self.assertEqual(model['output_elements'], 128)
+        self.assertEqual(model['logical_bytes'], (8 + 16 + 128) * 4)
+        self.assertIsNone(model['flops'])
+        self.assertFalse(model['roofline_usable'])
+        self.assertEqual(workflow.workload_model('logaddexp2', {
+            'dtype': 'float32', 'shape_detail': [[8, 3], [2, 3]]})['status'], 'unavailable')
+        case = {'operator': 'logaddexp2', 'walltime': {'candidate_us': 50},
+                'timing_scope': 'device_kernel', 'metrics': {'aiv_vec_ratio': 0.9}}
+        self.assertEqual(workflow.diagnose(case)['bound'], 'pointwise_vector_pipeline')
+
     def test_amin_actual_middle_axis_contract(self):
         axes = {"dtype": "bfloat16", "shape_detail": [[1024, 1024, 1024], 1]}
         model = workflow.workload_model("amin", axes)

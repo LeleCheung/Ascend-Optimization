@@ -1,0 +1,25 @@
+{
+  "api_version": "v6.2",
+  "binding": {
+    "catalog_name": "flaggems-adapter-definitions",
+    "definition": "logaddexp2"
+  },
+  "implementation": {
+    "name": "logaddexp2-seed-1",
+    "definition": "logaddexp2",
+    "language": "triton",
+    "entrypoint": "main.py::run",
+    "sources": [
+      {
+        "path": "main.py",
+        "content": "# Copyright 2026 FlagOS Contributors\n# SPDX-License-Identifier: Apache-2.0\n\"\"\"基于独立Agent扁平候选修复编译常量与超限网格，保留通用回退。\"\"\"\nimport torch\nimport triton\nimport triton.language as tl\nfrom flag_gems.utils import pointwise_dynamic\n\n\n@pointwise_dynamic(is_tensor=[True, True], promotion_methods=[(0, 1, \"DEFAULT\")])\n@triton.jit\ndef logaddexp2_general(x, y):\n    xf = x.to(tl.float32)\n    yf = y.to(tl.float32)\n    m = tl.maximum(xf, yf)\n    d = xf - yf\n    r = m + tl.log2(1.0 + tl.exp2(-tl.abs(d)))\n    r = tl.where(d != d, m, r)\n    return tl.where((xf != xf) | (yf != yf), float(\"nan\"), r)\n\n\n@triton.jit\ndef logaddexp2_bounded_kernel(X, Y, O, n, BLOCK: tl.constexpr):\n    start = tl.program_id(0) * BLOCK\n    step = tl.num_programs(0) * BLOCK\n    for base in tl.range(start, n, step):\n        offsets = base + tl.arange(0, BLOCK)\n        mask = offsets < n\n        xf = tl.load(X + offsets, mask=mask, other=0).to(tl.float32)\n        yf = tl.load(Y + offsets, mask=mask, other=0).to(tl.float32)\n        m = tl.maximum(xf, yf)\n        d = xf - yf\n        r = m + tl.log(1.0 + tl.exp(-tl.abs(d) * 0.6931471805599453)) * 1.4426950408889634\n        r = tl.where(d != d, m, r)\n        r = tl.where((xf != xf) | (yf != yf), float(\"nan\"), r)\n        tl.store(O + offsets, r.to(O.dtype.element_ty), mask=mask)\n\n\ndef run(self, other):\n    if (isinstance(self, torch.Tensor) and isinstance(other, torch.Tensor)\n            and self.dtype == other.dtype and self.dtype in (torch.float16, torch.bfloat16, torch.float32)\n            and self.shape == other.shape and self.device == other.device\n            and self.is_contiguous() and other.is_contiguous()\n            and self.numel() < (1 << 31)):\n        out = torch.empty_like(self)\n        n = self.numel()\n        if n:\n            block = 256 if n <= 65536 else 4096\n            grid = min(triton.cdiv(n, block), 4096)\n            logaddexp2_bounded_kernel[(grid,)](self, other, out, n, BLOCK=block)\n        return out\n    return logaddexp2_general(self, other)\n"
+      }
+    ]
+  },
+  "settings": {
+    "warmup_ms": 1000,
+    "benchmark_ms": 100,
+    "num_trials": 3,
+    "timeout_seconds": 1800
+  }
+}

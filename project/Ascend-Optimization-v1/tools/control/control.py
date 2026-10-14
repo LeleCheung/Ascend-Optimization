@@ -14,7 +14,7 @@ from pathlib import Path, PurePosixPath
 
 PROJECT = Path(__file__).resolve().parents[2]
 REPO = PROJECT.parents[1]
-OPERATORS = ('amin', 'matmul_bias_activation', 'narrow_copy')
+OPERATORS = ('amin', 'matmul_bias_activation', 'narrow_copy', 'logaddexp2', 'acosh', 'add_relu')
 MAX_BYTES = 256 * 1024 * 1024
 DERIVED = {'最终候选.json', '精简汇报.md', '真机诊断.md',
            '版本对比.md', '版本对比.json', '版本对比.csv'}
@@ -27,7 +27,9 @@ def ssh_command(host, command):
 
 
 def remote_python(host, parameters, script):
-    payload = 'parameters = ' + repr(parameters) + '\n' + script
+    marker = b'CONTROL_PYTHON_STARTED\n'
+    payload = ("import sys\nsys.stderr.write('CONTROL_PYTHON_STARTED\\n')\nsys.stderr.flush()\n"
+               + 'parameters = ' + repr(parameters) + '\n' + script)
     result = subprocess.run(ssh_command(host, 'python3 -'),
                             input=payload.encode('utf-8'), capture_output=True)
     if result.returncode:
@@ -35,6 +37,9 @@ def remote_python(host, parameters, script):
         raise RuntimeError('远端命令失败，退出码 ' + str(result.returncode))
     if result.stdout.strip() == b'no available gateway':
         raise RuntimeError('堡垒机返回 no available gateway，未进入目标服务器')
+    if marker not in result.stderr:
+        detail = result.stdout.decode('utf-8', errors='replace').strip()
+        raise RuntimeError('目标Python未确认启动，远端操作未获得回执：' + detail)
     return result.stdout
 
 
@@ -71,9 +76,11 @@ root=Path(parameters['root']).resolve()
 project=root/'Ascend-Optimization/project/Ascend-Optimization-v1'
 batch_root=root/'runs'/parameters['batch']
 if not batch_root.is_dir():batch_root=root
-rows={'root':str(root),'sessions':[],'runs':[],'logs':[],'services':[],'results':[]}
+rows={'root':str(root),'sessions':[],'runs':[],'logs':[],'services':[],'results':[],'campaigns':[]}
 tmux=subprocess.run(['tmux','list-sessions','-F','#{session_name}'],capture_output=True,text=True)
-rows['sessions']=[s for s in tmux.stdout.splitlines() if s.endswith(parameters['batch'])]
+session_suffix=parameters['batch'][:-6] if parameters['batch'].endswith('-agent') else parameters['batch']
+rows['sessions']=[s for s in tmux.stdout.splitlines() if s.endswith(parameters['batch'])
+                  or s.endswith(session_suffix) or s.startswith(('hanle-kgs-', 'profiling-'))]
 for f in sorted((batch_root/'kg-runs').glob('*/.kernelgen/run-progress.json')):
  if parameters['batch'] not in f.parents[1].name:continue
  d=json.loads(f.read_text());rows['runs'].append({'workspace':f.parents[1].name,
@@ -82,6 +89,11 @@ for f in sorted((batch_root/'campaign-logs').glob('*.log')):
  lines=f.read_text(errors='replace').splitlines()
  rows['logs'].append({'name':f.name,'last_line':lines[-1][:600] if lines else ''})
 for op in parameters['operators']:
+ for f in sorted((project/'operators'/op/'reports').glob('*/campaign-state.json')):
+  if parameters['batch'] not in f.parent.name:continue
+  d=json.loads(f.read_text());rows['campaigns'].append({'operator':op,
+   **{k:d.get(k) for k in ('status','stage','current_round','best','final_scores','current_error')},
+   'rounds':[{k:r.get(k) for k in ('round','status','score','accepted','error')} for r in d.get('history',[])]})
  for f in sorted((project/'operators'/op/'reports').glob('**/*.result.json')):
   if parameters['batch'] not in f.relative_to(project).as_posix():continue
   d=json.loads(f.read_text());rows['results'].append({'path':str(f.relative_to(project)),
@@ -131,6 +143,19 @@ batch_root=root/'runs'/parameters['batch']
 if not batch_root.is_dir():batch_root=root
 assert project.is_dir(),project
 selected={}
+campaigns={}
+def unfinished_campaign(f,directory):
+ for parent in (f.parent,)+tuple(f.parents):
+  if parent==directory.parent:break
+  state=parent/'campaign-state.json'
+  if not state.is_file():continue
+  key=str(state)
+  if key not in campaigns:
+   stopped=parent/'interruption.json'
+   archived_stop=stopped.is_file() and json.loads(stopped.read_text()).get('status')=='stopped'
+   campaigns[key]=json.loads(state.read_text()).get('status')!='completed' and not archived_stop
+  return campaigns[key]
+ return False
 def collect(directory,prefix,filter_batch=False):
  if not directory.is_dir():return
  for f in sorted(directory.rglob('*')):
@@ -138,12 +163,19 @@ def collect(directory,prefix,filter_batch=False):
   f.resolve().relative_to(directory.resolve())
   name=f.relative_to(directory).as_posix()
   if filter_batch and parameters['batch'] not in name:continue
+  if unfinished_campaign(f,directory):continue
   if f.suffix=='.log' and not any(s in f.parts for s in ('artifacts','native-evidence','startup-failure')):continue
   selected.setdefault(prefix+name,f)
 for op in parameters['operators']:
  directory=project/'operators'/op
  collect(directory/'candidates','operators/'+op+'/candidates/',True)
  collect(directory/'reports','operators/'+op+'/reports/',True)
+ index=directory/'README.md'
+ if index.is_file() and not index.is_symlink() and parameters['batch'] in index.read_text():
+  selected.setdefault('operators/'+op+'/README.md',index)
+selection=project/'operators'/('next-operator-screen-'+parameters['batch']+'.json')
+if selection.is_file() and not selection.is_symlink():
+ selected.setdefault('operators/'+selection.name,selection)
 for d in sorted((batch_root/'diagnostics').glob('*')):
  if not d.is_dir() or parameters['batch'] not in d.name:continue
  op=('amin' if d.name.startswith('amin-') else 'matmul_bias_activation' if d.name.startswith('matmul-')
@@ -166,9 +198,12 @@ def download_actions(data, project, operators, batch, replace_derived=False):
     with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as archive:
         for member in archive:
             parts = relative_name(member.name).parts
-            if (not member.isfile() or len(parts) < 4 or parts[0] != 'operators'
-                    or parts[1] not in operators or parts[2] not in ('candidates', 'reports')
-                    or batch not in '/'.join(parts[3:]) or member.name in seen):
+            metadata = (parts == ('operators', 'next-operator-screen-' + batch + '.json')
+                        or (len(parts) == 3 and parts[0] == 'operators'
+                            and parts[1] in operators and parts[2] == 'README.md'))
+            evidence = (len(parts) >= 4 and parts[0] == 'operators' and parts[1] in operators
+                        and parts[2] in ('candidates', 'reports') and batch in '/'.join(parts[3:]))
+            if (not member.isfile() or not (metadata or evidence) or member.name in seen):
                 raise ValueError('非法或重复的归档条目：' + member.name)
             seen.add(member.name)
             total += member.size

@@ -2,6 +2,8 @@
 
 验收看板华为列 G611 为 0.5408×，符合低于 0.8× 的筛选条件，因此保留在当前主线。
 
+**2026-10-13最新版本：自动闭环两次完整复验0.908×、0.906×，均42/42，采用0.906×，相对本批固定master为2.08×。** 六轮中采纳第3、5轮，将双N tile复用A扩展到FP32规则方阵，FP32 K分块128、半精度256。源码见[本批最终候选](candidates/profiling-agent-final-20261012-agent.py)，证据与同合同四版本见[本批精简汇报](reports/master-closure-20261012-agent/精简汇报.md)。以下v9及更早记录为历史结果。
+
 **2026-10-12 最新交付：v9 两次完整复验为 0.886×、0.884×，均 42/42 通过，已超过 0.8×。** 当前最终源码为 [双 tile 流水 v9](candidates/profiling-dual-acc-v9-20261012.py)，在双 N tile 复用 A 数据的基础上使用 dot 累加器，并启用 Ascend 多缓冲与流水调度。见 [精简汇报](reports/master-closure-20261012/精简汇报.md)、[同合同四版本对比](reports/master-closure-20261012/版本对比.md)、[两次复验与源码 SHA](reports/master-closure-20261012/最终候选.json)。
 
 以下 v8 和更早成绩为历史记录，保留原始数据。

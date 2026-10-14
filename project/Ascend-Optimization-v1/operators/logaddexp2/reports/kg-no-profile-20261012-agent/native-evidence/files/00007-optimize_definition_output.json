@@ -1,0 +1,466 @@
+{
+  "definition_name": "logaddexp2",
+  "op_type": "",
+  "status": "PASSED",
+  "best_geo_mean": 1.0654028251350924,
+  "best_code": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Self-contained Triton implementation of ``logaddexp2``.\n\n``log2(2**x + 2**y) = m + log2(1 + 2**(-|x - y|))`` with ``m = max(x, y)``.\n\nDesign notes (measured on the target, Ascend 910B):\n  * The bulk of the work runs in a mask-free kernel over the largest multiple of\n    ``BLOCK``; only the ragged remainder (``n % BLOCK``) goes through a masked\n    tail kernel.  Every benchmark shape is a multiple of ``BLOCK``, so the timed\n    path launches a single kernel.\n  * Program count is derived from the work, not from any core count: tiny inputs\n    get one tile per program, mid-size inputs about _MID_ELEMS elements per\n    program, and the largest inputs _TARGET_ITERS tiles per program.  Measured\n    optima: grid ~ 512 for the 2**24 shapes (all three dtypes) and 5461/10922\n    for the 2**30 shapes, which is ~10-30% faster than a single uniform grid.\n  * All math runs in fp32.  Evaluating the formula in the 16-bit element type\n    measured up to 20% faster but is not numerically admissible: the sum\n    ``m + log2(1 + 2**-|x-y|)`` cancels to ~0 (e.g. x = y = -1), where fp16\n    cannot carry the correction to the required absolute accuracy.\n  * The natural spelling ``ln(1 + e**(-|d| ln2)) / ln2`` is written out with the\n    ln2 factors folded into explicit multiplies.  Measured on the math-bound\n    shapes this is 7-18% faster than ``log2(1 + exp2(-|d|))`` because this\n    backend lowers ``exp2``/``log2`` through ``exp``/``ln`` plus an extra\n    scaling multiply, and it is bit-identical to torch.logaddexp2 for fp32 and\n    bf16 inputs.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n_TARGET_ITERS = 24\n_SMALL_ITERS = 48\n_SMALL_N = 1 << 18\n_MID_ELEMS = 1 << 15\n_MID_TILE_LIMIT = 1 << 16\n_LN2 = tl.constexpr(0.6931471805599453)\n_INV_LN2 = tl.constexpr(1.4426950408889634)\n\n\n@triton.jit\ndef _la2_math(x, y):\n    \"\"\"Elementwise logaddexp2 core; NaN/inf semantics match torch.logaddexp2.\"\"\"\n    x_f = x.to(tl.float32)\n    y_f = y.to(tl.float32)\n    m = tl.maximum(x_f, y_f)\n    d = x_f - y_f\n    # log2(2**x + 2**y) = m + ln(1 + e**(-|d| * ln2)) / ln2\n    r = m + tl.log(1.0 + tl.exp(tl.abs(d) * (-_LN2))) * _INV_LN2\n    # `d` is NaN when x and y are equal infinities (inf - inf); the value is m.\n    r = tl.where(d != d, m, r)\n    # Genuine NaN inputs still have to propagate NaN (tl.maximum does not).\n    return tl.where((x_f != x_f) | (y_f != y_f), float(\"nan\"), r)\n\n\n@triton.jit\ndef _la2_main(x_ptr, y_ptr, o_ptr, n, BLOCK: tl.constexpr, WIDE: tl.constexpr):\n    pid = tl.program_id(0)\n    nprog = tl.num_programs(0)\n    if WIDE:\n        n_i = n.to(tl.int64)\n        start = pid.to(tl.int64) * BLOCK\n        step = nprog.to(tl.int64) * BLOCK\n    else:\n        n_i = n\n        start = pid * BLOCK\n        step = nprog * BLOCK\n    ar = tl.arange(0, BLOCK)\n    for off in tl.range(start, n_i, step):\n        offs = off + ar\n        x = tl.load(x_ptr + offs)\n        y = tl.load(y_ptr + offs)\n        tl.store(o_ptr + offs, _la2_math(x, y).to(o_ptr.dtype.element_ty))\n\n\n@triton.jit\ndef _la2_tail(x_ptr, y_ptr, o_ptr, n, start, BLOCK: tl.constexpr,\n              WIDE: tl.constexpr):\n    if WIDE:\n        offs = start.to(tl.int64) + tl.arange(0, BLOCK)\n        n_i = n.to(tl.int64)\n    else:\n        offs = start + tl.arange(0, BLOCK)\n        n_i = n\n    mask = offs < n_i\n    x = tl.load(x_ptr + offs, mask=mask, other=0.0)\n    y = tl.load(y_ptr + offs, mask=mask, other=0.0)\n    tl.store(o_ptr + offs, _la2_math(x, y).to(o_ptr.dtype.element_ty), mask=mask)\n\n\ndef run(self, other):\n    x = self\n    y = other\n    if not isinstance(x, torch.Tensor):\n        x = torch.as_tensor(x, device=y.device)\n    if not isinstance(y, torch.Tensor):\n        y = torch.as_tensor(y, device=x.device)\n\n    shape = torch.broadcast_shapes(x.shape, y.shape)\n    out = torch.empty(shape, dtype=torch.promote_types(x.dtype, y.dtype),\n                      device=x.device)\n    n_elements = out.numel()\n    if n_elements == 0:\n        return out\n\n    if x.shape != shape:\n        x = x.expand(shape)\n    if y.shape != shape:\n        y = y.expand(shape)\n    if not x.is_contiguous():\n        x = x.contiguous()\n    if not y.is_contiguous():\n        y = y.contiguous()\n\n    if n_elements <= _SMALL_N:\n        block = 1024\n    elif out.element_size() >= 4:\n        block = 4096\n    else:\n        block = 8192\n    wide = n_elements >= (1 << 31)\n\n    n_full = (n_elements // block) * block\n    if n_full:\n        tiles = n_full // block\n        if tiles <= _SMALL_ITERS:\n            # Tiny problems: one tile per program.\n            grid = tiles\n        elif tiles < _MID_TILE_LIMIT:\n            # Mid-size: ~_MID_ELEMS elements per program.\n            grid = n_full // _MID_ELEMS\n            if grid < 1:\n                grid = 1\n        else:\n            # Largest: strided loop over _TARGET_ITERS tiles per program.\n            grid = tiles // _TARGET_ITERS\n        _la2_main[(grid,)](x, y, out, n_full, BLOCK=block, WIDE=wide)\n    if n_full != n_elements:\n        _la2_tail[(1,)](x, y, out, n_elements, n_full, BLOCK=block, WIDE=wide)\n    return out\n",
+  "search_best_geo_mean": 1.0694954042506375,
+  "final_verification": {
+    "status": "PASSED",
+    "reason_code": "VERIFIED",
+    "geo_mean": 1.0654028251350924,
+    "measured_geo_mean": 1.0654028251350924,
+    "comparisons": [
+      {
+        "uuid": "benchmark/test_logaddexp2.py::test_logaddexp2::core::float16::0",
+        "axes": {
+          "dtype": "float16",
+          "shape_detail": [
+            [
+              1073741824
+            ],
+            [
+              1073741824
+            ]
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 7.188944666666667,
+          "latency_ms": 9.358168666666666
+        },
+        "after": {
+          "reference_latency_ms": 7.172019333333333,
+          "latency_ms": 9.368484666666665
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9976456442331776,
+          "latency_ms": 1.0011023524332003
+        }
+      },
+      {
+        "uuid": "benchmark/test_logaddexp2.py::test_logaddexp2::core::float16::1",
+        "axes": {
+          "dtype": "float16",
+          "shape_detail": [
+            [
+              64,
+              64
+            ],
+            [
+              64,
+              64
+            ]
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.0020566666666666667,
+          "latency_ms": 0.0016573333333333334
+        },
+        "after": {
+          "reference_latency_ms": 0.002066,
+          "latency_ms": 0.0016466666666666667
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0045380875202594,
+          "latency_ms": 0.9935639581657281
+        }
+      },
+      {
+        "uuid": "benchmark/test_logaddexp2.py::test_logaddexp2::core::float16::2",
+        "axes": {
+          "dtype": "float16",
+          "shape_detail": [
+            [
+              4096,
+              4096
+            ],
+            [
+              4096,
+              4096
+            ]
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.096522,
+          "latency_ms": 0.14460733333333334
+        },
+        "after": {
+          "reference_latency_ms": 0.095072,
+          "latency_ms": 0.14366933333333334
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9849775180787801,
+          "latency_ms": 0.9935134686576522
+        }
+      },
+      {
+        "uuid": "benchmark/test_logaddexp2.py::test_logaddexp2::core::float16::3",
+        "axes": {
+          "dtype": "float16",
+          "shape_detail": [
+            [
+              64,
+              512,
+              512
+            ],
+            [
+              64,
+              512,
+              512
+            ]
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.09842266666666667,
+          "latency_ms": 0.14516466666666666
+        },
+        "after": {
+          "reference_latency_ms": 0.09443533333333333,
+          "latency_ms": 0.14316533333333334
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9594876518959047,
+          "latency_ms": 0.9862271351614489
+        }
+      },
+      {
+        "uuid": "benchmark/test_logaddexp2.py::test_logaddexp2::core::float16::4",
+        "axes": {
+          "dtype": "float16",
+          "shape_detail": [
+            [
+              1024,
+              1024,
+              1024
+            ],
+            [
+              1024,
+              1024,
+              1024
+            ]
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 7.189428,
+          "latency_ms": 9.362721333333335
+        },
+        "after": {
+          "reference_latency_ms": 7.173231333333333,
+          "latency_ms": 9.367068
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9977471550356068,
+          "latency_ms": 1.0004642524872753
+        }
+      },
+      {
+        "uuid": "benchmark/test_logaddexp2.py::test_logaddexp2::core::float32::0",
+        "axes": {
+          "dtype": "float32",
+          "shape_detail": [
+            [
+              1073741824
+            ],
+            [
+              1073741824
+            ]
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 15.314523333333334,
+          "latency_ms": 12.809819333333333
+        },
+        "after": {
+          "reference_latency_ms": 15.323492,
+          "latency_ms": 12.758135333333334
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0005856314605068,
+          "latency_ms": 0.9959652826745566
+        }
+      },
+      {
+        "uuid": "benchmark/test_logaddexp2.py::test_logaddexp2::core::float32::1",
+        "axes": {
+          "dtype": "float32",
+          "shape_detail": [
+            [
+              64,
+              64
+            ],
+            [
+              64,
+              64
+            ]
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.0018886666666666667,
+          "latency_ms": 0.00161
+        },
+        "after": {
+          "reference_latency_ms": 0.0018586666666666667,
+          "latency_ms": 0.0016026666666666667
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9841157783268619,
+          "latency_ms": 0.9954451345755694
+        }
+      },
+      {
+        "uuid": "benchmark/test_logaddexp2.py::test_logaddexp2::core::float32::2",
+        "axes": {
+          "dtype": "float32",
+          "shape_detail": [
+            [
+              4096,
+              4096
+            ],
+            [
+              4096,
+              4096
+            ]
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.23302,
+          "latency_ms": 0.195294
+        },
+        "after": {
+          "reference_latency_ms": 0.23102266666666665,
+          "latency_ms": 0.195292
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9914284896861499,
+          "latency_ms": 0.9999897590299753
+        }
+      },
+      {
+        "uuid": "benchmark/test_logaddexp2.py::test_logaddexp2::core::float32::3",
+        "axes": {
+          "dtype": "float32",
+          "shape_detail": [
+            [
+              64,
+              512,
+              512
+            ],
+            [
+              64,
+              512,
+              512
+            ]
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.23097066666666666,
+          "latency_ms": 0.195612
+        },
+        "after": {
+          "reference_latency_ms": 0.23141066666666665,
+          "latency_ms": 0.19690266666666667
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0019050038100077,
+          "latency_ms": 1.0065980955496936
+        }
+      },
+      {
+        "uuid": "benchmark/test_logaddexp2.py::test_logaddexp2::core::float32::4",
+        "axes": {
+          "dtype": "float32",
+          "shape_detail": [
+            [
+              1024,
+              1024,
+              1024
+            ],
+            [
+              1024,
+              1024,
+              1024
+            ]
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 15.308542,
+          "latency_ms": 12.836041333333334
+        },
+        "after": {
+          "reference_latency_ms": 15.329298,
+          "latency_ms": 12.822458
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0013558443384092,
+          "latency_ms": 0.9989417817393544
+        }
+      },
+      {
+        "uuid": "benchmark/test_logaddexp2.py::test_logaddexp2::core::bfloat16::0",
+        "axes": {
+          "dtype": "bfloat16",
+          "shape_detail": [
+            [
+              1073741824
+            ],
+            [
+              1073741824
+            ]
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 12.444478666666667,
+          "latency_ms": 9.372704
+        },
+        "after": {
+          "reference_latency_ms": 12.460221333333333,
+          "latency_ms": 9.369617333333334
+        },
+        "ratios": {
+          "reference_latency_ms": 1.001265032235447,
+          "latency_ms": 0.9996706749016435
+        }
+      },
+      {
+        "uuid": "benchmark/test_logaddexp2.py::test_logaddexp2::core::bfloat16::1",
+        "axes": {
+          "dtype": "bfloat16",
+          "shape_detail": [
+            [
+              64,
+              64
+            ],
+            [
+              64,
+              64
+            ]
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.0019526666666666668,
+          "latency_ms": 0.0016546666666666667
+        },
+        "after": {
+          "reference_latency_ms": 0.001956,
+          "latency_ms": 0.0016686666666666668
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0017070672584498,
+          "latency_ms": 1.008460918614021
+        }
+      },
+      {
+        "uuid": "benchmark/test_logaddexp2.py::test_logaddexp2::core::bfloat16::2",
+        "axes": {
+          "dtype": "bfloat16",
+          "shape_detail": [
+            [
+              4096,
+              4096
+            ],
+            [
+              4096,
+              4096
+            ]
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.18818933333333335,
+          "latency_ms": 0.14512466666666665
+        },
+        "after": {
+          "reference_latency_ms": 0.186836,
+          "latency_ms": 0.14423266666666665
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9928086607813407,
+          "latency_ms": 0.9938535603871613
+        }
+      },
+      {
+        "uuid": "benchmark/test_logaddexp2.py::test_logaddexp2::core::bfloat16::3",
+        "axes": {
+          "dtype": "bfloat16",
+          "shape_detail": [
+            [
+              64,
+              512,
+              512
+            ],
+            [
+              64,
+              512,
+              512
+            ]
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 0.18911333333333336,
+          "latency_ms": 0.145666
+        },
+        "after": {
+          "reference_latency_ms": 0.1864,
+          "latency_ms": 0.143738
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9856523425106637,
+          "latency_ms": 0.9867642414839428
+        }
+      },
+      {
+        "uuid": "benchmark/test_logaddexp2.py::test_logaddexp2::core::bfloat16::4",
+        "axes": {
+          "dtype": "bfloat16",
+          "shape_detail": [
+            [
+              1024,
+              1024,
+              1024
+            ],
+            [
+              1024,
+              1024,
+              1024
+            ]
+          ],
+          "benchmark_level": "core"
+        },
+        "before": {
+          "reference_latency_ms": 12.46776,
+          "latency_ms": 9.371039333333334
+        },
+        "after": {
+          "reference_latency_ms": 12.458175333333333,
+          "latency_ms": 9.375534
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9992312438909101,
+          "latency_ms": 1.0004796337425113
+        }
+      }
+    ],
+    "drift": [],
+    "drift_factor": 2.0,
+    "compared_to": "original_round",
+    "attempt_path": ".kernelgen/retests/4300343308deaa384fba19c7b15fbd1d079994a97fb3f0ab9bc21a8667853f7e/b50cb765bbd3701d2c4ccba59e0390e4bab8c182571433b1739e636875641746/attempt-0001.json",
+    "round_num": 6,
+    "solution_sha256": "4300343308deaa384fba19c7b15fbd1d079994a97fb3f0ab9bc21a8667853f7e"
+  },
+  "rounds": 6,
+  "summary": "Winning design: a self-contained Triton pointwise kernel with a mask-free main kernel covering whole BLOCK tiles plus a masked tail for the remainder, a size-derived program count (one tile per program when tiny, ~32K elements per program for mid-size inputs, ~24 strided tiles per program for the largest), BLOCK 1024/4096/8192 taken to the UB ceiling, fp32 accumulation for every dtype, and the formula written as m + ln(1 + e**(-|d|*ln2))/ln2 so the ln2 factors fold into the multiplies that this backend otherwise adds inside exp2/log2. Final authoritative result: geo_mean 1.0695x (min speedup 0.667, worst workload fp16 2**24) on all 36 frozen workloads, up from the 0.4302x baseline, with fp32 2**30 1.196x, fp32 2**24 1.193x, bf16 2**30 1.328x, bf16 2**24 1.297x and the tiny shapes 1.17-1.24x. Key lessons: these workloads are bound by vector-instruction count and unified-buffer traffic rather than bytes (all three dtypes took the same time on the 2**24 shapes), so the transcendental spelling (+7-22%) and launch granularity (+10-30%) mattered far more than tiling bytes, and fp16 arithmetic was ruled out because the sum cancels to ~0 (x = y = -1) where the real atol of 1e-4 cannot be met - the vendor's remaining edge on fp16 is exactly that dtype-width advantage.",
+  "workspace": "/data/hanle/ascend-optimization/runs/20261012-agent/kg-runs/logaddexp2-kg-no-profile-20261012-agent/stages/optimize/work"
+}

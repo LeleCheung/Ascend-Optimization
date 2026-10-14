@@ -1,0 +1,25 @@
+{
+  "api_version": "v6.2",
+  "binding": {
+    "catalog_name": "flaggems-adapter-definitions",
+    "definition": "logaddexp2"
+  },
+  "implementation": {
+    "name": "logaddexp2-master-1",
+    "definition": "logaddexp2",
+    "language": "triton",
+    "entrypoint": "main.py::run",
+    "sources": [
+      {
+        "path": "main.py",
+        "content": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\nimport logging\n\nimport triton\nimport triton.language as tl\n\nfrom flag_gems.utils import pointwise_dynamic\n\nlogger = logging.getLogger(__name__)\n\n\n@pointwise_dynamic(is_tensor=[True, True], promotion_methods=[(0, 1, \"DEFAULT\")])\n@triton.jit\ndef logaddexp2_func(x, y):\n    # log2(2**x + 2**y) = m + log2(1 + 2**(-|x - y|)), m = max(x, y)\n    x_f32 = x.to(tl.float32)\n    y_f32 = y.to(tl.float32)\n    m = tl.maximum(x_f32, y_f32)\n    delta = x_f32 - y_f32\n    res = m + tl.log2(1.0 + tl.exp2(-tl.abs(delta)))\n    # `delta` is NaN when x and y are equal infinities (inf - inf); the result\n    # is then m, e.g. logaddexp2(inf, inf) = inf, logaddexp2(-inf, -inf) = -inf.\n    res = tl.where(delta != delta, m, res)\n    # Genuine NaN inputs must still propagate NaN.\n    is_nan = (x_f32 != x_f32) | (y_f32 != y_f32)\n    return tl.where(is_nan, float(\"nan\"), res)\n\n\ndef logaddexp2(self, other):\n    logger.debug(\"GEMS LOGADDEXP2\")\n    return logaddexp2_func(self, other)\n\n\ndef logaddexp2_out(self, other, out):\n    logger.debug(\"GEMS LOGADDEXP2_OUT\")\n    logaddexp2_func(self, other, out0=out)\n    return out\n\n\nrun = logaddexp2\n"
+      }
+    ]
+  },
+  "settings": {
+    "warmup_ms": 1000,
+    "benchmark_ms": 100,
+    "num_trials": 3,
+    "timeout_seconds": 1800
+  }
+}

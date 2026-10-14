@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+from kg_workspace_state import exportable_state
 
 
 def read(path):
@@ -15,10 +16,10 @@ def main():
     parser.add_argument("workspace", type=Path)
     parser.add_argument("operator")
     parser.add_argument("output", type=Path)
+    parser.add_argument('--allow-review-waiting', action='store_true',
+                        help='仅在优化完成且worker退出时导出，保留原生审核等待状态')
     args = parser.parse_args()
-    progress = read(args.workspace / ".kernelgen/run-progress.json")
-    if progress.get("state") not in {"SUCCEEDED", "FAILED", "CANCELLED"}:
-        parser.error("KG 工作区尚未结束，不能导出最终候选")
+    workspace_state = exportable_state(args.workspace, args.allow_review_waiting)
     candidates = []
     for directory in sorted(args.workspace.glob("stages/optimize/work/.kernelgen/evals/round-*")):
         result_path = directory / "result.json"
@@ -52,7 +53,7 @@ def main():
         if path.is_file():
             (args.output / name).write_bytes(path.read_bytes())
     provenance = {"operator": args.operator, "workspace": str(args.workspace),
-                  "workspace_state": progress["state"], "round": directory.name,
+                  "workspace_state": workspace_state, "round": directory.name,
                   "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
                   "benchmark_fingerprint": identity.get("benchmark_fingerprint"),
                   "geo_mean": score,

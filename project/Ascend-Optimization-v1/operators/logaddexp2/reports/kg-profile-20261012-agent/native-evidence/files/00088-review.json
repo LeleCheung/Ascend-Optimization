@@ -1,0 +1,49 @@
+{
+  "subject_sha256": "b644045236cf2c45231b39439052eda41302067036d40506de94072c19487cc6",
+  "policy": "advisory",
+  "summary": "Reviewed the code-stage candidate for `logaddexp2`: `.best_kernel.py` (== `best_code` in optimize_definition_output.json, subject_sha256 b6440452... matching the recorded `solution_sha256`), against the supplied Catalog Definition, the pinned benchmark reference and the ledger. The candidate exposes the declared ABI (`logaddexp2(self, other) -> out`, `run = logaddexp2`), allocates a fresh output and never mutates or aliases the inputs (consistent with `effects.mutates=[]`), imports only `torch`, `triton`, `tl`, contains no `torch.ops`/reference fallback, no dispatcher registration or monkey patch, no host synchronization (`.item()/.cpu()` absent), no environment mutation, and no test-input-conditional computation. The element function `m + ln(1 + 2**-|x-y|)*log2(e)` with `m = max(x, y)` in operand dtype, fp32 correction and single cast-back is mathematically faithful, and the clamp `t = where(t <= 200.0, t, 200.0)` reproduces the intended NaN/equal-infinity behaviour (NaN |d| -> zero correction; NaN operands still propagate via `tl.maximum(..., PropagateNan.ALL)`). The measurement evidence is consistent and complete: `benchmark-reference.json` (phase=timing, status=PASSED) and `evaluation-contract.json` share `benchmark_fingerprint sha256:89e11ee7...`, the 15 core timing records match the Definition's workload set, and the ledger's round-6 evaluation (is_hack=false) plus `final_verification` (status=PASSED, reason=VERIFIED, geo_mean 1.2664) show 36/36 cases passing with 12/15 workloads faster than the pinned reference (fp32 1.31-1.42x, bf16 1.33-1.59x, fp16 0.83-0.95x). The reported geo_mean>1 with three fp16 regressions is reported honestly, not a measurement of the wrong implementation. Remaining findings are code-level robustness/coverage gaps, all advisory (P1); none alters the declared contract or the measured result. Note: `review_tests/attempts/01/review.json` records an explicit orchestration SKIP (`skip_review: true`) for the test-contract review, so the FlagGems correctness oracle is outside this review's evidence set.",
+  "reviewed_files": [
+    "/data/hanle/ascend-optimization/runs/20261012-agent/kg-runs/logaddexp2-kg-profile-20261012-agent/stages/optimize/work/optimize_definition_output.json",
+    "/data/hanle/ascend-optimization/runs/20261012-agent/kg-runs/logaddexp2-kg-profile-20261012-agent/stages/optimize/work/.ledger.json",
+    "/data/hanle/ascend-optimization/runs/20261012-agent/kg-runs/logaddexp2-kg-profile-20261012-agent/stages/optimize/work/.best_kernel.py",
+    "/data/hanle/ascend-optimization/runs/20261012-agent/kg-runs/logaddexp2-kg-profile-20261012-agent/stages/prepare_catalog/attempts/01/evaluation-contract.json",
+    "/data/hanle/ascend-optimization/runs/20261012-agent/kg-runs/logaddexp2-kg-profile-20261012-agent/stages/review_tests/attempts/01/review.json",
+    "/data/hanle/ascend-optimization/runs/20261012-agent/kg-runs/logaddexp2-kg-profile-20261012-agent/stages/review_tests/attempts/01/benchmark-reference.json"
+  ],
+  "findings": [
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py line 53 (`_MAXD = 8`), lines 152-158 (`_lad2_strided_kernel` signature exposes exactly 8 axis slots S0..S7 / X0..X7 / Y0..Y7), lines 172-212 (the `for k in tl.static_range(ND)` chain maps `ND-1-k == 0..6` to S0..S6 and folds every k with `ND-1-k >= 7` into the `else` branch that uses S7/X7/Y7), and lines 316-330 (`_launch_strided`: `sizes = [d[0] for d in dims] + [1] * (_MAXD - nd)`, with `[1]*(_MAXD-nd)` empty when `nd > 8`, then `*sizes, *xs, *ys` passed positionally).",
+      "reason": "The selected operator broadcasts two arbitrary tensors; torch supports outputs up to 64 dimensions, and `_collapse` (lines 237-259) can return more than 8 non-mergeable dims for a high-rank or heavily-broadcast input. With `nd > 8` the kernel is handed `3*nd` positional axis arguments against a fixed 8-slot signature (launch/TypeError) and, even where it compiles, axes 7..ND-1 are all accumulated from S7/X7/Y7, silently producing wrong offsets. This is a real behavioural gap versus the operator's declared domain, not merely a tuning limit.",
+      "requested_change": "Either generalise the strided kernel's axis handling (or pass per-axis metadata as vectors instead of a trace-time branch chain) so any rank is handled, or make `logaddexp2` detect `len(dims) > _MAXD` and fall back to a provably correct path; do not silently truncate/fold axes. Add a rank>8 broadcast case to the coverage evidence."
+    },
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py line 92 (`base = tl.program_id(0) * (BLOCK * UNROLL)`), lines 114-116, lines 141-149 (`_lad2_flat_loop`: `step = tl.num_programs(0) * BLOCK`, `cur = offs + j * step`), line 164 (`od = pid * (BLOCK * UNROLL) + t * BLOCK + tl.arange(0, BLOCK)`) and line 215 (`tl.store(o_ptr + od, ...)`); only the strided sub-offsets `xoff`/`yoff` are widened to `tl.int64` (lines 167-168), the output offsets are not.",
+      "reason": "All output index arithmetic (`base`, `offs`, `od`, `cur`) is done in 32-bit lanes. The benchmark already exercises n = 2^30 elements (ledger timing cases `core::*::0` and `::4`, shape [1073741824] and [1024,1024,1024]) at ~7.5-10.8 ms, so an n >= 2^31 input (e.g. 2 GiB fp32 operands on a 32/64 GiB Ascend910B) is a plausible next workload for this Definition; there the offsets wrap to negative values and the kernels write to the wrong locations without any error. The strided path's `od` has the same 32-bit width while its axis offsets were deliberately widened, showing the width was considered but not applied to the output offset.",
+      "requested_change": "Compute the launch base / output offsets in int64 (or guard the entry point against `n >= 2**31` with an explicit, correct fallback), and record the element-count ceiling in the kernel documentation."
+    },
+    {
+      "priority": "P1",
+      "category": "test_contract",
+      "evidence": "Ledger (`.ledger.json`) round-5/round-6 correctness workload list, lines ~5664-6035: all 21 correctness cases use equal-shaped inputs and rank <= 5 - `[]`, `[1]`, `[1024,1024]`, `[20,320,15]`, `[16,128,64,60]`, `[16,7,57,32,29]` plus `test_logaddexp2_non_finite[dtype0..2]`; the 15 timing cases in `benchmark-reference.json` are likewise equal-shape. `.best_kernel.py` lines 224-234 (`_broadcast_strides`), 237-259 (`_collapse`), 316-330 (`_launch_strided`) and 343-351 (dispatch on `len(dims)==1 and dims[0][1]==1 and dims[0][2]==1`) implement the broadcast/transposed path that those cases never reach.",
+      "reason": "The entire strided/broadcast branch and the zero-stride broadcast handling are unexercised by the supplied correctness evidence, so the 36/36 PASSED result does not validate them; a defect there (e.g. the rank>8 issue above, or the `_collapse` merge predicate) would not be caught by the current suite. Since the 36 cases are all same-shape and contiguous, the `else` branch of the dispatch is dead in every measured run.",
+      "requested_change": "Add correctness coverage that actually enters `_launch_strided` - at minimum a zero-stride broadcast (e.g. [N,1] + [N,M] and [1,M] + [N,M]), a transposed (non-contiguous) operand, and a rank>8 broadcast - or state explicitly that the broadcast path is unverified so it is not counted as validated."
+    },
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py lines 64 and 69 (`_LOOP_MIN_N = 1 << 28`, `_LOOP_SMALL_MIN_N = 1 << 20`), lines 59-60 (`_TARGET_GRID = 1024`, `_WIDE_TARGET_GRID = 512`), lines 262-272 (`_plan_prefetch` docstring: \"the measured optimum for the 16.7M-element shapes is ~1024 programs for fp32 and ~512 for 16-bit operands\"), and lines 287-303 (`_launch_flat` selecting `_LOOP_SMALL_BLOCK/_LOOP_SMALL_TILES` vs `_LOOP_BLOCK/_LOOP_TILES`).",
+      "reason": "The size/dtype dispatch thresholds are fitted to the exact benchmark size classes (2^30 = the [1073741824]/[1024,1024,1024] cases, 2^24 = the 16.7M-element [4096,4096] and [64,512,512] cases). This is justified specialization - the constants only select launch geometry, they never bypass or short-circuit the computation, and the same code path runs for every shape - so it is not a contract violation and no correctness dependence on the benchmark shapes exists. It is recorded only as an overfitting risk for shapes near a threshold.",
+      "requested_change": "No architectural change requested. Keep the geometry constants documented as performance-only tuning (as they now are) and ensure any future change to them is validated by correctness, not only by timing, since a threshold straddle changes which kernel runs."
+    }
+  ],
+  "blocker": null,
+  "missing_dependencies": [
+    "FlagGems correctness oracle `tests/test_logaddexp2.py` used to produce the 21 `flaggems::tests/test_logaddexp2.py::test_logaddexp2*` correctness results (exact input shapes, tolerance/rtol, and whether broadcast inputs are exercised) - referenced by the ledger but not supplied in evidence_paths, so the 36/36 PASSED claim could not be independently verified.",
+    "The pinned FlagGems `logaddexp2` reference implementation that produced `reference_latency_ms` in benchmark-reference.json - not supplied, so reference-precision and the per-workload speedup ratios were taken from the measurement artifacts rather than re-derived.",
+    "`.kernelgen/profile-analysis/round-0006.json` (referenced by the ledger round-6 `profile.analysis_path`) - not supplied."
+  ]
+}

@@ -18,6 +18,7 @@ class ArchiveTest(unittest.TestCase):
             control = workspace / '.kernelgen'
             control.mkdir(parents=True)
             (control / 'run-progress.json').write_text('{"state":"SUCCEEDED"}', encoding='utf-8')
+            (control / 'run-process.json').write_text('{"finished_at":"2026-10-13T00:00:00Z"}', encoding='utf-8')
             work = workspace / 'stages/optimize/work'
             paths = [work / '.kernelgen/profiles/round-0002/workload-hash/profile-id/manifest.json',
                      work / '.kernelgen/profiles/round-0002/workload-other/profile-id/manifest.json',
@@ -32,8 +33,8 @@ class ArchiveTest(unittest.TestCase):
             manifest = json.loads((output / 'archive-manifest.json').read_text(encoding='utf-8'))
             self.assertEqual(manifest['format_version'], 2)
             records = manifest['files']
-            self.assertEqual(len(records), 3)
-            self.assertEqual(len({r['archived_path'] for r in records}), 3)
+            self.assertEqual(len(records), 5)
+            self.assertEqual(len({r['archived_path'] for r in records}), 5)
             by_source = {r['source_path']: r for r in records}
             for path, content in zip(paths, contents):
                 row = by_source[path.relative_to(work).as_posix()]

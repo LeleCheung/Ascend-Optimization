@@ -1,0 +1,97 @@
+{
+  "operator": "amin",
+  "seed_sha256": "599ede4d0d21c4e1c7fb2c5b26d2f7ab3518c6edcae46ca0491ee4abe0923eb7",
+  "status": "completed",
+  "history": [
+    {
+      "round": 1,
+      "parent_result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/amin/reports/profiling-agent-20261012-agent/seed-evaluation/seed-1.result.json",
+      "parent_score": 0.8997956723470408,
+      "hypothesis": "修改点集中在两个 amin 设备内核 amin_native_middle_kernel / amin_native_last_kernel 以及驱动它们的 run 与 _NATIVE_TILES 配置表，没有改动任何其它 kernel 和 fallback 路径。\n\n1) 让 bfloat16 也走「输入精度 min」（NATIVE=True）。当前 bf16 三个形状走 NATIVE=False，即每次 tl.load 后都做 values.to(tl.float32)，累加器是 (BR,BC)/(BO,BR) 的 FP32 tile，再在 FP32 上做归约。与同 shape、同布局、同代码路径、仅 dtype 不同的 float16 对比（本轮可信诊断给出的同一合同计时）：(4096,4096) fp16 39.29us vs bf16 60.67us；(64,512,512) fp16 29.21us vs bf16 61.31us；(1024,1024,1024) fp16 1669.6us vs bf16 3658.8us。bf16 慢 1.5～2.2 倍，而两者唯一的差别就是「逐元素 fp32 转换 + FP32 累加器 + FP32 归约」这一组额外 Vector 指令。bf16 (4096,4096) 的真机指标显示 aiv_vec_ratio=0.795（MTE2 仅 0.1935），说明瓶颈在 Vector 流水线而不是搬运；而 min 选择操作在任何能表示原值的 dtype 上都是精确的，bf16 原生 min 不会改变结果，NaN/Inf、mask 用 inf 的语义都不变。\n\n2) BR 对齐 fp16。原生累加器只有 FP32 累加器一半的 UB 占用，因此 bf16 可以把归约片放大到与 fp16 相同：(64,512,512) BR 16→32（内层循环 32 次→16 次）、(1024,1024,1024) BR 8→16（64 次→32 次），(4096,4096) 保持 BO=8/BR=1024 只翻转 NATIVE。这直接针对这三个 bf16 慢 case，同时也减少每轮的 mask/地址生成开销。\n\n3) 编译失败安全网。知识中明确记载「bf16 直接输入类型 minimum 某些配置编译失败，不能假设支持」，所以新增 _BF16_NATIVE_FALLBACK：一旦原生路径抛异常，就把该 shape 记入 _native_bf16_disabled 并永久退回「原生配置未启用时」的原始分块（含 BR 一并还原，避免 FP32 累加器在放大后的 BR 下超片上容量），并立即用回退配置重跑同一 out。失败时候选与当前版本行为一致，不会因为编译问题丢掉 fallback；异常只对 bf16 原生路径吞掉，其余异常照常抛出。第一次调用之后不再走 try 分支里的失败路径，稳定 fallback 保持不变。\n\n未采用的方向：不动全归约（amin_global_chunk_kernel）与 v4 的路径判定，不动 fp16/fp32 的分块（它们已由设备计时选定），不做任何未经验证的 Roofline 推断，也不重复历史上已被否决的配置。",
+      "expected_effect": "主要改善三个此前明显落后 PyTorch 的 bfloat16 用例：test_amin[dtype2] 的 (4096,4096) dim=1（当前 60.67us / 0.46×）、(64,512,512) dim=1（61.31us / 0.55×）、(1024,1024,1024) dim=1（3658.76us / 0.39×）。去掉逐元素 FP32 转换与 FP32 累加后，这三个 case 的 Vector 工作量按同 shape 的 fp16 对照大约降到原来的 2/3～1/2，目标是把 bf16 拉回到与 fp16 同一量级（约 39us / 29us / 1670us 附近），使 bf16 三个 case 从 0.39～0.55× 提升到接近或超过 1.0×。若 bf16 原生 min 在本机编译失败，则自动退回现有已验证配置，指标与当前版本持平，不会回退。\n\nfloat16 / float32 的 9 个用例配置保持不变，预期与当前逐 case 事实一致（其中 (1024,1024,1024) 的 fp32 3302.75us×(4.3GB 已计入逻辑字节) 与 fp16 1669.6us 路径不动，避免无依据的分块改动）。全归约与 (64,64) 两个已领先的用例（1.3～2.1×）沿用原路径，不受影响。所有改动只涉及 dtype 归约精度与归约片大小，输出 dtype、keepdim、dim 归一化、mask 用 +inf 的语义完全一致，NaN/Inf 行为与 float16 现有路径相同，不修改计时与用例。以上为基于同合同对照计时的预期，最终以完整测试的实测结果为准。",
+      "source_sha256": "eca4ab44bbe16ae1095ea55deded8f676a97e2e83237e633f5c5f8978e8ede3d",
+      "status": "PASSED",
+      "score": 0.9229204558479288,
+      "result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/amin/reports/profiling-agent-20261012-agent/round-01/evaluation/trial-1.result.json",
+      "accepted": true
+    },
+    {
+      "round": 2,
+      "parent_result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/amin/reports/profiling-agent-20261012-agent/round-01/evaluation/trial-1.result.json",
+      "parent_score": 0.9229204558479288,
+      "hypothesis": "改动只落在两个 amin 设备内核 amin_native_middle_kernel / amin_native_last_kernel、启动函数 _launch_native 与驱动力 run；_NATIVE_TILES 分块表、_direct_axis_amin、全归约路径、bf16 回退表全部保留不动，run API、dim/keepdim/stride 语义不变。\n\n1) 新增 MASKED 编译期开关，取消“恒真掩码”。注册表 9 个配置的分块都能整除对应维度：last 路径 (4096,4096) 用 BO=8、BR=1024（4096%8==0、4096%1024==0），middle 路径 (64,512,512) 用 BC=512、BR=32（512%512==0、512%32==0）、(1024,1024,1024) 用 BC=1024、BR=16（1024%16==0），fp32 的 (512,16)/(8,1024) 与 bf16 回退配置同样整除。也就是说循环里 (r<R)&(cols<I) 和 rows<O 是恒真谓词，但它们仍要按整块 tile 生成比较+与运算、生成 other=inf 填充，并把本可整块连续的搬运降级为带谓词的访问——这些形状的 tile 本身是连续的（BC==I 时整块连续，last 路径每行 BR 个连续元素）。MASKED=False 分支直接 tl.load(ptr)，无掩码、无 other、无谓词；越界补 inf 的语义完整保留在 MASKED=True 分支，未被删除，非整除场景自动回落到该分支。\n\n2) 把两个内核的启动参数 multibuffer 由 False 改为 True（带逐配置回退）。此前单缓冲下每轮迭代是“发起 MTE2 → 等数据 → 向量 min”串行；真机指标显示 bf16 (1024,1024,1024) aiv_vec_ratio=0.764、aiv_mte2_ratio=0.348（之和 1.11，重叠不充分），说明向量流水大量时间在等搬运，而 bf16 (4096,4096) 的 mte2 仅 0.204 而 vec 0.781。multibuffer=True 让下一分块的搬运与当前分块的归约重叠，该后端在矩阵乘 v9 已验证可用（multibuffer=True/unit_flag=True）。UB 估算：最大 tile 是 fp32 (16,1024)/(8,1024) 的 32KB 累加器 + 双缓冲 2×32KB = 96KB，未超片上容量；若某配置编译报错，_multibuffer_disabled 永久退回单缓冲，只吞掉启动异常，其它异常照常抛出。\n\n3) multibuffer 与掩码删除都用 try/except 分级回退：双缓冲 → 单缓冲同分块 → 仅 bf16 原生路径 → FP32 累加回退配置（分块一并还原），不会因为编译问题丢掉稳定 fallback，也不改变最终结果值（min 的选择集合完全相同）。",
+      "expected_effect": "主要改善 3 个只有 4 轮迭代、每轮固定等待搬运的 (4096,4096) dim=1 用例和 2 个 program 数只有 64 的 (64,512,512) dim=1 用例。\n\n依据：fp16 (4096,4096) 现在 39.1us / 33.5MB（约 0.86 TB/s），而同样 512 个 program、同样 4 轮迭代、仅 dtype 不同的 fp32 (4096,4096) 却做到 67MB/53.5us（约 1.25 TB/s），说明该 fp16 用例不是被搬运字节卡住，而是每轮 ~0.3us 的“发起-等待”固定开销（512/20≈26 轮/核 × 4 轮）。双缓冲把这段等待与向量归约重叠、去掉恒真掩码的逐块比较/填充后，3 个 (4096,4096) 用例（fp16 39.1us→约 28-32us、fp32 53.5us→约 42-47us、bf16 60.4us→约 48-55us）预期从 0.59/0.70/0.46 向 0.75/0.88/0.55 靠拢；(64,512,512) 的 3 个用例（fp16 29.2us、fp32 53.1us、bf16 61.4us）因整块连续、掩码开销占比最大，预期有同量级改善。bf16 (1024,1024,1024) 真机 vec 0.764+mte2 0.348 表明重叠不充分，完全重叠的下界约为 3661×0.764≈2797us，即 0.394×→约 0.50×；fp16/fp32 的 (1024,1024,1024)（1669us/3304us，已接近本候选自身约 1.3 TB/s 的搬运速度）收益较小，预期 0.85×→0.90-0.95×。(1048576) 与 (64,64) 六个已领先 1.35-2.27× 的用例不在注册表覆盖范围，路径不变。以上均为基于同合同对照计时与真机 pipe ratio 的预期，带宽上界没有经核实的 roof，不作数值 Roofline 声称，最终以完整测试实测为准；若双缓冲在某配置上变慢或编译失败，回退机制使该配置与当前版本持平。",
+      "source_sha256": "fde0a861892398bbe90cb9e9e71d816184c3381631435340632b3df5358f76a9",
+      "status": "PASSED",
+      "score": 0.9327801734967498,
+      "result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/amin/reports/profiling-agent-20261012-agent/round-02/evaluation/trial-1.result.json",
+      "accepted": true
+    },
+    {
+      "round": 3,
+      "parent_result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/amin/reports/profiling-agent-20261012-agent/round-02/evaluation/trial-1.result.json",
+      "parent_score": 0.9327801734967498,
+      "hypothesis": "改动只落在 amin_native_last_kernel 在 (4096,4096) dim=1 上的分块（_NATIVE_TILES 中三个 (4096,4096) 条目）与驱动它们的 run 候选/回退编排。内核本体（amin_native_last_kernel / amin_native_middle_kernel 的循环、累计、tl.min、store）和 amin_native_middle_kernel 的全部配置 (64,512,512)=(512,32)/(512,16)、(1024,1024,1024)=(1024,16)/(1024,8) 完全不动；全局归约 amin_global_chunk_kernel、v4 路径 _v4_amin、bf16 的 FP32 累加回退表 _BF16_NATIVE_FALLBACK、MASKED 与 multibuffer 逻辑均保留。\n\n1) 为什么改这两个内核的最后一个：本轮同合同计时显示 (4096,4096) dim=1 的三个 dtype 是同 shape、同 grid、同 tile 结构，只有 dtype 不同：fp16 38.65us、fp32 52.70us、bf16 60.26us。字节比 1:2 而时间比只有 1:1.36，说明该路径耗时里有很大一块与搬运字节无关；同时这三个 case 是本轮最差的一组（0.592× / 0.716× / 0.465×）。历史里唯一一次「程序数与迭代数分离」的对照是 (16,512)/(16,256)（256 program、8 次内层迭代）被 (8,1024)（512 program、4 次迭代）取代并胜出，说明决定该路径快慢的是内层迭代次数与单次搬运的连续长度，而不是 program 数量。\n\n2) 具体改法：现状 (8,1024) 每轮把一行切成 8 段各 2KB 的跨步访问、串行 4 轮。本轮把 inner==1 的末轴路径改成「整行一次归约」：BR = R = 4096，BO 取 max(1, 8192 // R) 的按 dtype 版本——fp16/bf16（NATIVE=True，累加器与 tile 都是 2 字节）BO=4，fp32（NATIVE=False，累加器 4 字节）BO=2。UB 预算：fp16/bf16 acc (4,4096)=32KB + tile 32KB、双缓冲 64KB ≈ 96KB；fp32 acc (2,4096)=32KB + tile 32KB、双缓冲 64KB ≈ 96KB，与旧 (8,1024) 的累加器元素数（8192）和单次搬运元素数（8192）完全相同，属于等价片上占用的改写，不是靠放大 UB 换性能。收益来源三点：内层循环 range(tl.cdiv(4096,4096)) 由 4 轮变 1 轮，去掉 4 次「发起 DMA → 等数据 → 归约」串行链；BR==R 时 (BO,R) tile 恰好覆盖 BO 个相邻整行，单次搬运变成一次连续 DMA（fp16/bf16 32KB、fp32 32KB），取代每轮 8 段 2KB 跨步，描述符数量级下降；网格由 512 变为 1024（fp16/bf16）/2048（fp32），核填充更充分。因为 BR=4096 整除 R=4096、BO 整除 O=4096，MASKED 自动为 False，走无谓词连续 tl.load，越界补 inf 的语义分支仍完整保留。归约数学不变：仍是逐元素 tl.minimum 累积 + 末端 tl.min(acc, axis=1)，输出值、dtype、keepdim、stride 语义与 NaN/Inf 行为完全一致。\n\n3) 回退链（保证不丢用例）：每个候选先试 multibuffer=True，失败再试同候选单缓冲；主配置（整行）编译或资源失败则依次退到历史已 27/27 通过的 (8,1024) 同 NATIVE 配置；bf16 再退到 FP32 累加的 (8,1024,False)。失败候选记入 _config_disabled 永久跳过（不再重复编译尝试），bf16 原生路径失败记入 _native_bf16_disabled 后不再构造任何 NATIVE 候选；若所有候选均已被禁用则整体退回 _v4_amin。异常只吞编译/资源类失败，最终全部失败时仍抛出原始错误。不重复历史已被否决的方向：没有放宽 tile 到 128×256/256×128、没有 BK512、没有 enable_preload、没有关 subblock，也没有改任何已由设备计时选定的中间维分块。",
+      "expected_effect": "主要改善 3 个 (4096,4096) dim=1 末轴用例，即本轮最差的一组：test_amin[dtype0] float16（当前 38.65us / 0.592×）、test_amin[dtype1] float32（52.70us / 0.716×）、test_amin[dtype2] bfloat16（60.26us / 0.465×）。\n\n依据：这三个 case 每 program 只搬 64KB 却要等 4 轮串行跨步 DMA，且 fp16 与 fp32 的耗时差远小于字节差（1.36× vs 2×），说明有约六成的耗时与字节数无关；把 4 轮跨步 2KB 搬运压成 1 轮连续 32KB 搬运后，这部分固定开销被移除。预期 fp16 约 38.65→28-31us（0.59→约 0.74-0.82×）、fp32 约 52.70→40-45us（0.72→约 0.84-0.94×）、bf16 约 60.26→45-52us（0.47→约 0.54-0.62×）。bf16 的绝对收益相对小一些，因为其真机 pipe 指标 vec=0.73、mte2=0.21 表明该 case 还有很大一块是逐元素向量工作量（bf16 需经 FP32 转换再 min），本轮只去掉串行搬运与跨步 DMA，不动转换精度语义。\n\n其余 12 个用例的配置与路径完全不动，预期与当前逐 case 事实一致：全归约 (1048576) 三个 dtype（1.35-1.47×）、(64,64) dim=1 三个 dtype（2.11-2.26×）走 v4 路径；中间维 (64,512,512) 与 (1024,1024,1024) 六个用例继续用 (512,32)/(512,16)/(1024,16)/(1024,8)，不受影响。若某个新配置（尤其 bf16 BR=4096）编译或片上资源失败，逐级回退到历史已通过的 (8,1024)，该用例指标与当前版本持平，不会丢失任何用例。以上为基于同合同计时与历史对照的预期，涉及片上容量与指令行为的推测均由随后的完整测试验证；带宽上界没有经核实的 roof，因此不声称数值 Roofline，最终以完整 KGS 合同的实测结果为准。",
+      "source_sha256": "142f54b87ab7b4751679d136625148ddd929f0f674f73fa626c74383523b943e",
+      "status": "PASSED",
+      "score": 0.8743332472174657,
+      "result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/amin/reports/profiling-agent-20261012-agent/round-03/evaluation/trial-1.result.json",
+      "accepted": false
+    },
+    {
+      "round": 4,
+      "parent_result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/amin/reports/profiling-agent-20261012-agent/round-02/evaluation/trial-1.result.json",
+      "parent_score": 0.9327801734967498,
+      "status": "FAILED",
+      "error": "命令失败 1，见 /data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/amin/reports/profiling-agent-20261012-agent/round-04/claude-response.json",
+      "claude_error": "havior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.\"}],\"context_management\":null},\"parent_tool_use_id\":null,\"session_id\":\"821d79da-8a30-4f77-a12b-931c9775df66\",\"uuid\":\"5fe24f64-f02a-40c9-b99e-906a68f3f968\",\"timestamp\":\"2026-10-12T14:33:06.458Z\",\"error\":\"max_output_tokens\",\"is_api_error_message\":true,\"api_error\":\"max_output_tokens\"}\n{\"duration_api_ms\":757338,\"stop_reason\":\"stop_sequence\",\"session_id\":\"821d79da-8a30-4f77-a12b-931c9775df66\",\"total_cost_usd\":2.6596496000000003,\"usage\":{\"input_tokens\":21866,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":60928,\"output_tokens\":128000,\"output_tokens_details\":{\"thinking_tokens\":0},\"server_tool_use\":{\"web_search_requests\":0,\"web_fetch_requests\":0},\"service_tier\":\"standard\",\"cache_creation\":{\"ephemeral_1h_input_tokens\":0,\"ephemeral_5m_input_tokens\":0},\"inference_geo\":\"\",\"iterations\":[],\"speed\":\"standard\"},\"modelUsage\":{\"deepseek-flash\":{\"inputTokens\":21866,\"outputTokens\":128000,\"cacheReadInputTokens\":60928,\"cacheCreationInputTokens\":0,\"webSearchRequests\":0,\"costUSD\":2.6596496000000003,\"contextWindow\":200000,\"maxOutputTokens\":32000,\"thinkingTokens\":0,\"canonicalModel\":\"deepseek-flash\",\"provider\":\"firstParty\",\"costBasis\":\"unknown\"}},\"permission_denials\":[],\"terminal_reason\":\"api_error\",\"fast_mode_state\":\"off\",\"fast_mode_disabled_reason\":\"sdk_opt_in_required\",\"subagent_stats\":{\"spawned\":0,\"requested\":{\"background\":0,\"foreground\":0,\"unset\":0},\"started_in_background\":0,\"max_depth\":0,\"spawned_by_subagents\":0,\"completed\":0,\"failed\":0,\"killed\":{\"parent\":0,\"user\":0,\"system\":0},\"refused\":{\"depth_limit\":0,\"concurrency_limit\":0,\"budget\":0},\"by_type\":{}},\"is_error\":true,\"num_turns\":4,\"subtype\":\"success\",\"api_error_status\":null,\"result\":\"API Error: Claude's response exceeded the 32000 output token maximum. To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.\",\"type\":\"result\",\"duration_ms\":757601,\"uuid\":\"8733ce35-bdf3-456c-9cc0-9e6846d326c3\",\"queued_turn_count\":0,\"result_index\":0}\n"
+    },
+    {
+      "round": 5,
+      "parent_result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/amin/reports/profiling-agent-20261012-agent/round-02/evaluation/trial-1.result.json",
+      "parent_score": 0.9327801734967498,
+      "hypothesis": "改动只在 bf16 的中间维候选编排（run 的候选表 + 新增 _BF16_WIDE_FP32），两个内核本体、_NATIVE_TILES、MASKED/multibuffer 逻辑、全归约、v4 路径、run API 全部不动。\n\n诊断：按同合同的设备计时换算逻辑字节速率，fp32 在 (4096,4096)/(64,512,512)/(1024,1024,1024) 上分别达到 1.27/1.32/1.33 TB/s，fp16 在三个 3D 大 case 上是 1.20/1.32 TB/s，说明这条路径已接近本实现可达的搬运速率；而 bf16 的 (64,512,512)=0.57 TB/s、(1024,1024,1024)=0.61 TB/s 只有它的一半。把两个 dtype 的差别拆开：(4096,4096) 上 bf16 与 fp16 用的是完全相同的 tile (8,1024)，bf16 只慢 1.56×（这是类型代价）；而 (64,512,512) 慢 2.10×、(1024,1024,1024) 慢 2.17×，多出来的 1.35×/1.39× 正好等于回退配置 (512,16)/(1024,8) 相对 fp16 的 (512,32)/(1024,16) 的内层迭代次数之比（32 次 vs 16 次、128 次 vs 64 次），即 bf16 原生 min 不可编译后，_BF16_NATIVE_FALLBACK 为了给 FP32 累加器让出 UB 把 BR 砍半，每次迭代重新发起 DMA 并等待的串行开销翻倍。\n\n改法：给 bf16 中间维的 FP32 累加再用一档「与 fp16 同形状」的候选 —— (64,512,512) 用 (512,32,False)、(1024,1024,1024) 用 (1024,16,False)，即 BC 保持已被 round-01 采纳的宽度、BR 回到 fp16 的取值；片上预算用「只单缓冲」来满足：64KB FP32 acc + 32KB tile = 96KB，等于 round-02 已声明安全的预算（旧的 40KB 单缓冲并没有换来更小的 acc）。候选顺序是 native/mb → native/单缓冲 → 宽片 FP32/单缓冲 → 已逐值验证的窄片 FP32，每个候选有独立的编译失败记忆，失败即永久跳过，所以选择跨调用稳定；全部失败则抛回原错误或退回 v4，绝不丢用例。(4096,4096) 不新增条目（其 FP32 回退本就是 fp16 的 (8,1024)），因此不触碰 round-03 已证明会被打坏的末轴分块，也不重复宽 tile/BK512/enable_preload 等历史失败方向。归约仍是逐元素 minimum + 末端 tl.min，bf16 值到 fp32 精确可表示，输出值、dtype、keepdim、stride、NaN/Inf 与 mask 用 +inf 的语义完全不变（这三个配置的维度都能整除，MASKED 仍为 False）。",
+      "expected_effect": "改善两个此前最差的 bf16 case：test_amin[dtype2] (64,512,512) dim=1（当前 59.05us / 0.571×）与 (1024,1024,1024) dim=1（当前 3528us / 0.411×）。\n\n依据：去掉的是回退配置里翻倍的那部分迭代串行开销。按同 shape 的 fp16 计时乘以在相同 tile 上实测到的 1.56× 类型代价推算，bf16 这两档的现实目标是 fp16 时间 ×1.56，即 (64,512,512) 约 28.1×1.56≈44us（0.571→约 0.77×）、(1024,1024,1024) 约 1629×1.56≈2540us（0.411→约 0.57×）。若把两个 case 的 ln 收益摊到 15 项的几何平均上，整体约 0.933→0.97 量级。第三个 bf16 case (4096,4096) 不改动，因为它本来就用 fp16 同形状的 (8,1024)，只含类型代价；三个 fp16/fp32 的大 case 已处于本实现 1.2~1.33 TB/s 的可达速率附近，不做无根据的分块改动；(1048576) 与 (64,64) 六个已领先 1.35~2.27× 的 case 走 v4 路径不受影响。类型代价本身（bf16 min 在本机可能被编译成转 FP32 再比）本轮不触碰，只回收结构性的迭代开销，因此不预计 bf16 超过 fp16×1.56 的水平。以上为基于同合同计时与 tile 形状对照的推算，涉及片上容量与编译可行性的推测（96KB 峰值能否编译）由完整测试验证：若宽片候选编译或资源失败，候选链自动回落到已通过的窄片配置，该 case 指标与当前版本持平，不会回退或丢用例；带宽上界没有经核实的 roof，不作数值 Roofline 声称。",
+      "source_sha256": "9ab82d86a0cb9f44eb96872511d7fd6ab25ae9e382c2789832b3fe0dfca73291",
+      "status": "PASSED",
+      "score": 0.9301500380566812,
+      "result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/amin/reports/profiling-agent-20261012-agent/round-05/evaluation/trial-1.result.json",
+      "accepted": false
+    },
+    {
+      "round": 6,
+      "parent_result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/amin/reports/profiling-agent-20261012-agent/round-02/evaluation/trial-1.result.json",
+      "parent_score": 0.9327801734967498,
+      "hypothesis": "改动只落在中间维内核：新增 amin_flat_middle_kernel，并把 _launch_native 与驱动力 run 的候选表扩展为「扁平+双缓冲 → 扁平单缓冲 → 原二维+双缓冲 → 原二维单缓冲 → （仅 bf16 原生路径）FP32 累加回退」。原有 amin_native_middle_kernel / amin_native_last_kernel、_NATIVE_TILES 九个配置、_BF16_NATIVE_FALLBACK、_native_bf16_disabled、_multibuffer_disabled、全归约与 v4 路径、run API 全部保持不变；末轴 (4096,4096) 组分块一字未动（round-03 已证明该处换块会变坏，禁止重复）。\n\n机制：注册表里中间维两个 3D 形状 (64,512,512)=(BC 512, BR 32) 与 (1024,1024,1024)=(BC 1024, BR 16/8) 都满足 BC == 内层维 I 且 R % BR == 0，也就是说一个 program 每轮要取的 (BR,BC) 块在内存里本来就是连续的一段（fp16 (1024³) 每轮 16×1024=16384 个元素=32KB，(64,512,512) 每轮 32×512=16384=32KB），但二维地址式 r[:, None]*I + cols[None, :] 只能向编译器证明末维 1024 个元素连续，跨行的连续性一般证明不了，于是每轮被降级成 BR 段独立搬运（16 段 2KB / 32 段 1KB），并重复生成二维地址。新内核改用 offs = arange(0, BR*BC)、一次 tl.load(base + start*(BR*BC) + offs) 的一维连续取数，累加器同样是一维 (BR*BC,)，循环体内没有任何布局变换，只在循环结束后 tl.reshape 一次再做 tl.min(axis=0)。片上占用与旧配置逐元素相同（fp16/bf16 (1024³) 32KB 累加器、fp32 32KB），所以不是靠放大 UB 换性能。归约集合不变：扁平槽位 j*BC+c 恰好对应行槽 j、列 c，重排后按列取 min 即等价于原来 (BR,BC) 累加再 tl.min(axis=0)；BC == I 时无越界，本就不需要掩码，输出 dtype/keepdim/stride/NaN-Inf 语义不变。\n\n覆盖面：6 个此前偏离最快的 3D 用例 —— fp16/bf16/fp32 的 (64,512,512)（0.604/0.571/0.602×）与 (1024,1024,1024)（0.870/0.411/0.876×）。(4096,4096) 末轴与全归约、小形状 9 个用例路径不变。bf16 仍是向量侧受限（真机 aiv_vec_ratio 0.74/0.76、mte2 仅 0.22/0.36），本轮只削减搬运侧描述符与地址开销，不声称能消除 bf16 的类型代价。所有涉及容量与编译可行性的推测由完整测试验证；若扁平路径编译失败或资源不足，候选链自动回落到已在 27/27 通过的二维配置，该用例与当前版本持平，不会丢用例。",
+      "expected_effect": "主要改善中间维 6 个用例：test_amin[dtype0/1/2] 的 (64,512,512) dim=1（当前 28.09/50.95/59.05us，0.604/0.602/0.571×）与 (1024,1024,1024) dim=1（当前 1629.1/3233.1/3528.1us，0.870/0.876/0.411×）。\n\n依据：这 6 个 case 每轮要取的 (BR,BC) 块本来就是连续 32KB，现行二维取数把它拆成 16 段 2KB（(1024³)）或 32 段 1KB（(64,512,512)），每轮重复一次描述符与二维地址生成；改成一次 1-D 连续 tl.load 后，描述符数量与地址生成按 BR 倍数下降。同时 fp16 与 fp32 在这些形状上的逻辑字节速率已经同为 1.20~1.33 TB/s（fp32 (64,512,512) 67.2MB/50.95us≈1.32 TB/s、fp32 (1024³) 4299MB/3233us≈1.33 TB/s），两种元素宽度落在同一速率说明限制在搬运侧而非元素数或向量算力，因此收窄每轮的搬运描述符是这类用例唯一还剩下的结构性开销。预期把这 6 个 case 往同 shape 参照的 1.3~1.6 TB/s 量级推进：fp16/fp32 的 (64,512,512)、(1024³) 目标 0.60~0.88× 提到约 0.70~0.95×；bf16 因为真机 aiv_vec_ratio 0.74~0.76 表明其向量流水（bf16 min 需要额外转换）本身占了大头，(4096,4096) 60.26us/(64,512,512) 59.05us/(1024³) 3528.1us 只会拿到本轮削减的那部分搬运开销，预期小幅改善（例如 (1024³) 0.411→约 0.45~0.50×），不预计追上 fp16。\n\n其余 9 个用例配置不动：全归约 (1048576) 三个 dtype（1.35~1.47×）、(64,64) dim=1 三个 dtype（2.11~2.26×）走 v4 路径；末轴 (4096,4096) 三个 dtype（0.592/0.716/0.465×）严格沿用已在真机逐值核对、且 round-03 已证明换块会变坏的 (8,1024) 分块，不受影响。全部为基于同合同计时与真机 pipe ratio 的预期，不声称数值 Roofline（缺少经核实的 roof），容量与编译可行性推测由完整测试验证：若扁平路径编译或资源失败，回退链使该用例与当前版本持平。",
+      "source_sha256": "a2231e80c0fb31fbd14db4069dd4ff1e586bb02807e18be461a6dfb9e2e826c9",
+      "status": "PASSED",
+      "score": 0.9275761595460035,
+      "result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/amin/reports/profiling-agent-20261012-agent/round-06/evaluation/trial-1.result.json",
+      "accepted": false
+    }
+  ],
+  "best": {
+    "result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/amin/reports/profiling-agent-20261012-agent/round-02/evaluation/trial-1.result.json",
+    "score": 0.9327801734967498
+  },
+  "configuration": {
+    "server": "http://127.0.0.1:19655",
+    "model": "deepseek-flash",
+    "claude": "/data/hanle/ascend-optimization/runtime/kg-controller/claude",
+    "profile_cases": 2,
+    "knowledge_sha256": "709e042ff8b79c20d78659444da6d74eef7c86205d72d4f9145352339b7ad3be"
+  },
+  "repo_commit": "1cd2ce719e29d8644d07532807717ba1e274a781",
+  "current_error": null,
+  "seed_result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/amin/reports/profiling-agent-20261012-agent/seed-evaluation/seed-1.result.json",
+  "current_round": 6,
+  "stage": "completed",
+  "final_scores": [
+    0.9415754721496749,
+    0.9359701045362094
+  ],
+  "final_score": 0.9359701045362094,
+  "final_source_sha256": "fde0a861892398bbe90cb9e9e71d816184c3381631435340632b3df5358f76a9"
+}

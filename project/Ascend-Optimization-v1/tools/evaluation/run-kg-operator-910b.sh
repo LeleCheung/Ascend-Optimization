@@ -26,7 +26,7 @@ fi
 
 curl --noproxy '*' -fsS "http://127.0.0.1:$port/status" >/dev/null
 source "${KG_CANN_ENV:-/usr/local/Ascend/cann-9.0.0/set_env.sh}"
-export PATH="$base/bin:$base/venv/bin:/usr/local/python3.11.15/bin:$PATH"
+export PATH="$base:$base/bin:$base/venv/bin:/usr/local/python3.11.15/bin:$PATH"
 # 每次实验显式选择源码，避免 editable install 指向旧仓库。
 if test -n "${KG_SOURCE_ROOT:-}"; then
   test -f "$KG_SOURCE_ROOT/kernelgen/__init__.py"
