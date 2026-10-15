@@ -2,11 +2,13 @@
 
 本仓库用于优化华为昇腾 910B 上的 FlagGems 算子，并保存 KG/KGS 源码、实验候选、评测证据和复现方法。
 
-**当前目标：从验收看板华为列选择加速比低于 0.8×、正确性通过的代表性算子，使用 FlagGems `master` 的固定提交建立基线，完成固定 master 加三种优化版本的对照，争取超过 0.8×。**
+**当前目标：按 2026-10-15 会议指定的 10 项算子与 5 项 FlagGems-sglang 候选推进优化，固定 FlagGems/FlagTree 基线，将 HG-KDA 接入 KG，形成指标、指令与热点分阶段体检；正确性失败对象先修复，再报告性能。此前低于 0.8× 的四算子阶段已完成。**
 
 2026-10-09 导师确认：Excel 数字是加速比，绿色验收门槛为大于 0.8×，FlagGems 使用 `master`。筛选依据是华为列实际数字；黄色底色不作为立项依据。旧实验锁定的版本不是新的 master 基线。
 
 ## 当前状态
+
+2026-10-15 会议后进入[下一阶段](project/Ascend-Optimization-v1/operators/下一阶段计划-20261015.md)：固定 FlagGems 与 FlagTree 版本，登记会议指定的 10 项算子与 5 项 FlagGems-sglang 候选；原记录精度失败的指定对象先修正确性。HG-KDA 新增[项目内 skill、分类知识与分阶段体检入口](project/Ascend-Optimization-v1/tools/profiling/hgkda/README.md)，评测继续使用 KGS。以下四项属于上一阶段已完成成果。
 
 四算子的[统一工作流](project/Ascend-Optimization-v1/tools/profiling/四算子工作流.md)已完成本阶段验证与交付：历史最佳源码复现为 logaddexp2 1.262×、amin 0.934×、矩阵乘 0.889×、narrow_copy 1.105×，均完整通过并完成两次复验。从明确优化前源码调用 CC+DeepSeek 的四项生成实验也已完成，3 项在最终复验中取得有效提升；失败和未采纳代码保留。生成成绩、起点与方法见[最终交付](project/Ascend-Optimization-v1/operators/四算子工作流交付-20261014.md)和[最新进展](project/Ascend-Optimization-v1/operators/四算子工作流进展-20261014.md)。源码复验与方法生成分别记账，数值 Roofline 尚未建立。历史成绩保留如下。
 

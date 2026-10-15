@@ -167,7 +167,7 @@ def prefixes(source):
     return result
 
 
-def profile_best(operator, evaluation, directory, server, count, *, timing_scope='device_kernel'):
+def profile_best(operator, evaluation, directory, server, count, *, timing_scope='device_kernel', hgkda=False):
     loaded, _ = checked(evaluation)
     rows = sorted(loaded['timing'].values(), key=lambda r: r['speedup'])
     # 相同 dtype/shape 的重复 benchmark case 不占用新的采集名额。
@@ -231,6 +231,11 @@ def profile_best(operator, evaluation, directory, server, count, *, timing_scope
                                    scope='独立真机 msprof 采集')
             case['diagnosis'] = workflow.diagnose(case)
     report['collection_failures'] = failures
+    if hgkda:
+        import hgkda_adapter
+        report = hgkda_adapter.analyze_staged(
+            report, evaluation, directory, server, workflow=workflow, run=run,
+            assert_idle=assert_card_idle, call=call)
     save(directory / 'diagnosis.json', report)
     (directory / '诊断.md').write_text(workflow.render(report), encoding='utf-8')
     return report
@@ -338,6 +343,13 @@ def prompt_for(operator, source, report, history, knowledge):
     facts = [{'case_id': c['case_id'], 'axes': c['axes'], 'timing': c['walltime'],
               'workload': c['workload_model'], 'metrics': c['metrics'], 'diagnosis': c['diagnosis']}
              for c in report['cases']]
+    if report.get('diagnostic_policy') == 'hgkda-staged-v1':
+        for fact, case in zip(facts, report['cases']):
+            fact['hgkda'] = case['hgkda']
+            instruction = case['profiles'].get('instruction')
+            if instruction:
+                fact['instruction_evidence'] = instruction
+        knowledge += '\n\n按算子与指标选择的知识：\n' + report['routed_knowledge']
     return '\n'.join([
         '你是 Ascend 910B Triton 算子优化工程师。根据本轮真实诊断产出一个更快的完整单文件候选。',
         '禁止调用 Bash、文件系统、网络或任何工具；不要自行调查环境。下面已经给出完整源码、事实和知识，只在这些内容上推理并直接输出结果。',
@@ -390,6 +402,8 @@ def main():
     parser.add_argument('--provider-base-url', default='https://api.deepseek.com/anthropic')
     parser.add_argument('--replay', action='store_true',
                         help='以历史已验证候选复现方法；最终报告明确标注复现，不宣称重新发现')
+    parser.add_argument('--hgkda', action='store_true',
+                        help='使用分类知识与分阶段指标/指令采集策略；仅用于新批次')
     a = parser.parse_args()
     if a.operator == 'narrow_copy' and a.timing_scope != 'device_task':
         parser.error('narrow_copy必须使用device_task，覆盖DMA与kernel')
@@ -416,6 +430,9 @@ def main():
         configuration = {'server': a.server, 'model': a.model, 'claude': a.claude,
                          'profile_cases': a.profile_cases,
                          'knowledge_sha256': digest(knowledge)}
+        if a.hgkda:
+            import hgkda_adapter
+            configuration['hgkda_policy_sha256'] = hgkda_adapter.fingerprint()
         if 'configuration' not in state or state['configuration'].get('generation_noop_guard'):
             configuration['generation_noop_guard'] = True
         if a.knowledge_snapshot:
@@ -478,7 +495,7 @@ def main():
                 state.update(current_round=index, stage='profiling')
                 save(state_path, state)
                 report = profile_best(a.operator, best, directory / 'profiles', a.server, a.profile_cases,
-                                      timing_scope=a.timing_scope)
+                                      timing_scope=a.timing_scope, hgkda=a.hgkda)
                 prompt = prompt_for(a.operator, source, report, state['history'], knowledge)
                 (directory / '给CC的提示词.md').write_text(prompt, encoding='utf-8')
                 if a.replay:
