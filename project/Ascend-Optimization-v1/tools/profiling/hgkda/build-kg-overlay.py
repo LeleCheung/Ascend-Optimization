@@ -18,7 +18,7 @@ def build(output: Path, *, repo=REPO):
     if output.exists():
         raise FileExistsError('覆盖层目录已存在，请使用新批次：' + str(output))
     output = output.resolve()
-    if output.is_relative_to(source.resolve()):
+    if output == source.resolve() or source.resolve() in output.parents:
         raise ValueError('覆盖层不能写到基线 KG 源码内')
     output.mkdir(parents=True)
     target = output / 'kernelgen'
