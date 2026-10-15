@@ -8,6 +8,8 @@
 
 ## 当前状态
 
+2026-10-15 首项 `rad2deg_` 已闭环：固定 FlagGems 为0.253×，HG-KDA最终两次为0.803×/0.806×，均33/33，另通过21项补充语义检查；相对 FlagGems 为3.20×/3.19×。已验证 metrics→模拟器指令的阶段升级，并核查 CANN DMA 直接调用链。结果、失败记录与复现步骤见[会议后首项交付](project/Ascend-Optimization-v1/operators/会议后首项交付-20261015.md)。其余14项尚未完成优化。
+
 2026-10-15 会议后进入[下一阶段](project/Ascend-Optimization-v1/operators/下一阶段计划-20261015.md)：固定 FlagGems 与 FlagTree 版本，登记会议指定的 10 项算子与 5 项 FlagGems-sglang 候选；原记录精度失败的指定对象先修正确性。HG-KDA 新增[项目内 skill、分类知识与分阶段体检入口](project/Ascend-Optimization-v1/tools/profiling/hgkda/README.md)，评测继续使用 KGS。以下四项属于上一阶段已完成成果。
 
 四算子的[统一工作流](project/Ascend-Optimization-v1/tools/profiling/四算子工作流.md)已完成本阶段验证与交付：历史最佳源码复现为 logaddexp2 1.262×、amin 0.934×、矩阵乘 0.889×、narrow_copy 1.105×，均完整通过并完成两次复验。从明确优化前源码调用 CC+DeepSeek 的四项生成实验也已完成，3 项在最终复验中取得有效提升；失败和未采纳代码保留。生成成绩、起点与方法见[最终交付](project/Ascend-Optimization-v1/operators/四算子工作流交付-20261014.md)和[最新进展](project/Ascend-Optimization-v1/operators/四算子工作流进展-20261014.md)。源码复验与方法生成分别记账，数值 Roofline 尚未建立。历史成绩保留如下。
@@ -58,10 +60,10 @@ square 的 KG+KGS 烟雾测试已完成，记录见 [烟雾测试归档](project
 
 ### 第 1 步：筛选并固定正式对象
 
-1. 读取 [验收看板](project/Ascend-Optimization-v1/验收看板_结果表.xlsx)华为 Ascend910B 列，筛选有效加速比低于 0.8× 的算子；精度失败、无有效计时的记录不进入优化。
+1. 当前按[会议指定清单](project/Ascend-Optimization-v1/operators/下一阶段计划-20261015.md)推进十项 Excel 算子与五项 FlagGems-sglang 候选；同时记录 Excel 精度状态与加速比。指定的精度失败、无有效计时对象先修正确性或补齐评测，不再按上一阶段规则排除。
 2. 本轮固定 FlagGems `master` 提交 `d6a8eec473517a3d68157b208eb9c057eb1d4c50`，源码已纳入 `third_party/FlagGems/`，逐文件 SHA 见 `manifests/flaggems-master-files.json`。下一轮更新上游时重新固定提交，不静默追随 master。
 3. 在 `operators/<算子>/` 建立一个入口 README，记录 Excel 行号与数值、上游提交、实际调用实现、shape、dtype 和完整 workload。
-4. 复测 master 的正确性和性能。若在相同评测范围已超过 0.8×，记录原因后选下一项；正确性失败的对象不进入本轮性能优化。
+4. 固定 FlagTree 和 FlagGems 后复测正确性与性能；两者的版本身份见[锁定清单](manifests/hgkda-stage2.lock.json)。正确性失败先修复，完整通过后再报告有效性能；是否继续优化由本阶段指定任务决定。
 
 ### 第 2 步：走通 Definition 与基线
 
@@ -73,7 +75,7 @@ square 的 KG+KGS 烟雾测试已完成，记录见 [烟雾测试归档](project
 
 给 CC 的启动提示词可用下列模板，替换算子名、提交与环境参数：
 
-> 请先阅读 docs/ONBOARDING.md 和 docs/design/workflows/operator_optimization.md。从 kernelgen_server/data/flaggems-adapter-definitions 中使用指定算子的 Definition，完成 kg definition 和 kg run。优化对象来自验收看板华为列低于 0.8× 的算子，FlagGems 使用指定 master 提交。先复测完整正确性与基线，再优化性能；记录设备、Catalog、KGS 地址、模型、预算、候选源码和逐 case 结果，使用新的独立工作区。
+> 请先阅读 docs/ONBOARDING.md 和 docs/design/workflows/operator_optimization.md。从 kernelgen_server/data/flaggems-adapter-definitions 中使用指定算子的 Definition，完成 kg definition 和 kg run。优化对象使用会议指定清单，FlagGems 与 FlagTree 使用阶段锁定版本。先复测完整正确性与基线，再优化性能；记录设备、Catalog、KGS 地址、模型、预算、候选源码和逐 case 结果，使用新的独立工作区。
 
 ### 第 3 步：完成 KG 两组对照
 

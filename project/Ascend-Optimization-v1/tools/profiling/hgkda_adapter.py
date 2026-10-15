@@ -42,6 +42,41 @@ def instruction_hotspots(listing, source, *, count=12):
             'status': 'matched' if selected else 'no_candidate_kernel_match'}
 
 
+def render_staged(report):
+    lines = ['\n## HG-KDA 分阶段体检', '',
+             '流水比例用于提出检查方向；当前未建立数值 Roofline。']
+    for case in report.get('cases', []):
+        item = case.get('hgkda', {})
+        lines.extend(['', '### ' + case['case_id'], '',
+                      '算子类型：' + item.get('operator_type', 'unknown') +
+                      '；阶段：' + item.get('stage', 'unknown') + '。'])
+        for hypothesis in item.get('hypotheses', []):
+            lines.append('- ' + hypothesis['metric'] + '=' + str(hypothesis['value']) +
+                         '：' + hypothesis['action'] + '。')
+        for collection in item.get('requested_collections', []):
+            lines.append('- 待采集 ' + collection['level'] + '：' + collection['reason'] + '。')
+        for limitation in item.get('limitations', []):
+            lines.append('- ' + limitation + '。')
+        if item.get('knowledge'):
+            lines.extend(['', '知识入口：' + '、'.join(item['knowledge']) + '。'])
+    return '\n'.join(lines) + '\n'
+
+
+def check_supplementary(operator, candidate, directory, *, run):
+    if operator != 'rad2deg_':
+        return None
+    result_path = directory / 'supplementary-semantics.json'
+    if not result_path.exists():
+        run([sys.executable, str(ROOT / 'scripts/check_rad2deg.py'),
+             '--source', str(candidate), '--output', str(result_path)],
+            directory / 'supplementary-semantics.log', timeout=600)
+    result = json.loads(result_path.read_text(encoding='utf-8'))
+    if (result.get('status') != 'PASSED' or len(result.get('cases', [])) != 21
+            or result.get('source_sha256') != hashlib.sha256(candidate.read_bytes()).hexdigest()):
+        raise ValueError('补充原地语义检查未完整通过或源码身份不匹配')
+    return str(result_path)
+
+
 def analyze_staged(report, evaluation, directory, server, *, workflow, run, assert_idle, call):
     service = call(server, '/status', timeout=30)
     policy.enrich(report, service)
@@ -55,7 +90,9 @@ def analyze_staged(report, evaluation, directory, server, *, workflow, run, asse
         if metric is None:
             continue
         upgraded = True
-        output = directory / 'instruction' / case['case_id']
+        # KGS case_id 可包含 /、::，不能直接作为跨平台证据文件名。
+        case_key = hashlib.sha256(case['case_id'].encode()).hexdigest()[:20]
+        output = directory / 'instruction' / ('case-' + case_key)
         response_path = output / 'response.json'
         if output.exists() and not response_path.exists():
             raise RuntimeError('指令请求已有目录但结果未知，停止自动重发：' + str(output))
@@ -69,7 +106,7 @@ def analyze_staged(report, evaluation, directory, server, *, workflow, run, asse
                      '--inspect', str(request_path.parent / 'inspect.json'),
                      '--case-id', case['case_id'], '--output', str(output),
                      '--server', server, '--level', 'instruction', '--timeout', '900'],
-                    directory / ('instruction-' + case['case_id'] + '.log'), timeout=1200)
+                    directory / ('instruction-' + case_key + '.log'), timeout=1200)
             response = json.loads(response_path.read_text(encoding='utf-8'))
             request = json.loads((output / 'request.json').read_text(encoding='utf-8'))
             metric_request = json.loads(Path(metric['request']).read_text(encoding='utf-8'))

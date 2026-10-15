@@ -11,6 +11,7 @@ flock -n 8 || { echo '物理卡7已有本项目任务，停止重复启动'; exi
 docker exec -i -e HGKDA_BATCH="$hgkda_batch" tle_yy bash -s <<'RUN'
 set -euo pipefail
 source /usr/local/Ascend/cann-9.0.0/set_env.sh
+export PYTHONPATH=/data/hanle/ascend-optimization/Ascend-Optimization/third_party/FlagGems/src
 p=/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1
 py=/usr/local/python3.11.15/bin/python3.11
 out="$p/operators/rad2deg_/reports/hgkda-$HGKDA_BATCH"

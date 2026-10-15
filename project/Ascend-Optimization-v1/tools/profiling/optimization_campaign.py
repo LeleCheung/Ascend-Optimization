@@ -237,7 +237,10 @@ def profile_best(operator, evaluation, directory, server, count, *, timing_scope
             report, evaluation, directory, server, workflow=workflow, run=run,
             assert_idle=assert_card_idle, call=call)
     save(directory / 'diagnosis.json', report)
-    (directory / '诊断.md').write_text(workflow.render(report), encoding='utf-8')
+    rendered = workflow.render(report)
+    if hgkda:
+        rendered += hgkda_adapter.render_staged(report)
+    (directory / '诊断.md').write_text(rendered, encoding='utf-8')
     return report
 
 
@@ -554,6 +557,9 @@ def main():
                     save(directory / 'proposal.json', {k: v for k, v in proposal.items() if k != 'source'})
                 row.update(json.loads((directory / 'proposal.json').read_text(encoding='utf-8')))
                 row['source_sha256'] = digest(candidate.read_text(encoding='utf-8'))
+                if a.hgkda:
+                    row['supplementary_semantics'] = hgkda_adapter.check_supplementary(
+                        a.operator, candidate, directory, run=run)
                 result_path = directory / 'evaluation/trial-1.result.json'
                 state.update(stage='evaluating')
                 save(state_path, state)

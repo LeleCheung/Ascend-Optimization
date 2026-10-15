@@ -91,7 +91,7 @@ def diagnose_case(case: dict, *, levels=('metrics',), capabilities=()) -> dict:
         refs.append('性能指标/搬运与执行路径.md')
     if evidence_categories & {'vector_compute', 'cube_compute', 'control'}:
         refs.append('性能指标/计算与控制.md')
-    if complex_path or overlap:
+    if complex_path or overlap or needs_instruction or instruction_verified:
         refs.append('性能指标/指令与同步.md')
     return {
         'schema_version': '1.0', 'operator': operator, 'operator_type': kind,
