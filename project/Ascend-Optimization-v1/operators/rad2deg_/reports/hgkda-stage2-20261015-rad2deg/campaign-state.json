@@ -1,0 +1,59 @@
+{
+  "operator": "rad2deg_",
+  "seed_sha256": "f9545e1e3a2ebb98a6716d82cee1b70d797e30b7626b2c40e6919803582b7391",
+  "status": "completed",
+  "history": [
+    {
+      "round": 1,
+      "parent_result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/rad2deg_/reports/hgkda-stage2-20261015-rad2deg/seed-evaluation/seed-1.result.json",
+      "parent_score": 0.2527657656631712,
+      "hypothesis": "修改对象是唯一的 triton kernel rad2deg_func_kernel_rank_1（由 pointwise_dynamic 自动生成）以及它的调用参数：原实现走 pointwise_dynamic，本身对每个输出元素做 full-tensor 拉平索引，我改成自写的 _rad2deg_kernel，用 EVEN/ITERS 分支 + 有界 grid + grid-stride 循环覆盖全部元素。\n\n关键依据是 float16::2(4096x4096, 16.7M 元素) 的真机 msprof：aiv_mte2_ratio=0.8615、aiv_mte3_ratio=0.9585、aiv_vec_ratio 仅 0.3245、aiv_scalar_ratio 0.26，说明搬入/搬出流水几乎全程活跃而 Vector 计算只占三分之一，时间不在乘 57.29 上，而在搬运与寻址；float16::3(64x512x512, 同样 16.7M) 指标一致，说明与 shape 无关、只随元素量走。原实现同时存在两类浪费：(1) 用 numel>2^31 的 int64 索引，1024^3 与 2^30 的用例必须做 64 位地址运算，scalar/地址开销被放大；(2) 每 program 只处理一小块、program 数按元素量线性增长，承载不了 16.7M 以上的数据，1024^3（1.07e9）和 2^30 这类大 case 上候选 13014us vs 3599us、21278us vs 7207us 的巨大差距就是调度与寻址开销随 program 数膨胀的直接表现。\n\n改动点：小 case 仍保持 EVEN 快路径不引入 mask（64x64=4096 元素，block 取 1024、iters 4、grid 兜底到 4096 以内，与旧行为同数量级），大 case 用 grid-stride，每个 program 连续处理 ITERS*BLOCK 个元素、跨步为 num_programs*BLOCK，元素数在 host 端选路保证整除时走无 mask 的向量化 load/store，非整除回退带 mask 分支。预期改善的慢 case：float16/float32 的 4096x4096 与 64x512x512（190~218us，目标降到与 pytorch 17~29us 同量级）、以及 2^30 与 1024^3 的超大 case（13~21ms，主要收益来自 program 数下降与地址复用）。\n\n注意：EVEN 分支的整除性只由 host 端 _plan 在运行时确认，非整除走 mask 分支，不假设任何公开 shape 一定整除；保留原地语义（rad2deg_ 直接读写 A 的存储并返回 A 本身），保留所有 dtype（float16/bfloat16/float32 统一走 float32 中间精度，与旧公式逐位一致），保留非连续输入的 stride 语义（非连续时先 contiguous，避免用错误线性索引原地改写），grid 各维严格保持在 1..65535。",
+      "expected_effect": "float16/float32 的单个 4096x4096 与 64x512x512（16.7M 元素）case 从约 190~218us 降到接近 pytorch 的 17~29us 区间，speedup 从 0.09~0.13 提升到 0.6~1.0 量级；2^30 与 1024^3 的超大 case（13~21ms）因 program 数从百万级降到 2048~32768 且寻址复用，预期明显下降，但这部分依赖 910B4 上大 BLOCK 与多 ITERS 的实际编译与 DMA 切分表现，能否追平 pytorch 不做保证，需完整编译与正式计时验证；64x64 小 case（1.18~1.19us，已略快于 pytorch）保持不变，不作为收益来源。",
+      "source_sha256": "a910953f3a7ef9ec1bc01797d83a3154f57f3ed3f7edf3bab294e9d67bc11d72",
+      "status": "PASSED",
+      "score": 0.8024126718560453,
+      "result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/rad2deg_/reports/hgkda-stage2-20261015-rad2deg/round-01/evaluation/trial-1.result.json",
+      "accepted": true
+    },
+    {
+      "round": 2,
+      "parent_result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/rad2deg_/reports/hgkda-stage2-20261015-rad2deg/round-01/evaluation/trial-1.result.json",
+      "parent_score": 0.8024126718560453,
+      "hypothesis": "修改对象是唯一 Triton kernel _rad2deg_kernel 的分块常量与其分块选择函数 _plan/_launch 的参数，而不是重写索引结构（grid-stride + 有界 grid 是 round-01 已采纳的改动，本轮不重复当作新优化）。\n\n依据本轮 float16::2(4096x4096, 16.7M) 的模拟器指令热点：22 次循环里 WAIT_FLAG(VEC<-MTE3, FLAGID 0) 17.03us 是最大单项，BAR(ALL) 25.61us，MOV_SRC_TO_DST_ALIGN 在 MTE2/MTE3 各 22 次共约 16us，而 B16 的整块搬运 XM:X1=0x80000010（128B）在 0.5 元素/字节的量级上切得过碎。同时真机指标 aiv_vec_ratio 只有 0.34、aiv_mte2 0.23、aiv_mte3 0.21、aiv_scalar 0.21——没有任何一条流水接近饱和，说明时间被大量同步/切分开销摊掉，而不是被算力或带宽限住。\n\n当前 _plan 对 float16 从 block=1024 起步，16.7M 元素的 4096x4096 用例只把 block 升到 4096 就在 while 条件上停住（n%(block*2)==0 但 block*2*2<=n 的循环边界使它提前终止），iters 被拉到 1024，于是成为 block=4096、iters=1024、grid=4 的形状：只有 4 个 program 在 22 个 core 上跑，负载明显不均，这正是 4096x4096 三个 dtype 的 case 一致停在 39~65us、只有 pytorch 的 0.43~0.70 的直接原因（float16 39.4us vs 16.9us、bfloat16 39.7us vs 19.1us、float32 65.6us vs 45.7us）。\n\n改动点具体为：(1) block 不再从 1024 逐级爬升，而是按元素宽度直接给定——float32 取 2048、float16/bfloat16 取 4096，两个值都让 block*elem_size 恰好是 8KB/8KB（float16 的 4096*2B=8192B）的 64B 对齐整块，避免 128B 级别的碎搬运和随之而来的 BAR/WAIT_FLAG；(2) 让 block*iters 严格对齐 64B，非完全的尾部仍由 EVEN=0 的 mask 分支保护，整除性只在 host 端运行时确认，不假设任何公开 shape 一定整除；(3) 修正原 _launch_kernel_out/rad2deg 里 src 与 dst 混用同一指针的旧写法（原实现把 dst 传给 kernel 且只在两者都连续时才生效，else 分支 dst.copy_(src) 反而把源数据覆盖成未计算值），统一为对 A 原地计算后用 out.copy_(A) 填充返回值，dtype/shape/返回值语义与原地 A 的修改语义均保持。\n\n预期改善的 case：float16::2(4096x4096)、float16::3(64x512x512)、bfloat16::2、bfloat16::3 这四个 16.7M 元素用例，以及元素量更大的 2^30 与 1024^3 用例（grid 上限 32768 保持不变，block 变大后每 program 处理 8KB 对齐块，搬运切分次数显著下降）。64x64 小用例继续走 block=2 次幂、iters=1、grid 兜底的小路径，不作为收益来源。",
+      "expected_effect": "4096x4096 与 64x512x512（16.7M 元素）的 float16/bfloat16 case 从当前 39~40us 向 pytorch 的 16.7~19.1us 靠拢，speedup 从 0.42~0.48 提升到 0.7~1.0 量级；float32 的 4096x4096 与 64x512x512 从 40~66us 向 28.8~45.7us 靠拢；2^30 与 1024^3 的大 case 因对齐整块搬运带来的切分与同步下降而小幅改善（当前 3671~7383us，与 pytorch 基本持平，不承诺反超）。64x64 三个 dtype（0.94~1.03us，已快于 pytorch）保持不退化。以上均为基于指令热点与现有指标的方向性预期，910B4 上 num_warps=4/num_stages=2 与 block 8KB 的实际编译结果、DMA 切分与流水重叠必须由完整编译、正确性验证和正式计时确认，不能只凭本推理判定收益。",
+      "source_sha256": "dc64099f5e7b9ec2f9dbb1c1407399c31fcc9ea417335778bd7fad66f6eaf8b4",
+      "status": "PASSED",
+      "score": 0.5243867294455171,
+      "result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/rad2deg_/reports/hgkda-stage2-20261015-rad2deg/round-02/evaluation/trial-1.result.json",
+      "accepted": false
+    }
+  ],
+  "best": {
+    "result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/rad2deg_/reports/hgkda-stage2-20261015-rad2deg/round-01/evaluation/trial-1.result.json",
+    "score": 0.8024126718560453
+  },
+  "configuration": {
+    "server": "http://127.0.0.1:19655",
+    "model": "deepseek-flash",
+    "claude": "/data/hanle/ascend-optimization/runtime/kg-controller/claude",
+    "profile_cases": 2,
+    "knowledge_sha256": "eeb615ce767cd683373ea6b1ddcf022b43ed9a43e506bf15fd58a39d4d17b5cd",
+    "hgkda_policy_sha256": "e51de7ac044870b83730c9724c310aff33a340618ee813c265eb56be59dce6e2",
+    "generation_noop_guard": true,
+    "knowledge_snapshot_required": true,
+    "provider_thinking": "disabled",
+    "provider_base_url": "https://api.deepseek.com/anthropic",
+    "generation_format": "plain-json"
+  },
+  "repo_commit": "5b6d66a25c4e9505269d8a98249505ff37422a1c",
+  "current_error": null,
+  "seed_result": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/rad2deg_/reports/hgkda-stage2-20261015-rad2deg/seed-evaluation/seed-1.result.json",
+  "current_round": 2,
+  "stage": "completed",
+  "final_scores": [
+    0.803772011718273,
+    0.8031797036228524
+  ],
+  "final_score": 0.8031797036228524,
+  "final_source_sha256": "a910953f3a7ef9ec1bc01797d83a3154f57f3ed3f7edf3bab294e9d67bc11d72"
+}

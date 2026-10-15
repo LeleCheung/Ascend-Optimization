@@ -1,0 +1,25 @@
+{
+  "api_version": "v6.2",
+  "binding": {
+    "catalog_name": "flaggems-adapter-definitions",
+    "definition": "rad2deg_"
+  },
+  "implementation": {
+    "name": "rad2deg_-hgkda-reviewed-1",
+    "definition": "rad2deg_",
+    "language": "triton",
+    "entrypoint": "main.py::run",
+    "sources": [
+      {
+        "path": "main.py",
+        "content": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n# 基于 CC 首轮候选，Codex 修复原地别名、掩码覆盖和大索引语义；性能分块保持原候选。\nimport logging\nimport torch\nimport triton\nimport triton.language as tl\nlogger = logging.getLogger(__name__)\n_RAD2DEG = 57.29577951308232\n_MIN_GRID = 2048\n_MAX_GRID = 32768\n_TARGET_ELEMS_PER_PROGRAM = 4096\n\ndef _numel(x):\n    n = 1\n    for s in x.shape:\n        n *= s\n    return n\n\n@triton.jit\ndef _rad2deg_kernel(x_ptr, n_elements, BLOCK: tl.constexpr, EVEN: tl.constexpr, ITERS: tl.constexpr, USE_INT64: tl.constexpr):\n    pid = tl.program_id(0)\n    num_progs = tl.num_programs(0)\n    if USE_INT64:\n        pid = pid.to(tl.int64)\n        num_progs = num_progs.to(tl.int64)\n    offs = tl.arange(0, BLOCK)\n    if USE_INT64:\n        offs = offs.to(tl.int64)\n    total = num_progs * BLOCK\n    if EVEN:\n        base = pid * BLOCK\n        for _ in tl.static_range(ITERS):\n            off = base + offs\n            x = tl.load(x_ptr + off)\n            y = (x.to(tl.float32) * 57.29577951308232).to(x.dtype)\n            tl.store(x_ptr + off, y)\n            base += total\n    else:\n        for i in range(0, ITERS):\n            off = pid * BLOCK + i * total + offs\n            mask = off < n_elements\n            x = tl.load(x_ptr + off, mask=mask)\n            y = (x.to(tl.float32) * 57.29577951308232).to(x.dtype)\n            tl.store(x_ptr + off, y, mask=mask)\n\ndef _plan(n):\n    block = 1024\n    iters = 1\n    while block <= 8192 and n % (block * 2) == 0 and (block * 2 * 2 <= n):\n        block *= 2\n    while block * (iters + 1) * 4 <= n and iters < 1024:\n        iters += 1\n    grid = (n + block * iters - 1) // (block * iters)\n    if grid < _MIN_GRID:\n        grid = min(_MIN_GRID, max(1, (n + block - 1) // block))\n    if grid > _MAX_GRID:\n        grid = _MAX_GRID\n    while iters > 1 and grid * block * (iters - 1) >= n:\n        iters -= 1\n    return (int(block), int(iters), int(grid))\n\ndef _launch(x):\n    n = _numel(x)\n    if n == 0:\n        return\n    block, iters, grid = _plan(n)\n    even = n == grid * block * iters\n    _rad2deg_kernel[grid,](x, n, BLOCK=block, EVEN=even, ITERS=iters, USE_INT64=(n > 2147483647), num_warps=4, num_stages=2)\n\n@triton.jit\ndef _rad2deg_strided(x_ptr, N: tl.constexpr, SHAPE: tl.constexpr,\n                     STRIDES: tl.constexpr, BLOCK: tl.constexpr):\n    for start in range(tl.program_id(0) * BLOCK, N, tl.num_programs(0) * BLOCK):\n        logical = start.to(tl.int64) + tl.arange(0, BLOCK).to(tl.int64)\n        remaining = logical\n        physical = tl.full((BLOCK,), 0, tl.int64)\n        for axis in tl.static_range(len(SHAPE) - 1, -1, -1):\n            physical += (remaining % SHAPE[axis]) * STRIDES[axis]\n            remaining = remaining // SHAPE[axis]\n        value = tl.load(x_ptr + physical, logical < N, other=0)\n        result = (value.to(tl.float32) * 57.29577951308232).to(value.dtype)\n        tl.store(x_ptr + physical, result, logical < N)\n\n\ndef rad2deg_(A):\n    logger.debug('GEMS RAD2DEG_')\n    if A.dtype not in (torch.float16, torch.bfloat16, torch.float32):\n        raise TypeError('rad2deg_ requires a supported floating dtype')\n    if A.numel() == 0:\n        return A\n    if not A.is_contiguous():\n        if any(size > 1 and stride == 0 for size, stride in zip(A.shape, A.stride())):\n            raise RuntimeError('in-place rad2deg_ does not support overlapping expanded views')\n        _rad2deg_strided[(min(4096, triton.cdiv(A.numel(), 256)),)](\n            A, A.numel(), tuple(A.shape), tuple(A.stride()), 256)\n        return A\n    _launch(A)\n    return A\nrun = rad2deg_\n"
+      }
+    ]
+  },
+  "settings": {
+    "warmup_ms": 1000,
+    "benchmark_ms": 100,
+    "num_trials": 3,
+    "timeout_seconds": 1800
+  }
+}
