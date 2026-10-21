@@ -1,0 +1,25 @@
+{
+  "api_version": "v6.2",
+  "binding": {
+    "bundle_id": "sha256:e80b0617a6faecd1995477f9e58651176dcd1ede7a648dc04eb3d0bef7595798",
+    "definition": "per_token_quant_int8"
+  },
+  "implementation": {
+    "name": "per_token_quant_int8-FlagGems-1",
+    "definition": "per_token_quant_int8",
+    "language": "triton",
+    "entrypoint": "main.py::run",
+    "sources": [
+      {
+        "path": "main.py",
+        "content": "# Copyright 2026, The FlagOS Contributors.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\")\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#       http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef _per_token_quant_int8(\n    x_ptr, q_ptr, s_ptr, N: tl.constexpr, BLOCK_N: tl.constexpr\n):\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_N)\n    if N == BLOCK_N:\n        x = tl.load(x_ptr + row * N + offs).to(tl.float32)\n    else:\n        x = tl.load(x_ptr + row * N + offs, mask=offs < N, other=0.0).to(\n            tl.float32\n        )\n    amax = tl.maximum(tl.max(tl.abs(x), axis=0), 1.0e-10)\n    scale = amax / 127.0\n    inv = 127.0 / amax\n    q = tl.clamp(x * inv, -128.0, 127.0).to(tl.int8)\n    if N == BLOCK_N:\n        tl.store(q_ptr + row * N + offs, q)\n    else:\n        tl.store(q_ptr + row * N + offs, q, mask=offs < N)\n    tl.store(s_ptr + row, scale)\n\n\ndef per_token_quant_int8(x):\n    M, N = x.shape\n    q = torch.empty_like(x, dtype=torch.int8)\n    scales = torch.empty((M, 1), device=x.device, dtype=torch.float32)\n    block = 1 << (N - 1).bit_length()\n    _per_token_quant_int8[(M, 1, 1)](\n        x,\n        q,\n        scales,\n        N=N,\n        BLOCK_N=block,\n        num_warps=8,\n        num_stages=1,\n    )\n    return q, scales\n\n\n__all__ = [\"per_token_quant_int8\"]\n\nrun = per_token_quant_int8\n"
+      }
+    ]
+  },
+  "settings": {
+    "warmup_ms": 1000,
+    "benchmark_ms": 100,
+    "num_trials": 3,
+    "timeout_seconds": 1800
+  }
+}

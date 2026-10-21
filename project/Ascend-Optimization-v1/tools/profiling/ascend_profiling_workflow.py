@@ -264,6 +264,13 @@ def analyze(operator: str, source_path: Path, eval_path: Path, eval_request_path
     if evaluated_hash != source_hash or evaluated.get("status") != "PASSED":
         raise ValueError("正式评测未通过或候选源码 SHA 不匹配")
     fingerprint = inspect.get("benchmark_fingerprint")
+    # Native结果不重复携带axes，从冻结的case-list读取，保留原始评测JSON。
+    contract_cases = {case['case_id']: case for case in inspect['case_list']['cases']}
+    for row in evaluated.get('per_workload', []):
+        if row.get('phase') == 'timing' and not row.get('axes'):
+            case = contract_cases.get(row['uuid'], {})
+            row['axes'] = {'dtype': case.get('dtype'), 'shape_detail': case.get('shape'),
+                           'params': case.get('params', {})}
     if not fingerprint:
         raise ValueError("inspect 缺少 benchmark_fingerprint")
     timing = {row["uuid"]: row for row in evaluated.get("per_workload", [])

@@ -124,7 +124,7 @@ def check_pending_evaluation(output, label, repeats):
 
 
 def evaluate(operator, source, output, label, server, repeats=1, *, offline=False,
-             timing_scope='device_kernel'):
+             timing_scope='device_kernel', catalog='flaggems-adapter-definitions', operator_dir=None):
     check_pending_evaluation(output, label, repeats)
     existing = [output / f'{label}-{index}.result.json' for index in range(1, repeats + 1)]
     if all(path.exists() for path in existing):
@@ -144,7 +144,8 @@ def evaluate(operator, source, output, label, server, repeats=1, *, offline=Fals
     run([sys.executable, str(EVAL_TOOLS / 'evaluate-operator.py'),
          '--operator', operator, '--source', str(source), '--output', str(output),
          '--label', label, '--server', server, '--repeats', str(repeats),
-         '--timeout', '1800', '--timing-scope', timing_scope],
+         '--timeout', '1800', '--timing-scope', timing_scope, '--catalog', catalog]
+        + (['--operator-dir', str(operator_dir)] if operator_dir else []),
         output.parent / (output.name + '.log'), timeout=4000 * repeats)
     return output / (label + '-1.result.json')
 
@@ -170,10 +171,12 @@ def prefixes(source):
 def profile_best(operator, evaluation, directory, server, count, *, timing_scope='device_kernel', hgkda=False):
     loaded, _ = checked(evaluation)
     rows = sorted(loaded['timing'].values(), key=lambda r: r['speedup'])
+    inspection_data = json.loads((evaluation.parent / 'inspect.json').read_text(encoding='utf-8'))
+    contract_cases = {case['case_id']: case for case in inspection_data['case_list']['cases']}
     # 相同 dtype/shape 的重复 benchmark case 不占用新的采集名额。
     selected, seen = [], set()
     for row in rows:
-        key = json.dumps(row.get('axes'), sort_keys=True)
+        key = json.dumps(row.get('axes') or contract_cases[row['uuid']].get('params'), sort_keys=True)
         if key in seen:
             continue
         seen.add(key)
@@ -381,9 +384,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--operator', required=True)
     parser.add_argument('--seed', type=Path, required=True)
+    parser.add_argument('--catalog', default='flaggems-adapter-definitions')
+    parser.add_argument('--operator-dir', type=Path, help='独立Native合同，与原生KG使用相同bundle')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--server', default='http://127.0.0.1:19655')
-    parser.add_argument('--timing-scope', choices=('device_kernel', 'device_task'),
+    parser.add_argument('--timing-scope', choices=('device_kernel', 'device_task', 'walltime'),
                         default='device_kernel', help='narrow_copy混合DMA实现须使用device_task')
     parser.add_argument('--claude', default='/data/hanle/ascend-optimization/runtime/kg-controller/claude')
     # 宿主包装器会把别名 deepseek-flash 映射到实际 DeepSeek 配置；直接传
@@ -433,6 +438,12 @@ def main():
         configuration = {'server': a.server, 'model': a.model, 'claude': a.claude,
                          'profile_cases': a.profile_cases,
                          'knowledge_sha256': digest(knowledge)}
+        if a.catalog != 'flaggems-adapter-definitions' or a.operator_dir:
+            configuration['catalog'] = a.catalog
+            if a.operator_dir:
+                configuration['operator_contract'] = {
+                    p.relative_to(a.operator_dir).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+                    for p in sorted(a.operator_dir.rglob('*')) if p.is_file() and '__pycache__' not in p.parts}
         if a.hgkda:
             import hgkda_adapter
             configuration['hgkda_policy_sha256'] = hgkda_adapter.fingerprint()
@@ -480,7 +491,7 @@ def main():
         else:
             seed_dir = a.output / 'seed-evaluation'
             seed_result = evaluate(a.operator, a.seed, seed_dir, 'seed', a.server,
-                                   timing_scope=a.timing_scope)
+                                   timing_scope=a.timing_scope, catalog=a.catalog, operator_dir=a.operator_dir)
             contract, score = checked(seed_result)
             state.update(seed_result=str(seed_result), best={'result': str(seed_result), 'score': score})
             save(state_path, state)
@@ -565,7 +576,7 @@ def main():
                 save(state_path, state)
                 if not result_path.exists():
                     evaluate(a.operator, candidate, directory / 'evaluation', 'trial', a.server,
-                             timing_scope=a.timing_scope)
+                             timing_scope=a.timing_scope, catalog=a.catalog, operator_dir=a.operator_dir)
                 result, score = checked(result_path, contract)
                 row.update(status='PASSED', score=score, result=str(result_path))
                 if score > state['best']['score'] * 1.005:
@@ -610,7 +621,7 @@ def main():
         final_source = a.output / 'final.py'
         final_source.write_bytes(req['implementation']['sources'][0]['content'].encode())
         evaluate(a.operator, final_source, final_dir, 'final', a.server, repeats=2,
-                 timing_scope=a.timing_scope)
+                 timing_scope=a.timing_scope, catalog=a.catalog, operator_dir=a.operator_dir)
         final_scores = [checked(final_dir / f'final-{i}.result.json', contract)[1] for i in (1, 2)]
         state.update(status='completed', stage='completed', final_scores=final_scores,
                      final_score=min(final_scores), final_source_sha256=digest(final_source.read_text(encoding='utf-8')))

@@ -1,0 +1,238 @@
+{
+  "request": {
+    "api_version": "v6.2",
+    "evaluation_id": "2b392f28b86ec6343f1ca4a1b33b27edb31ac96a1a509ec7b636b16d90494421:round-2",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:86f4c5cc9ca970a7533ea91e9bf45484fe103e9c40341c7409ac63309a13c987",
+      "definition": "moe_sum_reduce"
+    },
+    "implementation": {
+      "name": "kernelgen-candidate-moe_sum_reduce",
+      "definition": "moe_sum_reduce",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef _moe_sum_reduce_kernel(\n    input_ptr,\n    output_ptr,\n    routed_scaling_factor,\n    NTOK: tl.constexpr,\n    NHID: tl.constexpr,\n    TOPK: tl.constexpr,\n    BLOCK_M: tl.constexpr,\n    BLOCK_N: tl.constexpr,\n    EVEN: tl.constexpr,\n):\n    offs_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)\n    offs_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)\n    base = input_ptr + offs_m[:, None] * (TOPK * NHID) + offs_n[None, :]\n    out_ptrs = output_ptr + offs_m[:, None] * NHID + offs_n[None, :]\n    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\n    if EVEN:\n        for k in range(TOPK):\n            acc += tl.load(base + k * NHID).to(tl.float32)\n        tl.store(out_ptrs, acc * routed_scaling_factor)\n    else:\n        mask = (offs_m[:, None] < NTOK) & (offs_n[None, :] < NHID)\n        for k in range(TOPK):\n            acc += tl.load(base + k * NHID, mask=mask, other=0.0).to(tl.float32)\n        tl.store(out_ptrs, acc * routed_scaling_factor, mask=mask)\n\n\n_CONFIGS = {}\n\n\ndef _make_config(num_tokens, hidden_dim):\n    block_n = 1024\n    while block_n > 1 and hidden_dim % block_n:\n        block_n >>= 1\n    block_m = 16\n    while block_m > 1 and num_tokens % block_m:\n        block_m >>= 1\n    even = (hidden_dim % block_n == 0) and (num_tokens % block_m == 0)\n    if num_tokens > 512:\n        warps, stages = 4, 2\n    else:\n        warps, stages = 4, 1\n    grid = (\n        (num_tokens + block_m - 1) // block_m,\n        (hidden_dim + block_n - 1) // block_n,\n    )\n    cfg = (block_m, block_n, warps, stages, even, grid)\n    _CONFIGS[(num_tokens, hidden_dim)] = cfg\n    return cfg\n\n\ndef moe_sum_reduce(input: torch.Tensor, routed_scaling_factor: float) -> torch.Tensor:\n    num_tokens, top_k, hidden_dim = input.shape\n    if not input.is_contiguous():\n        input = input.contiguous()\n    output = torch.empty(\n        (num_tokens, hidden_dim), dtype=input.dtype, device=input.device\n    )\n    cfg = _CONFIGS.get((num_tokens, hidden_dim))\n    if cfg is None:\n        cfg = _make_config(num_tokens, hidden_dim)\n    block_m, block_n, warps, stages, even, grid = cfg\n    _moe_sum_reduce_kernel[grid](\n        input,\n        output,\n        routed_scaling_factor,\n        num_tokens,\n        hidden_dim,\n        top_k,\n        block_m,\n        block_n,\n        even,\n        num_warps=warps,\n        num_stages=stages,\n    )\n    return output\n\n\n__all__ = [\"moe_sum_reduce\"]\n\nrun = moe_sum_reduce\n"
+        }
+      ]
+    },
+    "benchmark_fingerprint": "sha256:f971d2f2b1519dec0031793fda97b692476776342143dbbd0a6aa28c058c5329",
+    "case_id": "sglang_moe_sum_reduce-00002-timing",
+    "expected_backend": "npu",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "identity": {
+      "solution_sha256": "f9fff605fcdd834bae26008521efd331194da3e04f0d179d1caa34ee924d355d",
+      "workload_sha256": "fdc33c53087c5231fc5180fd7c4ff1e8fdbf15f6e728df03b166c564245a8ed7"
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "profile_id": "65595bc023414e0a8f39b1adb20256e7",
+    "created_at": "2026-10-21T17:08:08.399751+00:00",
+    "status": "completed",
+    "backend": "npu",
+    "profiler": "msprof",
+    "device": "npu:0",
+    "hardware": {
+      "target": {
+        "backend": "ascend",
+        "vendor": "huawei",
+        "device": "Ascend910B4-1",
+        "architecture": "dav-c220-cube",
+        "devices": [
+          {
+            "logical_device": "npu:0",
+            "device_id": 0,
+            "name": "Ascend910B4-1",
+            "l2_cache_size": 176160768,
+            "num_sm": 20,
+            "compute_capability": "",
+            "total_memory": 65452113920
+          }
+        ]
+      },
+      "software": {
+        "language": "triton",
+        "language_version": "3.5.1",
+        "compiler": "flagtree",
+        "compiler_version": "0.6.0+ascend.gitc286cba6",
+        "runtime": "cann",
+        "runtime_version": "9.0.0",
+        "driver_version": "25.2.0"
+      },
+      "metadata": {
+        "complete": true,
+        "missing": [],
+        "sources": {
+          "target.backend": "server configuration",
+          "target.vendor": "server configuration",
+          "software.language": "server configuration",
+          "software.compiler": "python package metadata",
+          "software.runtime": "server configuration",
+          "target.device": "device probe",
+          "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+          "software.language_version": "triton module metadata",
+          "software.compiler_version": "python package metadata",
+          "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+          "software.driver_version": "/usr/local/Ascend/driver/version.info"
+        }
+      }
+    },
+    "evaluation_id": "2b392f28b86ec6343f1ca4a1b33b27edb31ac96a1a509ec7b636b16d90494421:round-2",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "capabilities": [
+      "performance_counters",
+      "kernel_profile",
+      "pipeline_utilization",
+      "execution_timeline"
+    ],
+    "summary": {
+      "avg_time_us": 7.383,
+      "operation_count": 1,
+      "top_operations": [
+        {
+          "op_name": "_moe_sum_reduce_kernel",
+          "op_type": "_moe_sum_reduce_kernel",
+          "task_type": "AI_VECTOR_CORE",
+          "measured_invocations": 100,
+          "total_duration_us": 738.297,
+          "avg_duration_us": 7.383,
+          "min_duration_us": 7.14,
+          "max_duration_us": 7.92,
+          "aicore_time_us": 0.0,
+          "aic_total_cycles": 0.0,
+          "aic_mac_time_us": 0.0,
+          "aic_mac_ratio": 0.0,
+          "aic_scalar_time_us": 0.0,
+          "aic_scalar_ratio": 0.0,
+          "aic_mte1_time_us": 0.0,
+          "aic_mte1_ratio": 0.0,
+          "aic_mte2_time_us": 0.0,
+          "aic_mte2_ratio": 0.0,
+          "aic_fixpipe_time_us": 0.0,
+          "aic_fixpipe_ratio": 0.0,
+          "aic_icache_miss_rate": 0.0,
+          "aiv_time_us": 6.1323,
+          "aiv_total_cycles": 283312.98,
+          "aiv_vec_time_us": 4.888,
+          "aiv_vec_ratio": 0.7973,
+          "aiv_scalar_time_us": 0.7009,
+          "aiv_scalar_ratio": 0.1142,
+          "aiv_mte2_time_us": 2.1782,
+          "aiv_mte2_ratio": 0.3553,
+          "aiv_mte3_time_us": 0.305,
+          "aiv_mte3_ratio": 0.0498,
+          "aiv_icache_miss_rate": 0.0,
+          "cube_utilization_pct": 0.0
+        }
+      ],
+      "stage_count": 1
+    },
+    "metrics": {
+      "avg_time_us": 7.383,
+      "ops": [
+        {
+          "op_name": "_moe_sum_reduce_kernel",
+          "op_type": "_moe_sum_reduce_kernel",
+          "task_type": "AI_VECTOR_CORE",
+          "measured_invocations": 100,
+          "total_duration_us": 738.297,
+          "avg_duration_us": 7.383,
+          "min_duration_us": 7.14,
+          "max_duration_us": 7.92,
+          "aicore_time_us": 0.0,
+          "aic_total_cycles": 0.0,
+          "aic_mac_time_us": 0.0,
+          "aic_mac_ratio": 0.0,
+          "aic_scalar_time_us": 0.0,
+          "aic_scalar_ratio": 0.0,
+          "aic_mte1_time_us": 0.0,
+          "aic_mte1_ratio": 0.0,
+          "aic_mte2_time_us": 0.0,
+          "aic_mte2_ratio": 0.0,
+          "aic_fixpipe_time_us": 0.0,
+          "aic_fixpipe_ratio": 0.0,
+          "aic_icache_miss_rate": 0.0,
+          "aiv_time_us": 6.1323,
+          "aiv_total_cycles": 283312.98,
+          "aiv_vec_time_us": 4.888,
+          "aiv_vec_ratio": 0.7973,
+          "aiv_scalar_time_us": 0.7009,
+          "aiv_scalar_ratio": 0.1142,
+          "aiv_mte2_time_us": 2.1782,
+          "aiv_mte2_ratio": 0.3553,
+          "aiv_mte3_time_us": 0.305,
+          "aiv_mte3_ratio": 0.0498,
+          "aiv_icache_miss_rate": 0.0,
+          "cube_utilization_pct": 0.0
+        }
+      ]
+    },
+    "artifacts": [
+      {
+        "id": "a001",
+        "kind": "profile_log",
+        "format": "text",
+        "filename": "msprof-base-collection.log",
+        "media_type": "text/plain",
+        "size_bytes": 5031,
+        "download_url": "/profile_artifacts/65595bc023414e0a8f39b1adb20256e7/a001",
+        "local_path": "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/moe_sum_reduce-night-20261021-v3-HG-KDA/stages/optimize/work/.kernelgen/profiles/round-0002/sglang_moe_sum_reduce-00002-timing/873d766063464531b3970fa07a3bf64a/msprof-base-collection.log",
+        "download_error": null
+      },
+      {
+        "id": "a002",
+        "kind": "vendor_report",
+        "format": "msprof-tar-gz",
+        "filename": "msprof-report.tar.gz",
+        "media_type": "application/gzip",
+        "size_bytes": 147945,
+        "download_url": "/profile_artifacts/65595bc023414e0a8f39b1adb20256e7/a002",
+        "local_path": "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/moe_sum_reduce-night-20261021-v3-HG-KDA/stages/optimize/work/.kernelgen/profiles/round-0002/sglang_moe_sum_reduce-00002-timing/873d766063464531b3970fa07a3bf64a/msprof-report.tar.gz",
+        "download_error": null
+      },
+      {
+        "id": "a003",
+        "kind": "op_summary",
+        "format": "csv",
+        "filename": "op_summary.csv",
+        "media_type": "text/csv",
+        "size_bytes": 34855,
+        "download_url": "/profile_artifacts/65595bc023414e0a8f39b1adb20256e7/a003",
+        "local_path": "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/moe_sum_reduce-night-20261021-v3-HG-KDA/stages/optimize/work/.kernelgen/profiles/round-0002/sglang_moe_sum_reduce-00002-timing/873d766063464531b3970fa07a3bf64a/op_summary.csv",
+        "download_error": null
+      },
+      {
+        "id": "a004",
+        "kind": "execution_timeline",
+        "format": "trace-json",
+        "filename": "execution-trace.json",
+        "media_type": "application/json",
+        "size_bytes": 172821,
+        "download_url": "/profile_artifacts/65595bc023414e0a8f39b1adb20256e7/a004",
+        "local_path": "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/moe_sum_reduce-night-20261021-v3-HG-KDA/stages/optimize/work/.kernelgen/profiles/round-0002/sglang_moe_sum_reduce-00002-timing/873d766063464531b3970fa07a3bf64a/execution-trace.json",
+        "download_error": null
+      }
+    ],
+    "warnings": [
+      "msprof and simulator timing is diagnostic and is not eval latency"
+    ],
+    "error": null,
+    "workload_uuid": "sglang_moe_sum_reduce-00002-timing"
+  }
+}

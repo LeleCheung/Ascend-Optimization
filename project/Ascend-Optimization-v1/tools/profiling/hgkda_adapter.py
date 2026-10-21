@@ -119,6 +119,7 @@ def analyze_staged(report, evaluation, directory, server, *, workflow, run, asse
             listings = [a for a in artifacts if a['kind'] == 'instruction_listing']
             source = workflow.source_in(request)
             case['profiles']['instruction'] = {
+                'status': response['status'],
                 'profile_id': response.get('profile_id'), 'response': str(response_path),
                 'request': str(output / 'request.json'), 'artifacts': artifacts,
                 'instruction_count': response.get('summary', {}).get('simulator_instruction_count'),

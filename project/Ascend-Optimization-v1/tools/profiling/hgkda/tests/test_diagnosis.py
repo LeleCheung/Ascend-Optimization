@@ -54,11 +54,27 @@ class DiagnosisTests(unittest.TestCase):
 
     def test_instruction_artifacts_are_not_automatically_a_proven_bottleneck(self):
         case = self.case('scatter_add', aiv_mte2_ratio=.8)
-        case['profiles']['instruction'] = {'artifacts': [{'path': 'instructions.json'}]}
+        case['profiles']['instruction'] = {'status': 'completed', 'artifacts': [
+            {'kind': 'instruction_listing', 'path': 'instructions.json'}]}
         result = d.diagnose_case(case, levels=['metrics', 'instruction'])
         self.assertEqual(result['requested_collections'], [])
         self.assertEqual(result['stage'], 'instruction_evidence')
         self.assertTrue(result['limitations'])
+
+    def test_partial_opprof_or_logs_are_not_simulator_instruction_evidence(self):
+        for status, artifacts in [
+                ('failed', [{'kind': 'vendor_kernel_report', 'path': 'opprof.tar.gz'}]),
+                ('completed', [{'kind': 'vendor_kernel_report', 'path': 'opprof.tar.gz'}]),
+                ('completed', [{'kind': 'profile_log', 'path': 'profile.log'}]),
+                ('completed', [{'kind': 'instruction_listing', 'path': ''}]),
+                ('failed', [{'kind': 'instruction_listing', 'path': 'partial.json'}])]:
+            with self.subTest(status=status, artifacts=artifacts):
+                case = self.case('moe_sum_reduce', aiv_mte2_ratio=.8, aiv_vec_ratio=.75)
+                case['profiles']['instruction'] = {'status': status, 'artifacts': artifacts}
+                result = d.diagnose_case(case, levels=['metrics', 'instruction'])
+                self.assertEqual(result['stage'], 'metrics')
+                self.assertEqual(result['requested_collections'][0]['level'], 'instruction')
+                self.assertTrue(any('instruction_listing' in item for item in result['limitations']))
 
     def test_hotspots_filter_input_preparation_kernels(self):
         listing = {'kernels': [

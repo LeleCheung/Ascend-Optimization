@@ -1,0 +1,44 @@
+{
+  "subject_sha256": "cc149ba4e1548d6211763c0920d4778c94dd00f5c573042b6b8827cd034c1372",
+  "policy": "advisory",
+  "summary": "Code review of the round-2 best kernel (subject cc149ba4…, value_selecting_reduction_backward) against the supplied catalog definition, oracle, workload lists (78 correctness / 18 timing) and the two-round optimize ledger. The candidate implements the aten semantics out[o,r,i] = grad[o,i] if indices[o,i]==r else 0 (equivalent to zeros+scatter, which is injective here) with one Triton kernel, allocates a fresh output (no input mutation, no alias, no torch.ops fallback), performs no host synchronization or environment mutation, and uses no test-derived shapes; the measured evidence (96/96 PASSED, max_abs_error 0.0, geo_mean 1.602 with min_speedup 1.383) is consistent with an exact-match selection kernel and with reference/candidate measured separately. No P0 test-contract or conversion defect was found. Three advisory P1 findings are recorded: (a) inputs whose grad/indices layout is not affinely collapsible raise NotImplementedError, narrowing the operator's domain relative to aten (a permuted/sliced layout is not covered by the single strided workload pattern); (b) output offsets are computed in Triton's 32-bit integer arithmetic, so outputs above 2^31 elements would silently overflow (exercised maximum is 8192^2 ≈ 67M); (c) the supplied workload set never exercises the nb>1 tiling branch (requires sizes[dim] > 8192), nor nd==1 / zero-size / sizes[dim]==1 shapes. The optimize-side review_tests attempt is explicitly SKIPPED_EXPLICIT (subject 83d123…), so its evaluate.json reference-parity run (geo_mean 1.008) does not add independent validation of this candidate; candidate validation rests on .ledger.json round 2.",
+  "reviewed_files": [
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/value_selecting_reduction_backward-night-20261021-v3-kg-no-profile/stages/optimize/work/optimize_definition_output.json",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/value_selecting_reduction_backward-night-20261021-v3-kg-no-profile/stages/optimize/work/.ledger.json",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/value_selecting_reduction_backward-night-20261021-v3-kg-no-profile/stages/optimize/work/.best_kernel.py",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/value_selecting_reduction_backward-night-20261021-v3-kg-no-profile/stages/prepare_catalog/attempts/01/catalog/manifest.json",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/value_selecting_reduction_backward-night-20261021-v3-kg-no-profile/stages/prepare_catalog/attempts/01/catalog/ops/value_selecting_reduction_backward/correctness.jsonl",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/value_selecting_reduction_backward-night-20261021-v3-kg-no-profile/stages/prepare_catalog/attempts/01/catalog/ops/value_selecting_reduction_backward/definition.json",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/value_selecting_reduction_backward-night-20261021-v3-kg-no-profile/stages/prepare_catalog/attempts/01/catalog/ops/value_selecting_reduction_backward/oracle.py",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/value_selecting_reduction_backward-night-20261021-v3-kg-no-profile/stages/prepare_catalog/attempts/01/catalog/ops/value_selecting_reduction_backward/timing.jsonl",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/value_selecting_reduction_backward-night-20261021-v3-kg-no-profile/stages/prepare_catalog/attempts/01/evaluation-contract.json",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/value_selecting_reduction_backward-night-20261021-v3-kg-no-profile/stages/review_tests/attempts/01/review.json",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/value_selecting_reduction_backward-night-20261021-v3-kg-no-profile/stages/review_tests/attempts/01/preflight.json",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/value_selecting_reduction_backward-night-20261021-v3-kg-no-profile/stages/review_tests/attempts/01/evaluate.json"
+  ],
+  "findings": [
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:126-143 (_lead_stride returns None on a non-affine leading range), .best_kernel.py:105-123 (_collapse returns None on a non-affine trailing range) and .best_kernel.py:207-215 (`if gl is None or gr is None or il is None or ir is None: raise NotImplementedError(...)`). The catalog's only strided workloads are the affine 2x-span pattern sizes [5,7,9], dim=-2 (evaluation-contract.json correctness-24/25/50/51/76/77; oracle.py:26-32 builds base[...,0] views with strides (18,2)), which collapse cleanly. A permuted/sliced layout is not affine, e.g. grad with logical trailing shape (4,5) and strides (1,4) (transpose) gives _collapse None and the candidate raises, whereas the aten reference (oracle.py:77-78) computes a result for any strided input.",
+      "reason": "The candidate narrows the operator's input domain: for a layout the reference accepts it raises NotImplementedError instead of returning the selection result. This is outside the exercised workload set, so it does not block the measured results, but it is a semantic divergence from aten that would surface as a runtime exception in real autograd graphs.",
+      "requested_change": "Either implement the general path from full per-dimension strides (e.g. pass a small stride vector and compute o/i offsets per leaf dim, or materialize grad/indices before launch) instead of raising, or explicitly document the restriction in the kernel header and register it as a known portability limit for downstream readiness; do not silently narrow the domain."
+    },
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:62 (`off = o[:, None] * RED + r[None, :]`), .best_kernel.py:93-102 (`off = t * BLOCK + a`, `o = off // ri`, `rem = off % ri`, `g_ptr + o * gs_o + i * gs_i`). Program ids, loop indices and tl.arange are 32-bit, and the runtime scalars (outer, red, gs_o, gs_i, n_elem) all fit in int32, so these products are evaluated in Triton's default int32 arithmetic. The largest supplied shape is 8192x8192 (~6.7e7 elements), far below 2^31.",
+      "reason": "For outputs with more than 2^31 elements (reachable on the target's memory budget, e.g. a float16 sizes=[65536,65536] case) the offset computation wraps and the kernel would store to wrapped/out-of-range addresses rather than fail. The reference has no such cap. Not exercised by the supplied workloads, so this is advisory.",
+      "requested_change": "Compute the flat output offset and the grad/indices offset products in int64 (e.g. promote `o`/`off` with `.to(tl.int64)` before the multiply, or compute in int64 only when n_elem exceeds the int32 range), or guard the fast/general paths and fall back to an int64 variant for large tensors."
+    },
+    {
+      "priority": "P1",
+      "category": "source_quality",
+      "evidence": "correctness.jsonl lines 1-78 (78 cases: float16/bfloat16/float32 over sizes [3,4],[4,8],[2,3,5],[8,16,32] and one strided [5,7,9] pattern) and timing.jsonl lines 1-18 (max 8192x8192). The fast-path tiling variable `nb = (red + br - 1) // br` at .best_kernel.py:198-199 is 1 for every supplied case: br = _npow2(red) >= red whenever red <= 8192, and the only shapes with red >= 8192 have red == 8192 so br == red (nb == 1). Consequently the `t // NB` / `t % NB` multi-tile block index (.best_kernel.py:51-52) and the `nb > 1` iteration of the persistent loop are never validated. Likewise no case has len(sizes)==1 (the `_lead_stride(..., d<=0) -> 0` outer==1 fast-path branch), a zero-size dimension, or sizes[dim]==1.",
+      "reason": "These are coverage limitations of the supplied native case list, not candidate defects: they do not change the correctness reference and they do not invalidate the measured 96/96 PASSED result, but they leave several candidate branches unexercised (multi-row-block tiling, scalar-output shapes, empty/unit reduction dims).",
+      "requested_change": "Record for test-contract/source review (do not change the candidate for this): add correctness cases with sizes[dim] > 8192 (to exercise nb>1), a 1-D sizes case, a sizes containing 0, and sizes[dim] == 1, and consider a second strided layout such as a transposed grad/indices to cover the finding above."
+    }
+  ],
+  "blocker": null,
+  "missing_dependencies": []
+}

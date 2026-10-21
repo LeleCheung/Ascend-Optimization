@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import re
 from pathlib import Path
 from kg_workspace_state import exportable_state
 
@@ -17,7 +18,7 @@ def main():
     work = workspace / 'stages/optimize/work'
     workspace_state = exportable_state(workspace, args.allow_review_waiting)
     selected = []
-    for name in ('profile-analysis', 'profiles'):
+    for name in ('profile-analysis', 'profiles', 'debug-jobs'):
         root = work / '.kernelgen' / name
         if not root.exists():
             continue
@@ -29,13 +30,14 @@ def main():
             selected.append((path, Path(name) / path.relative_to(root)))
     # 审核等待和优化结果分开保留，避免导出后丢失原生反馈与轮次记录。
     for name in ('.kernelgen/run-progress.json', '.kernelgen/run-process.json',
+                 '.kernelgen/run-events.jsonl',
                  'stages/optimize/attempts/01/result.json',
                  'stages/code_review/attempts/01/result.json',
                  'stages/code_review/attempts/01/review.json'):
         path = workspace / name
         if path.is_file() and not path.is_symlink():
             selected.append((path, Path('workflow-state') / name))
-    for name in ('.ledger.json', 'optimize_definition_output.json'):
+    for name in ('.ledger.json', 'optimize_definition_output.json', '.kernelgen/run-events.jsonl'):
         path = work / name
         if path.is_file() and not path.is_symlink():
             selected.append((path, Path('optimization') / name))
@@ -43,6 +45,11 @@ def main():
         if path.is_file() and not path.is_symlink() and path.name in {
                 'main.py', 'result.json', 'identity.json', 'solution.json'}:
             selected.append((path, Path('evaluations') / path.relative_to(work / '.kernelgen/evals')))
+    # 原生KG可能只物化实际使用的knowledge角色；两种扩展角色都按真实工作区归档。
+    for role in ['kernel-profile-analyzer.md','kernel-knowledge-profile-analyzer.md']:
+        for path in sorted(workspace.rglob(role)):
+            if path.is_file() and not path.is_symlink() and 'HG-KDA 角色扩展' in path.read_text(encoding='utf-8',errors='replace'):
+                selected.append((path,Path('loaded-roles')/path.relative_to(workspace)))
     # 遇到异常大的采集先停下检查；不悄悄丢弃附件。
     assert sum(path.stat().st_size for path, _ in selected) <= 512 * 1024 * 1024, '采集超过 512MiB，须单独检查归档范围'
     args.output.mkdir(parents=True, exist_ok=False)
@@ -60,9 +67,22 @@ def main():
                         'original_archive_path': relative.as_posix(),
                         'archived_path': archived.as_posix(), 'size_bytes': len(data),
                         'sha256': hashlib.sha256(data).hexdigest()})
+    # Claude内部委派不会都进入Python顶层MODEL_INVOCATION事件；提取真实Agent调用参数，
+    # 保留日志SHA与偏移，不复制全局设置或完整模型思考日志。
+    delegated=[]
+    for log in sorted(workspace.rglob('claude-runtime.log')):
+        if log.is_symlink():continue
+        data=log.read_bytes();text=data.decode('utf-8');log_sha=hashlib.sha256(data).hexdigest()
+        for match in re.finditer(r'\[claude\] tool input id=([^:\r\n]+):\r?\n',text):
+            try:arguments,_=json.JSONDecoder().raw_decode(text[match.end():])
+            except ValueError:continue
+            if isinstance(arguments,dict) and arguments.get('subagent_type') in ['kernel-profile-analyzer','kernel-knowledge-profile-analyzer']:
+                delegated.append({'log_path':log.relative_to(workspace).as_posix(),'log_sha256':log_sha,
+                                  'character_offset':match.start(),'tool_use_id':match.group(1),'arguments':arguments})
     (args.output / 'archive-manifest.json').write_text(json.dumps({
         'workspace': str(workspace), 'state': workspace_state, 'files': records,
         'format_version': 2,
+        'model_role_invocations':delegated,
         'note': '原始分析和 manifest 字节保持不变；附件使用短路径平铺，旧绝对路径可通过 source_path 映射到 archived_path。',
     }, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     print('ARCHIVED_KG_PROFILE_EVIDENCE', len(records), sum(x['size_bytes'] for x in records), flush=True)

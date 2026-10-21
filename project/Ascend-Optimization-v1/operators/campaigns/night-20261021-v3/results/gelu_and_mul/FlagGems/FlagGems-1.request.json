@@ -1,0 +1,25 @@
+{
+  "api_version": "v6.2",
+  "binding": {
+    "bundle_id": "sha256:afaa5aa922329e010555b453c3887376a33b7eeeaf88031d5c9aeb8db53adfba",
+    "definition": "gelu_and_mul"
+  },
+  "implementation": {
+    "name": "gelu_and_mul-FlagGems-1",
+    "definition": "gelu_and_mul",
+    "language": "triton",
+    "entrypoint": "main.py::run",
+    "sources": [
+      {
+        "path": "main.py",
+        "content": "# Copyright 2026, The FlagOS Contributors.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\")\n# you may not use this file except in compliance with the License\n# You may obtain a copy of the License at\n#\n#       http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Ascend isolated launch-policy probe for FlagOS Task 29.\n\nThis source is byte-derived from the 8/8-correct T29-CAND-007 Ascend route.\nT29-CAND-027 changes only the maximum tile area from 512 elements to 1024 elements; exact-erf arithmetic, runtime-stride\naddressing, shape-aware row packing, persistent grid-stride coverage, and the\none-argument wrapper remain unchanged. This local probe has not been compiled\nor timed on Ascend hardware.\n\nCopyright 2023-2024 SGLang Team\nCopyright 2026 FlagOS Contributors\nSPDX-License-Identifier: Apache-2.0\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n__all__ = [\"gelu_and_mul\"]\n\n\n@triton.jit\ndef _gelu_and_mul_kernel(\n    hidden_states_ptr,\n    output_ptr,\n    hidden_size,\n    batch_size,\n    input_stride_batch,\n    input_stride_hidden,\n    output_stride_batch,\n    output_stride_hidden,\n    num_ctas,\n    tiles_per_cta,\n    num_column_tiles,\n    total_tiles,\n    BLOCK_ROWS: tl.constexpr,\n    BLOCK_COLUMNS: tl.constexpr,\n):\n    pid = tl.program_id(axis=0)\n    lanes = tl.arange(0, BLOCK_ROWS * BLOCK_COLUMNS)\n    rows_in_tile = lanes // BLOCK_COLUMNS\n    columns_in_tile = lanes - rows_in_tile * BLOCK_COLUMNS\n\n    for iteration in range(0, tiles_per_cta):\n        tile_id = pid + iteration * num_ctas\n        batch_tile = tile_id // num_column_tiles\n        column_tile = tile_id - batch_tile * num_column_tiles\n        batch_index = batch_tile * BLOCK_ROWS + rows_in_tile\n        columns = column_tile * BLOCK_COLUMNS + columns_in_tile\n        mask = (\n            (tile_id < total_tiles)\n            & (batch_index < batch_size)\n            & (columns < hidden_size)\n        )\n\n        input_row = batch_index * input_stride_batch\n        gate = tl.load(\n            hidden_states_ptr + input_row + columns * input_stride_hidden,\n            mask=mask,\n            other=0.0,\n        ).to(tl.float32)\n        up = tl.load(\n            hidden_states_ptr\n            + input_row\n            + (hidden_size + columns) * input_stride_hidden,\n            mask=mask,\n            other=0.0,\n        ).to(tl.float32)\n\n        activated = gate * (0.5 * (1.0 + tl.erf(gate * 0.7071067811865475)))\n        output_offsets = (\n            batch_index * output_stride_batch + columns * output_stride_hidden\n        )\n        tl.store(output_ptr + output_offsets, activated * up, mask=mask)\n\n\ndef gelu_and_mul(hidden_states):\n    batch_size, doubled_hidden_size = hidden_states.shape\n    hidden_size = doubled_hidden_size // 2\n    output = torch.empty(\n        (batch_size, hidden_size),\n        dtype=hidden_states.dtype,\n        device=hidden_states.device,\n    )\n    block_columns = min(1024, triton.next_power_of_2(hidden_size))\n    block_rows = min(1024 // block_columns, triton.next_power_of_2(batch_size))\n    num_column_tiles = triton.cdiv(hidden_size, block_columns)\n    num_batch_tiles = triton.cdiv(batch_size, block_rows)\n    num_tiles = num_batch_tiles * num_column_tiles\n    num_ctas = min(num_tiles, 48)\n    tiles_per_cta = triton.cdiv(num_tiles, num_ctas)\n    grid = (num_ctas,)\n    _gelu_and_mul_kernel[grid](\n        hidden_states,\n        output,\n        hidden_size,\n        batch_size,\n        hidden_states.stride(0),\n        hidden_states.stride(1),\n        output.stride(0),\n        output.stride(1),\n        num_ctas,\n        tiles_per_cta,\n        num_column_tiles,\n        num_tiles,\n        block_rows,\n        block_columns,\n        num_warps=4,\n    )\n    return output\n\nrun = gelu_and_mul\n"
+      }
+    ]
+  },
+  "settings": {
+    "warmup_ms": 1000,
+    "benchmark_ms": 100,
+    "num_trials": 3,
+    "timeout_seconds": 1800
+  }
+}

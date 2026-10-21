@@ -1,0 +1,238 @@
+{
+  "request": {
+    "api_version": "v6.2",
+    "evaluation_id": "d59c5d2840102eede63853845bb2aadf6cfe996314d9436e610da4468573aa4c:round-2",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:86f4c5cc9ca970a7533ea91e9bf45484fe103e9c40341c7409ac63309a13c987",
+      "definition": "moe_sum_reduce"
+    },
+    "implementation": {
+      "name": "kernelgen-candidate-moe_sum_reduce",
+      "definition": "moe_sum_reduce",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef _moe_sum_reduce_contig_kernel(\n    input_ptr,\n    output_ptr,\n    routed_scaling_factor,\n    K: tl.constexpr,\n    H: tl.constexpr,\n    BM: tl.constexpr,\n    BN: tl.constexpr,\n):\n    \"\"\"Mask-free flat [T, K, H] contiguous reduce over the K axis.\n\n    Each program owns BM whole tokens for one BN-wide column slice, so a\n    program streams a large contiguous window of the activation instead of a\n    single token row.  On the target this is what moves the kernel off the\n    per-program overhead regime and up to the memory-system ceiling.\n    \"\"\"\n    offsets_m = tl.program_id(0) * BM + tl.arange(0, BM)\n    offsets_n = tl.program_id(1) * BN + tl.arange(0, BN)\n    input_offsets = offsets_m[:, None] * (K * H) + offsets_n[None, :]\n    reduced = tl.zeros((BM, BN), dtype=tl.float32)\n    for topk_index in tl.static_range(0, K):\n        reduced += tl.load(input_ptr + input_offsets + topk_index * H).to(\n            tl.float32\n        )\n    output_offsets = offsets_m[:, None] * H + offsets_n[None, :]\n    tl.store(output_ptr + output_offsets, reduced * routed_scaling_factor)\n\n\n@triton.jit\ndef _moe_sum_reduce_strided_kernel(\n    input_ptr,\n    output_ptr,\n    routed_scaling_factor,\n    num_tokens: tl.constexpr,\n    top_k: tl.constexpr,\n    hidden_dim: tl.constexpr,\n    input_stride_token,\n    input_stride_topk,\n    input_stride_hidden,\n    output_stride_token,\n    output_stride_hidden,\n    BLOCK_M: tl.constexpr,\n    BLOCK_N: tl.constexpr,\n):\n    \"\"\"Generic masked, strided fallback (not used by the benchmarked shapes).\"\"\"\n    offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)\n    offsets_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)\n    mask = (offsets_m[:, None] < num_tokens) & (\n        offsets_n[None, :] < hidden_dim\n    )\n    input_offsets = (\n        offsets_m[:, None] * input_stride_token\n        + offsets_n[None, :] * input_stride_hidden\n    )\n    reduced = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\n    for topk_index in tl.static_range(0, top_k):\n        reduced += tl.load(\n            input_ptr + input_offsets + topk_index * input_stride_topk,\n            mask=mask,\n            other=0.0,\n        ).to(tl.float32)\n    reduced *= routed_scaling_factor\n    output_offsets = (\n        offsets_m[:, None] * output_stride_token\n        + offsets_n[None, :] * output_stride_hidden\n    )\n    tl.store(output_ptr + output_offsets, reduced, mask=mask)\n\n\ndef moe_sum_reduce(\n    input: torch.Tensor, routed_scaling_factor: float\n) -> torch.Tensor:\n    num_tokens, top_k, hidden_dim = input.shape\n    output = torch.empty(\n        (num_tokens, hidden_dim), dtype=input.dtype, device=input.device\n    )\n    if num_tokens == 0 or hidden_dim == 0:\n        return output\n\n    block_m = 16\n    while block_m > 1 and num_tokens % block_m:\n        block_m >>= 1\n    block_n = 1024\n    while block_n > 1 and hidden_dim % block_n:\n        block_n >>= 1\n\n    if block_n > 1 and input.is_contiguous():\n        _moe_sum_reduce_contig_kernel[\n            (num_tokens // block_m, hidden_dim // block_n)\n        ](\n            input,\n            output,\n            routed_scaling_factor,\n            K=top_k,\n            H=hidden_dim,\n            BM=block_m,\n            BN=block_n,\n            num_warps=4,\n            num_stages=2,\n        )\n    else:\n        block_n = 512 if hidden_dim >= 512 else 1 << (hidden_dim - 1).bit_length()\n        _moe_sum_reduce_strided_kernel[\n            (num_tokens, (hidden_dim + block_n - 1) // block_n)\n        ](\n            input,\n            output,\n            routed_scaling_factor,\n            num_tokens,\n            top_k,\n            hidden_dim,\n            *input.stride(),\n            *output.stride(),\n            BLOCK_M=1,\n            BLOCK_N=block_n,\n            num_warps=4,\n            num_stages=1,\n        )\n    return output\n\n\n__all__ = [\"moe_sum_reduce\"]\n\nrun = moe_sum_reduce\n"
+        }
+      ]
+    },
+    "benchmark_fingerprint": "sha256:f971d2f2b1519dec0031793fda97b692476776342143dbbd0a6aa28c058c5329",
+    "case_id": "sglang_moe_sum_reduce-00003-timing",
+    "expected_backend": "npu",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "identity": {
+      "solution_sha256": "04f7189ec591d4ce1a703957555be09a59b8378b7a69c4cbba683a7b961f9adf",
+      "workload_sha256": "3c22c10411a34f95f6f71093376b0641341840bdcffeb0f28791a1b7315684b8"
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "profile_id": "ef4972c319f54fdd9285b33721b96189",
+    "created_at": "2026-10-21T16:38:09.206674+00:00",
+    "status": "completed",
+    "backend": "npu",
+    "profiler": "msprof",
+    "device": "npu:0",
+    "hardware": {
+      "target": {
+        "backend": "ascend",
+        "vendor": "huawei",
+        "device": "Ascend910B4-1",
+        "architecture": "dav-c220-cube",
+        "devices": [
+          {
+            "logical_device": "npu:0",
+            "device_id": 0,
+            "name": "Ascend910B4-1",
+            "l2_cache_size": 176160768,
+            "num_sm": 20,
+            "compute_capability": "",
+            "total_memory": 65452113920
+          }
+        ]
+      },
+      "software": {
+        "language": "triton",
+        "language_version": "3.5.1",
+        "compiler": "flagtree",
+        "compiler_version": "0.6.0+ascend.gitc286cba6",
+        "runtime": "cann",
+        "runtime_version": "9.0.0",
+        "driver_version": "25.2.0"
+      },
+      "metadata": {
+        "complete": true,
+        "missing": [],
+        "sources": {
+          "target.backend": "server configuration",
+          "target.vendor": "server configuration",
+          "software.language": "server configuration",
+          "software.compiler": "python package metadata",
+          "software.runtime": "server configuration",
+          "target.device": "device probe",
+          "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+          "software.language_version": "triton module metadata",
+          "software.compiler_version": "python package metadata",
+          "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+          "software.driver_version": "/usr/local/Ascend/driver/version.info"
+        }
+      }
+    },
+    "evaluation_id": "d59c5d2840102eede63853845bb2aadf6cfe996314d9436e610da4468573aa4c:round-2",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "capabilities": [
+      "performance_counters",
+      "kernel_profile",
+      "pipeline_utilization",
+      "execution_timeline"
+    ],
+    "summary": {
+      "avg_time_us": 36.402,
+      "operation_count": 1,
+      "top_operations": [
+        {
+          "op_name": "_moe_sum_reduce_contig_kernel",
+          "op_type": "_moe_sum_reduce_contig_kernel",
+          "task_type": "AI_VECTOR_CORE",
+          "measured_invocations": 100,
+          "total_duration_us": 3640.172,
+          "avg_duration_us": 36.402,
+          "min_duration_us": 36.001,
+          "max_duration_us": 37.0,
+          "aicore_time_us": 0.0,
+          "aic_total_cycles": 0.0,
+          "aic_mac_time_us": 0.0,
+          "aic_mac_ratio": 0.0,
+          "aic_scalar_time_us": 0.0,
+          "aic_scalar_ratio": 0.0,
+          "aic_mte1_time_us": 0.0,
+          "aic_mte1_ratio": 0.0,
+          "aic_mte2_time_us": 0.0,
+          "aic_mte2_ratio": 0.0,
+          "aic_fixpipe_time_us": 0.0,
+          "aic_fixpipe_ratio": 0.0,
+          "aic_icache_miss_rate": 0.0,
+          "aiv_time_us": 35.4977,
+          "aiv_total_cycles": 2186663.09,
+          "aiv_vec_time_us": 24.6167,
+          "aiv_vec_ratio": 0.6935,
+          "aiv_scalar_time_us": 2.3554,
+          "aiv_scalar_ratio": 0.0664,
+          "aiv_mte2_time_us": 11.1147,
+          "aiv_mte2_ratio": 0.3131,
+          "aiv_mte3_time_us": 1.7456,
+          "aiv_mte3_ratio": 0.0491,
+          "aiv_icache_miss_rate": 0.0,
+          "cube_utilization_pct": 0.0
+        }
+      ],
+      "stage_count": 1
+    },
+    "metrics": {
+      "avg_time_us": 36.402,
+      "ops": [
+        {
+          "op_name": "_moe_sum_reduce_contig_kernel",
+          "op_type": "_moe_sum_reduce_contig_kernel",
+          "task_type": "AI_VECTOR_CORE",
+          "measured_invocations": 100,
+          "total_duration_us": 3640.172,
+          "avg_duration_us": 36.402,
+          "min_duration_us": 36.001,
+          "max_duration_us": 37.0,
+          "aicore_time_us": 0.0,
+          "aic_total_cycles": 0.0,
+          "aic_mac_time_us": 0.0,
+          "aic_mac_ratio": 0.0,
+          "aic_scalar_time_us": 0.0,
+          "aic_scalar_ratio": 0.0,
+          "aic_mte1_time_us": 0.0,
+          "aic_mte1_ratio": 0.0,
+          "aic_mte2_time_us": 0.0,
+          "aic_mte2_ratio": 0.0,
+          "aic_fixpipe_time_us": 0.0,
+          "aic_fixpipe_ratio": 0.0,
+          "aic_icache_miss_rate": 0.0,
+          "aiv_time_us": 35.4977,
+          "aiv_total_cycles": 2186663.09,
+          "aiv_vec_time_us": 24.6167,
+          "aiv_vec_ratio": 0.6935,
+          "aiv_scalar_time_us": 2.3554,
+          "aiv_scalar_ratio": 0.0664,
+          "aiv_mte2_time_us": 11.1147,
+          "aiv_mte2_ratio": 0.3131,
+          "aiv_mte3_time_us": 1.7456,
+          "aiv_mte3_ratio": 0.0491,
+          "aiv_icache_miss_rate": 0.0,
+          "cube_utilization_pct": 0.0
+        }
+      ]
+    },
+    "artifacts": [
+      {
+        "id": "a001",
+        "kind": "profile_log",
+        "format": "text",
+        "filename": "msprof-base-collection.log",
+        "media_type": "text/plain",
+        "size_bytes": 5031,
+        "download_url": "/profile_artifacts/ef4972c319f54fdd9285b33721b96189/a001",
+        "local_path": "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/moe_sum_reduce-night-20261021-v3-kg-profile/stages/optimize/work/.kernelgen/profiles/round-0002/sglang_moe_sum_reduce-00003-timing/f391eebd05cb49f0a3faf4469272d7e5/msprof-base-collection.log",
+        "download_error": null
+      },
+      {
+        "id": "a002",
+        "kind": "vendor_report",
+        "format": "msprof-tar-gz",
+        "filename": "msprof-report.tar.gz",
+        "media_type": "application/gzip",
+        "size_bytes": 149974,
+        "download_url": "/profile_artifacts/ef4972c319f54fdd9285b33721b96189/a002",
+        "local_path": "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/moe_sum_reduce-night-20261021-v3-kg-profile/stages/optimize/work/.kernelgen/profiles/round-0002/sglang_moe_sum_reduce-00003-timing/f391eebd05cb49f0a3faf4469272d7e5/msprof-report.tar.gz",
+        "download_error": null
+      },
+      {
+        "id": "a003",
+        "kind": "op_summary",
+        "format": "csv",
+        "filename": "op_summary.csv",
+        "media_type": "text/csv",
+        "size_bytes": 37252,
+        "download_url": "/profile_artifacts/ef4972c319f54fdd9285b33721b96189/a003",
+        "local_path": "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/moe_sum_reduce-night-20261021-v3-kg-profile/stages/optimize/work/.kernelgen/profiles/round-0002/sglang_moe_sum_reduce-00003-timing/f391eebd05cb49f0a3faf4469272d7e5/op_summary.csv",
+        "download_error": null
+      },
+      {
+        "id": "a004",
+        "kind": "execution_timeline",
+        "format": "trace-json",
+        "filename": "execution-trace.json",
+        "media_type": "application/json",
+        "size_bytes": 174385,
+        "download_url": "/profile_artifacts/ef4972c319f54fdd9285b33721b96189/a004",
+        "local_path": "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/moe_sum_reduce-night-20261021-v3-kg-profile/stages/optimize/work/.kernelgen/profiles/round-0002/sglang_moe_sum_reduce-00003-timing/f391eebd05cb49f0a3faf4469272d7e5/execution-trace.json",
+        "download_error": null
+      }
+    ],
+    "warnings": [
+      "msprof and simulator timing is diagnostic and is not eval latency"
+    ],
+    "error": null,
+    "workload_uuid": "sglang_moe_sum_reduce-00003-timing"
+  }
+}

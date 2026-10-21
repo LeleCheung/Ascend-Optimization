@@ -1,0 +1,72 @@
+{
+  "subject_sha256": "d4ab85095c59c2f4a66180860766280baa9eebc951739f9b04c5b218a21627b6",
+  "policy": "advisory",
+  "summary": "Reviewed the shipped log10_ candidate (.best_kernel.py / optimize_definition_output.json best_code, sha256 d4ab85…27b6) against the frozen evaluation contract (definition.json, correctness.jsonl, timing.jsonl, oracle.py, evaluation-contract.json) plus the optimize ledger and the review_tests receipts. The core semantics are contract-faithful: single positional argument A, in-place tl.store back to A, returns A (matches effects.mutates=[A] / returns_alias_of {out:A}), fp32 intermediate with a single cast-back, log(x)*0.4342944819032518 = log10(x), strided views indexed by the padded shape/stride tuple so base[..., 0] cases write only the view, no torch.ops / torch.log10_ fallback, no dispatcher monkey-patching, no environment mutation, and the correctness reference (torch.log10_ on 'target') is independent of the candidate. No P0 conversion or test-contract defect found. Remaining findings are advisory: silent precision reduction and silent mis-indexing for inputs outside the declared dtype/rank set, an unguarded private Ascend launcher ABI used on the hot path, a device-agnostic launch cache, an unbounded compile cache, a correctness-coverage gap that leaves the unmasked 32768-tile kernel unchecked, and the fact that the shipped candidate is still slower than the reference (geo_mean 0.649) because the remaining gap is device-side.",
+  "reviewed_files": [
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/log10_-night-20261021-v3-HG-KDA/stages/optimize/work/optimize_definition_output.json",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/log10_-night-20261021-v3-HG-KDA/stages/optimize/work/.ledger.json",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/log10_-night-20261021-v3-HG-KDA/stages/optimize/work/.best_kernel.py",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/log10_-night-20261021-v3-HG-KDA/stages/prepare_catalog/attempts/01/catalog/manifest.json",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/log10_-night-20261021-v3-HG-KDA/stages/prepare_catalog/attempts/01/catalog/ops/log10_/correctness.jsonl",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/log10_-night-20261021-v3-HG-KDA/stages/prepare_catalog/attempts/01/catalog/ops/log10_/definition.json",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/log10_-night-20261021-v3-HG-KDA/stages/prepare_catalog/attempts/01/catalog/ops/log10_/oracle.py",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/log10_-night-20261021-v3-HG-KDA/stages/prepare_catalog/attempts/01/catalog/ops/log10_/timing.jsonl",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/log10_-night-20261021-v3-HG-KDA/stages/prepare_catalog/attempts/01/evaluation-contract.json",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/log10_-night-20261021-v3-HG-KDA/stages/review_tests/attempts/01/review.json",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/log10_-night-20261021-v3-HG-KDA/stages/review_tests/attempts/01/preflight.json",
+    "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/log10_-night-20261021-v3-HG-KDA/stages/review_tests/attempts/01/evaluate.json"
+  ],
+  "findings": [
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:48,58,114 compute `tl.log(x.to(tl.float32))` and :49,59,115 cast back with `y.to(X.dtype.element_ty)` unconditionally; `run` (.best_kernel.py:228-264) has no dtype guard at all. The contract's dtype scope is float16/bfloat16/float32 (correctness.jsonl:1-24, timing.jsonl:1-12), and definition.json declares only a bare tensor parameter A with no dtype restriction. For any input outside that set (e.g. float64) the kernel silently reduces the compute precision to fp32 and casts back, so a caller gets a wrong-precision result rather than an error; torch.log10_ is the reference for the op and supports wider floats.",
+      "reason": "Silent precision loss for dtypes the definition does not exclude. The declared workloads only exercise fp16/bf16/fp32, so this is not a contract violation today, but a hard-coded fp32 math path with no guard is a latent correctness trap for any wider-float caller of the same operator signature.",
+      "requested_change": "Add an explicit dtype gate in `run`: keep the fp32-intermediate fast path for float16/bfloat16/float32, and for any other dtype either preserve the input precision in the kernel math (compute in `X.dtype.element_ty` when it is float64) or fail fast/delegate rather than silently computing in fp32. Document the supported set alongside the kernel."
+    },
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:125-127 `_pad8(values, fill)` truncates to the first 8 entries, and .best_kernel.py:261 passes `NDIMS=min(A.dim(), 8)` while .best_kernel.py:240-241 pad shape/stride with the same truncation. For a non-contiguous tensor with more than 8 dimensions the strided kernel therefore decomposes the logical index using only the leading 8 extents/strides (.best_kernel.py:87-112) and writes to incorrect offsets, with no error and no mask escape.",
+      "reason": "Wrong results are produced silently for legal torch inputs (non-contiguous views with rank > 8). The supplied correctness workloads only cover 1-D and 2-D shapes (correctness.jsonl:1-24), so this path is untested rather than disproven.",
+      "requested_change": "Either support arbitrary rank in the strided path (fold the leading dims' extents/strides into a collapsed leading index, or loop over a flattened offset decomposition) or raise a clear error / fall back to a generic path when `A.dim() > 8` instead of silently truncating the index space."
+    },
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:195-224 binds `compiled.run`, then calls `launcher.launch` (or the launcher itself) with a hand-decoded positional ABI `call(grid, 1, 1, stream(), function, metadata, None, None, None, X, None)` / `... X, X.numel(), None`, and .best_kernel.py:152-160 relies on the private `torch_npu._C._npu_getCurrentRawStreamNoWait`. The only fallback is the build-time `try/except` at .best_kernel.py:206-207; the actual invocation at .best_kernel.py:238 (`launch(A)`) is outside any guard, so any ABI/argument change in the installed torch_npu/triton raises at call time and aborts the whole run instead of degrading to `_standard_launch`.",
+      "reason": "The hot path depends on an undocumented, version-specific private ABI and a private stream accessor with no runtime safety net. This is a portability/reliability hazard for the same operator on other torch_npu/triton builds, and it can convert a benign environment drift into a hard failure.",
+      "requested_change": "Validate the direct-launch ABI at build time (invoke it once inside the existing `try`) and/or wrap the first real invocation so a failure permanently demotes the cache entry to `_standard_launch`. Keep a documented, supported-launch fallback for every path rather than only build-time exceptions."
+    },
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:141-169 resolves `_RUNTIME['device']` once from `torch.npu.current_device()` and bakes that device into the stream getter, while the launch cache key at .best_kernel.py:233 is `(A.dtype, n, A.data_ptr() & 15 == 0)` and contains no device component; `_build_launch` binds `function`/`packed_metadata` from a `warmup` on whatever tensor first populated the key (.best_kernel.py:188-205). A tensor of the same dtype/numel on a different NPU would reuse a kernel compiled and bound for the first device and enqueue it on the first device's stream.",
+      "reason": "Cross-device reuse silently launches on the wrong device/stream. The evaluated workloads all run on npu:0 (evaluate.json:5), so this is untested rather than disproven, but the operator signature does not restrict device and the failure mode is silent.",
+      "requested_change": "Include the tensor's device index (e.g. `A.device`) in the cache key and resolve the current stream per device at call time (or refuse to serve a cache entry whose device differs from the recorded one), so multi-NPU callers cannot hijack another device's compiled kernel and stream."
+    },
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:119 `_CACHE = {}` is populated at .best_kernel.py:233-237 for every distinct `(dtype, numel, aligned)` and never evicted or bounded; each entry retains a closure holding `compiled` (`function`, `packed_metadata`, launcher) and each miss triggers an additional `warmup` compile at .best_kernel.py:189-193.",
+      "reason": "Unbounded retention of compiled kernels and per-numel compile work is a real resource problem for a long-lived process that sees many shapes, which is the normal usage pattern for an elementwise op.",
+      "requested_change": "Bound the cache (LRU/FIFO with a cap) or otherwise make the specialization cache evictable, and keep the last-resort `_standard_launch` path for evicted entries."
+    },
+    {
+      "priority": "P1",
+      "category": "source_quality",
+      "evidence": "correctness.jsonl:1-24 covers only shapes [0], [1], [1025] and [7, 9] (max numel 1025). For those sizes `_pick_block` (.best_kernel.py:130-138) always returns `_BLOCK_MIN = 1024` and `masked = n % 1024 != 0` (.best_kernel.py:185) is True, so every correctness case runs `_log10_masked`; the unmasked fast kernel `_log10_nomask` (.best_kernel.py:42-49) — the path actually used for the 1024/65536/1048576/4096x4096 timing shapes and the whole point of the 32768-tile optimization — is never correctness-checked. The timing rows in evaluate.json:357-523 report `matched_ratio: null`, so the timing phase does not close that gap either.",
+      "reason": "The optimized path with the highest throughput on the large shapes is validated only by the unoptimized reference comparison of a different kernel variant. The unfiltered load/store in `_log10_nomask` has no mask safety net, so a tiling or launch-boundary error there would surface only as a latency measurement.",
+      "requested_change": "Add catalog correctness cases whose numel is an exact multiple of the selected tile (at minimum [1024], [32768], and a 4096x4096 fp16/bf16/fp32 case) so the unmasked kernel and the 32768-element tile are compared against the reference; this is a catalog coverage request for pytest review, not a candidate change."
+    },
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": "The shipped candidate never beats the reference: optimize_definition_output.json:5 best_geo_mean 0.6491952147515134 with min_speedup 0.4409462511568567 (.ledger.json:559-560), and every timing workload in the final verification is slower than the framework reference (optimize_definition_output.json:20-23, :40-43 etc., e.g. log10_-timing-3 0.03602 ms vs 0.01589 ms). The ledger itself attributes the 0.110 -> 0.602 jump to the host launch shortcut, not device work (.ledger.json:1456, :1459-1460), and still identifies the fp32-intermediate transcendental as the unresolved limit (.ledger.json:1455, :1457). The reference-as-solution check is correctly separated at ~1.03 (evaluate.json:9-12).",
+      "reason": "Accuracy of the reported outcome is fine, but the accepted best is still 1.5x slower than the baseline it replaces, and the win comes from bypassing the Triton launcher rather than from kernel work. Reporting this keeps the next epoch pointed at the device-side gap instead of re-tuning launch mechanics.",
+      "requested_change": "Carry this as advisory context for the next optimization epoch: keep the direct compiled-kernel launch, and target the fp32-intermediate log path on the 4096x4096 shapes (lower-precision or polynomial base-10 evaluation with the same output cast) as already suggested in .ledger.json:1457."
+    }
+  ],
+  "blocker": null,
+  "missing_dependencies": []
+}

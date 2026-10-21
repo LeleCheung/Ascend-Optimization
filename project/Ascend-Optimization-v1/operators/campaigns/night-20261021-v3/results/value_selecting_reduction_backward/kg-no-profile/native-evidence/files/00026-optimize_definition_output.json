@@ -1,0 +1,313 @@
+{
+  "definition_name": "value_selecting_reduction_backward",
+  "op_type": "",
+  "status": "PASSED",
+  "best_geo_mean": 1.6343877591532259,
+  "best_code": "# value_selecting_reduction_backward -- Triton implementation.\n#\n# Semantics (reference): out = zeros(sizes); out.scatter_(dim, indices, grad)\n# (with grad/indices unsqueezed along `dim` when keepdim is False).\n#\n# The scatter preserves each source element's non-reduced coordinates, so\n# (o, i) -> (o, idx[o, i], i) is injective and the whole operation is the\n# deterministic elementwise selection\n#     out[o, r, i] = grad[o, i] if idx[o, i] == r else 0\n# with the output viewed as (outer, red, inner) around `dim`.  A single kernel\n# therefore writes the entire output: the reference's separate full-tensor\n# zero-fill and scatter launches collapse into one pass.\n#\n# Ascend notes that shaped this design (measured on target):\n#   * rtKernelLaunch rejects more than 65535 blocks -> persistent 1D grid.\n#   * A launch costs ~55-70us of host time, so exactly one kernel is launched\n#     and the scalar geometry is passed as constexpr to keep the binder cheap.\n#   * The cost is dominated by program count, not block size: few programs each\n#     streaming large contiguous tiles (8192 elements) reach the fill roofline.\n\nimport torch\nimport triton\nimport triton.language as tl\n\n_MAX_PROGRAMS = 512  # persistent programs; task-derived upper bound\n_TILE_ELEMS = 8192  # elements written per tile (larger tiles exceed the UB)\n\n\n@triton.jit\ndef _vsrb_inner1_kernel(\n    out_ptr,\n    g_ptr,\n    i_ptr,\n    OUTER: tl.constexpr,\n    RED: tl.constexpr,\n    GSO: tl.constexpr,\n    ISO: tl.constexpr,\n    NB: tl.constexpr,\n    NT: tl.constexpr,\n    BO: tl.constexpr,\n    BR: tl.constexpr,\n    EVEN_O: tl.constexpr,\n    EVEN_R: tl.constexpr,\n):\n    \"\"\"inner == 1: out[o, r] = grad[o] if idx[o] == r else 0, contiguous rows.\"\"\"\n    pid = tl.program_id(0)\n    nprog = tl.num_programs(0)\n    ao = tl.arange(0, BO)\n    ar = tl.arange(0, BR)\n    for t in range(pid, NT, nprog):\n        o = (t // NB) * BO + ao\n        r = (t % NB) * BR + ar\n        if EVEN_O:\n            v = tl.load(i_ptr + o * ISO).to(tl.int32)\n            g = tl.load(g_ptr + o * GSO)\n        else:\n            mo = o < OUTER\n            v = tl.load(i_ptr + o * ISO, mask=mo, other=-1).to(tl.int32)\n            g = tl.load(g_ptr + o * GSO, mask=mo, other=0.0)\n        g2 = tl.broadcast_to(g[:, None], (BO, BR))\n        val = tl.where(r[None, :] == v[:, None], g2, tl.zeros_like(g2))\n        off = o[:, None] * RED + r[None, :]\n        if EVEN_O and EVEN_R:\n            tl.store(out_ptr + off, val)\n        elif EVEN_R:\n            tl.store(out_ptr + off, val, mask=(o < OUTER)[:, None])\n        else:\n            tl.store(out_ptr + off, val,\n                     mask=(o < OUTER)[:, None] & (r[None, :] < RED))\n\n\n@triton.jit\ndef _vsrb_general_kernel(\n    out_ptr,\n    g_ptr,\n    i_ptr,\n    n_elem,\n    red,\n    inner,\n    gs_o,\n    gs_i,\n    is_o,\n    is_i,\n    n_tiles,\n    BLOCK: tl.constexpr,\n):\n    \"\"\"inner > 1 (or non-collapsible strides): flat pass over the output.\"\"\"\n    pid = tl.program_id(0)\n    nprog = tl.num_programs(0)\n    a = tl.arange(0, BLOCK)\n    ri = red * inner\n    for t in range(pid, n_tiles, nprog):\n        off = t * BLOCK + a\n        m = off < n_elem\n        o = off // ri\n        rem = off % ri\n        r = rem // inner\n        i = rem % inner\n        g = tl.load(g_ptr + o * gs_o + i * gs_i, mask=m, other=0.0)\n        v = tl.load(i_ptr + o * is_o + i * is_i, mask=m, other=-1).to(tl.int32)\n        val = tl.where(r == v, g, tl.zeros_like(g))\n        tl.store(out_ptr + off, val, mask=m)\n\n\ndef _collapse(shape, stride):\n    \"\"\"Collapse a dim range into (size, stride) if it is affinely strided.\"\"\"\n    n = len(shape)\n    if n == 0:\n        return 1, 0\n    size = 1\n    st = 0\n    for j in range(n - 1, -1, -1):\n        sj = int(shape[j])\n        if j == n - 1 or size == 1:\n            st = int(stride[j])\n            size = sj\n        elif sj == 1:\n            continue\n        elif int(stride[j]) == st * size:\n            size *= sj\n        else:\n            return None\n    return size, st\n\n\ndef _lead_stride(shape, stride, d):\n    \"\"\"Collapsed stride of the leading `d` dims, or None when non-affine.\"\"\"\n    if d <= 0:\n        return 0\n    st = int(stride[d - 1])\n    acc = int(shape[d - 1])\n    for j in range(d - 2, -1, -1):\n        sj = int(shape[j])\n        if sj == 1:\n            continue\n        if acc == 1:\n            st = int(stride[j])\n            acc = sj\n        elif int(stride[j]) == st * acc:\n            acc *= sj\n        else:\n            return None\n    return st\n\n\ndef _npow2(n):\n    p = 1\n    while p < n:\n        p *= 2\n    return p\n\n\ndef value_selecting_reduction_backward(\n    grad: torch.Tensor,\n    dim: int,\n    indices: torch.Tensor,\n    sizes,\n    keepdim: bool,\n) -> torch.Tensor:\n    nd = len(sizes)\n    d = dim\n    if d < 0:\n        d += nd\n    red = int(sizes[d])\n    outer = 1\n    for j in range(d):\n        outer *= int(sizes[j])\n    inner = 1\n    for j in range(d + 1, nd):\n        inner *= int(sizes[j])\n\n    out = torch.empty(sizes, dtype=grad.dtype, device=grad.device)\n    if outer * red * inner == 0:\n        return out\n\n    gsh, gst = grad.shape, grad.stride()\n    ish, ist = indices.shape, indices.stride()\n    gso = iso = None\n    if inner == 1:\n        if keepdim:\n            gso = _lead_stride(gsh, gst, d)\n            iso = _lead_stride(ish, ist, d)\n        else:\n            # keepdim=False drops `dim`, so the leading dims coincide.\n            gso = _lead_stride(gsh, gst, d)\n            iso = _lead_stride(ish, ist, d)\n\n    if gso is not None and iso is not None:\n        if red >= _TILE_ELEMS:\n            br = _TILE_ELEMS\n            bo = 1\n        else:\n            br = _npow2(red)\n            bo = max(1, _TILE_ELEMS // br)\n            cap = _npow2(outer)\n            if bo > cap:\n                bo = cap\n        nb = (red + br - 1) // br\n        nt = ((outer + bo - 1) // bo) * nb\n        _vsrb_inner1_kernel[(nt if nt < _MAX_PROGRAMS else _MAX_PROGRAMS,)](\n            out, grad, indices,\n            outer, red, gso, iso, nb, nt, bo, br,\n            (outer % bo == 0), (red == br),\n        )\n        return out\n\n    lo, hi = (d, d + 1) if keepdim else (d, d)\n    gl = _collapse(gsh[:lo], gst[:lo])\n    gr = _collapse(gsh[hi:], gst[hi:])\n    il = _collapse(ish[:lo], ist[:lo])\n    ir = _collapse(ish[hi:], ist[hi:])\n    if gl is None or gr is None or il is None or ir is None:\n        raise NotImplementedError(\n            \"value_selecting_reduction_backward: unsupported strides\"\n        )\n    n_elem = outer * red * inner\n    nt = (n_elem + 255) // 256\n    _vsrb_general_kernel[(nt if nt < 65535 else 65535,)](\n        out, grad, indices,\n        n_elem, red, inner, gl[1], gr[1], il[1], ir[1], nt,\n        BLOCK=256,\n    )\n    return out\n\n\nrun = value_selecting_reduction_backward\n",
+  "search_best_geo_mean": 1.6020742636251846,
+  "final_verification": {
+    "status": "PASSED",
+    "reason_code": "VERIFIED",
+    "geo_mean": 1.6343877591532259,
+    "measured_geo_mean": 1.6343877591532259,
+    "comparisons": [
+      {
+        "uuid": "value_selecting_reduction_backward-timing-0",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.14764958030483286,
+          "latency_ms": 0.1027844783144161
+        },
+        "after": {
+          "reference_latency_ms": 0.1419332837427626,
+          "latency_ms": 0.09622892553208724
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9612847083596948,
+          "latency_ms": 0.9362204012723057
+        }
+      },
+      {
+        "uuid": "value_selecting_reduction_backward-timing-1",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.14734617532754,
+          "latency_ms": 0.10461388513732484
+        },
+        "after": {
+          "reference_latency_ms": 0.14319688012666756,
+          "latency_ms": 0.09673534793626792
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9718398174119631,
+          "latency_ms": 0.9246893737794473
+        }
+      },
+      {
+        "uuid": "value_selecting_reduction_backward-timing-2",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.32326662031399317,
+          "latency_ms": 0.11153105168301097
+        },
+        "after": {
+          "reference_latency_ms": 0.3229877013437541,
+          "latency_ms": 0.11154258867164461
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9991371859860813,
+          "latency_ms": 1.0001034419424863
+        }
+      },
+      {
+        "uuid": "value_selecting_reduction_backward-timing-3",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.15933000683165352,
+          "latency_ms": 0.10962720935826313
+        },
+        "after": {
+          "reference_latency_ms": 0.14292882361313755,
+          "latency_ms": 0.09848927387971716
+        },
+        "ratios": {
+          "reference_latency_ms": 0.8970615545391566,
+          "latency_ms": 0.8984017239538858
+        }
+      },
+      {
+        "uuid": "value_selecting_reduction_backward-timing-4",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.1534966895616542,
+          "latency_ms": 0.10941839363790051
+        },
+        "after": {
+          "reference_latency_ms": 0.14352029634282334,
+          "latency_ms": 0.09886257325466814
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9350058086117637,
+          "latency_ms": 0.9035279167215262
+        }
+      },
+      {
+        "uuid": "value_selecting_reduction_backward-timing-5",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.15735099177177106,
+          "latency_ms": 0.11163439192202006
+        },
+        "after": {
+          "reference_latency_ms": 0.14421344722856153,
+          "latency_ms": 0.09943174629203044
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9165080283557105,
+          "latency_ms": 0.8906909831289848
+        }
+      },
+      {
+        "uuid": "value_selecting_reduction_backward-timing-6",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.1535983002738688,
+          "latency_ms": 0.10890981209381179
+        },
+        "after": {
+          "reference_latency_ms": 0.1420565862030394,
+          "latency_ms": 0.09824696587774905
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9248578008334057,
+          "latency_ms": 0.9020947147821899
+        }
+      },
+      {
+        "uuid": "value_selecting_reduction_backward-timing-7",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.14926236039207583,
+          "latency_ms": 0.1073146267143756
+        },
+        "after": {
+          "reference_latency_ms": 0.14317587541982538,
+          "latency_ms": 0.0980304688899164
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9592229081982709,
+          "latency_ms": 0.9134865571571195
+        }
+      },
+      {
+        "uuid": "value_selecting_reduction_backward-timing-8",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.32511055058597854,
+          "latency_ms": 0.11151739036758368
+        },
+        "after": {
+          "reference_latency_ms": 0.32536956351009927,
+          "latency_ms": 0.1115601900724026
+        },
+        "ratios": {
+          "reference_latency_ms": 1.000796691844217,
+          "latency_ms": 1.000383793995518
+        }
+      },
+      {
+        "uuid": "value_selecting_reduction_backward-timing-9",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.14804747791680725,
+          "latency_ms": 0.10553564088699856
+        },
+        "after": {
+          "reference_latency_ms": 0.1627356754268058,
+          "latency_ms": 0.10353783727441022
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0992127506437654,
+          "latency_ms": 0.9810698680010153
+        }
+      },
+      {
+        "uuid": "value_selecting_reduction_backward-timing-10",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.1490732597867377,
+          "latency_ms": 0.10616584687722326
+        },
+        "after": {
+          "reference_latency_ms": 0.15833228847020245,
+          "latency_ms": 0.10248506071900333
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0621105937893263,
+          "latency_ms": 0.9653298469659776
+        }
+      },
+      {
+        "uuid": "value_selecting_reduction_backward-timing-11",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.14885959541005947,
+          "latency_ms": 0.10720461358472355
+        },
+        "after": {
+          "reference_latency_ms": 0.14480520014893547,
+          "latency_ms": 0.1001467281739637
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9727636283710468,
+          "latency_ms": 0.9341643500707922
+        }
+      },
+      {
+        "uuid": "value_selecting_reduction_backward-timing-12",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.14744195298007254,
+          "latency_ms": 0.10446771473198024
+        },
+        "after": {
+          "reference_latency_ms": 0.142437361961704,
+          "latency_ms": 0.09822355326589736
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9660572115519596,
+          "latency_ms": 0.940228792387172
+        }
+      },
+      {
+        "uuid": "value_selecting_reduction_backward-timing-13",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.1479849929867569,
+          "latency_ms": 0.10448046880236783
+        },
+        "after": {
+          "reference_latency_ms": 0.14282917378924762,
+          "latency_ms": 0.09814190456912543
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9651598510534735,
+          "latency_ms": 0.9393325441022643
+        }
+      },
+      {
+        "uuid": "value_selecting_reduction_backward-timing-14",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.6401862647943609,
+          "latency_ms": 0.18818632500441412
+        },
+        "after": {
+          "reference_latency_ms": 0.6397259778859171,
+          "latency_ms": 0.18819953492594368
+        },
+        "ratios": {
+          "reference_latency_ms": 0.999281010959222,
+          "latency_ms": 1.000070195969496
+        }
+      },
+      {
+        "uuid": "value_selecting_reduction_backward-timing-15",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.1475072097799053,
+          "latency_ms": 0.1066206009822217
+        },
+        "after": {
+          "reference_latency_ms": 0.13320754745708152,
+          "latency_ms": 0.09920878482621999
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9030578753122628,
+          "latency_ms": 0.9304842020423653
+        }
+      },
+      {
+        "uuid": "value_selecting_reduction_backward-timing-16",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.14862931535580365,
+          "latency_ms": 0.10635714782415699
+        },
+        "after": {
+          "reference_latency_ms": 0.13079398899579076,
+          "latency_ms": 0.09961382625594649
+        },
+        "ratios": {
+          "reference_latency_ms": 0.8800012883237945,
+          "latency_ms": 0.936597382440535
+        }
+      },
+      {
+        "uuid": "value_selecting_reduction_backward-timing-17",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.1484090787069181,
+          "latency_ms": 0.10640956690569897
+        },
+        "after": {
+          "reference_latency_ms": 0.12946014341460124,
+          "latency_ms": 0.09877821985083536
+        },
+        "ratios": {
+          "reference_latency_ms": 0.8723195679306271,
+          "latency_ms": 0.9282832617707525
+        }
+      }
+    ],
+    "drift": [],
+    "drift_factor": 2.0,
+    "compared_to": "original_round",
+    "attempt_path": ".kernelgen/retests/cc149ba4e1548d6211763c0920d4778c94dd00f5c573042b6b8827cd034c1372/b5ead2d6e48e6bd003b38823b94eef3415c84ff4c20a2faad1ca9c0ea163feab/attempt-0001.json",
+    "round_num": 2,
+    "solution_sha256": "cc149ba4e1548d6211763c0920d4778c94dd00f5c573042b6b8827cd034c1372"
+  },
+  "rounds": 2,
+  "summary": "Won by fusing the reference's zero-fill plus scatter into one Triton kernel that exploits the injectivity of value-selecting scatter (out[o,r,i] = grad[o,i] if idx[o,i]==r else 0), and by streaming contiguous 8192-element output tiles from a small persistent grid (<=512 task-derived programs, striding by tl.num_programs(0)) with a 3-pointer, compile-time-geometry launch. Measured geo_mean rose from 0.301 (round 1, one program per tile) to 1.602 with min_speedup 1.383 and all 96 workloads exact, as the large 8192^2 shapes went from 2.4 ms to 0.111/0.188 ms; the remaining limit on 15 of 18 timing shapes is a ~0.105 ms host alloc+launch floor versus the reference's ~0.147 ms floor.",
+  "workspace": "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/value_selecting_reduction_backward-night-20261021-v3-kg-no-profile/stages/optimize/work"
+}

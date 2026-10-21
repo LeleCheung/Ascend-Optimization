@@ -45,6 +45,13 @@ def load_result(path):
     if sources[0]['content'] != path.with_name(label + '.py').read_text(encoding='utf-8'):
         raise ValueError(f'候选快照与评测请求不一致：{path}')
     inspect = read(path.parent / 'inspect.json')
+    if inspect.get('kind') == 'native':
+        case_specs = {case['case_id']: case for case in inspect['case_list']['cases']}
+        for case_id, row in timing.items():
+            if not row.get('axes'):
+                case = case_specs.get(case_id, {})
+                row['axes'] = {'dtype': case.get('dtype'), 'shape_detail': case.get('shape'),
+                               'params': case.get('params', {})}
     expected = {case['case_id'] for case in inspect['case_list']['cases']}
     if set(timing) != expected:
         raise ValueError(f'性能 case 未完整覆盖 inspect：{path}')
@@ -95,7 +102,7 @@ def compare(versions):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--version', action='append', nargs=2, required=True,
-                        metavar=('NAME', 'RESULT'), help='第一项为固定 master；仅接收独立完整复验结果')
+                        metavar=('NAME', 'RESULT'), help='第一项为固定原版 FlagGems；仅接收独立完整复验结果')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     if len({name for name, _ in args.version}) != len(args.version):
@@ -106,20 +113,20 @@ def main():
                   'device_task': '设备任务计时（包括 DMA 复制与 AIV kernel，排除 host 发射间隙）',
                   'walltime': '批量调用前后同步的平均完整算子计时，包含 host 发射与设备执行'}[versions[0][1]['timing_scope']]
     lines = ['# 同合同版本性能对比', '',
-             f'以下为已提供并通过独立完整评测的版本。计时为 FlagGems core {scope_text}；数值为逐 case 加速比的几何平均。', '',
-             '| 版本 | 正确性 | 性能 case | 相对 PyTorch | 相对固定 master | PyTorch 基线变化 |',
+             f'以下为已提供并通过独立完整评测的版本。采用 KGS 的{scope_text}；数值为逐 case 加速比的几何平均。', '',
+             '| 版本 | 正确性 | 性能 case | 相对 PyTorch | 相对 FlagGems | PyTorch 参考变化 |',
              '| --- | ---: | ---: | ---: | ---: | ---: |']
     for row in summary:
         lines.append(f'| {row["version"]} | {row["correctness_count"]} 项全通过 | {row["timing_count"]} | '
                      f'{row["relative_pytorch"]:.3f}× | {row["relative_master"]:.3f}× | '
                      f'{row["reference_drift_geomean"]:.3f}× |')
-    lines += ['', '相对 master 使用相同 case 的 master 候选延迟 ÷ 当前候选延迟。PyTorch 基线变化用于检查各批次的环境波动；逐 case 数据见同名 CSV。', '']
+    lines += ['', '相对 FlagGems 使用相同 case 的固定原版延迟 ÷ 当前候选延迟。PyTorch 参考变化用于检查各批次的环境波动；逐 case 数据见同名 CSV。FlagGems-sglang 对象使用其固定原版，版本身份随来源记录保存。', '']
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text('\n'.join(lines), encoding='utf-8')
     args.output.with_suffix('.json').write_text(json.dumps(summary, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     with args.output.with_suffix('.csv').open('w', encoding='utf-8-sig', newline='') as stream:
         writer = csv.writer(stream)
-        writer.writerow(['版本', 'case_id', 'dtype', 'shape_detail', 'PyTorch_us', '候选_us', '相对PyTorch', '相对master', 'PyTorch基线变化'])
+        writer.writerow(['版本', 'case_id', 'dtype', 'shape_detail', 'PyTorch_us', '候选_us', '相对PyTorch', '相对FlagGems', 'PyTorch参考变化'])
         master = versions[0][1]
         for name, version in versions:
             for case_id, row in version['timing'].items():

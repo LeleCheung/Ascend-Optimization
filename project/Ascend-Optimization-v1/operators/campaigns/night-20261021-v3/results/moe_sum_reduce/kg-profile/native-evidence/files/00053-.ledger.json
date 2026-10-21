@@ -1,0 +1,462 @@
+{
+  "schema_version": "3.0",
+  "definition_name": "moe_sum_reduce",
+  "target_hardware": "Ascend910B",
+  "implementation_language": "triton",
+  "best_geo_mean": 1.6234482787134883,
+  "best_round": 2,
+  "best_code": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef _moe_sum_reduce_contig_kernel(\n    input_ptr,\n    output_ptr,\n    routed_scaling_factor,\n    K: tl.constexpr,\n    H: tl.constexpr,\n    BM: tl.constexpr,\n    BN: tl.constexpr,\n):\n    \"\"\"Mask-free flat [T, K, H] contiguous reduce over the K axis.\n\n    Each program owns BM whole tokens for one BN-wide column slice, so a\n    program streams a large contiguous window of the activation instead of a\n    single token row.  On the target this is what moves the kernel off the\n    per-program overhead regime and up to the memory-system ceiling.\n    \"\"\"\n    offsets_m = tl.program_id(0) * BM + tl.arange(0, BM)\n    offsets_n = tl.program_id(1) * BN + tl.arange(0, BN)\n    input_offsets = offsets_m[:, None] * (K * H) + offsets_n[None, :]\n    reduced = tl.zeros((BM, BN), dtype=tl.float32)\n    for topk_index in tl.static_range(0, K):\n        reduced += tl.load(input_ptr + input_offsets + topk_index * H).to(\n            tl.float32\n        )\n    output_offsets = offsets_m[:, None] * H + offsets_n[None, :]\n    tl.store(output_ptr + output_offsets, reduced * routed_scaling_factor)\n\n\n@triton.jit\ndef _moe_sum_reduce_strided_kernel(\n    input_ptr,\n    output_ptr,\n    routed_scaling_factor,\n    num_tokens: tl.constexpr,\n    top_k: tl.constexpr,\n    hidden_dim: tl.constexpr,\n    input_stride_token,\n    input_stride_topk,\n    input_stride_hidden,\n    output_stride_token,\n    output_stride_hidden,\n    BLOCK_M: tl.constexpr,\n    BLOCK_N: tl.constexpr,\n):\n    \"\"\"Generic masked, strided fallback (not used by the benchmarked shapes).\"\"\"\n    offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)\n    offsets_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)\n    mask = (offsets_m[:, None] < num_tokens) & (\n        offsets_n[None, :] < hidden_dim\n    )\n    input_offsets = (\n        offsets_m[:, None] * input_stride_token\n        + offsets_n[None, :] * input_stride_hidden\n    )\n    reduced = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\n    for topk_index in tl.static_range(0, top_k):\n        reduced += tl.load(\n            input_ptr + input_offsets + topk_index * input_stride_topk,\n            mask=mask,\n            other=0.0,\n        ).to(tl.float32)\n    reduced *= routed_scaling_factor\n    output_offsets = (\n        offsets_m[:, None] * output_stride_token\n        + offsets_n[None, :] * output_stride_hidden\n    )\n    tl.store(output_ptr + output_offsets, reduced, mask=mask)\n\n\ndef moe_sum_reduce(\n    input: torch.Tensor, routed_scaling_factor: float\n) -> torch.Tensor:\n    num_tokens, top_k, hidden_dim = input.shape\n    output = torch.empty(\n        (num_tokens, hidden_dim), dtype=input.dtype, device=input.device\n    )\n    if num_tokens == 0 or hidden_dim == 0:\n        return output\n\n    block_m = 16\n    while block_m > 1 and num_tokens % block_m:\n        block_m >>= 1\n    block_n = 1024\n    while block_n > 1 and hidden_dim % block_n:\n        block_n >>= 1\n\n    if block_n > 1 and input.is_contiguous():\n        _moe_sum_reduce_contig_kernel[\n            (num_tokens // block_m, hidden_dim // block_n)\n        ](\n            input,\n            output,\n            routed_scaling_factor,\n            K=top_k,\n            H=hidden_dim,\n            BM=block_m,\n            BN=block_n,\n            num_warps=4,\n            num_stages=2,\n        )\n    else:\n        block_n = 512 if hidden_dim >= 512 else 1 << (hidden_dim - 1).bit_length()\n        _moe_sum_reduce_strided_kernel[\n            (num_tokens, (hidden_dim + block_n - 1) // block_n)\n        ](\n            input,\n            output,\n            routed_scaling_factor,\n            num_tokens,\n            top_k,\n            hidden_dim,\n            *input.stride(),\n            *output.stride(),\n            BLOCK_M=1,\n            BLOCK_N=block_n,\n            num_warps=4,\n            num_stages=1,\n        )\n    return output\n\n\n__all__ = [\"moe_sum_reduce\"]\n\nrun = moe_sum_reduce\n",
+  "rounds": [
+    {
+      "round_num": 1,
+      "experiment_parent_round_num": null,
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Establish the measured baseline using the provided best-so-far seed implementation unchanged",
+        "code_changes": "None; the seed moe_sum_reduce Triton kernel is written verbatim to tmp/main.py",
+        "hypothesis": "The seed's fp32 accumulation across the top_k dimension with contiguous innermost BLOCK_N tiling already beats the torch reference chain (which materializes an fp32 intermediate) on every timing workload; measuring it gives per-workload speedups that identify the weakest shape class for the single follow-up optimization.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "Single fused kernel reads bf16 once and writes bf16 once, versus reference cast/sum/mul/cast materializing a fp32 copy"
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {},
+        "knowledge_uses": []
+      },
+      "solution": {
+        "sha256": "15e186b3064bbd3e0654d33442a41eed9bcc3a38accbb501243117d99603fa5e",
+        "snapshot_path": ".kernelgen/evals/round-0001",
+        "candidate_path": "tmp/main.py",
+        "code": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef _moe_sum_reduce_kernel(\n    input_ptr,\n    output_ptr,\n    num_tokens: tl.constexpr,\n    top_k: tl.constexpr,\n    hidden_dim: tl.constexpr,\n    input_stride_token,\n    input_stride_topk,\n    input_stride_hidden,\n    output_stride_token,\n    output_stride_hidden,\n    routed_scaling_factor,\n    BLOCK_M: tl.constexpr,\n    BLOCK_N: tl.constexpr,\n):\n    offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)\n    offsets_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)\n    mask = (offsets_m[:, None] < num_tokens) & (\n        offsets_n[None, :] < hidden_dim\n    )\n    input_offsets = (\n        offsets_m[:, None] * input_stride_token\n        + offsets_n[None, :] * input_stride_hidden\n    )\n    reduced = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\n    for topk_index in range(0, top_k):\n        values = tl.load(\n            input_ptr + input_offsets + topk_index * input_stride_topk,\n            mask=mask,\n            other=0.0,\n        )\n        reduced += values.to(tl.float32)\n    reduced *= routed_scaling_factor\n    output_offsets = (\n        offsets_m[:, None] * output_stride_token\n        + offsets_n[None, :] * output_stride_hidden\n    )\n    tl.store(output_ptr + output_offsets, reduced, mask=mask)\n\n\ndef moe_sum_reduce(\n    input: torch.Tensor, routed_scaling_factor: float\n) -> torch.Tensor:\n    num_tokens, top_k, hidden_dim = input.shape\n    output = torch.empty(\n        (num_tokens, hidden_dim), dtype=input.dtype, device=input.device\n    )\n    if num_tokens <= 64:\n        block_m, block_n, num_warps = 2, 512, 8\n    else:\n        block_m, block_n, num_warps = 1, 2048, 2\n    block_n = min(block_n, triton.next_power_of_2(hidden_dim))\n    _moe_sum_reduce_kernel[\n        (triton.cdiv(num_tokens, block_m), triton.cdiv(hidden_dim, block_n))\n    ](\n        input,\n        output,\n        num_tokens,\n        top_k,\n        hidden_dim,\n        *input.stride(),\n        *output.stride(),\n        routed_scaling_factor,\n        BLOCK_M=block_m,\n        BLOCK_N=block_n,\n        num_warps=num_warps,\n        num_stages=1,\n    )\n    return output\n\n\n__all__ = [\"moe_sum_reduce\"]\n\nrun = moe_sum_reduce\n"
+      },
+      "evaluation": {
+        "evaluated_at": "2026-10-21T16:24:37.784112Z",
+        "api_version": "v6.2",
+        "status": "PASSED",
+        "is_hack": false,
+        "hack_reason": "",
+        "geo_mean": 1.011722275539363,
+        "min_speedup": 0.715744663684579,
+        "worst_workload_uuid": "sglang_moe_sum_reduce-00000-timing",
+        "latency_ms": 0.12647641145693225,
+        "max_abs_error": 0.0,
+        "max_rel_error": 0.0,
+        "num_workloads": 8,
+        "num_passed": 8,
+        "timing_skipped": false,
+        "requested_hardware": "Ascend910B",
+        "server_backend": "npu",
+        "log": "",
+        "workloads": [
+          {
+            "uuid": "sglang_moe_sum_reduce-00000-correctness",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "sglang_moe_sum_reduce-00001-correctness",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "sglang_moe_sum_reduce-00002-correctness",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "sglang_moe_sum_reduce-00000-timing",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.12647641145693225,
+            "reference_latency_ms": 0.09052481658227442,
+            "speedup": 0.715744663684579,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "sglang_moe_sum_reduce-00001-timing",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.12597023671229649,
+            "reference_latency_ms": 0.0915170627244733,
+            "speedup": 0.7264975053868413,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "sglang_moe_sum_reduce-00002-timing",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.1338796999443431,
+            "reference_latency_ms": 0.1006179685995643,
+            "speedup": 0.7515550799814574,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "sglang_moe_sum_reduce-00003-timing",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.15335873883008103,
+            "reference_latency_ms": 0.2484988729314733,
+            "speedup": 1.6203763465139471,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "sglang_moe_sum_reduce-00004-timing",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 1.4369904992733051,
+            "reference_latency_ms": 2.405423235632782,
+            "speedup": 1.6739312033372657,
+            "abs_err": null,
+            "rel_err": null
+          }
+        ],
+        "comparison": {
+          "performance_baseline_round_num": null,
+          "geo_mean_before": null,
+          "geo_mean_after": 1.011722275539363,
+          "geo_mean_delta_pct": null,
+          "workloads": []
+        },
+        "fingerprint": "18759f3c831ac3c5b720e789ae62a542aecb0a66c830c45f30ea32a5179e6699"
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "Baseline of the seed kernel: fused single-pass bf16 kernel is correct on all 8 workloads (abs_err 0, matched_ratio 1.0). Its aggregate geo_mean is 1.0117, but the workload breakdown shows two distinct regimes. The two large timing shapes win (512 tokens 1.62x, 4096 tokens 1.67x) because the reference materializes a fp32 copy of the input (2.9 GB of traffic vs 0.53 GB for the fused kernel). The three small shapes lose (1 token 0.716x, 8 tokens 0.726x, 64 tokens 0.752x) at a nearly constant ~0.126-0.134 ms, which is dominated by fixed per-call overhead rather than by data movement; for these the reference chain of four small torch ops costs only ~0.09-0.10 ms. Additionally, on the 4096-token case the fused kernel sustains only ~0.40 TB/s of marginal bandwidth (1.437 ms for 528 MB) while the reference chain sustains ~1.0 TB/s, so the seed's launch geometry (16384 single-token, 2048-wide programs, num_warps=2) is far from saturating the memory system.",
+        "perf_gap_analysis": "No prior measurement existed, so this round only establishes the reference point. Per-workload speedups: 00000-timing (1,8,7168) 0.7157x / 0.1265 ms vs 0.0905 ms; 00001-timing (8,8,7168) 0.7265x / 0.1260 vs 0.0915; 00002-timing (64,8,7168) 0.7516x / 0.1339 vs 0.1006; 00003-timing (512,8,7168) 1.6204x / 0.1534 vs 0.2485; 00004-timing (4096,8,7168) 1.6739x / 1.4370 vs 2.4054. The two gaps to close are (a) the sub-1.0x small shapes, whose latency is essentially shape-independent, and (b) the large shape's 2.5x bandwidth deficit versus the reference chain's achieved throughput.",
+        "next_suggestion": "Run a bounded target-side sweep of the launch geometry (tokens per program, columns per program, num_warps, num_stages) plus a persistent grid-stride variant on the target, then adopt the geometry that maximizes achieved bandwidth on the 4096-token shape while keeping the small shapes at their minimum-latency configuration.",
+        "optimization_level": "L1_architecture",
+        "debug_lesson": "The geo_mean masks two opposing regimes: fixed per-call overhead dominates the small shapes while streaming bandwidth dominates the large shape. Constant-latency evidence across 1/8/64 tokens (~0.126-0.134 ms) is the signature of overhead dominance, and it means the reference must be beaten on overhead for those shapes, not on bytes.",
+        "strategy_evolution": "Established the measured baseline before touching the launch geometry so the single remaining round can be aimed with per-workload evidence instead of guesswork.",
+        "knowledge_assessments": []
+      },
+      "next_verdict": {
+        "should_continue": true,
+        "code": "continue",
+        "reason": "no stop trigger"
+      }
+    },
+    {
+      "round_num": 2,
+      "experiment_parent_round_num": 1,
+      "plan": {
+        "kind": "performance",
+        "strategy": "Workload-derived tiling: pack 16 whole tokens per program over a 1024-wide mask-free column slice with a two-stage software pipeline, replacing the seed's single-token 2048-wide program",
+        "code_changes": "Replaced the 1-token / 2048-column program with a mask-free kernel that packs BM=16 whole tokens per program over a BN=1024 column slice (largest power of 2 dividing T and H, so no masking is emitted), runs with num_stages=2 to pipeline the eight top_k loads, and drops the token dimension's masking and the five runtime stride arguments (strides are derived from the constexpr K, H). A conservative masked strided kernel (BM=1, BN<=512) handles non-contiguous or non-divisible shapes.",
+        "hypothesis": "The seed's loss is a launch-geometry problem, not a bandwidth problem: on the 4096-token shape it moves 528 MB in 1.437 ms (~0.38 TB/s) while the reference chain sustains ~1.0 TB/s, and the target probe showed achieved bandwidth climbing monotonically with tokens-per-program (BM=1 379 GB/s, BM=2 602, BM=4 863, BM=8 970, BM=16 1186 GB/s at BN=1024) with num_stages=2 adding a further 8.5%. The three small shapes are pinned at a ~0.10 ms host-dispatch floor that no geometry changes.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Packing 16 tokens per program cuts the program count on the 4096-token shape from 16384 to 1792 and lets each program stream a large contiguous window, moving the kernel from the per-program overhead regime toward the memory-system ceiling; pipelining the eight strided top_k loads with num_stages=2 hides their latency. The 4096- and 512-token shapes should approach the ~1.19 TB/s measured ceiling (1.437 ms -> ~0.45 ms and 0.153 ms -> ~0.096 ms), while the three small shapes stay at their host-dispatch floor."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": null
+        },
+        "key_params": {
+          "BM": 16,
+          "BN": 1024,
+          "num_stages": 2,
+          "num_warps": 4
+        },
+        "knowledge_uses": []
+      },
+      "solution": {
+        "sha256": "96b0e8e40b23afe9a654d9e1afdb120046c97edebeccea5d998c212fa8491196",
+        "snapshot_path": ".kernelgen/evals/round-0002",
+        "candidate_path": "tmp/main.py",
+        "code": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef _moe_sum_reduce_contig_kernel(\n    input_ptr,\n    output_ptr,\n    routed_scaling_factor,\n    K: tl.constexpr,\n    H: tl.constexpr,\n    BM: tl.constexpr,\n    BN: tl.constexpr,\n):\n    \"\"\"Mask-free flat [T, K, H] contiguous reduce over the K axis.\n\n    Each program owns BM whole tokens for one BN-wide column slice, so a\n    program streams a large contiguous window of the activation instead of a\n    single token row.  On the target this is what moves the kernel off the\n    per-program overhead regime and up to the memory-system ceiling.\n    \"\"\"\n    offsets_m = tl.program_id(0) * BM + tl.arange(0, BM)\n    offsets_n = tl.program_id(1) * BN + tl.arange(0, BN)\n    input_offsets = offsets_m[:, None] * (K * H) + offsets_n[None, :]\n    reduced = tl.zeros((BM, BN), dtype=tl.float32)\n    for topk_index in tl.static_range(0, K):\n        reduced += tl.load(input_ptr + input_offsets + topk_index * H).to(\n            tl.float32\n        )\n    output_offsets = offsets_m[:, None] * H + offsets_n[None, :]\n    tl.store(output_ptr + output_offsets, reduced * routed_scaling_factor)\n\n\n@triton.jit\ndef _moe_sum_reduce_strided_kernel(\n    input_ptr,\n    output_ptr,\n    routed_scaling_factor,\n    num_tokens: tl.constexpr,\n    top_k: tl.constexpr,\n    hidden_dim: tl.constexpr,\n    input_stride_token,\n    input_stride_topk,\n    input_stride_hidden,\n    output_stride_token,\n    output_stride_hidden,\n    BLOCK_M: tl.constexpr,\n    BLOCK_N: tl.constexpr,\n):\n    \"\"\"Generic masked, strided fallback (not used by the benchmarked shapes).\"\"\"\n    offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)\n    offsets_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)\n    mask = (offsets_m[:, None] < num_tokens) & (\n        offsets_n[None, :] < hidden_dim\n    )\n    input_offsets = (\n        offsets_m[:, None] * input_stride_token\n        + offsets_n[None, :] * input_stride_hidden\n    )\n    reduced = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\n    for topk_index in tl.static_range(0, top_k):\n        reduced += tl.load(\n            input_ptr + input_offsets + topk_index * input_stride_topk,\n            mask=mask,\n            other=0.0,\n        ).to(tl.float32)\n    reduced *= routed_scaling_factor\n    output_offsets = (\n        offsets_m[:, None] * output_stride_token\n        + offsets_n[None, :] * output_stride_hidden\n    )\n    tl.store(output_ptr + output_offsets, reduced, mask=mask)\n\n\ndef moe_sum_reduce(\n    input: torch.Tensor, routed_scaling_factor: float\n) -> torch.Tensor:\n    num_tokens, top_k, hidden_dim = input.shape\n    output = torch.empty(\n        (num_tokens, hidden_dim), dtype=input.dtype, device=input.device\n    )\n    if num_tokens == 0 or hidden_dim == 0:\n        return output\n\n    block_m = 16\n    while block_m > 1 and num_tokens % block_m:\n        block_m >>= 1\n    block_n = 1024\n    while block_n > 1 and hidden_dim % block_n:\n        block_n >>= 1\n\n    if block_n > 1 and input.is_contiguous():\n        _moe_sum_reduce_contig_kernel[\n            (num_tokens // block_m, hidden_dim // block_n)\n        ](\n            input,\n            output,\n            routed_scaling_factor,\n            K=top_k,\n            H=hidden_dim,\n            BM=block_m,\n            BN=block_n,\n            num_warps=4,\n            num_stages=2,\n        )\n    else:\n        block_n = 512 if hidden_dim >= 512 else 1 << (hidden_dim - 1).bit_length()\n        _moe_sum_reduce_strided_kernel[\n            (num_tokens, (hidden_dim + block_n - 1) // block_n)\n        ](\n            input,\n            output,\n            routed_scaling_factor,\n            num_tokens,\n            top_k,\n            hidden_dim,\n            *input.stride(),\n            *output.stride(),\n            BLOCK_M=1,\n            BLOCK_N=block_n,\n            num_warps=4,\n            num_stages=1,\n        )\n    return output\n\n\n__all__ = [\"moe_sum_reduce\"]\n\nrun = moe_sum_reduce\n"
+      },
+      "evaluation": {
+        "evaluated_at": "2026-10-21T16:35:43.327510Z",
+        "api_version": "v6.2",
+        "status": "PASSED",
+        "is_hack": false,
+        "hack_reason": "",
+        "geo_mean": 1.6234482787134883,
+        "min_speedup": 0.9254903423611779,
+        "worst_workload_uuid": "sglang_moe_sum_reduce-00000-timing",
+        "latency_ms": 0.09148055789224378,
+        "max_abs_error": 0.0,
+        "max_rel_error": 0.0,
+        "num_workloads": 8,
+        "num_passed": 8,
+        "timing_skipped": false,
+        "requested_hardware": "Ascend910B",
+        "server_backend": "npu",
+        "log": "",
+        "workloads": [
+          {
+            "uuid": "sglang_moe_sum_reduce-00000-correctness",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "sglang_moe_sum_reduce-00001-correctness",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "sglang_moe_sum_reduce-00002-correctness",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "sglang_moe_sum_reduce-00000-timing",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.09148055789224378,
+            "reference_latency_ms": 0.08466437284308426,
+            "speedup": 0.9254903423611779,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "sglang_moe_sum_reduce-00001-timing",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.09377863119754241,
+            "reference_latency_ms": 0.09283245980309829,
+            "speedup": 0.989910586427189,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "sglang_moe_sum_reduce-00002-timing",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.08498995235808497,
+            "reference_latency_ms": 0.08572931514472987,
+            "speedup": 1.0086994140616736,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "sglang_moe_sum_reduce-00003-timing",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.10237558075417756,
+            "reference_latency_ms": 0.2525576914853404,
+            "speedup": 2.4669720027452393,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "sglang_moe_sum_reduce-00004-timing",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.48730758566159804,
+            "reference_latency_ms": 2.410469317384731,
+            "speedup": 4.946504811970314,
+            "abs_err": null,
+            "rel_err": null
+          }
+        ],
+        "comparison": {
+          "performance_baseline_round_num": 1,
+          "geo_mean_before": 1.011722275539363,
+          "geo_mean_after": 1.6234482787134883,
+          "geo_mean_delta_pct": 60.463826680894805,
+          "workloads": [
+            {
+              "uuid": "sglang_moe_sum_reduce-00000-correctness",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "sglang_moe_sum_reduce-00001-correctness",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "sglang_moe_sum_reduce-00002-correctness",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "sglang_moe_sum_reduce-00000-timing",
+              "axes": {},
+              "before_latency_ms": 0.12647641145693225,
+              "after_latency_ms": 0.09148055789224378,
+              "latency_delta_ms": -0.03499585356468847,
+              "latency_delta_pct": -27.669865994423205,
+              "before_speedup": 0.715744663684579,
+              "after_speedup": 0.9254903423611779,
+              "speedup_delta": 0.20974567867659888,
+              "speedup_delta_pct": 29.30453963803935
+            },
+            {
+              "uuid": "sglang_moe_sum_reduce-00001-timing",
+              "axes": {},
+              "before_latency_ms": 0.12597023671229649,
+              "after_latency_ms": 0.09377863119754241,
+              "latency_delta_ms": -0.03219160551475407,
+              "latency_delta_pct": -25.554929763509538,
+              "before_speedup": 0.7264975053868413,
+              "after_speedup": 0.989910586427189,
+              "speedup_delta": 0.26341308104034766,
+              "speedup_delta_pct": 36.25794707995411
+            },
+            {
+              "uuid": "sglang_moe_sum_reduce-00002-timing",
+              "axes": {},
+              "before_latency_ms": 0.1338796999443431,
+              "after_latency_ms": 0.08498995235808497,
+              "latency_delta_ms": -0.04888974758625812,
+              "latency_delta_pct": -36.517670420969516,
+              "before_speedup": 0.7515550799814574,
+              "after_speedup": 1.0086994140616736,
+              "speedup_delta": 0.2571443340802162,
+              "speedup_delta_pct": 34.21496852719837
+            },
+            {
+              "uuid": "sglang_moe_sum_reduce-00003-timing",
+              "axes": {},
+              "before_latency_ms": 0.15335873883008103,
+              "after_latency_ms": 0.10237558075417756,
+              "latency_delta_ms": -0.050983158075903465,
+              "latency_delta_pct": -33.244377506515605,
+              "before_speedup": 1.6203763465139471,
+              "after_speedup": 2.4669720027452393,
+              "speedup_delta": 0.8465956562312922,
+              "speedup_delta_pct": 52.246853519717504
+            },
+            {
+              "uuid": "sglang_moe_sum_reduce-00004-timing",
+              "axes": {},
+              "before_latency_ms": 1.4369904992733051,
+              "after_latency_ms": 0.48730758566159804,
+              "latency_delta_ms": -0.9496829136117071,
+              "latency_delta_pct": -66.08832237178795,
+              "before_speedup": 1.6739312033372657,
+              "after_speedup": 4.946504811970314,
+              "speedup_delta": 3.2725736086330484,
+              "speedup_delta_pct": 195.50227644413448
+            }
+          ]
+        },
+        "fingerprint": "d59c5d2840102eede63853845bb2aadf6cfe996314d9436e610da4468573aa4c"
+      },
+      "profile": {
+        "required": true,
+        "status": "completed",
+        "analysis_path": ".kernelgen/profile-analysis/round-0002.json",
+        "summary": "mixed: Small-shape eval latency is a shared per-call floor: the device kernel is only 2-9% of measured latency for 1/2/8-token shapes, Load (MTE2) and vector pipes are ~89% serialized on every shape: pipe busy ratios sum to ~1.11 instead of ~1.0, 4096-token shape is device-bound at ~1.09 TB/s effective GM traffic, with MTE2 (GM->L1) at 67% of AIV time"
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "met",
+        "root_cause": "The seed's deficit was launch geometry, not arithmetic: it gave each program a single token over 2048 columns, so the 4096-token shape ran 16384 programs that each moved only ~36 KB and sustained ~0.38 TB/s while the memory system delivers ~1.19 TB/s. Packing 16 whole tokens into one program with a 1024-wide column slice cut that to 1792 programs, and num_stages=2 pipelined the eight strided top_k loads, lifting the same traffic to ~1.08 TB/s (4.95x over the reference). The three small shapes were never bandwidth limited; they were dominated by per-call host dispatch and allocation, which the smaller argument list and mask-free body reduced by ~30 us each.",
+        "perf_gap_analysis": "Frozen expectation: geo_mean increase via 16-token programs with a 1024-wide mask-free slice and a two-stage pipeline, with the 4096-token shape moving from 1.437 ms to about 0.45 ms and the 512-token shape from 0.153 ms to about 0.096 ms, while the three small shapes stayed at their dispatch floor. Observed: geo_mean 1.6234 versus the 1.0117 baseline (+60.5%), exceeding the 1.53-1.58 predicted from the target probe. Workload by workload against the baseline: 4096 tokens 1.6739x -> 4.9465x (1.4370 -> 0.4873 ms, reference 2.4105 ms) - slightly short of the 0.45 ms probe figure because the official harness reports 0.4873 ms, i.e. the achieved rate is ~1.08 TB/s versus the ~1.19 TB/s probe ceiling, a ~9% residual attributable to run-to-run variance and the harness allocation; 512 tokens 1.6204x -> 2.4670x (0.1534 -> 0.1024 ms) - somewhat better than the 0.096 ms probe estimate in speedup terms because the reference also measured faster here (0.2526 vs 0.2485 ms); 64 tokens 0.7516x -> 1.0087x (0.1339 -> 0.0850 ms); 8 tokens 0.7265x -> 0.9899x (0.1260 -> 0.0938 ms); 1 token 0.7157x -> 0.9255x (0.1265 -> 0.0915 ms). The three small shapes improved by 27-37% rather than staying flat as predicted, because the new wrapper also removed the five runtime stride arguments and the token masking, which lowered the per-call dispatch cost itself; they now sit at 0.085-0.094 ms against a measured floor of 0.085 ms for the fastest reference op chain, so the residual deficit on the 1-token shape is fixed dispatch cost, not device work. All three correctness workloads still match exactly (abs_err 0, matched_ratio 1.0).",
+        "next_suggestion": "No further round is available. Any future work should target the remaining host-side gap on the three small shapes (91-94 us, essentially at the Triton dispatch plus allocation floor of ~85-90 us) rather than the memory path: the 4096-token shape now runs at ~1.08 TB/s against a measured ceiling of ~1.19 TB/s, so the streaming architecture is close to exhausted.",
+        "optimization_level": "L1_architecture",
+        "debug_lesson": "Achieved bandwidth scaled monotonically with tokens-per-program (379 -> 602 -> 863 -> 970 -> 1186 GB/s for BM=1,2,4,8,16 at BN=1024), which is the signature of per-program overhead rather than a bandwidth wall; num_stages=2 then added another 8.5%. Two candidate geometries (BM=32/BN=1024, BM=16/BN=2048) are rejected by the target compiler with a ConvertLinalgIRToBinary failure, so BM<=16 with BN<=1024 is the portable envelope.",
+        "strategy_evolution": "Round 1 established that the geo_mean hides two regimes: constant ~0.126-0.134 ms latency across 1/8/64 tokens (overhead bound) versus 0.38 TB/s streaming on 4096 tokens (geometry bound). Prior probability of a bandwidth ceiling was displaced by a bounded target-side sweep, which showed achieved bandwidth still climbing steeply with tokens-per-program and thereby identified redundant per-program overhead as the root cause rather than insufficient memory throughput.",
+        "knowledge_assessments": []
+      },
+      "next_verdict": {
+        "should_continue": false,
+        "code": "max_round_reached",
+        "reason": "maximum round limit reached: 2/2"
+      }
+    }
+  ],
+  "rounds_without_improvement": 0
+}

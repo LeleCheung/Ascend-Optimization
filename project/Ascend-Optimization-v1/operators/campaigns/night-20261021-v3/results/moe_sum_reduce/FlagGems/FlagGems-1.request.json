@@ -1,0 +1,25 @@
+{
+  "api_version": "v6.2",
+  "binding": {
+    "bundle_id": "sha256:86f4c5cc9ca970a7533ea91e9bf45484fe103e9c40341c7409ac63309a13c987",
+    "definition": "moe_sum_reduce"
+  },
+  "implementation": {
+    "name": "moe_sum_reduce-FlagGems-1",
+    "definition": "moe_sum_reduce",
+    "language": "triton",
+    "entrypoint": "main.py::run",
+    "sources": [
+      {
+        "path": "main.py",
+        "content": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef _moe_sum_reduce_kernel(\n    input_ptr,\n    output_ptr,\n    num_tokens: tl.constexpr,\n    top_k: tl.constexpr,\n    hidden_dim: tl.constexpr,\n    input_stride_token,\n    input_stride_topk,\n    input_stride_hidden,\n    output_stride_token,\n    output_stride_hidden,\n    routed_scaling_factor,\n    BLOCK_M: tl.constexpr,\n    BLOCK_N: tl.constexpr,\n):\n    offsets_m = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)\n    offsets_n = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)\n    mask = (offsets_m[:, None] < num_tokens) & (\n        offsets_n[None, :] < hidden_dim\n    )\n    input_offsets = (\n        offsets_m[:, None] * input_stride_token\n        + offsets_n[None, :] * input_stride_hidden\n    )\n    reduced = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)\n    for topk_index in range(0, top_k):\n        values = tl.load(\n            input_ptr + input_offsets + topk_index * input_stride_topk,\n            mask=mask,\n            other=0.0,\n        )\n        reduced += values.to(tl.float32)\n    reduced *= routed_scaling_factor\n    output_offsets = (\n        offsets_m[:, None] * output_stride_token\n        + offsets_n[None, :] * output_stride_hidden\n    )\n    tl.store(output_ptr + output_offsets, reduced, mask=mask)\n\n\ndef moe_sum_reduce(\n    input: torch.Tensor, routed_scaling_factor: float\n) -> torch.Tensor:\n    num_tokens, top_k, hidden_dim = input.shape\n    output = torch.empty(\n        (num_tokens, hidden_dim), dtype=input.dtype, device=input.device\n    )\n    if num_tokens <= 64:\n        block_m, block_n, num_warps = 2, 512, 8\n    else:\n        block_m, block_n, num_warps = 1, 2048, 2\n    block_n = min(block_n, triton.next_power_of_2(hidden_dim))\n    _moe_sum_reduce_kernel[\n        (triton.cdiv(num_tokens, block_m), triton.cdiv(hidden_dim, block_n))\n    ](\n        input,\n        output,\n        num_tokens,\n        top_k,\n        hidden_dim,\n        *input.stride(),\n        *output.stride(),\n        routed_scaling_factor,\n        BLOCK_M=block_m,\n        BLOCK_N=block_n,\n        num_warps=num_warps,\n        num_stages=1,\n    )\n    return output\n\n\n__all__ = [\"moe_sum_reduce\"]\n\nrun = moe_sum_reduce\n"
+      }
+    ]
+  },
+  "settings": {
+    "warmup_ms": 1000,
+    "benchmark_ms": 100,
+    "num_trials": 3,
+    "timeout_seconds": 1800
+  }
+}

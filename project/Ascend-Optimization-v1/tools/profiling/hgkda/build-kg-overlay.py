@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parents[4]
 
 
-def build(output: Path, *, repo=REPO):
+def build(output: Path, *, repo=REPO, native_context=False):
     source = repo / 'sources/kernelgen'
     skill = ROOT / 'skills/hgkda'
     if output.exists():
@@ -36,6 +36,34 @@ def build(output: Path, *, repo=REPO):
         f'### {p.relative_to(skill).as_posix()}\n\n{p.read_text(encoding="utf-8")}'
         for p in sorted((skill / 'references').rglob('*.md')))
     appended = '\n\n# HG-KDA 角色扩展\n\n' + body + '\n\n' + references
+    context_extension = {}
+    if native_context:
+        helper = ROOT / 'native_context.py'
+        helper_target = target / 'tools/hgkda_native_context.py'
+        shutil.copyfile(helper, helper_target)
+        profile_target = target / 'tools/profile_round.py'
+        patch = '''
+
+# HG-KDA 可选扩展：只补充冻结 Native 输入，不改变测量、合同或采集参数。
+_hgkda_base_get_profile_context = get_profile_context
+
+def get_profile_context(workspace, context, round_num):
+    from kernelgen.tools.hgkda_native_context import enrich_native_context
+    authoritative = _hgkda_base_get_profile_context(workspace, context, round_num)
+    return enrich_native_context(authoritative, _load_snapshot(Path(workspace).resolve(), round_num))
+'''
+        original = profile_target.read_bytes()
+        profile_target.write_bytes(original + patch.encode('utf-8'))
+        context_extension = {
+            'helper_sha256': hashlib.sha256(helper_target.read_bytes()).hexdigest(),
+            'base_profile_round_sha256': hashlib.sha256(original).hexdigest(),
+            'overlay_profile_round_sha256': hashlib.sha256(profile_target.read_bytes()).hexdigest(),
+        }
+        appended += ('\n\n## Native 用例的准确输入\n\n'
+                     '`get_profile_context` 额外返回 `hgkda_workloads`，其中按用例身份保存原始'
+                     '`inputs`、seed、tolerance及phase。先从这里读取形状、dtype、stride相关规格'
+                     '与标量参数；不要根据case序号或其他算子的历史形状猜测。'
+                     '它不改变正式延迟、指标、候选源码或计分合同。\n')
     changed = {}
     for name in ['kernel-profile-analyzer', 'kernel-knowledge-profile-analyzer']:
         src = source / '.kernelgen/agents' / (name + '.md')
@@ -50,6 +78,8 @@ def build(output: Path, *, repo=REPO):
                             for p in sorted(skill.rglob('*')) if p.is_file() and '__pycache__' not in p.parts},
             'integration': '原生 KG 分析角色调用 KGS；额外分阶段方法与分类知识随角色加载',
             'compiler_changed': False, 'evaluator_changed': False}
+    if native_context:
+        data['native_context_extension'] = context_extension
     (output / 'hgkda-overlay.json').write_text(
         json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     return data
@@ -58,8 +88,10 @@ def build(output: Path, *, repo=REPO):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--native-context', action='store_true',
+                   help='仅新覆盖层：从冻结Native快照补充准确输入规格；不改变既有批次')
     a = p.parse_args()
-    print(json.dumps(build(a.output), ensure_ascii=False))
+    print(json.dumps(build(a.output, native_context=a.native_context), ensure_ascii=False))
 
 
 if __name__ == '__main__':

@@ -1,0 +1,238 @@
+{
+  "request": {
+    "api_version": "v6.2",
+    "evaluation_id": "9ee67af22c8ca8b0fbfe85b9254a91cf785747be859c3c7c0ea805a3541ffd03:round-2",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:b80b094798c640789f0e8243c79af58184e927db0fac8dc13f2269f2ec903b40",
+      "definition": "log10_"
+    },
+    "implementation": {
+      "name": "kernelgen-candidate-log10_",
+      "definition": "log10_",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"In-place base-10 logarithm (log10_) for Ascend with Triton.\n\nThe op is a single elementwise pass, so per-call latency on 910B is dominated by\nthe host launch path (measured ~52us through the FlagTree JIT wrapper versus\n~10us for the framework reference), not by the kernel.  Each (dtype, numel)\nspecialization is therefore compiled once and afterwards launched through the\nalready-bound compiled kernel with the current stream, which keeps the per-call\ncost to the compiled launcher itself (~13us).  Cold, misaligned and\nnon-contiguous calls use ordinary Triton launches.\n\"\"\"\n\nimport torch\nimport torch_npu  # noqa: F401  (provides the raw current-stream query)\nimport triton\nimport triton.language as tl\n\n_LOG10E = 0.4342944819032518\n\n# 32768 elements per program keeps per-program dispatch overhead amortized on the\n# large shapes (16384 programs at 1024 elements cost ~0.6ms on 4096x4096); larger\n# tiles exceed the 192KB UB budget once the fp32 compute buffer is materialized.\n_BLOCK_MAX = 32768\n_BLOCK_MIN = 1024\n_BLOCK_TARGET_PROGRAMS = 8\n_BLOCK_STRIDED = 1024\n\n\n@triton.jit\ndef _log10_nomask(X, BLOCK: tl.constexpr):\n    \"\"\"numel % BLOCK == 0 (host-guarded), so the tail mask can be dropped.\"\"\"\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    x = tl.load(X + offs)\n    y = tl.log(x.to(tl.float32)) * 0.4342944819032518\n    tl.store(X + offs, y.to(X.dtype.element_ty))\n\n\n@triton.jit\ndef _log10_masked(X, N, BLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < N\n    x = tl.load(X + offs, mask=mask)\n    y = tl.log(x.to(tl.float32)) * 0.4342944819032518\n    tl.store(X + offs, y.to(X.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _log10_strided(\n    X,\n    N,\n    S0,\n    S1,\n    S2,\n    S3,\n    S4,\n    S5,\n    S6,\n    S7,\n    T0,\n    T1,\n    T2,\n    T3,\n    T4,\n    T5,\n    T6,\n    T7,\n    NDIMS: tl.constexpr,\n    BLOCK: tl.constexpr,\n):\n    \"\"\"Arbitrary strides: logical index -> storage offset, written in place.\"\"\"\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK).to(tl.int64)\n    mask = offs < N\n    rem = offs\n    off = tl.zeros([BLOCK], tl.int64)\n    if NDIMS >= 8:\n        off += (rem % S7) * T7\n        rem = rem // S7\n    if NDIMS >= 7:\n        off += (rem % S6) * T6\n        rem = rem // S6\n    if NDIMS >= 6:\n        off += (rem % S5) * T5\n        rem = rem // S5\n    if NDIMS >= 5:\n        off += (rem % S4) * T4\n        rem = rem // S4\n    if NDIMS >= 4:\n        off += (rem % S3) * T3\n        rem = rem // S3\n    if NDIMS >= 3:\n        off += (rem % S2) * T2\n        rem = rem // S2\n    if NDIMS >= 2:\n        off += (rem % S1) * T1\n        rem = rem // S1\n    off += (rem % S0) * T0\n    x = tl.load(X + off, mask=mask)\n    y = tl.log(x.to(tl.float32)) * 0.4342944819032518\n    tl.store(X + off, y.to(X.dtype.element_ty), mask=mask)\n\n\n# per-(dtype, numel, alignment) launch entry\n_CACHE = {}\n\n# device index and cheapest faithful current-stream accessor, resolved once\n_RUNTIME = {}\n\n\ndef _pad8(values, fill):\n    head = list(values[:8])\n    return head + [fill] * (8 - len(head))\n\n\ndef _pick_block(n):\n    \"\"\"Largest tile that spreads work over cores without exceeding the UB budget.\"\"\"\n    if n >= _BLOCK_MAX * _BLOCK_TARGET_PROGRAMS:\n        return _BLOCK_MAX\n    target = -(-n // _BLOCK_TARGET_PROGRAMS)\n    block = _BLOCK_MIN\n    while block < target:\n        block <<= 1\n    return min(block, _BLOCK_MAX)\n\n\ndef _init_runtime():\n    \"\"\"Resolve the device index and the cheapest faithful stream accessor once.\"\"\"\n    try:\n        device = torch.npu.current_device()\n    except Exception:  # noqa: BLE001\n        device = 0\n    getter = None\n    try:\n        # The no-wait variant follows stream switches exactly like the torch\n        # accessor but does not stall behind already enqueued work: measured\n        # ~0.5us per call versus ~20us for the waiting raw query.\n        raw = getattr(torch_npu._C, \"_npu_getCurrentRawStreamNoWait\", None)\n        if raw is not None:\n            current = int(torch.npu.current_stream().npu_stream)\n            try:\n                if int(raw(device)) == current:\n                    getter = lambda: raw(device)  # noqa: E731\n            except TypeError:\n                if int(raw()) == current:\n                    getter = raw\n    except Exception:  # noqa: BLE001\n        getter = None\n    if getter is None:\n        from triton.runtime import driver\n\n        getter = lambda: driver.active.get_current_stream(device)  # noqa: E731\n    _RUNTIME[\"device\"] = device\n    _RUNTIME[\"stream\"] = getter\n    return getter\n\n\ndef _standard_launch(n, block, masked):\n    \"\"\"Ordinary Triton launch, used for cold, misaligned or unusual calls.\"\"\"\n    if masked:\n        def launch(X, n=n, block=block):\n            _log10_masked[(triton.cdiv(n, block),)](X, X.numel(), BLOCK=block)\n    else:\n        def launch(X, n=n, block=block):\n            _log10_nomask[(n // block,)](X, BLOCK=block)\n    return launch\n\n\ndef _build_launch(A, n, aligned):\n    block = _pick_block(n)\n    masked = n % block != 0\n    if not aligned:\n        return _standard_launch(n, block, masked)\n    try:\n        if masked:\n            compiled = _log10_masked.warmup(A, n, BLOCK=block, grid=(1,))\n            grid = triton.cdiv(n, block)\n        else:\n            compiled = _log10_nomask.warmup(A, BLOCK=block, grid=(1,))\n            grid = n // block\n        launcher = compiled.run\n        # NPULauncher only adds bookkeeping when one of these is enabled;\n        # otherwise its bound pybind launch is exactly what it forwards to.\n        if getattr(launcher, \"compile_only\", False) or getattr(\n            launcher, \"enable_msprof_register_tensor\", False\n        ):\n            call = launcher\n        else:\n            call = launcher.launch\n        function = compiled.function\n        metadata = compiled.packed_metadata\n    except Exception:  # noqa: BLE001\n        return _standard_launch(n, block, masked)\n\n    stream = _RUNTIME.get(\"stream\")\n    if stream is None:\n        stream = _init_runtime()\n\n    # The Ascend launcher ABI is (grid, stream, function, packed metadata, hooks,\n    # *kernel params) with constexpr params passed as placeholders.\n    if masked:\n        def launch(X, grid=grid, call=call, function=function, metadata=metadata,\n                   stream=stream):\n            call(grid, 1, 1, stream(), function, metadata, None, None, None,\n                 X, X.numel(), None)\n    else:\n        def launch(X, grid=grid, call=call, function=function, metadata=metadata,\n                   stream=stream):\n            call(grid, 1, 1, stream(), function, metadata, None, None, None,\n                 X, None)\n    return launch\n\n\ndef run(A):\n    n = A.numel()\n    if n == 0:\n        return A\n    if A.is_contiguous():\n        key = (A.dtype, n, A.data_ptr() & 15 == 0)\n        launch = _CACHE.get(key)\n        if launch is None:\n            launch = _build_launch(A, n, key[2])\n            _CACHE[key] = launch\n        launch(A)\n    else:\n        shape = _pad8(A.shape, 1)\n        strides = _pad8(A.stride(), 0)\n        _log10_strided[(triton.cdiv(n, _BLOCK_STRIDED),)](\n            A,\n            n,\n            shape[0],\n            shape[1],\n            shape[2],\n            shape[3],\n            shape[4],\n            shape[5],\n            shape[6],\n            shape[7],\n            strides[0],\n            strides[1],\n            strides[2],\n            strides[3],\n            strides[4],\n            strides[5],\n            strides[6],\n            strides[7],\n            NDIMS=min(A.dim(), 8),\n            BLOCK=_BLOCK_STRIDED,\n        )\n    return A\n"
+        }
+      ]
+    },
+    "benchmark_fingerprint": "sha256:a54cafb29e50ef8ffd72dd2370026a67ebbc34a8ef3546f20f4c92a62dae7cd6",
+    "case_id": "log10_-timing-11",
+    "expected_backend": "npu",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "identity": {
+      "solution_sha256": "9ca39b9a86a7932e24c872f0b4f9217836fcfa6a4740502c8b70690100f4beff",
+      "workload_sha256": "1fb46785a1e532fe9341ee7c9ffb48c5adce4429da884bcafd86443f72b521c6"
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "profile_id": "f279f388d4ca48e38e711c2f1031b2ed",
+    "created_at": "2026-10-21T18:36:34.534231+00:00",
+    "status": "completed",
+    "backend": "npu",
+    "profiler": "msprof",
+    "device": "npu:0",
+    "hardware": {
+      "target": {
+        "backend": "ascend",
+        "vendor": "huawei",
+        "device": "Ascend910B4-1",
+        "architecture": "dav-c220-cube",
+        "devices": [
+          {
+            "logical_device": "npu:0",
+            "device_id": 0,
+            "name": "Ascend910B4-1",
+            "l2_cache_size": 176160768,
+            "num_sm": 20,
+            "compute_capability": "",
+            "total_memory": 65452113920
+          }
+        ]
+      },
+      "software": {
+        "language": "triton",
+        "language_version": "3.5.1",
+        "compiler": "flagtree",
+        "compiler_version": "0.6.0+ascend.gitc286cba6",
+        "runtime": "cann",
+        "runtime_version": "9.0.0",
+        "driver_version": "25.2.0"
+      },
+      "metadata": {
+        "complete": true,
+        "missing": [],
+        "sources": {
+          "target.backend": "server configuration",
+          "target.vendor": "server configuration",
+          "software.language": "server configuration",
+          "software.compiler": "python package metadata",
+          "software.runtime": "server configuration",
+          "target.device": "device probe",
+          "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+          "software.language_version": "triton module metadata",
+          "software.compiler_version": "python package metadata",
+          "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+          "software.driver_version": "/usr/local/Ascend/driver/version.info"
+        }
+      }
+    },
+    "evaluation_id": "9ee67af22c8ca8b0fbfe85b9254a91cf785747be859c3c7c0ea805a3541ffd03:round-2",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "capabilities": [
+      "performance_counters",
+      "kernel_profile",
+      "pipeline_utilization",
+      "execution_timeline"
+    ],
+    "summary": {
+      "avg_time_us": 39.137,
+      "operation_count": 1,
+      "top_operations": [
+        {
+          "op_name": "_log10_nomask",
+          "op_type": "_log10_nomask",
+          "task_type": "AI_VECTOR_CORE",
+          "measured_invocations": 100,
+          "total_duration_us": 3913.718,
+          "avg_duration_us": 39.137,
+          "min_duration_us": 38.541,
+          "max_duration_us": 39.881,
+          "aicore_time_us": 0.0,
+          "aic_total_cycles": 0.0,
+          "aic_mac_time_us": 0.0,
+          "aic_mac_ratio": 0.0,
+          "aic_scalar_time_us": 0.0,
+          "aic_scalar_ratio": 0.0,
+          "aic_mte1_time_us": 0.0,
+          "aic_mte1_ratio": 0.0,
+          "aic_mte2_time_us": 0.0,
+          "aic_mte2_ratio": 0.0,
+          "aic_fixpipe_time_us": 0.0,
+          "aic_fixpipe_ratio": 0.0,
+          "aic_icache_miss_rate": 0.0,
+          "aiv_time_us": 37.6408,
+          "aiv_total_cycles": 2446072.41,
+          "aiv_vec_time_us": 12.9597,
+          "aiv_vec_ratio": 0.3443,
+          "aiv_scalar_time_us": 2.7653,
+          "aiv_scalar_ratio": 0.0735,
+          "aiv_mte2_time_us": 10.122,
+          "aiv_mte2_ratio": 0.2689,
+          "aiv_mte3_time_us": 11.9399,
+          "aiv_mte3_ratio": 0.3172,
+          "aiv_icache_miss_rate": 0.0,
+          "cube_utilization_pct": 0.0
+        }
+      ],
+      "stage_count": 1
+    },
+    "metrics": {
+      "avg_time_us": 39.137,
+      "ops": [
+        {
+          "op_name": "_log10_nomask",
+          "op_type": "_log10_nomask",
+          "task_type": "AI_VECTOR_CORE",
+          "measured_invocations": 100,
+          "total_duration_us": 3913.718,
+          "avg_duration_us": 39.137,
+          "min_duration_us": 38.541,
+          "max_duration_us": 39.881,
+          "aicore_time_us": 0.0,
+          "aic_total_cycles": 0.0,
+          "aic_mac_time_us": 0.0,
+          "aic_mac_ratio": 0.0,
+          "aic_scalar_time_us": 0.0,
+          "aic_scalar_ratio": 0.0,
+          "aic_mte1_time_us": 0.0,
+          "aic_mte1_ratio": 0.0,
+          "aic_mte2_time_us": 0.0,
+          "aic_mte2_ratio": 0.0,
+          "aic_fixpipe_time_us": 0.0,
+          "aic_fixpipe_ratio": 0.0,
+          "aic_icache_miss_rate": 0.0,
+          "aiv_time_us": 37.6408,
+          "aiv_total_cycles": 2446072.41,
+          "aiv_vec_time_us": 12.9597,
+          "aiv_vec_ratio": 0.3443,
+          "aiv_scalar_time_us": 2.7653,
+          "aiv_scalar_ratio": 0.0735,
+          "aiv_mte2_time_us": 10.122,
+          "aiv_mte2_ratio": 0.2689,
+          "aiv_mte3_time_us": 11.9399,
+          "aiv_mte3_ratio": 0.3172,
+          "aiv_icache_miss_rate": 0.0,
+          "cube_utilization_pct": 0.0
+        }
+      ]
+    },
+    "artifacts": [
+      {
+        "id": "a001",
+        "kind": "profile_log",
+        "format": "text",
+        "filename": "msprof-base-collection.log",
+        "media_type": "text/plain",
+        "size_bytes": 5031,
+        "download_url": "/profile_artifacts/f279f388d4ca48e38e711c2f1031b2ed/a001",
+        "local_path": "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/log10_-night-20261021-v3-HG-KDA/stages/optimize/work/.kernelgen/profiles/round-0002/log10_-timing-11/90ddbb49b62a467286317173357d7dd9/msprof-base-collection.log",
+        "download_error": null
+      },
+      {
+        "id": "a002",
+        "kind": "vendor_report",
+        "format": "msprof-tar-gz",
+        "filename": "msprof-report.tar.gz",
+        "media_type": "application/gzip",
+        "size_bytes": 147789,
+        "download_url": "/profile_artifacts/f279f388d4ca48e38e711c2f1031b2ed/a002",
+        "local_path": "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/log10_-night-20261021-v3-HG-KDA/stages/optimize/work/.kernelgen/profiles/round-0002/log10_-timing-11/90ddbb49b62a467286317173357d7dd9/msprof-report.tar.gz",
+        "download_error": null
+      },
+      {
+        "id": "a003",
+        "kind": "op_summary",
+        "format": "csv",
+        "filename": "op_summary.csv",
+        "media_type": "text/csv",
+        "size_bytes": 33823,
+        "download_url": "/profile_artifacts/f279f388d4ca48e38e711c2f1031b2ed/a003",
+        "local_path": "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/log10_-night-20261021-v3-HG-KDA/stages/optimize/work/.kernelgen/profiles/round-0002/log10_-timing-11/90ddbb49b62a467286317173357d7dd9/op_summary.csv",
+        "download_error": null
+      },
+      {
+        "id": "a004",
+        "kind": "execution_timeline",
+        "format": "trace-json",
+        "filename": "execution-trace.json",
+        "media_type": "application/json",
+        "size_bytes": 154873,
+        "download_url": "/profile_artifacts/f279f388d4ca48e38e711c2f1031b2ed/a004",
+        "local_path": "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/log10_-night-20261021-v3-HG-KDA/stages/optimize/work/.kernelgen/profiles/round-0002/log10_-timing-11/90ddbb49b62a467286317173357d7dd9/execution-trace.json",
+        "download_error": null
+      }
+    ],
+    "warnings": [
+      "msprof and simulator timing is diagnostic and is not eval latency"
+    ],
+    "error": null,
+    "workload_uuid": "log10_-timing-11"
+  }
+}

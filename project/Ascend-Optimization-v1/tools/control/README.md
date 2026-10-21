@@ -20,6 +20,17 @@ python3 "$ctl" --host baai-910b --remote-root "$root" status \
 
 输出该批次进度、完整评测结果、项目tmux会话和KGS队列；重启恢复会话的日期可以不同于原批次。仅查询状态，不启动或停止进程。支持用 `--operators amin` 等参数缩小范围；当前支持amin、matmul_bias_activation、narrow_copy、logaddexp2、acosh、add_relu。
 
+15项体检与原生KG四组对照使用新的批次状态入口，包含实际KG worker、控制进程、三个KGS服务、后置汇总及同前缀附加修复批次：
+
+```bash
+python3 project/Ascend-Optimization-v1/tools/control/nightly-status.py \
+  --batch night-20261021-v3
+```
+
+附加批次的“进程存活”来自远端 `ps` 与精确脚本/批次参数匹配，不仅依赖状态文件；原始KG的成功退出与外部两次复验分别展示。SELU启动路径审计单列，原postflight结束不代表所有后来追加任务已结束。`--json` 输出完整结构。
+
+对应原始证据通过 `fetch-nightly.py --batch night-20261021-v3 --snapshot` 获取；运行中仅保存被Git忽略的控制端快照。确认终态后再去掉 `--snapshot` 正式导入，并逐个收集附加批次。
+
 ## 执行 Bash 文件
 
 ```bash

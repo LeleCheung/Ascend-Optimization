@@ -8,7 +8,9 @@
 
 ## 当前状态
 
-2026-10-15 首项 `rad2deg_` 已闭环：固定 FlagGems 为0.253×，HG-KDA最终两次为0.803×/0.806×，均33/33，另通过21项补充语义检查；相对 FlagGems 为3.20×/3.19×。已验证 metrics→模拟器指令的阶段升级，并核查 CANN DMA 直接调用链。结果、失败记录与复现步骤见[会议后首项交付](project/Ascend-Optimization-v1/operators/会议后首项交付-20261015.md)。其余14项尚未完成优化。
+2026-10-21 的[15项体检与四组优化](project/Ascend-Optimization-v1/operators/夜间大goal-20261021.md)已结束：固定原版12项完整通过、3项部分失败。`value_selecting_reduction_backward`有效最佳版相对PyTorch为 **1.593× / 1.679×**，`moe_sum_reduce`为 **1.628× / 1.619×**；均通过扩展语义和两次完整复验，来源为KG生成后的独立修复。HG-KDA已真实接入KG，原始组与额外修复分别记录。见[精简汇报](project/Ascend-Optimization-v1/operators/campaigns/night-20261021-v3/精简汇报.md)、[交付源码与逐case数据](project/Ascend-Optimization-v1/operators/campaigns/night-20261021-v3/交付清单.md)。本批使用KGS Native完整调用walltime，与下述历史设备kernel成绩分别报告。
+
+2026-10-15 首项 `rad2deg_` 已完成历史批次闭环：固定 FlagGems 为0.253×，HG-KDA最终两次为0.803×/0.806×，均33/33，另通过21项补充语义检查；相对 FlagGems 为3.20×/3.19×。已验证 metrics→模拟器指令的阶段升级，并核查 CANN DMA 直接调用链。该批采用设备kernel计时，结果、失败记录与复现步骤见[会议后首项交付](project/Ascend-Optimization-v1/operators/会议后首项交付-20261015.md)；最新完整调用体检以上述夜间批次为准。
 
 2026-10-15 会议后进入[下一阶段](project/Ascend-Optimization-v1/operators/下一阶段计划-20261015.md)：固定 FlagGems 与 FlagTree 版本，登记会议指定的 10 项算子与 5 项 FlagGems-sglang 候选；原记录精度失败的指定对象先修正确性。HG-KDA 新增[项目内 skill、分类知识与分阶段体检入口](project/Ascend-Optimization-v1/tools/profiling/hgkda/README.md)，评测继续使用 KGS。以下四项属于上一阶段已完成成果。
 

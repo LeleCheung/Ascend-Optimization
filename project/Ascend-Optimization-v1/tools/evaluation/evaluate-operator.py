@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
 import time
 import urllib.error
@@ -45,6 +46,7 @@ def main() -> None:
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--server", default="http://127.0.0.1:19655")
     p.add_argument("--catalog", default="flaggems-adapter-definitions")
+    p.add_argument("--operator-dir", type=Path, help="独立v6.2 Native合同目录，上传内容寻址bundle，不修改服务源码")
     p.add_argument("--label", required=True)
     p.add_argument("--repeats", type=int, default=1)
     p.add_argument("--timeout", type=int, default=1800)
@@ -54,6 +56,18 @@ def main() -> None:
     a.output.mkdir(parents=True, exist_ok=True)
     source = a.source.read_text(encoding="utf-8")
     binding = {"catalog_name": a.catalog, "definition": a.operator}
+    if a.operator_dir:
+        from kernelgen_client.operator_bundles import pack_operator_bundle
+        archive = io.BytesIO()
+        digest, _ = pack_operator_bundle(a.operator_dir, archive)
+        request = urllib.request.Request(a.server + '/operator-bundles/' + digest,
+            data=archive.getvalue(), method='PUT', headers={'Content-Type': 'application/x-tar'})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=120) as response:
+            bundle = json.load(response)
+        save(a.output / 'bundle-response.json', bundle)
+        (a.output / 'operator-bundle.tar').write_bytes(archive.getvalue())
+        binding = {'bundle_id': bundle['bundle_id'], 'definition': a.operator}
     save(a.output / "server-status.json", call(a.server, "/status", timeout=60))
     inspect_path = a.output / "inspect.json"
     if not inspect_path.exists():

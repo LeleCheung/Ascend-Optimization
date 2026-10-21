@@ -64,8 +64,10 @@ def diagnose_case(case: dict, *, levels=('metrics',), capabilities=()) -> dict:
                                'interpretation': '流水活跃支持优先检查此方向，尚未证明其限制总耗时'})
     profiles = case.get('profiles') or {}
     instruction = profiles.get('instruction')
-    instruction_verified = (isinstance(instruction, dict)
-                            and bool(instruction.get('artifacts')))
+    instruction_verified = (
+        isinstance(instruction, dict) and instruction.get('status') == 'completed'
+        and any(isinstance(artifact, dict) and artifact.get('kind') == 'instruction_listing'
+                and artifact.get('path') for artifact in instruction.get('artifacts', [])))
     evidence_categories = {x['category'] for x in hypotheses}
     overlap = 'data_movement' in evidence_categories and bool(
         evidence_categories & {'vector_compute', 'cube_compute'})
@@ -84,6 +86,8 @@ def diagnose_case(case: dict, *, levels=('metrics',), capabilities=()) -> dict:
             limitations.append('需要更细定位，但本次服务没有声明 instruction；保留未决机制')
     if instruction_verified:
         limitations.append('指令附件已存在；热点与因果机制仍需分析，不自动把附件存在当作完成诊断')
+    elif isinstance(instruction, dict):
+        limitations.append('指令请求未完成或没有有效instruction_listing；设备计数/日志附件单独保留')
     if invalid:
         limitations.append('指标超出合法比例范围或类型无效：' + ', '.join(invalid))
     refs = [KNOWLEDGE[kind]] if kind in KNOWLEDGE else []
