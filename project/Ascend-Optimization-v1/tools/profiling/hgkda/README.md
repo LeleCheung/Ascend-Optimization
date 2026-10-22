@@ -2,6 +2,8 @@
 
 正在执行[夜间连续大goal](../../../operators/campaigns/endurance-20261022/README.md)：SELU、rad2deg_、cumulative_trapezoid、scatter_add、uniform和gelu_and_mul，最多两批自动搜索；语义、一次完整复验、真实任务采集和交付自动衔接。`run-endurance.py`在宿主tmux运行，`finish-endurance.py`独立等待并离线验收；不在单算子完成后暂停询问。当前进展以服务器本批状态为准，启动队列不等于取得优化成果。
 
+`stage-endurance-check.py` 将当前候选、登记身份一致的补充检查器及冻结 Native 合同复制到 KG 工作区的新 `tmp/` 目录，输出可供原生 `submit_debug_job` 调用的请求。模型可以在搜索内读取语义失败、修复后再评测，避免整批结束才发现高分候选不合格。打包本身不使用 NPU；调试检查由当前串行 KG/KGS 执行，不另开卡上任务。只有源码 SHA 相同才能复用检查结果；搜索内检查不代替最终补充门禁和一次完整正式评测。该入口覆盖 rad2deg_、cumulative_trapezoid、scatter_add、uniform、gelu_and_mul；SELU 保留三项专用检查。实际采用情况以调试请求和回执为准，工具存在不代表模型已经调用。
+
 本目录对应 2026-10-15 会议后的下一阶段。固定版本见[基线锁定](../../../../../manifests/hgkda-stage2.lock.json)，15 个对象的登记见 [targets.json](targets.json) 和[下一阶段计划](../../../operators/下一阶段计划-20261015.md)。
 
 最新[缓冲与搬运批次](../../../operators/campaigns/buffer-pointwise-20261022/README.md)已完成：log10_ 0.875×，较同批父版实际加速1.125×；selu_保留旧源码，本批复测0.898×。36项正式测试、42＋12＋9项补充检查和48项证据核验通过。新增缓冲生命周期知识、数值范围门禁、异常恢复及同字节评测复用；CC生成与Codex整合分别记录。复现使用`reproduce-paired.py --batch buffer-pointwise-20261022 --tag final --output /data/hanle/ascend-optimization/runs/新目录`，模拟器失败与最终真机采集分开报告。

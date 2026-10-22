@@ -18,6 +18,28 @@ def load(name,filename):
 
 
 class EnduranceTests(unittest.TestCase):
+    def test_debug_gate_bundle_keeps_actual_contract_and_detects_tampering(self):
+        prepare=load('prepare_debug_bundle','prepare-endurance.py')
+        staging=load('stage_debug_bundle','stage-endurance-check.py')
+        checker=load('check_debug_bundle','check-endurance.py')
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);batch=root/'batch';prepare.prepare(batch)
+            workspace=root/'workspace';source=workspace/'tmp/main.py';source.parent.mkdir(parents=True)
+            source.write_bytes(b'def run(y, dx=1, dim=-1): return y\n')
+            out=workspace/'tmp/independent-check'
+            result=staging.stage(batch,workspace,source,out,'cumulative_trapezoid')
+            self.assertEqual((out/'candidate/main.py').read_bytes(),source.read_bytes())
+            self.assertEqual((out/'plan.json').read_bytes(),(batch/'plan.json').read_bytes())
+            leaf,rows=checker.native_timing_contract(out/'candidate/main.py','cumulative_trapezoid')
+            self.assertEqual(len(rows),9)
+            self.assertEqual((leaf/'oracle.py').read_bytes(),(batch/'catalog/ops/cumulative_trapezoid/oracle.py').read_bytes())
+            for entry in result['debug_request']['files']:
+                self.assertTrue(entry['path'].startswith('tmp/'))
+                self.assertTrue((workspace/entry['path']).is_file())
+            (leaf/'oracle.py').write_bytes(b'changed\n')
+            with self.assertRaises(ValueError):checker.native_timing_contract(out/'candidate/main.py','cumulative_trapezoid')
+            with self.assertRaises(ValueError):staging.stage(batch,workspace,source,root/'outside','cumulative_trapezoid')
+
     def test_ir_capture_reaches_wrapped_jit_without_recompiling(self):
         m=load('endurance_ir','observe-endurance.py')
         compiled=SimpleNamespace(asm={'ttir':'actual compiled IR'})
