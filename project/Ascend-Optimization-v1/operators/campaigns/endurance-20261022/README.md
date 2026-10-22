@@ -24,6 +24,10 @@ SELU继续要求42项布局/特殊值、12项大连续输入、9项范围检查�
 
 `uniform`另增加3项生成器检查：高位seed有区分、高位offset有区分、推进与恢复状态可重放。检查包含第31/32/40位，防止截短随机状态后只靠均值方差过关；不要求候选与Philox逐值相同，也不把这些有限检查当作完整随机质量认证。回执见`uniform-generator-gate-amendment-03.json`，算法变更及剩余统计限制须单列。
 
+第二批手写 Philox 探针还发现具体整数错误：低字异或拼接错误、Weyl 常数低半字遗漏，以及 CPU/NPU 对照采用不同输出排列。原探针与回执保留，Codex 的独立 CPU 见证保存在 `research/uniform/second-pass-probe5-independent-review.json`。修正排列后仍存在设备不一致，尚不能宣称原因已全部解决。
+
+`hanle-endurance-uniform-philox-20261022` 等待主队列结束并取得同一卡锁，在独立 `endurance-20261022-uniform-philox-repair/` 核验最终源码。`check-uniform-philox.py` 用独立 Python 整数参考核对手写算法的全部原始位，覆盖动态标量／设备状态输入、高位 seed／counter 及 counter 低32位跨界；`tl.philox` 只作另列对照。必要时仅对独立副本修复已审查的常数、低字拼接与 counter 进位，再要求逐位检查、原有语义门禁和一次正式完整 KGS 全部通过。此补充不回写主批已冻结合同，也不把统计检查或搜索高分当作标准 Philox 正确性证明。
+
 门禁适配的后续修正单独留痕：`native-timing-gate-amendment-04.json` 修正低精度 Tensor 与 Python 区间边界比较的误拒，并支持 SGLang Native 输入配方；15 项 GELU 性能输入已在 CPU 上逐值对照 KGS 的输入生成器。`observer-input-recipe-amendment-05.json` 让成对采集复用该配方；`observer-wrapper-ir-amendment-06.json` 透过固定 LibEntry/LibTuner 的 `fn` 封装采集已实际编译的 IR，避免误记为零项。原始失败和旧采集保留，工具 SHA 按回执更新，不修改 KGS 合同。
 
 SELU必须降低实际延迟，不能把复测分数变化称作新增优化。FlagGems实测与当前优化版分列，会议算子和SGLang分别汇报。Codex提供诊断、控制器和追加排障，CC/DeepSeek负责实际代码生成；不称为纯原生KG独立成果。没有指令报告或匹配的流量与峰值数据时，不宣称成功模拟器分析或数值Roofline。

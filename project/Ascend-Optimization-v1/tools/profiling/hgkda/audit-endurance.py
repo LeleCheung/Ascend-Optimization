@@ -148,6 +148,24 @@ def audit(batch):
                     raise ValueError(op+'性能输入的独立数值检查缺失或失败')
                 if extra.get('contract_sha256')!={name:records[op]['contract_sha256'][name] for name in ['oracle.py','timing.jsonl']}:
                     raise ValueError(op+'性能输入语义检查使用了不同合同')
+        if op=='uniform' and plan.get('uniform_philox_check_required'):
+            proof=state['operators'][op].get('philox_check') or {}
+            if proof.get('status')!='passed':raise ValueError('修复版缺少Philox逐位核验')
+            data=read(local(proof['path']))
+            cases=data.get('cases',[])
+            manual=[r for r in cases if not r.get('builtin')]
+            expected_identities={(seed,offset,tensor) for seed,offset in
+                [(0,0),(0,1),(7,0),(1<<31,0),(1<<32,0),(1<<40,1<<40),
+                 (0x123456789ABCDEF0,1<<32),(0x7123456789ABCDEF,(1<<32)-16)]
+                for tensor in [False,True]}
+            identities={(r.get('seed'),r.get('offset'),r.get('from_tensor')) for r in manual}
+            if (data.get('source_sha256')!=digest or data.get('status')!='passed'
+                    or data.get('passed')!=16 or data.get('total')!=16 or len(manual)!=16
+                    or identities!=expected_identities
+                    or any(r.get('status')!='passed' or r.get('mismatches')!=0
+                           or r.get('echo')!=r.get('echo_expected') for r in manual)):
+                raise ValueError('Philox逐位核验身份或结果不符')
+            checks.append(dict(kind='philox',operator=op,source_sha256=digest,passed=16,total=16))
         profile=batch/'research'/op/'final/facts.json'
         profile_state='missing'
         if profile.exists():
