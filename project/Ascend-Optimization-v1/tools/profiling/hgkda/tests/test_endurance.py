@@ -7,6 +7,7 @@ import unittest
 import hashlib
 import io
 import tarfile
+from types import SimpleNamespace
 
 TOOLS=Path(__file__).resolve().parents[1]
 
@@ -17,6 +18,30 @@ def load(name,filename):
 
 
 class EnduranceTests(unittest.TestCase):
+    def test_rng_gate_rejects_truncated_keys_and_restores_state(self):
+        m=load('endurance_rng_gate','check-endurance.py')
+        class Generator:
+            seed=77
+            offset=128
+            def get_state(self):return self.seed,self.offset
+            def set_state(self,state):self.seed,self.offset=state
+            def manual_seed(self,seed):self.seed,self.offset=seed,0
+            def set_offset(self,offset):self.offset=offset
+            def get_offset(self):return self.offset
+        for mode in ['honest','truncated','detached']:
+            gen=Generator();saved=gen.get_state()
+            detached=[0]
+            def run(*args):
+                if mode=='detached':
+                    result=(gen.seed,detached[0]);detached[0]+=4096;return result
+                seed,offset=gen.get_state();gen.offset+=4096
+                return (seed&0x7fffffff,offset&0x7fffffff) if mode=='truncated' else (seed,offset)
+            torch=SimpleNamespace(float32=object(),empty=lambda *a,**k:None,equal=lambda a,b:a==b,
+                npu=SimpleNamespace(default_generators=[gen],current_device=lambda:0,synchronize=lambda:None))
+            result=m.uniform_generator_checks(SimpleNamespace(run=run),torch)
+            self.assertEqual(result['passed'],3 if mode=='honest' else 1)
+            self.assertEqual(gen.get_state(),saved)
+
     def test_scan_timing_gate_uses_frozen_large_inputs(self):
         m=load('endurance_semantics','check-endurance.py')
         with tempfile.TemporaryDirectory() as temp:
