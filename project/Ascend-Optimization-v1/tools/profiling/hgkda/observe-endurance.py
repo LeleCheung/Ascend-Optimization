@@ -28,16 +28,11 @@ def observe(op,source,leaf,output,index):
     output.mkdir(parents=True)
     oracle=load('endurance_oracle',leaf/'oracle.py')
     candidate=load('endurance_source',source,'flag_gems.ops' if op=='scatter_add' else None)
+    gate=load('endurance_input_recipes',Path(__file__).with_name('check-endurance.py'))
     rows=[json.loads(l) for l in (leaf/'timing.jsonl').read_text().splitlines() if l.strip()]
     case=rows[index]
     def inputs():
-        if hasattr(oracle,'gen_inputs'):return oracle.gen_inputs(case,'npu:0')
-        g=torch.Generator().manual_seed(case.get('seed',0));result={}
-        for k,v in case['inputs'].items():
-            if isinstance(v,dict) and v.get('type')=='random':
-                result[k]=torch.randn(v['shape'],generator=g).to(device='npu:0',dtype=getattr(torch,v['dtype']))
-            else:raise ValueError('未实现此Native输入，请保留失败而不猜测: '+k)
-        return result
+        return gate.native_timing_inputs(oracle,case,torch)
     facts=dict(operator=op,source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),case=case,
         physical_device=7,scope='同输入真实执行路径；独立采集时间不替代KGS完整调用成绩',sides={})
     for side,m in [('reference',oracle),('candidate',candidate)]:

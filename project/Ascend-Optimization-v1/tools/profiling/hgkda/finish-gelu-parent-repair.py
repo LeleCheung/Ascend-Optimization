@@ -32,7 +32,9 @@ def main():
     with (ROOT/'runs/physical-card-7-campaign.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
         old=read(parent/'endurance-state.json')['jobs']['parent:gelu_and_mul']
-        if old.get('status')!='failed' or "KeyError: 'spec'" not in old.get('error',''):
+        original_log=ROOT/'runs'/a.parent_batch/'gate-gelu_and_mul-parent-semantics.log'
+        if (old.get('status')!='failed' or not original_log.is_file()
+                or "KeyError: 'spec'" not in original_log.read_text(errors='replace')):
             raise ValueError('故障身份不同，先核对，不重复评测')
         if list((parent/'results/gelu_and_mul/parent').glob('formal/*.request.json')):
             raise ValueError('父版已有正式请求，先核对，不重复评测')
@@ -50,7 +52,7 @@ def main():
         (batch/'plan.json').write_text(json.dumps(plan,ensure_ascii=False,indent=2)+'\n')
         shutil.copytree(parent/'knowledge',batch/'knowledge')
         (batch/'parent-infrastructure-failure.json').write_text(json.dumps(dict(original_job=old,
-            original_log=str(ROOT/'runs'/a.parent_batch/'gate-gelu_and_mul-parent-semantics.log'),
+            original_log=str(original_log),original_log_sha256=hashlib.sha256(original_log.read_bytes()).hexdigest(),
             amendment=str(parent/'native-timing-gate-amendment-04.json')),ensure_ascii=False,indent=2)+'\n')
         spec=importlib.util.spec_from_file_location('gelu_parent_repair',TOOLS/'run-endurance.py')
         m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
