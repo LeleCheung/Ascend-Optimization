@@ -19,6 +19,25 @@ def load(name,path,package=None):
     s.loader.exec_module(m);return m
 
 
+def compiled_kernels(module):
+    """透过固定FlagGems的LibEntry/LibTuner.fn封装读取已实际编译的产物。"""
+    seen=set()
+    for name,obj in vars(module).items():
+        chain=set()
+        for depth in range(8):
+            if obj is None or id(obj) in chain:break
+            chain.add(id(obj))
+            caches=getattr(obj,'device_caches',None)
+            if isinstance(caches,dict):
+                for device,cache_tuple in caches.items():
+                    for compiled in cache_tuple[0].values():
+                        if hasattr(compiled,'result'):compiled=compiled.result()
+                        if id(compiled) in seen:continue
+                        seen.add(id(compiled));yield name,device,compiled,depth
+                break
+            obj=getattr(obj,'fn',None)
+
+
 def observe(op,source,leaf,output,index):
     if os.environ.get('ASCEND_RT_VISIBLE_DEVICES')!='7':raise ValueError('只允许物理卡7')
     import torch
@@ -60,19 +79,15 @@ def observe(op,source,leaf,output,index):
         except Exception as e:
             facts['sides'][side]=dict(status='failed',error=type(e).__name__+': '+str(e))
     ir=output/'ir';ir.mkdir();entries=[]
-    for name,obj in vars(candidate).items():
-        caches=getattr(obj,'device_caches',None)
-        if not isinstance(caches,dict):continue
-        for device,cache_tuple in caches.items():
-            for compiled in cache_tuple[0].values():
-                if hasattr(compiled,'result'):compiled=compiled.result()
-                artifacts=[]
-                for kind,content in compiled.asm.items():
-                    if not isinstance(content,(str,bytes)):continue
-                    data=content.encode() if isinstance(content,str) else content
-                    path=ir/(name+'-'+str(len(entries))+'.'+kind);path.write_bytes(data)
-                    artifacts.append(dict(kind=kind,path=str(path),sha256=hashlib.sha256(data).hexdigest()))
-                entries.append(dict(symbol=name,device=device,metadata=str(compiled.metadata),artifacts=artifacts))
+    for name,device,compiled,depth in compiled_kernels(candidate):
+        artifacts=[]
+        for kind,content in compiled.asm.items():
+            if not isinstance(content,(str,bytes)):continue
+            data=content.encode() if isinstance(content,str) else content
+            path=ir/(name+'-'+str(len(entries))+'.'+kind);path.write_bytes(data)
+            artifacts.append(dict(kind=kind,path=str(path),sha256=hashlib.sha256(data).hexdigest()))
+        entries.append(dict(symbol=name,device=device,wrapper_depth=depth,
+            metadata=str(compiled.metadata),artifacts=artifacts))
     facts['ir']=entries
     facts['status']='completed' if all(v['status']=='completed' for v in facts['sides'].values()) else 'partial'
     (output/'facts.json').write_text(json.dumps(facts,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')

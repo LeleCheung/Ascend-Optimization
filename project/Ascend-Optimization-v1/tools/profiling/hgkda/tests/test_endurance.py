@@ -18,6 +18,19 @@ def load(name,filename):
 
 
 class EnduranceTests(unittest.TestCase):
+    def test_ir_capture_reaches_wrapped_jit_without_recompiling(self):
+        m=load('endurance_ir','observe-endurance.py')
+        compiled=SimpleNamespace(asm={'ttir':'actual compiled IR'})
+        jit=SimpleNamespace(device_caches={0:({'first':compiled},)})
+        wrapper=SimpleNamespace(fn=SimpleNamespace(fn=jit))
+        module=SimpleNamespace(kernel=wrapper,alias=wrapper)
+        rows=list(m.compiled_kernels(module))
+        self.assertEqual(len(rows),1)
+        self.assertIs(rows[0][2],compiled)
+        self.assertEqual(rows[0][3],2)
+        wrapper.fn=wrapper
+        self.assertEqual(list(m.compiled_kernels(module)),[])
+
     def test_rng_gate_rejects_truncated_keys_and_restores_state(self):
         m=load('endurance_rng_gate','check-endurance.py')
         class Generator:
