@@ -72,6 +72,8 @@ def check(source, output):
     tests = [(0,0),(0,1),(7,0),(1<<31,0),(1<<32,0),(1<<40,1<<40),
              (0x123456789ABCDEF0,1<<32),(0x7123456789ABCDEF,(1<<32)-16)]
     rows = []
+    ir = []
+    captured = set()
     block = 64
     for seed,offset in tests:
         matrix = [reference(seed,offset+lane) for lane in range(block)]
@@ -84,13 +86,26 @@ def check(source, output):
                     state = torch.tensor([seed,offset],dtype=torch.int64,device='npu:0')
                     out = torch.empty(block*4,dtype=torch.int32,device='npu:0')
                     echo = torch.empty(4,dtype=torch.int64,device='npu:0')
-                    raw[(1,)](out,echo,state,seed,offset,FROM_TENSOR=from_tensor,BUILTIN=builtin,BLOCK=block)
+                    compiled = raw[(1,)](out,echo,state,seed,offset,FROM_TENSOR=from_tensor,BUILTIN=builtin,BLOCK=block)
                     torch.npu.synchronize()
                     actual = [int(v)&MASK for v in out.cpu().tolist()]
                     row.update(echo=echo.cpu().tolist(),echo_expected=echo_expected,
                                mismatches=sum(a!=b for a,b in zip(actual,expected)),
                                actual_first8=actual[:8],expected_first8=expected[:8])
                     row['status'] = 'passed' if row['mismatches']==0 and row['echo']==echo_expected else 'failed'
+                    identity=(from_tensor,builtin)
+                    if row['status']=='failed' and identity not in captured:
+                        captured.add(identity)
+                        folder=output.parent/(output.stem+'-ir')
+                        folder.mkdir(parents=True,exist_ok=True)
+                        for kind in ['ttir','ttadapter','bcmlir']:
+                            content=getattr(compiled,'asm',{}).get(kind)
+                            if not isinstance(content,str):
+                                continue
+                            path=folder/('tensor-'+str(int(from_tensor))+'-builtin-'+str(int(builtin))+'.'+kind)
+                            path.write_bytes(content.encode('utf-8'))
+                            ir.append(dict(path=str(path),sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                                           seed=seed,offset=offset,from_tensor=from_tensor,builtin=builtin,kind=kind))
                 except Exception as error:
                     row['error'] = type(error).__name__+': '+str(error)
                 rows.append(row)
@@ -98,7 +113,7 @@ def check(source, output):
     passed = sum(r['status']=='passed' for r in manual)
     data = dict(status='passed' if passed==len(manual) else 'failed',passed=passed,total=len(manual),
                 source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
-                checker_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),cases=rows,
+                checker_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),cases=rows,ir=ir,
                 scope='手写Philox与独立Python整数参考逐位比较；SoA布局一致；同时测动态标量、设备状态输入、高位seed/counter及counter低32位跨界。tl.philox仅作另列对照，不作为正确参考。')
     output.parent.mkdir(parents=True,exist_ok=True)
     output.write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
