@@ -32,6 +32,29 @@ def prepare(parent,output):
                      entry[1], entry[2], None, None, None, ptr, n, block)'''
     if text.count(old)!=1:raise ValueError('父源码直接启动入口不同，先审查')
     text=text.replace(old,new)
+    # 绑定只能编译，不能先执行再捕获异常重试，否则warmup或元数据异常可能原地乘两遍。
+    old='    _rad2deg_contig_kernel[(grid,)](a, n, BLOCK=block)\n'
+    if text.count(old)!=1:raise ValueError('父源码首次执行位置不同')
+    text=text.replace(old,'    # 这里只编译；本次原地计算在成功绑定后统一执行一次。\n')
+    old='''    try:
+        _launch_cache[(A.dtype, ptr & 15, block)] = _bind(A, n, block)
+    except Exception:  # pragma: no cover - keep working without the fast path
+        _rad2deg_contig_kernel[((n + block - 1) // block,)](A, n, BLOCK=block)
+    return A'''
+    new='''    try:
+        entry = _bind(A, n, block)
+        _launch_cache[(A.dtype, ptr & 15, block)] = entry
+    except Exception:
+        _rad2deg_contig_kernel[((n + block - 1) // block,)](A, n, BLOCK=block)
+        return A
+    if entry[0] is None:
+        _rad2deg_contig_kernel[((n + block - 1) // block,)](A, n, BLOCK=block)
+    else:
+        entry[0]((n + block - 1) // block, 1, 1, _stream_fn(),
+                 entry[1], entry[2], None, None, None, ptr, n, block)
+    return A'''
+    if text.count(old)!=1:raise ValueError('父源码首次调用收尾不同')
+    text=text.replace(old,new)
     if text.count('(A.dtype, ptr & 15, block)')!=2:raise ValueError('父源码缓存键不同')
     text=text.replace('(A.dtype, ptr & 15, block)','(A.dtype, ptr & 15, block, n & 15)')
     result=ast.parse(text)
@@ -42,7 +65,8 @@ def prepare(parent,output):
     proof=dict(parent=str(parent),parent_sha256=hashlib.sha256(parent.read_bytes()).hexdigest(),
         source=str(output),source_sha256=hashlib.sha256(output.read_bytes()).hexdigest(),
         kernels=list(kernels),kernel_ast_unchanged=True,
-        contribution='CC/DeepSeek生成计算与启动方案；Codex追加采集元数据兼容及N模16缓存身份修复，不更改算法或计算kernel')
+        first_call_executes_once=True,
+        contribution='CC/DeepSeek生成计算与启动方案；Codex追加采集元数据兼容、N模16缓存身份及绑定异常时原地执行次数修复，不更改计算kernel')
     output.with_suffix('.provenance.json').write_text(json.dumps(proof,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
     return proof
 
