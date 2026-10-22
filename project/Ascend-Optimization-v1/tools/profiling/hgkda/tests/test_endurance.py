@@ -4,6 +4,9 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import hashlib
+import io
+import tarfile
 
 TOOLS=Path(__file__).resolve().parents[1]
 
@@ -14,6 +17,27 @@ def load(name,filename):
 
 
 class EnduranceTests(unittest.TestCase):
+    def test_uploaded_contract_and_individual_cases_are_verified(self):
+        m=load('endurance_audit','audit-endurance.py')
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            contents={'definition.json':b'{}','oracle.py':b'def run(A): return A\n',
+                'correctness.jsonl':b'{"name":"check-1"}\n','timing.jsonl':b'{"name":"time-1"}\n'}
+            with tarfile.open(root/'operator-bundle.tar','w') as archive:
+                for name,data in contents.items():
+                    item=tarfile.TarInfo(name);item.size=len(data);archive.addfile(item,io.BytesIO(data))
+            record=dict(contract_sha256={k:hashlib.sha256(v).hexdigest() for k,v in contents.items()})
+            (root/'inspect.json').write_text(json.dumps(dict(benchmark_fingerprint='fixed-contract')))
+            (root/'once.request.json').write_text(json.dumps(dict(binding=dict(bundle_id='sha256:'+m.sha(root/'operator-bundle.tar')))))
+            result=dict(benchmark_fingerprint='fixed-contract',per_workload=[dict(uuid='check-1',phase='correctness',status='PASSED'),
+                dict(uuid='time-1',phase='timing',status='PASSED')])
+            m.verify_formal_contract(record,root,result)
+            result['per_workload'][1]['uuid']='different-case'
+            with self.assertRaises(ValueError):m.verify_formal_contract(record,root,result)
+            result['per_workload'][1]['uuid']='time-1'
+            record['contract_sha256']['oracle.py']='0'*64
+            with self.assertRaises(ValueError):m.verify_formal_contract(record,root,result)
+
     def test_actual_latency_ranking_ignores_reference_drift(self):
         m=load('endurance_logic','run-endurance.py')
         parent=dict(geo_mean=.75,per_workload=[dict(uuid='a',phase='timing',latency_ms=.020),dict(uuid='b',phase='timing',latency_ms=.080)])

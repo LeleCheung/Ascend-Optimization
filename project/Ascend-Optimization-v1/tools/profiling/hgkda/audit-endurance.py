@@ -4,10 +4,42 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import tarfile
 
 
 def read(p):return json.loads(p.read_text(encoding='utf-8'))
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def verify_formal_contract(record,formal,result):
+    """核验实际上传bundle和逐case集合，不能仅凭num_passed汇总认定合同一致。"""
+    with tarfile.open(formal/'operator-bundle.tar') as bundle:
+        members=bundle.getmembers()
+        if len(members)!=len(record['contract_sha256']) or any(not m.isfile() for m in members):
+            raise ValueError('上传合同文件集合不同')
+        actual={m.name:hashlib.sha256(bundle.extractfile(m).read()).hexdigest() for m in members}
+        if actual!=record['contract_sha256']:raise ValueError('实际上传合同字节不同')
+        cases={}
+        for phase in ['correctness','timing']:
+            raw=bundle.extractfile(phase+'.jsonl').read().decode('utf-8')
+            for line in raw.splitlines():
+                if not line.strip():continue
+                case=json.loads(line)
+                if case['name'] in cases:raise ValueError('合同case身份重复')
+                cases[case['name']]=phase
+    rows=result.get('per_workload',[])
+    observed={r['uuid']:r.get('phase') for r in rows}
+    if len(observed)!=len(rows) or observed!=cases or any(r.get('status')!='PASSED' for r in rows):
+        raise ValueError('完整结果逐case身份、phase或状态不同')
+    inspected=read(formal/'inspect.json')
+    # Native /evaluate响应没有benchmark_fingerprint；核对实际请求的内容寻址绑定。
+    requests=list(formal.glob('*.request.json'))
+    if len(requests)!=1:raise ValueError('无法唯一定位完整评测请求')
+    request=read(requests[0]);bundle_id='sha256:'+sha(formal/'operator-bundle.tar')
+    if request['binding'].get('bundle_id')!=bundle_id:
+        raise ValueError('完整评测请求未绑定已核验上传bundle')
+    if result.get('benchmark_fingerprint') is not None and result['benchmark_fingerprint']!=inspected.get('benchmark_fingerprint'):
+        raise ValueError('完整结果与上传合同fingerprint不同')
 
 
 def audit(batch):
@@ -33,6 +65,7 @@ def audit(batch):
             raise ValueError('完整评测未通过')
         expected=records[op]['correctness_cases']+records[op]['timing_cases']
         if result['num_workloads']!=expected:raise ValueError('正式用例不完整')
+        verify_formal_contract(records[op],result_path.parent,result)
         request=read(result_path.with_name(result_path.name.replace('.result.json','.request.json')))
         sources=request['implementation']['sources']
         if len(sources)!=1 or sources[0]['content']!=local(row['delivered']).read_text():
@@ -71,6 +104,8 @@ def audit(batch):
     return dict(status='passed',checks=len(checks),records=checks,
         delivered=len(delivery['records']),registered=len(records),
         unclosed=[op for op in records if op not in {r['operator'] for r in delivery['records']}],
+        profiling_gaps=[r['operator'] for r in checks if r['kind']=='delivery' and
+            (r['execution_profile']!='completed' or r['kgs_metrics']!='completed')],
         scope='离线证据身份核验；性能、是否达标及采集失败分别报告')
 
 
