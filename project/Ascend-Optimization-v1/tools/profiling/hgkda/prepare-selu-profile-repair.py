@@ -15,12 +15,15 @@ def kernel_ast(text):
 def prepare(parent,output):
     if output.exists():raise FileExistsError(output)
     text=parent.read_text(encoding='utf-8');before=kernel_ast(text)
+    legacy='return (A.dtype, n, masked, call, grid, function, metadata, stream)' in text
+    sentinel='None' if legacy else '-1'
     old='''        if (getattr(launcher, 'compile_only', False)
                 or getattr(launcher, 'enable_msprof_register_tensor', False)
                 or getattr(launcher.metadata, 'debug_enabled', False)
                 or getattr(launcher.metadata, 'debug', False)):
-            return (A.dtype, n, -1, _standard_launch(n, block, masked))
+            return (A.dtype, n, SENTINEL, _standard_launch(n, block, masked))
         call = launcher.launch'''
+    old=old.replace('SENTINEL',sentinel)
     new='''        requires_tensor = bool(getattr(launcher, 'compile_only', False)
                 or getattr(launcher, 'enable_msprof_register_tensor', False)
                 or getattr(launcher.metadata, 'debug_enabled', False)
@@ -29,12 +32,14 @@ def prepare(parent,output):
         call = launcher if requires_tensor else launcher.launch'''
     if text.count(old)!=1:raise ValueError('SELU父源码采集分支不同，先核对')
     text=text.replace(old,new)
-    old='return (A.dtype, n, kind, call, grid, function, metadata, stream)'
+    tag='masked' if legacy else 'kind'
+    old='return (A.dtype, n, '+tag+', call, grid, function, metadata, stream)'
     if text.count(old)!=1:raise ValueError('SELU缓存结构不同')
-    text=text.replace(old,'return (A.dtype, n, kind, call, grid, function, metadata, stream, requires_tensor)')
+    text=text.replace(old,'return (A.dtype, n, '+tag+', call, grid, function, metadata, stream, requires_tensor)')
     for indent in ['    ','        ']:
-        old=indent+'kind = entry[2]\n'+indent+'if kind == 0:'
-        new=indent+'kind = entry[2]\n'+indent+'argument = A if len(entry) > 8 and entry[8] else ptr\n'+indent+'if kind == 0:'
+        branch='if masked is None:' if legacy else 'if kind == 0:'
+        old=indent+tag+' = entry[2]\n'+indent+branch
+        new=indent+tag+' = entry[2]\n'+indent+'argument = A if len(entry) > 8 and entry[8] else ptr\n'+indent+branch
         if text.count(old)!=1:raise ValueError('SELU分派结构不同')
         text=text.replace(old,new)
     count=text.count('None, None, None, ptr,')
