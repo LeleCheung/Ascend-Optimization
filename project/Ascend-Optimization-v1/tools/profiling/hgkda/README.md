@@ -10,6 +10,8 @@
 
 本批[scatter_add 探针复核](../../../operators/campaigns/endurance-20261022/research/scatter_add/second-pass-probe-cpu-review/README.md)保存了实际诊断代码的 CPU 反例：错误的三维 stride 使累加模型大面积偏离参考。单行修复后九组 CPU 复核通过，原 NPU 探针结果保留；设备错误后的异常耗时不作为有效优化证据。
 
+相关约束已写入[诊断探针可信性](../../../operators/campaigns/endurance-20261022/knowledge/诊断探针可信性.md)，供后续新覆盖层读取：调试任务成功不等于每个变体正确，索引模型先做 CPU 校验，原子更新检查初始化，设备错误后的耗时需独立验证。已冻结的 scatter 角色不回改。
+
 本目录对应 2026-10-15 会议后的下一阶段。固定版本见[基线锁定](../../../../../manifests/hgkda-stage2.lock.json)，15 个对象的登记见 [targets.json](targets.json) 和[下一阶段计划](../../../operators/下一阶段计划-20261015.md)。
 
 最新[缓冲与搬运批次](../../../operators/campaigns/buffer-pointwise-20261022/README.md)已完成：log10_ 0.875×，较同批父版实际加速1.125×；selu_保留旧源码，本批复测0.898×。36项正式测试、42＋12＋9项补充检查和48项证据核验通过。新增缓冲生命周期知识、数值范围门禁、异常恢复及同字节评测复用；CC生成与Codex整合分别记录。复现使用`reproduce-paired.py --batch buffer-pointwise-20261022 --tag final --output /data/hanle/ascend-optimization/runs/新目录`，模拟器失败与最终真机采集分开报告。
