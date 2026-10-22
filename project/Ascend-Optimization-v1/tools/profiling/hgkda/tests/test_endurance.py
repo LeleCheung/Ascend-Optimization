@@ -28,10 +28,10 @@ class EnduranceTests(unittest.TestCase):
                 contract_sha256={n:hashlib.sha256(d).hexdigest() for n,d in files.items()})
             (root/'plan.json').write_text(json.dumps(dict(records=[record])))
             source=root/'results/candidate/main.py';source.parent.mkdir(parents=True);source.write_text('')
-            observed,rows=m.cumulative_timing_contract(source)
+            observed,rows=m.native_timing_contract(source,'cumulative_trapezoid')
             self.assertEqual(observed,leaf);self.assertEqual(rows[0]['inputs']['spec']['shape'],[1024,4096])
             (leaf/'timing.jsonl').write_text('')
-            with self.assertRaises(ValueError):m.cumulative_timing_contract(source)
+            with self.assertRaises(ValueError):m.native_timing_contract(source,'cumulative_trapezoid')
 
     def test_uploaded_contract_and_individual_cases_are_verified(self):
         m=load('endurance_audit','audit-endurance.py')

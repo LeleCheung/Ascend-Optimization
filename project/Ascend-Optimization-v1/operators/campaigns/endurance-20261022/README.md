@@ -20,6 +20,8 @@ SELU继续要求42项布局/特殊值、12项大连续输入、9项范围检查�
 
 运行中追加：累计积分的性能输入会触发不同于小正确性用例的Cube扫描分支，而Native计时phase不核对输出。独立门禁因此再检查全部9项冻结性能输入的数值，各两次并切换stream，按原合同容差逐元素比较；最终审计要求这些检查完整通过。修正回执见`timing-correctness-gate-amendment-01.json`，原合同及搜索成绩不改写；搜索超过PyTorch仍不自动代表候选可交付。
 
+同一门禁随后扩展至`scatter_add`与`gelu_and_mul`的全部冻结性能输入，回执为`timing-correctness-gate-amendment-02.json`。候选放在所属批次目录内，以便检查器定位`plan.json`和原始oracle；检查器核对合同SHA，并验证输出数值、全部Tensor输入保持不变和当前stream。原有18项新形状检查继续保留。
+
 SELU必须降低实际延迟，不能把复测分数变化称作新增优化。FlagGems实测与当前优化版分列，会议算子和SGLang分别汇报。Codex提供诊断、控制器和追加排障，CC/DeepSeek负责实际代码生成；不称为纯原生KG独立成果。没有指令报告或匹配的流量与峰值数据时，不宣称成功模拟器分析或数值Roofline。
 
 运行中的状态见`endurance-state.json`、`heartbeat.json`、`进展.md`；这些文件在服务器先产生。完成后的最终源码在`deliverables/`，不能把正在运行的队列状态当作最终优化成果。

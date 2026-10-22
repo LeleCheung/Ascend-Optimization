@@ -11,22 +11,22 @@ from pathlib import Path
 sys.dont_write_bytecode=True
 
 
-def cumulative_timing_contract(source):
+def native_timing_contract(source,op):
     """从候选所属批次读取冻结合同，避免仅小形状正确而计时分支未验数值。"""
     for batch in source.resolve().parents:
         plan=batch/'plan.json'
         if not plan.is_file():continue
         records=json.loads(plan.read_text(encoding='utf-8')).get('records',[])
-        record=next((r for r in records if r.get('operator')=='cumulative_trapezoid'),None)
+        record=next((r for r in records if r.get('operator')==op),None)
         if record is None:continue
         leaf=batch/record['catalog_leaf']
         for name in ['oracle.py','timing.jsonl']:
             if hashlib.sha256((leaf/name).read_bytes()).hexdigest()!=record['contract_sha256'][name]:
-                raise ValueError('累计积分性能输入合同身份改变: '+name)
+                raise ValueError(op+'性能输入合同身份改变: '+name)
         rows=[json.loads(line) for line in (leaf/'timing.jsonl').read_text().splitlines() if line.strip()]
-        if len(rows)!=record['timing_cases']:raise ValueError('累计积分性能输入不完整')
+        if len(rows)!=record['timing_cases']:raise ValueError(op+'性能输入不完整')
         return leaf,rows
-    raise ValueError('找不到候选所属批次的冻结累计积分合同')
+    raise ValueError('找不到候选所属批次的冻结合同: '+op)
 
 
 def check(op,source,output):
@@ -130,8 +130,8 @@ def check(op,source,output):
             records.append(row)
     timing_checks=[]
     timing_contract={}
-    if op=='cumulative_trapezoid':
-        leaf,rows=cumulative_timing_contract(source)
+    if op in ['cumulative_trapezoid','scatter_add','gelu_and_mul']:
+        leaf,rows=native_timing_contract(source,op)
         spec=importlib.util.spec_from_file_location('endurance_timing_oracle',leaf/'oracle.py')
         oracle=importlib.util.module_from_spec(spec);spec.loader.exec_module(oracle)
         timing_contract={name:hashlib.sha256((leaf/name).read_bytes()).hexdigest() for name in ['oracle.py','timing.jsonl']}
@@ -139,14 +139,16 @@ def check(op,source,output):
             row=dict(case=case['name'],status='failed',spec=case['inputs']['spec'])
             try:
                 for repetition in range(2):
-                    args=oracle.gen_inputs(case,'npu:0');before=args['y'].clone()
+                    args=oracle.gen_inputs(case,'npu:0')
+                    before={k:v.clone() for k,v in args.items() if isinstance(v,torch.Tensor)}
                     expected=oracle.run(**args);torch.npu.synchronize()
                     stream=torch.npu.Stream()
                     with torch.npu.stream(stream if repetition else torch.npu.default_stream()):
                         actual=m.run(**args)
                     torch.npu.synchronize()
-                    assert not torch._C._is_alias_of(actual,args['y'])
-                    torch.testing.assert_close(args['y'],before,atol=0.,rtol=0.,equal_nan=True)
+                    for key,saved in before.items():
+                        assert not torch._C._is_alias_of(actual,args[key])
+                        torch.testing.assert_close(args[key],saved,atol=0.,rtol=0.,equal_nan=True)
                     tol=case['tolerance']
                     torch.testing.assert_close(actual,expected,atol=tol['atol'],rtol=tol['rtol'],check_stride=False,equal_nan=True)
                 row.update(status='passed',repetitions=2,stream_switch_checked=True)
@@ -158,7 +160,7 @@ def check(op,source,output):
         checker_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),physical_device=7,
         timing_input_correctness=dict(total=len(timing_checks),passed=sum(r['status']=='passed' for r in timing_checks),
             cases=timing_checks,contract_sha256=timing_contract),
-        scope='独立非计分语义；18项各两次，含当前stream检查；累计积分另核对全部冻结性能输入的数值，不替代完整上游pytest')
+        scope='独立非计分语义；18项各两次，含当前stream检查；累计积分、scatter_add、gelu_and_mul另核对全部冻结性能输入的数值，不替代完整上游pytest')
     output.parent.mkdir(parents=True,exist_ok=True)
     output.write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
     print(json.dumps({k:v for k,v in result.items() if k not in ['cases','timing_input_correctness']},ensure_ascii=False),flush=True)
