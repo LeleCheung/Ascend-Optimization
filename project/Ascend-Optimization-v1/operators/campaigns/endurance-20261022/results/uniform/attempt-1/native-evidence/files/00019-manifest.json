@@ -1,0 +1,238 @@
+{
+  "request": {
+    "api_version": "v6.2",
+    "evaluation_id": "4fef87421e65ffbb0d93a1ed445b7aab165a4ef7901405ef4f5f4c70bb79d797:round-4",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:072b091f5a92d57b1f2b1446644729f69c5a4bff5163ed6d868bd1b37d5a5977",
+      "definition": "uniform"
+    },
+    "implementation": {
+      "name": "kernelgen-candidate-uniform",
+      "definition": "uniform",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Counter-based uniform sampler for Ascend 910B.\n\nGenerator semantics\n-------------------\nSampling is counter based.  The key is the device generator's seed, read with\n``initial_seed()`` (host-side, no device traffic), and the counter is a\nhost-side integer that advances by ``n + 4`` on every call, so consecutive\ncalls never reuse a counter and every call returns fresh values.  Reseeding a\ngenerator (``manual_seed``) changes ``initial_seed()``, which restarts that\ngenerator's counter at zero: reseeding therefore restarts the stream, the usual\nPRNG contract.\n\nThe counter ``off + i`` is turned into one uniform word by a bijective 32-bit\nfinalizer (Wellons' ``lowbias32`` mixer) and the word is mapped to ``[0, 1)``\nwith the same ``uint_to_uniform_float`` transform PyTorch/FlagGems use (31-bit\nresolution, exact symmetry about 0.5).\n\nStatistical limitations: one mixer output is consumed per element, so the\nsample is a counter-based (not Philox-refilled) stream.  ``lowbias32`` is a\nbijective avalanche mixer, which keeps the per-element marginal uniform and\ndecorrelated at the element counts used here, but this is not a drop-in\nreplacement for Philox where the identical PyTorch bit stream is required.\nBecause the counter lives on the host, the device generator's own Philox offset\nis not advanced: a later ``torch.rand`` on the same generator reuses offsets\nthis sampler never consumed, so mixing both consumers on one generator gives\ntwo overlapping streams.  Mean, variance, range and coverage were validated\nagainst the reference statistics gate on 1024 .. 1048576 element samples for\nfloat16/bfloat16/float32.\n\nInterval handling\n-----------------\n``from``/``to`` are rounded once per (dtype, from, to) on the host into the\nlargest output-dtype value strictly below ``to`` and the smallest one not below\n``from``, so the sampled values stay inside ``[from, to)`` even after the store\ncasts float32 -> float16/bfloat16.  ``from == to`` degenerates to a fill, which\nis what ``aten::uniform_`` produces for an empty interval.\n\"\"\"\n\nimport logging\nimport struct\n\nimport torch\nimport triton\nimport triton.language as tl\n\nfrom flag_gems.runtime import torch_device_fn\n\nlogger = logging.getLogger(__name__)\n\n# Widest block that stays inside the 192 KiB UB of the target once the gather\n# scratch for one 32-bit lane group is accounted for.\n_BLOCK_CAP = 8192\n\n\n@triton.jit(do_not_specialize=[\"seed\", \"off\"])\ndef _uniform_kernel(\n    out_ptr,\n    N,\n    seed,\n    off,\n    lo,\n    hi,\n    scale,\n    BLOCK: tl.constexpr,\n    EVEN: tl.constexpr,\n):\n    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    x = (i + off).to(tl.uint32)\n    x = x ^ seed.to(tl.uint32)\n    x = x ^ (x >> 16)\n    x = x * tl.full((), 0x7FEB352D, tl.uint32)\n    x = x ^ (x >> 15)\n    x = x * tl.full((), 0x846CA68B, tl.uint32)\n    x = x ^ (x >> 16)\n    xi = x.to(tl.int32, bitcast=True)\n    xi = tl.where(xi < 0, -xi - 1, xi)\n    v = xi.to(tl.float32) * 4.6566127342e-10\n    v = v * scale + lo\n    v = tl.minimum(tl.maximum(v, lo), hi)\n    if EVEN:\n        tl.store(out_ptr + i, v)\n    else:\n        tl.store(out_ptr + i, v, mask=i < N)\n\n\n@triton.jit\ndef _fill_kernel(out_ptr, N, val, BLOCK: tl.constexpr, EVEN: tl.constexpr):\n    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    v = tl.full((), 0.0, tl.float32) + val\n    if EVEN:\n        tl.store(out_ptr + i, v)\n    else:\n        tl.store(out_ptr + i, v, mask=i < N)\n\n\n# ---------------------------------------------------------------- host helpers\n\n_KIND = {\n    torch.float16: 16,\n    torch.bfloat16: -16,\n    torch.float32: 32,\n    torch.float64: 64,\n}\n\n\ndef _round_pattern(v, kind):\n    \"\"\"Round ``v`` (Python float) into the dtype; return (bit pattern, value).\"\"\"\n    if kind == 16:\n        try:\n            b = struct.unpack(\"<H\", struct.pack(\"<e\", v))[0]\n        except OverflowError:\n            b = 0x7C00 if v > 0 else 0xFC00\n        return b, struct.unpack(\"<e\", struct.pack(\"<H\", b))[0]\n    if kind == -16:  # bfloat16: round the top 16 bits of the float32 pattern\n        b = struct.unpack(\"<I\", struct.pack(\"<f\", v))[0]\n        pat = ((b + 0x7FFF + ((b >> 16) & 1)) >> 16) & 0xFFFF\n        return pat, struct.unpack(\"<f\", struct.pack(\"<I\", pat << 16))[0]\n    if kind == 32:\n        b = struct.unpack(\"<I\", struct.pack(\"<f\", v))[0]\n        return b, struct.unpack(\"<f\", struct.pack(\"<I\", b))[0]\n    b = struct.unpack(\"<Q\", struct.pack(\"<d\", v))[0]\n    return b, struct.unpack(\"<d\", struct.pack(\"<Q\", b))[0]\n\n\ndef _pattern_value(pat, kind):\n    if kind == 16:\n        return struct.unpack(\"<e\", struct.pack(\"<H\", pat))[0]\n    if kind == -16:\n        return struct.unpack(\"<f\", struct.pack(\"<I\", (pat & 0xFFFF) << 16))[0]\n    if kind == 32:\n        return struct.unpack(\"<f\", struct.pack(\"<I\", pat))[0]\n    return struct.unpack(\"<d\", struct.pack(\"<Q\", pat))[0]\n\n\ndef _key(pat, nbits):\n    \"\"\"Monotone integer key: key+1 is the next value up in that dtype.\"\"\"\n    half = 1 << (nbits - 1)\n    return pat if pat < half else -(pat & (half - 1)) - 1\n\n\ndef _pat(key, nbits):\n    half = 1 << (nbits - 1)\n    return key if key >= 0 else (half | (-key - 1))\n\n\ndef _interval_bounds(dtype, frm, to):\n    \"\"\"Smallest dtype value >= frm and largest dtype value < to.\"\"\"\n    kind = _KIND.get(dtype, 32)\n    nbits = 16 if kind in (16, -16) else (32 if kind == 32 else 64)\n\n    pat, val = _round_pattern(frm, kind)\n    lo = val if val >= frm else _pattern_value(_pat(_key(pat, nbits) + 1, nbits), kind)\n\n    pat, val = _round_pattern(to, kind)\n    if val < to:\n        hi = val\n    else:\n        step = _key(pat, nbits) - 1\n        # +-0.0 and their predecessor collapse onto the same key, so a hop of\n        # one from zero lands back on zero; the real predecessor is -min_sub.\n        if val == 0.0:\n            step -= 1\n        hi = _pattern_value(_pat(step, nbits), kind)\n    return lo, hi\n\n\n_BOUNDS = {}\n_TILES = {}\n_RNG = {}\n\n\ndef _rng_state(gen, n):\n    \"\"\"(key, counter) for this call, both guaranteed to fit in int32.\n\n    Pure host work: one ``initial_seed()`` read (no device traffic, so it never\n    synchronizes with the asynchronous launch queue) plus a counter bump.  A\n    device-side ``get_state``/``set_state`` pair here costs ~77 us per call\n    because it drains the queue.\n\n    The counter is split into a low 31-bit part and an epoch, and the epoch is\n    folded into the key.  Passing the raw counter instead makes the value grow\n    past 2**31 after a few thousand calls, at which point Triton promotes the\n    scalar argument to int64 and the device kernel drops onto an int64 path\n    that measured 4x slower (0.75 ms instead of 0.09 ms for 1M elements).\n    \"\"\"\n    st = _RNG.get(gen)\n    s = gen.initial_seed()\n    if st is None or s != st[0]:\n        st = [s, 0]\n        _RNG[gen] = st\n    o = st[1]\n    st[1] = o + n + 4\n    return (s & 0x7FFFFFFF) ^ ((o >> 31) & 0x7FFFFFFF), o & 0x7FFFFFFF\n\n\ndef _bounds(dtype, frm, to):\n    key = (dtype, frm, to)\n    hit = _BOUNDS.get(key)\n    if hit is None:\n        hit = _interval_bounds(dtype, frm, to)\n        if len(_BOUNDS) < 4096:\n            _BOUNDS[key] = hit\n    return hit\n\n\ndef _tile(n):\n    \"\"\"(BLOCK, EVEN) for this element count; cached because it is pure.\"\"\"\n    hit = _TILES.get(n)\n    if hit is None:\n        if n >= _BLOCK_CAP:\n            block = _BLOCK_CAP\n        else:\n            block = 1 << max(0, (n - 1).bit_length())\n            if block < 32:\n                block = 32\n            elif block > _BLOCK_CAP:\n                block = _BLOCK_CAP\n        hit = (block, n > 0 and n % block == 0)\n        if len(_TILES) < 4096:\n            _TILES[n] = hit\n    return hit\n\n\ndef uniform(self, from_=0.0, to=1.0, *, generator=None):\n    \"\"\"Sample ``U[from_, to)`` into a freshly allocated tensor.\"\"\"\n    if from_ > to:\n        raise RuntimeError(\n            \"uniform_ expects to return a [from, to) range, but found \"\n            f\"from={from_:g} > to={to:g}\"\n        )\n    out = torch.empty_like(self)\n    dev = out.device\n    n = out.numel()\n    block, even = _tile(n)\n    grid = (max(1, (n + block - 1) // block),)\n    guarded = dev.index != torch_device_fn.current_device()\n\n    if from_ == to:\n        val = float(from_)\n        if guarded:\n            with torch_device_fn.device(dev):\n                _fill_kernel[grid](out, n, val, block, even)\n        else:\n            _fill_kernel[grid](out, n, val, block, even)\n        return out\n\n    lo, hi = _bounds(out.dtype, from_, to)\n    if generator is None:\n        generator = torch_device_fn.default_generators[dev.index or 0]\n    seed, offset = _rng_state(generator, n)\n    args = (out, n, seed, offset, lo, hi, to - from_, block, even)\n    if guarded:\n        with torch_device_fn.device(dev):\n            _uniform_kernel[grid](*args)\n    else:\n        _uniform_kernel[grid](*args)\n    return out\n\n\nrun = uniform\n"
+        }
+      ]
+    },
+    "benchmark_fingerprint": "sha256:0868a007dbb3e466045d0bf8c05a445c92fde5e8bde22c6524c707663d8e70a4",
+    "case_id": "uniform-timing-1",
+    "expected_backend": "npu",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "identity": {
+      "solution_sha256": "7d89bcc126f65c289f29223af058f37a8238606361b7ccf324e710d3af07e646",
+      "workload_sha256": "4f30149d0281ca9768768916ffcb8a11a6c969f4bfbd37c1e5bec717f4fdf702"
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "profile_id": "e623d49f45c54e12a621714518c9325f",
+    "created_at": "2026-10-22T14:41:51.247825+00:00",
+    "status": "completed",
+    "backend": "npu",
+    "profiler": "msprof",
+    "device": "npu:0",
+    "hardware": {
+      "target": {
+        "backend": "ascend",
+        "vendor": "huawei",
+        "device": "Ascend910B4-1",
+        "architecture": "dav-c220-cube",
+        "devices": [
+          {
+            "logical_device": "npu:0",
+            "device_id": 0,
+            "name": "Ascend910B4-1",
+            "l2_cache_size": 176160768,
+            "num_sm": 20,
+            "compute_capability": "",
+            "total_memory": 65452113920
+          }
+        ]
+      },
+      "software": {
+        "language": "triton",
+        "language_version": "3.5.1",
+        "compiler": "flagtree",
+        "compiler_version": "0.6.0+ascend.gitc286cba6",
+        "runtime": "cann",
+        "runtime_version": "9.0.0",
+        "driver_version": "25.2.0"
+      },
+      "metadata": {
+        "complete": true,
+        "missing": [],
+        "sources": {
+          "target.backend": "server configuration",
+          "target.vendor": "server configuration",
+          "software.language": "server configuration",
+          "software.compiler": "python package metadata",
+          "software.runtime": "server configuration",
+          "target.device": "device probe",
+          "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+          "software.language_version": "triton module metadata",
+          "software.compiler_version": "python package metadata",
+          "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+          "software.driver_version": "/usr/local/Ascend/driver/version.info"
+        }
+      }
+    },
+    "evaluation_id": "4fef87421e65ffbb0d93a1ed445b7aab165a4ef7901405ef4f5f4c70bb79d797:round-4",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "capabilities": [
+      "performance_counters",
+      "kernel_profile",
+      "pipeline_utilization",
+      "execution_timeline"
+    ],
+    "summary": {
+      "avg_time_us": 7.614,
+      "operation_count": 1,
+      "top_operations": [
+        {
+          "op_name": "_uniform_kernel",
+          "op_type": "_uniform_kernel",
+          "task_type": "AI_VECTOR_CORE",
+          "measured_invocations": 100,
+          "total_duration_us": 761.417,
+          "avg_duration_us": 7.614,
+          "min_duration_us": 7.46,
+          "max_duration_us": 7.9,
+          "aicore_time_us": 0.0,
+          "aic_total_cycles": 0.0,
+          "aic_mac_time_us": 0.0,
+          "aic_mac_ratio": 0.0,
+          "aic_scalar_time_us": 0.0,
+          "aic_scalar_ratio": 0.0,
+          "aic_mte1_time_us": 0.0,
+          "aic_mte1_ratio": 0.0,
+          "aic_mte2_time_us": 0.0,
+          "aic_mte2_ratio": 0.0,
+          "aic_fixpipe_time_us": 0.0,
+          "aic_fixpipe_ratio": 0.0,
+          "aic_icache_miss_rate": 0.0,
+          "aiv_time_us": 6.6812,
+          "aiv_total_cycles": 88191.9,
+          "aiv_vec_time_us": 5.63,
+          "aiv_vec_ratio": 0.8427,
+          "aiv_scalar_time_us": 0.8579,
+          "aiv_scalar_ratio": 0.1283,
+          "aiv_mte2_time_us": 0.002,
+          "aiv_mte2_ratio": 0.0,
+          "aiv_mte3_time_us": 0.1895,
+          "aiv_mte3_ratio": 0.0283,
+          "aiv_icache_miss_rate": 0.0,
+          "cube_utilization_pct": 0.0
+        }
+      ],
+      "stage_count": 1
+    },
+    "metrics": {
+      "avg_time_us": 7.614,
+      "ops": [
+        {
+          "op_name": "_uniform_kernel",
+          "op_type": "_uniform_kernel",
+          "task_type": "AI_VECTOR_CORE",
+          "measured_invocations": 100,
+          "total_duration_us": 761.417,
+          "avg_duration_us": 7.614,
+          "min_duration_us": 7.46,
+          "max_duration_us": 7.9,
+          "aicore_time_us": 0.0,
+          "aic_total_cycles": 0.0,
+          "aic_mac_time_us": 0.0,
+          "aic_mac_ratio": 0.0,
+          "aic_scalar_time_us": 0.0,
+          "aic_scalar_ratio": 0.0,
+          "aic_mte1_time_us": 0.0,
+          "aic_mte1_ratio": 0.0,
+          "aic_mte2_time_us": 0.0,
+          "aic_mte2_ratio": 0.0,
+          "aic_fixpipe_time_us": 0.0,
+          "aic_fixpipe_ratio": 0.0,
+          "aic_icache_miss_rate": 0.0,
+          "aiv_time_us": 6.6812,
+          "aiv_total_cycles": 88191.9,
+          "aiv_vec_time_us": 5.63,
+          "aiv_vec_ratio": 0.8427,
+          "aiv_scalar_time_us": 0.8579,
+          "aiv_scalar_ratio": 0.1283,
+          "aiv_mte2_time_us": 0.002,
+          "aiv_mte2_ratio": 0.0,
+          "aiv_mte3_time_us": 0.1895,
+          "aiv_mte3_ratio": 0.0283,
+          "aiv_icache_miss_rate": 0.0,
+          "cube_utilization_pct": 0.0
+        }
+      ]
+    },
+    "artifacts": [
+      {
+        "id": "a001",
+        "kind": "profile_log",
+        "format": "text",
+        "filename": "msprof-base-collection.log",
+        "media_type": "text/plain",
+        "size_bytes": 6103,
+        "download_url": "/profile_artifacts/e623d49f45c54e12a621714518c9325f/a001",
+        "local_path": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/uniform-endurance-20261022-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0004/uniform-timing-1/87d7eb1bcd3f469cb3777966a7f9e6c9/msprof-base-collection.log",
+        "download_error": null
+      },
+      {
+        "id": "a002",
+        "kind": "vendor_report",
+        "format": "msprof-tar-gz",
+        "filename": "msprof-report.tar.gz",
+        "media_type": "application/gzip",
+        "size_bytes": 137282,
+        "download_url": "/profile_artifacts/e623d49f45c54e12a621714518c9325f/a002",
+        "local_path": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/uniform-endurance-20261022-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0004/uniform-timing-1/87d7eb1bcd3f469cb3777966a7f9e6c9/msprof-report.tar.gz",
+        "download_error": null
+      },
+      {
+        "id": "a003",
+        "kind": "op_summary",
+        "format": "csv",
+        "filename": "op_summary.csv",
+        "media_type": "text/csv",
+        "size_bytes": 30829,
+        "download_url": "/profile_artifacts/e623d49f45c54e12a621714518c9325f/a003",
+        "local_path": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/uniform-endurance-20261022-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0004/uniform-timing-1/87d7eb1bcd3f469cb3777966a7f9e6c9/op_summary.csv",
+        "download_error": null
+      },
+      {
+        "id": "a004",
+        "kind": "execution_timeline",
+        "format": "trace-json",
+        "filename": "execution-trace.json",
+        "media_type": "application/json",
+        "size_bytes": 143284,
+        "download_url": "/profile_artifacts/e623d49f45c54e12a621714518c9325f/a004",
+        "local_path": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/uniform-endurance-20261022-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0004/uniform-timing-1/87d7eb1bcd3f469cb3777966a7f9e6c9/execution-trace.json",
+        "download_error": null
+      }
+    ],
+    "warnings": [
+      "msprof and simulator timing is diagnostic and is not eval latency"
+    ],
+    "error": null,
+    "workload_uuid": "uniform-timing-1"
+  }
+}

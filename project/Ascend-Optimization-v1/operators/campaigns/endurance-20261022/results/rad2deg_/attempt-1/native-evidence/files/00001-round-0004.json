@@ -1,0 +1,124 @@
+{
+  "schema_version": "1.0",
+  "round_num": 4,
+  "evaluation_fingerprint": "2da8cc6ebfe6ef6bf67794499660887e18b169196ba19f1a02561eecb2e4a938",
+  "status": "failed",
+  "solution_sha256": "91e50d87973c45d399bace40c51900e03cd33550448d12e736e676327e91cef9",
+  "backend": "npu",
+  "profiler": "msprof",
+  "capabilities": [
+    "performance_counters",
+    "pipeline_utilization",
+    "kernel_profile",
+    "instruction_listing"
+  ],
+  "dominant_bound": "mixed",
+  "profiled_workloads": [
+    {
+      "uuid": "rad2deg_-timing-7",
+      "axes": {},
+      "eval_speedup": 0.6383848050075713,
+      "eval_latency_ms": 0.0299416073479499,
+      "eval_reference_latency_ms": 0.01911426716843426,
+      "selection_reason": "Lowest-speedup workload of the round (0.638x); bf16 4096x4096 is the single case that did not respond to the round's arithmetic-dtype change.",
+      "profile_ids": [
+        "bd6919b650f64ffa98027af18f49b15f"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0004/rad2deg_-timing-7/bc540739919b429c8559bf95c79f6316/manifest.json"
+      ],
+      "status": "failed"
+    },
+    {
+      "uuid": "rad2deg_-timing-11",
+      "axes": {},
+      "eval_speedup": 0.9347565609916867,
+      "eval_latency_ms": 0.03098378161333278,
+      "eval_reference_latency_ms": 0.0289622931473964,
+      "selection_reason": "Highest absolute latency of the round (30.98 us) and the conversion-free fp32 control for the same 4096x4096 geometry.",
+      "profile_ids": [
+        "ee21f7c29adf4048b05813254fe47751"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0004/rad2deg_-timing-11/186aca123ce249788bc64e30dbd73f6e/manifest.json"
+      ],
+      "status": "failed"
+    },
+    {
+      "uuid": "rad2deg_-timing-3",
+      "axes": {},
+      "eval_speedup": 0.8080496861315054,
+      "eval_latency_ms": 0.02118022808181186,
+      "eval_reference_latency_ms": 0.017114676653701772,
+      "selection_reason": "fp16 4096x4096: identical geometry and byte volume to timing-7 but the only large case that moved (-23.94%) under the same source change, so it is the natural control that isolates the bf16 anomaly.",
+      "profile_ids": [
+        "969d0b0aed6e40b2ac430e0a0d716bd3"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0004/rad2deg_-timing-3/cc83301fad1e48af9e4e31b3a5ce5892/manifest.json"
+      ],
+      "status": "failed"
+    },
+    {
+      "uuid": "rad2deg_-timing-0",
+      "axes": {},
+      "eval_speedup": 1.319265921281833,
+      "eval_latency_ms": 0.013471589921087856,
+      "eval_reference_latency_ms": 0.017772609488375026,
+      "selection_reason": "Smallest workload (fp16, 1024 elements, grid=1): cheap bound for testing whether a reduced-cost collection path exists at all, and representative of the ten near-identical floor-latency cases.",
+      "profile_ids": [
+        "51ce11fdbbff4bdfbb7c6eedbb17b033",
+        "6f46a2c8d18f45b9a987e82a3ed755ce"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0004/rad2deg_-timing-0/cd1c4f741b8d47e1b1d5f9fc0a06c94c/manifest.json",
+        ".kernelgen/profiles/round-0004/rad2deg_-timing-0/30c629dd24344a5198175b5d9bd45969/manifest.json"
+      ],
+      "status": "failed"
+    }
+  ],
+  "findings": [],
+  "performance_interpretation": "Round 4 scores geo_mean 1.13422 (round 3: 1.12893, +0.47%) with 36/36 PASSED, and the round's single change behaved as expected on fp16 but not at all on bf16. Removing the fp32 round-trip moved fp16 4096x4096 from 27.847 us to 21.180 us (-23.94%, speedup 0.6497x -> 0.8080x), left bf16 4096x4096 flat at 29.942 us versus 29.914 us (+0.09%, 0.6384x) and fp32 flat at 30.984 us (0.9348x). The other eight timing cases moved only within a 13.0-13.9 us band with no size trend (per-case deltas -4.8% to +5.2%), so the small positive geo_mean delta is carried by a single workload and the rest is scatter rather than real gain. The regime is mixed: ten cases are pinned to a fixed ~13 us per-call floor, while the three 4096x4096 cases pay an extra 8-18 us of data-dependent work, and among those bf16 is anomalously 1.41x slower than fp16 at identical byte volume (fp16 ~3.17 TB/s vs bf16 ~2.24 TB/s logical bytes over eval latency; fp32 ~4.33 TB/s, and since every working set of 67-134 MB fits the 176 MB L2 these are not HBM figures and no Roofline claim is made). On the frozen hypothesis: it is supported for fp16 and contradicted for bf16, whose time was unchanged by the arithmetic-dtype change, so no further source-level arithmetic variant should be expected to move rad2deg_-timing-7. The dominant finding is nevertheless the launch-floor observation, because it constrains ten of twelve scored cases. All of this is derived from authoritative eval latency plus workspace host microbenchmarks; no device counters were obtained and none of it substitutes for profiler evidence.",
+  "next_experiment": {
+    "action_category": "launch_host_overhead",
+    "action_description": "Cut the fixed per-invocation cost on the contiguous fast path only. Today run() performs, on every call, A.numel(), A.is_contiguous(), A.data_ptr(), a tuple construction plus dict lookup, a Python lambda hop through _stream_fn(), and then a 12-positional-argument call into compiled.run.launch (main.py:192-211). Replace that preamble with one pre-bound zero-argument callable per (dtype, ptr alignment, block class) that closes over nothing mutable and, at call time, reads the current address and the current stream; keep the ordinary Triton entry for the first call per key and as the fallback, and keep the strided kernel untouched. Do not cache the tensor, the output, a stale address, or a stale stream.",
+    "expected_impact": "Ten of the twelve timing workloads sit in a 12.996-13.926 us band while spanning a 1024x range of element counts (1024 to 1048576 elements, all three dtypes), so they are dominated by a fixed per-call cost rather than by data movement; each 1 us removed raises every one of them by roughly 8%, about +6% on geo_mean, and 2 us would be about +13%. The three 4096x4096 cases should not change, because their 8-18 us data-dependent term dominates. This is the largest available geo_mean lever: even recovering rad2deg_-timing-7 to the fp16 level (~0.80x) would only add about +1.9% to geo_mean, less than a 1 us reduction of the floor.",
+    "risks_and_rollback": "Risk: binding a callable per (dtype, alignment, block) can silently reuse the previous call's address or stream if those are not re-read per invocation, which would corrupt results on non-contiguous storage, a different storage_offset, or a switched stream. Mitigation: the current address must participate in the cache key as it does now, the stream must be read per call, and the ordinary Triton entry must remain the fallback. This is also the same mechanism that currently breaks profiling, so the rewrite must not drop the Tensor-argument path the profiler needs. Rollback: revert to the existing _launch_cache dict plus entry[0](...) call, a localized change confined to run().",
+    "validation_workloads": [
+      "rad2deg_-timing-0",
+      "rad2deg_-timing-1",
+      "rad2deg_-timing-2",
+      "rad2deg_-timing-4",
+      "rad2deg_-timing-5",
+      "rad2deg_-timing-6",
+      "rad2deg_-timing-8",
+      "rad2deg_-timing-9",
+      "rad2deg_-timing-10",
+      "rad2deg_-timing-3",
+      "rad2deg_-timing-7",
+      "rad2deg_-timing-11"
+    ],
+    "success_criteria": [
+      "Full eval returns 36/36 PASSED, including the 24 correctness workloads with unchanged abs/rel error.",
+      "The batch-specific rad2deg_ supplementary gate scripts/check_rad2deg.py passes all 21 items (three dtypes of in-place aliasing, non-contiguous input, odd length, special values) before any formal evaluation is booked.",
+      "geo_mean strictly exceeds the round-4 value of 1.1342198875004348, not merely the round-3 value.",
+      "At least six of the nine sub-4096x4096 timing workloads show lower eval latency than their round-4 values, with no single one regressing by more than 1%.",
+      "rad2deg_-timing-7 does not regress below 0.638 and rad2deg_-timing-11 does not regress, so the change is shown to be a floor-only change and not a device-side arithmetic change."
+    ]
+  },
+  "warnings": [
+    "Profiling is unavailable for this candidate as written: all five msprof requests, at both metrics and instruction level, ended with 'exited successfully without profile completion marker' in ~20 s with zero artifacts. No performance counters, pipeline utilization or instruction listing exists for round 4.",
+    "The next candidate must restore collection compatibility before further device-side evidence is gathered, per the batch rule that a collection failure be repaired first. The documented approach is to keep the current-address entry point while supplying the pointer metadata the profiling-enabled launcher reads (an integer type that exposes size()), or to route the profiled run through the ordinary Triton entry point; an offline-interface fix alone does not prove collection works - only a completed collection with the target kernel identity does.",
+    "All quantitative statements above come from authoritative eval latency, the round-3/round-4 differential and in-workspace host microbenchmarks, not from profiler counters. Treat them as method-level guidance to be verified by the next formal evaluation.",
+    "Any bandwidth figure for the 4096x4096 cases is unreliable as an HBM measurement because every working set (67-134 MB) fits inside the 176 MB L2; they are logical bytes over eval latency only.",
+    "Round-4 per-case timing deltas for the eight mid/small workloads (-4.8% to +5.2% with no size trend) are within scatter; do not attribute them to the arithmetic change."
+  ],
+  "open_questions": [
+    "Is the ~13 us floor host-side or device-side? Eval latency is nearly shape-independent below 4096x4096 and workspace host microbenchmarks of this launch path report 10.0-10.5 us for a full runner call, but no device-side duration was collected, so the split is unmeasured.",
+    "What makes bf16 4096x4096 1.41x slower than fp16 at identical byte volume, given that its time did not change when the source arithmetic moved from fp32 to bf16? This needs the instruction listing (bf16 convert/emulation vs native vector multiply) or Vector/MTE2 pipeline counters, which the failed collection did not deliver.",
+    "Does L2 actually serve the repeated 4096x4096 loop? Cache hit/miss counters were not collected, so the absence of an HBM ceiling in the numbers remains an inference from working-set size.",
+    "Was the profiled run terminating inside the fast launcher (a metadata/attribute error) or before profiler finalization? A harness log from the failed run, which this round did not surface, would separate those two.",
+    "How many programs and what grid did the 4096x4096 launches actually use, and does BLOCK_LARGE=32768 give 512 programs against 20 reported SMs? Source geometry only, not a measured occupancy."
+  ],
+  "error": "msprof base collection exited successfully without profile completion marker — all 5 requests (timing-7, timing-11, timing-3, timing-0 at metrics level; timing-0 again at instruction level) returned status=failed with artifacts=[], metrics={} and summary.stage_count=1. No counters, pipeline utilization or instruction listing were produced for round 4, so no artifact exists to cite; the eval-side observations below are carried in prose instead of evidence entries and remain unverified on the device side."
+}

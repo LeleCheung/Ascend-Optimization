@@ -1,0 +1,9 @@
+# uniform：保留生成器语义的状态接口优化
+
+第一批第三轮曾尝试只读generator.initial_seed()，另维护Python计数器。这样的计数器不跟随set_state/get_state，也不能检测重复manual_seed(同一个seed)，不应作为完整uniform语义的交付；门禁会测恢复重放和真实生成器offset推进。
+
+固定FlagGems本身已有可参考的低开销路径：src/flag_gems/runtime/backend/_ascend/ops/rrelu_with_noise.py里的_lean_seed_offset，使用generator.initial_seed()、get_offset()、set_offset()，避免构造get_state/set_state的Tensor。请先读这份源码并实际测量，比自建一个脱离生成器的计数器更合适。保持所选RNG真实需要的递增单位、合法4倍数以及完整seed/counter位数。
+
+状态API优化和随机算法替换是两项独立改变。优先用同一Philox计算先测真正的host成本收益；如果PhiIox设备计算仍慢，再研究该计算的实现，不能把状态别名当加速。当前完整门禁要求18项区间/统计与3项高位/重放语义；仍不等于完整随机质量认证。
+
+该建议来自Codex阅读固定上游实现，只供之后新overlay；尚未证明本轮uniform已应用或已获收益。

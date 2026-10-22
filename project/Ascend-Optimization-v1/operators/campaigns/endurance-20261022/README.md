@@ -1,5 +1,7 @@
 # 夜间连续优化大 goal
 
+**2026-10-23最终状态：本队列及六个追加批次全部结束。请使用[最终交付报告](../../夜间连续优化交付-20261023.md)和[最终机器清单](../../夜间连续优化交付-20261023.json)。本目录原始manifest中的uniform 1.497×未通过标准Philox核验，最终替换为`endurance-20261022-uniform-shift-repair-v2`的1.325×；旧状态、源码和原始快照继续保留。下文按执行顺序记录流程。**
+
 本批是持续执行的优化队列，**不是只复现baseline**。优先SELU显式缓冲与中间量优化，之后依次执行`rad2deg_`、`cumulative_trapezoid`、`scatter_add`、`uniform`、`gelu_and_mul`。服务器由tmux托管，各阶段自动衔接；控制端断开不影响既有队列运行。Codex持续负责诊断和排障，不在单项完成后询问是否继续。
 
 固定FlagGems `d6a8eec473517a3d68157b208eb9c057eb1d4c50`、FlagGems-SGLang `938612058a981487e439da514df7d1371cf31e68`、FlagTree `0.6.0+ascend.gitc286cba6`、物理卡7和KGS19659完整调用walltime。测试合同从已执行批次逐文件复制，SHA写入[计划](plan.json)；SELU从上轮最终有效源码起步，其他五项从固定FlagGems源码起步。

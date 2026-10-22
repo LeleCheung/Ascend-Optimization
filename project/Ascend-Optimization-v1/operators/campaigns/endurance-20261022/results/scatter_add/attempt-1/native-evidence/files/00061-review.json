@@ -1,0 +1,58 @@
+{
+  "subject_sha256": "ab2327d7e898418d2b41966a67ec49a6d4152f359586a700cbec139a64b0242b",
+  "policy": "advisory",
+  "summary": "Reviewed the round-4 candidate (`ab2327d7…`, identical to `.best_kernel.py`) against the supplied `scatter_add` Definition, reference oracle, 9 correctness workloads, 9 timing workloads and all four optimize rounds. The candidate is a self-contained Triton port with three branches: a single-launch all-affine 'dense' last-axis kernel, a data-dependent-atomic last-axis kernel, and a generic 8-slot N-d atomic kernel; `torch` is used only for allocation/views, there is no torch.ops or reference fallback, no host synchronization, no environment mutation, inputs are not mutated and a fresh buffer is returned (consistent with `definition.json` effects). All 18 workloads PASSED and the optimize ledger's per-round evidence is internally consistent with the code. No P0 conversion defect: no correctness-reference substitution, no circular candidate call, no test-shape special-casing — the dense/atomic dispatch (`ncols >= 32` and `n*ncols < 903*n + 1.077e7`) is a measured cost model that leaves semantics unchanged, so I treat it as justified specialization rather than cheating (though the constants are device- and benchmark-calibrated, so they are not portable tuning). Remaining code-level issues are advisory: silent mis-decomposition for rank > 8 (`_MAXR` slots), a hard `2**31` numel refusal, fp32-only accumulation in the dense branch, no correctness workload that exercises the dense branch or the ncols>=32 last-dim atomic branch, and a residual ~5.8x gap on the 1024^2/2048^2 cases. Note the supplied `review_tests/attempts/01/review.json` is `SKIPPED_EXPLICIT` for a different subject sha (`20fb30…`), so no independent test-contract review covered the dense-branch coverage gap reported below.",
+  "reviewed_files": [
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/scatter_add-endurance-20261022-attempt-1/stages/optimize/work/optimize_definition_output.json",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/scatter_add-endurance-20261022-attempt-1/stages/optimize/work/.ledger.json",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/scatter_add-endurance-20261022-attempt-1/stages/optimize/work/.best_kernel.py",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/scatter_add-endurance-20261022-attempt-1/stages/prepare_catalog/attempts/01/catalog/manifest.json",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/scatter_add-endurance-20261022-attempt-1/stages/prepare_catalog/attempts/01/catalog/ops/scatter_add/correctness.jsonl",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/scatter_add-endurance-20261022-attempt-1/stages/prepare_catalog/attempts/01/catalog/ops/scatter_add/definition.json",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/scatter_add-endurance-20261022-attempt-1/stages/prepare_catalog/attempts/01/catalog/ops/scatter_add/oracle.py",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/scatter_add-endurance-20261022-attempt-1/stages/prepare_catalog/attempts/01/catalog/ops/scatter_add/timing.jsonl",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/scatter_add-endurance-20261022-attempt-1/stages/prepare_catalog/attempts/01/evaluation-contract.json",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/scatter_add-endurance-20261022-attempt-1/stages/review_tests/attempts/01/review.json",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/scatter_add-endurance-20261022-attempt-1/stages/review_tests/attempts/01/preflight.json",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/scatter_add-endurance-20261022-attempt-1/stages/review_tests/attempts/01/evaluate.json"
+  ],
+  "findings": [
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:36 sets `_MAXR = 8`; `.best_kernel.py:49-56` implements `_slots` as `[pad] * (_MAXR - len(values)) + list(values)`, which for `len(values) > 8` evaluates `[pad] * negative` to `[]` and returns the full (longer) list instead of raising or right-aligning. Call sites then take only slots 0..7: `.best_kernel.py:331-337` (`idx_shape`, `src_strides`, `idx_strides`, `out_slots`) and the launches at `.best_kernel.py:340-355`; `_launch_copy` does the same for `_copy_nd_kernel` at `.best_kernel.py:266-276`. All frozen workloads are rank <= 3 (`correctness.jsonl:1-9`, `timing.jsonl:1-9`).",
+      "reason": "For an input with more than 8 dimensions the generic N-d path builds a div/mod chain from the first eight axes instead of the innermost eight, so it silently returns wrong values (and `_copy_nd_kernel` copies the wrong source elements) rather than failing. `torch.scatter_add` supports up to 64 dims, so this is a latent semantic deviation that the frozen contract cannot detect.",
+      "requested_change": "Add an explicit rank check (e.g. raise when `inp.ndim > _MAXR`, in the same style as the existing `2**31` guard) or make `_slots` reject/right-align ranks above `_MAXR`, so an unsupported rank can never silently produce an incorrect decomposition."
+    },
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:283-284: `if inp.numel() >= 2**31: raise RuntimeError(\"scatter_add: int32 offset range exceeded\")`; every scatter/copy kernel then computes int32 element offsets (`.best_kernel.py:84-88`, `:142-165`, `:195-245`). The largest frozen workload is 2048x2048 (`timing.jsonl:3,6,9`), far below the guard.",
+      "reason": "The candidate refuses valid `torch.scatter_add` inputs above 2^31 elements instead of computing them, so the operator's domain is narrowed by construction. The contract does not exercise this, but it is a behavioral deviation from the source operator rather than a documented runtime capability limit.",
+      "requested_change": "Either state the int32/2^31 limit explicitly in the submission as an accepted specialization limit, or add an int64-offset variant of `_scatter_add_lastdim_kernel`/`_scatter_add_nd_kernel` and dispatch on `inp.numel()` so large tensors are still computable."
+    },
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:115 `acc = tl.zeros([BLOCK], dtype=tl.float32)`, `:120` `val = tl.load(...).to(tl.float32)`, `:123` `cur = tl.load(inp_ptr + base + dst, ...).to(tl.float32)`, `:124` `(cur + acc).to(out_ptr.dtype.element_ty)`. The dense branch is selected purely on shape (`:308-312`, `ncols >= 32 and n*ncols < 903*n + 10770000`) with no dtype gate, while the sibling atomic branch (`.best_kernel.py:67-88`) accumulates in the tensor's native dtype.",
+      "reason": "Any wider element type (float64) routed through the contiguous last-axis fast path is truncated to float32 and accumulated in float32 before cast-back, so the two internal branches disagree with each other and with `torch.scatter_add` for the same inputs. The frozen workloads only use fp16/bf16/fp32 (`correctness.jsonl:1-9`, `timing.jsonl:1-9`), so the divergence is latent rather than observed.",
+      "requested_change": "Gate the dense branch on element width (e.g. only when `inp.element_size() <= 4`) or derive the accumulator dtype from `out_ptr.dtype.element_ty` when it is wider than 4 bytes, so no dtype loses precision relative to the reference."
+    },
+    {
+      "priority": "P1",
+      "category": "source_quality",
+      "evidence": "correctness.jsonl:1-9 uses only shape `[5,7,9]`: the `dim=2` cases have `ncols = 9 < 32` and therefore take the last-dim atomic branch (`.best_kernel.py:301-319`), while `dim=0/1` take the generic N-d branch (`.best_kernel.py:322-356`). The dense kernel that serves every small timed shape is selected only via `.best_kernel.py:308-312`, which fires for the 128x128 cases (`timing.jsonl:1,4,7`); timing per-workload records carry `abs_err: null` (e.g. `.ledger.json:1491-1598`, `optimize_definition_output.json:13-157`), so timing does not check outputs.",
+      "reason": "The dense kernel producing the result for all three 128x128 timing cases — and the atomic last-dim kernel with `ncols >= 32`, non-contiguous inputs and partial-extent index — are never numerically validated by the frozen contract; their agreement with `torch.scatter_add` rests only on coder probes recorded in `.ledger.json:1320` and `:1339`. A numerical error in that branch would leave the reported 1.39-1.45x small-shape results uncorrected. This is a coverage gap in the supplied test contract, not necessarily a defect in the candidate.",
+      "requested_change": "Add correctness workloads that hit every dispatch branch — e.g. `[128,128]` with `dim=-1` (dense path), a last-dim case with `ncols >= 32` (e.g. `[64,256]` or `[1024,1024]`) for the atomic path, plus a partial-extent `index` and a non-contiguous `inp` — so each kernel is compared against the reference before acceptance."
+    },
+    {
+      "priority": "P1",
+      "category": "target_capability",
+      "evidence": "Per-workload speedups in `.ledger.json:1509-1597`: 1024x1024 = 4.955/4.959/4.908 ms against 0.854/0.854/0.854 ms reference (0.1723x) and 2048x2048 = 19.548/19.554/19.520 ms against 3.362/3.360/3.365 ms (0.1720x); final verification ratios in `optimize_definition_output.json:14-159` give geo_mean 0.3355 (best round 0.3471). Worst case `scatter_add-timing-5` = 0.1718x. `.best_kernel.py:67-88` is the per-element data-dependent `tl.atomic_add` used for these shapes.",
+      "reason": "Six of nine timing cases are ~5.8x slower than the FlagGems baseline because wide rows stay on the scalarized data-dependent atomic path; `.ledger.json:1830` and `:1837` record that atomic cost (~4.65 ns/element) is invariant to conflict density, BLOCK and num_warps on this target. PASSED status here only means the gate was met, not a speedup greater than one, so the submission's practical value is limited to the three 128x128 shapes.",
+      "requested_change": "Record the wide-row atomic limit as an accepted specialization limit in the submission, and schedule a segmented/sorted formulation with affine writes (or a vectorized atomic path) for the 1024^2/2048^2 families as the next-epoch priority instead of further tuning the current atomic kernel."
+    }
+  ],
+  "blocker": null,
+  "missing_dependencies": []
+}

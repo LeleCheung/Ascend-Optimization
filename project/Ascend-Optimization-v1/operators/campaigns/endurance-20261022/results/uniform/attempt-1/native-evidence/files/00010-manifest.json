@@ -1,0 +1,324 @@
+{
+  "request": {
+    "api_version": "v6.2",
+    "evaluation_id": "4fef87421e65ffbb0d93a1ed445b7aab165a4ef7901405ef4f5f4c70bb79d797:round-4",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:072b091f5a92d57b1f2b1446644729f69c5a4bff5163ed6d868bd1b37d5a5977",
+      "definition": "uniform"
+    },
+    "implementation": {
+      "name": "kernelgen-candidate-uniform",
+      "definition": "uniform",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Counter-based uniform sampler for Ascend 910B.\n\nGenerator semantics\n-------------------\nSampling is counter based.  The key is the device generator's seed, read with\n``initial_seed()`` (host-side, no device traffic), and the counter is a\nhost-side integer that advances by ``n + 4`` on every call, so consecutive\ncalls never reuse a counter and every call returns fresh values.  Reseeding a\ngenerator (``manual_seed``) changes ``initial_seed()``, which restarts that\ngenerator's counter at zero: reseeding therefore restarts the stream, the usual\nPRNG contract.\n\nThe counter ``off + i`` is turned into one uniform word by a bijective 32-bit\nfinalizer (Wellons' ``lowbias32`` mixer) and the word is mapped to ``[0, 1)``\nwith the same ``uint_to_uniform_float`` transform PyTorch/FlagGems use (31-bit\nresolution, exact symmetry about 0.5).\n\nStatistical limitations: one mixer output is consumed per element, so the\nsample is a counter-based (not Philox-refilled) stream.  ``lowbias32`` is a\nbijective avalanche mixer, which keeps the per-element marginal uniform and\ndecorrelated at the element counts used here, but this is not a drop-in\nreplacement for Philox where the identical PyTorch bit stream is required.\nBecause the counter lives on the host, the device generator's own Philox offset\nis not advanced: a later ``torch.rand`` on the same generator reuses offsets\nthis sampler never consumed, so mixing both consumers on one generator gives\ntwo overlapping streams.  Mean, variance, range and coverage were validated\nagainst the reference statistics gate on 1024 .. 1048576 element samples for\nfloat16/bfloat16/float32.\n\nInterval handling\n-----------------\n``from``/``to`` are rounded once per (dtype, from, to) on the host into the\nlargest output-dtype value strictly below ``to`` and the smallest one not below\n``from``, so the sampled values stay inside ``[from, to)`` even after the store\ncasts float32 -> float16/bfloat16.  ``from == to`` degenerates to a fill, which\nis what ``aten::uniform_`` produces for an empty interval.\n\"\"\"\n\nimport logging\nimport struct\n\nimport torch\nimport triton\nimport triton.language as tl\n\nfrom flag_gems.runtime import torch_device_fn\n\nlogger = logging.getLogger(__name__)\n\n# Widest block that stays inside the 192 KiB UB of the target once the gather\n# scratch for one 32-bit lane group is accounted for.\n_BLOCK_CAP = 8192\n\n\n@triton.jit(do_not_specialize=[\"seed\", \"off\"])\ndef _uniform_kernel(\n    out_ptr,\n    N,\n    seed,\n    off,\n    lo,\n    hi,\n    scale,\n    BLOCK: tl.constexpr,\n    EVEN: tl.constexpr,\n):\n    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    x = (i + off).to(tl.uint32)\n    x = x ^ seed.to(tl.uint32)\n    x = x ^ (x >> 16)\n    x = x * tl.full((), 0x7FEB352D, tl.uint32)\n    x = x ^ (x >> 15)\n    x = x * tl.full((), 0x846CA68B, tl.uint32)\n    x = x ^ (x >> 16)\n    xi = x.to(tl.int32, bitcast=True)\n    xi = tl.where(xi < 0, -xi - 1, xi)\n    v = xi.to(tl.float32) * 4.6566127342e-10\n    v = v * scale + lo\n    v = tl.minimum(tl.maximum(v, lo), hi)\n    if EVEN:\n        tl.store(out_ptr + i, v)\n    else:\n        tl.store(out_ptr + i, v, mask=i < N)\n\n\n@triton.jit\ndef _fill_kernel(out_ptr, N, val, BLOCK: tl.constexpr, EVEN: tl.constexpr):\n    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    v = tl.full((), 0.0, tl.float32) + val\n    if EVEN:\n        tl.store(out_ptr + i, v)\n    else:\n        tl.store(out_ptr + i, v, mask=i < N)\n\n\n# ---------------------------------------------------------------- host helpers\n\n_KIND = {\n    torch.float16: 16,\n    torch.bfloat16: -16,\n    torch.float32: 32,\n    torch.float64: 64,\n}\n\n\ndef _round_pattern(v, kind):\n    \"\"\"Round ``v`` (Python float) into the dtype; return (bit pattern, value).\"\"\"\n    if kind == 16:\n        try:\n            b = struct.unpack(\"<H\", struct.pack(\"<e\", v))[0]\n        except OverflowError:\n            b = 0x7C00 if v > 0 else 0xFC00\n        return b, struct.unpack(\"<e\", struct.pack(\"<H\", b))[0]\n    if kind == -16:  # bfloat16: round the top 16 bits of the float32 pattern\n        b = struct.unpack(\"<I\", struct.pack(\"<f\", v))[0]\n        pat = ((b + 0x7FFF + ((b >> 16) & 1)) >> 16) & 0xFFFF\n        return pat, struct.unpack(\"<f\", struct.pack(\"<I\", pat << 16))[0]\n    if kind == 32:\n        b = struct.unpack(\"<I\", struct.pack(\"<f\", v))[0]\n        return b, struct.unpack(\"<f\", struct.pack(\"<I\", b))[0]\n    b = struct.unpack(\"<Q\", struct.pack(\"<d\", v))[0]\n    return b, struct.unpack(\"<d\", struct.pack(\"<Q\", b))[0]\n\n\ndef _pattern_value(pat, kind):\n    if kind == 16:\n        return struct.unpack(\"<e\", struct.pack(\"<H\", pat))[0]\n    if kind == -16:\n        return struct.unpack(\"<f\", struct.pack(\"<I\", (pat & 0xFFFF) << 16))[0]\n    if kind == 32:\n        return struct.unpack(\"<f\", struct.pack(\"<I\", pat))[0]\n    return struct.unpack(\"<d\", struct.pack(\"<Q\", pat))[0]\n\n\ndef _key(pat, nbits):\n    \"\"\"Monotone integer key: key+1 is the next value up in that dtype.\"\"\"\n    half = 1 << (nbits - 1)\n    return pat if pat < half else -(pat & (half - 1)) - 1\n\n\ndef _pat(key, nbits):\n    half = 1 << (nbits - 1)\n    return key if key >= 0 else (half | (-key - 1))\n\n\ndef _interval_bounds(dtype, frm, to):\n    \"\"\"Smallest dtype value >= frm and largest dtype value < to.\"\"\"\n    kind = _KIND.get(dtype, 32)\n    nbits = 16 if kind in (16, -16) else (32 if kind == 32 else 64)\n\n    pat, val = _round_pattern(frm, kind)\n    lo = val if val >= frm else _pattern_value(_pat(_key(pat, nbits) + 1, nbits), kind)\n\n    pat, val = _round_pattern(to, kind)\n    if val < to:\n        hi = val\n    else:\n        step = _key(pat, nbits) - 1\n        # +-0.0 and their predecessor collapse onto the same key, so a hop of\n        # one from zero lands back on zero; the real predecessor is -min_sub.\n        if val == 0.0:\n            step -= 1\n        hi = _pattern_value(_pat(step, nbits), kind)\n    return lo, hi\n\n\n_BOUNDS = {}\n_TILES = {}\n_RNG = {}\n\n\ndef _rng_state(gen, n):\n    \"\"\"(key, counter) for this call, both guaranteed to fit in int32.\n\n    Pure host work: one ``initial_seed()`` read (no device traffic, so it never\n    synchronizes with the asynchronous launch queue) plus a counter bump.  A\n    device-side ``get_state``/``set_state`` pair here costs ~77 us per call\n    because it drains the queue.\n\n    The counter is split into a low 31-bit part and an epoch, and the epoch is\n    folded into the key.  Passing the raw counter instead makes the value grow\n    past 2**31 after a few thousand calls, at which point Triton promotes the\n    scalar argument to int64 and the device kernel drops onto an int64 path\n    that measured 4x slower (0.75 ms instead of 0.09 ms for 1M elements).\n    \"\"\"\n    st = _RNG.get(gen)\n    s = gen.initial_seed()\n    if st is None or s != st[0]:\n        st = [s, 0]\n        _RNG[gen] = st\n    o = st[1]\n    st[1] = o + n + 4\n    return (s & 0x7FFFFFFF) ^ ((o >> 31) & 0x7FFFFFFF), o & 0x7FFFFFFF\n\n\ndef _bounds(dtype, frm, to):\n    key = (dtype, frm, to)\n    hit = _BOUNDS.get(key)\n    if hit is None:\n        hit = _interval_bounds(dtype, frm, to)\n        if len(_BOUNDS) < 4096:\n            _BOUNDS[key] = hit\n    return hit\n\n\ndef _tile(n):\n    \"\"\"(BLOCK, EVEN) for this element count; cached because it is pure.\"\"\"\n    hit = _TILES.get(n)\n    if hit is None:\n        if n >= _BLOCK_CAP:\n            block = _BLOCK_CAP\n        else:\n            block = 1 << max(0, (n - 1).bit_length())\n            if block < 32:\n                block = 32\n            elif block > _BLOCK_CAP:\n                block = _BLOCK_CAP\n        hit = (block, n > 0 and n % block == 0)\n        if len(_TILES) < 4096:\n            _TILES[n] = hit\n    return hit\n\n\ndef uniform(self, from_=0.0, to=1.0, *, generator=None):\n    \"\"\"Sample ``U[from_, to)`` into a freshly allocated tensor.\"\"\"\n    if from_ > to:\n        raise RuntimeError(\n            \"uniform_ expects to return a [from, to) range, but found \"\n            f\"from={from_:g} > to={to:g}\"\n        )\n    out = torch.empty_like(self)\n    dev = out.device\n    n = out.numel()\n    block, even = _tile(n)\n    grid = (max(1, (n + block - 1) // block),)\n    guarded = dev.index != torch_device_fn.current_device()\n\n    if from_ == to:\n        val = float(from_)\n        if guarded:\n            with torch_device_fn.device(dev):\n                _fill_kernel[grid](out, n, val, block, even)\n        else:\n            _fill_kernel[grid](out, n, val, block, even)\n        return out\n\n    lo, hi = _bounds(out.dtype, from_, to)\n    if generator is None:\n        generator = torch_device_fn.default_generators[dev.index or 0]\n    seed, offset = _rng_state(generator, n)\n    args = (out, n, seed, offset, lo, hi, to - from_, block, even)\n    if guarded:\n        with torch_device_fn.device(dev):\n            _uniform_kernel[grid](*args)\n    else:\n        _uniform_kernel[grid](*args)\n    return out\n\n\nrun = uniform\n"
+        }
+      ]
+    },
+    "benchmark_fingerprint": "sha256:0868a007dbb3e466045d0bf8c05a445c92fde5e8bde22c6524c707663d8e70a4",
+    "case_id": "uniform-timing-0",
+    "expected_backend": "npu",
+    "options": {
+      "level": "instruction",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "identity": {
+      "solution_sha256": "7d89bcc126f65c289f29223af058f37a8238606361b7ccf324e710d3af07e646",
+      "workload_sha256": "5b265553d37288587eb575388aa6f8d5ec61c3561ff17352be5af4b7a0391443"
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "profile_id": "f039e6ef5806460481a988671d0729ba",
+    "created_at": "2026-10-22T14:48:07.216359+00:00",
+    "status": "completed",
+    "backend": "npu",
+    "profiler": "msprof",
+    "device": "npu:0",
+    "hardware": {
+      "target": {
+        "backend": "ascend",
+        "vendor": "huawei",
+        "device": "Ascend910B4-1",
+        "architecture": "dav-c220-cube",
+        "devices": [
+          {
+            "logical_device": "npu:0",
+            "device_id": 0,
+            "name": "Ascend910B4-1",
+            "l2_cache_size": 176160768,
+            "num_sm": 20,
+            "compute_capability": "",
+            "total_memory": 65452113920
+          }
+        ]
+      },
+      "software": {
+        "language": "triton",
+        "language_version": "3.5.1",
+        "compiler": "flagtree",
+        "compiler_version": "0.6.0+ascend.gitc286cba6",
+        "runtime": "cann",
+        "runtime_version": "9.0.0",
+        "driver_version": "25.2.0"
+      },
+      "metadata": {
+        "complete": true,
+        "missing": [],
+        "sources": {
+          "target.backend": "server configuration",
+          "target.vendor": "server configuration",
+          "software.language": "server configuration",
+          "software.compiler": "python package metadata",
+          "software.runtime": "server configuration",
+          "target.device": "device probe",
+          "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+          "software.language_version": "triton module metadata",
+          "software.compiler_version": "python package metadata",
+          "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+          "software.driver_version": "/usr/local/Ascend/driver/version.info"
+        }
+      }
+    },
+    "evaluation_id": "4fef87421e65ffbb0d93a1ed445b7aab165a4ef7901405ef4f5f4c70bb79d797:round-4",
+    "options": {
+      "level": "instruction",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "capabilities": [
+      "kernel_profile",
+      "arithmetic_utilization",
+      "memory_counters",
+      "cache_counters",
+      "resource_conflicts",
+      "performance_counters",
+      "pipeline_utilization",
+      "execution_timeline",
+      "instruction_listing",
+      "source_hotspots"
+    ],
+    "summary": {
+      "detailed_kernel_count": 1,
+      "avg_time_us": 2.785,
+      "operation_count": 1,
+      "top_operations": [
+        {
+          "op_name": "_uniform_kernel",
+          "op_type": "_uniform_kernel",
+          "task_type": "AI_VECTOR_CORE",
+          "measured_invocations": 100,
+          "total_duration_us": 278.469,
+          "avg_duration_us": 2.785,
+          "min_duration_us": 2.32,
+          "max_duration_us": 4.68,
+          "aicore_time_us": 0.0,
+          "aic_total_cycles": 0.0,
+          "aic_mac_time_us": 0.0,
+          "aic_mac_ratio": 0.0,
+          "aic_scalar_time_us": 0.0,
+          "aic_scalar_ratio": 0.0,
+          "aic_mte1_time_us": 0.0,
+          "aic_mte1_ratio": 0.0,
+          "aic_mte2_time_us": 0.0,
+          "aic_mte2_ratio": 0.0,
+          "aic_fixpipe_time_us": 0.0,
+          "aic_fixpipe_ratio": 0.0,
+          "aic_icache_miss_rate": 0.0,
+          "aiv_time_us": 2.2539,
+          "aiv_total_cycles": 3718.96,
+          "aiv_vec_time_us": 1.194,
+          "aiv_vec_ratio": 0.5685,
+          "aiv_scalar_time_us": 0.6396,
+          "aiv_scalar_ratio": 0.2859,
+          "aiv_mte2_time_us": 0.002,
+          "aiv_mte2_ratio": 0.001,
+          "aiv_mte3_time_us": 0.1969,
+          "aiv_mte3_ratio": 0.0825,
+          "aiv_icache_miss_rate": 0.0498,
+          "cube_utilization_pct": 0.0
+        }
+      ],
+      "simulator_kernel_count": 1,
+      "simulator_core_count": 1,
+      "simulator_instruction_count": 641,
+      "simulator_mapped_instruction_count": 616,
+      "text": "Section: AI Core Simulator Instruction Profile\nSoC Version: Ascend910B4\nKernel Count: 1\nTiming Scope: simulator instruction execution; eval latency remains authoritative\n\nKernel 1: _uniform_kernel\nCore: core0.veccore0\nListed Instructions: 641\nMapped Instructions: 616\nSource Hotspots:\nSource | Calls | Cycles | Running Time(us)\n/data/hanle/ascend-optimization/runs/night-20261021/profiles/f039e6ef5806460481a988671d0729ba/target/candidate/internal:0 | 554 | 5065 | 1.540000\nmain.py:90 xi = tl.where(xi < 0, -xi - 1, xi) | 77 | 3811 | 0.430000\nmain.py:93 v = tl.minimum(tl.maximum(v, lo), hi) | 166 | 3294 | 0.490000\nmain.py:88 x = x ^ (x >> 16) | 44 | 1928 | 0.290000\nmain.py:86 x = x ^ (x >> 15) | 45 | 1872 | 0.360000\nmain.py:84 x = x ^ (x >> 16) | 46 | 1499 | 0.240000\nmain.py:81 i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK) | 77 | 1073 | 0.150000\nmain.py:83 x = x ^ seed.to(tl.uint32) | 49 | 596 | 0.130000\nmain.py:95 tl.store(out_ptr + i, v) | 20 | 420 | 0.200000\nmain.py:85 x = x * tl.full((), 0x7FEB352D, tl.uint32) | 11 | 411 | 0.240000\nmain.py:92 v = v * scale + lo | 25 | 389 | 0.120000\nmain.py:70 def _uniform_kernel( | 15 | 341 | 0.200000\nmain.py:87 x = x * tl.full((), 0x846CA68B, tl.uint32) | 12 | 294 | 0.160000\nmain.py:91 v = xi.to(tl.float32) * 4.6566127342e-10 | 20 | 230 | 0.070000\nmain.py:82 x = (i + off).to(tl.uint32) | 9 | 216 | 0.130000\nInstruction Listing:\nPC | Instruction | Pipeline | Calls | Cycles | Running Time(us) | Source\n0x10d115f8 | BAR | VECTOR | 1 | 602 | 0.360000 | main.py:90\n0x10d115d8 | BAR | VECTOR | 1 | 573 | 0.350000 | main.py:90\n0x10d115b8 | BAR | VECTOR | 1 | 544 | 0.330000 | main.py:90\n0x10d11568 | BAR | VECTOR | 1 | 519 | 0.310000 | main.py:90\n0x10d11560 | BAR | VECTOR | 1 | 467 | 0.280000 | main.py:90\n0x10d113e4 | BAR | VECTOR | 1 | 453 | 0.270000 | main.py:86\n0x10d11528 | BAR | VECTOR | 1 | 441 | 0.270000 | main.py:90\n0x10d113b8 | BAR | VECTOR | 1 | 412 | 0.250000 | main.py:86\n0x10d11508 | BAR | VECTOR | 1 | 400 | 0.240000 | main.py:88\n0x10d11394 | BAR | VECTOR | 1 | 382 | 0.230000 | main.py:86\n0x10d114e8 | BAR | VECTOR | 1 | 375 | 0.230000 | main.py:88\n0x10d11050 | LD_XD_XN_IMM | SCALAR | 1 | 364 | 0.220000 | \n0x10d11040 | LD_XD_XN_IMM | SCALAR | 1 | 362 | 0.220000 | \n0x10d1104c | LD_XD_XN_IMM | SCALAR | 1 | 361 | 0.220000 | \n0x10d11058 | LDP_XI_XJ_XN | SCALAR | 1 | 360 | 0.220000 | \n0x10d11054 | LDP_XI_XJ_XN | SCALAR | 1 | 360 | 0.220000 | \n0x10d11368 | BAR | VECTOR | 1 | 352 | 0.210000 | main.py:85\n0x10d114c8 | BAR | VECTOR | 1 | 334 | 0.200000 | main.py:88\n0x10d11344 | BAR | VECTOR | 1 | 311 | 0.190000 | main.py:84\n0x10d117c8 | WAIT_FLAG | SCALAR | 1 | 307 | 0.190000 | main.py:93\n0x10d119f0 | BAR | ALL | 1 | 307 | 0.190000 | main.py:70\n0x10d11788 | BAR | VECTOR | 1 | 301 | 0.180000 | main.py:93\n0x10d1149c | BAR | VECTOR | 1 | 293 | 0.180000 | main.py:88\n0x10d11324 | BAR | VECTOR | 1 | 286 | 0.170000 | main.py:84\n0x10d11740 | BAR | VECTOR | 1 | 275 | 0.170000 | main.py:93\n0x10d11620 | WAIT_FLAG | SCALAR | 1 | 264 | 0.160000 | main.py:90\n0x10d11478 | BAR | VECTOR | 1 | 263 | 0.160000 | main.py:88\n0x10d119ec | MOV_SRC_TO_DST_ALIGN | MTE3 | 1 | 246 | 0.150000 | main.py:95\n0x10d11304 | BAR | VECTOR | 1 | 245 | 0.150000 | main.py:84\n0x10d11448 | BAR | VECTOR | 1 | 234 | 0.140000 | main.py:87\n0x10d11718 | BAR | VECTOR | 1 | 227 | 0.140000 | main.py:93\n0x10d112d8 | BAR | VECTOR | 1 | 204 | 0.120000 | main.py:84\n0x10d11424 | BAR | VECTOR | 1 | 193 | 0.120000 | main.py:86\n0x10d1192c | WAIT_FLAG | SCALAR | 1 | 191 | 0.120000 | main.py:93\n0x10d118f0 | BAR | VECTOR | 1 | 186 | 0.110000 | main.py:93\n0x10d111c8 | BAR | VECTOR | 1 | 176 | 0.110000 | main.py:82\n0x10d11710 | BAR | VECTOR | 1 | 175 | 0.110000 | main.py:93\n0x10d112b0 | BAR | VECTOR | 1 | 173 | 0.100000 | main.py:84\n0x10d11404 | BAR | VECTOR | 1 | 168 | 0.100000 | main.py:86\n0x10d118a8 | BAR | VECTOR | 1 | 162 | 0.100000 | main.py:93\n0x10d1119c | BAR | VECTOR | 1 | 148 | 0.090000 | main.py:81\n0x10d116ec | BAR | VECTOR | 1 | 144 | 0.090000 | main.py:92\n0x10d11290 | BAR | VECTOR | 1 | 132 | 0.080000 | main.py:83\n0x10d11180 | BAR | VECTOR | 1 | 124 | 0.080000 | main.py:81\n0x10d11880 | BAR | VECTOR | 1 | 113 | 0.070000 | main.py:93\n0x10d11270 | BAR | VECTOR | 1 | 107 | 0.060000 | main.py:83\n0x10d116ac | BAR | VECTOR | 1 | 103 | 0.060000 | main.py:92\n0x10d11174 | BAR | VECTOR | 1 | 101 | 0.060000 | main.py:81\n0x10d11164 | BAR | VECTOR | 1 | 80 | 0.050000 | main.py:81\n0x10d1167c | BAR | VECTOR | 1 | 72 | 0.040000 | main.py:91\n0x10d11250 | BAR | VECTOR | 1 | 66 | 0.040000 | main.py:83\n0x10d11878 | BAR | VECTOR | 1 | 62 | 0.040000 | main.py:93\n0x10d119e4 | WAIT_FLAG | MTE3 | 1 | 60 | 0.040000 | main.py:95\n0x10d11158 | BAR | VECTOR | 1 | 60 | 0.040000 | main.py:81\n0x10d11864 | MOVEV | VECTOR | 1 | 54 | 0.030000 | main.py:93\n0x10d116dc | MOVEV | VECTOR | 1 | 53 | 0.030000 | main.py:92\n0x10d118a4 | VCMPV | VECTOR | 1 | 53 | 0.030000 | main.py:93\n0x10d1173c | VCMPV | VECTOR | 1 | 53 | 0.030000 | main.py:93\n0x10d11564 | VCMPV | VECTOR | 1 | 52 | 0.030000 | main.py:90\n0x10d11714 | VCMPV | VECTOR | 1 | 52 | 0.030000 | main.py:93\n0x10d11960 | BAR | VECTOR | 1 | 51 | 0.030000 | main.py:93\n0x10d1187c | VCMPV | VECTOR | 1 | 51 | 0.030000 | main.py:93\n0x10d113d4 | VOR | VECTOR | 1 | 47 | 0.030000 | main.py:86\n0x10d114d8 | VAND | VECTOR | 1 | 47 | 0.030000 | main.py:88\n0x10d11434 | VAND | VECTOR | 1 | 47 | 0.030000 | main.py:86\n0x10d11314 | VAND | VECTOR | 1 | 47 | 0.030000 | main.py:84\n0x10d113f4 | VAND | VECTOR | 1 | 47 | 0.030000 | main.py:86\n0x10d11240 | VOR | VECTOR | 1 | 47 | 0.030000 | main.py:83\n0x10d11518 | VAND | VECTOR | 1 | 47 | 0.030000 | main.py:88\n0x10d112f4 | VOR | VECTOR | 1 | 47 | 0.030000 | main.py:84\n0x10d1197c | WAIT_FLAG | SCALAR | 1 | 47 | 0.030000 | main.py:93\n0x10d11260 | VAND | VECTOR | 1 | 47 | 0.030000 | main.py:83\n0x10d114b8 | VOR | VECTOR | 1 | 47 | 0.030000 | main.py:88\n0x10d11354 | VAND | VECTOR | 1 | 47 | 0.030000 | main.py:84\n0x10d112a0 | VAND | VECTOR | 1 | 47 | 0.030000 | main.py:83\n0x10d119a8 | BAR | VECTOR | 1 | 45 | 0.030000 | main.py:95\n0x10d1165c | BAR | VECTOR | 1 | 43 | 0.030000 | main.py:91\n0x10d11808 | BAR | VECTOR | 1 | 41 | 0.020000 | main.py:93\n0x10d11148 | BAR | VECTOR | 1 | 40 | 0.020000 | main.py:81\n0x10d11860 | MOVEMASK | VECTOR | 1 | 39 | 0.020000 | main.py:93\n0x10d11840 | VSEL | VECTOR | 1 | 39 | 0.020000 | main.py:93\n0x10d116bc | VMULS | VECTOR | 1 | 38 | 0.020000 | main.py:92\n0x10d1169c | VMULS | VECTOR | 1 | 38 | 0.020000 | main.py:91\n0x10d113a8 | VSHR | VECTOR | 1 | 37 | 0.020000 | main.py:86\n0x10d11468 | VMULS | VECTOR | 1 | 37 | 0.020000 | main.py:87\n0x10d11778 | VMAXS | VECTOR | 1 | 37 | 0.020000 | main.py:93\n0x10d112c8 | VSHR | VECTOR | 1 | 37 | 0.020000 | main.py:84\n0x10d115a8 | VMULS | VECTOR | 1 | 37 | 0.020000 | main.py:90\n0x10d11950 | VSEL | VECTOR | 1 | 37 | 0.020000 | main.py:93\n0x10d117f8 | VSEL | VECTOR | 1 | 37 | 0.020000 | main.py:93\n0x10d11384 | VMULS | VECTOR | 1 | 37 | 0.020000 | main.py:85\n0x10d116fc | VADDS | VECTOR | 1 | 37 | 0.020000 | main.py:92\n0x10d11824 | WAIT_FLAG | SCALAR | 1 | 37 | 0.020000 | main.py:93\n0x10d1148c | VSHR | VECTOR | 1 | 37 | 0.020000 | main.py:88\n0x10d111b0 | VADDS | VECTOR | 1 | 35 | 0.020000 | main.py:81\n0x10d11540 | VMAXS | VECTOR | 1 | 35 | 0.020000 | main.py:90\n0x10d1166c | VCONV | VECTOR | 1 | 35 | 0.020000 | main.py:91\n0x10d115c8 | VADDS | VECTOR | 1 | 35 | 0.020000 | main.py:90\n0x10d111d8 | VADDS | VECTOR | 1 | 35 | 0.020000 | main.py:82\n0x10d115e8 | VADDS | VECTOR | 1 | 35 | 0.020000 | main.py:90\n0x10d118dc | VMINS | VECTOR | 1 | 35 | 0.020000 | main.py:93\n0x10d118e0 | MOVEMASK | VECTOR | 1 | 35 | 0.020000 | main.py:93\n0x10d11998 | VSEL | VECTOR | 1 | 32 | 0.020000 | main.py:93\n0x10d1164c | VSEL | VECTOR | 1 | 32 | 0.020000 | main.py:90\n0x10d11334 | VNOT | VECTOR | 1 | 31 | 0.020000 | main.py:84\n0x10d114f8 | VNOT | VECTOR | 1 | 31 | 0.020000 | main.py:88\n0x10d11280 | VNOT | VECTOR | 1 | 31 | 0.020000 | main.py:83\n0x10d11414 | VNOT | VECTOR | 1 | 31 | 0.020000 | main.py:86\n0x10d1120c | MOVEV | VECTOR | 1 | 31 | 0.020000 | main.py:83\n0x10d110dc | STP_XI_XJ_XN | SCALAR | 1 | 28 | 0.020000 | main.py:81\n0x10d110e0 | SET_FLAG | SCALAR | 1 | 28 | 0.020000 | main.py:81\n0x10d1121c | BAR | VECTOR | 1 | 28 | 0.020000 | main.py:83\n0x10d11188 | VADDS | VECTOR | 1 | 27 | 0.020000 | main.py:81\n0x10d119c8 | VCONV | VECTOR | 1 | 27 | 0.020000 | main.py:95\n0x10d119e0 | SET_FLAG | VECTOR | 1 | 26 | 0.020000 | main.py:95\n0x10d1117c | VADDS | VECTOR | 1 | 23 | 0.010000 | main.py:81\n0x10d1116c | VADDS | VECTOR | 1 | 21 | 0.010000 | main.py:81\n0x10d110d4 | STP_XI_XJ_XN | SCALAR | 1 | 20 | 0.010000 | main.py:81\n0x10d11160 | VADDS | VECTOR | 1 | 20 | 0.010000 | main.py:81\n0x10d1107c | DIV | SCALAR | 1 | 20 | 0.010000 | main.py:70\n0x10d110d8 | STP_XI_XJ_XN | SCALAR | 1 | 20 | 0.010000 | main.py:81\n0x10d11138 | VADDS | VECTOR | 1 | 20 | 0.010000 | main.py:81\n0x10d1113c | BAR | VECTOR | 1 | 20 | 0.010000 | main.py:81\n0x10d11098 | REM | SCALAR | 1 | 20 | 0.010000 | main.py:81\n0x10d11144 | VADDS | VECTOR | 1 | 20 | 0.010000 | main.py:81\n0x10d11150 | VADDS | VECTOR | 1 | 20 | 0.010000 | main.py:81\n0x10d11380 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:85\n0x10d117d8 | VMOVMASK_XN | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d11944 | BAR | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d117f4 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d11948 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d11178 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:81\n0x10d1194c | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d11578 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:90\n0x10d118b8 | VNOT | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d11728 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d115a4 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:90\n0x10d1172c | VNOT | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d1193c | VMOVMASK_XN | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d112ec | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:84\n0x10d11770 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d1153c | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:90\n0x10d114b0 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:88\n0x10d114b4 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:88\n0x10d11184 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:81\n0x10d112c4 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:84\n0x10d11750 | VNOT | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d117a0 | MOVEV | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d1198c | VMOVMASK_XN | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d1179c | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d1115c | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:81\n0x10d11698 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:91\n0x10d11894 | VNOT | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d1114c | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:81\n0x10d11140 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:81\n0x10d11884 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d11694 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:91\n0x10d1157c | VNOT | VECTOR | 1 | 16 | 0.010000 | main.py:90\n0x10d11130 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:81\n0x10d11638 | VMOVMASK_XN | VECTOR | 1 | 16 | 0.010000 | main.py:90\n0x10d11464 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:87\n0x10d113d0 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:86\n0x10d11208 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:83\n0x10d115a0 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:90\n0x10d113cc | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:86\n0x10d11030 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | \n0x10d112f0 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:84\n0x10d1102c | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | \n0x10d118d8 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d111ac | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:81\n0x10d1123c | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:83\n0x10d11994 | BAR | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d11168 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:81\n0x10d11834 | VMOVMASK_XN | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d11774 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d1183c | BAR | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d11110 | MOVEMASK | VECTOR | 1 | 16 | 0.010000 | main.py:81\n0x10d11904 | MOVEV | VECTOR | 1 | 16 | 0.010000 | main.py:93\n0x10d117c4 | SET_FLAG | VECTOR | 1 | 15 | 0.010000 | main.py:93\n0x10d11928 | SET_FLAG | VECTOR | 1 | 15 | 0.010000 | main.py:93\n0x10d11648 | BAR | VECTOR | 1 | 14 | 0.010000 | main.py:90\n0x10d117f0 | BAR | VECTOR | 1 | 13 | 0.010000 | main.py:93\n0x10d110bc | STP_XI_XJ_XN | SCALAR | 1 | 13 | 0.010000 | main.py:81\n0x10d11930 | ST_XD_XN_IMM | SCALAR | 1 | 12 | 0.010000 | main.py:93\n0x10d11984 | SET_FLAG | SCALAR | 1 | 12 | 0.010000 | main.py:93\n0x10d11980 | ST_XD_XN_IMM | SCALAR | 1 | 12 | 0.010000 | main.py:93\n0x10d117cc | ST_XD_XN_IMM | SCALAR | 1 | 12 | 0.010000 | main.py:93\n0x10d117d0 | SET_FLAG | SCALAR | 1 | 12 | 0.010000 | main.py:93\n0x10d11934 | SET_FLAG | SCALAR | 1 | 12 | 0.010000 | main.py:93\n0x10d11828 | ST_XD_XN_IMM | SCALAR | 1 | 12 | 0.010000 | main.py:93\n0x10d1182c | SET_FLAG | SCALAR | 1 | 12 | 0.010000 | main.py:93\n0x10d11624 | ST_XD_XN_IMM | SCALAR | 1 | 12 | 0.010000 | main.py:90\n0x10d11628 | SET_FLAG | SCALAR | 1 | 12 | 0.010000 | main.py:90\n0x10d119fc | DCCI | FLOWCTRL | 1 | 5 | 0.000000 | main.py:70\n0x10d11060 | LDP_XI_XJ_XN | SCALAR | 1 | 5 | 0.000000 | \n0x10d119e8 | MOV_SPR_XN | MTE2 | 1 | 4 | 0.000000 | main.py:95\n0x10d11028 | MADD | SCALAR | 1 | 3 | 0.000000 | \n0x10d1105c | MUL | SCALAR | 1 | 2 | 0.000000 | \n0x10d11608 | MOV_XD_IMM | SCALAR | 1 | 1 | 0.000000 | main.py:90\n0x10d11914 | MOV_XD_SPR | SCALAR | 1 | 1 | 0.000000 | main.py:93\n0x10d11968 | INSERT_XD | SCALAR | 1 | 1 | 0.000000 | main.py:93\n0x10d11920 | MOVX8_XD_IMM | SCALAR | 1 | 1 | 0.000000 | main.py:93\n0x10d11618 | ADD | SCALAR | 1 | 1 | 0.000000 | main.py:90\n0x10d11614 | MOV_XD_IMM | SCALAR | 1 | 1 | 0.000000 | main.py:90\n0x10d11610 | AND | SCALAR | 1 | 1 | 0.000000 | main.py:90\n0x10d11924 | ADD | SCALAR | 1 | 1 | 0.000000 | main.py:93\n0x10d1160c | NEG | SCALAR | 1 | 1 | 0.000000 | main.py:90\n0x10d115ec | MOV_XD_SPR | SCALAR | 1 | 1 | 0.000000 | main.py:90\n0x10d11600 | INSERT_XD | SCALAR | 1 | 1 | 0.000000 | main.py:90\n0x10d11964 | MOV_XD_SPR | SCALAR | 1 | 1 | 0.000000 | main.py:93\n0x10d11940 | MOVX8_XD_IMM | SCALAR | 1 | 1 | 0.000000 | main.py:93\n0x10d115fc | MOV_XD_SPR | SCALAR | 1 | 1 | 0.000000 | main.py:90\n0x10d11954 | MOV_XD_SPR | SCALAR | 1 | 1 | 0.000000 | main.py:93\n0x10d115f0 | INSERT_XD | SCALAR | 1 | 1 | 0.000000 | main.py:90\n0x10d11958 | INSERT_XD | SCALAR | 1 | 1 | 0.000000 | main.py:93\n0x10d11640 | MOVK | SCALAR | 1 | 1 | 0.000000 | main.py:90\n0x10d118cc | INSERT_XD | SCALAR | 1 | 1 | 0.000000 | main.py:93\n0x10d118d4 | MOVX8_XD_IMM | SCALAR | 1 | 1 | 0.000000 | main.py:93\n0x10d11654 | INSERT_XD | SCALAR | 1 | 1 | 0.000000 | main.py:90\n0x10d11650 | MOV_XD_SPR | SCALAR | 1 | 1 | 0.000000 | main.py:90\n0x10d118e4 | MOV_XD_SPR | SCALAR | 1 | 1 | 0.000000 | main.py:93\n0x10d118e8 | INSERT_XD | SCALAR | 1 | 1 | 0.000000 | main.py:93\n0x10d118f4 | MOV_XD_SPR | SCALAR | 1 | 1 | 0.000000 | main.py:93\n0x10d11644 | MOV_XD_IMM | SCALAR | 1 | 1 | 0.000000 | main.py:90\n0x10d11918 | INSERT_XD | SCALAR | 1 | 1 | 0.000000 | main.py:93\n0x10d1163c | MOVK | SCALAR | 1 | 1 | 0.000000 | main.py:90\n0x10d118f8 | INSERT_XD | SCALAR | 1 | 1 | 0.000000 | main.py:93\n0x10d11634 | MOVK | SCALAR | 1 | 1 | 0.000000 | main.py:90\n0x10d11900 | MOVX8_XD_IMM | SCALAR | 1 | 1 | 0.000000 | main.py:93\n0x10d11908 | MOV_XD_SPR | SCALAR | 1 | 1 | 0.000000 | main.py:93\n0x10d1162c | MOV_XD_IMM | SCALAR | 1 | 1 | 0.000000 | main.py:90\n0x10d1190c | INSERT_XD | SCALAR | 1 | 1 | 0.000000 | main.py:93\n0x10d115dc | MOV_XD_SPR | SCALAR | 1 | 1 | 0.000000 | main.py:90\n0x10d119d0 | INSERT_XD | SCALAR | 1 | 1 | 0.000000 | main.py:95\n0x10d1159c | NEG | SCALAR | 1 | 1 | 0.000000 | main.py:90\n0x10d1",
+      "stage_count": 4
+    },
+    "metrics": {
+      "detailed_kernel_names": [
+        "_uniform_kernel"
+      ],
+      "avg_time_us": 2.785,
+      "ops": [
+        {
+          "op_name": "_uniform_kernel",
+          "op_type": "_uniform_kernel",
+          "task_type": "AI_VECTOR_CORE",
+          "measured_invocations": 100,
+          "total_duration_us": 278.469,
+          "avg_duration_us": 2.785,
+          "min_duration_us": 2.32,
+          "max_duration_us": 4.68,
+          "aicore_time_us": 0.0,
+          "aic_total_cycles": 0.0,
+          "aic_mac_time_us": 0.0,
+          "aic_mac_ratio": 0.0,
+          "aic_scalar_time_us": 0.0,
+          "aic_scalar_ratio": 0.0,
+          "aic_mte1_time_us": 0.0,
+          "aic_mte1_ratio": 0.0,
+          "aic_mte2_time_us": 0.0,
+          "aic_mte2_ratio": 0.0,
+          "aic_fixpipe_time_us": 0.0,
+          "aic_fixpipe_ratio": 0.0,
+          "aic_icache_miss_rate": 0.0,
+          "aiv_time_us": 2.2539,
+          "aiv_total_cycles": 3718.96,
+          "aiv_vec_time_us": 1.194,
+          "aiv_vec_ratio": 0.5685,
+          "aiv_scalar_time_us": 0.6396,
+          "aiv_scalar_ratio": 0.2859,
+          "aiv_mte2_time_us": 0.002,
+          "aiv_mte2_ratio": 0.001,
+          "aiv_mte3_time_us": 0.1969,
+          "aiv_mte3_ratio": 0.0825,
+          "aiv_icache_miss_rate": 0.0498,
+          "cube_utilization_pct": 0.0
+        }
+      ],
+      "simulator": {
+        "soc_version": "Ascend910B4",
+        "instruction_count": 641,
+        "mapped_instruction_count": 616
+      }
+    },
+    "artifacts": [
+      {
+        "id": "a001",
+        "kind": "profile_log",
+        "format": "text",
+        "filename": "msprof-base-collection.log",
+        "media_type": "text/plain",
+        "size_bytes": 6103,
+        "download_url": "/profile_artifacts/f039e6ef5806460481a988671d0729ba/a001",
+        "local_path": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/uniform-endurance-20261022-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0004/uniform-timing-0/f22a20b6eb9e4f7c997d59b9182b9062/msprof-base-collection.log",
+        "download_error": null
+      },
+      {
+        "id": "a002",
+        "kind": "vendor_report",
+        "format": "msprof-tar-gz",
+        "filename": "msprof-report.tar.gz",
+        "media_type": "application/gzip",
+        "size_bytes": 136588,
+        "download_url": "/profile_artifacts/f039e6ef5806460481a988671d0729ba/a002",
+        "local_path": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/uniform-endurance-20261022-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0004/uniform-timing-0/f22a20b6eb9e4f7c997d59b9182b9062/msprof-report.tar.gz",
+        "download_error": null
+      },
+      {
+        "id": "a003",
+        "kind": "profile_log",
+        "format": "text",
+        "filename": "msprof-op-kernel-discovery.log",
+        "media_type": "text/plain",
+        "size_bytes": 11739,
+        "download_url": "/profile_artifacts/f039e6ef5806460481a988671d0729ba/a003",
+        "local_path": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/uniform-endurance-20261022-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0004/uniform-timing-0/f22a20b6eb9e4f7c997d59b9182b9062/msprof-op-kernel-discovery.log",
+        "download_error": null
+      },
+      {
+        "id": "a004",
+        "kind": "profile_log",
+        "format": "text",
+        "filename": "msprof-op-kernel-0.log",
+        "media_type": "text/plain",
+        "size_bytes": 2982,
+        "download_url": "/profile_artifacts/f039e6ef5806460481a988671d0729ba/a004",
+        "local_path": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/uniform-endurance-20261022-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0004/uniform-timing-0/f22a20b6eb9e4f7c997d59b9182b9062/msprof-op-kernel-0.log",
+        "download_error": null
+      },
+      {
+        "id": "a005",
+        "kind": "vendor_kernel_report",
+        "format": "msprof-op-tar-gz",
+        "filename": "msprof-op-report.tar.gz",
+        "media_type": "application/gzip",
+        "size_bytes": 47347,
+        "download_url": "/profile_artifacts/f039e6ef5806460481a988671d0729ba/a005",
+        "local_path": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/uniform-endurance-20261022-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0004/uniform-timing-0/f22a20b6eb9e4f7c997d59b9182b9062/msprof-op-report.tar.gz",
+        "download_error": null
+      },
+      {
+        "id": "a006",
+        "kind": "profile_log",
+        "format": "text",
+        "filename": "ascend-simulator-kernel-0.log",
+        "media_type": "text/plain",
+        "size_bytes": 6410,
+        "download_url": "/profile_artifacts/f039e6ef5806460481a988671d0729ba/a006",
+        "local_path": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/uniform-endurance-20261022-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0004/uniform-timing-0/f22a20b6eb9e4f7c997d59b9182b9062/ascend-simulator-kernel-0.log",
+        "download_error": null
+      },
+      {
+        "id": "a007",
+        "kind": "vendor_instruction_report",
+        "format": "msprof-simulator-tar-gz",
+        "filename": "msprof-simulator-report.tar.gz",
+        "media_type": "application/gzip",
+        "size_bytes": 96930,
+        "download_url": "/profile_artifacts/f039e6ef5806460481a988671d0729ba/a007",
+        "local_path": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/uniform-endurance-20261022-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0004/uniform-timing-0/f22a20b6eb9e4f7c997d59b9182b9062/msprof-simulator-report.tar.gz",
+        "download_error": null
+      },
+      {
+        "id": "a008",
+        "kind": "instruction_listing",
+        "format": "aicore-instruction-json",
+        "filename": "ascend-instructions.json",
+        "media_type": "application/json",
+        "size_bytes": 529349,
+        "download_url": "/profile_artifacts/f039e6ef5806460481a988671d0729ba/a008",
+        "local_path": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/uniform-endurance-20261022-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0004/uniform-timing-0/f22a20b6eb9e4f7c997d59b9182b9062/ascend-instructions.json",
+        "download_error": null
+      },
+      {
+        "id": "a009",
+        "kind": "op_summary",
+        "format": "csv",
+        "filename": "op_summary.csv",
+        "media_type": "text/csv",
+        "size_bytes": 31057,
+        "download_url": "/profile_artifacts/f039e6ef5806460481a988671d0729ba/a009",
+        "local_path": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/uniform-endurance-20261022-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0004/uniform-timing-0/f22a20b6eb9e4f7c997d59b9182b9062/op_summary.csv",
+        "download_error": null
+      },
+      {
+        "id": "a010",
+        "kind": "execution_timeline",
+        "format": "trace-json",
+        "filename": "execution-trace.json",
+        "media_type": "application/json",
+        "size_bytes": 143471,
+        "download_url": "/profile_artifacts/f039e6ef5806460481a988671d0729ba/a010",
+        "local_path": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/uniform-endurance-20261022-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0004/uniform-timing-0/f22a20b6eb9e4f7c997d59b9182b9062/execution-trace.json",
+        "download_error": null
+      }
+    ],
+    "warnings": [
+      "msprof and simulator timing is diagnostic and is not eval latency"
+    ],
+    "error": null,
+    "workload_uuid": "uniform-timing-0"
+  }
+}

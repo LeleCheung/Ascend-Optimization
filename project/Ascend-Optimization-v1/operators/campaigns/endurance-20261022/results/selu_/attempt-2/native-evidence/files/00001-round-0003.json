@@ -1,0 +1,111 @@
+{
+  "schema_version": "1.0",
+  "round_num": 3,
+  "evaluation_fingerprint": "3344507a461314e4658315511094d2ec8ab858fc8fd25520fc0cfe0fa2ee7734",
+  "status": "failed",
+  "solution_sha256": "9beeae21e3eeb44e3b18e11e3061ad7424743cabd8d003736bd4806251c8441a",
+  "backend": "npu",
+  "profiler": "msprof",
+  "capabilities": [
+    "performance_counters",
+    "pipeline_utilization",
+    "kernel_profile",
+    "instruction_listing"
+  ],
+  "dominant_bound": "unknown",
+  "profiled_workloads": [
+    {
+      "uuid": "selu_-timing-11",
+      "axes": {},
+      "eval_speedup": 0.6768232537276573,
+      "eval_latency_ms": 0.0728674420994654,
+      "eval_reference_latency_ms": 0.04931837925257185,
+      "selection_reason": "Lowest eval speedup and highest eval latency in this round (0.677x, 72.87us); primary outlier for the 16M-element regime the persistent-kernel hypothesis targets.",
+      "profile_ids": [
+        "fa09d4f7e1344d9096612e91fe9dddd6"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0003/selu_-timing-11/89855ba1d8464deab9e074313d660674/manifest.json"
+      ],
+      "status": "failed"
+    },
+    {
+      "uuid": "selu_-timing-7",
+      "axes": {},
+      "eval_speedup": 0.7830897305879002,
+      "eval_latency_ms": 0.0755067570531119,
+      "eval_reference_latency_ms": 0.05912856603828743,
+      "selection_reason": "Second-lowest speedup and second-highest latency (0.783x, 75.51us); same element count as timing-11 but half the bytes, which would separate a dtype-specific compute path from a pure bandwidth limit.",
+      "profile_ids": [
+        "8479166b49344913a96b4c073a2d66b5"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0003/selu_-timing-7/3cddeb448e534fd09321525219946f09/manifest.json"
+      ],
+      "status": "failed"
+    },
+    {
+      "uuid": "selu_-timing-3",
+      "axes": {},
+      "eval_speedup": 1.3591662044380972,
+      "eval_latency_ms": 0.041877505301115524,
+      "eval_reference_latency_ms": 0.056918489931453486,
+      "selection_reason": "Control in the same 16M regime: the only dtype above the reference (1.359x, 41.88us), so it would separate dtype-dependent device behaviour from a common launch path.",
+      "profile_ids": [
+        "9492e6ccc5694c63a90b4a92e6f384ca"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0003/selu_-timing-3/364fa65e3b58483096f195e43c3a086c/manifest.json"
+      ],
+      "status": "failed"
+    },
+    {
+      "uuid": "selu_-timing-0",
+      "axes": {},
+      "eval_speedup": 0.8719978918793025,
+      "eval_latency_ms": 0.012933768808173684,
+      "eval_reference_latency_ms": 0.011278219134781732,
+      "selection_reason": "Smallest-input regime (1024 elements, 12.93us) that does NOT enter the persistent path (1 tile < 4*num_vectorcore); discriminates a launch/host limit from a device-kernel limit.",
+      "profile_ids": [
+        "fee31ce94e7c46b38d921d17b472dd12"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0003/selu_-timing-0/da21be3419c7435fb9dc0b2198b57229/manifest.json"
+      ],
+      "status": "failed"
+    }
+  ],
+  "findings": [],
+  "performance_interpretation": "Only authoritative eval evidence (from get_profile_context) supports performance statements in this round; the profiler contributed no measurements. geo_mean moved 0.8632 -> 0.8871 (+2.76%). Latency fell on exactly the three workloads the frozen plan targets: timing-3 (f16 4096x4096) 45.61 -> 41.88us (-8.2%, 1.359x vs reference), timing-7 (bf16 4096x4096) 83.25 -> 75.51us (-9.3%), timing-11 (f32 4096x4096) 82.71 -> 72.87us (-11.9%). Small/mid cases moved only -3.2% to -8.8% and remain below the reference (timing-0 0.872x, timing-4 0.903x, timing-8 0.825x), consistent with them not entering the persistent path because tiles < 4*num_vectorcore. The hypothesis that per-program tile cost limits the 16M cases is therefore supported by eval latency for the large regime and unsupported for the 1024/65536 regime, where a launch-side residual remains. It must not be upgraded to a device-level mechanism: no pipeline ratios, MTE/Vector activity or instruction counts were obtained, and the reference for timing-3 is itself slower (56.92us) than for timing-11 (49.32us), so the 1.359x cannot be read as a faster compute body.",
+  "next_experiment": {
+    "action_category": "profiling_compatibility_host_launch",
+    "action_description": "Make the profiled call path use the ordinary Tensor-argument launch (compiled.run.__call__ or kernel[grid]) while keeping the identical kernel body, BLOCK/tile selection and persistent grid, and keep the bare-address fast path only for non-profiled calls. Detect the real msprof condition instead of only scanning enable_msprof_register_tensor: in the installed backend the generated launcher extracts tensor shapes when the internal __MsprofFlagL1 global is set and calls PyObject_CallMethod(tensor, \"size\", NULL) on every pointer argument (driver.py lines 986-994 and 936-948), while enable_msprof_register_tensor only reflects TRITON_REGISTER_TENSOR_MSPROF at construction time (driver.py lines 131-132, 158-162). Treat that L1 state as a fallback trigger and do not cache a bare-address entry in _FAST when it was built under it.",
+    "expected_impact": "Restores msprof collection for semantically identical code so the 16M regime can be attributed (MTE2/MTE3 vs Vector vs Scalar) and the persistent-kernel gain explained rather than inferred. This is a collection fix, so headline eval latency should be unchanged; a geo_mean move beyond run-to-run noise would mean the fallback altered the executed kernel and must be booked as a separate performance change.",
+    "risks_and_rollback": "Risk: a fallback that fires on every call silently discards the bare-address host optimisation and removes the measured 8-12% large-input gain; risk: detecting the flag at the wrong moment caches an entry built under profiling and keeps failing. Mitigate by keying the cached entry on the mode observed at build time, keeping the fast path for normal execution, and requiring one successful collection before promoting any further candidate. Roll back to solution 9beeae21e3eeb44e3b18e11e3061ad7424743cabd8d003736bd4806251c8441a (this round's passing source, geo_mean 0.8871) if the fallback changes latency or semantics.",
+    "validation_workloads": [
+      "selu_-timing-11",
+      "selu_-timing-7",
+      "selu_-timing-0"
+    ],
+    "success_criteria": [
+      "A metrics profile of selu_-timing-11 returns status completed with a non-empty artifact list and the chosen kernel (expected _selu_persist) identifiable in the report.",
+      "A metrics profile of selu_-timing-0 also completes, showing the fix is not specific to the persistent path.",
+      "Full KGS evaluation stays PASSED on all 24 correctness workloads; the 12 timing workloads keep latencies within run-to-run noise of this round (headline geo_mean not below 0.8871 minus noise).",
+      "The project's independent semantics (42 items), dense-contiguous (12 items) and numeric-range gates still pass for the modified source before it is treated as a candidate.",
+      "The recorded pipeline counters for selu_-timing-11 must agree with the observed -11.9% latency change; otherwise the per-program-tile-cost hypothesis is marked falsified and the next round re-targets the 16M regime."
+    ]
+  },
+  "warnings": [
+    "All four profile requests (timing-11, timing-7, timing-3, timing-0) failed with 'msprof base collection exited successfully without profile completion marker'; no artifacts were downloaded, so no device counters, pipeline ratios or instruction listings exist for this round and no finding could be artifact-backed.",
+    "The scheduler reported healthy=1/broken=0 and the identical error appeared across four differently sized workloads, so a transient device fault is not supported by the manifests; the shared host launch path is the suspected element, but no run log was archived to pin the abort point.",
+    "No quantitative Roofline is claimed: transferred bytes, matched execution time and a verified bandwidth ceiling are unavailable, and pipeline activity could not be collected at all.",
+    "The persistent-kernel gain is visible only in authoritative eval latency; it is not backed by any profiler measurement in this round."
+  ],
+  "open_questions": [
+    "Does the installed launcher's __MsprofFlagL1 shape-extraction branch abort the launch (or leave an unhandled Python error) when pointer arguments are plain integers, and does that explain the missing completion marker rather than a msprof post-processing failure?",
+    "Would a standard Tensor launch of the same _selu_persist kernel collect successfully on this service, i.e. is the incompatibility purely the bare-address entry?",
+    "Why do bf16 and f32 4096x4096 stay at 0.783x/0.677x while f16 reaches 1.359x, when bf16 moves the same byte volume as f16? Answering this needs the missing MTE2/MTE3 vs Vector split.",
+    "Is the residual on the 1024/65536 cases launch-side as the plan assumes, and what is the device-task duration for this source under this profiler?"
+  ],
+  "error": "msprof base collection exited successfully without profile completion marker (4/4 workloads: selu_-timing-11, selu_-timing-7, selu_-timing-3, selu_-timing-0). The service declared capabilities performance_counters, pipeline_utilization, kernel_profile and instruction_listing, but every result returned an empty capability set, an empty artifact list and no metrics, so no artifact could be cited as evidence."
+}

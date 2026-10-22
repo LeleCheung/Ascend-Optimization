@@ -1,6 +1,8 @@
 # HG-KDA 分阶段体检与 KG 接入
 
-正在执行[夜间连续大goal](../../../operators/campaigns/endurance-20261022/README.md)：SELU、rad2deg_、cumulative_trapezoid、scatter_add、uniform和gelu_and_mul，最多两批自动搜索；语义、一次完整复验、真实任务采集和交付自动衔接。`run-endurance.py`在宿主tmux运行，`finish-endurance.py`独立等待并离线验收；不在单算子完成后暂停询问。当前进展以服务器本批状态为准，启动队列不等于取得优化成果。
+[夜间连续大goal](../../../operators/夜间连续优化交付-20261023.md)已取得完整结果：GELU 2.271×、标准Philox修复uniform 1.325×、rad2deg_ 1.117×、SELU 0.837×；scatter_add 0.419×未达标，累计积分未通过全部数值检查。`run-endurance.py`与独立补充队列在宿主tmux串行执行，自动衔接有限搜索、门禁、一次正式完整KGS、采集与证据审计。
+
+新增[uniform整数机制知识](research/uniform无符号整数修复-20261023.md)：通过确定性设备反例区分乘法、逻辑右移与参数状态；显式有符号移位加掩码、位运算counter进位绕过固定后端的错误与不支持转换。最终标准Philox逐位16项、语义18项、随机状态3项和完整KGS18项通过。原错误高分、失败修复与最终版分别归档，CC生成与Codex机制修复分别登记。
 
 主批次最终审计还会读取所有已通过门禁的起点与搜索候选，核对它们实际上传的合同、源码和逐 case 正式延迟，独立确认入选者耗时最低。相对 PyTorch 分数更高、用例集合不同、非有限延迟或同源码出现冲突正式延迟，均不能绕过选版核验。追加采集修复批次按其登记的兼容修复目标独立核验。
 

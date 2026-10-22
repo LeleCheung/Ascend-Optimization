@@ -34,9 +34,9 @@ Ascend-Optimization-v1/
 
 ## 阅读入口
 
-当前在跑[六算子夜间连续优化](operators/campaigns/endurance-20261022/README.md)，服务器tmux自动推进完整队列。运行状态和最终交付分开记录，全部门禁、采集与三端同步完成后统一汇报。
+[六算子夜间连续优化已结束](operators/夜间连续优化交付-20261023.md)：`gelu_and_mul` 2.271×、`uniform` 1.325×、`rad2deg_` 1.117×、`selu_` 0.837×；SELU 同批实际加速1.042×。`scatter_add` 0.419×未达标，`cumulative_trapezoid`未通过数值门禁。七份完整原始快照共4507个文件、62项离线证据核验通过；SELU/rad2deg_的KGS metrics缺口单列。最终源码与结果以[机器清单](operators/夜间连续优化交付-20261023.json)为准，uniform已替换为标准Philox修复版，旧1.497×不作为交付。
 
-最新结果：[log10_、selu_缓冲与搬运优化](operators/campaigns/buffer-pointwise-20261022/README.md)。最终0.875×、0.898×；log10_相对同批父版实际加速1.125×，SELU保留旧源码。各36项正式测试及42＋12＋9项补充检查通过，最终采集和48项证据核验闭环。源码、简报和一次完整复现命令均在该批次内；上轮0.737×、0.790×保留在[历史成对批次](operators/campaigns/paired-pointwise-20261022/README.md)。
+上轮结果：[log10_、selu_缓冲与搬运优化](operators/campaigns/buffer-pointwise-20261022/README.md)。最终0.875×、0.898×；log10_相对同批父版实际加速1.125×，SELU保留旧源码。各36项正式测试及42＋12＋9项补充检查通过，最终采集和48项证据核验闭环。源码、简报和一次完整复现命令均在该批次内；上轮0.737×、0.790×保留在[历史成对批次](operators/campaigns/paired-pointwise-20261022/README.md)。
 
 | 入口 | 用途 |
 |---|---|

@@ -1,0 +1,108 @@
+{
+  "request": {
+    "api_version": "v6.2",
+    "evaluation_id": "3344507a461314e4658315511094d2ec8ab858fc8fd25520fc0cfe0fa2ee7734:round-3",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:33cb3c607a86088c6cbbfdc7b81ad7be7fec72735fb292a6cdaf4d9bcb9b2c96",
+      "definition": "selu_"
+    },
+    "implementation": {
+      "name": "kernelgen-candidate-selu_",
+      "definition": "selu_",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "# Copyright 2026 FlagOS Contributors\n# SPDX-License-Identifier: Apache-2.0\n# Host-side fast path: cache the compiled launcher primitives per input address and\n# invoke the generated launcher directly with the current bare address and stream.\n\"\"\"SELU in-place: minimal per-call host work, full stride support, dtype-sized UB blocks.\n\nPer call the fast path reads the current data pointer and the current stream, checks\ndtype/numel/contiguity against the cached specialization, then calls the compiled\nlauncher directly (no Tensor argument marshalling).  Inputs whose pointer is not\n16-byte aligned, masked tails, non-contiguous layouts, debug/profiling launches and\nany binding failure keep the ordinary Triton entry.\n\nLong enough contiguous tensors use a persistent grid-stride kernel: on this backend the\nper-program tile cost dominates the 16M cases, and one program per vector core with an\nin-program loop over dtype-sized tiles removes most of it (num_stages=1 keeps the tile\ninside the 192KiB UB budget).\n\"\"\"\nimport torch\nimport torch_npu\nimport triton\nimport triton.language as tl\n\n_BLOCK_MAX = 32768\n_BLOCK_MIN = 1024\n_BLOCK_TARGET_PROGRAMS = 8\n_BLOCK_STRIDED = 1024\n_PERSIST_MIN_TILES_PER_CORE = 4\n\n\n@triton.jit\ndef _selu_nomask(X, BLOCK: tl.constexpr):\n    \"\"\"numel % BLOCK == 0 (host-guarded), so the tail mask can be dropped.\"\"\"\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    x = tl.load(X + offs)\n    if X.dtype.element_ty == tl.float16:\n        y = 1.0507009873554805 * tl.where(x > 0, x, 1.6732632423543772 * (tl.exp(x) - 1.0))\n    else:\n        xf = x.to(tl.float32)\n        y = 1.0507009873554805 * tl.where(xf > 0, xf, 1.6732632423543772 * (tl.exp(xf) - 1.0))\n    tl.store(X + offs, y.to(X.dtype.element_ty))\n\n\n@triton.jit\ndef _selu_persist(X, TILES: tl.constexpr, G: tl.constexpr, BLOCK: tl.constexpr):\n    \"\"\"Exact cover: program p handles tiles p, p+G, p+2G, ... of a BLOCK-exact numel.\"\"\"\n    pid = tl.program_id(0)\n    for tile in range(pid, TILES, G):\n        offs = tile * BLOCK + tl.arange(0, BLOCK)\n        x = tl.load(X + offs)\n        if X.dtype.element_ty == tl.float16:\n            y = 1.0507009873554805 * tl.where(x > 0, x, 1.6732632423543772 * (tl.exp(x) - 1.0))\n        else:\n            xf = x.to(tl.float32)\n            y = 1.0507009873554805 * tl.where(xf > 0, xf, 1.6732632423543772 * (tl.exp(xf) - 1.0))\n        tl.store(X + offs, y.to(X.dtype.element_ty))\n\n\n@triton.jit\ndef _selu_masked(X, N, BLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < N\n    x = tl.load(X + offs, mask=mask)\n    if X.dtype.element_ty == tl.float16:\n        y = 1.0507009873554805 * tl.where(x > 0, x, 1.6732632423543772 * (tl.exp(x) - 1.0))\n    else:\n        xf = x.to(tl.float32)\n        y = 1.0507009873554805 * tl.where(xf > 0, xf, 1.6732632423543772 * (tl.exp(xf) - 1.0))\n    tl.store(X + offs, y.to(X.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _selu_strided(X, N: tl.constexpr, SHAPE: tl.constexpr, STRIDES: tl.constexpr, BLOCK: tl.constexpr):\n    \"\"\"Non-contiguous input: logical index -> storage offset, written in place.\"\"\"\n    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    remainder = index\n    offset = tl.full((BLOCK,), 0, tl.int64)\n    for axis in tl.static_range(len(SHAPE) - 1, -1, -1):\n        coord = remainder % SHAPE[axis]\n        remainder = remainder // SHAPE[axis]\n        offset += coord.to(tl.int64) * STRIDES[axis]\n    x = tl.load(X + offset, index < N, other=1)\n    if X.dtype.element_ty == tl.float16:\n        y = 1.0507009873554805 * tl.where(x > 0, x, 1.6732632423543772 * (tl.exp(x) - 1.0))\n    else:\n        xf = x.to(tl.float32)\n        y = 1.0507009873554805 * tl.where(xf > 0, xf, 1.6732632423543772 * (tl.exp(xf) - 1.0))\n    tl.store(X + offset, y.to(X.dtype.element_ty), index < N)\n\n\n_FAST = {}\n_fast_get = _FAST.get\n_STREAM = {}\n_CORES = {}\n\n\ndef _pick_block(n, dtype):\n    maximum = 16384 if dtype is torch.float16 else 8192\n    if n >= maximum * _BLOCK_TARGET_PROGRAMS:\n        return maximum\n    target = -(-n // _BLOCK_TARGET_PROGRAMS)\n    block = _BLOCK_MIN\n    while block < target:\n        block <<= 1\n    return min(block, maximum)\n\n\ndef _vector_cores(device):\n    \"\"\"Vector-core count for launch concurrency; queried on first use, never hard-coded per part.\"\"\"\n    key = -1 if device is None else device\n    count = _CORES.get(key)\n    if count:\n        return count\n    count = 0\n    try:\n        from triton.runtime import driver\n        props = driver.active.utils.get_device_properties(0 if device is None else device)\n        count = int(props.get('num_vectorcore') or 0)\n        if not count:\n            count = int(props.get('num_aicore') or 0) * 2\n    except Exception:\n        count = 0\n    if count <= 0:\n        count = 40\n    _CORES[key] = count\n    return count\n\n\ndef _resolve_stream(device):\n    \"\"\"Cheapest faithful current-stream accessor for this device, resolved once.\"\"\"\n    getter = _STREAM.get(device)\n    if getter is not None:\n        return getter\n    raw = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\n    if raw is not None:\n        try:\n            want = int(torch.npu.current_stream().npu_stream)\n            try:\n                if int(raw(device)) == want:\n                    getter = lambda: raw(device)\n            except TypeError:\n                if int(raw()) == want:\n                    getter = raw\n        except Exception:\n            getter = None\n    if getter is None:\n        from triton.runtime import driver\n        getter = lambda: driver.active.get_current_stream(device)\n    _STREAM[device] = getter\n    return getter\n\n\ndef _standard_launch(n, block, masked):\n    \"\"\"Ordinary Triton launch: no alignment assumption, safe for any pointer.\"\"\"\n    if masked:\n\n        def launch(X, ptr, n=n, block=block):\n            _selu_masked[triton.cdiv(n, block),](X, n, BLOCK=block)\n    else:\n\n        def launch(X, ptr, n=n, block=block):\n            _selu_nomask[n // block,](X, BLOCK=block)\n    return launch\n\n\ndef _make_entry(A, n):\n    \"\"\"(dtype, n, kind, call, grid, function, metadata, stream_getter).\n\n    kind 0 = unmasked tile grid, 1 = masked tail, 2 = persistent grid-stride,\n    -1 = fallback where index 3 is a plain launch callable.\n    \"\"\"\n    block = _pick_block(n, A.dtype)\n    masked = bool(n % block)\n    if A.data_ptr() & 15:\n        return (A.dtype, n, -1, _standard_launch(n, block, masked))\n    try:\n        if masked:\n            compiled = _selu_masked.warmup(A, n, BLOCK=block, grid=(1,))\n            grid = triton.cdiv(n, block)\n            kind = 1\n        else:\n            tiles = n // block\n            cores = _vector_cores(A.device.index)\n            kind = 0\n            grid = tiles\n            compiled = None\n            if cores and tiles >= _PERSIST_MIN_TILES_PER_CORE * cores:\n                try:\n                    compiled = _selu_persist.warmup(\n                        A, TILES=tiles, G=cores, BLOCK=block, grid=(1,), num_stages=1)\n                    kind = 2\n                    grid = cores\n                except Exception:\n                    compiled = None\n            if compiled is None:\n                compiled = _selu_nomask.warmup(A, BLOCK=block, grid=(1,))\n        launcher = compiled.run\n        if (getattr(launcher, 'compile_only', False)\n                or getattr(launcher, 'enable_msprof_register_tensor', False)\n                or getattr(launcher.metadata, 'debug_enabled', False)\n                or getattr(launcher.metadata, 'debug', False)):\n            return (A.dtype, n, -1, _standard_launch(n, block, masked))\n        call = launcher.launch\n        function = compiled.function\n        metadata = compiled.packed_metadata\n        stream = _resolve_stream(A.device.index)\n    except Exception:\n        return (A.dtype, n, -1, _standard_launch(n, block, masked))\n    return (A.dtype, n, kind, call, grid, function, metadata, stream)\n\n\ndef _dispatch(A, ptr):\n    n = A.numel()\n    if n == 0:\n        return A\n    if not A.is_contiguous():\n        _selu_strided[triton.cdiv(n, _BLOCK_STRIDED),](\n            A, n, tuple(A.shape), tuple(A.stride()), BLOCK=_BLOCK_STRIDED)\n        return A\n    entry = _make_entry(A, n)\n    _FAST[ptr] = entry\n    kind = entry[2]\n    if kind == 0:\n        entry[3](entry[4], 1, 1, entry[7](), entry[5], entry[6],\n                 None, None, None, ptr, None)\n    elif kind == 1:\n        entry[3](entry[4], 1, 1, entry[7](), entry[5], entry[6],\n                 None, None, None, ptr, n, None)\n    elif kind == 2:\n        entry[3](entry[4], 1, 1, entry[7](), entry[5], entry[6],\n                 None, None, None, ptr, None, None, None)\n    else:\n        entry[3](A, ptr)\n    return A\n\n\ndef run(A):\n    ptr = A.data_ptr()\n    entry = _fast_get(ptr)\n    if entry is not None and A.is_contiguous() and A.numel() == entry[1] and A.dtype is entry[0]:\n        kind = entry[2]\n        if kind == 0:\n            entry[3](entry[4], 1, 1, entry[7](), entry[5], entry[6],\n                     None, None, None, ptr, None)\n        elif kind == 1:\n            entry[3](entry[4], 1, 1, entry[7](), entry[5], entry[6],\n                     None, None, None, ptr, A.numel(), None)\n        elif kind == 2:\n            entry[3](entry[4], 1, 1, entry[7](), entry[5], entry[6],\n                     None, None, None, ptr, None, None, None)\n        else:\n            entry[3](A, ptr)\n        return A\n    return _dispatch(A, ptr)\n"
+        }
+      ]
+    },
+    "benchmark_fingerprint": "sha256:61d405aa07da0579eeecd4f4dc7b5079d9b978d5b7904e64e85232d8c50fe3d7",
+    "case_id": "selu_-timing-3",
+    "expected_backend": "npu",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "identity": {
+      "solution_sha256": "9beeae21e3eeb44e3b18e11e3061ad7424743cabd8d003736bd4806251c8441a",
+      "workload_sha256": "833269eac52a62327806fa81c9818873756d2cca99d6d4a9b490b527e4f22196"
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "profile_id": "9492e6ccc5694c63a90b4a92e6f384ca",
+    "created_at": "2026-10-22T16:01:27.215229+00:00",
+    "status": "failed",
+    "backend": "npu",
+    "profiler": "msprof",
+    "device": "npu:0",
+    "hardware": {
+      "target": {
+        "backend": "ascend",
+        "vendor": "huawei",
+        "device": "Ascend910B4-1",
+        "architecture": "dav-c220-cube",
+        "devices": [
+          {
+            "logical_device": "npu:0",
+            "device_id": 0,
+            "name": "Ascend910B4-1",
+            "l2_cache_size": 176160768,
+            "num_sm": 20,
+            "compute_capability": "",
+            "total_memory": 65452113920
+          }
+        ]
+      },
+      "software": {
+        "language": "triton",
+        "language_version": "3.5.1",
+        "compiler": "flagtree",
+        "compiler_version": "0.6.0+ascend.gitc286cba6",
+        "runtime": "cann",
+        "runtime_version": "9.0.0",
+        "driver_version": "25.2.0"
+      },
+      "metadata": {
+        "complete": true,
+        "missing": [],
+        "sources": {
+          "target.backend": "server configuration",
+          "target.vendor": "server configuration",
+          "software.language": "server configuration",
+          "software.compiler": "python package metadata",
+          "software.runtime": "server configuration",
+          "target.device": "device probe",
+          "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+          "software.language_version": "triton module metadata",
+          "software.compiler_version": "python package metadata",
+          "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+          "software.driver_version": "/usr/local/Ascend/driver/version.info"
+        }
+      }
+    },
+    "evaluation_id": "3344507a461314e4658315511094d2ec8ab858fc8fd25520fc0cfe0fa2ee7734:round-3",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "capabilities": [],
+    "summary": {
+      "stage_count": 1
+    },
+    "metrics": {},
+    "artifacts": [],
+    "warnings": [],
+    "error": "msprof base collection exited successfully without profile completion marker",
+    "workload_uuid": "selu_-timing-3"
+  }
+}

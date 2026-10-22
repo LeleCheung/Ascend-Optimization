@@ -1,0 +1,67 @@
+{
+  "subject_sha256": "0e782a69158783eb900458c93ca3531737ecaa2579739621ffcc9b3415ac7622",
+  "policy": "advisory",
+  "summary": "Reviewed the selu_ candidate (.best_kernel.py == the round-3 solution sha256 0e782a69… in .ledger.json and optimize_definition_output.json) against the supplied catalog (definition/oracle/correctness/timing) and the measurement receipts. The math (scale=1.0507009873554805, alpha=1.6732632423543772, fp32 intermediate for non-fp16, in-place write, returns A) matches torch.selu_ semantics; the oracle is independent of the candidate and there is no torch.ops/fallback computation, no host synchronisation in the hot path, and no test-specific shapes/values. The main risks are (a) the dispatch branches that dominate the measured geo_mean (unmasked tile kernel kind 0 and persistent grid-stride kernel kind 2) are never exercised by any correctness workload, whose shapes are all masked/early-return/strided, while timing workloads are never output-checked; (b) the pointer-keyed direct-launcher fast path ignores the device, grows without bound, and depends on an undocumented positional launcher ABI with inconsistent trailing argument counts and no launch-time fallback; (c) int32 index arithmetic caps the kernels below 2^31 elements and every non-fp16 dtype is forced through a float32 intermediate, which would silently degrade float64 input (uncovered by the catalog). Correctness within the covered paths (masked tail, strided, empty, n=1) is consistent: all 24 correctness workloads passed in the ledger with errors inside the catalog tolerances. Findings are advisory per the code-review policy.",
+  "reviewed_files": [
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/selu_-endurance-20261022-attempt-2/stages/optimize/work/optimize_definition_output.json",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/selu_-endurance-20261022-attempt-2/stages/optimize/work/.ledger.json",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/selu_-endurance-20261022-attempt-2/stages/optimize/work/.best_kernel.py",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/selu_-endurance-20261022-attempt-2/stages/prepare_catalog/attempts/01/catalog/manifest.json",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/selu_-endurance-20261022-attempt-2/stages/prepare_catalog/attempts/01/catalog/ops/selu_/correctness.jsonl",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/selu_-endurance-20261022-attempt-2/stages/prepare_catalog/attempts/01/catalog/ops/selu_/definition.json",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/selu_-endurance-20261022-attempt-2/stages/prepare_catalog/attempts/01/catalog/ops/selu_/oracle.py",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/selu_-endurance-20261022-attempt-2/stages/prepare_catalog/attempts/01/catalog/ops/selu_/timing.jsonl",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/selu_-endurance-20261022-attempt-2/stages/prepare_catalog/attempts/01/evaluation-contract.json",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/selu_-endurance-20261022-attempt-2/stages/review_tests/attempts/01/review.json",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/selu_-endurance-20261022-attempt-2/stages/review_tests/attempts/01/preflight.json",
+    "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/selu_-endurance-20261022-attempt-2/stages/review_tests/attempts/01/evaluate.json"
+  ],
+  "findings": [
+    {
+      "priority": "P0",
+      "category": "test_contract",
+      "evidence": "correctness.jsonl:1-24 (also evaluation-contract.json:32-471) contains only shapes [0], [1], [1025], [7,9] for float16/bfloat16/float32 with strided true/false. In .best_kernel.py the dispatch resolves every one of these to an early return or to masked/strided code: n==0 returns at :215-216; _pick_block (:98-106) yields block=1024 for n in {1,63,1025}, so masked=bool(n%block) is true at :174 and kind 1 (_selu_masked, :59-70) is chosen at :178-181; strided cases take _selu_strided at :217-220. Consequently the unmasked tile kernel kind 0 (_selu_nomask, :30-41, selected at :196-197) and the persistent grid-stride kernel kind 2 (_selu_persist, :44-56, selected at :188-195) are never executed under a correctness workload. The timed shapes do reach them — timing.jsonl:1-12 has 1024/65536/1048576/4096x4096, and for n=1024 _pick_block returns 1024 with tiles=1 (kind 0) while 4096x4096 gives tiles=1024 >= 4*cores (kind 2) — yet evaluate.json:357-523 and .ledger.json:1805-1947 record abs_err=null/matched_ratio=null for every timing workload, i.e. timing outputs are never compared to the reference. The round-3 gain that carries the reported geo_mean (timing-3 1.250->1.359, timing-7 0.710->0.783, timing-11 0.598->0.677, .ledger.json:2397-2405) is therefore produced entirely by numerically unverified kernel paths.",
+      "reason": "The measured implementation paths (direct-launcher + unmasked tile grid and persistent grid-stride kernels) are validated only for absence of a crash, never for values; the only value-checked paths are the masked tail, the strided kernel and the n==0 early return. Static inspection shows the SELU expression is copied identically in all four kernels, so the residual risk is in the non-obvious parts: tile->offset cover in _selu_persist (:48-49, offs = tile*BLOCK+arange with TILES=n//block), grid/pointer binding through the hand-built launcher call (:243-251), and the persistent branch's extra trailing arguments (see the ABI finding). None of these are established wrong — they are simply unverified by the supplied evidence, which is a candidate-validation gap rather than a demonstrated defect.",
+      "requested_change": "Make the optimized branches numerically checkable before their speedups are credited: either add a correctness shape whose numel is an exact multiple of the block size (for example 16384 float16 / 8192 float32 elements, contiguous) so kind 0 and kind 2 are compared against the oracle, or have the harness compare outputs on the timing workloads (the timing_tolerance is already present in timing.jsonl). Until then treat the reported geo_mean as an upper bound measured on unvalidated kernel paths."
+    },
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:92-95 declares `_FAST` keyed by the raw data pointer only, and :238-241 accepts a cached entry after checking `A.is_contiguous()`, `A.numel() == entry[1]` and `A.dtype is entry[0]` — the device index is not part of the key and is not re-checked. The entry stores the stream getter resolved for the original tensor's device (:207, `_resolve_stream(A.device.index)`), and :244-251 launch with `entry[7]()`.",
+      "reason": "Two tensors on different devices can receive the same virtual address from their respective allocators; such a collision would satisfy the contiguity/numel/dtype test and launch a kernel using the other device's stream getter, writing through a pointer that belongs to a different device's address space. The harness currently uses npu:0 only, so this is a latent multi-device correctness hazard rather than an observed failure.",
+      "requested_change": "Include the device index in the cache key (or store `A.device.index` in the entry and require it to match in `run`) and resolve the stream from the entry's validated device."
+    },
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:221-222: `entry = _make_entry(A, n); _FAST[ptr] = entry` — a new entry is inserted for every previously unseen `data_ptr`, and nothing ever evicts. Each entry holds a compiled launcher reference, `compiled.function`, `packed_metadata` and a stream getter (:204-207).",
+      "reason": "A long-lived process (or the harness's repeated allocations with varying shapes) accumulates one entry per distinct address forever; the dict retains compiled-kernel handles and metadata long after the tensor is freed, which leaks host memory and keeps per-specialization resources alive. Correctness is unaffected, but the cache is unbounded and pointer-keyed entries can never be reclaimed.",
+      "requested_change": "Bound the cache (LRU/size cap) and/or key it by a stable specialization key (dtype, block, kind, device) plus the current pointer at call time, so entries do not accumulate per allocation."
+    },
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:243-251: the cached branch passes `ptr` followed by `None` (kind 0), `A.numel()` + `None` (kind 1) and `None, None, None` (kind 2) after the nine fixed launcher slots (`entry[4], 1, 1, entry[7](), entry[5], entry[6], None, None, None`). The kernels' runtime parameter counts are 1 (`_selu_nomask`, :31), 2 (`_selu_masked`, :60) and 1 (`_selu_persist`, :45, TILES/G/BLOCK are constexpr), so the number of trailing slots differs between branches for kernels of identical arity, and the positional layout of the generated npu launcher is nowhere established in the supplied evidence. The direct call is also outside any try/except: only entry construction (:177-209) is guarded, so a binding mismatch at launch time raises out of `run` instead of using the documented ordinary Triton entry (:154-164).",
+      "reason": "The hot path depends on a private, version-specific positional ABI (grid, stream, function, packed metadata, trailing slots, raw integer address) with unevidenced arity, and the degradation path promised by the module docstring ('any binding failure keeps the ordinary Triton entry', :9-11) does not cover failures that occur at launch rather than at warmup. On the pinned build the launches evidently succeed (all 36 workloads ran), so this is a robustness/portability risk, not a demonstrated ABI defect.",
+      "requested_change": "Normalize the direct call to exactly the launcher's declared parameters per kernel (no inconsistent trailing slots), derive the arity from the compiled object rather than hard-coding it, and wrap the first direct launch in a try/except that falls back to `_standard_launch` so a build- or profiling-induced binding change degrades instead of raising."
+    },
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:34, :49, :62, :76: `offs = pid * BLOCK + tl.arange(0, BLOCK)` and `index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)` are int32 expressions, and the element offsets are used directly as pointer offsets in `tl.load`/`tl.store`.",
+      "reason": "For numel >= 2^31 the index arithmetic wraps and the kernels write to wrong/duplicated offsets, whereas torch.selu_ imposes no such limit. The supplied cases top out at 16M elements, so this is untested scope, but the limit is factual in the code and would silently corrupt data rather than fail loudly at sizes the reference supports.",
+      "requested_change": "Compute tile base offsets in int64 (e.g. cast `pid`/`tile` to tl.int64 before `* BLOCK`) or explicitly document and enforce the < 2^31 constraint on the fast path."
+    },
+    {
+      "priority": "P1",
+      "category": "source_quality",
+      "evidence": "correctness.jsonl:1-24 and timing.jsonl:1-12 cover only float16, bfloat16 and float32. The kernels upcast every non-float16 element to float32 before computing (.best_kernel.py:39-40, :54-55, :68-69, :87-88) and cast back at :41/:56/:70/:89, while the operator contract (definition.json:4-21) and the reference (oracle.py:71-76, torch.selu_) accept any floating dtype, including float64.",
+      "reason": "float64 input would be silently computed in float32 and rounded back to float64, losing ~7 decimal digits relative to the reference; the catalog has no case that would expose it, so this is a coverage limitation inherited from the source case list combined with a candidate specialization, not a failure of any supplied workload.",
+      "requested_change": "For the source tests: note that float64 is untested in the catalog. For the candidate: add a float64 branch that keeps the fp64 intermediate (or document/guard the fp32 intermediate as the intended contract for this operator) so unsupported-precision input cannot be silently downgraded."
+    }
+  ],
+  "blocker": null,
+  "missing_dependencies": [
+    "Native benchmark/timing harness (the adapter that invokes the candidate's `run` and computes reference_latency_ms/geo_mean, referenced by evaluation-contract.json:682-683 and preflight.json:8, e.g. benchmark/base.py) is not among the supplied evidence_paths; baseline separation can be checked only from the reference_latency_ms values in the contract and ledger, not from the harness source."
+  ]
+}

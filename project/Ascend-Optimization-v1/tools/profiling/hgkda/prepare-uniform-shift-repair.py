@@ -26,13 +26,20 @@ def prepare(parent,output):
         function=function.replace(old,new)
         text=''.join(lines[:begin])+function+''.join(lines[following:])
         tree=ast.parse(text)
+    old='    c1 = c1 + (new_c0 < c0).to(tl.uint32)'
+    new='''    carry_bits = (c0 & lane) | ((c0 | lane) & ~new_c0)
+    carry = ((carry_bits.to(tl.int32, bitcast=True) >> 31) & 1).to(tl.uint32)
+    c1 = c1 + carry'''
+    if text.count(old)!=1:raise ValueError('counter进位结构不同')
+    text=text.replace(old,new)
+    tree=ast.parse(text)
     after={n.name:ast.dump(n,include_attributes=False) for n in tree.body if isinstance(n,ast.FunctionDef)}
     changed={name for name in functions if functions[name]!=after.get(name)}
-    if set(functions)!=set(after) or changed!={'_mul_hi_lo'}:raise ValueError('修改超出已登记整数拆分函数')
+    if set(functions)!=set(after) or changed!={'_mul_hi_lo','uniform_kernel'}:raise ValueError('修改超出已登记整数拆分与counter进位函数')
     output.parent.mkdir(parents=True,exist_ok=True);output.write_bytes(text.encode('utf-8'))
     proof=dict(parent=str(parent),parent_sha256=hashlib.sha256(parent.read_bytes()).hexdigest(),
                source=str(output),source_sha256=hashlib.sha256(output.read_bytes()).hexdigest(),
-               changed_functions=sorted(changed),contribution='Codex根据64组设备整数原语反例，显式signed shift+mask绕过逻辑右移错误；CC原分块与启动方案保持。尚须逐位设备核验、原门禁与一次完整KGS。')
+               changed_functions=sorted(changed),contribution='Codex根据64组设备整数原语反例，显式signed shift+mask绕过逻辑右移错误，bitwise carry避免无符号比较触发不支持的uint64转换；CC原分块与启动方案保持。尚须逐位设备核验、原门禁与一次完整KGS。')
     output.with_suffix('.provenance.json').write_text(json.dumps(proof,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')
     return proof
 

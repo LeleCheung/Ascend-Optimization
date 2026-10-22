@@ -1,0 +1,217 @@
+{
+  "definition_name": "selu_",
+  "op_type": "",
+  "status": "PASSED",
+  "best_geo_mean": 0.9051538258659729,
+  "best_code": "# Copyright 2026 FlagOS Contributors\n# SPDX-License-Identifier: Apache-2.0\n# Host-side fast path: cache the compiled launcher primitives per input address and\n# invoke the generated launcher directly with the current bare address and stream.\n\"\"\"SELU in-place: minimal per-call host work, full stride support, dtype-sized UB blocks.\n\nPer call the fast path reads the current data pointer and the current stream, checks\ndtype/numel/contiguity against the cached specialization, then calls the compiled\nlauncher directly (no Tensor argument marshalling).  Inputs whose pointer is not\n16-byte aligned, masked tails, non-contiguous layouts, debug/profiling launches and\nany binding failure keep the ordinary Triton entry.\n\nLong enough contiguous tensors use a persistent grid-stride kernel: on this backend the\nper-program tile cost dominates the 16M cases, and one program per vector core with an\nin-program loop over dtype-sized tiles removes most of it (num_stages=1 keeps the tile\ninside the 192KiB UB budget).\n\"\"\"\nimport torch\nimport torch_npu\nimport triton\nimport triton.language as tl\n\n_BLOCK_MAX = 32768\n_BLOCK_MIN = 1024\n_BLOCK_TARGET_PROGRAMS = 8\n_BLOCK_STRIDED = 1024\n_PERSIST_MIN_TILES_PER_CORE = 4\n\n\n@triton.jit\ndef _selu_nomask(X, BLOCK: tl.constexpr):\n    \"\"\"numel % BLOCK == 0 (host-guarded), so the tail mask can be dropped.\"\"\"\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    x = tl.load(X + offs)\n    if X.dtype.element_ty == tl.float16:\n        y = 1.0507009873554805 * tl.where(x > 0, x, 1.6732632423543772 * (tl.exp(x) - 1.0))\n    else:\n        xf = x.to(tl.float32)\n        y = 1.0507009873554805 * tl.where(xf > 0, xf, 1.6732632423543772 * (tl.exp(xf) - 1.0))\n    tl.store(X + offs, y.to(X.dtype.element_ty))\n\n\n@triton.jit\ndef _selu_persist(X, TILES: tl.constexpr, G: tl.constexpr, BLOCK: tl.constexpr):\n    \"\"\"Exact cover: program p handles tiles p, p+G, p+2G, ... of a BLOCK-exact numel.\"\"\"\n    pid = tl.program_id(0)\n    for tile in range(pid, TILES, G):\n        offs = tile * BLOCK + tl.arange(0, BLOCK)\n        x = tl.load(X + offs)\n        if X.dtype.element_ty == tl.float16:\n            y = 1.0507009873554805 * tl.where(x > 0, x, 1.6732632423543772 * (tl.exp(x) - 1.0))\n        else:\n            xf = x.to(tl.float32)\n            y = 1.0507009873554805 * tl.where(xf > 0, xf, 1.6732632423543772 * (tl.exp(xf) - 1.0))\n        tl.store(X + offs, y.to(X.dtype.element_ty))\n\n\n@triton.jit\ndef _selu_masked(X, N, BLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < N\n    x = tl.load(X + offs, mask=mask)\n    if X.dtype.element_ty == tl.float16:\n        y = 1.0507009873554805 * tl.where(x > 0, x, 1.6732632423543772 * (tl.exp(x) - 1.0))\n    else:\n        xf = x.to(tl.float32)\n        y = 1.0507009873554805 * tl.where(xf > 0, xf, 1.6732632423543772 * (tl.exp(xf) - 1.0))\n    tl.store(X + offs, y.to(X.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _selu_strided(X, N: tl.constexpr, SHAPE: tl.constexpr, STRIDES: tl.constexpr, BLOCK: tl.constexpr):\n    \"\"\"Non-contiguous input: logical index -> storage offset, written in place.\"\"\"\n    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    remainder = index\n    offset = tl.full((BLOCK,), 0, tl.int64)\n    for axis in tl.static_range(len(SHAPE) - 1, -1, -1):\n        coord = remainder % SHAPE[axis]\n        remainder = remainder // SHAPE[axis]\n        offset += coord.to(tl.int64) * STRIDES[axis]\n    x = tl.load(X + offset, index < N, other=1)\n    if X.dtype.element_ty == tl.float16:\n        y = 1.0507009873554805 * tl.where(x > 0, x, 1.6732632423543772 * (tl.exp(x) - 1.0))\n    else:\n        xf = x.to(tl.float32)\n        y = 1.0507009873554805 * tl.where(xf > 0, xf, 1.6732632423543772 * (tl.exp(xf) - 1.0))\n    tl.store(X + offset, y.to(X.dtype.element_ty), index < N)\n\n\n_FAST = {}\n_fast_get = _FAST.get\n_STREAM = {}\n_CORES = {}\n\n\ndef _pick_block(n, dtype):\n    maximum = 16384 if dtype is torch.float16 else 8192\n    if n >= maximum * _BLOCK_TARGET_PROGRAMS:\n        return maximum\n    target = -(-n // _BLOCK_TARGET_PROGRAMS)\n    block = _BLOCK_MIN\n    while block < target:\n        block <<= 1\n    return min(block, maximum)\n\n\ndef _vector_cores(device):\n    \"\"\"Vector-core count for launch concurrency; queried on first use, never hard-coded per part.\"\"\"\n    key = -1 if device is None else device\n    count = _CORES.get(key)\n    if count:\n        return count\n    count = 0\n    try:\n        from triton.runtime import driver\n        props = driver.active.utils.get_device_properties(0 if device is None else device)\n        count = int(props.get('num_vectorcore') or 0)\n        if not count:\n            count = int(props.get('num_aicore') or 0) * 2\n    except Exception:\n        count = 0\n    if count <= 0:\n        count = 40\n    _CORES[key] = count\n    return count\n\n\ndef _resolve_stream(device):\n    \"\"\"Cheapest faithful current-stream accessor for this device, resolved once.\"\"\"\n    getter = _STREAM.get(device)\n    if getter is not None:\n        return getter\n    raw = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\n    if raw is not None:\n        try:\n            want = int(torch.npu.current_stream().npu_stream)\n            try:\n                if int(raw(device)) == want:\n                    getter = lambda: raw(device)\n            except TypeError:\n                if int(raw()) == want:\n                    getter = raw\n        except Exception:\n            getter = None\n    if getter is None:\n        from triton.runtime import driver\n        getter = lambda: driver.active.get_current_stream(device)\n    _STREAM[device] = getter\n    return getter\n\n\ndef _standard_launch(n, block, masked):\n    \"\"\"Ordinary Triton launch: no alignment assumption, safe for any pointer.\"\"\"\n    if masked:\n\n        def launch(X, ptr, n=n, block=block):\n            _selu_masked[triton.cdiv(n, block),](X, n, BLOCK=block)\n    else:\n\n        def launch(X, ptr, n=n, block=block):\n            _selu_nomask[n // block,](X, BLOCK=block)\n    return launch\n\n\ndef _make_entry(A, n):\n    \"\"\"(dtype, n, kind, call, grid, function, metadata, stream_getter).\n\n    kind 0 = unmasked tile grid, 1 = masked tail, 2 = persistent grid-stride,\n    -1 = fallback where index 3 is a plain launch callable.\n    \"\"\"\n    block = _pick_block(n, A.dtype)\n    masked = bool(n % block)\n    if A.data_ptr() & 15:\n        return (A.dtype, n, -1, _standard_launch(n, block, masked))\n    try:\n        if masked:\n            compiled = _selu_masked.warmup(A, n, BLOCK=block, grid=(1,))\n            grid = triton.cdiv(n, block)\n            kind = 1\n        else:\n            tiles = n // block\n            cores = _vector_cores(A.device.index)\n            kind = 0\n            grid = tiles\n            compiled = None\n            if cores and tiles >= _PERSIST_MIN_TILES_PER_CORE * cores:\n                try:\n                    compiled = _selu_persist.warmup(\n                        A, TILES=tiles, G=cores, BLOCK=block, grid=(1,), num_stages=1)\n                    kind = 2\n                    grid = cores\n                except Exception:\n                    compiled = None\n            if compiled is None:\n                compiled = _selu_nomask.warmup(A, BLOCK=block, grid=(1,))\n        launcher = compiled.run\n        if (getattr(launcher, 'compile_only', False)\n                or getattr(launcher, 'enable_msprof_register_tensor', False)\n                or getattr(launcher.metadata, 'debug_enabled', False)\n                or getattr(launcher.metadata, 'debug', False)):\n            return (A.dtype, n, -1, _standard_launch(n, block, masked))\n        call = launcher.launch\n        function = compiled.function\n        metadata = compiled.packed_metadata\n        stream = _resolve_stream(A.device.index)\n    except Exception:\n        return (A.dtype, n, -1, _standard_launch(n, block, masked))\n    return (A.dtype, n, kind, call, grid, function, metadata, stream)\n\n\ndef _dispatch(A, ptr):\n    n = A.numel()\n    if n == 0:\n        return A\n    if not A.is_contiguous():\n        _selu_strided[triton.cdiv(n, _BLOCK_STRIDED),](\n            A, n, tuple(A.shape), tuple(A.stride()), BLOCK=_BLOCK_STRIDED)\n        return A\n    entry = _make_entry(A, n)\n    _FAST[ptr] = entry\n    kind = entry[2]\n    if kind == 0:\n        entry[3](entry[4], 1, 1, entry[7](), entry[5], entry[6],\n                 None, None, None, ptr, None)\n    elif kind == 1:\n        entry[3](entry[4], 1, 1, entry[7](), entry[5], entry[6],\n                 None, None, None, ptr, n, None)\n    elif kind == 2:\n        entry[3](entry[4], 1, 1, entry[7](), entry[5], entry[6],\n                 None, None, None, ptr, None, None, None)\n    else:\n        entry[3](A, ptr)\n    return A\n\n\ndef run(A):\n    ptr = A.data_ptr()\n    entry = _fast_get(ptr)\n    if entry is not None and A.is_contiguous() and A.numel() == entry[1] and A.dtype is entry[0]:\n        kind = entry[2]\n        if kind == 0:\n            entry[3](entry[4], 1, 1, entry[7](), entry[5], entry[6],\n                     None, None, None, ptr, None)\n        elif kind == 1:\n            entry[3](entry[4], 1, 1, entry[7](), entry[5], entry[6],\n                     None, None, None, ptr, A.numel(), None)\n        elif kind == 2:\n            entry[3](entry[4], 1, 1, entry[7](), entry[5], entry[6],\n                     None, None, None, ptr, None, None, None)\n        else:\n            entry[3](A, ptr)\n        return A\n    return _dispatch(A, ptr)\n",
+  "search_best_geo_mean": 0.8870867172659556,
+  "final_verification": {
+    "status": "PASSED",
+    "reason_code": "VERIFIED",
+    "geo_mean": 0.9051538258659729,
+    "measured_geo_mean": 0.9051538258659729,
+    "comparisons": [
+      {
+        "uuid": "selu_-timing-0",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011278219134781732,
+          "latency_ms": 0.012933768808173684
+        },
+        "after": {
+          "reference_latency_ms": 0.013651567181607769,
+          "latency_ms": 0.014966761090815702
+        },
+        "ratios": {
+          "reference_latency_ms": 1.2104364189472692,
+          "latency_ms": 1.157184832417697
+        }
+      },
+      {
+        "uuid": "selu_-timing-1",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011389394939908213,
+          "latency_ms": 0.012862688655679076
+        },
+        "after": {
+          "reference_latency_ms": 0.014168291098685162,
+          "latency_ms": 0.014852841973441533
+        },
+        "ratios": {
+          "reference_latency_ms": 1.243989796950473,
+          "latency_ms": 1.1547229643068266
+        }
+      },
+      {
+        "uuid": "selu_-timing-2",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011222862456716803,
+          "latency_ms": 0.013055227918918298
+        },
+        "after": {
+          "reference_latency_ms": 0.013634360884503613,
+          "latency_ms": 0.014986599281291882
+        },
+        "ratios": {
+          "reference_latency_ms": 1.2148737398401905,
+          "latency_ms": 1.1479385403585975
+        }
+      },
+      {
+        "uuid": "selu_-timing-3",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.056918489931453486,
+          "latency_ms": 0.041877505301115524
+        },
+        "after": {
+          "reference_latency_ms": 0.057025915948925456,
+          "latency_ms": 0.041730110732425996
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0018873659087115,
+          "latency_ms": 0.9964803402774424
+        }
+      },
+      {
+        "uuid": "selu_-timing-4",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011568829146654589,
+          "latency_ms": 0.012808392288700732
+        },
+        "after": {
+          "reference_latency_ms": 0.01364910397435951,
+          "latency_ms": 0.015228957425704558
+        },
+        "ratios": {
+          "reference_latency_ms": 1.1798172314011988,
+          "latency_ms": 1.1889827452536095
+        }
+      },
+      {
+        "uuid": "selu_-timing-5",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011792855964522876,
+          "latency_ms": 0.012526622985219884
+        },
+        "after": {
+          "reference_latency_ms": 0.013734235087231912,
+          "latency_ms": 0.015895418630759345
+        },
+        "ratios": {
+          "reference_latency_ms": 1.1646233218271635,
+          "latency_ms": 1.2689308722322281
+        }
+      },
+      {
+        "uuid": "selu_-timing-6",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011307545355322413,
+          "latency_ms": 0.012246548446793659
+        },
+        "after": {
+          "reference_latency_ms": 0.013977146869312838,
+          "latency_ms": 0.016477904232813177
+        },
+        "ratios": {
+          "reference_latency_ms": 1.236090276899385,
+          "latency_ms": 1.3455141507342303
+        }
+      },
+      {
+        "uuid": "selu_-timing-7",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.05912856603828743,
+          "latency_ms": 0.0755067570531119
+        },
+        "after": {
+          "reference_latency_ms": 0.0589951851489891,
+          "latency_ms": 0.07515924117836685
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9977442224928648,
+          "latency_ms": 0.9953975526388903
+        }
+      },
+      {
+        "uuid": "selu_-timing-8",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.009550403267123265,
+          "latency_ms": 0.011582960045711433
+        },
+        "after": {
+          "reference_latency_ms": 0.01317050291509328,
+          "latency_ms": 0.014397454149706128
+        },
+        "ratios": {
+          "reference_latency_ms": 1.379052019764653,
+          "latency_ms": 1.2429857387824415
+        }
+      },
+      {
+        "uuid": "selu_-timing-9",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.01066591021468706,
+          "latency_ms": 0.011765984445109573
+        },
+        "after": {
+          "reference_latency_ms": 0.013916229154979422,
+          "latency_ms": 0.014890466163342405
+        },
+        "ratios": {
+          "reference_latency_ms": 1.3047390119426134,
+          "latency_ms": 1.2655520864241407
+        }
+      },
+      {
+        "uuid": "selu_-timing-10",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011116053647628276,
+          "latency_ms": 0.013134901197609558
+        },
+        "after": {
+          "reference_latency_ms": 0.013590658864348912,
+          "latency_ms": 0.014538547349734357
+        },
+        "ratios": {
+          "reference_latency_ms": 1.2226154438584071,
+          "latency_ms": 1.1068638531046013
+        }
+      },
+      {
+        "uuid": "selu_-timing-11",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.04931837925257185,
+          "latency_ms": 0.0728674420994654
+        },
+        "after": {
+          "reference_latency_ms": 0.049312911089436993,
+          "latency_ms": 0.07267342062730216
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9998891252466581,
+          "latency_ms": 0.9973373365858185
+        }
+      }
+    ],
+    "drift": [],
+    "drift_factor": 2.0,
+    "compared_to": "original_round",
+    "attempt_path": ".kernelgen/retests/0e782a69158783eb900458c93ca3531737ecaa2579739621ffcc9b3415ac7622/fae56c03205087b05ae0e960ff84d7f48476a85e4d35f2e49364ed0a3d2806be/attempt-0001.json",
+    "round_num": 3,
+    "solution_sha256": "0e782a69158783eb900458c93ca3531737ecaa2579739621ffcc9b3415ac7622"
+  },
+  "rounds": 3,
+  "summary": "Three measured rounds took selu_ from 0.7527x to 0.8871x geo_mean against the PyTorch reference, with all 36 workloads passing. The winning architecture combines a bare-integer-address host fast path that calls the compiled launcher from a single frame (nine launch-bound cases 18.5us -> 12.8us) with a persistent grid-stride kernel at one program per queried vector core for long contiguous tensors (fp16 16M 1.25x -> 1.36x, bf16 0.71x -> 0.78x, fp32 0.60x -> 0.68x). The key lesson from on-target probes is that the large cases were bound by per-program tile overhead, not by exp arithmetic (a same-tile copy cost 78us of 83us, and exp2/fp16-negative variants were slower or UB-infeasible), while the small cases were bound by host Python, not by the 9.4us compiled launch floor.",
+  "workspace": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/selu_-endurance-20261022-attempt-2/stages/optimize/work"
+}

@@ -1,0 +1,35 @@
+{
+  "bench": {
+    "jit_full_us": 53.33078637098273,
+    "npu_launcher_call_us": 15.065913321450353,
+    "c_launch_direct_us": 12.920846541722616,
+    "c_launch_intptr_us": 7.802940284212431,
+    "ref_tight_us": 11.347343291466434,
+    "noop_us": 0.14193356037139893,
+    "proto_us": 22.1099234962215,
+    "big16M_us": {
+      "raw_blk8192": 78.91339870790641,
+      "raw_blk16384": 41.56303281585375,
+      "raw_blk32768": 29.682364159574114,
+      "ref_16M_tight": 19.2393665201962
+    },
+    "big16M_fp32_us": {
+      "raw_blk8192": 77.27173312256733,
+      "raw_blk16384": 42.16136488442619,
+      "raw_blk32768": 32.75769995525479,
+      "ref_16M_tight": 30.63736561064919
+    }
+  },
+  "errors": {},
+  "src": {
+    "driver.get_current_stream": "    def get_current_stream(self, device: Optional[int] = None) -> int:\n        \"\"\"\n        Get stream for current device\n        \"\"\"\n        # According to torch_npu, the content of a torch.npu.Stream is essentilly an rtStream_t\n        # TODO: use CANN API instead of torchnpu\n        return get_backend_func(\"get_current_stream\", device)\n\n",
+    "driver.make_launcher": "def make_launcher(constants, signature, metadata):\n    import os\n    workspace_size = int(metadata.workspace_size) \\\n                          if hasattr(metadata, 'workspace_size') else -1\n    lock_init_value = int(metadata.lock_init_value) \\\n                          if hasattr(metadata, 'lock_init_value') else 0\n    lock_num = int(metadata.lock_num) \\\n                          if hasattr(metadata, 'lock_num') else -1\n    bs_task_type = metadata.bs_task_type if hasattr(metadata, 'bs_task_type') else 0\n    mix_mode = metadata.mix_mode\n    compile_on_910_95 = metadata.compile_on_910_95\n    parallel_mode = metadata.parallel_mode\n    enable_simt = (\"simt\" in parallel_mode) or metadata.force_simt_only\n\n",
+    "driver.make_npu_launcher_stub": "def make_npu_launcher_stub(header_src, wrapper_src, debug=False):\n    \"\"\"\n    Generate the launcher stub to launch the kernel\n    \"\"\"\n    enable_precompile = not os.getenv(\"TRITON_DISABLE_PRECOMPILE\", 'false').lower() in ('true', '1')\n    # if precompile header file and its gch file not exist, do precompile\n    header_path = _precompile_npu_ext_with_lock(header_src, enable_precompile)\n    assert header_path is not None, \"the precompiled.h path is empty.\"\n\n    # try to get cached file\n    so_cache_key = hashlib.sha256(wrapper_src.encode(\"utf-8\")).hexdigest()\n    so_cache_manager = get_cache_manager(so_cache_key)\n    # append the cxx11_abi value to the launcher name to avoid\n    # linking to a launcher with wrong cxx11_abi.\n    use_cxx11_abi = _check_cxx11_abi()\n    name = f\"launcher_cxx11abi{use_cxx11_abi}\"\n    suffix = sysconfig.get_config_var('EXT_SUFFIX')\n    so_name = f\"{name}{suffix}\"\n\n    if debug:\n        dump_manager = get_dump_manager(so_cache_key)\n        if header_path is not None:\n            print(f\"Dumping precompiled.h to {dump_manager.cache_dir}\")\n            dump_manager.put(header_src, \"precompiled.h\", binary=False)\n        print(f\"Dumping {name}.cxx to {dump_manager.cache_dir}\")\n        dump_manager.put(wrapper_src, f\"{name}.cxx\", binary=False)\n\n    cache_path = so_cache_manager.get_file(so_name)\n    if cache_path is not None:\n        return cache_path\n\n    kernel_launcher_type = \"torch\"\n\n    with tempfile.TemporaryDirectory() as tmpdir:\n        src_path = os.path.join(tmpdir, f\"{name}.cxx\")\n        with open(src_path, \"w\") as f:\n            f.write(wrapper_src)\n        so_path = _build_npu_ext(name, header_path, src_path, kernel_launcher=kernel_launcher_type,\n                                 precompile=enable_precompile)\n        if debug:\n            with open(so_path, \"rb\") as f:\n                dump_manager.put(f.read(), so_name, binary=True)\n        with open(so_path, \"rb\") as f:\n            so_cache_path = so_cache_manager.put(f.read(), so_name, binary=True)\n    return so_cache_path\n\n\n",
+    "jit.run": "    def run(self, *args, grid, warmup, **kwargs):\n        kwargs[\"debug\"] = kwargs.get(\"debug\", self.debug) or knobs.runtime.debug\n        # FlagPrism: options must affect specialization and cache keys.\n        _flagprism.apply_compile_options(kwargs)\n\n        # parse options\n        device = driver.active.get_current_device()\n        stream = driver.active.get_current_stream(device)\n\n        # Execute pre run hooks with args and kwargs\n        for hook in self.pre_run_hooks:\n            hook(*args, **kwargs)\n\n        kernel_cache, kernel_key_cache, target, backend, binder = self.device_caches[device]\n        # specialization is list[tuple[str, Any]], where first element of tuple is\n        # the type and the second parameter is the 'specialization' value.\n        bound_args, specialization, options = binder(*args, **kwargs)\n\n        key = compute_cache_key(kernel_key_cache, specialization, options)\n        kernel = kernel_cache.get(key, None)\n\n        # Kernel is not cached; we have to compile.\n        if kernel is None:\n            options, signature, constexprs, attrs = self._pack_args(backend, kwargs, bound_args, specialization,\n                                                                    options)\n\n            kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)\n            if kernel is None:\n                return None\n\n        # Check that used global values have not changed.\n        not_present = object()\n        for (name, _), (val, globals_dict) in self.used_global_vals.items():\n            if (newVal := globals_dict.get(name, not_present)) != val:\n                raise RuntimeError(\n                    f\"Global variable {name} has changed since we compiled this kernel, from {val} to {newVal}\")\n\n        if not warmup:\n            # canonicalize grid\n            assert grid is not None\n            if callable(grid):\n                grid = grid(bound_args)\n            grid_size = len(grid)\n            grid_0 = grid[0]\n            grid_1 = grid[1] if grid_size > 1 else 1\n            grid_2 = grid[2] if grid_size > 2 else 1\n            if hasattr(kernel, \"result\"):\n                kernel = kernel.result()\n            # launch kernel\n            launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())\n            kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,\n                       knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *bound_args.values())\n        return kernel\n\n",
+    "jit.getitem": "NOT FOUND",
+    "stub_candidates": []
+  },
+  "facts_raw_correct_trailing": true,
+  "facts_raw_max_err": 0.0,
+  "facts_raw_11arg": "TypeError('function takes exactly 12 arguments (11 given)')"
+}

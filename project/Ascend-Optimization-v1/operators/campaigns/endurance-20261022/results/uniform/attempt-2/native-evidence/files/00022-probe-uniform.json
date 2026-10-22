@@ -1,0 +1,65 @@
+{
+  "torch": "2.9.0+cpu",
+  "torch_npu": "2.9.0.post2",
+  "triton": "3.5.1",
+  "flag_gems_file": "/data/hanle/ascend-optimization/Ascend-Optimization/third_party/FlagGems/src/flag_gems/__init__.py",
+  "random_utils_file": "/data/hanle/ascend-optimization/Ascend-Optimization/third_party/FlagGems/src/flag_gems/utils/random_utils.py",
+  "random_utils_sha256": "cc421b446f25628e7132a3d62fdd4e154f3e9b64c787a75f39a26196335968ce",
+  "src_philox_backend_seed_offset": "def philox_backend_seed_offset(increment, generator=None):\n    global _SPACEMIT_CPU_GENERATOR\n\n    if generator is None:\n        device = torch_device_fn.current_device()\n        # SPACEMIT uses CPU generator\n        if flag_gems.vendor_name == \"spacemit\":\n            if _SPACEMIT_CPU_GENERATOR is None:\n                _SPACEMIT_CPU_GENERATOR = torch.Generator(device=\"cpu\")\n            generator = _SPACEMIT_CPU_GENERATOR\n        else:\n            generator = torch_device_fn.default_generators[device]\n    state_copy = generator.get_state()\n    # TODO[kunlunxin]: we will upgrade torch version in 2025.04\n    if flag_gems.vendor_name in (\"kunlunxin\", \"aipu\"):\n        c0, c1 = state_copy.view(torch.int64)[-2], state_copy.view(torch.int64)[-1]\n    elif flag_gems.vendor_name == \"spacemit\":\n        state_view = state_copy.view(torch.int64)\n        c0 = state_view[-2].item()\n        c1 = state_view[-1].item()\n    else:\n        c0, c1 = state_copy.view(torch.int64)\n\n    seed, offset = int(c0), int(c1)\n    increment = (increment + 3) // 4 * 4\n    c1 += increment\n    # get_state returns a new tensor, so it needs set_state to update the actual generator state.\n    generator.set_state(state_copy)\n    return seed, offset\n",
+  "src_uint_to_uniform_float": "ERROR: TypeError: module, class, method, function, traceback, frame, or code object was expected, got JITFunction",
+  "lean_seed_offset": {
+    "path": "/data/hanle/ascend-optimization/Ascend-Optimization/third_party/FlagGems/src/flag_gems/runtime/backend/_ascend/ops/rrelu_with_noise.py",
+    "sha256": "0b6a98867815dc41dab95827612ebe923a7b190aa7e5229bf5319341c3389089",
+    "lean_helper": "def _lean_seed_offset(increment, generator, device):\n    # Ascend-local lean equivalent of philox_backend_seed_offset: the NPU\n    # generator state is [seed, offset] int64, and get_offset/set_offset hit\n    # the same fields with far less Python/Tensor overhead than manipulating\n    # the state ByteTensor. The offset increment is rounded to a multiple of\n    # 4 exactly like philox_backend_seed_offset.\n    if generator is None:\n        generator = torch_device_fn.default_generators[\n            (\n                device.index\n                if device.index is not None\n                else torch_device_fn.current_device()\n            )\n        ]\n    seed = generator.initial_seed()\n    offset = generator.get_offset()\n    inc = (increment + 3) // 4 * 4\n    generator.set_offset(offset + inc)\n    return generator, seed, offset, inc\n\n"
+  },
+  "heuristic_config": "{'BLOCK': <function uniform_heur_block at 0xfffcacabd300>, 'num_warps': <function uniform_heur_num_warps at 0xfffcacabd3a0>}",
+  "device_props": "_NPUDeviceProperties(name='Ascend910B4-1', total_memory=62420MB, cube_core_num=20, vector_core_num=40, uuid=00000000-0000-0000-0000-000000000000, L2_cache_size=168MB)",
+  "driver": {
+    "active": "NPUDriver",
+    "props": "None",
+    "backends": [
+      "amd",
+      "ascend",
+      "nvidia"
+    ]
+  },
+  "host_us_parent_seed_offset": 27.104485197924078,
+  "host_us_lean_seed_offset": 0.9038002463057637,
+  "host_us_empty_like": 7.163955015130341,
+  "offset_delta_parent": 16,
+  "offset_delta_lean": 64,
+  "seed_and_offset_from_parent": [
+    1234,
+    64
+  ],
+  "get_state_us": 3.316854708828032,
+  "set_state_us": 5.735204904340208,
+  "kern_float32_1048576_const": "ERROR: TypeError: dynamic_func() got multiple values for argument 'BLOCK'",
+  "kern_float32_1048576_tl_philox": {
+    "us_per_call": 2452.1669387817383,
+    "grid": 256,
+    "n": 1048576,
+    "dtype": "torch.float32"
+  },
+  "kern_float32_1048576_manual16": "ERROR: CompilationError: at 8:21:\ndef k_manual16(out_ptr, N, philox_seed, philox_offset, from_, to, BLOCK: tl.constexpr):\n    philox_seed = philox_seed.to(tl.int64)\n    philox_offset = philox_offset.to(tl.int64)\n    c0 = (philox_offset & 0xFFFFFFFF).to(tl.uint32)\n    c1 = ((philox_offset >> 32) & 0xFFFFFFFF).to(tl.uint32)\n    i4 = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    c0 += i4\n    r0, r1, r2, r3 = _philox16(philox_seed, c0, c1)\n                     ^\nCompilationError('def _philox16(seed, c0, c1):\\n    k0 = seed.to(tl.uint32)  # low 32 bits of the 64-bit seed\\n    k1 = (seed >> 32).to(tl.uint32)\\n    c2 = c0 * 0\\n    c3 = c2\\n    for _ in tl.static_range(10):\\n        hi0 = _mulhi16(c0, M0 & 0xFFFF, M0 >> 16)\\n        lo0 = c0 * (M0 & 0xFFFFFFFF)\\n        hi1 = _mulhi16(c2, M1 & 0xFFFF, M1 >> 16)\\n        lo1 = c2 * (M1 & 0xFFFFFFFF)\\n        c0 = hi1 ^ c1 ^ k0\\n        c1 = lo1\\n        c2 = hi0 ^ c3 ^ k1\\n        c3 = lo0\\n        k0 = k0 + (W0 & 0xFFFFFFFF)\\n        k1 = k1 + (W1 & 0xFFFFFFFF)\\n    return c0, c1, c2, c3\\n', <ast.Name object at 0xfffc6b5e9150>, 'NameError(\"Cannot access global variable M0 from within @jit\\'ed function. Triton kernels can only access global variables that are instanstiated as constexpr (`x = triton.language.constexpr(42)`). Note that this is different from annotating a variable as constexpr (`x: triton.language.constexpr = 42`), which is not supported.  Alternatively, set the envvar TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1, but we do not promise to support this forever.\")')",
+  "kern_float32_1048576_manual64": "ERROR: CompilationError: at 8:21:\ndef k_manual64(out_ptr, N, philox_seed, philox_offset, from_, to, BLOCK: tl.constexpr):\n    philox_seed = philox_seed.to(tl.int64)\n    philox_offset = philox_offset.to(tl.int64)\n    c0 = (philox_offset & 0xFFFFFFFF).to(tl.uint32)\n    c1 = ((philox_offset >> 32) & 0xFFFFFFFF).to(tl.uint32)\n    i4 = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    c0 += i4\n    r0, r1, r2, r3 = _philox64(philox_seed, c0, c1)\n                     ^\nCompilationError('def _philox64(seed, c0, c1):\\n    k0 = seed.to(tl.uint32)\\n    k1 = (seed >> 32).to(tl.uint32)\\n    c2 = c0 * 0\\n    c3 = c2\\n    for _ in tl.static_range(10):\\n        p0 = c0.to(tl.uint64) * M0\\n        p1 = c2.to(tl.uint64) * M1\\n        hi0 = (p0 >> 32).to(tl.uint32)\\n        lo0 = p0.to(tl.uint32)\\n        hi1 = (p1 >> 32).to(tl.uint32)\\n        lo1 = p1.to(tl.uint32)\\n        c0 = hi1 ^ c1 ^ k0\\n        c1 = lo1\\n        c2 = hi0 ^ c3 ^ k1\\n        c3 = lo0\\n        k0 = k0 + (W0 & 0xFFFFFFFF)\\n        k1 = k1 + (W1 & 0xFFFFFFFF)\\n    return c0, c1, c2, c3\\n', <ast.Name object at 0xfffc6b5c6d40>, 'NameError(\"Cannot access global variable M0 from within @jit\\'ed function. Triton kernels can only access global variables that are instanstiated as constexpr (`x = triton.language.constexpr(42)`). Note that this is different from annotating a variable as constexpr (`x: triton.language.constexpr = 42`), which is not supported.  Alternatively, set the envvar TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1, but we do not promise to support this forever.\")')",
+  "kern_float32_1024_const": "ERROR: TypeError: dynamic_func() got multiple values for argument 'BLOCK'",
+  "kern_float32_1024_tl_philox": {
+    "us_per_call": 350.5290985107422,
+    "grid": 1,
+    "n": 1024,
+    "dtype": "torch.float32"
+  },
+  "kern_float16_1048576_tl_philox": {
+    "us_per_call": 2448.736000061035,
+    "grid": 256,
+    "n": 1048576,
+    "dtype": "torch.float16"
+  },
+  "kern_float16_1048576_manual16": "ERROR: CompilationError: at 8:21:\ndef k_manual16(out_ptr, N, philox_seed, philox_offset, from_, to, BLOCK: tl.constexpr):\n    philox_seed = philox_seed.to(tl.int64)\n    philox_offset = philox_offset.to(tl.int64)\n    c0 = (philox_offset & 0xFFFFFFFF).to(tl.uint32)\n    c1 = ((philox_offset >> 32) & 0xFFFFFFFF).to(tl.uint32)\n    i4 = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    c0 += i4\n    r0, r1, r2, r3 = _philox16(philox_seed, c0, c1)\n                     ^\nCompilationError('def _philox16(seed, c0, c1):\\n    k0 = seed.to(tl.uint32)  # low 32 bits of the 64-bit seed\\n    k1 = (seed >> 32).to(tl.uint32)\\n    c2 = c0 * 0\\n    c3 = c2\\n    for _ in tl.static_range(10):\\n        hi0 = _mulhi16(c0, M0 & 0xFFFF, M0 >> 16)\\n        lo0 = c0 * (M0 & 0xFFFFFFFF)\\n        hi1 = _mulhi16(c2, M1 & 0xFFFF, M1 >> 16)\\n        lo1 = c2 * (M1 & 0xFFFFFFFF)\\n        c0 = hi1 ^ c1 ^ k0\\n        c1 = lo1\\n        c2 = hi0 ^ c3 ^ k1\\n        c3 = lo0\\n        k0 = k0 + (W0 & 0xFFFFFFFF)\\n        k1 = k1 + (W1 & 0xFFFFFFFF)\\n    return c0, c1, c2, c3\\n', <ast.Name object at 0xfffc6b6171c0>, 'NameError(\"Cannot access global variable M0 from within @jit\\'ed function. Triton kernels can only access global variables that are instanstiated as constexpr (`x = triton.language.constexpr(42)`). Note that this is different from annotating a variable as constexpr (`x: triton.language.constexpr = 42`), which is not supported.  Alternatively, set the envvar TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1, but we do not promise to support this forever.\")')",
+  "bitcheck": "ERROR: CompilationError: at 8:21:\ndef k_manual16(out_ptr, N, philox_seed, philox_offset, from_, to, BLOCK: tl.constexpr):\n    philox_seed = philox_seed.to(tl.int64)\n    philox_offset = philox_offset.to(tl.int64)\n    c0 = (philox_offset & 0xFFFFFFFF).to(tl.uint32)\n    c1 = ((philox_offset >> 32) & 0xFFFFFFFF).to(tl.uint32)\n    i4 = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    c0 += i4\n    r0, r1, r2, r3 = _philox16(philox_seed, c0, c1)\n                     ^\nCompilationError('def _philox16(seed, c0, c1):\\n    k0 = seed.to(tl.uint32)  # low 32 bits of the 64-bit seed\\n    k1 = (seed >> 32).to(tl.uint32)\\n    c2 = c0 * 0\\n    c3 = c2\\n    for _ in tl.static_range(10):\\n        hi0 = _mulhi16(c0, M0 & 0xFFFF, M0 >> 16)\\n        lo0 = c0 * (M0 & 0xFFFFFFFF)\\n        hi1 = _mulhi16(c2, M1 & 0xFFFF, M1 >> 16)\\n        lo1 = c2 * (M1 & 0xFFFFFFFF)\\n        c0 = hi1 ^ c1 ^ k0\\n        c1 = lo1\\n        c2 = hi0 ^ c3 ^ k1\\n        c3 = lo0\\n        k0 = k0 + (W0 & 0xFFFFFFFF)\\n        k1 = k1 + (W1 & 0xFFFFFFFF)\\n    return c0, c1, c2, c3\\n', <ast.Name object at 0xfffc6b616410>, 'NameError(\"Cannot access global variable M0 from within @jit\\'ed function. Triton kernels can only access global variables that are instanstiated as constexpr (`x = triton.language.constexpr(42)`). Note that this is different from annotating a variable as constexpr (`x: triton.language.constexpr = 42`), which is not supported.  Alternatively, set the envvar TRITON_ALLOW_NON_CONSTEXPR_GLOBALS=1, but we do not promise to support this forever.\")')",
+  "wrapper": {
+    "parent_wrapper_1024": 351.0982131958008,
+    "parent_wrapper_1048576": 2449.1060892740884
+  }
+}

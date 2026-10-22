@@ -1,0 +1,169 @@
+{
+  "definition_name": "scatter_add",
+  "op_type": "",
+  "status": "PASSED",
+  "best_geo_mean": 0.33551973725200396,
+  "best_code": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\"\"\"Self-contained Triton ``scatter_add`` (out-of-place).\n\nSemantics (PyTorch ``torch.scatter_add``)::\n\n    out = inp.clone()\n    out[index[i_0, ..., i_d, ...]] += src[i_0, ..., i_d, ...]   along ``dim``\n\nwith ``index.shape == src.shape``, ``index.size(k) <= inp.size(k)`` for\n``k != dim`` and ``index.size(dim) <= src.size(dim)``.  The result is a fresh\nbuffer: ``inp``, ``index`` and ``src`` are never modified.\n\nBaseline architecture: a device copy of ``inp`` into a freshly allocated\ncontiguous output followed by one generic N-d atomic-add kernel over the index\nelement space.  All computation that produces the returned values happens in\nTriton kernels; the host only allocates, builds zero-copy views and computes\nlaunch scalars.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n_MAXR = 8\n\n_D_ARGS = [f\"d{i}\" for i in range(_MAXR)]\n_SS_ARGS = [f\"ss{i}\" for i in range(_MAXR)]\n_IS_ARGS = [f\"is{i}\" for i in range(_MAXR)]\n_OS_ARGS = [f\"os{i}\" for i in range(_MAXR)]\n\n_COPY_BLOCK = 8192\n_SCATTER_BLOCK = 512\n_DENSE_BLOCK = 128\n_DENSE_CHUNK = 32\n\n\ndef _slots(values, pad):\n    \"\"\"Right-align ``values`` into ``_MAXR`` slots, padding in front.\n\n    Front padding is transparent for the sequential ``div/mod`` decomposition\n    used in the kernels: a shape slot of ``1`` always yields a zero remainder\n    and leaves the running quotient unchanged.\n    \"\"\"\n    return [pad] * (_MAXR - len(values)) + list(values)\n\n\n@triton.jit(do_not_specialize=[\"n\"])\ndef _copy_flat_kernel(src_ptr, dst_ptr, n, BLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    off = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)\n    mask = off < n\n    tl.store(dst_ptr + off, tl.load(src_ptr + off, mask=mask), mask=mask)\n\n\n@triton.jit(do_not_specialize=[\"ncols\"])\ndef _scatter_add_lastdim_kernel(\n    src_ptr,\n    idx_ptr,\n    out_ptr,\n    ncols,\n    BLOCK: tl.constexpr,\n):\n    \"\"\"Scatter-add along the last axis of a contiguous (rows, ncols) view.\n\n    One program owns one ``(row, column block)`` pair, so the element offset is\n    ``row * ncols + col`` with no div/mod, and only four runtime arguments are\n    shipped to the launcher.\n    \"\"\"\n    row = tl.program_id(0)\n    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)\n    mask = col < ncols\n    base = row * ncols\n    off = base + col\n    idx = tl.load(idx_ptr + off, mask=mask, other=0).to(tl.int32)\n    val = tl.load(src_ptr + off, mask=mask, other=0)\n    tl.atomic_add(out_ptr + (base + idx), val, mask=mask, sem=\"relaxed\")\n\n\n@triton.jit(do_not_specialize=[\"ncols\"])\ndef _scatter_add_lastdim_dense_kernel(\n    inp_ptr,\n    idx_ptr,\n    src_ptr,\n    out_ptr,\n    ncols,\n    BLOCK: tl.constexpr,\n    CHUNK: tl.constexpr,\n):\n    \"\"\"Conflict-free last-axis scatter-add with entirely affine addresses.\n\n    Every address below is ``base + arange`` (a scalar row base plus a constant\n    range), so the compiler never has to emit a vector-of-data-dependent-\n    addresses store/atomic: the destination side is resolved by broadcasting a\n    ``[CHUNK, BLOCK]`` compare against the destination block this program owns.\n    The trade-off is ``rows * ncols`` comparisons per output element, which is\n    only cheaper than the per-element data-dependent atomic path while ``ncols``\n    stays small (measured crossover near ``ncols`` ~ 900).\n    \"\"\"\n    row = tl.program_id(0)\n    dst = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)\n    dmask = dst < ncols\n    base = row * ncols\n    acc = tl.zeros([BLOCK], dtype=tl.float32)\n    for s0 in range(0, ncols, CHUNK):\n        so = s0 + tl.arange(0, CHUNK)\n        smask = so < ncols\n        idx = tl.load(idx_ptr + base + so, mask=smask, other=-1).to(tl.int32)\n        val = tl.load(src_ptr + base + so, mask=smask, other=0).to(tl.float32)\n        hit = (idx[:, None] == dst[None, :]) & smask[:, None]\n        acc += tl.sum(tl.where(hit, val[:, None], 0.0), axis=0)\n    cur = tl.load(inp_ptr + base + dst, mask=dmask, other=0).to(tl.float32)\n    tl.store(out_ptr + base + dst, (cur + acc).to(out_ptr.dtype.element_ty), mask=dmask)\n\n\n@triton.jit(do_not_specialize=[\"n\"] + _D_ARGS + _SS_ARGS)\ndef _copy_nd_kernel(\n    src_ptr,\n    dst_ptr,\n    n,\n    d0, d1, d2, d3, d4, d5, d6, d7,\n    ss0, ss1, ss2, ss3, ss4, ss5, ss6, ss7,\n    BLOCK: tl.constexpr,\n):\n    \"\"\"Contiguous ``dst`` copy of an arbitrarily strided ``src``.\"\"\"\n    pid = tl.program_id(0)\n    off = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = off < n\n    cur = off\n    src_off = tl.zeros([BLOCK], dtype=tl.int32)\n    md = cur % d7\n    src_off += md * ss7\n    cur = cur // d7\n    md = cur % d6\n    src_off += md * ss6\n    cur = cur // d6\n    md = cur % d5\n    src_off += md * ss5\n    cur = cur // d5\n    md = cur % d4\n    src_off += md * ss4\n    cur = cur // d4\n    md = cur % d3\n    src_off += md * ss3\n    cur = cur // d3\n    md = cur % d2\n    src_off += md * ss2\n    cur = cur // d2\n    md = cur % d1\n    src_off += md * ss1\n    cur = cur // d1\n    md = cur % d0\n    src_off += md * ss0\n    tl.store(dst_ptr + off, tl.load(src_ptr + src_off, mask=mask), mask=mask)\n\n\n@triton.jit(do_not_specialize=[\"n\", \"odim\"] + _D_ARGS + _SS_ARGS + _IS_ARGS + _OS_ARGS)\ndef _scatter_add_nd_kernel(\n    src_ptr,\n    index_ptr,\n    out_ptr,\n    n,\n    odim,\n    d0, d1, d2, d3, d4, d5, d6, d7,\n    ss0, ss1, ss2, ss3, ss4, ss5, ss6, ss7,\n    is0, is1, is2, is3, is4, is5, is6, is7,\n    os0, os1, os2, os3, os4, os5, os6, os7,\n    BLOCK: tl.constexpr,\n):\n    \"\"\"Generic N-d scatter-add over the ``index``/``src`` element space.\n\n    ``ss``/``is`` are the strides of ``src``/``index``; ``os`` are the\n    (contiguous) strides of the output with the entry for ``dim`` forced to 0,\n    so the ``dim`` coordinate is contributed only through ``idx * odim``.\n    \"\"\"\n    pid = tl.program_id(0)\n    off = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = off < n\n    cur = off\n    src_off = tl.zeros([BLOCK], dtype=tl.int32)\n    idx_off = tl.zeros([BLOCK], dtype=tl.int32)\n    out_off = tl.zeros([BLOCK], dtype=tl.int32)\n\n    md = cur % d7\n    src_off += md * ss7\n    idx_off += md * is7\n    out_off += md * os7\n    cur = cur // d7\n\n    md = cur % d6\n    src_off += md * ss6\n    idx_off += md * is6\n    out_off += md * os6\n    cur = cur // d6\n\n    md = cur % d5\n    src_off += md * ss5\n    idx_off += md * is5\n    out_off += md * os5\n    cur = cur // d5\n\n    md = cur % d4\n    src_off += md * ss4\n    idx_off += md * is4\n    out_off += md * os4\n    cur = cur // d4\n\n    md = cur % d3\n    src_off += md * ss3\n    idx_off += md * is3\n    out_off += md * os3\n    cur = cur // d3\n\n    md = cur % d2\n    src_off += md * ss2\n    idx_off += md * is2\n    out_off += md * os2\n    cur = cur // d2\n\n    md = cur % d1\n    src_off += md * ss1\n    idx_off += md * is1\n    out_off += md * os1\n    cur = cur // d1\n\n    md = cur % d0\n    src_off += md * ss0\n    idx_off += md * is0\n    out_off += md * os0\n\n    idx = tl.load(index_ptr + idx_off, mask=mask, other=0).to(tl.int32)\n    val = tl.load(src_ptr + src_off, mask=mask, other=0)\n    out_off += idx * odim\n    tl.atomic_add(out_ptr + out_off, val, mask=mask, sem=\"relaxed\")\n\n\ndef _contig_strides(shape):\n    \"\"\"Row-major strides of ``shape`` (what ``torch.empty(shape)`` uses).\"\"\"\n    strides = [0] * len(shape)\n    acc = 1\n    for i in range(len(shape) - 1, -1, -1):\n        strides[i] = acc\n        acc *= shape[i]\n    return strides\n\n\ndef _launch_copy(src, dst):\n    n = dst.numel()\n    if n == 0:\n        return\n    if src.is_contiguous():\n        grid = (triton.cdiv(n, _COPY_BLOCK),)\n        _copy_flat_kernel[grid](src, dst, n, BLOCK=_COPY_BLOCK)\n        return\n    shape = _slots(src.shape, 1)\n    strides = _slots(src.stride(), 0)\n    grid = (triton.cdiv(n, _SCATTER_BLOCK),)\n    _copy_nd_kernel[grid](\n        src,\n        dst,\n        n,\n        shape[0], shape[1], shape[2], shape[3], shape[4], shape[5], shape[6], shape[7],\n        strides[0], strides[1], strides[2], strides[3], strides[4], strides[5], strides[6], strides[7],\n        BLOCK=_SCATTER_BLOCK,\n    )\n\n\ndef run(inp, dim, index, src):\n    ndim = inp.ndim\n    dim = dim % ndim\n    n = index.numel()\n    if inp.numel() >= 2**31:\n        raise RuntimeError(\"scatter_add: int32 offset range exceeded\")\n\n    # Fast path: last-axis scatter of a fully contiguous, full-extent triple.\n    # Every measured shape takes it; it removes all div/mod from the element\n    # addressing and keeps the launch at four runtime arguments.  Host work here\n    # is on the critical path for small tensors, so the allocation uses\n    # ``empty_like`` (contiguous in, contiguous out) and the dispatch test stays\n    # in integer form.\n    if (\n        n != 0\n        and dim == ndim - 1\n        and index.shape == inp.shape\n        and src.shape == index.shape\n        and inp.is_contiguous()\n        and index.is_contiguous()\n        and src.is_contiguous()\n    ):\n        ncols = inp.shape[-1]\n        rows = n // ncols\n        out = torch.empty_like(inp)\n        # Dispatch cost model, integer form of the measured fit: the dense\n        # kernel costs ~5.2ps per (source, destination) pair plus one launch,\n        # the atomic path ~4.7ns per element plus two launches, so dense wins\n        # while pairs < 903 * n + 1.08e7 (crossover near ncols 900).\n        if ncols >= 32 and n * ncols < 903 * n + 10770000:\n            _scatter_add_lastdim_dense_kernel[(rows, (ncols + 127) >> 7)](\n                inp, index, src, out, ncols, BLOCK=_DENSE_BLOCK, CHUNK=_DENSE_CHUNK\n            )\n            return out\n        _launch_copy(inp, out)\n        block = 128\n        while block < ncols and block < 2048:\n            block *= 2\n        _scatter_add_lastdim_kernel[(rows, (ncols + block - 1) // block)](\n            src, index, out, ncols, BLOCK=block\n        )\n        return out\n\n    out = torch.empty(inp.shape, dtype=inp.dtype, device=inp.device)\n    _launch_copy(inp, out)\n    if n == 0:\n        return out\n\n    # ``src`` follows ``index``'s extent; extra trailing entries of ``src`` are\n    # never read, exactly like the reference.\n    src_view = src.as_strided(index.shape, src.stride())\n\n    idx_shape = _slots(index.shape, 1)\n    src_strides = _slots(src_view.stride(), 0)\n    idx_strides = _slots(index.stride(), 0)\n    out_strides = _contig_strides(inp.shape)\n    odim = out_strides[dim]\n    out_strides[dim] = 0\n    out_slots = _slots(out_strides, 0)\n\n    grid = (triton.cdiv(n, _SCATTER_BLOCK),)\n    _scatter_add_nd_kernel[grid](\n        src_view,\n        index,\n        out,\n        n,\n        odim,\n        idx_shape[0], idx_shape[1], idx_shape[2], idx_shape[3],\n        idx_shape[4], idx_shape[5], idx_shape[6], idx_shape[7],\n        src_strides[0], src_strides[1], src_strides[2], src_strides[3],\n        src_strides[4], src_strides[5], src_strides[6], src_strides[7],\n        idx_strides[0], idx_strides[1], idx_strides[2], idx_strides[3],\n        idx_strides[4], idx_strides[5], idx_strides[6], idx_strides[7],\n        out_slots[0], out_slots[1], out_slots[2], out_slots[3],\n        out_slots[4], out_slots[5], out_slots[6], out_slots[7],\n        BLOCK=_SCATTER_BLOCK,\n    )\n    return out\n",
+  "search_best_geo_mean": 0.34714313979247696,
+  "final_verification": {
+    "status": "PASSED",
+    "reason_code": "VERIFIED",
+    "geo_mean": 0.33551973725200396,
+    "measured_geo_mean": 0.33551973725200396,
+    "comparisons": [
+      {
+        "uuid": "scatter_add-timing-0",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.13965622786493903,
+          "latency_ms": 0.10069121313809098
+        },
+        "after": {
+          "reference_latency_ms": 0.13142267746613864,
+          "latency_ms": 0.10134601211215157
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9410441587555765,
+          "latency_ms": 1.006503039874617
+        }
+      },
+      {
+        "uuid": "scatter_add-timing-1",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.8540439271382171,
+          "latency_ms": 4.95552596791337
+        },
+        "after": {
+          "reference_latency_ms": 0.8546251341780596,
+          "latency_ms": 4.950092148889477
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0006805352996186,
+          "latency_ms": 0.998903482887775
+        }
+      },
+      {
+        "uuid": "scatter_add-timing-2",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 3.3620218732983047,
+          "latency_ms": 19.548596263242263
+        },
+        "after": {
+          "reference_latency_ms": 3.3622203788174123,
+          "latency_ms": 19.554011601333816
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0000590434942391,
+          "latency_ms": 1.0002770192815191
+        }
+      },
+      {
+        "uuid": "scatter_add-timing-3",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.14692890275221826,
+          "latency_ms": 0.1016775030655044
+        },
+        "after": {
+          "reference_latency_ms": 0.13563437227230468,
+          "latency_ms": 0.10205885881438931
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9231292804319057,
+          "latency_ms": 1.0037506403814738
+        }
+      },
+      {
+        "uuid": "scatter_add-timing-4",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.8540735658949075,
+          "latency_ms": 4.95896810847498
+        },
+        "after": {
+          "reference_latency_ms": 0.8547874020083391,
+          "latency_ms": 4.950597950179751
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0008358016708827,
+          "latency_ms": 0.9983121169339799
+        }
+      },
+      {
+        "uuid": "scatter_add-timing-5",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 3.359942322318581,
+          "latency_ms": 19.55422826576978
+        },
+        "after": {
+          "reference_latency_ms": 3.3566195854981395,
+          "latency_ms": 19.545996266727645
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9990110732561182,
+          "latency_ms": 0.9995790169302388
+        }
+      },
+      {
+        "uuid": "scatter_add-timing-6",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.14325256537427067,
+          "latency_ms": 0.10323670455664151
+        },
+        "after": {
+          "reference_latency_ms": 0.11824339492267166,
+          "latency_ms": 0.10014241336295933
+        },
+        "ratios": {
+          "reference_latency_ms": 0.8254190395386046,
+          "latency_ms": 0.9700272184493793
+        }
+      },
+      {
+        "uuid": "scatter_add-timing-7",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.8544613598575311,
+          "latency_ms": 4.90828324885418
+        },
+        "after": {
+          "reference_latency_ms": 0.8555230006727763,
+          "latency_ms": 4.9067162481757505
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0012424679044845,
+          "latency_ms": 0.9996807436329607
+        }
+      },
+      {
+        "uuid": "scatter_add-timing-8",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 3.365087171684651,
+          "latency_ms": 19.519636865394812
+        },
+        "after": {
+          "reference_latency_ms": 3.366735885615578,
+          "latency_ms": 19.51309359477212
+        },
+        "ratios": {
+          "reference_latency_ms": 1.000489946871154,
+          "latency_ms": 0.9996647852279316
+        }
+      }
+    ],
+    "drift": [],
+    "drift_factor": 2.0,
+    "compared_to": "original_round",
+    "attempt_path": ".kernelgen/retests/ab2327d7e898418d2b41966a67ec49a6d4152f359586a700cbec139a64b0242b/a1c179447c9477717794943de9d021de532196ffa5d203102b4cadda942d3cc1/attempt-0001.json",
+    "round_num": 4,
+    "solution_sha256": "ab2327d7e898418d2b41966a67ec49a6d4152f359586a700cbec139a64b0242b"
+  },
+  "rounds": 4,
+  "summary": "Four measured rounds took scatter_add from 0.190x to 0.347x geo_mean (best round 4, all 18 workloads PASSED): a self-contained Triton port (the seed could not even import) with a shape-dependent dispatch between a div-free last-axis atomic kernel for wide rows and an all-affine single-launch dense compare kernel for narrow rows, plus a trimmed host path. The measured mechanism is that any data-dependent address store/atomic is scalarized on this target at ~4.6ns/element and is invariant to conflict density, BLOCK, num_warps and masking (an affine copy of the same volume is 0.10ms vs 13.6ms for the store), so the 128^2 family was won by removing the second launch (1.39-1.45x) while the 1024^2/2048^2 family stays pinned near 0.172x by that lowering; per-launch latency (~0.0655ms) and the residual 0.1718x worst case (timing-5) are the recorded limits.",
+  "workspace": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/scatter_add-endurance-20261022-attempt-1/stages/optimize/work"
+}

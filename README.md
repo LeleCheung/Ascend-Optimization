@@ -8,7 +8,7 @@
 
 ## 当前状态
 
-正在执行[六算子夜间连续队列](project/Ascend-Optimization-v1/operators/campaigns/endurance-20261022/README.md)：`selu_`、`rad2deg_`、`cumulative_trapezoid`、`scatter_add`、`uniform`、`gelu_and_mul`。服务器tmux串行运行，自动衔接搜索、补充语义、一次独立完整评测及最终采集；阶段结果不表示整轮完成。最终报告和三端同步验收完成后再更新交付成绩。
+[六算子夜间连续优化](project/Ascend-Optimization-v1/operators/夜间连续优化交付-20261023.md)已完成搜索与完整评测：`gelu_and_mul` **2.271×**、修复标准 Philox 的 `uniform` **1.325×**、`rad2deg_` **1.117×**、`selu_` **0.837×**；均为 KGS 完整调用 walltime。SELU 同批实际加速1.042×。`scatter_add` 完整通过但为0.419×，`cumulative_trapezoid` 没有通过全部数值检查的交付。uniform旧1.497×源码的随机数机制错误已由独立整数反例定位并修复，使用新批结果替代；SELU和rad2deg_的KGS metrics仍有明确采集缺口。源码、逐case证据及复现入口见交付报告。
 
 最新[缓冲与搬运批次](project/Ascend-Optimization-v1/operators/campaigns/buffer-pointwise-20261022/README.md)已闭环：`log10_` **0.875×**、`selu_` **0.898×**，各36项正式测试与42＋12＋9项补充检查通过，最终真机采集及48项证据核验通过。log10_相对同批父版实际加速**1.125×**；SELU保留上一轮源码，本次分数属于复测结果。新增源码、失败机制、中文简报和一次完整复现命令见该批次；历史成绩如下保留。
 

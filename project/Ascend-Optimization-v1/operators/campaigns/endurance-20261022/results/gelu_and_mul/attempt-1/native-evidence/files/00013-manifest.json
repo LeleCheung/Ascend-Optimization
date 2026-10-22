@@ -1,0 +1,238 @@
+{
+  "request": {
+    "api_version": "v6.2",
+    "evaluation_id": "9ec3b9e7488348ad21bf4aab775b39716dfe9e2ae865be9dbef316e0d4e9c232:round-3",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:afaa5aa922329e010555b453c3887376a33b7eeeaf88031d5c9aeb8db53adfba",
+      "definition": "gelu_and_mul"
+    },
+    "implementation": {
+      "name": "kernelgen-candidate-gelu_and_mul",
+      "definition": "gelu_and_mul",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "# Copyright 2026, The FlagOS Contributors.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\")\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#       http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Fused exact-GELU gating for Ascend (FlagOS, gelu_and_mul).\n\nArchitecture\n------------\nThe reference evaluates ``x1.float() -> gelu(exact) -> * x3.float() -> bf16``\nwith five separate aclnn kernels (three of them pure casts).  This module\nperforms the whole expression in one vector kernel, so HBM traffic drops from\nfive passes over the tensor to one read of the gated pair plus one write.\n\nDevice layout\n-------------\nRows are addressed as ``row * (2 * d)`` (input) and ``row * d`` (output) so a\nrow-tile is a purely affine, contiguous range: the compiler emits bulk MTE\nmoves instead of the per-element gather that a runtime stride multiply forces.\nThe runtime argument list is two pointers plus ``d``.\n\nHost layout\n-----------\nThe measurement is a full-call walltime, and on this target a Triton call\nspends several times longer inside ``JITFunction.run`` (binder, specialization\nkey, cache lookup, metadata) than the reference spends launching five aclnn\nkernels.  The first call for each (dtype, hidden size, device) compiles\nnormally and keeps the resulting ``CompiledKernel``; later calls invoke that\nkernel's launcher directly with the *current* tensor addresses, the *current*\nstream and the same constexprs.  No tensor, address or output is cached across\ncalls.  An installed launch hook (profiling) disables the shortcut, and any\nexception or missing cache entry falls back to ``kernel[grid](...)``.\n\nNumerics\n--------\nGate and up operands are loaded in the input dtype and widened to FP32, the\nexact GELU ``x * 0.5 * (1 + erf(x / sqrt(2)))`` is evaluated in FP32, the\nproduct is formed in FP32 and rounded once to the output dtype -- the same\nrounding order as the reference.\n\nCopyright 2023-2024 SGLang Team\nCopyright 2026 FlagOS Contributors\nSPDX-License-Identifier: Apache-2.0\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\nfrom triton.runtime import driver\n\ntry:  # pragma: no cover - import guard: no compiled handle, no shortcut\n    from triton.compiler.compiler import CompiledKernel as _CompiledKernel\nexcept Exception:  # pragma: no cover\n    _CompiledKernel = None\n\n__all__ = [\"gelu_and_mul\"]\n\n\n@triton.jit\ndef _gelu_and_mul_rows_kernel(\n    x_ptr,\n    o_ptr,\n    d,\n    BLOCK: tl.constexpr,\n    EVEN: tl.constexpr,\n):\n    \"\"\"One row-tile per program; contiguous input/output row layout.\"\"\"\n    row = tl.program_id(0)\n    column_tile = tl.program_id(1)\n    columns = column_tile * BLOCK + tl.arange(0, BLOCK)\n\n    in_base = row * (2 * d)\n    if EVEN:\n        gate = tl.load(x_ptr + in_base + columns)\n        up = tl.load(x_ptr + in_base + d + columns)\n    else:\n        mask = columns < d\n        gate = tl.load(x_ptr + in_base + columns, mask=mask, other=0.0)\n        up = tl.load(x_ptr + in_base + d + columns, mask=mask, other=0.0)\n\n    gate_f = gate.to(tl.float32)\n    up_f = up.to(tl.float32)\n    activated = gate_f * (0.5 * (1.0 + tl.erf(gate_f * 0.7071067811865475)))\n    result = activated * up_f\n\n    out_base = row * d\n    if EVEN:\n        tl.store(o_ptr + out_base + columns, result.to(o_ptr.dtype.element_ty))\n    else:\n        tl.store(o_ptr + out_base + columns, result.to(o_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _gelu_and_mul_generic_kernel(\n    hidden_states_ptr,\n    output_ptr,\n    hidden_size,\n    batch_size,\n    input_stride_batch,\n    input_stride_hidden,\n    output_stride_batch,\n    output_stride_hidden,\n    BLOCK: tl.constexpr,\n):\n    \"\"\"Layout fallback: explicit strides, one row-tile per program.\"\"\"\n    row = tl.program_id(0)\n    column_tile = tl.program_id(1)\n    columns = column_tile * BLOCK + tl.arange(0, BLOCK)\n    mask = (row < batch_size) & (columns < hidden_size)\n\n    gate = tl.load(\n        hidden_states_ptr + row * input_stride_batch + columns * input_stride_hidden,\n        mask=mask,\n        other=0.0,\n    ).to(tl.float32)\n    up = tl.load(\n        hidden_states_ptr\n        + row * input_stride_batch\n        + (hidden_size + columns) * input_stride_hidden,\n        mask=mask,\n        other=0.0,\n    ).to(tl.float32)\n\n    activated = gate * (0.5 * (1.0 + tl.erf(gate * 0.7071067811865475)))\n    tl.store(\n        output_ptr + row * output_stride_batch + columns * output_stride_hidden,\n        (activated * up).to(output_ptr.dtype.element_ty),\n        mask=mask,\n    )\n\n\n_MAX_BLOCK = 4096\n_NUM_WARPS = 4\n# hidden size -> (block, even, num_column_tiles); pure metadata, no tensors.\n_PLAN = {}\n# (dtype, hidden size, device index) -> CompiledKernel of the row kernel.\n_LAUNCHER = {}\n\n\ndef _plan_for(hidden_size):\n    plan = _PLAN.get(hidden_size)\n    if plan is not None:\n        return plan\n    block = 1\n    while block * 2 <= _MAX_BLOCK and hidden_size % (block * 2) == 0:\n        block *= 2\n    if block >= 32:\n        even = True\n    else:\n        block = min(_MAX_BLOCK, triton.next_power_of_2(hidden_size))\n        even = hidden_size % block == 0\n    plan = (block, even, triton.cdiv(hidden_size, block))\n    _PLAN[hidden_size] = plan\n    return plan\n\n\ndef _shortcut_allowed():\n    \"\"\"False as soon as any Triton launch hook is installed (profiling).\"\"\"\n    if _CompiledKernel is None:\n        return False\n    return (\n        getattr(_CompiledKernel, \"launch_enter_hook\", None) is None\n        and getattr(_CompiledKernel, \"launch_exit_hook\", None) is None\n    )\n\n\ndef gelu_and_mul(hidden_states):\n    shape = hidden_states.shape\n    doubled_hidden_size = shape[-1]\n    hidden_size = doubled_hidden_size // 2\n    leading = hidden_states.numel() // doubled_hidden_size\n    dtype = hidden_states.dtype\n    dev = hidden_states.device\n    if len(shape) == 2:\n        output = torch.empty((shape[0], hidden_size), dtype=dtype, device=dev)\n    else:\n        output = torch.empty(shape[:-1] + (hidden_size,), dtype=dtype, device=dev)\n\n    block, even, num_column_tiles = _plan_for(hidden_size)\n    grid = (leading, num_column_tiles)\n\n    rank = hidden_states.dim()\n    if hidden_states.stride(-1) != 1:\n        row_regular = False\n    elif rank <= 1:\n        row_regular = True\n    elif rank == 2:\n        row_regular = hidden_states.stride(0) == doubled_hidden_size\n    else:\n        row_regular = hidden_states.is_contiguous()\n\n    if not row_regular:\n        _gelu_and_mul_generic_kernel[grid](\n            hidden_states,\n            output,\n            hidden_size,\n            leading,\n            hidden_states.stride(-2) if rank > 1 else 0,\n            hidden_states.stride(-1),\n            output.stride(-2) if output.dim() > 1 else 0,\n            output.stride(-1),\n            block,\n            num_warps=_NUM_WARPS,\n        )\n        return output\n\n    device_index = dev.index\n    if device_index is None:\n        device_index = torch.npu.current_device()\n    launcher_key = (dtype, hidden_size, device_index)\n\n    compiled = _LAUNCHER.get(launcher_key)\n    if compiled is not None and _shortcut_allowed():\n        try:\n            compiled.run(\n                leading,\n                num_column_tiles,\n                1,\n                driver.active.get_current_stream(device_index),\n                compiled.function,\n                compiled.packed_metadata,\n                None,\n                None,\n                None,\n                hidden_states,\n                output,\n                hidden_size,\n                block,\n                even,\n            )\n            return output\n        except Exception:\n            _LAUNCHER.pop(launcher_key, None)\n\n    cache = _gelu_and_mul_rows_kernel.device_caches[device_index][0]\n    known = set(cache)\n    _gelu_and_mul_rows_kernel[grid](\n        hidden_states,\n        output,\n        hidden_size,\n        block,\n        even,\n        num_warps=_NUM_WARPS,\n    )\n    fresh = set(cache) - known\n    if len(fresh) == 1:\n        _LAUNCHER[launcher_key] = cache[fresh.pop()]\n    return output\n\n\nrun = gelu_and_mul\n"
+        }
+      ]
+    },
+    "benchmark_fingerprint": "sha256:237cef2034c4167e1ab9b60c915b700831b48b60e876a73e9fd82c6ea5906075",
+    "case_id": "sglang_gelu_and_mul-00010-timing",
+    "expected_backend": "npu",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "identity": {
+      "solution_sha256": "466d189cf5968fcdd60aac4ef265bb638f78b47e5701b73ff66ced40d4e41c84",
+      "workload_sha256": "8c0b17937993b1253d1b6a74c9ca5e55cc014de6a18bb1e0fd330b5526c4461e"
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "profile_id": "51db85b03b254e3186058830eaf06839",
+    "created_at": "2026-10-22T15:25:45.177100+00:00",
+    "status": "completed",
+    "backend": "npu",
+    "profiler": "msprof",
+    "device": "npu:0",
+    "hardware": {
+      "target": {
+        "backend": "ascend",
+        "vendor": "huawei",
+        "device": "Ascend910B4-1",
+        "architecture": "dav-c220-cube",
+        "devices": [
+          {
+            "logical_device": "npu:0",
+            "device_id": 0,
+            "name": "Ascend910B4-1",
+            "l2_cache_size": 176160768,
+            "num_sm": 20,
+            "compute_capability": "",
+            "total_memory": 65452113920
+          }
+        ]
+      },
+      "software": {
+        "language": "triton",
+        "language_version": "3.5.1",
+        "compiler": "flagtree",
+        "compiler_version": "0.6.0+ascend.gitc286cba6",
+        "runtime": "cann",
+        "runtime_version": "9.0.0",
+        "driver_version": "25.2.0"
+      },
+      "metadata": {
+        "complete": true,
+        "missing": [],
+        "sources": {
+          "target.backend": "server configuration",
+          "target.vendor": "server configuration",
+          "software.language": "server configuration",
+          "software.compiler": "python package metadata",
+          "software.runtime": "server configuration",
+          "target.device": "device probe",
+          "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+          "software.language_version": "triton module metadata",
+          "software.compiler_version": "python package metadata",
+          "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+          "software.driver_version": "/usr/local/Ascend/driver/version.info"
+        }
+      }
+    },
+    "evaluation_id": "9ec3b9e7488348ad21bf4aab775b39716dfe9e2ae865be9dbef316e0d4e9c232:round-3",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "capabilities": [
+      "performance_counters",
+      "kernel_profile",
+      "pipeline_utilization",
+      "execution_timeline"
+    ],
+    "summary": {
+      "avg_time_us": 39.151,
+      "operation_count": 1,
+      "top_operations": [
+        {
+          "op_name": "_gelu_and_mul_rows_kernel",
+          "op_type": "_gelu_and_mul_rows_kernel",
+          "task_type": "AI_VECTOR_CORE",
+          "measured_invocations": 100,
+          "total_duration_us": 3915.076,
+          "avg_duration_us": 39.151,
+          "min_duration_us": 38.8,
+          "max_duration_us": 39.98,
+          "aicore_time_us": 0.0,
+          "aic_total_cycles": 0.0,
+          "aic_mac_time_us": 0.0,
+          "aic_mac_ratio": 0.0,
+          "aic_scalar_time_us": 0.0,
+          "aic_scalar_ratio": 0.0,
+          "aic_mte1_time_us": 0.0,
+          "aic_mte1_ratio": 0.0,
+          "aic_mte2_time_us": 0.0,
+          "aic_mte2_ratio": 0.0,
+          "aic_fixpipe_time_us": 0.0,
+          "aic_fixpipe_ratio": 0.0,
+          "aic_icache_miss_rate": 0.0,
+          "aiv_time_us": 37.8321,
+          "aiv_total_cycles": 2458501.32,
+          "aiv_vec_time_us": 29.7748,
+          "aiv_vec_ratio": 0.787,
+          "aiv_scalar_time_us": 4.5768,
+          "aiv_scalar_ratio": 0.121,
+          "aiv_mte2_time_us": 2.4162,
+          "aiv_mte2_ratio": 0.0639,
+          "aiv_mte3_time_us": 2.0567,
+          "aiv_mte3_ratio": 0.0543,
+          "aiv_icache_miss_rate": 0.0,
+          "cube_utilization_pct": 0.0
+        }
+      ],
+      "stage_count": 1
+    },
+    "metrics": {
+      "avg_time_us": 39.151,
+      "ops": [
+        {
+          "op_name": "_gelu_and_mul_rows_kernel",
+          "op_type": "_gelu_and_mul_rows_kernel",
+          "task_type": "AI_VECTOR_CORE",
+          "measured_invocations": 100,
+          "total_duration_us": 3915.076,
+          "avg_duration_us": 39.151,
+          "min_duration_us": 38.8,
+          "max_duration_us": 39.98,
+          "aicore_time_us": 0.0,
+          "aic_total_cycles": 0.0,
+          "aic_mac_time_us": 0.0,
+          "aic_mac_ratio": 0.0,
+          "aic_scalar_time_us": 0.0,
+          "aic_scalar_ratio": 0.0,
+          "aic_mte1_time_us": 0.0,
+          "aic_mte1_ratio": 0.0,
+          "aic_mte2_time_us": 0.0,
+          "aic_mte2_ratio": 0.0,
+          "aic_fixpipe_time_us": 0.0,
+          "aic_fixpipe_ratio": 0.0,
+          "aic_icache_miss_rate": 0.0,
+          "aiv_time_us": 37.8321,
+          "aiv_total_cycles": 2458501.32,
+          "aiv_vec_time_us": 29.7748,
+          "aiv_vec_ratio": 0.787,
+          "aiv_scalar_time_us": 4.5768,
+          "aiv_scalar_ratio": 0.121,
+          "aiv_mte2_time_us": 2.4162,
+          "aiv_mte2_ratio": 0.0639,
+          "aiv_mte3_time_us": 2.0567,
+          "aiv_mte3_ratio": 0.0543,
+          "aiv_icache_miss_rate": 0.0,
+          "cube_utilization_pct": 0.0
+        }
+      ]
+    },
+    "artifacts": [
+      {
+        "id": "a001",
+        "kind": "profile_log",
+        "format": "text",
+        "filename": "msprof-base-collection.log",
+        "media_type": "text/plain",
+        "size_bytes": 5031,
+        "download_url": "/profile_artifacts/51db85b03b254e3186058830eaf06839/a001",
+        "local_path": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/gelu_and_mul-endurance-20261022-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0003/sglang_gelu_and_mul-00010-timing/23e2dd2f63a7427ea7d3004229cb3a7e/msprof-base-collection.log",
+        "download_error": null
+      },
+      {
+        "id": "a002",
+        "kind": "vendor_report",
+        "format": "msprof-tar-gz",
+        "filename": "msprof-report.tar.gz",
+        "media_type": "application/gzip",
+        "size_bytes": 147447,
+        "download_url": "/profile_artifacts/51db85b03b254e3186058830eaf06839/a002",
+        "local_path": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/gelu_and_mul-endurance-20261022-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0003/sglang_gelu_and_mul-00010-timing/23e2dd2f63a7427ea7d3004229cb3a7e/msprof-report.tar.gz",
+        "download_error": null
+      },
+      {
+        "id": "a003",
+        "kind": "op_summary",
+        "format": "csv",
+        "filename": "op_summary.csv",
+        "media_type": "text/csv",
+        "size_bytes": 36056,
+        "download_url": "/profile_artifacts/51db85b03b254e3186058830eaf06839/a003",
+        "local_path": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/gelu_and_mul-endurance-20261022-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0003/sglang_gelu_and_mul-00010-timing/23e2dd2f63a7427ea7d3004229cb3a7e/op_summary.csv",
+        "download_error": null
+      },
+      {
+        "id": "a004",
+        "kind": "execution_timeline",
+        "format": "trace-json",
+        "filename": "execution-trace.json",
+        "media_type": "application/json",
+        "size_bytes": 173339,
+        "download_url": "/profile_artifacts/51db85b03b254e3186058830eaf06839/a004",
+        "local_path": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/gelu_and_mul-endurance-20261022-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0003/sglang_gelu_and_mul-00010-timing/23e2dd2f63a7427ea7d3004229cb3a7e/execution-trace.json",
+        "download_error": null
+      }
+    ],
+    "warnings": [
+      "msprof and simulator timing is diagnostic and is not eval latency"
+    ],
+    "error": null,
+    "workload_uuid": "sglang_gelu_and_mul-00010-timing"
+  }
+}

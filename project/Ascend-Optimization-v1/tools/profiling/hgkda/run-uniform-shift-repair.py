@@ -18,6 +18,7 @@ def read(p):return json.loads(p.read_text())
 def main():
     import fcntl
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--parent-batch',required=True)
+    p.add_argument('--variant',choices=['v2'],default='')
     a=p.parse_args()
     if not a.parent_batch.replace('-','').replace('_','').isalnum():raise ValueError('非法批次名')
     parent=TOOLS.parents[2]/'operators/campaigns'/a.parent_batch
@@ -30,7 +31,7 @@ def main():
         shift=next(r for r in primitive['cases'] if r['operation']=='shr16')
         assert shift['status']=='failed' and shift['mismatches']>0
         source=prior/'candidates/philox-compatible/main.py'
-        batch=parent.parent/(a.parent_batch+'-uniform-shift-repair')
+        batch=parent.parent/(a.parent_batch+'-uniform-shift-repair'+('-'+a.variant if a.variant else ''))
         if batch.exists():raise FileExistsError(batch)
         plan=read(parent/'plan.json');record=dict(next(r for r in plan['records'] if r['operator']=='uniform'))
         leaf=batch/record['catalog_leaf'];leaf.parent.mkdir(parents=True,exist_ok=True)
