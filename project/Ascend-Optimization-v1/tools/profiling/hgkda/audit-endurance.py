@@ -160,6 +160,7 @@ def audit(batch):
                 for tensor in [False,True]}
             identities={(r.get('seed'),r.get('offset'),r.get('from_tensor')) for r in manual}
             if (data.get('source_sha256')!=digest or data.get('status')!='passed'
+                    or data.get('checker_sha256')!=plan.get('supplemental_tool_sha256',{}).get('check-uniform-philox.py')
                     or data.get('passed')!=16 or data.get('total')!=16 or len(manual)!=16
                     or identities!=expected_identities
                     or any(r.get('status')!='passed' or r.get('mismatches')!=0

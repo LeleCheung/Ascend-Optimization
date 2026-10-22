@@ -57,6 +57,8 @@ def main():
         record.update(source_sha256=hashlib.sha256(seed.read_bytes()).hexdigest(),seed_origin=str(source))
         plan.update(records=[record],duration_hours=1,parent_batch=args.parent_batch,uniform_philox_check_required=True,
                     policy='独立Philox逐位核验；已证实的整数机制修复另列贡献；保留原18项语义和3项随机状态及一次完整KGS，不用统计通过代替算法正确')
+        plan['supplemental_tool_sha256']={name:hashlib.sha256((TOOLS/name).read_bytes()).hexdigest() for name in
+            ['check-uniform-philox.py','prepare-uniform-philox-repair.py','finish-uniform-philox-repair.py']}
         (batch/'plan.json').write_text(json.dumps(plan,ensure_ascii=False,indent=2)+'\n')
         shutil.copytree(parent/'knowledge',batch/'knowledge')
         spec=importlib.util.spec_from_file_location('uniform_repair_campaign',TOOLS/'run-endurance.py')
