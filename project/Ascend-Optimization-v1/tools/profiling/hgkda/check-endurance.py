@@ -31,6 +31,15 @@ def check(op,source,output):
                     return base[...,0]
                 tol=(1e-4,1e-4) if dtype==torch.float32 else (.015,.015)
                 stream=torch.npu.Stream()
+                if op=='rad2deg_' and case==0:
+                    # 裸启动缓存不得沿用第一次整除输入的n%16假设。先以整除长度
+                    # 填满三个分块档位，再执行后续奇数长度，不只验证"先小后大"顺序。
+                    for warm_n in [2048,65536,1048576]:
+                        warm=tensor((warm_n,));want=torch.rad2deg(warm)
+                        got=m.run(warm);torch.npu.synchronize()
+                        assert got is warm
+                        torch.testing.assert_close(got,want,atol=tol[0],rtol=tol[1],equal_nan=True)
+                    row['cache_primed_with_divisible_lengths']=[2048,65536,1048576]
                 for repetition in range(2):
                     # 所有输入在默认stream建立；同步后再交给另一个stream，避免检查器自己的竞争。
                     if op=='rad2deg_':
