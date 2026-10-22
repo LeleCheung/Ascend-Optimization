@@ -49,3 +49,5 @@ rad2deg_的CC裸启动候选完整评测通过，但原生msprof采集没有产�
 `gelu_and_mul` 的父版独立检查最初错误地假设输入采用 `spec` 配方，因此正式父版评测尚未提交。已修复配方适配，另由 `hanle-endurance-gelu-parent-20261022` 等待主队列和同一卡锁，按同字节固定 FlagGems-SGLang 源码补齐门禁、首次正式完整评测与成对采集，保存到 `endurance-20261022-gelu-parent-repair/`。这属于基础设施修复，不是新增优化；原始故障不覆盖。
 
 第一批结束后的诊断继续供第二批新覆盖层使用：累计积分需保留低精度相邻和、缩放的中间舍入；散射需先修 BF16 累加，父版代表实例的真实 IR 已证实原子写入被逐 lane 循环展开；随机数需使用真实生成器状态及完整高位。具体适用范围、失败源码与建议分别保存在 `knowledge/` 和 `research/`，不能将尚未通过独立门禁的搜索高分发布为有效交付。
+
+SELU 第二批候选的采集分支会把 persistent kernel 切换成普通 tile kernel，四项原生 profiling 也全部失败。另有同 kernel 的元数据修复：采集时通过带当前 Tensor 的 launcher 执行原先选中的计算 kernel，普通模式继续使用裸启动；计算 kernel AST 保持不变。六项 CPU host 分派检查复现了原版换 kernel 的问题，并验证修复后的路径、参数、当前 stream 和每次一次执行，见 `research/selu_/profile-repair-host-cpu.json`。`hanle-endurance-selu-repair-20261022` 等待主批次选定源码，再对采用该结构的入选版本执行63项补充检查、一次正式完整评测及真实采集，独立保存到 `endurance-20261022-selu-profile-repair/`。CPU 检查不代表 NPU 采集已经成功。
