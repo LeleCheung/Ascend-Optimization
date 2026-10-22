@@ -76,6 +76,15 @@ def audit(batch):
         for g in gates:
             if g['source_sha256']!=digest or g['status'].lower()!='passed' or g['passed']!=g['total']:
                 raise ValueError('门禁身份或结果不符')
+            if op=='cumulative_trapezoid':
+                extra=g.get('timing_input_correctness',{})
+                expected_cases=[json.loads(line)['name'] for line in (batch/records[op]['catalog_leaf']/'timing.jsonl').read_text().splitlines() if line.strip()]
+                actual=extra.get('cases',[])
+                if (extra.get('total')!=records[op]['timing_cases'] or extra.get('passed')!=extra.get('total')
+                        or [r['case'] for r in actual]!=expected_cases or any(r['status']!='passed' for r in actual)):
+                    raise ValueError('累计积分性能输入的独立数值检查缺失或失败')
+                if extra.get('contract_sha256')!={name:records[op]['contract_sha256'][name] for name in ['oracle.py','timing.jsonl']}:
+                    raise ValueError('累计积分性能输入语义检查使用了不同合同')
         profile=batch/'research'/op/'final/facts.json'
         profile_state='missing'
         if profile.exists():

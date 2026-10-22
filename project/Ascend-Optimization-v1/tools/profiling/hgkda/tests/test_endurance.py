@@ -17,6 +17,22 @@ def load(name,filename):
 
 
 class EnduranceTests(unittest.TestCase):
+    def test_scan_timing_gate_uses_frozen_large_inputs(self):
+        m=load('endurance_semantics','check-endurance.py')
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);leaf=root/'catalog/ops/cumulative_trapezoid';leaf.mkdir(parents=True)
+            files={'oracle.py':b'def run(y): return y\n',
+                   'timing.jsonl':b'{"name":"large-dot","inputs":{"spec":{"shape":[1024,4096]}}}\n'}
+            for name,data in files.items():(leaf/name).write_bytes(data)
+            record=dict(operator='cumulative_trapezoid',catalog_leaf='catalog/ops/cumulative_trapezoid',timing_cases=1,
+                contract_sha256={n:hashlib.sha256(d).hexdigest() for n,d in files.items()})
+            (root/'plan.json').write_text(json.dumps(dict(records=[record])))
+            source=root/'results/candidate/main.py';source.parent.mkdir(parents=True);source.write_text('')
+            observed,rows=m.cumulative_timing_contract(source)
+            self.assertEqual(observed,leaf);self.assertEqual(rows[0]['inputs']['spec']['shape'],[1024,4096])
+            (leaf/'timing.jsonl').write_text('')
+            with self.assertRaises(ValueError):m.cumulative_timing_contract(source)
+
     def test_uploaded_contract_and_individual_cases_are_verified(self):
         m=load('endurance_audit','audit-endurance.py')
         with tempfile.TemporaryDirectory() as temp:
