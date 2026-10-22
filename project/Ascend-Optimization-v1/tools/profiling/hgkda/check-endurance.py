@@ -29,6 +29,24 @@ def native_timing_contract(source,op):
     raise ValueError('找不到候选所属批次的冻结合同: '+op)
 
 
+def native_timing_inputs(oracle,case,torch,device='npu:0'):
+    if hasattr(oracle,'gen_inputs'):
+        result=oracle.gen_inputs(case,device)
+        if result is not None:return result
+    # SGLang合同使用标准Native随机配方，直接复用KGS的CPU输入生成器，
+    # 保持source_dtype、seed和transforms，再将已转换dtype的Tensor搬到设备。
+    from kernelgen_server.evaluation.workload_runtime import _random_tensor
+    generator=torch.Generator(device='cpu').manual_seed(case.get('seed',0))
+    result={}
+    for key,recipe in case['inputs'].items():
+        if isinstance(recipe,dict) and recipe.get('type')=='random':
+            result[key]=_random_tensor(recipe,generator).to(device=device)
+        elif isinstance(recipe,dict) and recipe.get('type') in ['scalar','literal']:
+            result[key]=recipe['value']
+        else:raise ValueError('未支持的Native输入配方: '+key)
+    return result
+
+
 def uniform_generator_checks(module,torch):
     """检查可复现、状态推进及64位seed/offset高位；不要求与Philox逐值相同。"""
     gen=torch.npu.default_generators[torch.npu.current_device()]
@@ -149,13 +167,17 @@ def check(op,source,output):
                         torch.testing.assert_close(x,before,atol=0.,rtol=0.,equal_nan=True)
                     if op=='uniform':
                         assert actual.shape==x.shape and actual.dtype==dtype and actual.device==x.device
-                        assert torch.isfinite(actual).all()
+                        # Tensor与Python标量直接比较会把边界转成Tensor的低精度dtype。
+                        # 例如FP16的0.89990234375本来小于0.9，却会因比较上界也
+                        # 舍入为0.89990234375而被误拒。非计分检查在CPU FP64核对。
+                        values=actual.detach().cpu().to(torch.float64)
+                        assert torch.isfinite(values).all(),'随机输出含非有限值'
                         if low==high:assert (actual==low).all()
                         else:
-                            assert ((actual>=low)&(actual<high)).all()
-                            z=(actual.float()-low)/(high-low)
-                            assert abs(z.mean().item()-.5)<.025
-                            assert abs(z.var(unbiased=False).item()-1/12)<.012
+                            assert ((values>=low)&(values<high)).all(),f'输出范围[{values.min().item()}, {values.max().item()}]不在[{low}, {high})'
+                            z=(values-low)/(high-low)
+                            assert abs(z.mean().item()-.5)<.025,'随机均值超差'
+                            assert abs(z.var(unbiased=False).item()-1/12)<.012,'随机方差超差'
                             nxt=m.run(*args);torch.npu.synchronize()
                             assert not torch.equal(nxt,actual),'连续两次调用复用了随机输出'
                     else:
@@ -174,10 +196,10 @@ def check(op,source,output):
         oracle=importlib.util.module_from_spec(spec);spec.loader.exec_module(oracle)
         timing_contract={name:hashlib.sha256((leaf/name).read_bytes()).hexdigest() for name in ['oracle.py','timing.jsonl']}
         for case in rows:
-            row=dict(case=case['name'],status='failed',spec=case['inputs']['spec'])
+            row=dict(case=case['name'],status='failed',spec=case['inputs'].get('spec',case['inputs']))
             try:
                 for repetition in range(2):
-                    args=oracle.gen_inputs(case,'npu:0')
+                    args=native_timing_inputs(oracle,case,torch)
                     before={k:v.clone() for k,v in args.items() if isinstance(v,torch.Tensor)}
                     expected=oracle.run(**args);torch.npu.synchronize()
                     stream=torch.npu.Stream()
