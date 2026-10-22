@@ -8,6 +8,8 @@
 
 ## 当前状态
 
+正在执行[六算子夜间连续队列](project/Ascend-Optimization-v1/operators/campaigns/endurance-20261022/README.md)：`selu_`、`rad2deg_`、`cumulative_trapezoid`、`scatter_add`、`uniform`、`gelu_and_mul`。服务器tmux串行运行，自动衔接搜索、补充语义、一次独立完整评测及最终采集；阶段结果不表示整轮完成。最终报告和三端同步验收完成后再更新交付成绩。
+
 最新[缓冲与搬运批次](project/Ascend-Optimization-v1/operators/campaigns/buffer-pointwise-20261022/README.md)已闭环：`log10_` **0.875×**、`selu_` **0.898×**，各36项正式测试与42＋12＋9项补充检查通过，最终真机采集及48项证据核验通过。log10_相对同批父版实际加速**1.125×**；SELU保留上一轮源码，本次分数属于复测结果。新增源码、失败机制、中文简报和一次完整复现命令见该批次；历史成绩如下保留。
 
 2026-10-22的[log10_、selu_成对诊断](project/Ascend-Optimization-v1/operators/campaigns/paired-pointwise-20261022/精简汇报.md)已完成方法接入、源码优化与完整验证：最终完整调用加速比分别为**0.737×、0.790×**，各通过36项正式测试、42＋12项补充检查，最终KGS profiling及成对硬件采集成功，48项证据核验通过；整组尚未达0.8×。小输入定位到启动参数处理，大FP16的SELU从81.6降至45.6微秒；固定后端的UB约束和失败候选一并归档。源码和复现入口见[批次README](project/Ascend-Optimization-v1/operators/campaigns/paired-pointwise-20261022/README.md)。
