@@ -1,0 +1,155 @@
+{
+ "npu_launcher_src": "class NPULauncher(object):\n\n    def __init__(self, src, metadata):\n        self.compile_only = os.getenv(\"TRITON_COMPILE_ONLY\", 'false').lower() in ('true', '1')\n        self.enable_msprof_register_tensor = os.getenv(\"TRITON_REGISTER_TENSOR_MSPROF\",\n                                                       'false').lower() in ('true', '1')\n        debug_mode = metadata.debug\n        header_src = generate_npu_header_src()\n        constants = src.constants if hasattr(src, \"constants\") else dict()\n        cst_key = lambda i: src.fn.arg_names.index(i) if isinstance(i, str) else i\n        constants = {cst_key(key): value for key, value in constants.items()}\n        signature = {cst_key(key): value for key, value in src.signature.items()}\n        wrapper_src = make_launcher(constants, signature, metadata)\n        so_launcher_path = make_npu_launcher_stub(header_src, wrapper_src, metadata.debug)\n        self.metadata = metadata  # FlagPrism\n        # setup for remote run\n        # TODO: use a var to pack all vars required to run on a remote machine\n        self.mix_mode = metadata.mix_mode\n        self.shared = metadata.shared\n        # initialize launcher\n        import importlib.util\n        spec = importlib.util.spec_from_file_location(\"__triton_launcher\", so_launcher_path)\n        mod = importlib.util.module_from_spec(spec)\n        spec.loader.exec_module(mod)\n        self.launch = getattr(mod, \"launch\")\n\n    def __call__(self, *args, **kwargs):\n        if self.compile_only:\n            cache_manager = get_cache_manager(args[5]['hash'])\n            print(\"[INFO]: skip running kernel\")\n            print(f\"[INFO]: The compiled kernel cache is in {cache_manager.cache_dir}\")\n        if self.enable_msprof_register_tensor:\n            tensor_params_shape = get_backend_func(\"get_tensor_params_shape\", *args)\n            # args[5] must be the packed metadata.\n            # Check the launch wrapper in which PyArg_ParseTuple specifies the ordering of args\n            args[5]['tensor_params_shape'] = tensor_params_shape\n        else:\n            if self.compile_only:\n                return\n            debug_enabled = bool(getattr(self.metadata, \"debug_enabled\", False))\n            if debug_enabled:\n                # FlagPrism: use the backend-neutral launch gateway; this\n                # backend only supplies its name and launch state.\n                with _flagprism.debugger_launch_context(\n                        \"ascend\",\n                        self.metadata,\n                        args[:3],\n                        args[3],\n                        args[6],\n                        args[9:],\n                ) as hidden_args:\n                    profiler_registered = self.launch(*args, *hidden_args, **kwargs)\n            else:\n                profiler_registered = self.launch(*args, **kwargs)\n            import triton\n            triton.backends.ascend.utils.TRITON_PROFILER_REGISTERED = True if profiler_registered == 1 else False\n",
+ "launch_doc": "Entry point for all kernels with this signature",
+ "call_arity": {
+  "args11": {
+   "host_us": 6.382,
+   "total_us": 6.418
+  },
+  "args10": {
+   "error": "TypeError('function takes exactly 11 arguments (10 given)')"
+  },
+  "args9": {
+   "error": "TypeError('function takes exactly 11 arguments (9 given)')"
+  },
+  "args8": {
+   "error": "TypeError('function takes exactly 11 arguments (8 given)')"
+  },
+  "args6": {
+   "error": "TypeError('function takes exactly 11 arguments (6 given)')"
+  },
+  "args5": {
+   "error": "TypeError('function takes exactly 11 arguments (5 given)')"
+  }
+ },
+ "fp16_4096x4096": {
+  "torch": {
+   "host_us": 5.107,
+   "total_us": 15.961
+  },
+  "cand_run": {
+   "host_us": 12.611,
+   "total_us": 33.938
+  },
+  "tile_b8192": {
+   "host_us": 51.95,
+   "total_us": 77.259
+  },
+  "tile_b16384": {
+   "host_us": 51.492,
+   "total_us": 51.682
+  },
+  "tile_b32768": {
+   "host_us": 51.764,
+   "total_us": 51.911
+  },
+  "chunk_p20_b8192": {
+   "host_us": 55.61,
+   "total_us": 84.689
+  },
+  "chunk_p20_b16384": {
+   "host_us": 56.013,
+   "total_us": 70.342
+  },
+  "chunk_p40_b8192": {
+   "host_us": 57.8,
+   "total_us": 58.039
+  },
+  "chunk_p40_b16384": {
+   "host_us": 55.571,
+   "total_us": 55.777
+  },
+  "chunk_p80_b8192": {
+   "host_us": 55.827,
+   "total_us": 56.024
+  },
+  "chunk_p80_b16384": {
+   "host_us": 56.571,
+   "total_us": 56.779
+  },
+  "stride_p40_b8192": {
+   "host_us": 55.432,
+   "total_us": 55.642
+  },
+  "stride_p40_b16384": {
+   "host_us": 54.608,
+   "total_us": 54.815
+  },
+  "stride_p80_b8192": {
+   "host_us": 54.943,
+   "total_us": 55.154
+  },
+  "stride_p80_b16384": {
+   "host_us": 55.428,
+   "total_us": 55.624
+  }
+ },
+ "fp32_4096x4096": {
+  "torch": {
+   "host_us": 8.979,
+   "total_us": 25.925
+  },
+  "cand_run": {
+   "host_us": 14.658,
+   "total_us": 39.023
+  },
+  "tile_b8192": {
+   "host_us": 52.911,
+   "total_us": 77.552
+  },
+  "tile_b16384": {
+   "host_us": 53.59,
+   "total_us": 53.826
+  },
+  "tile_b32768": {
+   "host_us": 53.249,
+   "total_us": 53.437
+  },
+  "chunk_p20_b8192": {
+   "host_us": 54.693,
+   "total_us": 88.458
+  },
+  "chunk_p20_b16384": {
+   "host_us": 54.822,
+   "total_us": 75.997
+  },
+  "chunk_p40_b8192": {
+   "host_us": 54.312,
+   "total_us": 54.528
+  },
+  "chunk_p40_b16384": {
+   "host_us": 55.795,
+   "total_us": 55.994
+  },
+  "chunk_p80_b8192": {
+   "host_us": 54.713,
+   "total_us": 54.952
+  },
+  "chunk_p80_b16384": {
+   "host_us": 54.951,
+   "total_us": 55.174
+  },
+  "stride_p40_b8192": {
+   "host_us": 53.881,
+   "total_us": 54.092
+  },
+  "stride_p40_b16384": {
+   "host_us": 56.992,
+   "total_us": 57.167
+  },
+  "stride_p80_b8192": {
+   "host_us": 58.974,
+   "total_us": 59.172
+  },
+  "stride_p80_b16384": {
+   "host_us": 57.423,
+   "total_us": 57.621
+  }
+ },
+ "chunk_check_1025": {
+  "max_abs_err": 0.0
+ },
+ "chunk_check_4096": {
+  "max_abs_err": 0.0
+ }
+}

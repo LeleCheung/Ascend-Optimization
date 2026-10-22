@@ -8,6 +8,8 @@
 
 ## 当前状态
 
+最新[缓冲与搬运批次](project/Ascend-Optimization-v1/operators/campaigns/buffer-pointwise-20261022/README.md)已闭环：`log10_` **0.875×**、`selu_` **0.898×**，各36项正式测试与42＋12＋9项补充检查通过，最终真机采集及48项证据核验通过。log10_相对同批父版实际加速**1.125×**；SELU保留上一轮源码，本次分数属于复测结果。新增源码、失败机制、中文简报和一次完整复现命令见该批次；历史成绩如下保留。
+
 2026-10-22的[log10_、selu_成对诊断](project/Ascend-Optimization-v1/operators/campaigns/paired-pointwise-20261022/精简汇报.md)已完成方法接入、源码优化与完整验证：最终完整调用加速比分别为**0.737×、0.790×**，各通过36项正式测试、42＋12项补充检查，最终KGS profiling及成对硬件采集成功，48项证据核验通过；整组尚未达0.8×。小输入定位到启动参数处理，大FP16的SELU从81.6降至45.6微秒；固定后端的UB约束和失败候选一并归档。源码和复现入口见[批次README](project/Ascend-Optimization-v1/operators/campaigns/paired-pointwise-20261022/README.md)。
 
 后续汇报遵循[实验归属与汇报口径](docs/实验归属与汇报口径.md)：FlagGems与FlagGems-SGLang分别成表，简表采用“当前优化版”，写清Codex参与，不将混合流程成绩称为纯原生KG独立效果。

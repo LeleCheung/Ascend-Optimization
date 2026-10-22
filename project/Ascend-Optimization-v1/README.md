@@ -34,7 +34,7 @@ Ascend-Optimization-v1/
 
 ## 阅读入口
 
-最新结果：[log10_、selu_成对诊断与优化](operators/campaigns/paired-pointwise-20261022/README.md)。最终0.737×、0.790×，完整正确性与两侧采集闭环；尚未达到0.8×。源码、简报和一次完整复现命令均在该批次内。
+最新结果：[log10_、selu_缓冲与搬运优化](operators/campaigns/buffer-pointwise-20261022/README.md)。最终0.875×、0.898×；log10_相对同批父版实际加速1.125×，SELU保留旧源码。各36项正式测试及42＋12＋9项补充检查通过，最终采集和48项证据核验闭环。源码、简报和一次完整复现命令均在该批次内；上轮0.737×、0.790×保留在[历史成对批次](operators/campaigns/paired-pointwise-20261022/README.md)。
 
 | 入口 | 用途 |
 |---|---|

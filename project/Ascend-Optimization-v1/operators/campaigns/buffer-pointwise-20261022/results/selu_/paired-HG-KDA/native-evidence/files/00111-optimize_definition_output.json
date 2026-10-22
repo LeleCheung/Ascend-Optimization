@@ -1,0 +1,217 @@
+{
+  "definition_name": "selu_",
+  "op_type": "",
+  "status": "PASSED",
+  "best_geo_mean": 0.8839578790022817,
+  "best_code": "# Copyright 2026 FlagOS Contributors\n# SPDX-License-Identifier: Apache-2.0\n# HG-KDA/CC诊断＋Codex整合：当前地址、当前stream、完整stride；按dtype控制UB分块。\n\"\"\"SELU原地计算：轻量启动、完整stride、按dtype控制分块；本次输入地址和stream每次读取。\n\n宿主快路径按 numel 建表（不是 (numel, 对齐) 元组），Tensor 方法在模块级绑定，\nlauncher 闭包只接收本 Tensor 与本次地址；每次调用仍然读取本次地址、dtype、\n连续性、以及当前 stream，对齐条件只用于选择 launcher 形态。\n\"\"\"\n\ndef _hgkda_address_type(n):\n\n    class DeviceAddress(int):\n\n        def size(self):\n            return (n,)\n    return DeviceAddress\nimport torch\nimport torch_npu\nimport triton\nimport triton.language as tl\n_BLOCK_MAX = 32768\n_BLOCK_MIN = 1024\n_BLOCK_TARGET_PROGRAMS = 8\n_BLOCK_STRIDED = 1024\n\n@triton.jit\ndef _selu_nomask(X, BLOCK: tl.constexpr):\n    \"\"\"numel % BLOCK == 0 (host-guarded), so the tail mask can be dropped.\"\"\"\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    x = tl.load(X + offs)\n    if X.dtype.element_ty == tl.float16:\n        y = 1.0507009873554805 * tl.where(x > 0, x, 1.6732632423543772 * (tl.exp(x) - 1.0))\n    else:\n        xf = x.to(tl.float32)\n        y = 1.0507009873554805 * tl.where(xf > 0, xf, 1.6732632423543772 * (tl.exp(xf) - 1.0))\n    tl.store(X + offs, y.to(X.dtype.element_ty))\n\n@triton.jit\ndef _selu_masked(X, N, BLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < N\n    x = tl.load(X + offs, mask=mask)\n    if X.dtype.element_ty == tl.float16:\n        y = 1.0507009873554805 * tl.where(x > 0, x, 1.6732632423543772 * (tl.exp(x) - 1.0))\n    else:\n        xf = x.to(tl.float32)\n        y = 1.0507009873554805 * tl.where(xf > 0, xf, 1.6732632423543772 * (tl.exp(xf) - 1.0))\n    tl.store(X + offs, y.to(X.dtype.element_ty), mask=mask)\n\n@triton.jit\ndef _selu_strided(X, N: tl.constexpr, SHAPE: tl.constexpr, STRIDES: tl.constexpr, BLOCK: tl.constexpr):\n    \"\"\"Non-contiguous input: logical index -> storage offset, written in place.\"\"\"\n    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    remainder = index\n    offset = tl.full((BLOCK,), 0, tl.int64)\n    for axis in tl.static_range(len(SHAPE) - 1, -1, -1):\n        coord = remainder % SHAPE[axis]\n        remainder = remainder // SHAPE[axis]\n        offset += coord.to(tl.int64) * STRIDES[axis]\n    x = tl.load(X + offset, index < N, other=1)\n    if X.dtype.element_ty == tl.float16:\n        y = 1.0507009873554805 * tl.where(x > 0, x, 1.6732632423543772 * (tl.exp(x) - 1.0))\n    else:\n        xf = x.to(tl.float32)\n        y = 1.0507009873554805 * tl.where(xf > 0, xf, 1.6732632423543772 * (tl.exp(xf) - 1.0))\n    tl.store(X + offset, y.to(X.dtype.element_ty), index < N)\n_TAB = {}\n_numel = torch.Tensor.numel\n_data_ptr = torch.Tensor.data_ptr\n_is_contiguous = torch.Tensor.is_contiguous\n_TAB_GET = _TAB.get\n_STREAM = {}\n\ndef _pick_block(n, dtype):\n    maximum = 16384 if dtype is torch.float16 else 8192\n    if n >= maximum * _BLOCK_TARGET_PROGRAMS:\n        return maximum\n    target = -(-n // _BLOCK_TARGET_PROGRAMS)\n    block = _BLOCK_MIN\n    while block < target:\n        block <<= 1\n    return min(block, maximum)\n\ndef _resolve_stream(device):\n    \"\"\"Cheapest faithful current-stream accessor for this device, resolved once.\"\"\"\n    getter = _STREAM.get(device)\n    if getter is not None:\n        return getter\n    raw = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\n    if raw is not None:\n        try:\n            want = int(torch.npu.current_stream().npu_stream)\n            try:\n                if int(raw(device)) == want:\n                    getter = lambda: raw(device)\n            except TypeError:\n                if int(raw()) == want:\n                    getter = raw\n        except Exception:\n            getter = None\n    if getter is None:\n        from triton.runtime import driver\n        getter = lambda: driver.active.get_current_stream(device)\n    _STREAM[device] = getter\n    return getter\n\ndef _standard_launch(n, block, masked):\n    \"\"\"Ordinary Triton launch: no alignment assumption, safe for any pointer.\"\"\"\n    if masked:\n\n        def launch(X, ptr, n=n, block=block):\n            _selu_masked[triton.cdiv(n, block),](X, n, BLOCK=block)\n    else:\n\n        def launch(X, ptr, n=n, block=block):\n            _selu_nomask[n // block,](X, BLOCK=block)\n    return launch\n\ndef _make_launch(A, n):\n    \"\"\"Build (aligned launcher, fallback launcher); both take (tensor, address).\"\"\"\n    block = _pick_block(n, A.dtype)\n    masked = bool(n % block)\n    standard = _standard_launch(n, block, masked)\n    if _data_ptr(A) & 15:\n        return (standard, standard)\n    try:\n        if masked:\n            compiled = _selu_masked.warmup(A, n, BLOCK=block, grid=(1,))\n            grid = triton.cdiv(n, block)\n        else:\n            compiled = _selu_nomask.warmup(A, BLOCK=block, grid=(1,))\n            grid = n // block\n        launcher = compiled.run\n        if getattr(launcher, 'compile_only', False) or getattr(launcher, 'enable_msprof_register_tensor', False) or getattr(launcher.metadata, 'debug_enabled', False):\n            return (standard, standard)\n        call = launcher.launch\n        function = compiled.function\n        metadata = compiled.packed_metadata\n        stream = _resolve_stream(A.device.index)\n    except Exception:\n        return (standard, standard)\n    if masked:\n\n        def launch(X, ptr, grid=grid, call=call, function=function, metadata=metadata, stream=stream, n=n, *, _address=_hgkda_address_type(n)):\n            call(grid, 1, 1, stream(), function, metadata, None, None, None, _address(ptr), n, None)\n    else:\n\n        def launch(X, ptr, grid=grid, call=call, function=function, metadata=metadata, stream=stream, *, _address=_hgkda_address_type(n)):\n            call(grid, 1, 1, stream(), function, metadata, None, None, None, _address(ptr), None)\n    return (launch, standard)\n\ndef _dispatch(A):\n    n = _numel(A)\n    ptr = _data_ptr(A)\n    if n == 0:\n        return A\n    if not _is_contiguous(A):\n        _selu_strided[triton.cdiv(n, _BLOCK_STRIDED),](A, n, tuple(A.shape), tuple(A.stride()), BLOCK=_BLOCK_STRIDED)\n        return A\n    pair = _make_launch(A, n)\n    _TAB[n] = (A.dtype, pair[0], pair[1])\n    pair[1 if ptr & 15 else 0](A, ptr)\n    return A\n\ndef run(A):\n    ptr = _data_ptr(A)\n    entry = _TAB_GET(_numel(A))\n    if entry is not None and entry[0] is A.dtype and _is_contiguous(A):\n        entry[1 + ((ptr & 15) != 0)](A, ptr)\n        return A\n    return _dispatch(A)\n",
+  "search_best_geo_mean": 0.8839117631467809,
+  "final_verification": {
+    "status": "PASSED",
+    "reason_code": "VERIFIED",
+    "geo_mean": 0.8839578790022817,
+    "measured_geo_mean": 0.8839578790022817,
+    "comparisons": [
+      {
+        "uuid": "selu_-timing-0",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011773487710259274,
+          "latency_ms": 0.012848448172297867
+        },
+        "after": {
+          "reference_latency_ms": 0.011501360679708474,
+          "latency_ms": 0.01253371336585019
+        },
+        "ratios": {
+          "reference_latency_ms": 0.976886455632542,
+          "latency_ms": 0.9755040607062364
+        }
+      },
+      {
+        "uuid": "selu_-timing-1",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.01380401995055037,
+          "latency_ms": 0.012661435198749247
+        },
+        "after": {
+          "reference_latency_ms": 0.012537869456272005,
+          "latency_ms": 0.013440752219104993
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9082766832550192,
+          "latency_ms": 1.0615504489122
+        }
+      },
+      {
+        "uuid": "selu_-timing-2",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011364793503461144,
+          "latency_ms": 0.012410319556764624
+        },
+        "after": {
+          "reference_latency_ms": 0.011793379204654139,
+          "latency_ms": 0.01319087093885359
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0377117015863482,
+          "latency_ms": 1.0628953491905455
+        }
+      },
+      {
+        "uuid": "selu_-timing-3",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.0569201487591617,
+          "latency_ms": 0.04560250249548087
+        },
+        "after": {
+          "reference_latency_ms": 0.05692221432438235,
+          "latency_ms": 0.04562542772756445
+        },
+        "ratios": {
+          "reference_latency_ms": 1.000036288823302,
+          "latency_ms": 1.0005027187287772
+        }
+      },
+      {
+        "uuid": "selu_-timing-4",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011489563734347898,
+          "latency_ms": 0.012586754321262437
+        },
+        "after": {
+          "reference_latency_ms": 0.011794497673075763,
+          "latency_ms": 0.012951526449098598
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0265400798305568,
+          "latency_ms": 1.0289806346041062
+        }
+      },
+      {
+        "uuid": "selu_-timing-5",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011262338774280458,
+          "latency_ms": 0.012543138069199338
+        },
+        "after": {
+          "reference_latency_ms": 0.011570186860259596,
+          "latency_ms": 0.01314180815146459
+        },
+        "ratios": {
+          "reference_latency_ms": 1.02733429460337,
+          "latency_ms": 1.0477288920015426
+        }
+      },
+      {
+        "uuid": "selu_-timing-6",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.010852150043469415,
+          "latency_ms": 0.012531085160524022
+        },
+        "after": {
+          "reference_latency_ms": 0.011912766038526666,
+          "latency_ms": 0.012947128072467506
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0977332593825964,
+          "latency_ms": 1.0332008686090588
+        }
+      },
+      {
+        "uuid": "selu_-timing-7",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.059111418346039224,
+          "latency_ms": 0.08330983362795497
+        },
+        "after": {
+          "reference_latency_ms": 0.059035335486169675,
+          "latency_ms": 0.08328495138830184
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9987128906394335,
+          "latency_ms": 0.9997013288999683
+        }
+      },
+      {
+        "uuid": "selu_-timing-8",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.012103940174038519,
+          "latency_ms": 0.013386736754661122
+        },
+        "after": {
+          "reference_latency_ms": 0.0117359195178462,
+          "latency_ms": 0.012525278925827657
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9695949706541283,
+          "latency_ms": 0.935648407478132
+        }
+      },
+      {
+        "uuid": "selu_-timing-9",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011739916753817367,
+          "latency_ms": 0.013323557142851356
+        },
+        "after": {
+          "reference_latency_ms": 0.011842301827759293,
+          "latency_ms": 0.013221140712159483
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0087211073203424,
+          "latency_ms": 0.9923131315763657
+        }
+      },
+      {
+        "uuid": "selu_-timing-10",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.010804848647153082,
+          "latency_ms": 0.012440401939801051
+        },
+        "after": {
+          "reference_latency_ms": 0.011774011632043406,
+          "latency_ms": 0.012980932157776215
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0896970440345488,
+          "latency_ms": 1.043449578284591
+        }
+      },
+      {
+        "uuid": "selu_-timing-11",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.05268066299787324,
+          "latency_ms": 0.09216644616050305
+        },
+        "after": {
+          "reference_latency_ms": 0.04951346516438729,
+          "latency_ms": 0.08267946059293117
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9398793095369014,
+          "latency_ms": 0.8970668181015595
+        }
+      }
+    ],
+    "drift": [],
+    "drift_factor": 2.0,
+    "compared_to": "original_round",
+    "attempt_path": ".kernelgen/retests/9ac565b2a89fc4f4da3c38bfd231cf2da46e57705344d596d51ac27a34c27aa8/08ab15502f2a70d725589e83842e6cfe7cef83cb4f1dcc9dbfe926f760f936de/attempt-0001.json",
+    "round_num": 2,
+    "solution_sha256": "9ac565b2a89fc4f4da3c38bfd231cf2da46e57705344d596d51ac27a34c27aa8"
+  },
+  "rounds": 3,
+  "summary": "Three measured rounds on Ascend 910B4 (all 36 workloads passing throughout): the seed scored geo_mean 0.825, and profiling plus target probes showed two distinct regimes — nine of twelve timing workloads are host-launch bound (1.65 us device task against a 13.2 us walltime) while the three large ones are bound by MTE transfer count, not bytes or program count. Rewriting the per-call host dispatch (module-bound Tensor methods, numel-keyed table, single-frame launcher call, still reading this call's address, dtype, contiguity and stream) raised geo_mean to 0.884 as the best round; the follow-up bf16 narrowing to fp16-width math did deliver its predicted device win (selu_-timing-7 83.3 -> 63.5 us, 0.710 -> 0.932) but the round scored 0.873 because the byte-identical fp16/fp32 small workloads and their references drifted +12% together, so it was reverted per the ledger. Key lesson: on this shared card a cross-round geo_mean at the ~12 us scale is noise-dominated — verify with retest or per-workload device durations, and note that fp32 large is pinned at BLOCK 8192 because every fp32-domain BLOCK 16384 form overflows UB.",
+  "workspace": "/data/hanle/ascend-optimization/runs/buffer-pointwise-20261022/kg-runs/selu_-buffer-pointwise-20261022-paired-hgkda/stages/optimize/work"
+}

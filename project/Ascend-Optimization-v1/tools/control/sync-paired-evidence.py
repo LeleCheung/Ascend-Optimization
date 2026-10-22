@@ -12,8 +12,8 @@ REMOTE_PACK = r'''
 from pathlib import Path
 import hashlib,io,json,tarfile
 root=Path('/data/hanle/ascend-optimization')
-batch=root/'Ascend-Optimization/project/Ascend-Optimization-v1/operators/campaigns/paired-pointwise-20261022'
-target=root/'runs/paired-pointwise-20261022'/parameters['snapshot']
+batch=root/'Ascend-Optimization/project/Ascend-Optimization-v1/operators/campaigns'/parameters['batch']
+target=root/'runs'/parameters['batch']/parameters['snapshot']
 if target.exists():raise ValueError('snapshot already exists')
 files=[]
 for p in sorted(batch.rglob('*')):
@@ -40,18 +40,24 @@ print(json.dumps({'path':str(target),'size_bytes':target.stat().st_size,
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--snapshot',required=True,help='不可重用的归档名，例如 paired-final-20261022-v1.tar.gz')
+    p.add_argument('--batch',default='paired-pointwise-20261022')
+    p.add_argument('--allow-update',nargs='*',default=[],help='明确允许更新的项目相对证据；旧字节自动备份')
     a=p.parse_args()
     if PurePosixPath(a.snapshot).name!=a.snapshot or not a.snapshot.endswith('.tar.gz'):
         raise ValueError('非法归档名')
+    if not a.batch.replace('-', '').replace('_', '').isalnum():
+        raise ValueError('非法批次名')
     s=importlib.util.spec_from_file_location('paired_control',Path(__file__).with_name('control.py'))
     c=importlib.util.module_from_spec(s);s.loader.exec_module(c)
-    meta=json.loads(c.remote_python('baai-910b',{'snapshot':a.snapshot},REMOTE_PACK))
+    for name in a.allow_update:
+        c.relative_name(name)
+    meta=json.loads(c.remote_python('baai-910b',{'snapshot':a.snapshot,'batch':a.batch},REMOTE_PACK))
     if meta['size_bytes']>c.MAX_BYTES:raise ValueError('压缩归档超过256MiB')
     data=c.remote_python('baai-910b',{'path':meta['path']},
         "from pathlib import Path\nimport sys\nsys.stdout.buffer.write(Path(parameters['path']).read_bytes())\n")
     if len(data)!=meta['size_bytes'] or hashlib.sha256(data).hexdigest()!=meta['sha256']:
         raise ValueError('下载字节与远端回执不同')
-    batch=c.PROJECT/'operators/campaigns/paired-pointwise-20261022'
+    batch=c.PROJECT/'operators/campaigns'/a.batch
     pending=[]
     with tarfile.open(fileobj=io.BytesIO(data),mode='r:gz') as archive:
         manifest=json.load(archive.extractfile('_snapshot-manifest.json'))
@@ -73,7 +79,8 @@ def main():
             target.resolve().relative_to(batch.resolve())
             old=target.read_bytes() if target.exists() else None
             if old is not None and old!=content:
-                if entry.name.endswith('-state.json') or '-state-' in target.name or entry.name=='queue-state.json':
+                if (entry.name.endswith('-state.json') or '-state-' in target.name
+                        or entry.name=='queue-state.json' or entry.name in a.allow_update):
                     pass
                 else:raise ValueError('本地已有不同证据：'+entry.name)
             pending.append((target,content,old))

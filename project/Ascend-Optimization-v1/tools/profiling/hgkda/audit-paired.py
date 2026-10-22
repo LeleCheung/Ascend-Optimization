@@ -24,14 +24,16 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--batch-dir',type=Path,required=True)
     p.add_argument('--output',type=Path,required=True)
+    p.add_argument('--tag', default='final-v6', help='对应completion-state与deliverables的最终版本名')
     a=p.parse_args();b=a.batch_dir
+    if not a.tag.replace('-', '').isalnum():raise ValueError('非法最终版本名')
     if a.output.exists():raise ValueError('验收记录已存在')
     tools=Path(__file__).resolve().parent
     exporter=load_module('paired_audit_exporter',tools/'export-paired-deliverables.py')
     compare=load_module('paired_audit_compare',tools/'skills/hgkda/scripts/compare_opprof.py')
-    state=json.loads((b/'completion-state-final-v6.json').read_text())
+    state=json.loads((b/('completion-state-'+a.tag+'.json')).read_text())
     if state['status']!='completed':raise ValueError('最终队列未结束')
-    delivery=json.loads((b/'deliverables-final-v6/manifest.json').read_text())
+    delivery=json.loads((b/('deliverables-'+a.tag)/'manifest.json').read_text())
     if not delivery['dense_gate_required'] or delivery['final_repeats']!=1:raise ValueError('最终门禁配置不符')
     checks=[]
     def checked(kind,**data):checks.append(dict(kind=kind,**data))
@@ -45,10 +47,13 @@ def main():
         verified=exporter.read_arm(b,op,selected['arm'],require_dense=True)
         if not verified or verified['source_sha256']!=selected['source_sha256']:
             raise ValueError('交付与完整评测身份不符')
+        if (b/'require-range-gate.json').exists() and verified['range_cases'] != 9:
+            raise ValueError('本批交付缺少9项数值范围门禁')
         delivered=local(b,row['delivered'])
         if exporter.sha(delivered)!=verified['source_sha256']:raise ValueError('交付字节不同')
         checked('delivery',operator=op,source_sha256=verified['source_sha256'],geo_mean=verified['geo_mean'],
-                formal=verified['workloads'],semantics=verified['semantics_cases'],dense=verified['dense_cases'])
+                formal=verified['workloads'],semantics=verified['semantics_cases'],dense=verified['dense_cases'],
+                ranges=verified['range_cases'])
         proof=state['results'][op]
         if proof['source_sha256']!=verified['source_sha256']:raise ValueError('采集源码不同')
         response_path=local(b,proof['kgs_profile']);response=json.loads(response_path.read_text())

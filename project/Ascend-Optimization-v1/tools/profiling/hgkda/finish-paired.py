@@ -18,14 +18,27 @@ def main():
     p.add_argument('--suffix', default='profilemeta-v3')
     p.add_argument('--wait-suffixes', nargs='+')
     p.add_argument('--arms', nargs='+')
+    p.add_argument('--batch', default='paired-pointwise-20261022')
+    p.add_argument('--wait-kg', action='store_true', help='等待本批KG终态，再检查候选队列')
+    p.add_argument('--skip-backfill', action='store_true', help='本批各来源已完成快路径门禁，不补旧批次来源')
     a = p.parse_args()
     if not a.suffix.replace('-', '').isalnum():
         raise ValueError('非法候选版本')
+    if not a.batch.replace('-', '').replace('_', '').isalnum():
+        raise ValueError('非法批次名')
     tools = Path(__file__).resolve().parent
     root = Path('/data/hanle/ascend-optimization')
     s = importlib.util.spec_from_file_location('paired_finish_queue', tools/'run-nightly.py')
     m = importlib.util.module_from_spec(s);s.loader.exec_module(m)
-    q = m.Queue('paired-pointwise-20261022',root,'tle_yy')
+    q = m.Queue(a.batch,root,'tle_yy')
+    additional = q.batch/'additional-candidate-queues.json'
+    if additional.exists():
+        extra=json.loads(additional.read_text())
+        suffixes=extra['suffixes']
+        if not all(s.replace('-', '').isalnum() for s in suffixes):
+            raise ValueError('非法追加候选版本')
+        a.wait_suffixes=list(dict.fromkeys((a.wait_suffixes or [a.suffix])+suffixes))
+        a.arms=list(dict.fromkeys((a.arms or ['codex-'+a.suffix])+['codex-'+s for s in suffixes]))
     path = q.batch/('completion-state-'+a.suffix+'.json')
     if path.exists():
         raise ValueError('终验已有状态，不重复提交设备请求')
@@ -36,6 +49,12 @@ def main():
     try:
         while True:
             values=[]
+            if a.wait_kg:
+                kg_path = q.batch/'kg-paired-state.json'
+                kg = json.loads(kg_path.read_text()) if kg_path.exists() else {}
+                if kg.get('status') == 'needs_attention':
+                    raise RuntimeError('前序KG控制器异常，先检查原始日志')
+                values.append(kg.get('status') == 'completed')
             for suffix in (a.wait_suffixes or [a.suffix]):
                 candidate = q.batch/('candidate-state-'+suffix+'.json')
                 if candidate.exists():
@@ -55,7 +74,7 @@ def main():
             state['status']='running';m.save(path,state)
             # 为原成绩补独立快路径门禁，不重新跑其正式性能，保留一次完整评测口径。
             for op in ['log10_','selu_']:
-                for arm in ['codex-rawptr-v1','paired-HG-KDA']:
+                for arm in ([] if a.skip_backfill else ['codex-rawptr-v1','paired-HG-KDA']):
                     directory=q.batch/'results'/op/arm
                     semantic=directory/'semantics.json'
                     if not semantic.exists() or json.loads(semantic.read_text())['status']!='passed':
@@ -67,6 +86,27 @@ def main():
                         q.run('dense-'+op+'-'+arm,quote([q.py,tools/'check-dense-pointwise.py',
                             '--operator',op,'--source',source,'--output',output]),1800)
             delivery=q.batch/('deliverables-'+a.suffix)
+            range_policy = q.batch/'require-range-gate.json'
+            if range_policy.exists():
+                policy = json.loads(range_policy.read_text())
+                checker = tools/'check-pointwise-ranges.py'
+                if policy['checker_sha256'] != hashlib.sha256(checker.read_bytes()).hexdigest():
+                    raise ValueError('冻结数值范围门禁与检查器身份不同')
+                for op in ['log10_', 'selu_']:
+                    for arm in (a.arms or ['codex-'+a.suffix]):
+                        directory = q.batch/'results'/op/arm
+                        dense = directory/'dense-semantics.json'
+                        if not dense.exists() or json.loads(dense.read_text())['status'] != 'passed':
+                            continue
+                        source = (q.batch/'candidates'/(op+'-'+arm[len('codex-'):]+'.py')
+                                  if arm.startswith('codex-') else directory/'export/main.py')
+                        ranges = directory/'range-semantics.json'
+                        if not ranges.exists():
+                            try:
+                                q.run('ranges-'+op+'-'+arm, quote([q.py,checker,'--operator',op,
+                                    '--source',source,'--output',ranges]),1800)
+                            except RuntimeError:
+                                if not ranges.exists():raise
             # 本次正式交付要求元数据适配版本；旧的裸地址版本保留为历史性能证据。
             q.run('export-final-'+a.suffix,quote([q.py,tools/'export-paired-deliverables.py',
                 '--batch-dir',q.batch,'--output',delivery,'--require-dense','--arms']

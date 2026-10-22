@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """成对诊断后的独立Codex候选验证；先语义，再一次正式KGS评测。"""
 import argparse
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -11,16 +12,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--suffix', default='rawptr-v1')
     parser.add_argument('--dense', action='store_true')
+    parser.add_argument('--batch', default='paired-pointwise-20261022')
     parser.add_argument('--operators', nargs='+', choices=['log10_', 'selu_'], default=['log10_', 'selu_'])
     args = parser.parse_args()
     if not args.suffix.replace('-', '').isalnum():
         raise ValueError('非法候选后缀')
+    if not args.batch.replace('-', '').replace('_', '').isalnum():
+        raise ValueError('非法批次名')
     root = Path('/data/hanle/ascend-optimization')
     tools = Path(__file__).resolve().parent
     s = importlib.util.spec_from_file_location('paired_candidate_queue', tools/'run-nightly.py')
     m = importlib.util.module_from_spec(s)
     s.loader.exec_module(m)
-    queue = m.Queue('paired-pointwise-20261022', root, 'tle_yy')
+    queue = m.Queue(args.batch, root, 'tle_yy')
     state_path = queue.batch/('candidate-state-v1.json' if args.suffix == 'rawptr-v1'
                              else 'candidate-state-'+args.suffix+'.json')
     if state_path.exists():
@@ -34,6 +38,36 @@ def main():
             for op in args.operators:
                 queue.idle()
                 source = queue.batch/'candidates'/(op+'-'+args.suffix+'.py')
+                digest = hashlib.sha256(source.read_bytes()).hexdigest()
+                reused = None
+                for previous in sorted((queue.batch/'results'/op).glob('*')):
+                    semantics = previous/'semantics.json'
+                    dense_check = previous/'dense-semantics.json'
+                    if not semantics.exists():continue
+                    sem = json.loads(semantics.read_text())
+                    if sem.get('source_sha256') != digest or sem.get('status') != 'passed':continue
+                    if args.dense:
+                        if not dense_check.exists():continue
+                        dense_result = json.loads(dense_check.read_text())
+                        if (dense_result.get('source_sha256') != digest or dense_result.get('status') != 'passed'):
+                            continue
+                    results = list((previous/'formal').glob('*.result.json'))
+                    if len(results) != 1:continue
+                    result = json.loads(results[0].read_text())
+                    request = results[0].with_name(results[0].name.replace('.result.json', '.request.json'))
+                    if not request.exists():continue
+                    submitted = json.loads(request.read_text())['implementation']['sources']
+                    if (result.get('status') != 'PASSED' or result.get('num_passed') != 36
+                            or result.get('num_workloads') != 36 or len(submitted) != 1
+                            or submitted[0]['content'] != source.read_text()):continue
+                    reused = dict(status='reused_existing', source_sha256=digest,
+                        existing_arm=previous.name, evidence=str(results[0]), scores=[result['geo_mean']],
+                        reason='同批同字节源码已有完整门禁与一次正式评测，不重复计时')
+                    break
+                if reused:
+                    state['results'][op] = reused
+                    m.save(state_path, state)
+                    continue
                 output = queue.batch/'results'/op/('codex-'+args.suffix)
                 output.mkdir(parents=True, exist_ok=True)
                 state.update(status='running', current_operator=op)

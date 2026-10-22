@@ -1,0 +1,238 @@
+{
+  "request": {
+    "api_version": "v6.2",
+    "evaluation_id": "6d38cc441f5218ecf1735b5206822b9659ed4f276c993c85d107e812533a78f6:round-2",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:33cb3c607a86088c6cbbfdc7b81ad7be7fec72735fb292a6cdaf4d9bcb9b2c96",
+      "definition": "selu_"
+    },
+    "implementation": {
+      "name": "kernelgen-candidate-selu_",
+      "definition": "selu_",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "# Copyright 2026 FlagOS Contributors\n# SPDX-License-Identifier: Apache-2.0\n# HG-KDA/CC诊断＋Codex整合：当前地址、当前stream、完整stride；按dtype控制UB分块。\n\"\"\"SELU原地计算：轻量启动、完整stride、按dtype控制分块；本次输入地址和stream每次读取。\n\n宿主快路径按 numel 建表（不是 (numel, 对齐) 元组），Tensor 方法在模块级绑定，\nlauncher 闭包只接收本 Tensor 与本次地址；每次调用仍然读取本次地址、dtype、\n连续性、以及当前 stream，对齐条件只用于选择 launcher 形态。\n\"\"\"\n\ndef _hgkda_address_type(n):\n\n    class DeviceAddress(int):\n\n        def size(self):\n            return (n,)\n    return DeviceAddress\nimport torch\nimport torch_npu\nimport triton\nimport triton.language as tl\n_BLOCK_MAX = 32768\n_BLOCK_MIN = 1024\n_BLOCK_TARGET_PROGRAMS = 8\n_BLOCK_STRIDED = 1024\n\n@triton.jit\ndef _selu_nomask(X, BLOCK: tl.constexpr):\n    \"\"\"numel % BLOCK == 0 (host-guarded), so the tail mask can be dropped.\"\"\"\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    x = tl.load(X + offs)\n    if X.dtype.element_ty == tl.float16:\n        y = 1.0507009873554805 * tl.where(x > 0, x, 1.6732632423543772 * (tl.exp(x) - 1.0))\n    else:\n        xf = x.to(tl.float32)\n        y = 1.0507009873554805 * tl.where(xf > 0, xf, 1.6732632423543772 * (tl.exp(xf) - 1.0))\n    tl.store(X + offs, y.to(X.dtype.element_ty))\n\n@triton.jit\ndef _selu_masked(X, N, BLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < N\n    x = tl.load(X + offs, mask=mask)\n    if X.dtype.element_ty == tl.float16:\n        y = 1.0507009873554805 * tl.where(x > 0, x, 1.6732632423543772 * (tl.exp(x) - 1.0))\n    else:\n        xf = x.to(tl.float32)\n        y = 1.0507009873554805 * tl.where(xf > 0, xf, 1.6732632423543772 * (tl.exp(xf) - 1.0))\n    tl.store(X + offs, y.to(X.dtype.element_ty), mask=mask)\n\n@triton.jit\ndef _selu_strided(X, N: tl.constexpr, SHAPE: tl.constexpr, STRIDES: tl.constexpr, BLOCK: tl.constexpr):\n    \"\"\"Non-contiguous input: logical index -> storage offset, written in place.\"\"\"\n    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    remainder = index\n    offset = tl.full((BLOCK,), 0, tl.int64)\n    for axis in tl.static_range(len(SHAPE) - 1, -1, -1):\n        coord = remainder % SHAPE[axis]\n        remainder = remainder // SHAPE[axis]\n        offset += coord.to(tl.int64) * STRIDES[axis]\n    x = tl.load(X + offset, index < N, other=1)\n    if X.dtype.element_ty == tl.float16:\n        y = 1.0507009873554805 * tl.where(x > 0, x, 1.6732632423543772 * (tl.exp(x) - 1.0))\n    else:\n        xf = x.to(tl.float32)\n        y = 1.0507009873554805 * tl.where(xf > 0, xf, 1.6732632423543772 * (tl.exp(xf) - 1.0))\n    tl.store(X + offset, y.to(X.dtype.element_ty), index < N)\n_TAB = {}\n_numel = torch.Tensor.numel\n_data_ptr = torch.Tensor.data_ptr\n_is_contiguous = torch.Tensor.is_contiguous\n_TAB_GET = _TAB.get\n_STREAM = {}\n\ndef _pick_block(n, dtype):\n    maximum = 16384 if dtype is torch.float16 else 8192\n    if n >= maximum * _BLOCK_TARGET_PROGRAMS:\n        return maximum\n    target = -(-n // _BLOCK_TARGET_PROGRAMS)\n    block = _BLOCK_MIN\n    while block < target:\n        block <<= 1\n    return min(block, maximum)\n\ndef _resolve_stream(device):\n    \"\"\"Cheapest faithful current-stream accessor for this device, resolved once.\"\"\"\n    getter = _STREAM.get(device)\n    if getter is not None:\n        return getter\n    raw = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\n    if raw is not None:\n        try:\n            want = int(torch.npu.current_stream().npu_stream)\n            try:\n                if int(raw(device)) == want:\n                    getter = lambda: raw(device)\n            except TypeError:\n                if int(raw()) == want:\n                    getter = raw\n        except Exception:\n            getter = None\n    if getter is None:\n        from triton.runtime import driver\n        getter = lambda: driver.active.get_current_stream(device)\n    _STREAM[device] = getter\n    return getter\n\ndef _standard_launch(n, block, masked):\n    \"\"\"Ordinary Triton launch: no alignment assumption, safe for any pointer.\"\"\"\n    if masked:\n\n        def launch(X, ptr, n=n, block=block):\n            _selu_masked[triton.cdiv(n, block),](X, n, BLOCK=block)\n    else:\n\n        def launch(X, ptr, n=n, block=block):\n            _selu_nomask[n // block,](X, BLOCK=block)\n    return launch\n\ndef _make_launch(A, n):\n    \"\"\"Build (aligned launcher, fallback launcher); both take (tensor, address).\"\"\"\n    block = _pick_block(n, A.dtype)\n    masked = bool(n % block)\n    standard = _standard_launch(n, block, masked)\n    if _data_ptr(A) & 15:\n        return (standard, standard)\n    try:\n        if masked:\n            compiled = _selu_masked.warmup(A, n, BLOCK=block, grid=(1,))\n            grid = triton.cdiv(n, block)\n        else:\n            compiled = _selu_nomask.warmup(A, BLOCK=block, grid=(1,))\n            grid = n // block\n        launcher = compiled.run\n        if getattr(launcher, 'compile_only', False) or getattr(launcher, 'enable_msprof_register_tensor', False) or getattr(launcher.metadata, 'debug_enabled', False):\n            return (standard, standard)\n        call = launcher.launch\n        function = compiled.function\n        metadata = compiled.packed_metadata\n        stream = _resolve_stream(A.device.index)\n    except Exception:\n        return (standard, standard)\n    if masked:\n\n        def launch(X, ptr, grid=grid, call=call, function=function, metadata=metadata, stream=stream, n=n, *, _address=_hgkda_address_type(n)):\n            call(grid, 1, 1, stream(), function, metadata, None, None, None, _address(ptr), n, None)\n    else:\n\n        def launch(X, ptr, grid=grid, call=call, function=function, metadata=metadata, stream=stream, *, _address=_hgkda_address_type(n)):\n            call(grid, 1, 1, stream(), function, metadata, None, None, None, _address(ptr), None)\n    return (launch, standard)\n\ndef _dispatch(A):\n    n = _numel(A)\n    ptr = _data_ptr(A)\n    if n == 0:\n        return A\n    if not _is_contiguous(A):\n        _selu_strided[triton.cdiv(n, _BLOCK_STRIDED),](A, n, tuple(A.shape), tuple(A.stride()), BLOCK=_BLOCK_STRIDED)\n        return A\n    pair = _make_launch(A, n)\n    _TAB[n] = (A.dtype, pair[0], pair[1])\n    pair[1 if ptr & 15 else 0](A, ptr)\n    return A\n\ndef run(A):\n    ptr = _data_ptr(A)\n    entry = _TAB_GET(_numel(A))\n    if entry is not None and entry[0] is A.dtype and _is_contiguous(A):\n        entry[1 + ((ptr & 15) != 0)](A, ptr)\n        return A\n    return _dispatch(A)\n"
+        }
+      ]
+    },
+    "benchmark_fingerprint": "sha256:61d405aa07da0579eeecd4f4dc7b5079d9b978d5b7904e64e85232d8c50fe3d7",
+    "case_id": "selu_-timing-3",
+    "expected_backend": "npu",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "identity": {
+      "solution_sha256": "e73f55e933bf57c747e291910cb4a7ed2f83aacb4d9b6769a5bf15015724f08e",
+      "workload_sha256": "833269eac52a62327806fa81c9818873756d2cca99d6d4a9b490b527e4f22196"
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "profile_id": "2dbba7f8a90d496e86c54123b0b87a31",
+    "created_at": "2026-10-22T08:38:42.273956+00:00",
+    "status": "completed",
+    "backend": "npu",
+    "profiler": "msprof",
+    "device": "npu:0",
+    "hardware": {
+      "target": {
+        "backend": "ascend",
+        "vendor": "huawei",
+        "device": "Ascend910B4-1",
+        "architecture": "dav-c220-cube",
+        "devices": [
+          {
+            "logical_device": "npu:0",
+            "device_id": 0,
+            "name": "Ascend910B4-1",
+            "l2_cache_size": 176160768,
+            "num_sm": 20,
+            "compute_capability": "",
+            "total_memory": 65452113920
+          }
+        ]
+      },
+      "software": {
+        "language": "triton",
+        "language_version": "3.5.1",
+        "compiler": "flagtree",
+        "compiler_version": "0.6.0+ascend.gitc286cba6",
+        "runtime": "cann",
+        "runtime_version": "9.0.0",
+        "driver_version": "25.2.0"
+      },
+      "metadata": {
+        "complete": true,
+        "missing": [],
+        "sources": {
+          "target.backend": "server configuration",
+          "target.vendor": "server configuration",
+          "software.language": "server configuration",
+          "software.compiler": "python package metadata",
+          "software.runtime": "server configuration",
+          "target.device": "device probe",
+          "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+          "software.language_version": "triton module metadata",
+          "software.compiler_version": "python package metadata",
+          "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+          "software.driver_version": "/usr/local/Ascend/driver/version.info"
+        }
+      }
+    },
+    "evaluation_id": "6d38cc441f5218ecf1735b5206822b9659ed4f276c993c85d107e812533a78f6:round-2",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "capabilities": [
+      "performance_counters",
+      "kernel_profile",
+      "pipeline_utilization",
+      "execution_timeline"
+    ],
+    "summary": {
+      "avg_time_us": 45.86,
+      "operation_count": 1,
+      "top_operations": [
+        {
+          "op_name": "_selu_nomask",
+          "op_type": "_selu_nomask",
+          "task_type": "AI_VECTOR_CORE",
+          "measured_invocations": 100,
+          "total_duration_us": 4586.012,
+          "avg_duration_us": 45.86,
+          "min_duration_us": 45.141,
+          "max_duration_us": 47.241,
+          "aicore_time_us": 0.0,
+          "aic_total_cycles": 0.0,
+          "aic_mac_time_us": 0.0,
+          "aic_mac_ratio": 0.0,
+          "aic_scalar_time_us": 0.0,
+          "aic_scalar_ratio": 0.0,
+          "aic_mte1_time_us": 0.0,
+          "aic_mte1_ratio": 0.0,
+          "aic_mte2_time_us": 0.0,
+          "aic_mte2_ratio": 0.0,
+          "aic_fixpipe_time_us": 0.0,
+          "aic_fixpipe_ratio": 0.0,
+          "aic_icache_miss_rate": 0.0,
+          "aiv_time_us": 44.9355,
+          "aiv_total_cycles": 2920116.86,
+          "aiv_vec_time_us": 27.209,
+          "aiv_vec_ratio": 0.6056,
+          "aiv_scalar_time_us": 5.8373,
+          "aiv_scalar_ratio": 0.1298,
+          "aiv_mte2_time_us": 7.0225,
+          "aiv_mte2_ratio": 0.1563,
+          "aiv_mte3_time_us": 7.5608,
+          "aiv_mte3_ratio": 0.1683,
+          "aiv_icache_miss_rate": 0.0,
+          "cube_utilization_pct": 0.0
+        }
+      ],
+      "stage_count": 1
+    },
+    "metrics": {
+      "avg_time_us": 45.86,
+      "ops": [
+        {
+          "op_name": "_selu_nomask",
+          "op_type": "_selu_nomask",
+          "task_type": "AI_VECTOR_CORE",
+          "measured_invocations": 100,
+          "total_duration_us": 4586.012,
+          "avg_duration_us": 45.86,
+          "min_duration_us": 45.141,
+          "max_duration_us": 47.241,
+          "aicore_time_us": 0.0,
+          "aic_total_cycles": 0.0,
+          "aic_mac_time_us": 0.0,
+          "aic_mac_ratio": 0.0,
+          "aic_scalar_time_us": 0.0,
+          "aic_scalar_ratio": 0.0,
+          "aic_mte1_time_us": 0.0,
+          "aic_mte1_ratio": 0.0,
+          "aic_mte2_time_us": 0.0,
+          "aic_mte2_ratio": 0.0,
+          "aic_fixpipe_time_us": 0.0,
+          "aic_fixpipe_ratio": 0.0,
+          "aic_icache_miss_rate": 0.0,
+          "aiv_time_us": 44.9355,
+          "aiv_total_cycles": 2920116.86,
+          "aiv_vec_time_us": 27.209,
+          "aiv_vec_ratio": 0.6056,
+          "aiv_scalar_time_us": 5.8373,
+          "aiv_scalar_ratio": 0.1298,
+          "aiv_mte2_time_us": 7.0225,
+          "aiv_mte2_ratio": 0.1563,
+          "aiv_mte3_time_us": 7.5608,
+          "aiv_mte3_ratio": 0.1683,
+          "aiv_icache_miss_rate": 0.0,
+          "cube_utilization_pct": 0.0
+        }
+      ]
+    },
+    "artifacts": [
+      {
+        "id": "a001",
+        "kind": "profile_log",
+        "format": "text",
+        "filename": "msprof-base-collection.log",
+        "media_type": "text/plain",
+        "size_bytes": 5031,
+        "download_url": "/profile_artifacts/2dbba7f8a90d496e86c54123b0b87a31/a001",
+        "local_path": "/data/hanle/ascend-optimization/runs/buffer-pointwise-20261022/kg-runs/selu_-buffer-pointwise-20261022-paired-hgkda/stages/optimize/work/.kernelgen/profiles/round-0002/selu_-timing-3/114dd055654c41b4b0aba207f97e1adb/msprof-base-collection.log",
+        "download_error": null
+      },
+      {
+        "id": "a002",
+        "kind": "vendor_report",
+        "format": "msprof-tar-gz",
+        "filename": "msprof-report.tar.gz",
+        "media_type": "application/gzip",
+        "size_bytes": 137384,
+        "download_url": "/profile_artifacts/2dbba7f8a90d496e86c54123b0b87a31/a002",
+        "local_path": "/data/hanle/ascend-optimization/runs/buffer-pointwise-20261022/kg-runs/selu_-buffer-pointwise-20261022-paired-hgkda/stages/optimize/work/.kernelgen/profiles/round-0002/selu_-timing-3/114dd055654c41b4b0aba207f97e1adb/msprof-report.tar.gz",
+        "download_error": null
+      },
+      {
+        "id": "a003",
+        "kind": "op_summary",
+        "format": "csv",
+        "filename": "op_summary.csv",
+        "media_type": "text/csv",
+        "size_bytes": 33140,
+        "download_url": "/profile_artifacts/2dbba7f8a90d496e86c54123b0b87a31/a003",
+        "local_path": "/data/hanle/ascend-optimization/runs/buffer-pointwise-20261022/kg-runs/selu_-buffer-pointwise-20261022-paired-hgkda/stages/optimize/work/.kernelgen/profiles/round-0002/selu_-timing-3/114dd055654c41b4b0aba207f97e1adb/op_summary.csv",
+        "download_error": null
+      },
+      {
+        "id": "a004",
+        "kind": "execution_timeline",
+        "format": "trace-json",
+        "filename": "execution-trace.json",
+        "media_type": "application/json",
+        "size_bytes": 114726,
+        "download_url": "/profile_artifacts/2dbba7f8a90d496e86c54123b0b87a31/a004",
+        "local_path": "/data/hanle/ascend-optimization/runs/buffer-pointwise-20261022/kg-runs/selu_-buffer-pointwise-20261022-paired-hgkda/stages/optimize/work/.kernelgen/profiles/round-0002/selu_-timing-3/114dd055654c41b4b0aba207f97e1adb/execution-trace.json",
+        "download_error": null
+      }
+    ],
+    "warnings": [
+      "msprof and simulator timing is diagnostic and is not eval latency"
+    ],
+    "error": null,
+    "workload_uuid": "selu_-timing-3"
+  }
+}

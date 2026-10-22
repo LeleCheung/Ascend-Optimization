@@ -2,6 +2,8 @@
 
 本目录对应 2026-10-15 会议后的下一阶段。固定版本见[基线锁定](../../../../../manifests/hgkda-stage2.lock.json)，15 个对象的登记见 [targets.json](targets.json) 和[下一阶段计划](../../../operators/下一阶段计划-20261015.md)。
 
+最新[缓冲与搬运批次](../../../operators/campaigns/buffer-pointwise-20261022/README.md)已完成：log10_ 0.875×，较同批父版实际加速1.125×；selu_保留旧源码，本批复测0.898×。36项正式测试、42＋12＋9项补充检查和48项证据核验通过。新增缓冲生命周期知识、数值范围门禁、异常恢复及同字节评测复用；CC生成与Codex整合分别记录。复现使用`reproduce-paired.py --batch buffer-pointwise-20261022 --tag final --output /data/hanle/ascend-optimization/runs/新目录`，模拟器失败与最终真机采集分开报告。
+
 2026-10-22新目标：[log10_、selu_成对诊断与优化](../../../operators/campaigns/paired-pointwise-20261022/README.md)。新增同输入成对采集与设备计数比较，结合实际launcher/IR提出修改。`build-kg-overlay.py --paired-evidence 摘要.json --native-context`可把冻结seed的成对证据注入新KG分析角色；角色明确区分起点证据和新候选测量。新批次最终默认一次完整KGS评测，历史批次保留原验证次数。
 
 该目标本批已完成闭环：log10_最终0.737×、selu_最终0.790×；各36/36、42＋12补充检查通过，KGS原生profiling与四组成对采集成功，48项证据核验通过。成果包含当前地址启动、log10中间精度优化、SELU按dtype分块，仍未达到整组0.8×。`finish-paired.py`串行收尾，`audit-paired.py`离线核验证据，`reproduce-paired.py --output /data/hanle/ascend-optimization/runs/新目录`独立复现交付源码。快路径依赖固定FlagTree的私有launcher ABI，换版本须重新验证。冻结覆盖层未回溯应用后续知识更新。

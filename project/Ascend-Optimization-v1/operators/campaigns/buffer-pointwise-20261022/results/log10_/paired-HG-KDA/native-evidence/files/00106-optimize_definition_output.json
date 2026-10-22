@@ -1,0 +1,217 @@
+{
+  "definition_name": "log10_",
+  "op_type": "",
+  "status": "PASSED",
+  "best_geo_mean": 0.7569986531292425,
+  "best_code": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"In-place base-10 logarithm (log10_) for Ascend with Triton.\n\nlog10_ is a single elementwise pass, so the per-call cost for every measured\nshape up to 1M elements is the host launch path, not the device work.  Measured\non the target with this batch's paired method:\n\n* FlagTree's Python dispatch (``kernel[grid](...)``) costs ~52us per call;\n* the compiled launcher entry itself costs ~6.5-8us, and ``torch.log10_``\n  dispatches in ~5.5-9.5us, so only the compiled launcher is competitive;\n* building the pointer wrapper class per call costs ~18us (class creation),\n  while reusing one instance costs nothing, so each (numel, pointer)\n  specialization is built once and its wrapper object is reused;\n* the current stream must be read per call, which costs ~0.26us through\n  ``_npu_getCurrentRawStreamNoWait`` and is kept on the steady-state path.\n\nSteady state is therefore one ``data_ptr``, one ``numel``, one dict lookup, one\ndtype identity check, one contiguity check, one stream read and the launch.\nThe address is part of the cache key, so a different tensor with the same extent\nnever reuses a stale pointer.  Cold, misaligned and non-contiguous calls keep\nthe ordinary Triton path.\n\"\"\"\n\ndef _hgkda_address_type(n):\n\n    class DeviceAddress(int):\n\n        def size(self):\n            return (n,)\n    return DeviceAddress\nimport torch\nimport torch_npu\nimport triton\nimport triton.language as tl\n_BLOCK_MAX = 32768\n_BLOCK_MIN = 1024\n_BLOCK_TARGET_PROGRAMS = 8\n_BLOCK_STRIDED = 1024\n_FAST_LIMIT = 4096\n\n@triton.jit\ndef _log10_nomask(X, BLOCK: tl.constexpr):\n    \"\"\"numel % BLOCK == 0 (host-guarded), so the tail mask can be dropped.\"\"\"\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    x = tl.load(X + offs)\n    y = tl.log(x) * 0.4342944819032518\n    tl.store(X + offs, y.to(X.dtype.element_ty))\n\n@triton.jit\ndef _log10_masked(X, N, BLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < N\n    x = tl.load(X + offs, mask=mask)\n    y = tl.log(x) * 0.4342944819032518\n    tl.store(X + offs, y.to(X.dtype.element_ty), mask=mask)\n\n@triton.jit\ndef _log10_strided(X, N: tl.constexpr, SHAPE: tl.constexpr, STRIDES: tl.constexpr, BLOCK: tl.constexpr):\n    \"\"\"Non-contiguous input: logical index -> storage offset, written in place.\"\"\"\n    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    remainder = index\n    offset = tl.full((BLOCK,), 0, tl.int64)\n    for axis in tl.static_range(len(SHAPE) - 1, -1, -1):\n        coord = remainder % SHAPE[axis]\n        remainder = remainder // SHAPE[axis]\n        offset += coord.to(tl.int64) * STRIDES[axis]\n    x = tl.load(X + offset, index < N, other=1)\n    y = tl.log(x) * 0.4342944819032518\n    tl.store(X + offset, y.to(X.dtype.element_ty), index < N)\n_FAST = {}\n_fast_get = _FAST.get\n_STREAM = {}\n\ndef _pick_block(n):\n    \"\"\"Largest tile that spreads work over cores without exceeding the UB budget.\"\"\"\n    if n >= _BLOCK_MAX * _BLOCK_TARGET_PROGRAMS:\n        return _BLOCK_MAX\n    target = -(-n // _BLOCK_TARGET_PROGRAMS)\n    block = _BLOCK_MIN\n    while block < target:\n        block <<= 1\n    return min(block, _BLOCK_MAX)\n\ndef _resolve_stream(device):\n    \"\"\"Cheapest faithful current-stream accessor for this device, resolved once.\"\"\"\n    getter = _STREAM.get(device)\n    if getter is not None:\n        return getter\n    raw = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\n    if raw is not None:\n        try:\n            want = int(torch.npu.current_stream().npu_stream)\n            try:\n                if int(raw(device)) == want:\n                    getter = lambda: raw(device)\n            except TypeError:\n                if int(raw()) == want:\n                    getter = raw\n        except Exception:\n            getter = None\n    if getter is None:\n        from triton.runtime import driver\n        getter = lambda: driver.active.get_current_stream(device)\n    _STREAM[device] = getter\n    return getter\n\ndef _standard_launch(n, block, masked):\n    \"\"\"Ordinary Triton launch: no alignment assumption, safe for any pointer.\"\"\"\n    if masked:\n\n        def launch(X, ptr, n=n, block=block):\n            _log10_masked[triton.cdiv(n, block),](X, n, BLOCK=block)\n    else:\n\n        def launch(X, ptr, n=n, block=block):\n            _log10_nomask[n // block,](X, BLOCK=block)\n    return launch\n\ndef _make_launch(A, n, ptr):\n    \"\"\"Build the per-specialization launcher, degrading to a plain Triton launch.\"\"\"\n    block = _pick_block(n)\n    masked = bool(n % block)\n    if ptr & 15:\n        return _standard_launch(n, block, masked)\n    try:\n        if masked:\n            compiled = _log10_masked.warmup(A, n, BLOCK=block, grid=(1,))\n            grid = triton.cdiv(n, block)\n        else:\n            compiled = _log10_nomask.warmup(A, BLOCK=block, grid=(1,))\n            grid = n // block\n        launcher = compiled.run\n        if getattr(launcher, 'compile_only', False) or getattr(launcher, 'enable_msprof_register_tensor', False) or getattr(launcher.metadata, 'debug_enabled', False):\n            return _standard_launch(n, block, masked)\n        call = launcher.launch\n        function = compiled.function\n        metadata = compiled.packed_metadata\n        stream = _resolve_stream(A.device.index)\n    except Exception:\n        return _standard_launch(n, block, masked)\n    address = _hgkda_address_type(n)(ptr)\n    if masked:\n\n        def launch(X, ptr, grid=grid, call=call, function=function, metadata=metadata, stream=stream, address=address, n=n):\n            call(grid, 1, 1, stream(), function, metadata, None, None, None, address, n, None)\n    else:\n\n        def launch(X, ptr, grid=grid, call=call, function=function, metadata=metadata, stream=stream, address=address):\n            call(grid, 1, 1, stream(), function, metadata, None, None, None, address, None)\n    return launch\n\ndef _dispatch(A, n, ptr):\n    if n == 0:\n        return A\n    if not A.is_contiguous():\n        _log10_strided[triton.cdiv(n, _BLOCK_STRIDED),](A, n, tuple(A.shape), tuple(A.stride()), BLOCK=_BLOCK_STRIDED)\n        return A\n    if len(_FAST) >= _FAST_LIMIT:\n        _FAST.clear()\n    launch = _make_launch(A, n, ptr)\n    _FAST[(n, ptr)] = (A.dtype, launch)\n    launch(A, ptr)\n    return A\n\ndef run(A):\n    n = A.numel()\n    ptr = A.data_ptr()\n    entry = _fast_get((n, ptr))\n    if entry is not None and A.dtype is entry[0] and A.is_contiguous():\n        entry[1](A, ptr)\n        return A\n    return _dispatch(A, n, ptr)\n",
+  "search_best_geo_mean": 0.802630027438517,
+  "final_verification": {
+    "status": "PASSED",
+    "reason_code": "VERIFIED",
+    "geo_mean": 0.7569986531292425,
+    "measured_geo_mean": 0.7569986531292425,
+    "comparisons": [
+      {
+        "uuid": "log10_-timing-0",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.010611688826980053,
+          "latency_ms": 0.012019720014552314
+        },
+        "after": {
+          "reference_latency_ms": 0.011425795416321572,
+          "latency_ms": 0.015156949168325246
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0767179100909616,
+          "latency_ms": 1.2610068412554267
+        }
+      },
+      {
+        "uuid": "log10_-timing-1",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.010950785153265646,
+          "latency_ms": 0.01227965329793645
+        },
+        "after": {
+          "reference_latency_ms": 0.01252229609416008,
+          "latency_ms": 0.014741449790358312
+        },
+        "ratios": {
+          "reference_latency_ms": 1.143506690972363,
+          "latency_ms": 1.200477687170171
+        }
+      },
+      {
+        "uuid": "log10_-timing-2",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011341612238444316,
+          "latency_ms": 0.012739122735905564
+        },
+        "after": {
+          "reference_latency_ms": 0.016518049638891925,
+          "latency_ms": 0.014609094669976485
+        },
+        "ratios": {
+          "reference_latency_ms": 1.4564110720432848,
+          "latency_ms": 1.146789694458344
+        }
+      },
+      {
+        "uuid": "log10_-timing-3",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.015863139826865755,
+          "latency_ms": 0.033891647957817114
+        },
+        "after": {
+          "reference_latency_ms": 0.015888933237909623,
+          "latency_ms": 0.03385942331893226
+        },
+        "ratios": {
+          "reference_latency_ms": 1.001625996576049,
+          "latency_ms": 0.999049186427141
+        }
+      },
+      {
+        "uuid": "log10_-timing-4",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.010917373955822292,
+          "latency_ms": 0.012819709302438018
+        },
+        "after": {
+          "reference_latency_ms": 0.011628617008287061,
+          "latency_ms": 0.015690528208960126
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0651478144234,
+          "latency_ms": 1.223937909885066
+        }
+      },
+      {
+        "uuid": "log10_-timing-5",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.0111534102117513,
+          "latency_ms": 0.012640444806857531
+        },
+        "after": {
+          "reference_latency_ms": 0.011769462585762539,
+          "latency_ms": 0.01587959447542513
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0552344406163923,
+          "latency_ms": 1.2562528232242538
+        }
+      },
+      {
+        "uuid": "log10_-timing-6",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011888631030571703,
+          "latency_ms": 0.013123820170478572
+        },
+        "after": {
+          "reference_latency_ms": 0.01201387050952644,
+          "latency_ms": 0.01621851256669549
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0105343902618125,
+          "latency_ms": 1.2358072844657142
+        }
+      },
+      {
+        "uuid": "log10_-timing-7",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.025332337832673354,
+          "latency_ms": 0.03812301919923142
+        },
+        "after": {
+          "reference_latency_ms": 0.025304484529258684,
+          "latency_ms": 0.03809320090916937
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9989004842901336,
+          "latency_ms": 0.9992178402789608
+        }
+      },
+      {
+        "uuid": "log10_-timing-8",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011303336270302528,
+          "latency_ms": 0.013504057165118334
+        },
+        "after": {
+          "reference_latency_ms": 0.011718643239739838,
+          "latency_ms": 0.01424542002951195
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0367419812616259,
+          "latency_ms": 1.0548992688144563
+        }
+      },
+      {
+        "uuid": "log10_-timing-9",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011624337365492843,
+          "latency_ms": 0.012182106462802683
+        },
+        "after": {
+          "reference_latency_ms": 0.012300797272811756,
+          "latency_ms": 0.0145172971782271
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0581934166266547,
+          "latency_ms": 1.1916902238996827
+        }
+      },
+      {
+        "uuid": "log10_-timing-10",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.01084988505427878,
+          "latency_ms": 0.01207422881243469
+        },
+        "after": {
+          "reference_latency_ms": 0.012156739949432768,
+          "latency_ms": 0.01443272545263935
+        },
+        "ratios": {
+          "reference_latency_ms": 1.1204487318175427,
+          "latency_ms": 1.1953331079642746
+        }
+      },
+      {
+        "uuid": "log10_-timing-11",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.02615080069557797,
+          "latency_ms": 0.03896547900125655
+        },
+        "after": {
+          "reference_latency_ms": 0.02557650052109103,
+          "latency_ms": 0.03894188166766497
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9780389066792876,
+          "latency_ms": 0.9993944041188145
+        }
+      }
+    ],
+    "drift": [],
+    "drift_factor": 2.0,
+    "compared_to": "original_round",
+    "attempt_path": ".kernelgen/retests/2b208ae4c2c4394549f03fc466768c1f280011516f34878ab49998d23825b6fd/f4764e6dfac3a88dccddc679b0f6360895947744651d51bf27f6ed4eaf4eca13/attempt-0001.json",
+    "round_num": 2,
+    "solution_sha256": "2b208ae4c2c4394549f03fc466768c1f280011516f34878ab49998d23825b6fd"
+  },
+  "rounds": 3,
+  "summary": "Best round (2 of 3) reached geo_mean 0.8026 with all 36 workloads passing, up 27.6% from the seed baseline, by rebuilding the host dispatch: every measured shape up to 1M elements is host-bound, so each (numel, exact device pointer) specialization now binds the compiled FlagTree launcher once and the steady state costs one data_ptr, one numel, one dict lookup, a dtype and contiguity check, one current-stream read and the launch, taking those shapes from 16.7-17.5us to 12.0-13.1us. Key lesson: on this target Triton's Python dispatch is ~52us and the compiled launcher ~8us against torch's ~10us, so only the direct launcher is competitive; a third round's unrolled 2-4-tile programs reproducibly cut the 4096x4096 fp16/bf16 shapes to 30.2/34.7us but regressed fp32 to 48-56us from 39.0us, which was net negative and was reverted.",
+  "workspace": "/data/hanle/ascend-optimization/runs/buffer-pointwise-20261022/kg-runs/log10_-buffer-pointwise-20261022-paired-hgkda/stages/optimize/work"
+}

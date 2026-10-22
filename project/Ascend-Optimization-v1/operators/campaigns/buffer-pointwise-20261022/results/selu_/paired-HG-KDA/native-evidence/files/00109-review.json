@@ -1,0 +1,65 @@
+{
+  "subject_sha256": "9ac565b2a89fc4f4da3c38bfd231cf2da46e57705344d596d51ac27a34c27aa8",
+  "policy": "advisory",
+  "summary": "Read all 12 supplied evidence files for kind=code on operator selu_ (subject 9ac565b2..., the round-2 best code stored in .best_kernel.py:1-175). The candidate is a single-file Triton implementation whose `run(A)` computes SELU in place (scale/alpha constants identical to torch.selu_), handles contiguous, masked-tail, non-contiguous (stride-recomputed offsets) and empty inputs, returns A (matching definition.json:11-21 outputs=['out'], mutates A, returns_alias_of out=A), uses no torch/torch.ops computation, no host synchronization, no environment mutation, and no test-specific shapes or values (block sizes derive only from numel and dtype). I found no P0 conversion or test-contract defect: the catalog oracle (oracle.py:71-76) is an independent torch.selu_ reference that does not import the candidate, inputs are built independently (oracle.py:9-68), correctness workloads cover empty/1/1025/7x9 with strided variants over fp16/bf16/fp32 (correctness.jsonl:1-24), timing workloads cover 1024..4096x4096 over the same three dtypes (timing.jsonl:1-12), and reported evaluation is 36/36 PASSED with max_abs_error 0.001953125. All findings below are P1 advisories about latent correctness hazards, portability, cache growth, and reporting; I did not assert device execution or timing validity from static inspection. The measured evidence reports best_geo_mean 0.8839579 (optimize_definition_output.json:5), i.e. performance PASSED is not a speedup greater than one: ledger round 2 shows 10 of 12 timing workloads slower than the reference (0.916, 1.090, 0.916, 1.248, 0.913, 0.898, 0.866, 0.710, 0.904, 0.881, 0.869, 0.572), and the one verified device win from round 3 (timing-7 83.3->63.5 us) is not in the submitted code because that round was reverted (.ledger.json:2397-2412).",
+  "reviewed_files": [
+    "/data/hanle/ascend-optimization/runs/buffer-pointwise-20261022/kg-runs/selu_-buffer-pointwise-20261022-paired-hgkda/stages/optimize/work/optimize_definition_output.json",
+    "/data/hanle/ascend-optimization/runs/buffer-pointwise-20261022/kg-runs/selu_-buffer-pointwise-20261022-paired-hgkda/stages/optimize/work/.ledger.json",
+    "/data/hanle/ascend-optimization/runs/buffer-pointwise-20261022/kg-runs/selu_-buffer-pointwise-20261022-paired-hgkda/stages/optimize/work/.best_kernel.py",
+    "/data/hanle/ascend-optimization/runs/buffer-pointwise-20261022/kg-runs/selu_-buffer-pointwise-20261022-paired-hgkda/stages/prepare_catalog/attempts/01/catalog/manifest.json",
+    "/data/hanle/ascend-optimization/runs/buffer-pointwise-20261022/kg-runs/selu_-buffer-pointwise-20261022-paired-hgkda/stages/prepare_catalog/attempts/01/catalog/ops/selu_/correctness.jsonl",
+    "/data/hanle/ascend-optimization/runs/buffer-pointwise-20261022/kg-runs/selu_-buffer-pointwise-20261022-paired-hgkda/stages/prepare_catalog/attempts/01/catalog/ops/selu_/definition.json",
+    "/data/hanle/ascend-optimization/runs/buffer-pointwise-20261022/kg-runs/selu_-buffer-pointwise-20261022-paired-hgkda/stages/prepare_catalog/attempts/01/catalog/ops/selu_/oracle.py",
+    "/data/hanle/ascend-optimization/runs/buffer-pointwise-20261022/kg-runs/selu_-buffer-pointwise-20261022-paired-hgkda/stages/prepare_catalog/attempts/01/catalog/ops/selu_/timing.jsonl",
+    "/data/hanle/ascend-optimization/runs/buffer-pointwise-20261022/kg-runs/selu_-buffer-pointwise-20261022-paired-hgkda/stages/prepare_catalog/attempts/01/evaluation-contract.json",
+    "/data/hanle/ascend-optimization/runs/buffer-pointwise-20261022/kg-runs/selu_-buffer-pointwise-20261022-paired-hgkda/stages/review_tests/attempts/01/review.json",
+    "/data/hanle/ascend-optimization/runs/buffer-pointwise-20261022/kg-runs/selu_-buffer-pointwise-20261022-paired-hgkda/stages/review_tests/attempts/01/preflight.json",
+    "/data/hanle/ascend-optimization/runs/buffer-pointwise-20261022/kg-runs/selu_-buffer-pointwise-20261022-paired-hgkda/stages/review_tests/attempts/01/evaluate.json"
+  ],
+  "findings": [
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:122-153 builds the fast launcher with `stream = _resolve_stream(A.device.index)` and captures that per-device getter plus `compiled.function` in the closure; .best_kernel.py:155-166 stores it as `_TAB[n] = (A.dtype, pair[0], pair[1])`; .best_kernel.py:168-174 reuses the entry checking only `_numel(A)`, `entry[0] is A.dtype` and `_is_contiguous(A)`.",
+      "reason": "The dispatch cache key omits the device. If the same numel and dtype are used on a second NPU (or a tensor whose device index differs from the one used at build time), `run` reuses a launcher whose compiled function and stream getter belong to the first device, so the kernel is enqueued on device A's stream while writing device B's pointer. The measured suite runs on npu:0 only (evaluate.json:5), so evaluation cannot detect this.",
+      "requested_change": "Key the cache by at least (device index, numel, dtype), or store the device in the entry and rebuild/fall back when `A.device.index` differs from the entry's device, so a launcher is never reused across devices."
+    },
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:33-37, 46-50, 64-69: every dtype other than float16 takes `xf = x.to(tl.float32)` and the result is stored with `y.to(X.dtype.element_ty)`. Contract dtype coverage is only float16/bfloat16/float32 (correctness.jsonl:1-24, timing.jsonl:1-12).",
+      "reason": "For float64 input (which the reference `torch.selu_` in oracle.py:71-76 supports natively) the kernel computes in float32 and casts back to float64, silently returning fp32-rounded results. The contract workloads never exercise float64, so 36/36 PASSED does not cover this semantic difference from the reference.",
+      "requested_change": "Add an explicit float64 computation path (or an explicit unsupported-dtype guard that fails rather than returning silently downcast values); do not leave a non-fp16 branch that assumes float32 precision for all other dtypes."
+    },
+    {
+      "priority": "P1",
+      "category": "target_capability",
+      "evidence": ".best_kernel.py:11-17 defines an `int` subclass whose `.size()` is used as the kernel pointer argument; .best_kernel.py:87-108 resolves the stream through the private `torch_npu._C._npu_getCurrentRawStreamNoWait`; .best_kernel.py:136-142 reads `compiled.run`, `compiled.function`, `launcher.launch` and `compiled.packed_metadata`; .best_kernel.py:147-152 calls `call(grid, 1, 1, stream(), function, metadata, None, None, None, _address(ptr), n, None)` at launch time, outside the try/except at lines 129-144 that guards construction.",
+      "reason": "The fast path is pinned to undocumented Triton/torch_npu launcher internals and a masquerading address type. Because only construction is guarded, any drift in the private `launch` positional ABI or in the pointer-argument convention surfaces as a runtime error inside `run` instead of degrading to `_standard_launch`, breaking the operator rather than just reducing speed.",
+      "requested_change": "Validate the private launcher signature/attributes once during `_make_launch`, and guard the invocation so an incompatibility falls back to the ordinary Triton launch path (or replace the private-ABI call with the supported launch API) rather than raising during a call."
+    },
+    {
+      "priority": "P1",
+      "category": "target_capability",
+      "evidence": ".best_kernel.py:70 creates `_TAB = {}` and .best_kernel.py:164 writes `_TAB[n] = (A.dtype, pair[0], pair[1])`; no entry is ever evicted or bounded (also `_STREAM` at .best_kernel.py:75/107 grows per device).",
+      "reason": "Every distinct numel permanently retains a compiled kernel, two closures and a device stream getter. In a long-running process that sees many shapes this is unbounded host memory and JIT-artifact growth; the three-shape-per-dtype benchmark cannot exercise it.",
+      "requested_change": "Bound the specialization cache (for example a small LRU keyed by device/numel/dtype) so stale kernels and closures are released."
+    },
+    {
+      "priority": "P1",
+      "category": "target_capability",
+      "evidence": "optimize_definition_output.json:5 `best_geo_mean` 0.8839578790022817; .ledger.json:556 (round-2 geo_mean 0.8839117631467809) and .ledger.json:858-996 (per-workload speedups 0.916, 1.090, 0.916, 1.248, 0.913, 0.898, 0.866, 0.710, 0.904, 0.881, 0.869, 0.572); .ledger.json:2397-2412 records that round 3's verified bf16 device win was reverted, so the submitted code is still the round-2 form.",
+      "reason": "PASSED verification is not a speedup: the submitted candidate is about 12% slower than the reference in geo-mean, 10 of 12 timing workloads are slower than the reference, and the only device-level improvement demonstrated in this run (timing-7 83.3 -> 63.5 us with the bf16 fp16-width branch) was not carried into the submitted code.",
+      "requested_change": "For the next optimization epoch, re-apply the verified bf16 fp16-width branch (ledger round 3) and re-measure with the same-state retest path the ledger itself identifies as necessary, rather than reporting the round-2 aggregate as the performance outcome."
+    },
+    {
+      "priority": "P1",
+      "category": "test_contract",
+      "evidence": "review.json:2-5 (`\"status\": \"SKIPPED_EXPLICIT\"`, `\"skip_review\": true`, `\"subject_sha256\": \"9f57f199d534cd27febda69a1893f83eb40d88947de734a5576774ad4a96eec5\"`) versus this subject 9ac565b2a89fc4f4da3c38bfd231cf2da46e57705344d596d51ac27a34c27aa8 (.ledger.json:545); preflight.json:1-10 carries no subject sha and reports `num_cases` 12; evaluate.json:9 reports geo_mean 1.043785367677196, which does not match the candidate's measured 0.88396 (optimize_definition_output.json:5).",
+      "reason": "The supplied test-contract review record belongs to a different subject and the accompanying evaluate record's geo-mean is inconsistent with this candidate's measured result, so neither can be cited as test-contract acceptance for the submitted artifact; the skip was recorded for another subject.",
+      "requested_change": "Rebind or re-run the test-contract review against 9ac565b2... before any acceptance statement is made about this candidate, or record the provenance mismatch explicitly so an earlier report is not reused for this submission."
+    }
+  ],
+  "blocker": null,
+  "missing_dependencies": []
+}

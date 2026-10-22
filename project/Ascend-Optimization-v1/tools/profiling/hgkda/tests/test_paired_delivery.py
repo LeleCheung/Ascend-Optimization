@@ -77,6 +77,18 @@ class DeliveryTest(unittest.TestCase):
             dense['status']='failed';path.write_text(json.dumps(dense))
             self.assertIsNone(m.read_arm(p,'log10_','codex-rawptr-v1',require_dense=True))
 
+    def test_range_failure_excludes_candidate_even_when_formal_passes(self):
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d);directory,_=self.fixture(p)
+            source=p/'candidates/log10_-rawptr-v1.py'
+            ranges=dict(status='failed',source_sha256=m.sha(source),passed=8,total=9)
+            (directory/'range-semantics.json').write_text(json.dumps(ranges))
+            self.assertIsNone(m.read_arm(p,'log10_','codex-rawptr-v1'))
+            ranges['source_sha256']='foreign'
+            (directory/'range-semantics.json').write_text(json.dumps(ranges))
+            with self.assertRaisesRegex(ValueError,'身份'):
+                m.read_arm(p,'log10_','codex-rawptr-v1')
+
 
 if __name__ == '__main__':
     unittest.main()

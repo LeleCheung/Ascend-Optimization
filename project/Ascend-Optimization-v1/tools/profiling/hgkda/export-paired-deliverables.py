@@ -56,6 +56,26 @@ def read_arm(batch, op, arm, require_dense=False):
                        or not r.get('stream_switch_checked') for r in dense_rows)):
             raise ValueError('连续对齐检查身份或case覆盖不完整：'+str(directory))
         dense_count = len(dense_rows)
+    range_path = directory/'range-semantics.json'
+    range_count = 0
+    if range_path.exists():
+        ranges = json.loads(range_path.read_text())
+        if ranges.get('source_sha256') != sha(source):
+            raise ValueError('数值范围检查与源码身份不同')
+        if ranges.get('status') == 'failed':
+            return None
+        expected_ranges = {(dtype, n) for dtype in ['torch.float16','torch.bfloat16','torch.float32']
+                           for n in [1024,1048576,4194304]}
+        if (ranges.get('status') != 'passed' or ranges.get('passed') != 9 or ranges.get('total') != 9
+                or ranges.get('operator') != op or ranges.get('physical_device') != 7
+                or ranges.get('logical_device') != 'npu:0'
+                or ranges.get('checker_sha256') != sha(Path(__file__).with_name('check-pointwise-ranges.py'))
+                or len(ranges.get('cases', [])) != 9
+                or {(r['dtype'], r['numel']) for r in ranges['cases']} != expected_ranges
+                or any(r['status'] != 'passed' or r.get('repetitions') != 2
+                       or not r.get('stream_switch_checked') for r in ranges['cases'])):
+            raise ValueError('数值范围检查不完整')
+        range_count = 9
     formal = directory/'formal'
     results = list(formal.glob('*.result.json'))
     if len(results) != 1:
@@ -87,6 +107,7 @@ def read_arm(batch, op, arm, require_dense=False):
         newline_policy='原始源码字节与提交文本分别计算SHA；read_text只规范化换行',
         geo_mean=score, geometric_latency_ms=geo([r['latency_ms'] for r in timing]),
         timing_cases=len(timing), workloads=len(actual), semantics_cases=len(rows), dense_cases=dense_count,
+        range_cases=range_count,
         evidence=dict(semantics=str(semantics_path), dense_semantics=str(dense_path) if require_dense else None,
                       request=str(request_path), result=str(result_path)),
         passed=True, meets_08=score >= .8)
