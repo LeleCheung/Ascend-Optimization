@@ -1,0 +1,31 @@
+{
+ "dev": {
+  "float16": {
+   "ref": 16.545900143682957,
+   "seed_run": 36.83179966174066,
+   "b32768_t1_g512": 36.8186752893962,
+   "b32768_t2_g256": 37.5436749891378,
+   "b32768_t4_g128": 41.48705047555268,
+   "b32768_t8_g64": 42.61693684384227,
+   "b16384_t4_g256": 42.187049984931946,
+   "b16384_t8_g128": 46.81619902839884
+  },
+  "float32": {
+   "ref": 26.727787917479873,
+   "seed_run": 39.873813511803746,
+   "b16384_t1_g1024": 44.23881327966228,
+   "b16384_t2_g512": 41.67893639532849,
+   "b16384_t4_g256": 79.87811259226874,
+   "b16384_t8_g128": 47.326687490567565,
+   "b8192_t8_g256": 49.80018857168034
+  }
+ },
+ "src": {
+  "npu_launcher": [
+   {
+    "file": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/driver.py",
+    "body": "class NPULauncher(object):\n\n    def __init__(self, src, metadata):\n        self.compile_only = os.getenv(\"TRITON_COMPILE_ONLY\", 'false').lower() in ('true', '1')\n        self.enable_msprof_register_tensor = os.getenv(\"TRITON_REGISTER_TENSOR_MSPROF\",\n                                                       'false').lower() in ('true', '1')\n        debug_mode = metadata.debug\n        header_src = generate_npu_header_src()\n        constants = src.constants if hasattr(src, \"constants\") else dict()\n        cst_key = lambda i: src.fn.arg_names.index(i) if isinstance(i, str) else i\n        constants = {cst_key(key): value for key, value in constants.items()}\n        signature = {cst_key(key): value for key, value in src.signature.items()}\n        wrapper_src = make_launcher(constants, signature, metadata)\n        so_launcher_path = make_npu_launcher_stub(header_src, wrapper_src, metadata.debug)\n        self.metadata = metadata  # FlagPrism\n        # setup for remote run\n        # TODO: use a var to pack all vars required to run on a remote machine\n        self.mix_mode = metadata.mix_mode\n        self.shared = metadata.shared\n        # initialize launcher\n        import importlib.util\n        spec = importlib.util.spec_from_file_location(\"__triton_launcher\", so_launcher_path)\n        mod = importlib.util.module_from_spec(spec)\n        spec.loader.exec_module(mod)\n        self.launch = getattr(mod, \"launch\")\n\n    def __call__(self, *args, **kwargs):\n        if self.compile_only:\n            cache_manager = get_cache_manager(args[5]['hash'])\n            print(\"[INFO]: skip running kernel\")\n            print(f\"[INFO]: The compiled kernel cache is in {cache_manager.cache_dir}\")\n        if self.enable_msprof_register_tensor:\n            tensor_params_shape = get_backend_func(\"get_tensor_params_shape\", *args)\n            # args[5] must be the packed metadata.\n            # Check the launch wrapper in which PyArg_ParseTuple specifies the ordering of args\n            args[5]['tensor_params_shape'] = tensor_params_shape\n        else:\n            if self.compile_only:\n                return\n            debug_enabled = bool(getattr(self.metadata, \"debug_enabled\", False))\n            if debug_enabled:\n                # FlagPrism: use the backend-neutral launch gateway; this\n                # backend only supplies its name and launch state.\n                with _flagprism.debugger_launch_context(\n                        \"ascend\",\n                        self.metadata,\n                        args[:3],\n                        args[3],\n                        args[6],\n                        args[9:],\n                ) as hidden_args:\n                    profiler_registered = self.launch(*args, *hidden_args, **kwargs)\n            else:\n                profiler_registered = self.launch(*args, **kwargs)\n            import triton\n            triton.backends.ascend.utils.TRITON_PROFILER_REGISTERED = True if profiler_registered == 1 else False\n\n\nclass NPUDriver(DriverBase):\n\n    def __init__(self):\n        self.utils = NPUUtils()\n        self.launcher_cls = NPULauncher\n        super().__init__()\n\n    @classmethod\n    def is_active(cls):\n\n        def test_npucompiler():\n            from triton.backends.ascend.utils import _get_bisheng_path\n            npucompiler = _get_bisheng_path()\n            targets = subprocess.check_output([npucompiler, \"-print-targets\"]).decode().strip().split()\n            return \"hiipu64\" in targets\n\n        try:\n            return test_np"
+   }
+  ]
+ }
+}

@@ -1,0 +1,51 @@
+{
+  "subject_sha256": "c4ebec907f02a509b94000b0b8e7a7a8ba061560e12d5a6e8473f3d1d5385ab2",
+  "policy": "advisory",
+  "summary": "Reviewed the frozen candidate (sha256 c4ebec90…, .best_kernel.py, identical to rounds[1].solution.code in .ledger.json) against the log10_ definition, oracle, correctness/timing case lists and the supplied preflight/evaluate receipts. The implementation is a single in-place elementwise Triton pass (tl.log(x.to(fp32)) * log10(e)) with a host-side specialization cache that calls the already-compiled Ascend launcher with the raw device pointer; it mutates A and returns A, matching Definition effects {mutates:[A], returns_alias_of:{out:A}}, and it does not route computation through torch.ops or any fallback implementation, does not special-case workload shapes/seeds, and has no per-call host synchronization. The supplied evaluate.json reports all 36 workloads PASSED (geo_mean 1.0290, min_speedup 0.9878) which is a different measurement process from the optimize ledger's round-2 geo_mean 0.7233; I make no claim about execution or timing validity beyond that static reading. No P0 defect was found. Advisory issues: the fast-path cache key omits the device index although the captured stream and compiled launcher are device-bound; the private Ascend launcher ABI is invoked without a call-time guard so an ABI drift would break the hot path instead of degrading to the documented fallback; compute is unconditionally fp32 while run() accepts any dtype (fp64 silently loses precision, non-float dtypes are silently cast); and the declared correctness cases never exceed numel 1025, so the nomask/multi-tile kernel-selection path used by every timing shape has no numerical coverage in the supplied evidence. review_tests was explicitly skipped (review.json status SKIPPED_EXPLICIT, subject dacd9554…), so this code review does not substitute for a test-contract review.",
+  "reviewed_files": [
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/log10_-paired-pointwise-20261022-paired-hgkda/stages/optimize/work/optimize_definition_output.json",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/log10_-paired-pointwise-20261022-paired-hgkda/stages/optimize/work/.ledger.json",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/log10_-paired-pointwise-20261022-paired-hgkda/stages/optimize/work/.best_kernel.py",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/log10_-paired-pointwise-20261022-paired-hgkda/stages/prepare_catalog/attempts/01/catalog/manifest.json",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/log10_-paired-pointwise-20261022-paired-hgkda/stages/prepare_catalog/attempts/01/catalog/ops/log10_/correctness.jsonl",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/log10_-paired-pointwise-20261022-paired-hgkda/stages/prepare_catalog/attempts/01/catalog/ops/log10_/definition.json",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/log10_-paired-pointwise-20261022-paired-hgkda/stages/prepare_catalog/attempts/01/catalog/ops/log10_/oracle.py",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/log10_-paired-pointwise-20261022-paired-hgkda/stages/prepare_catalog/attempts/01/catalog/ops/log10_/timing.jsonl",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/log10_-paired-pointwise-20261022-paired-hgkda/stages/prepare_catalog/attempts/01/evaluation-contract.json",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/log10_-paired-pointwise-20261022-paired-hgkda/stages/review_tests/attempts/01/review.json",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/log10_-paired-pointwise-20261022-paired-hgkda/stages/review_tests/attempts/01/preflight.json",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/log10_-paired-pointwise-20261022-paired-hgkda/stages/review_tests/attempts/01/evaluate.json"
+  ],
+  "findings": [
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py L197 `key = (n, ptr & 15)` and L213 `entry = _fast_get((n, ptr & 15))` key the specialization cache on numel and pointer alignment only, while the cached closure is device-bound: L171 `stream = _resolve_stream(A.device.index)`, L108-132 `_resolve_stream(device)` caching into the per-device `_STREAM` dict (L94), and L168-170 capture `launcher.launch`, `compiled.function`, `compiled.packed_metadata`. The round-1 code kept in .ledger.json L34 keyed on `(A.dtype, n, A.data_ptr() & 15 == 0, A.device.index)`; round 2 dropped both dtype from the key (recovered via the `A.dtype is entry[0]` guard at L199/L214) and the device index entirely.",
+      "reason": "A tensor on NPU:1 with the same numel and the same `data_ptr() & 15` as an NPU:0 specialization hits the NPU:0 entry and is launched through a raw `_npu_getCurrentRawStreamNoWait(device=0)` handle (L113-124) using an NPU:0 compiled function/metadata. That is a wrong-device launch the dtype/contiguity guards at L214 do not catch, so run(A) is not correct for the general ABI in definition.json (which places no device restriction on A).",
+      "requested_change": "Include the device index in the fast-path cache key, e.g. `key = (A.device.index, n, ptr & 15)` in both `run` (L213) and `_dispatch` (L197), and keep the per-device stream resolution keyed the same way so a compiled launcher is never reused across devices."
+    },
+    {
+      "priority": "P1",
+      "category": "target_capability",
+      "evidence": ".best_kernel.py L154-173 wraps only launcher *construction* in `try/except Exception` (falling back to `_standard_launch`). The steady-state closures built at L177-186 call the private Ascend launcher ABI directly — `call(grid, 1, 1, stream(), function, metadata, None, None, None, ptr, None)` (L180-181, L185-186) — with no guard, and neither `_dispatch` (L190-207) nor `run` (L210-217) has a try/except. The only pre-checks are the three attribute probes at L164-166.",
+      "reason": "The launch relies on undocumented torch_npu/FlagTree internals (`compiled.run.launch`, `compiled.packed_metadata`, `_npu_getCurrentRawStreamNoWait`) and on an exact positional signature. If any of those change while the probed attributes still exist, every hot call raises TypeError in the timed path instead of degrading to the documented `_standard_launch` fallback, turning a portability issue into a total failure of `run`.",
+      "requested_change": "Guard the direct ABI call: either validate the callable's signature/arity at build time (and fall back to `_standard_launch` on mismatch), or wrap the first invocation per specialization in try/except and permanently demote that key to `_standard_launch` on failure."
+    },
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py L53/L63/L85 compute `y = tl.log(x.to(tl.float32)) * 0.4342944819032518` and store `y.to(X.dtype.element_ty)`; `run` (L210-217) and `_dispatch` (L190-207) perform no dtype acceptance check. definition.json L4-10 declares a single unconstrained parameter `A` with no dtype restriction.",
+      "reason": "torch.log10_ (the oracle's reference, oracle.py L74-76) supports float64 and rejects integer/bool inputs. This candidate silently computes fp64 inputs through an fp32 intermediate (~7 significant digits lost, far outside the fp32 tolerance band of 1e-4 and outside any fp64 tolerance) and silently casts float results into integer/bool element types instead of raising. That is a behaviour change for inputs the declared ABI admits, even though the current case list only exercises fp16/bf16/fp32.",
+      "requested_change": "Either preserve the reference dtype semantics (skip the fp32 upcast when the element type already has >= 32-bit precision, and reject non-float dtypes) or narrow the accepted dtype set explicitly in `run` so unsupported dtypes cannot silently produce wrong values."
+    },
+    {
+      "priority": "P1",
+      "category": "source_quality",
+      "evidence": "correctness.jsonl L1-24 use only shapes [0] (8 cases), [1] (4 cases), [1025] (6 cases) and [7,9] (6 cases) — max numel 1025, and 12 of 24 cases are 0- or 1-element. timing.jsonl L2-L4/L8-L12 use 65536, 1048576 and 4096x4096. In the candidate, `_pick_block` (.best_kernel.py L97-105) returns 8192 for 65536 and 32768 for >=262144, and L149 `masked = bool(n % block)` is then False for all those shapes, so the timing shapes select `_log10_nomask` (L47-54) and its raw-launcher closure (L182-186), which no correctness case ever reaches. evaluate.json L357-367 and L469-495 report `abs_err: null`, `rel_err: null`, `matched_ratio: null` for timing workloads, i.e. no accuracy metric is reported there.",
+      "reason": "The kernel-selection branch and tile sizes that dominate the measured score are numerically unverified in the supplied evidence: a defect in `_pick_block`/`_log10_nomask` for n > 1025 (including the fast masked/numask launcher closures at L177-186) would not be detected by any declared case. This is a coverage limitation of the case set, not a defect of the candidate.",
+      "requested_change": "In a later catalogue/epoch revision, derive at least one correctness case with a large aligned numel (e.g. 65536 and one 4096x4096 entry) so the nomask, multi-tile and raw-launcher paths are checked against the torch.log10_ reference; keep the existing cases and tolerances unchanged."
+    }
+  ],
+  "blocker": null,
+  "missing_dependencies": []
+}

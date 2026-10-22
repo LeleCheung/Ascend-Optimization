@@ -1,0 +1,72 @@
+{
+  "subject_sha256": "8d098b024ee2abdc1b331d3ec962285133c3737c8995cb7ef34e9e848f5b9a75",
+  "policy": "advisory",
+  "summary": "Reviewed the round-2 selu_ candidate (subject 8d098b0…) against the frozen selu_ definition/oracle/workloads and the optimize measurements. The math is the torch SELU default (scale 1.0507009873554805, alpha 1.6732632423543772, fp32 compute with cast-back to the input dtype), run(A) mutates and returns the same tensor as the Definition declares (mutates [A], out alias of A), no torch/torch.ops fallback is used for computation, and there is no host synchronization. All 24 correctness workloads exercised the raw pointer-bound launch path (shapes 0/1/1025/7x9) and passed with 0.0 error. Findings are the host-path machinery introduced in round 2: the launch cache key and the process-global cached device omit the device (a regression from round 1, which keyed on A.device.index), the object-identity fast path trusts that the tensor object's storage/numel/dtype never change between calls, the caches grow without bound and keep tensors alive, the raw launcher ABI is private and never runtime-validated, the strided kernel truncates to 8 dims, and the misaligned fallback branch is unreachable in the evaluation (the allocator is >=512B aligned, so ptr & 15 == 0 always holds). Measurement note: the supplied final_verification records geo_mean 0.9276 (<1.0) versus the search best 1.0016, with the nine launch-bound workloads rising from 8.96-10.4us to 11.3-14.0us while the reference only rose ~13-15%, so the round-2 host-side win did not reproduce. Code findings are advisory for later epochs; none of the supplied Preflight/correctness gates is duplicated here.",
+  "reviewed_files": [
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/selu_-paired-pointwise-20261022-paired-hgkda/stages/optimize/work/optimize_definition_output.json",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/selu_-paired-pointwise-20261022-paired-hgkda/stages/optimize/work/.ledger.json",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/selu_-paired-pointwise-20261022-paired-hgkda/stages/optimize/work/.best_kernel.py",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/selu_-paired-pointwise-20261022-paired-hgkda/stages/prepare_catalog/attempts/01/catalog/manifest.json",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/selu_-paired-pointwise-20261022-paired-hgkda/stages/prepare_catalog/attempts/01/catalog/ops/selu_/correctness.jsonl",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/selu_-paired-pointwise-20261022-paired-hgkda/stages/prepare_catalog/attempts/01/catalog/ops/selu_/definition.json",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/selu_-paired-pointwise-20261022-paired-hgkda/stages/prepare_catalog/attempts/01/catalog/ops/selu_/oracle.py",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/selu_-paired-pointwise-20261022-paired-hgkda/stages/prepare_catalog/attempts/01/catalog/ops/selu_/timing.jsonl",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/selu_-paired-pointwise-20261022-paired-hgkda/stages/prepare_catalog/attempts/01/evaluation-contract.json",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/selu_-paired-pointwise-20261022-paired-hgkda/stages/review_tests/attempts/01/review.json",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/selu_-paired-pointwise-20261022-paired-hgkda/stages/review_tests/attempts/01/preflight.json",
+    "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/selu_-paired-pointwise-20261022-paired-hgkda/stages/review_tests/attempts/01/evaluate.json"
+  ],
+  "findings": [
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:130 comment '`# (dtype, numel, aligned, data_ptr) -> zero-argument launch`'; .best_kernel.py:263 `key = (A.dtype, n, ptr & 15 == 0, ptr)`; .best_kernel.py:201-209 caches `_RUNTIME[\"device\"]` once from the first tensor (or `torch.npu.current_device()`); .best_kernel.py:214-224 every `invoke` closes over that single `dev` and calls `raw(dev)`. Round 1 keyed on the device: .ledger.json:34 `key = (A.dtype, n, ptr % 16 == 0, A.device.index)`.",
+      "reason": "The launch cache and the process-global device are not keyed by device, which is a regression from the round-1 seed that did include `A.device.index`. A tensor on a different NPU whose data_ptr, dtype and numel coincide with a cached entry (address values repeat across devices) reuses a specialization bound to another device's raw stream and compiled function. `run()` also never validates `A.device`, so a non-NPU tensor is silently launched through the NPU path with a host pointer. This is outside the single-device evaluation but is a real correctness/ABI hazard for the operator.",
+      "requested_change": "Put the device in every cache key, e.g. `key = (A.device, A.dtype, n, ptr & 15 == 0, ptr)`, resolve `dev` per key instead of once in `_RUNTIME`, and validate `A.device.type == 'npu'` at the top of `run()` (fall back or raise for other devices)."
+    },
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:246-253: `if A is last[0] and launch is not None: launch(); return A`, with the comment 'Repeat call on the same tensor: storage, shape, dtype and pointer are unchanged by an in-place op, so the bound launch is still exact.'; .best_kernel.py:126-130 the `_LAST`/`_CACHE` globals; the bound launch carries the integer `ptr` and the numel-derived `grid`/`block` (.best_kernel.py:214-224).",
+      "reason": "The fast path uses Python object identity as a proxy for unchanged storage metadata, and it skips numel/is_contiguous/data_ptr/dtype revalidation entirely. A same-object caller sequence such as `run(A); A.set_(other_storage); run(A)` writes to the stale (possibly freed) buffer, and `run(A); A.resize_(larger); run(A)` launches the old grid/pointer over a larger storage (out-of-bounds write). Because the benefit only exists when the harness calls with the identical tensor object, it also over-fits the benchmark call pattern rather than the operator contract, which is the smell behind the non-reproducing final verification.",
+      "requested_change": "Keep the fast path only after a cheap revalidation of the invariants it depends on (same `A.data_ptr()`, `A.numel()`, dtype, contiguity and device), or drop the object-identity short-circuit and key the dispatch on `(device, dtype, numel, data_ptr, contiguous)` as round 1 did."
+    },
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:130 `_CACHE = {}`; .best_kernel.py:264-267 `_CACHE[key] = launch` with no eviction or size bound; .best_kernel.py:156-168 `_plain_launch` returns closures that capture `A`; .best_kernel.py:176 and 194 return that closure for misaligned inputs and for any introspection failure; .best_kernel.py:227-243 `_make_strided_launch` also captures `A`.",
+      "reason": "Every distinct (dtype, numel, alignment, pointer) adds a permanent entry, and the misaligned/fallback entries are closures over the tensor object, so the cache keeps those tensors and their storage alive for the lifetime of the process. In a long-running training/inference process that slides over many buffers this is unbounded host memory growth, plus retained device allocations via the captured tensors.",
+      "requested_change": "Bound the cache (small LRU or last-N entries) and make the fallback closures not retain the tensor (pass the tensor as an argument at call time, as round 1's `_standard_launch(n, block, masked)` did), so freeing a buffer actually releases it."
+    },
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:178 `raw = getattr(torch_npu._C, \"_npu_getCurrentRawStreamNoWait\", None)`; .best_kernel.py:181-199 the `try/except` only covers warmup and attribute probing; .best_kernel.py:211-224 the hand-written ABI `call(grid, 1, 1, raw(dev), function, metadata, None, None, None, ptr, n, None)` passes an integer where the kernel parameter is a tensor and relies on undocumented positional semantics of `compiled.run.launch`.",
+      "reason": "The kernel launch depends on private torch_npu/Triton internals (`_npu_getCurrentRawStreamNoWait`, `compiled.function`, `compiled.packed_metadata`, `launcher.launch` positional layout, integer-for-tensor substitution). Only the introspection is guarded: once `invoke` is installed, a vendor or triton-npu update that rejects an integer tensor argument raises on every subsequent call, and a reordered positional ABI would bind the pointer/numel to the wrong slots. Nothing validates the specialization before it is used, and `torch_npu._C` is accessed outside the try block (line 178), so a missing `_C` attribute raises instead of falling back.",
+      "requested_change": "Validate the fast launch once before installing it (e.g. run one canary invocation on a small tensor and compare against the ordinary `_plain_launch` result, or verify `triton.__version__`/launcher signature), fall back to `_plain_launch` when the check fails, and move the `torch_npu._C` lookup inside the guarded block."
+    },
+    {
+      "priority": "P1",
+      "category": "conversion",
+      "evidence": ".best_kernel.py:136-139 `_pad8(values, fill)` returns only `list(values[:8])` padded to 8; .best_kernel.py:228-231 `shape = _pad8(A.shape, 1)`, `strides = _pad8(A.stride(), 0)`, `ndims = min(A.dim(), 8)`, then .best_kernel.py:99-120 peels exactly 8 axes with `NDIMS >= 8` selecting the top peel.",
+      "reason": "For a non-contiguous tensor with more than 8 dimensions the shape and stride vectors are silently truncated to the first 8 axes while the grid still covers the full `numel`. The kernel then decomposes only 8 axes worth of logical indices, so offsets are wrong (duplicated/out-of-range) and `run()` gives incorrect results with no error. The definition places no rank limit on `A`.",
+      "requested_change": "Explicitly reject or fall back for `A.dim() > 8` (raise a clear error, or use a non-specialized fallback) instead of silently truncating, and cover a >8-D non-contiguous case in the correctness workloads."
+    },
+    {
+      "priority": "P1",
+      "category": "target_capability",
+      "evidence": "optimize_definition_output.json:5 `\"best_geo_mean\": 0.927565331348264` versus :7 `\"search_best_geo_mean\": 1.001556545566768`; optimize_definition_output.json:16-28 final_verification for selu_-timing-0 shows before latency_ms 0.0089626 / reference 0.0109299 and after latency_ms 0.0130003 / reference 0.0126314; the same pattern holds for timing-1/2/4/5/6/8/9/10 (candidate +37-46%, reference +13.6-38%); .ledger.json:857-999 records the round-2 search latencies of 0.00896-0.01038 for those nine workloads.",
+      "reason": "The round-2 host-side win recorded during the search (geo_mean 1.0016, all nine launch-bound workloads above the reference) did not reproduce in the final verification, which measured geo_mean 0.9276, i.e. slower than the framework reference overall, with the nine launch-bound workloads rising back to 11.3-14.0us while the reference only degraded ~13-15%. The ledger summary'itself still claims 'each of those nine now faster than the framework reference', which the supplied final verification contradicts; the delivered speedup is inside run-to-run and environment drift. This is a measurement-robustness limitation, not a proven defect of the kernel (the correctness numbers remain 0.0 error).",
+      "requested_change": "Report the final-verification geo_mean (0.9276, <1.0) as the delivered result instead of the search-best 1.0016, and re-measure the fast path in a dedicated repeat run (interleaved candidate/reference on the same session) before treating the identity short-circuit as a confirmed speedup."
+    },
+    {
+      "priority": "P1",
+      "category": "source_quality",
+      "evidence": ".best_kernel.py:171-177 `_make_contig_launch` routes `if not aligned: return _plain_launch(...)`, gated by the key element `ptr & 15 == 0` (.best_kernel.py:263); correctness.jsonl:1-24 only uses shapes [0], [1], [1025], [7,9] with `strided` true/false, and the device allocator hands out >=512B-aligned buffers, so `aligned` is always True and `_plain_launch` (line 156-168) is never taken; the strided kernel path (.best_kernel.py:227-243) is exercised only through the 12 `strided: true` cases, and no 0-dim, >2-D (other than 7x9) or large-shape numeric check exists.",
+      "reason": "The two fallback branches that make the specialization safe - the misaligned `_plain_launch` path and the introspection-failure path (lines 176, 194, 198-199) - are effectively unreachable in the supplied evaluation, and there is no 0-dim or high-rank numeric coverage. A regression in exactly those branches (the ones that exist to protect against a bad ABI) would not be detected by the supplied 24 correctness workloads.",
+      "requested_change": "Add a correctness case that forces a misaligned contiguous view (e.g. an offset slice so `data_ptr() % 16 != 0`), a 0-dim tensor and a non-contiguous tensor with rank > 2, so the `_plain_launch` and strided fallbacks are actually exercised."
+    }
+  ],
+  "blocker": null,
+  "missing_dependencies": []
+}

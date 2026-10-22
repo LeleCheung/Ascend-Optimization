@@ -1,0 +1,217 @@
+{
+  "definition_name": "log10_",
+  "op_type": "",
+  "status": "PASSED",
+  "best_geo_mean": 0.7613608774536661,
+  "best_code": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"In-place base-10 logarithm (log10_) for Ascend with Triton.\n\nlog10_ is a single elementwise pass, so for every measured shape up to 1M\nelements the per-call cost is the host launch path, not the kernel (~2us of\ndevice work).  Two facts measured on the target drive this file:\n\n* the FlagTree JIT dispatch (`kernel[grid](...)`) costs ~17us per call because of\n  its Python argument handling, while the compiled launcher itself is a compiled\n  C entry costing ~7-10us;\n* the residual Python work inside the wrapper is visible at that scale.\n\nEach (numel, pointer-alignment) specialization is therefore built once and\nafterwards dispatched through the already-bound compiled launcher called with\nthe raw device pointer, so the steady-state path is one `numel`, one `data_ptr`,\none dict lookup, one dtype identity check, one contiguity check and the launch.\nCold, misaligned and non-contiguous calls keep the ordinary Triton path.\n\"\"\"\n\nimport torch\nimport torch_npu  # noqa: F401  (provides the raw current-stream query)\nimport triton\nimport triton.language as tl\n\n# 32768 elements per program keeps per-program dispatch overhead amortized on the\n# large shapes and is the best measured tile for 4096x4096 on this target; smaller\n# tiles scale strictly worse (16384 costs 2x on fp16, loop/stride variants worse).\n_BLOCK_MAX = 32768\n_BLOCK_MIN = 1024\n_BLOCK_TARGET_PROGRAMS = 8\n_BLOCK_STRIDED = 1024\n\n\n@triton.jit\ndef _log10_nomask(X, BLOCK: tl.constexpr):\n    \"\"\"numel % BLOCK == 0 (host-guarded), so the tail mask can be dropped.\"\"\"\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    x = tl.load(X + offs)\n    y = tl.log(x.to(tl.float32)) * 0.4342944819032518\n    tl.store(X + offs, y.to(X.dtype.element_ty))\n\n\n@triton.jit\ndef _log10_masked(X, N, BLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < N\n    x = tl.load(X + offs, mask=mask)\n    y = tl.log(x.to(tl.float32)) * 0.4342944819032518\n    tl.store(X + offs, y.to(X.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _log10_strided(\n    X,\n    N: tl.constexpr,\n    SHAPE: tl.constexpr,\n    STRIDES: tl.constexpr,\n    BLOCK: tl.constexpr,\n):\n    \"\"\"Non-contiguous input: logical index -> storage offset, written in place.\"\"\"\n    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    remainder = index\n    offset = tl.full((BLOCK,), 0, tl.int64)\n    for axis in tl.static_range(len(SHAPE) - 1, -1, -1):\n        coord = remainder % SHAPE[axis]\n        remainder = remainder // SHAPE[axis]\n        offset += coord.to(tl.int64) * STRIDES[axis]\n    x = tl.load(X + offset, index < N, other=1)\n    y = tl.log(x.to(tl.float32)) * 0.4342944819032518\n    tl.store(X + offset, y.to(X.dtype.element_ty), index < N)\n\n\n# (numel, data_ptr() & 15) -> (dtype, launch(A, ptr)); the hot path lookup\n_fast_get = {}  # type: ignore[assignment]\n_FAST = {}\n_fast_get = _FAST.get\n\n# per-device raw current-stream accessor, resolved once\n_STREAM = {}\n\n\ndef _pick_block(n):\n    \"\"\"Largest tile that spreads work over cores without exceeding the UB budget.\"\"\"\n    if n >= _BLOCK_MAX * _BLOCK_TARGET_PROGRAMS:\n        return _BLOCK_MAX\n    target = -(-n // _BLOCK_TARGET_PROGRAMS)\n    block = _BLOCK_MIN\n    while block < target:\n        block <<= 1\n    return min(block, _BLOCK_MAX)\n\n\ndef _resolve_stream(device):\n    \"\"\"Cheapest faithful current-stream accessor for this device, resolved once.\"\"\"\n    getter = _STREAM.get(device)\n    if getter is not None:\n        return getter\n    raw = getattr(torch_npu._C, \"_npu_getCurrentRawStreamNoWait\", None)\n    if raw is not None:\n        try:\n            # The no-wait variant follows stream switches like the torch accessor\n            # but does not stall behind already enqueued work (~0.2us vs ~20us).\n            want = int(torch.npu.current_stream().npu_stream)\n            try:\n                if int(raw(device)) == want:\n                    getter = lambda: raw(device)  # noqa: E731\n            except TypeError:\n                if int(raw()) == want:\n                    getter = raw\n        except Exception:  # noqa: BLE001\n            getter = None\n    if getter is None:\n        from triton.runtime import driver\n\n        getter = lambda: driver.active.get_current_stream(device)  # noqa: E731\n    _STREAM[device] = getter\n    return getter\n\n\ndef _standard_launch(n, block, masked):\n    \"\"\"Ordinary Triton launch: no alignment assumption, safe for any pointer.\"\"\"\n    if masked:\n        def launch(X, ptr, n=n, block=block):\n            _log10_masked[(triton.cdiv(n, block),)](X, n, BLOCK=block)\n    else:\n        def launch(X, ptr, n=n, block=block):\n            _log10_nomask[(n // block,)](X, BLOCK=block)\n    return launch\n\n\ndef _make_launch(A, n):\n    \"\"\"Build the per-specialization launcher, degrading to a plain Triton launch.\"\"\"\n    block = _pick_block(n)\n    masked = bool(n % block)\n    if A.data_ptr() & 15:\n        # Never bind the compiled kernel to a pointer whose alignment differs\n        # from the one it was specialized for.\n        return _standard_launch(n, block, masked)\n    try:\n        if masked:\n            compiled = _log10_masked.warmup(A, n, BLOCK=block, grid=(1,))\n            grid = triton.cdiv(n, block)\n        else:\n            compiled = _log10_nomask.warmup(A, BLOCK=block, grid=(1,))\n            grid = n // block\n        launcher = compiled.run\n        # NPULauncher only adds bookkeeping when one of these is enabled;\n        # otherwise its bound compiled launch is exactly what it forwards to.\n        if (getattr(launcher, \"compile_only\", False)\n                or getattr(launcher, \"enable_msprof_register_tensor\", False)\n                or getattr(launcher.metadata, \"debug_enabled\", False)):\n            return _standard_launch(n, block, masked)\n        call = launcher.launch\n        function = compiled.function\n        metadata = compiled.packed_metadata\n        stream = _resolve_stream(A.device.index)\n    except Exception:  # noqa: BLE001\n        return _standard_launch(n, block, masked)\n\n    # The Ascend launcher ABI is (grid x/y/z, stream, function, packed metadata,\n    # hooks, *kernel params) with constexpr params passed as placeholders.\n    if masked:\n        def launch(X, ptr, grid=grid, call=call, function=function,\n                   metadata=metadata, stream=stream, n=n):\n            call(grid, 1, 1, stream(), function, metadata, None, None, None,\n                 ptr, n, None)\n    else:\n        def launch(X, ptr, grid=grid, call=call, function=function,\n                   metadata=metadata, stream=stream):\n            call(grid, 1, 1, stream(), function, metadata, None, None, None,\n                 ptr, None)\n    return launch\n\n\ndef _dispatch(A, n, ptr):\n    if n == 0:\n        return A\n    if not A.is_contiguous():\n        _log10_strided[(triton.cdiv(n, _BLOCK_STRIDED),)](\n            A, n, tuple(A.shape), tuple(A.stride()), BLOCK=_BLOCK_STRIDED)\n        return A\n    key = (n, ptr & 15)\n    entry = _fast_get(key)\n    if entry is not None and A.dtype is entry[0]:\n        # Same specialization reached from the cold path (e.g. after a miss on\n        # contiguity): reuse it instead of rebuilding.\n        entry[1](A, ptr)\n        return A\n    launch = _make_launch(A, n)\n    _FAST[key] = (A.dtype, launch)\n    launch(A, ptr)\n    return A\n\n\ndef run(A):\n    n = A.numel()\n    ptr = A.data_ptr()\n    entry = _fast_get((n, ptr & 15))\n    if entry is not None and A.dtype is entry[0] and A.is_contiguous():\n        entry[1](A, ptr)\n        return A\n    return _dispatch(A, n, ptr)\n",
+  "search_best_geo_mean": 0.7232637007603351,
+  "final_verification": {
+    "status": "PASSED",
+    "reason_code": "VERIFIED",
+    "geo_mean": 0.7613608774536661,
+    "measured_geo_mean": 0.7613608774536661,
+    "comparisons": [
+      {
+        "uuid": "log10_-timing-0",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.010892392179537927,
+          "latency_ms": 0.01272171500322375
+        },
+        "after": {
+          "reference_latency_ms": 0.013849358352790046,
+          "latency_ms": 0.016256391562853533
+        },
+        "ratios": {
+          "reference_latency_ms": 1.271470777448408,
+          "latency_ms": 1.277845916115404
+        }
+      },
+      {
+        "uuid": "log10_-timing-1",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011022498895644293,
+          "latency_ms": 0.013112442828085285
+        },
+        "after": {
+          "reference_latency_ms": 0.013291147502184337,
+          "latency_ms": 0.016692474914086115
+        },
+        "ratios": {
+          "reference_latency_ms": 1.2058198080143636,
+          "latency_ms": 1.2730255630425193
+        }
+      },
+      {
+        "uuid": "log10_-timing-2",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.010717381585681557,
+          "latency_ms": 0.012530469640954786
+        },
+        "after": {
+          "reference_latency_ms": 0.013536433719528692,
+          "latency_ms": 0.016231179030742438
+        },
+        "ratios": {
+          "reference_latency_ms": 1.2630355289031974,
+          "latency_ms": 1.295336846568958
+        }
+      },
+      {
+        "uuid": "log10_-timing-3",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.015854689882422675,
+          "latency_ms": 0.0360061879665062
+        },
+        "after": {
+          "reference_latency_ms": 0.015827711230463504,
+          "latency_ms": 0.03600943130609547
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9982983803430251,
+          "latency_ms": 1.0000900772831682
+        }
+      },
+      {
+        "uuid": "log10_-timing-4",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.009304093548127997,
+          "latency_ms": 0.011539771922629777
+        },
+        "after": {
+          "reference_latency_ms": 0.013343631399640047,
+          "latency_ms": 0.01549370639333413
+        },
+        "ratios": {
+          "reference_latency_ms": 1.4341678026576605,
+          "latency_ms": 1.3426354088463905
+        }
+      },
+      {
+        "uuid": "log10_-timing-5",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.00977669424393845,
+          "latency_ms": 0.012095735055665366
+        },
+        "after": {
+          "reference_latency_ms": 0.01293959407424219,
+          "latency_ms": 0.015052238195283318
+        },
+        "ratios": {
+          "reference_latency_ms": 1.3235142422772133,
+          "latency_ms": 1.2444252561759934
+        }
+      },
+      {
+        "uuid": "log10_-timing-6",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.009464397692699437,
+          "latency_ms": 0.012266669220475724
+        },
+        "after": {
+          "reference_latency_ms": 0.012927312912785366,
+          "latency_ms": 0.015245754877465822
+        },
+        "ratios": {
+          "reference_latency_ms": 1.3658885998373802,
+          "latency_ms": 1.2428601932150711
+        }
+      },
+      {
+        "uuid": "log10_-timing-7",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.02534232065588841,
+          "latency_ms": 0.03808779488491606
+        },
+        "after": {
+          "reference_latency_ms": 0.025317447285357526,
+          "latency_ms": 0.03808196855657681
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9990185046243938,
+          "latency_ms": 0.9998470289929662
+        }
+      },
+      {
+        "uuid": "log10_-timing-8",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.009724259237235877,
+          "latency_ms": 0.011943080536574216
+        },
+        "after": {
+          "reference_latency_ms": 0.012606390387228708,
+          "latency_ms": 0.015167678004489175
+        },
+        "ratios": {
+          "reference_latency_ms": 1.2963856762432504,
+          "latency_ms": 1.269997129973295
+        }
+      },
+      {
+        "uuid": "log10_-timing-9",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.009176740456090996,
+          "latency_ms": 0.012293372751082889
+        },
+        "after": {
+          "reference_latency_ms": 0.01284179836158337,
+          "latency_ms": 0.015378466806453522
+        },
+        "ratios": {
+          "reference_latency_ms": 1.3993855904532768,
+          "latency_ms": 1.2509558701129335
+        }
+      },
+      {
+        "uuid": "log10_-timing-10",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.008924260389378135,
+          "latency_ms": 0.011780990907236078
+        },
+        "after": {
+          "reference_latency_ms": 0.012851657784919994,
+          "latency_ms": 0.016310071981304578
+        },
+        "ratios": {
+          "reference_latency_ms": 1.4400809954196696,
+          "latency_ms": 1.3844397393844574
+        }
+      },
+      {
+        "uuid": "log10_-timing-11",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.026050406735876552,
+          "latency_ms": 0.053081350326048944
+        },
+        "after": {
+          "reference_latency_ms": 0.02601809551899366,
+          "latency_ms": 0.038920462127965516
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9987596655510796,
+          "latency_ms": 0.7332229095322361
+        }
+      }
+    ],
+    "drift": [],
+    "drift_factor": 2.0,
+    "compared_to": "original_round",
+    "attempt_path": ".kernelgen/retests/c4ebec907f02a509b94000b0b8e7a7a8ba061560e12d5a6e8473f3d1d5385ab2/ca8f80035a8917739fb99db199bb4afb8500a6063a6bcb4c0b839e5b1a1a5e95/attempt-0001.json",
+    "round_num": 2,
+    "solution_sha256": "c4ebec907f02a509b94000b0b8e7a7a8ba061560e12d5a6e8473f3d1d5385ab2"
+  },
+  "rounds": 2,
+  "summary": "Both rounds passed all 36 workloads; the winning architecture keeps one straight-line Triton elementwise kernel (32768-element tiles, tl.log in fp32) launched through the already-compiled Ascend pybind launcher with a raw device pointer, reached via a dict of pre-bound closures keyed on (numel, data_ptr&15) with dtype and contiguity guards, which lifted geo_mean from 0.6958x to 0.7233x (best round 2). Target-side debugging showed 9 of 12 timing workloads are pure host-launch bound (flat 11.5-13.1us for 1024..1M elements against a 7.4-10.3us compiled-launch floor) while the three 4096x4096 workloads stay device bound, and that grid-stride loops, contiguous-chunk loops, statically unrolled 2/4/8-tile programs, num_stages 1/2 and tl.log2 all measured worse than the 512-program straight-line tile; the key lesson is that on this target the FlagTree JIT dispatch costs ~17us per call, so the launch path, not the kernel, is the optimization surface for small shapes.",
+  "workspace": "/data/hanle/ascend-optimization/runs/paired-pointwise-20261022/kg-runs/log10_-paired-pointwise-20261022-paired-hgkda/stages/optimize/work"
+}

@@ -1,0 +1,28 @@
+{
+  "api_version": "v6.2",
+  "name": "log10_",
+  "description": "",
+  "parameters": [
+    {
+      "name": "A",
+      "kind": "positional_or_keyword",
+      "required": true,
+      "default": null,
+      "type_hint": null
+    }
+  ],
+  "outputs": [
+    "out"
+  ],
+  "effects": {
+    "mutates": [
+      "A"
+    ],
+    "returns_alias_of": {
+      "out": "A"
+    }
+  },
+  "reference": "\"\"\"夜间体检的独立 PyTorch 参考与输入构建；不进入候选源码。\"\"\"\nimport torch\nimport torch.nn.functional as F\n\nREFERENCE_DEVICE = 'target'\nOPERATOR = 'log10_'\n\n\ndef gen_inputs(ctx, device):\n    s = ctx['inputs']['spec']\n    dtype = getattr(torch, s.get('dtype', 'float32'))\n    g = torch.Generator().manual_seed(ctx.get('seed', 0))\n    def random(shape):\n        return torch.randn(shape, generator=g).to(dtype=dtype, device=device)\n    op = OPERATOR\n    if op == 'value_selecting_reduction_backward':\n        sizes, dim, keep = s['sizes'], s['dim'], s['keepdim']\n        axis = dim % len(sizes)\n        shape = list(sizes)\n        if keep:\n            shape[axis] = 1\n        else:\n            shape.pop(axis)\n        grad = random(shape)\n        indices = torch.randint(sizes[axis], shape, generator=g).to(device)\n        if s.get('strided') and shape:\n            # 相同逻辑shape，但两倍物理跨度；grad与indices均测试stride。\n            grad_base = torch.empty((*shape, 2), dtype=dtype, device=device)\n            index_base = torch.empty((*shape, 2), dtype=torch.int64, device=device)\n            grad_base[..., 0] = grad\n            index_base[..., 0] = indices\n            grad, indices = grad_base[..., 0], index_base[..., 0]\n        return dict(grad=grad, dim=dim, indices=indices, sizes=sizes, keepdim=keep)\n    if op == 'scatter_add':\n        shape, dim = s['shape'], s['dim']\n        x, src = random(shape), random(shape)\n        indices = torch.randint(shape[dim], shape, generator=g).to(device)\n        return dict(inp=x, dim=dim, index=indices, src=src)\n    if op == 'fractional_max_pool3d':\n        x = random(s['shape'])\n        samples = torch.rand((s['shape'][0], s['shape'][1], 3), generator=g).to(dtype=dtype, device=device)\n        return dict(input=x, kernel_size=s['kernel_size'], output_size=s['output_size'],\n                    return_indices=True, _random_samples=samples)\n    if op == 'upsample_bilinear2d':\n        return dict(input=random(s['shape']), output_size=s['output_size'], align_corners=s['align_corners'])\n    if op == 'cumulative_trapezoid':\n        y = random(s['shape'])\n        if s.get('transpose'):\n            y = y.transpose(-1, -2)\n        return dict(y=y, dx=s['dx'], dim=s['dim'])\n    x = random(s['shape'])\n    if op == 'conj_physical':\n        if dtype.is_complex:\n            x = torch.complex(torch.randn(s['shape'], generator=g), torch.randn(s['shape'], generator=g)).to(dtype=dtype, device=device)\n        if s.get('transpose'):\n            x = x.transpose(-1, -2)\n        if s.get('conj'):\n            x = x.conj()\n        return dict(input=x)\n    if op == 'uniform':\n        return dict(self=x, from_=s['from_'], to=s['to'])\n    if op == 'log10_':\n        x = x.abs() + 0.05\n    if s.get('strided'):\n        base = torch.empty((*x.shape, 2), dtype=dtype, device=device)\n        base[..., 0] = x\n        x = base[..., 0]\n    return dict(A=x)\n\n\ndef run(A):\n    kwargs = locals().copy()\n    op = OPERATOR\n    if op in {'selu_', 'rad2deg_', 'log10_'}:\n        a = kwargs['A']\n        return {'selu_': torch.selu_, 'rad2deg_': torch.rad2deg_, 'log10_': torch.log10_}[op](a)\n    if op == 'value_selecting_reduction_backward':\n        return torch.ops.aten.value_selecting_reduction_backward(**kwargs)\n    if op == 'cumulative_trapezoid':\n        return torch.cumulative_trapezoid(**kwargs)\n    if op == 'scatter_add':\n        return torch.scatter_add(kwargs['inp'], kwargs['dim'], kwargs['index'], kwargs['src'])\n    if op == 'upsample_bilinear2d':\n        return torch.ops.aten.upsample_bilinear2d(**kwargs)\n    if op == 'fractional_max_pool3d':\n        return F.fractional_max_pool3d(**kwargs)\n    if op == 'conj_physical':\n        return torch.conj_physical(kwargs['input'])\n    if op == 'uniform':\n        return torch.ops.aten.uniform(kwargs['self'], kwargs['from_'], kwargs['to'])\n    raise ValueError(op)\n\n",
+  "reference_device": "target",
+  "source_policy_id": null
+}

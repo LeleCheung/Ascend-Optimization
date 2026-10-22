@@ -1,0 +1,27 @@
+{
+  "source": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/driver.py",
+  "source_sha256": "dfa7d353e4d847abcb2348a6cb9f616dba7d4b9b62f833d691f14ff0fe27b74c",
+  "extracts": [
+    {
+      "lines": [
+        619,
+        662
+      ],
+      "text": "619: static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {\n620:   DevicePtrInfo ptr_info;\n621:   ptr_info.dev_ptr = 0;\n622:   ptr_info.valid = true;\n623:   if (PyLong_Check(obj)) {\n624:     ptr_info.dev_ptr = reinterpret_cast<void *>(PyLong_AsUnsignedLongLong(obj));\n625:     return ptr_info;\n626:   }\n627:   if (obj == Py_None) {\n628:     // valid nullptr\n629:     return ptr_info;\n630:   }\n631:   PyObject *ptr = PyObject_GetAttrString(obj, \"data_ptr\");\n632:   if(ptr){\n633:     PyObject *empty_tuple = PyTuple_New(0);\n634:     PyObject *ret = PyObject_Call(ptr, empty_tuple, NULL);\n635:     Py_DECREF(empty_tuple);\n636:     Py_DECREF(ptr);\n637:     if (!PyLong_Check(ret)) {\n638:       PyErr_SetString(PyExc_TypeError, \"data_ptr method of Pointer object must return 64-bit int\");\n639:       ptr_info.valid = false;\n640:       return ptr_info;\n641:     }\n642:     ptr_info.dev_ptr = reinterpret_cast<void *>(PyLong_AsUnsignedLongLong(ret));\n643:     if(!ptr_info.dev_ptr)\n644:       return ptr_info;\n645:     aclrtPtrAttributes attributes;\n646:     aclError status = aclrtPointerGetAttributes(ptr_info.dev_ptr, &attributes);\n647: \n648:     if (status == ACL_SUCCESS) {\n649:       if (attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE && attributes.location.type != 4) {\n650:         Py_DECREF(ret);\n651:         PyErr_Format(PyExc_ValueError,\n652:                      \"Pointer argument (at %d) cannot be accessed from Triton (cpu tensor?)\", idx);\n653:         ptr_info.valid = false;\n654:         return ptr_info;\n655:       }\n656:     } else {\n657:       Py_DECREF(ret);\n658:       PyErr_Format(PyExc_RuntimeError,\n659:                    \"Failed to query pointer attributes at argument %d. \"\n660:                    \"Error code: %d. This may indicate invalid memory address \"\n661:                    \"or NPU device error.\",\n662:                    idx, status);"
+    },
+    {
+      "lines": [
+        935,
+        962
+      ],
+      "text": "935: // Extract tensor shape from PyObject\n936: static std::vector<int64_t> _get_tensor_shape(PyObject *tensor) {{\n937:   std::vector<int64_t> shape;\n938: \n939:   // Early return if tensor is None or null\n940:   if (!tensor || tensor == Py_None) {{\n941:     return shape;\n942:   }}\n943: \n944:   // Calling tensor.size()\n945:   PyObject* size_result = PyObject_CallMethod(tensor, \"size\", NULL);\n946:   if (!size_result) {{\n947:     return shape;\n948:   }}\n949:   // Using PySequence_Fast to improve access efficiency\n950:   PyObject* seq = PySequence_Fast(size_result, \"Expected a sequence from tensor.size()\");\n951:   if (seq) {{\n952:     Py_ssize_t len = PySequence_Fast_GET_SIZE(seq);\n953:     PyObject** items = PySequence_Fast_ITEMS(seq);\n954:     for (Py_ssize_t i = 0; i < len; ++i) {{\n955:       PyObject* dim = items[i];\n956:       if (PyLong_Check(dim)) {{\n957:         shape.push_back(PyLong_AsLong(dim));\n958:       }}\n959:     }}\n960:   }}\n961:   Py_DECREF(seq);\n962:   Py_DECREF(size_result);"
+    },
+    {
+      "lines": [
+        976,
+        1024
+      ],
+      "text": "976:   // FlagPrism: decode the optional hidden argument after user arguments.\n977:   {debug_abi.extracted_declaration}\n978:   {newline.join([f\"{_extracted_type(ty)} _arg{i};\" for i, ty in signature.items()])}\n979:   if(!PyArg_ParseTuple(\n980:       args, \\\"{format}\\\",\n981:       &gridX, &gridY, &gridZ, &stream, &function,\n982:       &packedMetadata, &launch_metadata,\n983:       &launch_enter_hook, &launch_exit_hook{args_list})) {{\n984:     return NULL;\n985:   }}\n986:   if (__MsprofFlagL1)\n987:   {{\n988:     {\n989:       LINE_CHANGE_CHAR.join(\n990:         f\"{{ auto tmp = _get_tensor_shape(_arg{i}); if (!tmp.empty()) tensorShapes.push_back(tmp); }}\"\n991:         for i, ty in signature.items() if ty[0] == \"*\"\n992:       )\n993:     }\n994:   }}\n995: \n996:   if (launch_enter_hook != Py_None){{\n997:     PyObject* args = Py_BuildValue(\"(O)\", launch_metadata);\n998:     PyObject* ret = PyObject_CallObject(launch_enter_hook, args);\n999:     Py_DECREF(args);\n1000:     if (!ret)\n1001:       return NULL;\n1002:   }}\n1003: \n1004:   // get kernel_name\n1005:   PyObject *kernelNameObj = PyDict_GetItemString(packedMetadata, \"kernel_name\");\n1006:   const char *kernelName = PyUnicode_AsUTF8(kernelNameObj);\n1007:   // get tensor_kinds\n1008:   std::vector<int> tensorKinds;\n1009:   PyObject *tensorKindList = PyDict_GetItemString(packedMetadata, \"tensor_kinds\");\n1010:   if (tensorKindList) {{\n1011:     int size = PyObject_Size(tensorKindList);\n1012:     for (int i = 0; i < size; i++) {{\n1013:       PyObject *kind = PySequence_GetItem(tensorKindList, i);\n1014:       tensorKinds.push_back(PyLong_AsLong(kind));\n1015:     }}\n1016:   }}\n1017: \n1018:   // raise exception asap\n1019:   {newline.join(ptr_decls)}\n1020:   // FlagPrism: forward the optional pointer after all user arguments.\n1021:   _launch(kernelName, function, stream, gridX, gridY, gridZ, tensorShapes, tensorKinds{', ' + ', '.join(internal_args_list) if len(internal_args_list) > 0 else ''}{debug_abi.call_argument});\n1022:   if (PyErr_Occurred()) {{\n1023:     return NULL;\n1024:   }}"
+    }
+  ]
+}

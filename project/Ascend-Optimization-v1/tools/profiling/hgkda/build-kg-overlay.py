@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parents[4]
 
 
-def build(output: Path, *, repo=REPO, native_context=False):
+def build(output: Path, *, repo=REPO, native_context=False, paired_evidence=None):
     source = repo / 'sources/kernelgen'
     skill = ROOT / 'skills/hgkda'
     if output.exists():
@@ -36,6 +36,23 @@ def build(output: Path, *, repo=REPO, native_context=False):
         f'### {p.relative_to(skill).as_posix()}\n\n{p.read_text(encoding="utf-8")}'
         for p in sorted((skill / 'references').rglob('*.md')))
     appended = '\n\n# HG-KDA 角色扩展\n\n' + body + '\n\n' + references
+    paired_extension = {}
+    if paired_evidence:
+        raw = Path(paired_evidence).read_bytes()
+        evidence = json.loads(raw)
+        if evidence.get('schema_version') != 'hgkda-paired-v1' or not evidence.get('cases'):
+            raise ValueError('成对证据缺少schema或case')
+        if len(raw) > 128 * 1024:
+            raise ValueError('角色内成对摘要过大，请保留紧凑摘要和原始证据路径')
+        dest = dest_skill / 'paired-evidence.json'
+        dest.write_bytes(raw)
+        paired_extension = {'source': str(Path(paired_evidence).resolve()),
+                            'sha256': hashlib.sha256(raw).hexdigest(), 'cases': len(evidence['cases'])}
+        appended += ('\n\n## 本批起点的成对硬件证据\n\n'
+            '以下是冻结seed与PyTorch的独立对照，不是本轮新候选的测量。核对operator、'
+            '源码SHA和case参数；它用于提出修改，不能替代本轮KGS profiling或正式评测。'
+            '如新候选改变执行路径，需要重新采集以检验机制。\n\n'
+            + json.dumps(evidence, ensure_ascii=False, indent=2) + '\n')
     context_extension = {}
     if native_context:
         helper = ROOT / 'native_context.py'
@@ -80,6 +97,8 @@ def get_profile_context(workspace, context, round_num):
             'compiler_changed': False, 'evaluator_changed': False}
     if native_context:
         data['native_context_extension'] = context_extension
+    if paired_extension:
+        data['paired_evidence_extension'] = paired_extension
     (output / 'hgkda-overlay.json').write_text(
         json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     return data
@@ -90,8 +109,11 @@ def main():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--native-context', action='store_true',
                    help='仅新覆盖层：从冻结Native快照补充准确输入规格；不改变既有批次')
+    p.add_argument('--paired-evidence', type=Path,
+                   help='本批seed成对采集的结构化摘要；只注入新覆盖层，保留来源身份')
     a = p.parse_args()
-    print(json.dumps(build(a.output, native_context=a.native_context), ensure_ascii=False))
+    print(json.dumps(build(a.output, native_context=a.native_context,
+                           paired_evidence=a.paired_evidence), ensure_ascii=False))
 
 
 if __name__ == '__main__':

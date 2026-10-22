@@ -1,6 +1,7 @@
 """防止诊断读错 Native 形状，或把其他候选、其他合同的输入混入上下文。"""
 from copy import deepcopy
 import importlib.util
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -75,6 +76,15 @@ class NativeContextTests(unittest.TestCase):
             self.assertTrue((root / 'enhanced/kernelgen/tools/profile_round.py').read_bytes().startswith(original))
             self.assertEqual((root / 'enhanced/kernelgen/tools/hgkda_native_context.py').read_bytes(),
                              (ROOT / 'native_context.py').read_bytes())
+            evidence = root/'paired.json'
+            evidence.write_text(json.dumps({'schema_version':'hgkda-paired-v1',
+                'cases':[{'operator':'log10_', 'source_sha256':'seed', 'evidence':'pair/comparison.json'}]}), encoding='utf-8')
+            paired = overlay.build(root/'paired', repo=root/'repo', paired_evidence=evidence)
+            embedded = root/'paired/kernelgen/.kernelgen/skills/hgkda/paired-evidence.json'
+            self.assertEqual(embedded.read_bytes(), evidence.read_bytes())
+            self.assertEqual(paired['paired_evidence_extension']['sha256'],
+                             __import__('hashlib').sha256(evidence.read_bytes()).hexdigest())
+            self.assertEqual((source/'tools/profile_round.py').read_bytes(), original)
 
 
 if __name__ == '__main__':unittest.main()

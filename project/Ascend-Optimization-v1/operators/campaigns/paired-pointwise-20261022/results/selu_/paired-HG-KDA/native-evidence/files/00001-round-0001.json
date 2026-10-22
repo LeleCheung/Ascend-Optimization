@@ -1,0 +1,108 @@
+{
+  "schema_version": "1.0",
+  "round_num": 1,
+  "evaluation_fingerprint": "9590a170fd4832811335042818cfd9339394a6aaa8a3b95a127caf554fb13db6",
+  "status": "failed",
+  "solution_sha256": "eba77dae3925ab2c44d239b49b8197daf82cb495ebf509c5b1e750532fd4203e",
+  "backend": "npu",
+  "profiler": "msprof",
+  "capabilities": [],
+  "dominant_bound": "mixed",
+  "profiled_workloads": [
+    {
+      "uuid": "selu_-timing-11",
+      "axes": {},
+      "eval_speedup": 0.5979988435148135,
+      "eval_latency_ms": 0.08267845083013875,
+      "eval_reference_latency_ms": 0.049441617980019344,
+      "selection_reason": "Lowest eval speedup (0.598), 4096x4096 fp32: primary large-shape representative and the worst workload.",
+      "profile_ids": [],
+      "manifest_paths": [],
+      "status": "failed"
+    },
+    {
+      "uuid": "selu_-timing-3",
+      "axes": {},
+      "eval_speedup": 0.6940757893665901,
+      "eval_latency_ms": 0.08192873529908541,
+      "eval_reference_latency_ms": 0.05686475162451912,
+      "selection_reason": "Second-lowest speedup (0.694), 4096x4096 fp16: half the bytes of timing-11 at identical element count, the key dtype control.",
+      "profile_ids": [],
+      "manifest_paths": [],
+      "status": "failed"
+    },
+    {
+      "uuid": "selu_-timing-7",
+      "axes": {},
+      "eval_speedup": 0.7098676940633876,
+      "eval_latency_ms": 0.08324873751730054,
+      "eval_reference_latency_ms": 0.05909558933509435,
+      "selection_reason": "Third-lowest speedup (0.710) and the highest absolute latency (83.2 us); bf16 large-shape regime.",
+      "profile_ids": [],
+      "manifest_paths": [],
+      "status": "failed"
+    },
+    {
+      "uuid": "selu_-timing-2",
+      "axes": {},
+      "eval_speedup": 0.7519666186302466,
+      "eval_latency_ms": 0.016890089296759225,
+      "eval_reference_latency_ms": 0.012700783336846955,
+      "selection_reason": "Boundary between the flat launch-bound regime and the 4096x4096 regime: 1048576 fp16 elements, same dtype as timing-3 with 16x fewer elements.",
+      "profile_ids": [],
+      "manifest_paths": [],
+      "status": "failed"
+    },
+    {
+      "uuid": "selu_-timing-0",
+      "axes": {},
+      "eval_speedup": 0.7288545060968308,
+      "eval_latency_ms": 0.01750504576744845,
+      "eval_reference_latency_ms": 0.012758631487036057,
+      "selection_reason": "Smallest workload (1024 fp16): tests whether any device kernel time is measurable at the launch-bound extreme.",
+      "profile_ids": [],
+      "manifest_paths": [],
+      "status": "failed"
+    }
+  ],
+  "findings": [],
+  "performance_interpretation": "No profiler counters were obtained, so the following is derived from the authoritative round-1 eval (all 36 cases PASS, geo_mean 0.7301) plus grid arithmetic over the frozen source; treat it as inference, not measurement. Two regimes are visible. (1) Nine workloads, numel 1024..1048576 across fp16/bf16/fp32, sit on a flat plateau of 15.97-17.51 us; for fp32 it is 16.110 us at numel=1024 versus 16.112 us at numel=1048576, so 1000x more elements adds 0.002 us and a fixed per-call cost near 16 us (against an 11.83-14.23 us reference) sets these cases, with the device kernel off the critical path. Headroom is at most ~4 us per call and the seed has already replaced the JIT wrapper with a cached raw launcher, so further host shaving has limited ceiling. (2) The three 4096x4096 workloads cost 81.9 (fp16), 83.2 (bf16) and 82.7 (fp32) us. Doubling moved bytes from 67 MB to 134 MB changes wall time by +0.75 percent, so these cases are NOT bandwidth-bound; subtracting the ~16 us fixed term implies about 66 us of device work and logical rates of 1.02 TB/s (fp16) and 2.03 TB/s (fp32), the latter high enough that the working set is plausibly L2-resident (L2 = 176 MB). Time therefore tracks element count and program count, not bytes: the frozen source launches exactly n/8192 single-tile programs, which is 2048 programs, i.e. ~102 waves on the 20-core device, each a strictly serialized load->compute->store with no loop to overlap MTE2 with VEC. The reference shows the inverted ordering, fp32 fastest at 49.4 us, so it is not byte-bound either. Estimated geo_mean ceilings: 0.903 if only the nine flat workloads reached parity, 0.808 if only the three large ones did, about 0.98 if the large shapes fell to ~30 us. The single highest-value experiment is therefore the persistent multi-tile loop, because the large-shape gap (up to 1.67x) exceeds the per-call host gap (~1.3x), it attacks the largest absolute latencies, and it is falsifiable with one closed-form geometry change. The alternative axis, kept as a fallback only if this experiment falsifies, is reducing per-element vector work for fp16/bf16 by avoiding the blanket fp32 upcast and the unfolded exp form.",
+  "next_experiment": {
+    "action_category": "persistent_grid_stride_loop",
+    "action_description": "In the aligned contiguous fast path only, replace one-monolithic-tile-per-program with a small fixed number of programs whose body loops over consecutive 8192-element tiles: add @triton.jit _selu_persistent(X, NTILES: tl.constexpr, BLOCK: tl.constexpr) with 'for i in tl.range(0, NTILES)' and offs = (pid*NTILES + i)*BLOCK + tl.arange(0, BLOCK), keeping the identical body 1.0507009873554805*tl.where(x>0, x, 1.6732632423543772*(tl.exp(x)-1.0)) and the identical in-place store. Launch with G = 20 or 40 programs (1-2 per AIV core; device probe reports num_sm=20) and NTILES = n//(G*BLOCK), reusing the same 8192-tile UB buffers each iteration so UB footprint does not grow while 2048 program dispatches collapse to 20-40. Gate it strictly on n % (G*BLOCK) == 0; leave _selu_masked, _selu_strided, the strided general kernel and the cached raw launcher ABI untouched; derive G and NTILES from that closed-form rule rather than a sweep so exactly one mechanism is tested. Also fold scale*alpha into the single constant (y = where(x>0, 1.0507*x, 1.7580993408473766*exp(x) - 1.7580993408473766)) and rely on compiler CSE for the repeated x.to(tl.float32); no precision-semantics change in this round.",
+    "expected_impact": "If the per-program/wave hypothesis holds, the 4096x4096 device time should fall from roughly 66 us (82-83 us wall minus a ~16 us fixed term) toward the vector-math or memory floor, i.e. about 15-35 us, lifting timing-3/7/11 from 0.694/0.710/0.598 toward 1.3-2.7 and geo_mean from 0.7301 to an estimated 0.85-0.95. The 1048576-element shapes also drop from 128 to 20-40 programs but stay host-bound, so little wall-time change is expected there. If instead per-element vector math dominates, large-shape latency moves by less than 15 percent, which falsifies this hypothesis and makes a native-dtype/FMA math path the correct next axis.",
+    "risks_and_rollback": "Risks: (1) Triton-on-Ascend may not software-pipeline the tile loop (a num_stages argument would not prove double buffering), so gains could be partial; (2) too few programs can under-fill the 20 AIV cores or fail to hide memory latency, so G must be at least one per core; (3) coverage and tail correctness - a compile-time trip-count loop is only safe when n is divisible by G*BLOCK, so every other size must keep the existing masked path and empty/numel=1/numel=1025/7x9/strided inputs must be untouched; (4) in-place aliasing - each iteration must own a disjoint range with no cross-iteration read/write hazard, and the buffer must never be replaced by a contiguous copy. Rollback: the change is confined to a new entry point for the aligned no-mask specialization; revert to the current _raw_launch_entry body if any of the 36 cases regresses or full-eval geo_mean does not improve.",
+    "validation_workloads": [
+      "selu_-timing-11",
+      "selu_-timing-3",
+      "selu_-timing-7",
+      "selu_-timing-2",
+      "selu_-timing-10",
+      "selu_-timing-0"
+    ],
+    "success_criteria": [
+      "All 36 evaluation workloads PASS (24 correctness covering empty, numel=1, numel=1025, 7x9 and strided inputs, plus 12 timing) with in-place semantics preserved (same storage mutated).",
+      "timing-11/3/7 latency drops materially from ~82-83 us; target <=50 us (>=1.0x versus reference), stretch 25-40 us.",
+      "Headline geo_mean > 0.7301 baseline, preferably > 0.8084 (the level reached by bringing only the three 4096x4096 cases to parity).",
+      "None of the nine ~16 us workloads regresses by more than 2 percent, confirming the host launch path was left intact.",
+      "Either outcome is informative: a move of less than 15 percent on the large shapes records the falsification of the per-program hypothesis and redirects to the native-dtype/FMA math path."
+    ]
+  },
+  "warnings": [
+    "msprof advertised performance_counters / pipeline_utilization / kernel_profile / instruction_listing, but every collection failed with 'msprof base collection exited successfully without profile completion marker' (2 attempts: 5 workloads, then selu_-timing-11 alone; deterministic). capabilities is recorded as empty.",
+    "Findings could not be persisted with evidence: the round produced zero downloaded artifacts, and the recorder accepts only downloaded artifacts as evidence paths, so manifests, .kernelgen/evals/round-0001/result.json and the frozen source are all inadmissible here. Every quantitative claim above is therefore in performance_interpretation and is labelled inference.",
+    "Direct answers to the three profiler questions remain UNMEASURED: host-versus-device split for the 4096x4096 shapes, which pipeline (MTE2/MTE3/VEC/CUBE) is saturated with what UB usage and sync stalls, and the achieved bandwidth. Do not quote a pipeline ratio or a bandwidth number for this round.",
+    "Derived rates (1.02 TB/s fp16, 2.03 TB/s fp32) are logical bytes divided by derived device time assuming a ~16 us fixed term. They are not measured HBM or L2 counters and must not be presented as hardware bandwidth or as a calibrated Roofline.",
+    "Do not substitute values from the project's earlier paired-preflight evidence for selu_: it belongs to a different source identity (source_sha256 2d58eb8...) and a different candidate revision, so it cannot stand in for this round's measurements.",
+    "The frozen source defines run twice (main.py lines 228 and 314); the effective entrypoint is the later raw-launcher version, which matters for any source-level edit. Its module docstring is inherited from a log10_ seed and its '~0.6 ms at 16384 programs' comment is the seed author's note, not a round-1 measurement."
+  ],
+  "open_questions": [
+    "What is the true host enqueue cost per call, and how much of the ~16 us plateau is Python-side (key tuple, data_ptr, stream getter, pybind marshalling) versus device setup? Needs a working msprof device-task duration or a synced-vs-unsynced timing probe.",
+    "Is the 4096x4096 kernel VEC-saturated (fp32 exp over 16.78M lanes) or dispatch-saturated (102 waves of program setup)? Eval-side scale invariance favours dispatch, but one msprof PipeUtilization sample would settle it.",
+    "Does Triton/FlagTree actually pipeline an inner tile loop on Ascend, overlapping MTE2 with VEC?",
+    "Why is the reference faster in fp32 (49.4 us) than in fp16/bf16 (56.9/59.1 us)? A native fp32 vector path without pack/unpack would be an independent lever for timing-3/7.",
+    "Why did msprof produce no completion marker on CANN 9.0.0 / driver 25.2.0 while the service still advertises the capability, and is a retry likely to succeed in a later round?",
+    "Does the cached raw launcher path (torch_npu._C._npu_getCurrentRawStreamNoWait plus compiled.run.launch) bypass msprof tensor registration and therefore break collection? Unproven, but it would explain a systemic failure across all shapes, dtypes and levels."
+  ],
+  "error": "msprof base collection exited successfully without profile completion marker. Deterministic on 2 attempts (5 workloads, then selu_-timing-11 alone). No device counters, pipeline utilization, UB usage, sync stalls or kernel durations exist for round 1: every manifest records status=failed with capabilities=[] and artifacts=[]. Because the artifact list is empty, this analysis carries no evidence-backed findings; the quantitative reasoning below is derived from the authoritative round-1 eval latencies plus grid arithmetic over the frozen source, and is inference only."
+}

@@ -8,6 +8,10 @@
 
 ## 当前状态
 
+2026-10-22的[log10_、selu_成对诊断](project/Ascend-Optimization-v1/operators/campaigns/paired-pointwise-20261022/精简汇报.md)已完成方法接入、源码优化与完整验证：最终完整调用加速比分别为**0.737×、0.790×**，各通过36项正式测试、42＋12项补充检查，最终KGS profiling及成对硬件采集成功，48项证据核验通过；整组尚未达0.8×。小输入定位到启动参数处理，大FP16的SELU从81.6降至45.6微秒；固定后端的UB约束和失败候选一并归档。源码和复现入口见[批次README](project/Ascend-Optimization-v1/operators/campaigns/paired-pointwise-20261022/README.md)。
+
+后续汇报遵循[实验归属与汇报口径](docs/实验归属与汇报口径.md)：FlagGems与FlagGems-SGLang分别成表，简表采用“当前优化版”，写清Codex参与，不将混合流程成绩称为纯原生KG独立效果。
+
 2026-10-21 的[15项体检与四组优化](project/Ascend-Optimization-v1/operators/夜间大goal-20261021.md)已结束：固定原版12项完整通过、3项部分失败。`value_selecting_reduction_backward`有效最佳版相对PyTorch为 **1.593× / 1.679×**，`moe_sum_reduce`为 **1.628× / 1.619×**；均通过扩展语义和两次完整复验，来源为KG生成后的独立修复。HG-KDA已真实接入KG，原始组与额外修复分别记录。见[精简汇报](project/Ascend-Optimization-v1/operators/campaigns/night-20261021-v3/精简汇报.md)、[交付源码与逐case数据](project/Ascend-Optimization-v1/operators/campaigns/night-20261021-v3/交付清单.md)。本批使用KGS Native完整调用walltime，与下述历史设备kernel成绩分别报告。
 
 2026-10-15 首项 `rad2deg_` 已完成历史批次闭环：固定 FlagGems 为0.253×，HG-KDA最终两次为0.803×/0.806×，均33/33，另通过21项补充语义检查；相对 FlagGems 为3.20×/3.19×。已验证 metrics→模拟器指令的阶段升级，并核查 CANN DMA 直接调用链。该批采用设备kernel计时，结果、失败记录与复现步骤见[会议后首项交付](project/Ascend-Optimization-v1/operators/会议后首项交付-20261015.md)；最新完整调用体检以上述夜间批次为准。

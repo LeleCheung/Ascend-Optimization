@@ -21,6 +21,12 @@ out={'batch':batch,'state':json.loads((directory/'queue-state.json').read_text()
 for name in ['postflight','repair-verification','delivery-finalization','completion-audit']:
  path=directory/(name+'.json')
  out[name]=json.loads(path.read_text()) if path.exists() else None
+out['paired_subqueues']={}
+for pattern in ['candidate-state-*.json','kg-paired-state.json','verification-state*.json','completion-state-*.json']:
+ for path in sorted(directory.glob(pattern)):
+  data=json.loads(path.read_text())
+  out['paired_subqueues'][path.name]={k:data.get(k) for k in
+   ['status','current_operator','current_job','error','results'] if k in data}
 audit=subprocess.run(['docker','exec','tle_yy','ps','-eo','pid,etimes,pcpu,args'],capture_output=True,text=True)
 processes={}
 if audit.returncode==0:
