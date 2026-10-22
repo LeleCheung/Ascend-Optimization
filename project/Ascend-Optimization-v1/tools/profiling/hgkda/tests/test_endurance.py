@@ -24,12 +24,18 @@ class EnduranceTests(unittest.TestCase):
         checker=load('check_debug_bundle','check-endurance.py')
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);batch=root/'batch';prepare.prepare(batch)
+            # 实际批次的plan曾在Windows生成；元数据统一换行必须显式登记两个SHA。
+            plan=batch/'plan.json';plan.write_bytes(plan.read_bytes().replace(b'\r\n',b'\n').replace(b'\n',b'\r\n'))
             workspace=root/'workspace';source=workspace/'tmp/main.py';source.parent.mkdir(parents=True)
             source.write_bytes(b'def run(y, dx=1, dim=-1): return y\n')
             out=workspace/'tmp/independent-check'
             result=staging.stage(batch,workspace,source,out,'cumulative_trapezoid')
             self.assertEqual((out/'candidate/main.py').read_bytes(),source.read_bytes())
-            self.assertEqual((out/'plan.json').read_bytes(),(batch/'plan.json').read_bytes())
+            self.assertEqual(json.loads((out/'plan.json').read_bytes()),json.loads(plan.read_bytes()))
+            manifest=json.loads((out/'bundle-manifest.json').read_bytes())
+            self.assertTrue(manifest['plan_newline_normalized'])
+            self.assertEqual(manifest['plan_sha256'],staging.sha(plan.read_bytes()))
+            self.assertEqual(manifest['bundled_plan_sha256'],staging.sha((out/'plan.json').read_bytes()))
             leaf,rows=checker.native_timing_contract(out/'candidate/main.py','cumulative_trapezoid')
             self.assertEqual(len(rows),9)
             self.assertEqual((leaf/'oracle.py').read_bytes(),(batch/'catalog/ops/cumulative_trapezoid/oracle.py').read_bytes())
@@ -39,6 +45,11 @@ class EnduranceTests(unittest.TestCase):
             (leaf/'oracle.py').write_bytes(b'changed\n')
             with self.assertRaises(ValueError):checker.native_timing_contract(out/'candidate/main.py','cumulative_trapezoid')
             with self.assertRaises(ValueError):staging.stage(batch,workspace,source,root/'outside','cumulative_trapezoid')
+            source.write_bytes(b'def run(y):\r\n    return y\r\n')
+            rejected=workspace/'tmp/crlf-check'
+            with self.assertRaisesRegex(ValueError,'换行字节'):
+                staging.stage(batch,workspace,source,rejected,'cumulative_trapezoid')
+            self.assertFalse(rejected.exists())
 
     def test_ir_capture_reaches_wrapped_jit_without_recompiling(self):
         m=load('endurance_ir','observe-endurance.py')

@@ -4,6 +4,10 @@
 
 `stage-endurance-check.py` 将当前候选、登记身份一致的补充检查器及冻结 Native 合同复制到 KG 工作区的新 `tmp/` 目录，输出可供原生 `submit_debug_job` 调用的请求。模型可以在搜索内读取语义失败、修复后再评测，避免整批结束才发现高分候选不合格。打包本身不使用 NPU；调试检查由当前串行 KG/KGS 执行，不另开卡上任务。只有源码 SHA 相同才能复用检查结果；搜索内检查不代替最终补充门禁和一次完整正式评测。该入口覆盖 rad2deg_、cumulative_trapezoid、scatter_add、uniform、gelu_and_mul；SELU 保留三项专用检查。实际采用情况以调试请求和回执为准，工具存在不代表模型已经调用。
 
+打包清单登记打包器本身的 SHA，并拒绝调试接口文本传输会改写换行的文件。遇到 CRLF/CR 源码时，应先生成并登记换行规范化后的新候选，再打包；工具不会偷偷改写源码或冻结合同。
+
+用于定位合同的 `plan.json` 元数据会显式统一换行；打包清单同时保存原 plan 和打包 plan 的 SHA，并核对 JSON 内容完全相同。四份冻结合同及候选源码仍要求原字节通过文本接口传输。
+
 本目录对应 2026-10-15 会议后的下一阶段。固定版本见[基线锁定](../../../../../manifests/hgkda-stage2.lock.json)，15 个对象的登记见 [targets.json](targets.json) 和[下一阶段计划](../../../operators/下一阶段计划-20261015.md)。
 
 最新[缓冲与搬运批次](../../../operators/campaigns/buffer-pointwise-20261022/README.md)已完成：log10_ 0.875×，较同批父版实际加速1.125×；selu_保留旧源码，本批复测0.898×。36项正式测试、42＋12＋9项补充检查和48项证据核验通过。新增缓冲生命周期知识、数值范围门禁、异常恢复及同字节评测复用；CC生成与Codex整合分别记录。复现使用`reproduce-paired.py --batch buffer-pointwise-20261022 --tag final --output /data/hanle/ascend-optimization/runs/新目录`，模拟器失败与最终真机采集分开报告。

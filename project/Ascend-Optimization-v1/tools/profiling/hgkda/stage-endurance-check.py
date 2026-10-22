@@ -30,11 +30,21 @@ def stage(batch,workspace,source,output,operator):
     frozen=json.loads((batch/'knowledge/tool-sha256.json').read_text(encoding='utf-8'))
     if sha(checker)!=frozen['check-endurance.py']:raise ValueError('门禁工具与本批登记身份不同')
     candidate=source.read_bytes();candidate.decode('utf-8')
-    payloads={'candidate/main.py':candidate,'check-endurance.py':checker,'plan.json':plan_raw}
+    # plan是定位合同的元数据，可显式统一换行；冻结合同与源码保持原字节。
+    # 登记原plan和打包plan两个SHA，不能把此转换隐去。
+    plan_payload=plan_raw.decode('utf-8').replace('\r\n','\n').replace('\r','\n').encode('utf-8')
+    if json.loads(plan_payload)!=plan:raise ValueError('plan元数据转换改变语义')
+    payloads={'candidate/main.py':candidate,'check-endurance.py':checker,'plan.json':plan_payload}
     for name in CONTRACT:
         raw=(original/name).read_bytes()
         if sha(raw)!=record['contract_sha256'][name]:raise ValueError('合同SHA改变: '+name)
         payloads[leaf.joinpath(name).as_posix()]=raw
+    # 原生Debug接口使用read_text后再UTF-8编码上传，会统一CRLF/CR。
+    # 拒绝会在该传输中改变的字节，不能声称另一个源码SHA的检查已通过。
+    for name,raw in payloads.items():
+        decoded=raw.decode('utf-8')
+        if decoded.replace('\r\n','\n').replace('\r','\n').encode('utf-8')!=raw:
+            raise ValueError('调试文本传输会改变换行字节，请先登记规范化后的新源码身份: '+name)
     output.mkdir(parents=True)
     files=[]
     for name,raw in payloads.items():
@@ -43,6 +53,8 @@ def stage(batch,workspace,source,output,operator):
         files.append(dict(path=target.relative_to(workspace).as_posix(),sha256=sha(raw),size_bytes=len(raw)))
     manifest=dict(schema_version='hgkda-debug-semantic-bundle-v1',operator=operator,
         batch=str(batch),source=str(source),source_sha256=sha(candidate),plan_sha256=sha(plan_raw),
+        bundled_plan_sha256=sha(plan_payload),plan_newline_normalized=plan_payload!=plan_raw,
+        stager_sha256=sha(Path(__file__).read_bytes()),
         checker_sha256=sha(checker),contract_sha256=record['contract_sha256'],files=files,
         scope='只复制准确字节；不运行NPU、不修改正式合同、不代替一次正式KGS完整评测')
     manifest_path=output/'bundle-manifest.json'
