@@ -31,3 +31,9 @@ python3 project/Ascend-Optimization-v1/tools/profiling/hgkda/run-endurance.py \
 ```
 
 本批实际由`hanle-endurance-20261022` tmux会话执行。控制器持有项目卡锁，所有设备工作串行。冻结工具SHA见[控制器清单](knowledge/tool-sha256.json)，任务知识见[夜间任务](knowledge/夜间任务.md)。
+
+## 运行中发现的采集兼容问题
+
+rad2deg_的CC裸启动候选完整评测通过，但原生msprof采集没有产生完成标记。原失败请求与分析保留，不将推测写为已获得的硬件结论。Codex准备了独立采集兼容候选：在采集launcher要求Tensor元数据时，用同一计算kernel的标准启动；缓存键另纳入N模16，防止跨整除属性错误复用。生成器以AST核对计算kernel未变化，仍须重新通过补充语义、一次完整评测和真实采集。
+
+补充验证由`hanle-endurance-rad-repair-20261022`等待主队列结束并取得同一卡锁后自动执行，结果写到独立`endurance-20261022-rad-profile-repair/`，不覆盖主队列原始候选、门禁或成绩。它属于额外Codex修复，不能作为CC原生独立生成成果。此段记录排队计划，不表示修复已经在NPU上验证成功。
