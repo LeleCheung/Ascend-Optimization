@@ -18,6 +18,23 @@ def load(name,filename):
 
 
 class EnduranceTests(unittest.TestCase):
+    def test_selection_audit_rejects_faster_reference_score_and_changed_cases(self):
+        audit=load('endurance_selection_audit','audit-endurance.py')
+        def measured(digest,score,latencies):
+            return dict(source_sha256=digest,result=dict(status='PASSED',geo_mean=score,
+                per_workload=[dict(uuid=case,phase='timing',latency_ms=value) for case,value in latencies.items()]))
+        fast=measured('fast',.8,{'small':1.,'large':2.})
+        slow=measured('slow',1.5,{'small':2.,'large':3.})
+        result=audit.verify_fastest('fast',[fast,slow,fast],['small','large'])
+        self.assertEqual(result['compared_sources'],2)
+        with self.assertRaisesRegex(ValueError,'实际耗时最低'):
+            audit.verify_fastest('slow',[fast,slow],['small','large'])
+        for rows in [{'small':1.,'different':2.},{'small':float('nan'),'large':2.}]:
+            with self.assertRaises(ValueError):
+                audit.verify_fastest('bad',[measured('bad',2.,rows)],['small','large'])
+        with self.assertRaisesRegex(ValueError,'重复测量挑分'):
+            audit.verify_fastest('fast',[fast,measured('fast',3.,{'small':.5,'large':1.})],['small','large'])
+
     def test_debug_gate_bundle_keeps_actual_contract_and_detects_tampering(self):
         prepare=load('prepare_debug_bundle','prepare-endurance.py')
         staging=load('stage_debug_bundle','stage-endurance-check.py')

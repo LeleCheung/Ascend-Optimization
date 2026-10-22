@@ -2,6 +2,8 @@
 
 正在执行[夜间连续大goal](../../../operators/campaigns/endurance-20261022/README.md)：SELU、rad2deg_、cumulative_trapezoid、scatter_add、uniform和gelu_and_mul，最多两批自动搜索；语义、一次完整复验、真实任务采集和交付自动衔接。`run-endurance.py`在宿主tmux运行，`finish-endurance.py`独立等待并离线验收；不在单算子完成后暂停询问。当前进展以服务器本批状态为准，启动队列不等于取得优化成果。
 
+主批次最终审计还会读取所有已通过门禁的起点与搜索候选，核对它们实际上传的合同、源码和逐 case 正式延迟，独立确认入选者耗时最低。相对 PyTorch 分数更高、用例集合不同、非有限延迟或同源码出现冲突正式延迟，均不能绕过选版核验。追加采集修复批次按其登记的兼容修复目标独立核验。
+
 `stage-endurance-check.py` 将当前候选、登记身份一致的补充检查器及冻结 Native 合同复制到 KG 工作区的新 `tmp/` 目录，输出可供原生 `submit_debug_job` 调用的请求。模型可以在搜索内读取语义失败、修复后再评测，避免整批结束才发现高分候选不合格。打包本身不使用 NPU；调试检查由当前串行 KG/KGS 执行，不另开卡上任务。只有源码 SHA 相同才能复用检查结果；搜索内检查不代替最终补充门禁和一次完整正式评测。该入口覆盖 rad2deg_、cumulative_trapezoid、scatter_add、uniform、gelu_and_mul；SELU 保留三项专用检查。实际采用情况以调试请求和回执为准，工具存在不代表模型已经调用。
 
 打包清单登记打包器本身的 SHA，并拒绝调试接口文本传输会改写换行的文件。遇到 CRLF/CR 源码时，应先生成并登记换行规范化后的新候选，再打包；工具不会偷偷改写源码或冻结合同。

@@ -3,12 +3,69 @@
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 import tarfile
 
 
 def read(p):return json.loads(p.read_text(encoding='utf-8'))
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def verify_fastest(selected_sha,candidates,expected_cases):
+    """按同case真实延迟核对合格候选，不使用相对参考分数排名。"""
+    expected=set(expected_cases);timings={}
+    if not expected:raise ValueError('选择审计缺少计时合同')
+    for candidate in candidates:
+        result=candidate['result'];digest=candidate['source_sha256']
+        if result.get('status')!='PASSED':raise ValueError('选择审计混入失败候选')
+        rows=[r for r in result.get('per_workload',[]) if r.get('phase')=='timing']
+        times={r['uuid']:r.get('latency_ms') for r in rows}
+        if len(times)!=len(rows) or set(times)!=expected:
+            raise ValueError('选择审计的计时case集合不同或重复')
+        if any(not isinstance(v,(int,float)) or isinstance(v,bool) or not math.isfinite(v) or v<=0 for v in times.values()):
+            raise ValueError('选择审计存在无效真实延迟')
+        if digest in timings and timings[digest]!=times:
+            raise ValueError('同源码出现不同正式延迟，不能通过重复测量挑分')
+        timings[digest]=times
+    if selected_sha not in timings:raise ValueError('入选源码不在合格候选集合')
+    latency=lambda values:math.exp(sum(math.log(v) for v in values.values())/len(values))
+    measured={digest:latency(values) for digest,values in timings.items()}
+    minimum=min(measured.values());selected=measured[selected_sha]
+    if selected>minimum and not math.isclose(selected,minimum,rel_tol=1e-12,abs_tol=0.):
+        raise ValueError('入选源码不是合格候选中实际耗时最低的一份')
+    return dict(compared_sources=len(measured),selected_latency_ms=selected,minimum_latency_ms=minimum)
+
+
+def verify_main_selection(batch,op,record,state,selected_sha,local):
+    candidates=[]
+    for key,job in state['jobs'].items():
+        if key!='parent:'+op and not key.startswith('validate:'+op+':'):continue
+        value=job.get('result') or {}
+        if job.get('status')!='completed' or value.get('status')!='passed':continue
+        digest=value['source_sha256'];source=local(value['source'])
+        if sha(source)!=digest:raise ValueError('备选源码身份改变')
+        gates=[read(local(p)) for p in value.get('gates',[])]
+        if sorted(g['total'] for g in gates)!=([9,12,42] if op=='selu_' else [18]):
+            raise ValueError('备选源码缺少补充门禁')
+        for gate in gates:
+            if (gate['source_sha256']!=digest or gate['status'].lower()!='passed'
+                    or gate['passed']!=gate['total']):raise ValueError('备选源码门禁身份或状态不符')
+            if op in ['cumulative_trapezoid','scatter_add','gelu_and_mul']:
+                extra=gate.get('timing_input_correctness',{})
+                if extra.get('passed')!=record['timing_cases'] or extra.get('total')!=record['timing_cases']:
+                    raise ValueError('备选源码缺少性能输入数值检查')
+            if op=='uniform' and gate.get('generator_semantics',{}).get('passed')!=3:
+                raise ValueError('备选源码缺少随机状态检查')
+        path=local(value['result']);result=read(path)
+        verify_formal_contract(record,path.parent,result)
+        request=read(path.with_name(path.name.replace('.result.json','.request.json')))
+        sources=request['implementation']['sources']
+        if len(sources)!=1 or sources[0]['content']!=source.read_text():
+            raise ValueError('备选源码与正式请求不同')
+        candidates.append(dict(source_sha256=digest,result=result))
+    expected=[json.loads(line)['name'] for line in (batch/record['catalog_leaf']/'timing.jsonl').read_text().splitlines() if line.strip()]
+    return verify_fastest(selected_sha,candidates,expected)
 
 
 def verify_formal_contract(record,formal,result):
@@ -115,6 +172,10 @@ def audit(batch):
         checks.append(dict(kind='delivery',operator=op,source_sha256=digest,formal=expected,
             supplementary=totals,relative_pytorch=selected['geo_mean'],new_source=row['new_source'],
             execution_profile=profile_state,kgs_metrics=metrics_state))
+        # 追加采集修复单独验证兼容源码；其有效CC父版不是本修复的可替代对象。
+        if not plan.get('parent_batch'):
+            selection=verify_main_selection(batch,op,records[op],state,digest,local)
+            checks.append(dict(kind='selection',operator=op,source_sha256=digest,**selection))
     if delivery['final_repeats']!=1:raise ValueError('复验次数不符')
     return dict(status='passed',checks=len(checks),records=checks,
         delivered=len(delivery['records']),registered=len(records),
