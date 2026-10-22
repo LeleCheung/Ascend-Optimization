@@ -76,6 +76,12 @@ def audit(batch):
         for g in gates:
             if g['source_sha256']!=digest or g['status'].lower()!='passed' or g['passed']!=g['total']:
                 raise ValueError('门禁身份或结果不符')
+            if op=='uniform':
+                rng=g.get('generator_semantics',{})
+                if (rng.get('total')!=3 or rng.get('passed')!=3
+                        or [r['case'] for r in rng.get('cases',[])]!=['seed_high_bits','offset_high_bits','state_advance_and_replay']
+                        or any(r['status']!='passed' for r in rng.get('cases',[]))):
+                    raise ValueError('uniform生成器状态和高位语义检查缺失或失败')
             if op in ['cumulative_trapezoid','scatter_add','gelu_and_mul']:
                 extra=g.get('timing_input_correctness',{})
                 expected_cases=[json.loads(line)['name'] for line in (batch/records[op]['catalog_leaf']/'timing.jsonl').read_text().splitlines() if line.strip()]

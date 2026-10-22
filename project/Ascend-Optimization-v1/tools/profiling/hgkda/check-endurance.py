@@ -29,6 +29,44 @@ def native_timing_contract(source,op):
     raise ValueError('找不到候选所属批次的冻结合同: '+op)
 
 
+def uniform_generator_checks(module,torch):
+    """检查可复现、状态推进及64位seed/offset高位；不要求与Philox逐值相同。"""
+    gen=torch.npu.default_generators[torch.npu.current_device()]
+    saved=gen.get_state()
+    rows=[]
+    try:
+        probe=torch.empty(4096,dtype=torch.float32,device='npu:0')
+        def sample(seed,offset):
+            gen.manual_seed(seed);gen.set_offset(offset)
+            result=module.run(probe,0.,1.);torch.npu.synchronize();return result
+        for name in ['seed_high_bits','offset_high_bits','state_advance_and_replay']:
+            row=dict(case=name,status='failed')
+            try:
+                if name=='seed_high_bits':
+                    first=sample(12345,0)
+                    assert torch.equal(first,sample(12345,0)),'相同seed/offset不能复现'
+                    for bit in [31,32,40]:
+                        assert not torch.equal(first,sample(12345+(1<<bit),0)),f'seed第{bit}位被忽略'
+                elif name=='offset_high_bits':
+                    first=sample(12345,0)
+                    for bit in [31,32,40]:
+                        assert not torch.equal(first,sample(12345,1<<bit)),f'offset第{bit}位被忽略'
+                else:
+                    first=sample(12345,0);state=gen.get_state();offset=gen.get_offset()
+                    assert offset>0,'调用没有推进生成器状态'
+                    second=module.run(probe,0.,1.);torch.npu.synchronize()
+                    assert not torch.equal(first,second),'连续调用重复输出'
+                    gen.set_state(state)
+                    replay=module.run(probe,0.,1.);torch.npu.synchronize()
+                    assert torch.equal(second,replay),'恢复生成器状态不能复现'
+                row['status']='passed'
+            except Exception as error:row['error']=type(error).__name__+': '+str(error)
+            rows.append(row)
+    finally:gen.set_state(saved)
+    return dict(total=len(rows),passed=sum(r['status']=='passed' for r in rows),cases=rows,
+        scope='局部生成器状态语义检查，不证明完整随机质量或与Philox位流等价')
+
+
 def check(op,source,output):
     if os.environ.get('ASCEND_RT_VISIBLE_DEVICES')!='7':raise ValueError('只允许物理卡7')
     import torch
@@ -154,12 +192,14 @@ def check(op,source,output):
                 row.update(status='passed',repetitions=2,stream_switch_checked=True)
             except Exception as error:row['error']=type(error).__name__+': '+str(error)
             timing_checks.append(row)
-    result=dict(operator=op,status='passed' if all(r['status']=='passed' for r in records+timing_checks) else 'failed',
+    rng=uniform_generator_checks(m,torch) if op=='uniform' else dict(total=0,passed=0,cases=[])
+    result=dict(operator=op,status='passed' if all(r['status']=='passed' for r in records+timing_checks+rng['cases']) else 'failed',
         total=len(records),passed=sum(r['status']=='passed' for r in records),cases=records,
         source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
         checker_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),physical_device=7,
         timing_input_correctness=dict(total=len(timing_checks),passed=sum(r['status']=='passed' for r in timing_checks),
             cases=timing_checks,contract_sha256=timing_contract),
+        generator_semantics=rng,
         scope='独立非计分语义；18项各两次，含当前stream检查；累计积分、scatter_add、gelu_and_mul另核对全部冻结性能输入的数值，不替代完整上游pytest')
     output.parent.mkdir(parents=True,exist_ok=True)
     output.write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n',encoding='utf-8')

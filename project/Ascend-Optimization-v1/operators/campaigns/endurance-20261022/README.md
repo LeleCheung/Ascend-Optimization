@@ -22,6 +22,8 @@ SELU继续要求42项布局/特殊值、12项大连续输入、9项范围检查�
 
 同一门禁随后扩展至`scatter_add`与`gelu_and_mul`的全部冻结性能输入，回执为`timing-correctness-gate-amendment-02.json`。候选放在所属批次目录内，以便检查器定位`plan.json`和原始oracle；检查器核对合同SHA，并验证输出数值、全部Tensor输入保持不变和当前stream。原有18项新形状检查继续保留。
 
+`uniform`另增加3项生成器检查：高位seed有区分、高位offset有区分、推进与恢复状态可重放。检查包含第31/32/40位，防止截短随机状态后只靠均值方差过关；不要求候选与Philox逐值相同，也不把这些有限检查当作完整随机质量认证。回执见`uniform-generator-gate-amendment-03.json`，算法变更及剩余统计限制须单列。
+
 SELU必须降低实际延迟，不能把复测分数变化称作新增优化。FlagGems实测与当前优化版分列，会议算子和SGLang分别汇报。Codex提供诊断、控制器和追加排障，CC/DeepSeek负责实际代码生成；不称为纯原生KG独立成果。没有指令报告或匹配的流量与峰值数据时，不宣称成功模拟器分析或数值Roofline。
 
 运行中的状态见`endurance-state.json`、`heartbeat.json`、`进展.md`；这些文件在服务器先产生。完成后的最终源码在`deliverables/`，不能把正在运行的队列状态当作最终优化成果。
