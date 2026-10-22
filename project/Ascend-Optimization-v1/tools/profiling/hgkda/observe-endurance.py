@@ -12,9 +12,11 @@ from pathlib import Path
 sys.dont_write_bytecode=True
 
 
-def load(name,path):
+def load(name,path,package=None):
     s=importlib.util.spec_from_file_location(name,path)
-    m=importlib.util.module_from_spec(s);s.loader.exec_module(m);return m
+    m=importlib.util.module_from_spec(s)
+    if package:m.__package__=package
+    s.loader.exec_module(m);return m
 
 
 def observe(op,source,leaf,output,index):
@@ -24,7 +26,8 @@ def observe(op,source,leaf,output,index):
     assert torch.npu.device_count()==1
     if output.exists():raise FileExistsError(output)
     output.mkdir(parents=True)
-    oracle=load('endurance_oracle',leaf/'oracle.py');candidate=load('endurance_source',source)
+    oracle=load('endurance_oracle',leaf/'oracle.py')
+    candidate=load('endurance_source',source,'flag_gems.ops' if op=='scatter_add' else None)
     rows=[json.loads(l) for l in (leaf/'timing.jsonl').read_text().splitlines() if l.strip()]
     case=rows[index]
     def inputs():

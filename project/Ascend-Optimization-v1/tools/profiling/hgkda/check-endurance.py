@@ -15,7 +15,9 @@ def check(op,source,output):
     import torch.nn.functional as F
     assert torch.npu.device_count()==1
     s=importlib.util.spec_from_file_location('endurance_candidate',source)
-    m=importlib.util.module_from_spec(s);s.loader.exec_module(m)
+    m=importlib.util.module_from_spec(s)
+    if op=='scatter_add':m.__package__='flag_gems.ops'
+    s.loader.exec_module(m)
     records=[]
     for dtype in [torch.float16,torch.bfloat16,torch.float32]:
         for case in range(6):
