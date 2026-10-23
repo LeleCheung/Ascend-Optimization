@@ -1,0 +1,1517 @@
+{
+  "schema_version": "3.0",
+  "definition_name": "_conj_physical",
+  "target_hardware": "Ascend910B",
+  "implementation_language": "triton",
+  "best_geo_mean": 112.14772442067374,
+  "best_round": 3,
+  "best_code": "# Copyright 2026, The FlagOS Contributors.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Self-contained Triton implementation of ``aten._conj_physical``.\n\nSemantics (verified against the reference on the target):\n  * the result is always a freshly allocated tensor -- for real dtypes the\n    conjugate is the identity, but ``_conj_physical`` still returns a copy, so\n    the input must never be aliased or returned;\n  * the input may carry the lazy conjugate bit; it stores ``conj(logical)`` and\n    the operator conjugates the *logical* value, hence\n      - bit clear -> output = conj(storage)   (imaginary part negated)\n      - bit set   -> output = storage          (imaginary part unchanged)\n    The bit becomes a constexpr ``NEG`` and is cleared with a metadata-only\n    ``input.conj()`` view, so the kernel reads plain storage;\n  * the reference (whose only backend here is the CPU fallback) materialises a\n    contiguous output for every layout, so the result is contiguous and the\n    input is read through its real strides.\n\nKernels: a flat vector kernel over contiguous storage (all timing inputs) and a\nrank-generic strided kernel for arbitrary layouts.\n\nDense contiguous calls take a pre-bound launch path: the first call for a\n(kernel, dtype, tile, pointer-alignment) specialization compiles through the\nordinary ``kernel[grid](...)`` call; later calls reuse that compiled kernel and\ninvoke its generated launcher directly, passing this call's pointers, element\ncount and *current* stream. Nothing about a tensor (data, shape, stream, dtype)\nis cached -- only the compiled artifact.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\ntry:  # one cheap C call instead of the driver wrapper, same raw rtStream_t value\n    from torch_npu._C import _npu_getCurrentRawStreamNoWait as _raw_stream\nexcept Exception:  # pragma: no cover\n    _raw_stream = None\n\n# Tile sizes per size class (elements, in units of the kernel's scalar type).\n# They are bounded by the unified buffer, not by taste: with auto multi-buffering\n# the compiler needs roughly ``buffers * BLOCK * itemsize`` bytes of UB\n# (1.5 Mib available). A masked load+store pair costs 4 buffers, so a 16384-wide\n# fp32 tile overflows (measured: 2097408 bits required); the strided complex\n# kernel touches four streams and overflows even earlier.\n_TINY_MAX = 4096\n_MID_MAX = 262144\n\n_COPY_TINY, _COPY_MID, _COPY_LARGE = 1024, 8192, 16384      # 2 streams\n_CONJ_TINY, _CONJ_MID, _CONJ_LARGE = 1024, 4096, 8192       # 4 buffers\n_STR_TINY, _STR_MID, _STR_LARGE = 1024, 2048, 4096          # 4-6 streams\n# The strided complex kernel needs 3145728 bits of UB at BLOCK=4096 (measured),\n# so it keeps one fixed, small tile; this path only serves non-contiguous\n# layouts, never the timed ones.\n_STR_COMPLEX_BLOCK = 1024\n\n# (dtype, tile, src_ptr & 15, dst_ptr & 15) -> compiled launcher\n_copy_cache = {}\n_conj_cache = {}\n_device = None\n_stream_fn = None\n\n\n@triton.jit(do_not_specialize=[\"n\"])\ndef _copy_flat_kernel(src_ptr, dst_ptr, n, BLOCK: tl.constexpr):\n    \"\"\"Flat element copy: real dtypes need no arithmetic at all.\"\"\"\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    tl.store(dst_ptr + offs, tl.load(src_ptr + offs, mask=mask), mask=mask)\n\n\n@triton.jit(do_not_specialize=[\"n\"])\ndef _conj_flat_kernel(src_ptr, dst_ptr, n, NEG: tl.constexpr, BLOCK: tl.constexpr):\n    \"\"\"Flat copy over the interleaved real/imaginary float stream.\n\n    ``n`` counts scalars, so even offsets hold real parts and odd offsets hold\n    imaginary parts. Negating only the odd lanes keeps both the load and the\n    store fully contiguous, and a sign flip is exact for every float value.\n    \"\"\"\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    v = tl.load(src_ptr + offs, mask=mask)\n    if NEG:\n        v = tl.where((offs & 1) == 1, -v, v)\n    tl.store(dst_ptr + offs, v, mask=mask)\n\n\n@triton.jit\ndef _conj_strided_kernel(\n    src_ptr,\n    dst_ptr,\n    n,\n    s0, s1, s2, s3, s4, s5, s6, s7,\n    t0, t1, t2, t3, t4, t5, t6, t7,\n    NEG: tl.constexpr,\n    IS_COMPLEX: tl.constexpr,\n    NDIM: tl.constexpr,\n    BLOCK: tl.constexpr,\n):\n    \"\"\"Rank-generic strided read into a contiguous write.\n\n    ``s*`` are the logical sizes (last axis fastest), ``t*`` the input strides\n    in scalar units. The destination is contiguous, so its offset is a plain\n    multiple of the logical linear index.\n    \"\"\"\n    pid = tl.program_id(0)\n    idx = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = idx < n\n    rem = idx\n    off = tl.zeros_like(idx)\n\n    if NDIM >= 1:\n        off += (rem % s7) * t7\n        rem = rem // s7\n    if NDIM >= 2:\n        off += (rem % s6) * t6\n        rem = rem // s6\n    if NDIM >= 3:\n        off += (rem % s5) * t5\n        rem = rem // s5\n    if NDIM >= 4:\n        off += (rem % s4) * t4\n        rem = rem // s4\n    if NDIM >= 5:\n        off += (rem % s3) * t3\n        rem = rem // s3\n    if NDIM >= 6:\n        off += (rem % s2) * t2\n        rem = rem // s2\n    if NDIM >= 7:\n        off += (rem % s1) * t1\n        rem = rem // s1\n    if NDIM >= 8:\n        off += (rem % s0) * t0\n\n    if IS_COMPLEX:\n        out_off = idx * 2\n        re = tl.load(src_ptr + off, mask=mask)\n        im = tl.load(src_ptr + off + 1, mask=mask)\n        if NEG:\n            im = -im\n        tl.store(dst_ptr + out_off, re, mask=mask)\n        tl.store(dst_ptr + out_off + 1, im, mask=mask)\n    else:\n        tl.store(dst_ptr + idx, tl.load(src_ptr + off, mask=mask), mask=mask)\n\n\ndef _resolve_stream(device):\n    global _device, _stream_fn\n    _device = device\n    if _raw_stream is not None:\n        _stream_fn = lambda: _raw_stream(device)\n    else:  # pragma: no cover - fallback for a driver without the raw query\n        _stream_fn = lambda: triton.runtime.driver.active.get_current_stream(device)\n\n\ndef _cur_stream():\n    device = torch.npu.current_device()\n    if device != _device:\n        _resolve_stream(device)\n    return _stream_fn()\n\n\ndef _bind_copy(src, dst, n, block, grid):\n    \"\"\"Compile and remember the launcher for this dense-copy specialization.\"\"\"\n    try:\n        if _stream_fn is None:\n            _resolve_stream(torch.npu.current_device())\n        compiled = _copy_flat_kernel.warmup(src, dst, n, BLOCK=block, grid=(grid, 1, 1))\n        _copy_cache[\n            (src.dtype, block, src.data_ptr() & 15, dst.data_ptr() & 15)\n        ] = (compiled.run.launch, compiled.function, compiled.packed_metadata)\n    except Exception:  # pragma: no cover - the ordinary launch path stays usable\n        pass\n\n\ndef _bind_conj(src, dst, n, neg, block, grid):\n    \"\"\"Compile and remember the launcher for this dense-conjugate specialization.\n\n    The specialization is keyed on the interleaved *real* views (the kernel reads\n    a float stream), so warmup receives the same view the ordinary launch passes;\n    their base pointer is the complex tensor's pointer, so the cached launcher\n    matches the raw pointers used later.\n    \"\"\"\n    try:\n        if _stream_fn is None:\n            _resolve_stream(torch.npu.current_device())\n        compiled = _conj_flat_kernel.warmup(\n            torch.view_as_real(src), torch.view_as_real(dst), n,\n            NEG=neg, BLOCK=block, grid=(grid, 1, 1),\n        )\n        _conj_cache[\n            (src.dtype, block, neg, src.data_ptr() & 15, dst.data_ptr() & 15)\n        ] = (compiled.run.launch, compiled.function, compiled.packed_metadata)\n    except Exception:  # pragma: no cover\n        pass\n\n\ndef _collapse(shape, strides):\n    \"\"\"Merge adjacent axes whose strides compose exactly (pure index rewrite).\"\"\"\n    shape = list(shape)\n    strides = list(strides)\n    i = len(shape) - 1\n    while i > 0:\n        if shape[i] != 0 and strides[i - 1] == strides[i] * shape[i]:\n            shape[i - 1] *= shape[i]\n            strides[i - 1] = strides[i]\n            del shape[i]\n            del strides[i]\n        i -= 1\n    return shape, strides\n\n\ndef _launch_strided(src, out, n, neg, is_complex, block):\n    shape, strides = _collapse(src.shape, src.stride())\n    if is_complex:\n        # scalar-unit strides: one complex element spans two scalars\n        strides = [s * 2 for s in strides]\n\n    if len(shape) > 8:  # pragma: no cover - only for exotic layouts\n        step = n // shape[0]\n        for k in range(shape[0]):\n            _launch_strided(src[k], out[k], step, neg, is_complex, block)\n        return\n\n    rank = len(shape)\n    pad_s = [1] * 8\n    pad_t = [0] * 8\n    for d in range(rank):\n        pad_s[8 - rank + d] = shape[d]\n        pad_t[8 - rank + d] = strides[d]\n\n    carrier = torch.view_as_real(src) if is_complex else src\n    grid = (triton.cdiv(n, block),)\n    _conj_strided_kernel[grid](\n        carrier, torch.view_as_real(out) if is_complex else out, n,\n        pad_s[0], pad_s[1], pad_s[2], pad_s[3],\n        pad_s[4], pad_s[5], pad_s[6], pad_s[7],\n        pad_t[0], pad_t[1], pad_t[2], pad_t[3],\n        pad_t[4], pad_t[5], pad_t[6], pad_t[7],\n        NEG=neg,\n        IS_COMPLEX=is_complex,\n        NDIM=rank,\n        BLOCK=block,\n    )\n\n\ndef _block_for(n, small, mid, large):\n    if n <= _TINY_MAX:\n        return small\n    if n <= _MID_MAX:\n        return mid\n    return large\n\n\ndef run(input):\n    n = input.numel()\n    # The reference (whose only available backend is the CPU fallback) always\n    # produces a contiguous fresh tensor, never an alias of the input.\n    # ``empty_like`` is measurably cheaper (0.0058 ms vs 0.0070 ms per call on\n    # the target) but mirrors the input's layout, so it is only taken where that\n    # layout *is* contiguous and the input carries no conjugate bit to inherit.\n    has_bit = input.is_conj()\n    contig = input.is_contiguous()\n    if contig and not has_bit:\n        out = torch.empty_like(input)\n    else:\n        out = torch.empty(input.shape, dtype=input.dtype, device=input.device)\n    if n == 0:\n        return out\n\n    if input.is_complex():\n        # A lazy conjugate bit stores conj(logical); clear it with a\n        # metadata-only view so the kernel reads plain storage.\n        src = input.conj() if has_bit else input\n        neg = not has_bit\n        if contig:\n            nf = n + n\n            block = _block_for(nf, _CONJ_TINY, _CONJ_MID, _CONJ_LARGE)\n            grid = -(-nf // block)\n            sp = src.data_ptr()\n            dp = out.data_ptr()\n            entry = _conj_cache.get((input.dtype, block, neg, sp & 15, dp & 15))\n            if entry is None:\n                _conj_flat_kernel[(grid,)](\n                    torch.view_as_real(src), torch.view_as_real(out), nf,\n                    NEG=neg, BLOCK=block,\n                )\n                _bind_conj(src, out, nf, neg, block, grid)\n            else:\n                entry[0](grid, 1, 1, _cur_stream(), entry[1], entry[2],\n                         None, None, None, sp, dp, nf, neg, block)\n            return out\n        _launch_strided(src, out, n, neg, True, _STR_COMPLEX_BLOCK)\n        return out\n\n    # Real dtypes have no conjugate bit (``conj()`` returns the input itself),\n    # so the physical conjugate is the identity and the op is a plain copy.\n    if contig:\n        block = _block_for(n, _COPY_TINY, _COPY_MID, _COPY_LARGE)\n        grid = -(-n // block)\n        sp = input.data_ptr()\n        dp = out.data_ptr()\n        entry = _copy_cache.get((input.dtype, block, sp & 15, dp & 15))\n        if entry is None:\n            _copy_flat_kernel[(grid,)](input, out, n, BLOCK=block)\n            _bind_copy(input, out, n, block, grid)\n        else:\n            entry[0](grid, 1, 1, _cur_stream(), entry[1], entry[2],\n                     None, None, None, sp, dp, n, block)\n        return out\n\n    _launch_strided(\n        input, out, n, False, False,\n        _block_for(n, _STR_TINY, _STR_MID, _STR_LARGE),\n    )\n    return out\n",
+  "rounds": [
+    {
+      "round_num": 1,
+      "experiment_parent_round_num": null,
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Establish a native Triton baseline: one flat vector kernel for contiguous storage (copy for real dtypes, alternating-sign conj over the interleaved real/imaginary float stream for complex) plus a rank-generic strided kernel that reads through the input's real strides into a contiguous output.",
+        "code_changes": "Self-contained tmp/main.py replacing the FlagGems copy_/launch_conj_physical seed (which redispatched to a CPU-only copy and produced wrong values for strided inputs). Turns the lazy conjugate bit into a NEG flag with a metadata-only view, allocates a contiguous output like the reference, and selects UB-safe tile sizes per kernel/dtype after a measured 16384-wide fp32 tile overflowed the unified buffer.",
+        "hypothesis": "The reference aten::_conj_physical has no NPU kernel and falls back to the CPU with per-call transfer/sync, so a single native Triton pass should already beat it; the remaining gap will be host launch cost on the small inputs.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "Native device execution replaces a CPU-fallback reference that pays D2H/H2D plus synchronization per call."
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {
+          "copy_block": "1024/8192/16384",
+          "conj_block": "1024/4096/8192",
+          "strided_block": "1024/2048/4096"
+        },
+        "knowledge_uses": []
+      },
+      "solution": {
+        "sha256": "9164b1dde5699d174a796e86903e6702bf878140b82ee04364f0b84b5bd18103",
+        "snapshot_path": ".kernelgen/evals/round-0001",
+        "candidate_path": "tmp/main.py",
+        "code": "# Copyright 2026, The FlagOS Contributors.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Self-contained Triton implementation of ``aten._conj_physical``.\n\nSemantics (verified against the reference on the target):\n  * the result is always a freshly allocated tensor -- for real dtypes the\n    conjugate is the identity, but ``_conj_physical`` still returns a copy, so\n    the input must never be aliased or returned;\n  * the input may carry the lazy conjugate bit; it stores ``conj(logical)`` and\n    the operator conjugates the *logical* value, hence\n      - bit clear -> output = conj(storage)   (imaginary part negated)\n      - bit set   -> output = storage          (imaginary part unchanged)\n    The bit is turned into a boolean flag (``NEG``) here and cleared with a\n    metadata-only ``input.conj()`` view, so the kernel reads plain storage.\n  * the reference materialises a contiguous output for every layout, so the\n    result is allocated contiguous and the input is read through its real\n    strides (transposed / offset / gapped views are all addressed correctly).\n\nTwo kernels: a flat vector kernel for contiguous storage (all timing inputs)\nand a rank-generic strided kernel for arbitrary layouts.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n# Tile sizes per size class (elements, in units of the kernel's scalar type).\n# They are bounded by the unified buffer, not by taste: with auto multi-buffering\n# the compiler needs roughly ``buffers * BLOCK * itemsize`` bytes of UB\n# (1.5 Mib available). A masked load+store pair costs 4 buffers, so a 16384-wide\n# fp32 tile overflows (measured: 2097408 bits required); the strided complex\n# kernel touches four streams and overflows even earlier.\n_TINY_MAX = 4096\n_MID_MAX = 262144\n\n_COPY_TINY, _COPY_MID, _COPY_LARGE = 1024, 8192, 16384      # 2 streams\n_CONJ_TINY, _CONJ_MID, _CONJ_LARGE = 1024, 4096, 8192       # 4 buffers\n_STR_TINY, _STR_MID, _STR_LARGE = 1024, 2048, 4096          # 4-6 streams\n# The strided complex kernel needs 3145728 bits of UB at BLOCK=4096 (measured),\n# so it keeps one fixed, small tile: this path only serves non-contiguous\n# layouts, never the timed ones.\n_STR_COMPLEX_BLOCK = 1024\n\n\ndef _block_for(n, small, mid, large):\n    if n <= _TINY_MAX:\n        return small\n    if n <= _MID_MAX:\n        return mid\n    return large\n\n\n@triton.jit(do_not_specialize=[\"n\"])\ndef _copy_flat_kernel(src_ptr, dst_ptr, n, BLOCK: tl.constexpr):\n    \"\"\"Flat element copy: real dtypes need no arithmetic at all.\"\"\"\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    tl.store(dst_ptr + offs, tl.load(src_ptr + offs, mask=mask), mask=mask)\n\n\n@triton.jit(do_not_specialize=[\"n\"])\ndef _conj_flat_kernel(src_ptr, dst_ptr, n, NEG: tl.constexpr, BLOCK: tl.constexpr):\n    \"\"\"Flat copy over the interleaved real/imaginary float stream.\n\n    ``n`` counts scalars, so even offsets hold real parts and odd offsets hold\n    imaginary parts. Negating only the odd lanes keeps both the load and the\n    store fully contiguous, and a sign flip is exact for every float value.\n    \"\"\"\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    v = tl.load(src_ptr + offs, mask=mask)\n    if NEG:\n        v = tl.where((offs & 1) == 1, -v, v)\n    tl.store(dst_ptr + offs, v, mask=mask)\n\n\n@triton.jit\ndef _conj_strided_kernel(\n    src_ptr,\n    dst_ptr,\n    n,\n    s0, s1, s2, s3, s4, s5, s6, s7,\n    t0, t1, t2, t3, t4, t5, t6, t7,\n    NEG: tl.constexpr,\n    IS_COMPLEX: tl.constexpr,\n    NDIM: tl.constexpr,\n    BLOCK: tl.constexpr,\n):\n    \"\"\"Rank-generic strided read into a contiguous write.\n\n    ``s*`` are the logical sizes (last axis fastest), ``t*`` the input strides\n    in scalar units. The destination is contiguous, so its offset is a plain\n    multiple of the logical linear index.\n    \"\"\"\n    pid = tl.program_id(0)\n    idx = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = idx < n\n    rem = idx\n    off = tl.zeros_like(idx)\n\n    if NDIM >= 1:\n        off += (rem % s7) * t7\n        rem = rem // s7\n    if NDIM >= 2:\n        off += (rem % s6) * t6\n        rem = rem // s6\n    if NDIM >= 3:\n        off += (rem % s5) * t5\n        rem = rem // s5\n    if NDIM >= 4:\n        off += (rem % s4) * t4\n        rem = rem // s4\n    if NDIM >= 5:\n        off += (rem % s3) * t3\n        rem = rem // s3\n    if NDIM >= 6:\n        off += (rem % s2) * t2\n        rem = rem // s2\n    if NDIM >= 7:\n        off += (rem % s1) * t1\n        rem = rem // s1\n    if NDIM >= 8:\n        off += (rem % s0) * t0\n\n    if IS_COMPLEX:\n        out_off = idx * 2\n        re = tl.load(src_ptr + off, mask=mask)\n        im = tl.load(src_ptr + off + 1, mask=mask)\n        if NEG:\n            im = -im\n        tl.store(dst_ptr + out_off, re, mask=mask)\n        tl.store(dst_ptr + out_off + 1, im, mask=mask)\n    else:\n        tl.store(dst_ptr + idx, tl.load(src_ptr + off, mask=mask), mask=mask)\n\n\ndef _collapse(shape, strides):\n    \"\"\"Merge adjacent axes whose strides compose exactly (pure index rewrite).\"\"\"\n    shape = list(shape)\n    strides = list(strides)\n    i = len(shape) - 1\n    while i > 0:\n        if shape[i] != 0 and strides[i - 1] == strides[i] * shape[i]:\n            shape[i - 1] *= shape[i]\n            strides[i - 1] = strides[i]\n            del shape[i]\n            del strides[i]\n        i -= 1\n    return shape, strides\n\n\ndef _launch_strided(src, out, n, neg, is_complex, block):\n    shape, strides = _collapse(src.shape, src.stride())\n    if is_complex:\n        # scalar-unit strides: one complex element spans two scalars\n        strides = [s * 2 for s in strides]\n\n    if len(shape) > 8:  # pragma: no cover - only for exotic layouts\n        step = n // shape[0]\n        for k in range(shape[0]):\n            _launch_strided(src[k], out[k], step, neg, is_complex, block)\n        return\n\n    rank = len(shape)\n    pad_s = [1] * 8\n    pad_t = [0] * 8\n    for d in range(rank):\n        pad_s[8 - rank + d] = shape[d]\n        pad_t[8 - rank + d] = strides[d]\n\n    carrier = torch.view_as_real(src) if is_complex else src\n    grid = (triton.cdiv(n, block),)\n    _conj_strided_kernel[grid](\n        carrier, torch.view_as_real(out) if is_complex else out, n,\n        pad_s[0], pad_s[1], pad_s[2], pad_s[3],\n        pad_s[4], pad_s[5], pad_s[6], pad_s[7],\n        pad_t[0], pad_t[1], pad_t[2], pad_t[3],\n        pad_t[4], pad_t[5], pad_t[6], pad_t[7],\n        NEG=neg,\n        IS_COMPLEX=is_complex,\n        NDIM=rank,\n        BLOCK=block,\n    )\n\n\ndef run(input):\n    n = input.numel()\n    # The reference (whose only available backend is the CPU fallback) always\n    # produces a contiguous fresh tensor, never an alias of the input.\n    out = torch.empty(input.shape, dtype=input.dtype, device=input.device)\n    if n == 0:\n        return out\n\n    # A lazy conjugate bit stores conj(logical); clear it with a metadata-only\n    # view so the kernel reads plain storage. The result is conj(*logical*):\n    #   bit set   -> output == storage      (no negation)\n    #   bit clear -> output == conj(storage) (imaginary part negated)\n    has_bit = input.is_conj()\n    src = input.conj() if has_bit else input\n\n    if src.is_complex():\n        neg = not has_bit\n        block = _block_for(2 * n, _CONJ_TINY, _CONJ_MID, _CONJ_LARGE)\n        if src.is_contiguous() and out.is_contiguous():\n            nf = 2 * n\n            _conj_flat_kernel[(triton.cdiv(nf, block),)](\n                torch.view_as_real(src), torch.view_as_real(out), nf,\n                NEG=neg, BLOCK=block,\n            )\n        else:\n            _launch_strided(src, out, n, neg, True, _STR_COMPLEX_BLOCK)\n        return out\n\n    # Real dtypes have no conjugate bit (``conj()`` returns the input itself),\n    # so the physical conjugate is the identity and the op is a plain copy.\n    block = _block_for(n, _COPY_TINY, _COPY_MID, _COPY_LARGE)\n    if src.is_contiguous() and out.is_contiguous():\n        _copy_flat_kernel[(triton.cdiv(n, block),)](src, out, n, BLOCK=block)\n    else:\n        _launch_strided(\n            src, out, n, False, False,\n            _block_for(n, _STR_TINY, _STR_MID, _STR_LARGE),\n        )\n    return out\n"
+      },
+      "evaluation": {
+        "evaluated_at": "2026-10-23T11:50:09.956853Z",
+        "api_version": "v6.2",
+        "status": "PASSED",
+        "is_hack": false,
+        "hack_reason": "",
+        "geo_mean": 15.304934839726046,
+        "min_speedup": 1.0560153902218261,
+        "worst_workload_uuid": "_conj_physical-timing-3",
+        "latency_ms": 0.11831665302441269,
+        "max_abs_error": 0.0,
+        "max_rel_error": 0.0,
+        "num_workloads": 14,
+        "num_passed": 14,
+        "timing_skipped": false,
+        "requested_hardware": "Ascend910B",
+        "server_backend": "npu",
+        "log": "",
+        "workloads": [
+          {
+            "uuid": "_conj_physical-correctness-0",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-1",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-2",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-3",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-4",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-5",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-6",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-7",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-timing-0",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.10618928223871442,
+            "reference_latency_ms": 0.13240166562059705,
+            "speedup": 1.2468458476153645,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "_conj_physical-timing-1",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.1081233587824254,
+            "reference_latency_ms": 5.821596568398129,
+            "speedup": 53.842172810343584,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "_conj_physical-timing-2",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.10590046714768077,
+            "reference_latency_ms": 7.310989269083648,
+            "speedup": 69.03642133030722,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "_conj_physical-timing-3",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.11831665302441269,
+            "reference_latency_ms": 0.12494420651331557,
+            "speedup": 1.0560153902218261,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "_conj_physical-timing-4",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.12516777576723337,
+            "reference_latency_ms": 6.182186141966578,
+            "speedup": 49.39119596934598,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "_conj_physical-timing-5",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.11882753122544683,
+            "reference_latency_ms": 6.317897597784359,
+            "speedup": 53.16863468111325,
+            "abs_err": null,
+            "rel_err": null
+          }
+        ],
+        "comparison": {
+          "performance_baseline_round_num": null,
+          "geo_mean_before": null,
+          "geo_mean_after": 15.304934839726046,
+          "geo_mean_delta_pct": null,
+          "workloads": []
+        },
+        "fingerprint": "c16561d6eb426b691065b2176fd1530786afb79d58bec21533d03f0f481416e5"
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "The reference aten::_conj_physical has no NPU kernel and falls back to the CPU (measured warning from aten::conj_physical.out plus per-call 0.13 ms for 1024 elements and 5.8-7.3 ms for 65k-1M elements), so a single native Triton pass already wins on every workload. The candidate's own latency is however nearly constant at 0.106-0.125 ms across 1024, 65536 and 1048576 elements, and its per-call device event span equals its walltime, so the remaining bottleneck is host launch submission (~0.10 ms/call, versus ~7 us for the output allocation), not kernel work or HBM traffic.",
+        "perf_gap_analysis": "Baseline round (no previous measurement). Observed: all 8 correctness workloads pass with abs_err/rel_err 0 and matched_ratio 1, including the lazy conjugate-bit and transposed complex cases, and the two small timing inputs are the limiting ones (1.247x for float32[1024], 1.056x for complex64[1024]) while the four larger inputs reach 49-69x. The size independence of the candidate latency shows the gap to the 0.8x bar is entirely launch-side, which the next round targets.",
+        "next_suggestion": "Add a pre-bound launch fast path for the two contiguous kernels: compile through the ordinary kernel[grid](...) call once per (kernel, dtype, tile, pointer-alignment) specialization, then invoke the generated launcher directly with this call's pointers, element count and current stream, keeping the ordinary JIT path as fallback for the strided kernel and for any binding failure.",
+        "optimization_level": "L1_architecture",
+        "debug_lesson": "Preflight PASSED a candidate whose complex64[1048576] specialization later failed to compile with a unified-buffer overflow (2097408 bits required vs 1572864 available at a 16384-wide fp32 tile); only the debug numeric run over the real timing inputs exposed it. Tile width must be budgeted from buffered bytes per kernel shape, not chosen by taste, and preflight is not a substitute for compiling every frozen timing specialization.",
+        "strategy_evolution": "Moved from replicating the FlagGems copy/conj decomposition to a self-contained flat-stream kernel: complex conjugate is applied as an alternating-lane sign flip over the interleaved real/imaginary floats, which keeps load and store contiguous, and the conjugate bit is converted into a constexpr instead of being materialized by a copy.",
+        "knowledge_assessments": []
+      },
+      "next_verdict": {
+        "should_continue": true,
+        "code": "continue",
+        "reason": "no stop trigger"
+      }
+    },
+    {
+      "round_num": 2,
+      "experiment_parent_round_num": 1,
+      "plan": {
+        "kind": "performance",
+        "strategy": "Cut host launch cost on the dense contiguous paths with a pre-bound compiled launcher, while keeping the ordinary Triton launch path for non-contiguous layouts and as a fallback.",
+        "code_changes": "Added _copy_cache/_conj_cache plus _bind_copy/_bind_conj: the first call for a (kernel, dtype, tile, src-alignment, dst-alignment) specialization compiles through the ordinary kernel[grid](...) path, then reuses compiled.run.launch with this call's raw pointers, element count and current stream from _npu_getCurrentRawStreamNoWait. The strided kernel and any binding failure keep the ordinary launch. Complex binding warms up on the interleaved real views because Triton has no complex dtype.",
+        "hypothesis": "Because candidate latency was nearly constant at 0.106-0.125 ms for 1024 through 1048576 elements, the cost is host launch submission rather than kernel work; bypassing JIT dispatch should cut latency toward the ~0.008 ms launcher plus ~0.007 ms output allocation floor and raise every workload, especially the two small inputs that cap the geometric mean.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Replacing Triton's per-call JIT dispatch with a direct launcher call removes roughly 30 us of host submission per invocation, which is the measured bottleneck at every input size."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": 1
+        },
+        "key_params": {
+          "prebound_launch": "compiled.run.launch",
+          "stream": "_npu_getCurrentRawStreamNoWait",
+          "alignment_key": "ptr & 15"
+        },
+        "knowledge_uses": []
+      },
+      "solution": {
+        "sha256": "38748dd722f0bbff0803d22ea2a7fc6e47f4bc2e2ccb9d51b90757d6dba56db2",
+        "snapshot_path": ".kernelgen/evals/round-0002",
+        "candidate_path": "tmp/main.py",
+        "code": "# Copyright 2026, The FlagOS Contributors.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Self-contained Triton implementation of ``aten._conj_physical``.\n\nSemantics (verified against the reference on the target):\n  * the result is always a freshly allocated tensor -- for real dtypes the\n    conjugate is the identity, but ``_conj_physical`` still returns a copy, so\n    the input must never be aliased or returned;\n  * the input may carry the lazy conjugate bit; it stores ``conj(logical)`` and\n    the operator conjugates the *logical* value, hence\n      - bit clear -> output = conj(storage)   (imaginary part negated)\n      - bit set   -> output = storage          (imaginary part unchanged)\n    The bit becomes a constexpr ``NEG`` and is cleared with a metadata-only\n    ``input.conj()`` view, so the kernel reads plain storage;\n  * the reference (whose only backend here is the CPU fallback) materialises a\n    contiguous output for every layout, so the result is contiguous and the\n    input is read through its real strides.\n\nKernels: a flat vector kernel over contiguous storage (all timing inputs) and a\nrank-generic strided kernel for arbitrary layouts.\n\nDense contiguous calls take a pre-bound launch path: the first call for a\n(kernel, dtype, tile, pointer-alignment) specialization compiles through the\nordinary ``kernel[grid](...)`` call; later calls reuse that compiled kernel and\ninvoke its generated launcher directly, passing this call's pointers, element\ncount and *current* stream. Nothing about a tensor (data, shape, stream, dtype)\nis cached -- only the compiled artifact.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\ntry:  # one cheap C call instead of the driver wrapper, same raw rtStream_t value\n    from torch_npu._C import _npu_getCurrentRawStreamNoWait as _raw_stream\nexcept Exception:  # pragma: no cover\n    _raw_stream = None\n\n# Tile sizes per size class (elements, in units of the kernel's scalar type).\n# They are bounded by the unified buffer, not by taste: with auto multi-buffering\n# the compiler needs roughly ``buffers * BLOCK * itemsize`` bytes of UB\n# (1.5 Mib available). A masked load+store pair costs 4 buffers, so a 16384-wide\n# fp32 tile overflows (measured: 2097408 bits required); the strided complex\n# kernel touches four streams and overflows even earlier.\n_TINY_MAX = 4096\n_MID_MAX = 262144\n\n_COPY_TINY, _COPY_MID, _COPY_LARGE = 1024, 8192, 16384      # 2 streams\n_CONJ_TINY, _CONJ_MID, _CONJ_LARGE = 1024, 4096, 8192       # 4 buffers\n_STR_TINY, _STR_MID, _STR_LARGE = 1024, 2048, 4096          # 4-6 streams\n# The strided complex kernel needs 3145728 bits of UB at BLOCK=4096 (measured),\n# so it keeps one fixed, small tile; this path only serves non-contiguous\n# layouts, never the timed ones.\n_STR_COMPLEX_BLOCK = 1024\n\n# (dtype, tile, src_ptr & 15, dst_ptr & 15) -> compiled launcher\n_copy_cache = {}\n_conj_cache = {}\n_device = None\n_stream_fn = None\n\n\n@triton.jit(do_not_specialize=[\"n\"])\ndef _copy_flat_kernel(src_ptr, dst_ptr, n, BLOCK: tl.constexpr):\n    \"\"\"Flat element copy: real dtypes need no arithmetic at all.\"\"\"\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    tl.store(dst_ptr + offs, tl.load(src_ptr + offs, mask=mask), mask=mask)\n\n\n@triton.jit(do_not_specialize=[\"n\"])\ndef _conj_flat_kernel(src_ptr, dst_ptr, n, NEG: tl.constexpr, BLOCK: tl.constexpr):\n    \"\"\"Flat copy over the interleaved real/imaginary float stream.\n\n    ``n`` counts scalars, so even offsets hold real parts and odd offsets hold\n    imaginary parts. Negating only the odd lanes keeps both the load and the\n    store fully contiguous, and a sign flip is exact for every float value.\n    \"\"\"\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    v = tl.load(src_ptr + offs, mask=mask)\n    if NEG:\n        v = tl.where((offs & 1) == 1, -v, v)\n    tl.store(dst_ptr + offs, v, mask=mask)\n\n\n@triton.jit\ndef _conj_strided_kernel(\n    src_ptr,\n    dst_ptr,\n    n,\n    s0, s1, s2, s3, s4, s5, s6, s7,\n    t0, t1, t2, t3, t4, t5, t6, t7,\n    NEG: tl.constexpr,\n    IS_COMPLEX: tl.constexpr,\n    NDIM: tl.constexpr,\n    BLOCK: tl.constexpr,\n):\n    \"\"\"Rank-generic strided read into a contiguous write.\n\n    ``s*`` are the logical sizes (last axis fastest), ``t*`` the input strides\n    in scalar units. The destination is contiguous, so its offset is a plain\n    multiple of the logical linear index.\n    \"\"\"\n    pid = tl.program_id(0)\n    idx = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = idx < n\n    rem = idx\n    off = tl.zeros_like(idx)\n\n    if NDIM >= 1:\n        off += (rem % s7) * t7\n        rem = rem // s7\n    if NDIM >= 2:\n        off += (rem % s6) * t6\n        rem = rem // s6\n    if NDIM >= 3:\n        off += (rem % s5) * t5\n        rem = rem // s5\n    if NDIM >= 4:\n        off += (rem % s4) * t4\n        rem = rem // s4\n    if NDIM >= 5:\n        off += (rem % s3) * t3\n        rem = rem // s3\n    if NDIM >= 6:\n        off += (rem % s2) * t2\n        rem = rem // s2\n    if NDIM >= 7:\n        off += (rem % s1) * t1\n        rem = rem // s1\n    if NDIM >= 8:\n        off += (rem % s0) * t0\n\n    if IS_COMPLEX:\n        out_off = idx * 2\n        re = tl.load(src_ptr + off, mask=mask)\n        im = tl.load(src_ptr + off + 1, mask=mask)\n        if NEG:\n            im = -im\n        tl.store(dst_ptr + out_off, re, mask=mask)\n        tl.store(dst_ptr + out_off + 1, im, mask=mask)\n    else:\n        tl.store(dst_ptr + idx, tl.load(src_ptr + off, mask=mask), mask=mask)\n\n\ndef _resolve_stream(device):\n    global _device, _stream_fn\n    _device = device\n    if _raw_stream is not None:\n        _stream_fn = lambda: _raw_stream(device)\n    else:  # pragma: no cover - fallback for a driver without the raw query\n        _stream_fn = lambda: triton.runtime.driver.active.get_current_stream(device)\n\n\ndef _cur_stream():\n    device = torch.npu.current_device()\n    if device != _device:\n        _resolve_stream(device)\n    return _stream_fn()\n\n\ndef _bind_copy(src, dst, n, block, grid):\n    \"\"\"Compile and remember the launcher for this dense-copy specialization.\"\"\"\n    try:\n        if _stream_fn is None:\n            _resolve_stream(torch.npu.current_device())\n        compiled = _copy_flat_kernel.warmup(src, dst, n, BLOCK=block, grid=(grid, 1, 1))\n        _copy_cache[\n            (src.dtype, block, src.data_ptr() & 15, dst.data_ptr() & 15)\n        ] = (compiled.run.launch, compiled.function, compiled.packed_metadata)\n    except Exception:  # pragma: no cover - the ordinary launch path stays usable\n        pass\n\n\ndef _bind_conj(src, dst, n, neg, block, grid):\n    \"\"\"Compile and remember the launcher for this dense-conjugate specialization.\n\n    The specialization is keyed on the interleaved *real* views (the kernel reads\n    a float stream), so warmup receives the same view the ordinary launch passes;\n    their base pointer is the complex tensor's pointer, so the cached launcher\n    matches the raw pointers used later.\n    \"\"\"\n    try:\n        if _stream_fn is None:\n            _resolve_stream(torch.npu.current_device())\n        compiled = _conj_flat_kernel.warmup(\n            torch.view_as_real(src), torch.view_as_real(dst), n,\n            NEG=neg, BLOCK=block, grid=(grid, 1, 1),\n        )\n        _conj_cache[\n            (src.dtype, block, neg, src.data_ptr() & 15, dst.data_ptr() & 15)\n        ] = (compiled.run.launch, compiled.function, compiled.packed_metadata)\n    except Exception:  # pragma: no cover\n        pass\n\n\ndef _collapse(shape, strides):\n    \"\"\"Merge adjacent axes whose strides compose exactly (pure index rewrite).\"\"\"\n    shape = list(shape)\n    strides = list(strides)\n    i = len(shape) - 1\n    while i > 0:\n        if shape[i] != 0 and strides[i - 1] == strides[i] * shape[i]:\n            shape[i - 1] *= shape[i]\n            strides[i - 1] = strides[i]\n            del shape[i]\n            del strides[i]\n        i -= 1\n    return shape, strides\n\n\ndef _launch_strided(src, out, n, neg, is_complex, block):\n    shape, strides = _collapse(src.shape, src.stride())\n    if is_complex:\n        # scalar-unit strides: one complex element spans two scalars\n        strides = [s * 2 for s in strides]\n\n    if len(shape) > 8:  # pragma: no cover - only for exotic layouts\n        step = n // shape[0]\n        for k in range(shape[0]):\n            _launch_strided(src[k], out[k], step, neg, is_complex, block)\n        return\n\n    rank = len(shape)\n    pad_s = [1] * 8\n    pad_t = [0] * 8\n    for d in range(rank):\n        pad_s[8 - rank + d] = shape[d]\n        pad_t[8 - rank + d] = strides[d]\n\n    carrier = torch.view_as_real(src) if is_complex else src\n    grid = (triton.cdiv(n, block),)\n    _conj_strided_kernel[grid](\n        carrier, torch.view_as_real(out) if is_complex else out, n,\n        pad_s[0], pad_s[1], pad_s[2], pad_s[3],\n        pad_s[4], pad_s[5], pad_s[6], pad_s[7],\n        pad_t[0], pad_t[1], pad_t[2], pad_t[3],\n        pad_t[4], pad_t[5], pad_t[6], pad_t[7],\n        NEG=neg,\n        IS_COMPLEX=is_complex,\n        NDIM=rank,\n        BLOCK=block,\n    )\n\n\ndef _block_for(n, small, mid, large):\n    if n <= _TINY_MAX:\n        return small\n    if n <= _MID_MAX:\n        return mid\n    return large\n\n\ndef run(input):\n    n = input.numel()\n    # The reference (whose only available backend is the CPU fallback) always\n    # produces a contiguous fresh tensor, never an alias of the input.\n    out = torch.empty(input.shape, dtype=input.dtype, device=input.device)\n    if n == 0:\n        return out\n\n    if input.is_complex():\n        # A lazy conjugate bit stores conj(logical); clear it with a\n        # metadata-only view so the kernel reads plain storage.\n        has_bit = input.is_conj()\n        src = input.conj() if has_bit else input\n        neg = not has_bit\n        if src.is_contiguous():\n            nf = n + n\n            block = _block_for(nf, _CONJ_TINY, _CONJ_MID, _CONJ_LARGE)\n            grid = -(-nf // block)\n            sp = src.data_ptr()\n            dp = out.data_ptr()\n            entry = _conj_cache.get((input.dtype, block, neg, sp & 15, dp & 15))\n            if entry is None:\n                _conj_flat_kernel[(grid,)](\n                    torch.view_as_real(src), torch.view_as_real(out), nf,\n                    NEG=neg, BLOCK=block,\n                )\n                _bind_conj(src, out, nf, neg, block, grid)\n            else:\n                entry[0](grid, 1, 1, _cur_stream(), entry[1], entry[2],\n                         None, None, None, sp, dp, nf, neg, block)\n            return out\n        _launch_strided(src, out, n, neg, True, _STR_COMPLEX_BLOCK)\n        return out\n\n    # Real dtypes have no conjugate bit (``conj()`` returns the input itself),\n    # so the physical conjugate is the identity and the op is a plain copy.\n    if input.is_contiguous():\n        block = _block_for(n, _COPY_TINY, _COPY_MID, _COPY_LARGE)\n        grid = -(-n // block)\n        sp = input.data_ptr()\n        dp = out.data_ptr()\n        entry = _copy_cache.get((input.dtype, block, sp & 15, dp & 15))\n        if entry is None:\n            _copy_flat_kernel[(grid,)](input, out, n, BLOCK=block)\n            _bind_copy(input, out, n, block, grid)\n        else:\n            entry[0](grid, 1, 1, _cur_stream(), entry[1], entry[2],\n                     None, None, None, sp, dp, n, block)\n        return out\n\n    _launch_strided(\n        input, out, n, False, False,\n        _block_for(n, _STR_TINY, _STR_MID, _STR_LARGE),\n    )\n    return out\n"
+      },
+      "evaluation": {
+        "evaluated_at": "2026-10-23T11:56:48.807069Z",
+        "api_version": "v6.2",
+        "status": "PASSED",
+        "is_hack": false,
+        "hack_reason": "",
+        "geo_mean": 89.38029764192028,
+        "min_speedup": 3.9939131789518476,
+        "worst_workload_uuid": "_conj_physical-timing-0",
+        "latency_ms": 0.03156744993430278,
+        "max_abs_error": 0.0,
+        "max_rel_error": 0.0,
+        "num_workloads": 14,
+        "num_passed": 14,
+        "timing_skipped": false,
+        "requested_hardware": "Ascend910B",
+        "server_backend": "npu",
+        "log": "",
+        "workloads": [
+          {
+            "uuid": "_conj_physical-correctness-0",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-1",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-2",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-3",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-4",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-5",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-6",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-7",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-timing-0",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.03156744993430278,
+            "reference_latency_ms": 0.1260776543185145,
+            "speedup": 3.9939131789518476,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "_conj_physical-timing-1",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.031741661738674425,
+            "reference_latency_ms": 13.556932532487231,
+            "speedup": 427.102167621215,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "_conj_physical-timing-2",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.031794782081305296,
+            "reference_latency_ms": 12.701870713499375,
+            "speedup": 399.4954480586871,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "_conj_physical-timing-3",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.03205377862037646,
+            "reference_latency_ms": 0.1366225527880742,
+            "speedup": 4.262291644493477,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "_conj_physical-timing-4",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.0328344535325347,
+            "reference_latency_ms": 13.226922186246762,
+            "speedup": 402.8366780382256,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "_conj_physical-timing-5",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.032324284976247,
+            "reference_latency_ms": 14.085274237293069,
+            "speedup": 435.74898091770365,
+            "abs_err": null,
+            "rel_err": null
+          }
+        ],
+        "comparison": {
+          "performance_baseline_round_num": 1,
+          "geo_mean_before": 15.304934839726046,
+          "geo_mean_after": 89.38029764192028,
+          "geo_mean_delta_pct": 483.9965904978669,
+          "workloads": [
+            {
+              "uuid": "_conj_physical-correctness-0",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-1",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-2",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-3",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-4",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-5",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-6",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-7",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-timing-0",
+              "axes": {},
+              "before_latency_ms": 0.10618928223871442,
+              "after_latency_ms": 0.03156744993430278,
+              "latency_delta_ms": -0.07462183230441163,
+              "latency_delta_pct": -70.27247075336767,
+              "before_speedup": 1.2468458476153645,
+              "after_speedup": 3.9939131789518476,
+              "speedup_delta": 2.747067331336483,
+              "speedup_delta_pct": 220.32132814095212
+            },
+            {
+              "uuid": "_conj_physical-timing-1",
+              "axes": {},
+              "before_latency_ms": 0.1081233587824254,
+              "after_latency_ms": 0.031741661738674425,
+              "latency_delta_ms": -0.07638169704375097,
+              "latency_delta_pct": -70.64310423194716,
+              "before_speedup": 53.842172810343584,
+              "after_speedup": 427.102167621215,
+              "speedup_delta": 373.25999481087143,
+              "speedup_delta_pct": 693.2483875152317
+            },
+            {
+              "uuid": "_conj_physical-timing-2",
+              "axes": {},
+              "before_latency_ms": 0.10590046714768077,
+              "after_latency_ms": 0.031794782081305296,
+              "latency_delta_ms": -0.07410568506637547,
+              "latency_delta_pct": -69.97673104032043,
+              "before_speedup": 69.03642133030722,
+              "after_speedup": 399.4954480586871,
+              "speedup_delta": 330.45902672837985,
+              "speedup_delta_pct": 478.67346012518067
+            },
+            {
+              "uuid": "_conj_physical-timing-3",
+              "axes": {},
+              "before_latency_ms": 0.11831665302441269,
+              "after_latency_ms": 0.03205377862037646,
+              "latency_delta_ms": -0.08626287440403624,
+              "latency_delta_pct": -72.90848092722612,
+              "before_speedup": 1.0560153902218261,
+              "after_speedup": 4.262291644493477,
+              "speedup_delta": 3.2062762542716507,
+              "speedup_delta_pct": 303.6202203074088
+            },
+            {
+              "uuid": "_conj_physical-timing-4",
+              "axes": {},
+              "before_latency_ms": 0.12516777576723337,
+              "after_latency_ms": 0.0328344535325347,
+              "latency_delta_ms": -0.09233332223469867,
+              "latency_delta_pct": -73.76764639998487,
+              "before_speedup": 49.39119596934598,
+              "after_speedup": 402.8366780382256,
+              "speedup_delta": 353.44548206887964,
+              "speedup_delta_pct": 715.6042187928414
+            },
+            {
+              "uuid": "_conj_physical-timing-5",
+              "axes": {},
+              "before_latency_ms": 0.11882753122544683,
+              "after_latency_ms": 0.032324284976247,
+              "latency_delta_ms": -0.08650324624919983,
+              "latency_delta_pct": -72.79730998120344,
+              "before_speedup": 53.16863468111325,
+              "after_speedup": 435.74898091770365,
+              "speedup_delta": 382.5803462365904,
+              "speedup_delta_pct": 719.5602229231062
+            }
+          ]
+        },
+        "fingerprint": "d9fd19dde5bedde8b1ceb2942af178553da0749c38d1b96cafc04276e7e4282d"
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "met",
+        "root_cause": "Per-call cost is now host-side and size independent: every timing input takes 0.0316-0.0328 ms while its device work ranges from nothing to 16 MB of traffic, so the remaining gap is output allocation plus launcher invocation plus Python glue, not device execution.",
+        "perf_gap_analysis": "Expected a large gain from bypassing JIT dispatch and observed it: geo_mean 15.30x -> 89.38x, i.e. 5.8x better than round 1, with the same 14/14 pass and abs_err/rel_err 0. Per workload latency collapsed from 0.106-0.125 ms to 0.0316-0.0328 ms and is now flat across 1024, 65536 and 1048576 elements, confirming the hypothesis that host submission, not kernel work, set the cost. The large inputs gained the most (t1 53.8x -> 427x, t2 69.0x -> 399x, t4 49.4x -> 403x, t5 53.2x -> 436x) because their reference pays 12.7-14.1 ms of CPU-fallback transfer. The two small inputs improved least (t0 1.25x -> 3.99x, t3 1.06x -> 4.26x) because their reference is only ~0.13 ms, so they are now pinned by the residual per-call floor: allocation ~0.0075 ms plus launcher ~0.008 ms plus Python glue. min_speedup moved from 1.056 to 3.99 and the bottleneck is unchanged in kind, only smaller.",
+        "next_suggestion": "Attack the remaining ~0.032 ms per-call floor, which is now identical for 1024 and 1048576 elements: split it into output allocation, launcher call and Python glue with a preallocated-output probe, then remove whichever dominates (for example by trimming per-call device/stream lookups or by avoiding a masked tail kernel where the count divides evenly).",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "The complex specialization never bound because JITFunction.warmup received complex tensors while the kernel's signature is a float stream; the failure was invisible because the bind is wrapped in try/except, and only a probe that printed the cache contents exposed that the fast path was dead (t3 stayed at 0.154 ms). Cache-population state is worth asserting in any host-side fast path.",
+        "strategy_evolution": "Kept the round 1 kernels untouched and changed only the launch layer, so the 5.8x aggregate gain is attributable to dispatch cost rather than arithmetic or tiling. The strided kernel and any binding failure still take the ordinary Triton path, and the pre-bound path still keys on pointer alignment, so unaligned views get their own specialization (verified: offset view with ptr%16==4 exact and equally fast).",
+        "knowledge_assessments": []
+      },
+      "next_verdict": {
+        "should_continue": true,
+        "code": "continue",
+        "reason": "no stop trigger"
+      }
+    },
+    {
+      "round_num": 3,
+      "experiment_parent_round_num": 2,
+      "plan": {
+        "kind": "performance",
+        "strategy": "Trim the dominant remaining host cost (output allocation) without touching the kernels, by selecting the cheaper allocator entry point on the path where it provably preserves the required contiguous, bit-free output.",
+        "code_changes": "run() now reads is_conj()/is_contiguous() once and, when the input is contiguous and carries no conjugate bit, allocates with torch.empty_like(input) instead of torch.empty(input.shape, dtype=..., device=...); every other case keeps the contiguous torch.empty allocation so the reference's contiguous output layout is preserved. The two flags are reused by both the complex and real branches instead of re-querying.",
+        "hypothesis": "The per-call floor is now output allocation (~0.0070 ms) plus launcher (~0.0070 ms) plus stream query (~0.0010 ms); torch.empty_like measured 0.0056 ms against 0.0071 ms for torch.empty(shape, ...), so taking it on the dense bit-free path should cut the floor by roughly 1.3 us, from ~0.0313 to ~0.0280 ms.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Removing 1.3 us of per-call allocation cost from a floor that is otherwise unchanged raises every workload by the same small factor, with the largest relative gain on the small inputs where the reference is fastest."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": 2
+        },
+        "key_params": {
+          "alloc": "torch.empty_like on contiguous bit-free inputs",
+          "fallback_alloc": "torch.empty(shape, dtype, device)"
+        },
+        "knowledge_uses": []
+      },
+      "solution": {
+        "sha256": "feccb337a7fc417432a66c6fefde42181665a258a6b7fdf82ce96c2799ecaef2",
+        "snapshot_path": ".kernelgen/evals/round-0003",
+        "candidate_path": "tmp/main.py",
+        "code": "# Copyright 2026, The FlagOS Contributors.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Self-contained Triton implementation of ``aten._conj_physical``.\n\nSemantics (verified against the reference on the target):\n  * the result is always a freshly allocated tensor -- for real dtypes the\n    conjugate is the identity, but ``_conj_physical`` still returns a copy, so\n    the input must never be aliased or returned;\n  * the input may carry the lazy conjugate bit; it stores ``conj(logical)`` and\n    the operator conjugates the *logical* value, hence\n      - bit clear -> output = conj(storage)   (imaginary part negated)\n      - bit set   -> output = storage          (imaginary part unchanged)\n    The bit becomes a constexpr ``NEG`` and is cleared with a metadata-only\n    ``input.conj()`` view, so the kernel reads plain storage;\n  * the reference (whose only backend here is the CPU fallback) materialises a\n    contiguous output for every layout, so the result is contiguous and the\n    input is read through its real strides.\n\nKernels: a flat vector kernel over contiguous storage (all timing inputs) and a\nrank-generic strided kernel for arbitrary layouts.\n\nDense contiguous calls take a pre-bound launch path: the first call for a\n(kernel, dtype, tile, pointer-alignment) specialization compiles through the\nordinary ``kernel[grid](...)`` call; later calls reuse that compiled kernel and\ninvoke its generated launcher directly, passing this call's pointers, element\ncount and *current* stream. Nothing about a tensor (data, shape, stream, dtype)\nis cached -- only the compiled artifact.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\ntry:  # one cheap C call instead of the driver wrapper, same raw rtStream_t value\n    from torch_npu._C import _npu_getCurrentRawStreamNoWait as _raw_stream\nexcept Exception:  # pragma: no cover\n    _raw_stream = None\n\n# Tile sizes per size class (elements, in units of the kernel's scalar type).\n# They are bounded by the unified buffer, not by taste: with auto multi-buffering\n# the compiler needs roughly ``buffers * BLOCK * itemsize`` bytes of UB\n# (1.5 Mib available). A masked load+store pair costs 4 buffers, so a 16384-wide\n# fp32 tile overflows (measured: 2097408 bits required); the strided complex\n# kernel touches four streams and overflows even earlier.\n_TINY_MAX = 4096\n_MID_MAX = 262144\n\n_COPY_TINY, _COPY_MID, _COPY_LARGE = 1024, 8192, 16384      # 2 streams\n_CONJ_TINY, _CONJ_MID, _CONJ_LARGE = 1024, 4096, 8192       # 4 buffers\n_STR_TINY, _STR_MID, _STR_LARGE = 1024, 2048, 4096          # 4-6 streams\n# The strided complex kernel needs 3145728 bits of UB at BLOCK=4096 (measured),\n# so it keeps one fixed, small tile; this path only serves non-contiguous\n# layouts, never the timed ones.\n_STR_COMPLEX_BLOCK = 1024\n\n# (dtype, tile, src_ptr & 15, dst_ptr & 15) -> compiled launcher\n_copy_cache = {}\n_conj_cache = {}\n_device = None\n_stream_fn = None\n\n\n@triton.jit(do_not_specialize=[\"n\"])\ndef _copy_flat_kernel(src_ptr, dst_ptr, n, BLOCK: tl.constexpr):\n    \"\"\"Flat element copy: real dtypes need no arithmetic at all.\"\"\"\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    tl.store(dst_ptr + offs, tl.load(src_ptr + offs, mask=mask), mask=mask)\n\n\n@triton.jit(do_not_specialize=[\"n\"])\ndef _conj_flat_kernel(src_ptr, dst_ptr, n, NEG: tl.constexpr, BLOCK: tl.constexpr):\n    \"\"\"Flat copy over the interleaved real/imaginary float stream.\n\n    ``n`` counts scalars, so even offsets hold real parts and odd offsets hold\n    imaginary parts. Negating only the odd lanes keeps both the load and the\n    store fully contiguous, and a sign flip is exact for every float value.\n    \"\"\"\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    v = tl.load(src_ptr + offs, mask=mask)\n    if NEG:\n        v = tl.where((offs & 1) == 1, -v, v)\n    tl.store(dst_ptr + offs, v, mask=mask)\n\n\n@triton.jit\ndef _conj_strided_kernel(\n    src_ptr,\n    dst_ptr,\n    n,\n    s0, s1, s2, s3, s4, s5, s6, s7,\n    t0, t1, t2, t3, t4, t5, t6, t7,\n    NEG: tl.constexpr,\n    IS_COMPLEX: tl.constexpr,\n    NDIM: tl.constexpr,\n    BLOCK: tl.constexpr,\n):\n    \"\"\"Rank-generic strided read into a contiguous write.\n\n    ``s*`` are the logical sizes (last axis fastest), ``t*`` the input strides\n    in scalar units. The destination is contiguous, so its offset is a plain\n    multiple of the logical linear index.\n    \"\"\"\n    pid = tl.program_id(0)\n    idx = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = idx < n\n    rem = idx\n    off = tl.zeros_like(idx)\n\n    if NDIM >= 1:\n        off += (rem % s7) * t7\n        rem = rem // s7\n    if NDIM >= 2:\n        off += (rem % s6) * t6\n        rem = rem // s6\n    if NDIM >= 3:\n        off += (rem % s5) * t5\n        rem = rem // s5\n    if NDIM >= 4:\n        off += (rem % s4) * t4\n        rem = rem // s4\n    if NDIM >= 5:\n        off += (rem % s3) * t3\n        rem = rem // s3\n    if NDIM >= 6:\n        off += (rem % s2) * t2\n        rem = rem // s2\n    if NDIM >= 7:\n        off += (rem % s1) * t1\n        rem = rem // s1\n    if NDIM >= 8:\n        off += (rem % s0) * t0\n\n    if IS_COMPLEX:\n        out_off = idx * 2\n        re = tl.load(src_ptr + off, mask=mask)\n        im = tl.load(src_ptr + off + 1, mask=mask)\n        if NEG:\n            im = -im\n        tl.store(dst_ptr + out_off, re, mask=mask)\n        tl.store(dst_ptr + out_off + 1, im, mask=mask)\n    else:\n        tl.store(dst_ptr + idx, tl.load(src_ptr + off, mask=mask), mask=mask)\n\n\ndef _resolve_stream(device):\n    global _device, _stream_fn\n    _device = device\n    if _raw_stream is not None:\n        _stream_fn = lambda: _raw_stream(device)\n    else:  # pragma: no cover - fallback for a driver without the raw query\n        _stream_fn = lambda: triton.runtime.driver.active.get_current_stream(device)\n\n\ndef _cur_stream():\n    device = torch.npu.current_device()\n    if device != _device:\n        _resolve_stream(device)\n    return _stream_fn()\n\n\ndef _bind_copy(src, dst, n, block, grid):\n    \"\"\"Compile and remember the launcher for this dense-copy specialization.\"\"\"\n    try:\n        if _stream_fn is None:\n            _resolve_stream(torch.npu.current_device())\n        compiled = _copy_flat_kernel.warmup(src, dst, n, BLOCK=block, grid=(grid, 1, 1))\n        _copy_cache[\n            (src.dtype, block, src.data_ptr() & 15, dst.data_ptr() & 15)\n        ] = (compiled.run.launch, compiled.function, compiled.packed_metadata)\n    except Exception:  # pragma: no cover - the ordinary launch path stays usable\n        pass\n\n\ndef _bind_conj(src, dst, n, neg, block, grid):\n    \"\"\"Compile and remember the launcher for this dense-conjugate specialization.\n\n    The specialization is keyed on the interleaved *real* views (the kernel reads\n    a float stream), so warmup receives the same view the ordinary launch passes;\n    their base pointer is the complex tensor's pointer, so the cached launcher\n    matches the raw pointers used later.\n    \"\"\"\n    try:\n        if _stream_fn is None:\n            _resolve_stream(torch.npu.current_device())\n        compiled = _conj_flat_kernel.warmup(\n            torch.view_as_real(src), torch.view_as_real(dst), n,\n            NEG=neg, BLOCK=block, grid=(grid, 1, 1),\n        )\n        _conj_cache[\n            (src.dtype, block, neg, src.data_ptr() & 15, dst.data_ptr() & 15)\n        ] = (compiled.run.launch, compiled.function, compiled.packed_metadata)\n    except Exception:  # pragma: no cover\n        pass\n\n\ndef _collapse(shape, strides):\n    \"\"\"Merge adjacent axes whose strides compose exactly (pure index rewrite).\"\"\"\n    shape = list(shape)\n    strides = list(strides)\n    i = len(shape) - 1\n    while i > 0:\n        if shape[i] != 0 and strides[i - 1] == strides[i] * shape[i]:\n            shape[i - 1] *= shape[i]\n            strides[i - 1] = strides[i]\n            del shape[i]\n            del strides[i]\n        i -= 1\n    return shape, strides\n\n\ndef _launch_strided(src, out, n, neg, is_complex, block):\n    shape, strides = _collapse(src.shape, src.stride())\n    if is_complex:\n        # scalar-unit strides: one complex element spans two scalars\n        strides = [s * 2 for s in strides]\n\n    if len(shape) > 8:  # pragma: no cover - only for exotic layouts\n        step = n // shape[0]\n        for k in range(shape[0]):\n            _launch_strided(src[k], out[k], step, neg, is_complex, block)\n        return\n\n    rank = len(shape)\n    pad_s = [1] * 8\n    pad_t = [0] * 8\n    for d in range(rank):\n        pad_s[8 - rank + d] = shape[d]\n        pad_t[8 - rank + d] = strides[d]\n\n    carrier = torch.view_as_real(src) if is_complex else src\n    grid = (triton.cdiv(n, block),)\n    _conj_strided_kernel[grid](\n        carrier, torch.view_as_real(out) if is_complex else out, n,\n        pad_s[0], pad_s[1], pad_s[2], pad_s[3],\n        pad_s[4], pad_s[5], pad_s[6], pad_s[7],\n        pad_t[0], pad_t[1], pad_t[2], pad_t[3],\n        pad_t[4], pad_t[5], pad_t[6], pad_t[7],\n        NEG=neg,\n        IS_COMPLEX=is_complex,\n        NDIM=rank,\n        BLOCK=block,\n    )\n\n\ndef _block_for(n, small, mid, large):\n    if n <= _TINY_MAX:\n        return small\n    if n <= _MID_MAX:\n        return mid\n    return large\n\n\ndef run(input):\n    n = input.numel()\n    # The reference (whose only available backend is the CPU fallback) always\n    # produces a contiguous fresh tensor, never an alias of the input.\n    # ``empty_like`` is measurably cheaper (0.0058 ms vs 0.0070 ms per call on\n    # the target) but mirrors the input's layout, so it is only taken where that\n    # layout *is* contiguous and the input carries no conjugate bit to inherit.\n    has_bit = input.is_conj()\n    contig = input.is_contiguous()\n    if contig and not has_bit:\n        out = torch.empty_like(input)\n    else:\n        out = torch.empty(input.shape, dtype=input.dtype, device=input.device)\n    if n == 0:\n        return out\n\n    if input.is_complex():\n        # A lazy conjugate bit stores conj(logical); clear it with a\n        # metadata-only view so the kernel reads plain storage.\n        src = input.conj() if has_bit else input\n        neg = not has_bit\n        if contig:\n            nf = n + n\n            block = _block_for(nf, _CONJ_TINY, _CONJ_MID, _CONJ_LARGE)\n            grid = -(-nf // block)\n            sp = src.data_ptr()\n            dp = out.data_ptr()\n            entry = _conj_cache.get((input.dtype, block, neg, sp & 15, dp & 15))\n            if entry is None:\n                _conj_flat_kernel[(grid,)](\n                    torch.view_as_real(src), torch.view_as_real(out), nf,\n                    NEG=neg, BLOCK=block,\n                )\n                _bind_conj(src, out, nf, neg, block, grid)\n            else:\n                entry[0](grid, 1, 1, _cur_stream(), entry[1], entry[2],\n                         None, None, None, sp, dp, nf, neg, block)\n            return out\n        _launch_strided(src, out, n, neg, True, _STR_COMPLEX_BLOCK)\n        return out\n\n    # Real dtypes have no conjugate bit (``conj()`` returns the input itself),\n    # so the physical conjugate is the identity and the op is a plain copy.\n    if contig:\n        block = _block_for(n, _COPY_TINY, _COPY_MID, _COPY_LARGE)\n        grid = -(-n // block)\n        sp = input.data_ptr()\n        dp = out.data_ptr()\n        entry = _copy_cache.get((input.dtype, block, sp & 15, dp & 15))\n        if entry is None:\n            _copy_flat_kernel[(grid,)](input, out, n, BLOCK=block)\n            _bind_copy(input, out, n, block, grid)\n        else:\n            entry[0](grid, 1, 1, _cur_stream(), entry[1], entry[2],\n                     None, None, None, sp, dp, n, block)\n        return out\n\n    _launch_strided(\n        input, out, n, False, False,\n        _block_for(n, _STR_TINY, _STR_MID, _STR_LARGE),\n    )\n    return out\n"
+      },
+      "evaluation": {
+        "evaluated_at": "2026-10-23T12:01:54.951533Z",
+        "api_version": "v6.2",
+        "status": "PASSED",
+        "is_hack": false,
+        "hack_reason": "",
+        "geo_mean": 112.14772442067374,
+        "min_speedup": 4.693064782084147,
+        "worst_workload_uuid": "_conj_physical-timing-0",
+        "latency_ms": 0.027785239250494347,
+        "max_abs_error": 0.0,
+        "max_rel_error": 0.0,
+        "num_workloads": 14,
+        "num_passed": 14,
+        "timing_skipped": false,
+        "requested_hardware": "Ascend910B",
+        "server_backend": "npu",
+        "log": "",
+        "workloads": [
+          {
+            "uuid": "_conj_physical-correctness-0",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-1",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-2",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-3",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-4",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-5",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-6",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-7",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-timing-0",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.027785239250494347,
+            "reference_latency_ms": 0.13039792778827716,
+            "speedup": 4.693064782084147,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "_conj_physical-timing-1",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.029020216425193802,
+            "reference_latency_ms": 27.15534724864281,
+            "speedup": 935.7389638578983,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "_conj_physical-timing-2",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.029534372191442993,
+            "reference_latency_ms": 13.128848028524468,
+            "speedup": 444.5277503588952,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "_conj_physical-timing-3",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.030207409664410864,
+            "reference_latency_ms": 0.1428129174693932,
+            "speedup": 4.727744585052903,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "_conj_physical-timing-4",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.03354262240955342,
+            "reference_latency_ms": 19.075194590388694,
+            "speedup": 568.6852493964755,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "_conj_physical-timing-5",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.03066256574611866,
+            "reference_latency_ms": 11.62291808416032,
+            "speedup": 379.05888830035616,
+            "abs_err": null,
+            "rel_err": null
+          }
+        ],
+        "comparison": {
+          "performance_baseline_round_num": 2,
+          "geo_mean_before": 89.38029764192028,
+          "geo_mean_after": 112.14772442067374,
+          "geo_mean_delta_pct": 25.472534081241747,
+          "workloads": [
+            {
+              "uuid": "_conj_physical-correctness-0",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-1",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-2",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-3",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-4",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-5",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-6",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-7",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-timing-0",
+              "axes": {},
+              "before_latency_ms": 0.03156744993430278,
+              "after_latency_ms": 0.027785239250494347,
+              "latency_delta_ms": -0.003782210683808431,
+              "latency_delta_pct": -11.981362738136445,
+              "before_speedup": 3.9939131789518476,
+              "after_speedup": 4.693064782084147,
+              "speedup_delta": 0.6991516031322997,
+              "speedup_delta_pct": 17.505428180483964
+            },
+            {
+              "uuid": "_conj_physical-timing-1",
+              "axes": {},
+              "before_latency_ms": 0.031741661738674425,
+              "after_latency_ms": 0.029020216425193802,
+              "latency_delta_ms": -0.002721445313480623,
+              "latency_delta_pct": -8.573732956661122,
+              "before_speedup": 427.102167621215,
+              "after_speedup": 935.7389638578983,
+              "speedup_delta": 508.63679623668327,
+              "speedup_delta_pct": 119.09019311926767
+            },
+            {
+              "uuid": "_conj_physical-timing-2",
+              "axes": {},
+              "before_latency_ms": 0.031794782081305296,
+              "after_latency_ms": 0.029534372191442993,
+              "latency_delta_ms": -0.0022604098898623033,
+              "latency_delta_pct": -7.109373745924744,
+              "before_speedup": 399.4954480586871,
+              "after_speedup": 444.5277503588952,
+              "speedup_delta": 45.03230230020813,
+              "speedup_delta_pct": 11.27229421988126
+            },
+            {
+              "uuid": "_conj_physical-timing-3",
+              "axes": {},
+              "before_latency_ms": 0.03205377862037646,
+              "after_latency_ms": 0.030207409664410864,
+              "latency_delta_ms": -0.0018463689559655924,
+              "latency_delta_pct": -5.7602224618593425,
+              "before_speedup": 4.262291644493477,
+              "after_speedup": 4.727744585052903,
+              "speedup_delta": 0.46545294055942676,
+              "speedup_delta_pct": 10.920250873981205
+            },
+            {
+              "uuid": "_conj_physical-timing-4",
+              "axes": {},
+              "before_latency_ms": 0.0328344535325347,
+              "after_latency_ms": 0.03354262240955342,
+              "latency_delta_ms": 0.0007081688770187167,
+              "latency_delta_pct": 2.156785939248274,
+              "before_speedup": 402.8366780382256,
+              "after_speedup": 568.6852493964755,
+              "speedup_delta": 165.84857135824984,
+              "speedup_delta_pct": 41.170176500788315
+            },
+            {
+              "uuid": "_conj_physical-timing-5",
+              "axes": {},
+              "before_latency_ms": 0.032324284976247,
+              "after_latency_ms": 0.03066256574611866,
+              "latency_delta_ms": -0.0016617192301283425,
+              "latency_delta_pct": -5.140776451356715,
+              "before_speedup": 435.74898091770365,
+              "after_speedup": 379.05888830035616,
+              "speedup_delta": -56.69009261734749,
+              "speedup_delta_pct": -13.009804979453085
+            }
+          ]
+        },
+        "fingerprint": "cc5a756b5e5e31442425615c56bbfdb70375d8a978fef90e92b1434bdd7a4632"
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 3,
+        "expectation_status": "met",
+        "root_cause": "Adopted torch.empty_like on the contiguous bit-free path, the cheapest measured allocation entry point, cutting ~1.3 us from a per-call floor that is otherwise dominated by the ~0.007 ms direct launcher call. Confirmed: every timing workload still runs at 0.028-0.034 ms regardless of whether its device work is zero or 16 MB of traffic.",
+        "perf_gap_analysis": "Candidate-side latency fell as predicted: t0 0.03157 -> 0.02779 ms and t3 0.03205 -> 0.03021 ms, i.e. about 1.3-1.8 us per call, matching the 0.0056 vs 0.0071 ms allocation measurement that motivated the change. The headline geo_mean 89.38 -> 112.15 is larger than that change can explain and must not be attributed to it: the reference side moved as well (t1 reference 13.56 -> 27.16 ms, t4 13.23 -> 19.08 ms), which is the CPU-fallback path's own variance. Reads honestly: all six candidate latencies are within 0.0278-0.0335 ms and still size independent, so the floor remains host-bound; the two small inputs stay lowest (4.69x and 4.73x) because their reference is only ~0.13-0.14 ms, and they are now within ~2x of the level where device time would start to dominate.",
+        "next_suggestion": "Stop trimming host glue: the floor is now ~0.028 ms split between a ~0.0056 ms allocation and a ~0.007 ms launcher call, and the remaining Python glue is only a few microseconds. Any further gain would have to come from the launcher call itself, which is already the cheapest supported path (passing tensors instead of raw pointers measured slower at 0.0152 ms vs 0.0102 ms), so the next experiment should instead revisit whether device work begins to matter at the largest sizes, e.g. by comparing tile sizes at 1048576 elements with the host cost held fixed.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "",
+        "strategy_evolution": "Kept both kernels and the launch mechanism identical to round 2 and changed only the allocation entry point, so the candidate-side delta is attributable to that one host-side choice; the geo_mean movement beyond it is reference variance and is reported as such rather than as an optimization win.",
+        "knowledge_assessments": []
+      },
+      "next_verdict": {
+        "should_continue": true,
+        "code": "continue",
+        "reason": "no stop trigger"
+      }
+    },
+    {
+      "round_num": 4,
+      "experiment_parent_round_num": 3,
+      "plan": {
+        "kind": "performance",
+        "strategy": "Make the host fast path fail safe: keep the pre-bound launcher as the default and add an exception-guarded fallback to the ordinary Triton dispatch, verifying the guard neither changes results nor costs measurable time.",
+        "code_changes": "Both pre-bound launch sites in run() are now wrapped in try/except; on any exception the code falls through to the ordinary kernel[grid](...) dispatch for the same kernel and tile, writing the same output. No kernel, tile, key or allocation logic changed.",
+        "hypothesis": "The direct launcher passes raw integer pointers, which a profiler-instrumented launch context is documented to reject by calling size() on pointer arguments; a guarded fallback should leave the 0.0278-0.0280 ms floor and all workload results unchanged while removing that failure mode.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "maintain",
+          "mechanism": "A passing try/except costs nothing on CPython 3.11, so the measured floor should be unchanged while a launch context that rejects raw integer pointers degrades to the slower JIT path instead of failing."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": 3
+        },
+        "key_params": {
+          "fallback": "ordinary kernel[grid](...) launch",
+          "guard": "try/except around compiled.run.launch"
+        },
+        "knowledge_uses": []
+      },
+      "solution": {
+        "sha256": "c5dd849d838b35f5b3f4d0df73c3bd84a877c9a83f8a8fdca43e0ba868b909a3",
+        "snapshot_path": ".kernelgen/evals/round-0004",
+        "candidate_path": "tmp/main.py",
+        "code": "# Copyright 2026, The FlagOS Contributors.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Self-contained Triton implementation of ``aten._conj_physical``.\n\nSemantics (verified against the reference on the target):\n  * the result is always a freshly allocated tensor -- for real dtypes the\n    conjugate is the identity, but ``_conj_physical`` still returns a copy, so\n    the input must never be aliased or returned;\n  * the input may carry the lazy conjugate bit; it stores ``conj(logical)`` and\n    the operator conjugates the *logical* value, hence\n      - bit clear -> output = conj(storage)   (imaginary part negated)\n      - bit set   -> output = storage          (imaginary part unchanged)\n    The bit becomes a constexpr ``NEG`` and is cleared with a metadata-only\n    ``input.conj()`` view, so the kernel reads plain storage;\n  * the reference (whose only backend here is the CPU fallback) materialises a\n    contiguous output for every layout, so the result is contiguous and the\n    input is read through its real strides.\n\nKernels: a flat vector kernel over contiguous storage (all timing inputs) and a\nrank-generic strided kernel for arbitrary layouts.\n\nDense contiguous calls take a pre-bound launch path: the first call for a\n(kernel, dtype, tile, pointer-alignment) specialization compiles through the\nordinary ``kernel[grid](...)`` call; later calls reuse that compiled kernel and\ninvoke its generated launcher directly, passing this call's pointers, element\ncount and *current* stream. Nothing about a tensor (data, shape, stream, dtype)\nis cached -- only the compiled artifact.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\ntry:  # one cheap C call instead of the driver wrapper, same raw rtStream_t value\n    from torch_npu._C import _npu_getCurrentRawStreamNoWait as _raw_stream\nexcept Exception:  # pragma: no cover\n    _raw_stream = None\n\n# Tile sizes per size class (elements, in units of the kernel's scalar type).\n# They are bounded by the unified buffer, not by taste: with auto multi-buffering\n# the compiler needs roughly ``buffers * BLOCK * itemsize`` bytes of UB\n# (1.5 Mib available). A masked load+store pair costs 4 buffers, so a 16384-wide\n# fp32 tile overflows (measured: 2097408 bits required); the strided complex\n# kernel touches four streams and overflows even earlier.\n_TINY_MAX = 4096\n_MID_MAX = 262144\n\n_COPY_TINY, _COPY_MID, _COPY_LARGE = 1024, 8192, 16384      # 2 streams\n_CONJ_TINY, _CONJ_MID, _CONJ_LARGE = 1024, 4096, 8192       # 4 buffers\n_STR_TINY, _STR_MID, _STR_LARGE = 1024, 2048, 4096          # 4-6 streams\n# The strided complex kernel needs 3145728 bits of UB at BLOCK=4096 (measured),\n# so it keeps one fixed, small tile; this path only serves non-contiguous\n# layouts, never the timed ones.\n_STR_COMPLEX_BLOCK = 1024\n\n# (dtype, tile, src_ptr & 15, dst_ptr & 15) -> compiled launcher\n_copy_cache = {}\n_conj_cache = {}\n_device = None\n_stream_fn = None\n\n\n@triton.jit(do_not_specialize=[\"n\"])\ndef _copy_flat_kernel(src_ptr, dst_ptr, n, BLOCK: tl.constexpr):\n    \"\"\"Flat element copy: real dtypes need no arithmetic at all.\"\"\"\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    tl.store(dst_ptr + offs, tl.load(src_ptr + offs, mask=mask), mask=mask)\n\n\n@triton.jit(do_not_specialize=[\"n\"])\ndef _conj_flat_kernel(src_ptr, dst_ptr, n, NEG: tl.constexpr, BLOCK: tl.constexpr):\n    \"\"\"Flat copy over the interleaved real/imaginary float stream.\n\n    ``n`` counts scalars, so even offsets hold real parts and odd offsets hold\n    imaginary parts. Negating only the odd lanes keeps both the load and the\n    store fully contiguous, and a sign flip is exact for every float value.\n    \"\"\"\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    v = tl.load(src_ptr + offs, mask=mask)\n    if NEG:\n        v = tl.where((offs & 1) == 1, -v, v)\n    tl.store(dst_ptr + offs, v, mask=mask)\n\n\n@triton.jit\ndef _conj_strided_kernel(\n    src_ptr,\n    dst_ptr,\n    n,\n    s0, s1, s2, s3, s4, s5, s6, s7,\n    t0, t1, t2, t3, t4, t5, t6, t7,\n    NEG: tl.constexpr,\n    IS_COMPLEX: tl.constexpr,\n    NDIM: tl.constexpr,\n    BLOCK: tl.constexpr,\n):\n    \"\"\"Rank-generic strided read into a contiguous write.\n\n    ``s*`` are the logical sizes (last axis fastest), ``t*`` the input strides\n    in scalar units. The destination is contiguous, so its offset is a plain\n    multiple of the logical linear index.\n    \"\"\"\n    pid = tl.program_id(0)\n    idx = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = idx < n\n    rem = idx\n    off = tl.zeros_like(idx)\n\n    if NDIM >= 1:\n        off += (rem % s7) * t7\n        rem = rem // s7\n    if NDIM >= 2:\n        off += (rem % s6) * t6\n        rem = rem // s6\n    if NDIM >= 3:\n        off += (rem % s5) * t5\n        rem = rem // s5\n    if NDIM >= 4:\n        off += (rem % s4) * t4\n        rem = rem // s4\n    if NDIM >= 5:\n        off += (rem % s3) * t3\n        rem = rem // s3\n    if NDIM >= 6:\n        off += (rem % s2) * t2\n        rem = rem // s2\n    if NDIM >= 7:\n        off += (rem % s1) * t1\n        rem = rem // s1\n    if NDIM >= 8:\n        off += (rem % s0) * t0\n\n    if IS_COMPLEX:\n        out_off = idx * 2\n        re = tl.load(src_ptr + off, mask=mask)\n        im = tl.load(src_ptr + off + 1, mask=mask)\n        if NEG:\n            im = -im\n        tl.store(dst_ptr + out_off, re, mask=mask)\n        tl.store(dst_ptr + out_off + 1, im, mask=mask)\n    else:\n        tl.store(dst_ptr + idx, tl.load(src_ptr + off, mask=mask), mask=mask)\n\n\ndef _resolve_stream(device):\n    global _device, _stream_fn\n    _device = device\n    if _raw_stream is not None:\n        _stream_fn = lambda: _raw_stream(device)\n    else:  # pragma: no cover - fallback for a driver without the raw query\n        _stream_fn = lambda: triton.runtime.driver.active.get_current_stream(device)\n\n\ndef _cur_stream():\n    device = torch.npu.current_device()\n    if device != _device:\n        _resolve_stream(device)\n    return _stream_fn()\n\n\ndef _bind_copy(src, dst, n, block, grid):\n    \"\"\"Compile and remember the launcher for this dense-copy specialization.\"\"\"\n    try:\n        if _stream_fn is None:\n            _resolve_stream(torch.npu.current_device())\n        compiled = _copy_flat_kernel.warmup(src, dst, n, BLOCK=block, grid=(grid, 1, 1))\n        _copy_cache[\n            (src.dtype, block, src.data_ptr() & 15, dst.data_ptr() & 15)\n        ] = (compiled.run.launch, compiled.function, compiled.packed_metadata)\n    except Exception:  # pragma: no cover - the ordinary launch path stays usable\n        pass\n\n\ndef _bind_conj(src, dst, n, neg, block, grid):\n    \"\"\"Compile and remember the launcher for this dense-conjugate specialization.\n\n    The specialization is keyed on the interleaved *real* views (the kernel reads\n    a float stream), so warmup receives the same view the ordinary launch passes;\n    their base pointer is the complex tensor's pointer, so the cached launcher\n    matches the raw pointers used later.\n    \"\"\"\n    try:\n        if _stream_fn is None:\n            _resolve_stream(torch.npu.current_device())\n        compiled = _conj_flat_kernel.warmup(\n            torch.view_as_real(src), torch.view_as_real(dst), n,\n            NEG=neg, BLOCK=block, grid=(grid, 1, 1),\n        )\n        _conj_cache[\n            (src.dtype, block, neg, src.data_ptr() & 15, dst.data_ptr() & 15)\n        ] = (compiled.run.launch, compiled.function, compiled.packed_metadata)\n    except Exception:  # pragma: no cover\n        pass\n\n\ndef _collapse(shape, strides):\n    \"\"\"Merge adjacent axes whose strides compose exactly (pure index rewrite).\"\"\"\n    shape = list(shape)\n    strides = list(strides)\n    i = len(shape) - 1\n    while i > 0:\n        if shape[i] != 0 and strides[i - 1] == strides[i] * shape[i]:\n            shape[i - 1] *= shape[i]\n            strides[i - 1] = strides[i]\n            del shape[i]\n            del strides[i]\n        i -= 1\n    return shape, strides\n\n\ndef _launch_strided(src, out, n, neg, is_complex, block):\n    shape, strides = _collapse(src.shape, src.stride())\n    if is_complex:\n        # scalar-unit strides: one complex element spans two scalars\n        strides = [s * 2 for s in strides]\n\n    if len(shape) > 8:  # pragma: no cover - only for exotic layouts\n        step = n // shape[0]\n        for k in range(shape[0]):\n            _launch_strided(src[k], out[k], step, neg, is_complex, block)\n        return\n\n    rank = len(shape)\n    pad_s = [1] * 8\n    pad_t = [0] * 8\n    for d in range(rank):\n        pad_s[8 - rank + d] = shape[d]\n        pad_t[8 - rank + d] = strides[d]\n\n    carrier = torch.view_as_real(src) if is_complex else src\n    grid = (triton.cdiv(n, block),)\n    _conj_strided_kernel[grid](\n        carrier, torch.view_as_real(out) if is_complex else out, n,\n        pad_s[0], pad_s[1], pad_s[2], pad_s[3],\n        pad_s[4], pad_s[5], pad_s[6], pad_s[7],\n        pad_t[0], pad_t[1], pad_t[2], pad_t[3],\n        pad_t[4], pad_t[5], pad_t[6], pad_t[7],\n        NEG=neg,\n        IS_COMPLEX=is_complex,\n        NDIM=rank,\n        BLOCK=block,\n    )\n\n\ndef _block_for(n, small, mid, large):\n    if n <= _TINY_MAX:\n        return small\n    if n <= _MID_MAX:\n        return mid\n    return large\n\n\ndef run(input):\n    n = input.numel()\n    # The reference (whose only available backend is the CPU fallback) always\n    # produces a contiguous fresh tensor, never an alias of the input.\n    # ``empty_like`` is measurably cheaper (0.0058 ms vs 0.0070 ms per call on\n    # the target) but mirrors the input's layout, so it is only taken where that\n    # layout *is* contiguous and the input carries no conjugate bit to inherit.\n    has_bit = input.is_conj()\n    contig = input.is_contiguous()\n    if contig and not has_bit:\n        out = torch.empty_like(input)\n    else:\n        out = torch.empty(input.shape, dtype=input.dtype, device=input.device)\n    if n == 0:\n        return out\n\n    if input.is_complex():\n        # A lazy conjugate bit stores conj(logical); clear it with a\n        # metadata-only view so the kernel reads plain storage.\n        src = input.conj() if has_bit else input\n        neg = not has_bit\n        if contig:\n            nf = n + n\n            block = _block_for(nf, _CONJ_TINY, _CONJ_MID, _CONJ_LARGE)\n            grid = -(-nf // block)\n            sp = src.data_ptr()\n            dp = out.data_ptr()\n            entry = _conj_cache.get((input.dtype, block, neg, sp & 15, dp & 15))\n            if entry is None:\n                _conj_flat_kernel[(grid,)](\n                    torch.view_as_real(src), torch.view_as_real(out), nf,\n                    NEG=neg, BLOCK=block,\n                )\n                _bind_conj(src, out, nf, neg, block, grid)\n            else:\n                # The pre-bound launcher takes raw pointers, which a\n                # profiler-instrumented launch context can refuse; fall back to\n                # the ordinary dispatch so such a context costs speed, not\n                # correctness. A passing try/except is free on this interpreter.\n                try:\n                    entry[0](grid, 1, 1, _cur_stream(), entry[1], entry[2],\n                             None, None, None, sp, dp, nf, neg, block)\n                except Exception:  # pragma: no cover\n                    _conj_flat_kernel[(grid,)](\n                        torch.view_as_real(src), torch.view_as_real(out), nf,\n                        NEG=neg, BLOCK=block,\n                    )\n            return out\n        _launch_strided(src, out, n, neg, True, _STR_COMPLEX_BLOCK)\n        return out\n\n    # Real dtypes have no conjugate bit (``conj()`` returns the input itself),\n    # so the physical conjugate is the identity and the op is a plain copy.\n    if contig:\n        block = _block_for(n, _COPY_TINY, _COPY_MID, _COPY_LARGE)\n        grid = -(-n // block)\n        sp = input.data_ptr()\n        dp = out.data_ptr()\n        entry = _copy_cache.get((input.dtype, block, sp & 15, dp & 15))\n        if entry is None:\n            _copy_flat_kernel[(grid,)](input, out, n, BLOCK=block)\n            _bind_copy(input, out, n, block, grid)\n        else:\n            try:\n                entry[0](grid, 1, 1, _cur_stream(), entry[1], entry[2],\n                         None, None, None, sp, dp, n, block)\n            except Exception:  # pragma: no cover\n                _copy_flat_kernel[(grid,)](input, out, n, BLOCK=block)\n        return out\n\n    _launch_strided(\n        input, out, n, False, False,\n        _block_for(n, _STR_TINY, _STR_MID, _STR_LARGE),\n    )\n    return out\n"
+      },
+      "evaluation": {
+        "evaluated_at": "2026-10-23T12:06:03.531044Z",
+        "api_version": "v6.2",
+        "status": "PASSED",
+        "is_hack": false,
+        "hack_reason": "",
+        "geo_mean": 68.75499098959077,
+        "min_speedup": 4.6704971821148735,
+        "worst_workload_uuid": "_conj_physical-timing-0",
+        "latency_ms": 0.028006393938653697,
+        "max_abs_error": 0.0,
+        "max_rel_error": 0.0,
+        "num_workloads": 14,
+        "num_passed": 14,
+        "timing_skipped": false,
+        "requested_hardware": "Ascend910B",
+        "server_backend": "npu",
+        "log": "",
+        "workloads": [
+          {
+            "uuid": "_conj_physical-correctness-0",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-1",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-2",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-3",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-4",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-5",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-6",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-correctness-7",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "_conj_physical-timing-0",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.028006393938653697,
+            "reference_latency_ms": 0.13080378397168116,
+            "speedup": 4.6704971821148735,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "_conj_physical-timing-1",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.0282451790110269,
+            "reference_latency_ms": 5.85160128132009,
+            "speedup": 207.17168331755408,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "_conj_physical-timing-2",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.028547201426059692,
+            "reference_latency_ms": 7.299130144190744,
+            "speedup": 255.68636432178027,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "_conj_physical-timing-3",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.028641015609357296,
+            "reference_latency_ms": 0.13464163180349067,
+            "speedup": 4.7010075913474925,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "_conj_physical-timing-4",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.02812731564155027,
+            "reference_latency_ms": 6.768546364199008,
+            "speedup": 240.6396134795162,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "_conj_physical-timing-5",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.02801586641469579,
+            "reference_latency_ms": 10.574754263482328,
+            "speedup": 377.45590684053644,
+            "abs_err": null,
+            "rel_err": null
+          }
+        ],
+        "comparison": {
+          "performance_baseline_round_num": 3,
+          "geo_mean_before": 112.14772442067374,
+          "geo_mean_after": 68.75499098959077,
+          "geo_mean_delta_pct": -38.69247785029849,
+          "workloads": [
+            {
+              "uuid": "_conj_physical-correctness-0",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-1",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-2",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-3",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-4",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-5",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-6",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-correctness-7",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "_conj_physical-timing-0",
+              "axes": {},
+              "before_latency_ms": 0.027785239250494347,
+              "after_latency_ms": 0.028006393938653697,
+              "latency_delta_ms": 0.00022115468815935013,
+              "latency_delta_pct": 0.7959430767018334,
+              "before_speedup": 4.693064782084147,
+              "after_speedup": 4.6704971821148735,
+              "speedup_delta": -0.02256759996927382,
+              "speedup_delta_pct": -0.4808712646675155
+            },
+            {
+              "uuid": "_conj_physical-timing-1",
+              "axes": {},
+              "before_latency_ms": 0.029020216425193802,
+              "after_latency_ms": 0.0282451790110269,
+              "latency_delta_ms": -0.0007750374141669014,
+              "latency_delta_pct": -2.6706810273615167,
+              "before_speedup": 935.7389638578983,
+              "after_speedup": 207.17168331755408,
+              "speedup_delta": -728.5672805403442,
+              "speedup_delta_pct": -77.86009866860527
+            },
+            {
+              "uuid": "_conj_physical-timing-2",
+              "axes": {},
+              "before_latency_ms": 0.029534372191442993,
+              "after_latency_ms": 0.028547201426059692,
+              "latency_delta_ms": -0.000987170765383301,
+              "latency_delta_pct": -3.342447095148731,
+              "before_speedup": 444.5277503588952,
+              "after_speedup": 255.68636432178027,
+              "speedup_delta": -188.84138603711494,
+              "speedup_delta_pct": -42.481349226150996
+            },
+            {
+              "uuid": "_conj_physical-timing-3",
+              "axes": {},
+              "before_latency_ms": 0.030207409664410864,
+              "after_latency_ms": 0.028641015609357296,
+              "latency_delta_ms": -0.001566394055053568,
+              "latency_delta_pct": -5.18546301207359,
+              "before_speedup": 4.727744585052903,
+              "after_speedup": 4.7010075913474925,
+              "speedup_delta": -0.02673699370541094,
+              "speedup_delta_pct": -0.5655338020996697
+            },
+            {
+              "uuid": "_conj_physical-timing-4",
+              "axes": {},
+              "before_latency_ms": 0.03354262240955342,
+              "after_latency_ms": 0.02812731564155027,
+              "latency_delta_ms": -0.005415306768003149,
+              "latency_delta_pct": -16.14455394060302,
+              "before_speedup": 568.6852493964755,
+              "after_speedup": 240.6396134795162,
+              "speedup_delta": -328.0456359169592,
+              "speedup_delta_pct": -57.68492083540093
+            },
+            {
+              "uuid": "_conj_physical-timing-5",
+              "axes": {},
+              "before_latency_ms": 0.03066256574611866,
+              "after_latency_ms": 0.02801586641469579,
+              "latency_delta_ms": -0.0026466993314228707,
+              "latency_delta_pct": -8.631695577392756,
+              "before_speedup": 379.05888830035616,
+              "after_speedup": 377.45590684053644,
+              "speedup_delta": -1.6029814598197163,
+              "speedup_delta_pct": -0.42288454625275973
+            }
+          ]
+        },
+        "fingerprint": "4c68aec34bc92d1f4b20f52e96b607ed7c00bbdf2a7afc3537fba46391811139"
+      },
+      "profile": {
+        "required": false,
+        "status": "not_required",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 4,
+        "expectation_status": "partially_met",
+        "root_cause": "Added an exception-guarded fallback around both pre-bound launch sites so a launch context that rejects raw integer pointers degrades to the ordinary JIT dispatch. The guard is free when unused, so the measured per-call floor and every workload result are unchanged; the lower geo_mean of this round comes from faster reference-side measurements, not from the candidate.",
+        "perf_gap_analysis": "Candidate side behaved exactly as predicted: every timing workload stayed within 0.0280-0.0286 ms versus round 3's 0.0278-0.0335 ms, all 14 workloads passed with abs_err/rel_err 0, and the guard was separately proven to produce exact output when the launcher raises, so the added try/except cost nothing measurable. The aggregate metric nevertheless fell from 112.15 to 68.75, which the candidate cannot explain: the reference side was remeasured 2-4x faster on the same workloads (t1 27.16 -> 5.85 ms, t2 13.13 -> 7.30 ms, t4 19.08 -> 6.77 ms, t5 11.62 -> 10.57 ms) while the two small inputs stayed flat (t0 0.1304 -> 0.1308 ms reference, 4.69x -> 4.67x speedup). That is the CPU-fallback reference's own variance, so the round is not a candidate regression; the honest reading is that geo_mean for this operator has moved between 15.3 and 112.1 across rounds largely with the reference, while the candidate's own cost has fallen and then held at ~0.028 ms.",
+        "next_suggestion": "Treat the candidate as settled at a ~0.028 ms per-call host floor and do not spend further rounds on host glue: the allocation, launcher and stream steps have each been measured and the only remaining lever is the ~0.007 ms direct launcher call, whose cheaper alternatives (tensor arguments) measured 50% worse. If more measurement is wanted, remeasure the existing best round instead of changing code, because the spread between rounds 3 and 4 is reference-side.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "A failing launcher can be simulated by replacing the cached (launch, function, metadata) tuple with a function that raises; that exercises the guard end to end and proved both the real and complex paths still return exact values, which a plain code review of try/except would not have established.",
+        "strategy_evolution": "This round deliberately optimized for robustness rather than speed, using the round-paired structure as a control: identical candidate latency with a very different aggregate score isolates the reference's variance and shows that further host micro-tuning is below the measurement noise of this contract.",
+        "knowledge_assessments": []
+      },
+      "next_verdict": {
+        "should_continue": false,
+        "code": "max_round_reached",
+        "reason": "maximum round limit reached: 4/4"
+      }
+    }
+  ],
+  "rounds_without_improvement": 1
+}

@@ -1,0 +1,121 @@
+{
+  "definition_name": "upsample_bilinear2d",
+  "op_type": "",
+  "status": "PASSED",
+  "best_geo_mean": 0.35033663945409593,
+  "best_code": "# Copyright 2026, The FlagOS Contributors.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\"\"\"Triton implementation of ``aten.upsample_bilinear2d`` (NCHW bilinear).\n\nRound 2 architecture\n--------------------\nRound 1 measured 37.8 ns per output element, exactly linear in the element\ncount and identical for fp16/bf16/fp32.  A target probe showed a contiguous\nblock copy of the same volume needs ~0.03 ms net, so the cost is per-lane\naddressing: ``tl.load(ptr + <vector of unrelated indices>)`` lowers to\nper-lane non-affine loads, roughly 300x slower than block transfers.\n\nTwo kernels are therefore used.\n\n``_bilinear_int_kernel`` (fast path)\n    Taken when ``align_corners`` is False, no explicit ``scales_*`` is given,\n    the last input stride is 1 and ``OW == 2*IW``.  One program owns ``BR``\n    whole output rows.  Every memory access keeps a *contiguous minor\n    dimension*: the two source rows are found from a data-dependent row base\n    and read along the row (row-gather with a contiguous minor dimension,\n    which the backend handles well), and the horizontal resample is expressed\n    as an affine expansion -- output column ``2*k + j`` is selected between\n    the two interpolants of input column ``k`` on a constexpr axis ``j``, so\n    no index vector ever addresses memory.  The store is contiguous over the\n    whole ``(BR, IW, 2)`` tile, i.e. over ``BR`` complete output rows.\n\n``_bilinear_flat_kernel`` (general path)\n    A flat 1-D tile over ``N*C*OH*OW`` with the four neighbours read through\n    the real input strides; it covers every shape the fast path declines\n    (non-2x ratios, ``align_corners=True``, 1x1 outputs, non-unit minor\n    stride, explicit scales).\n\nBoth kernels reproduce PyTorch's coordinate mapping exactly:\n``src = idx*(in-1)/(out-1)`` for ``align_corners`` (0 when ``out == 1``),\notherwise ``src = max((idx + 0.5)*scale - 0.5, 0)`` with ``scale = 1/scales_*``\nwhen given and positive, else ``in/out``; the right/bottom neighbour is\n``min(i0 + 1, size - 1)``, matching PyTorch's ``i1p`` edge rule.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n# tuning knobs (overridable by diagnostics)\n_TARGET_PROGRAMS = 256\n_UB_ELEMS = 2048\n_FLAT_ELEMS = 2048\n\n\n# --------------------------------------------------------------------------\n# fast path: exact 2x horizontal expansion, contiguous minor dimension\n# --------------------------------------------------------------------------\n@triton.jit\ndef _bilinear_int_kernel(\n    ptr_o,\n    ptr_i,\n    n_rows,\n    s_n,\n    s_c,\n    s_h,\n    rh,\n    C: tl.constexpr,\n    IH: tl.constexpr,\n    IW: tl.constexpr,\n    OH: tl.constexpr,\n    OW: tl.constexpr,\n    BR: tl.constexpr,\n    IWP: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    rows = pid * BR + tl.arange(0, BR)\n    oh = rows % OH\n    nc = rows // OH\n    n = nc // C\n    c = nc - n * C\n\n    real_h = tl.maximum((oh.to(tl.float32) + 0.5) * rh - 0.5, 0.0)\n    h0f = real_h.to(tl.int32)\n    hl = real_h - h0f.to(tl.float32)\n    h0 = tl.minimum(h0f, IH - 1)\n    h1 = tl.minimum(h0 + 1, IH - 1)\n\n    base = n * s_n + c * s_c\n    rr0 = (base + h0 * s_h)[:, None]\n    rr1 = (base + h1 * s_h)[:, None]\n\n    k = tl.arange(0, IWP)\n    ka = k[None, :]\n    lm = tl.broadcast_to((ka < IW) & (rows[:, None] < n_rows), (BR, IWP))\n    il = tl.broadcast_to(tl.maximum(k - 1, 0)[None, :], (BR, IWP))\n    ir = tl.broadcast_to(tl.minimum(k + 1, IW - 1)[None, :], (BR, IWP))\n\n    hl2 = hl[:, None]\n    h0l2 = 1.0 - hl2\n\n    # Two *aligned* row loads only.  A load whose base is off by one element\n    # costs ~25x more than an aligned one on this backend (measured: 6 loads\n    # with +-1 taps 21.3 ms vs 2 aligned loads 0.59 ms on the 8.4M-output\n    # geometry), so the +-1 column neighbours are produced in registers with\n    # tl.gather, which measured nearly free (0.59 -> 0.69 ms).\n    v = h0l2 * tl.load(ptr_i + (rr0 + ka), mask=lm, other=0.0).to(tl.float32) \\\n        + hl2 * tl.load(ptr_i + (rr1 + ka), mask=lm, other=0.0).to(tl.float32)\n\n    vm = tl.gather(v, il, 1)\n    vp = tl.gather(v, ir, 1)\n\n    even = 0.25 * vm + 0.75 * v\n    odd = 0.75 * v + 0.25 * vp\n\n    # (BR, IWP, 2) tile: its row-major order is exactly BR output rows of\n    # OW = 2*IW contiguous elements.\n    val = tl.join(even, odd)\n    j = tl.arange(0, 2)\n    ooff = (rows * OW)[:, None, None] + (ka * 2)[:, :, None] + j[None, None, :]\n    om = tl.broadcast_to(\n        (ka < IW)[:, :, None] & (rows[:, None, None] < n_rows), (BR, IWP, 2)\n    )\n    tl.store(ptr_o + ooff, val.to(ptr_o.dtype.element_ty), mask=om)\n\n\n# --------------------------------------------------------------------------\n# general path: flat 1-D tile, neighbours read through the real strides\n# --------------------------------------------------------------------------\n@triton.jit\ndef _bilinear_flat_kernel(\n    ptr_o,\n    ptr_i,\n    total,\n    s_n,\n    s_c,\n    s_h,\n    s_w,\n    rh,\n    rw,\n    C: tl.constexpr,\n    OH: tl.constexpr,\n    OW: tl.constexpr,\n    IH: tl.constexpr,\n    IW: tl.constexpr,\n    ALIGN_CORNERS: tl.constexpr,\n    BLOCK: tl.constexpr,\n):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < total\n\n    ow = offs % OW\n    row = offs // OW\n    oh = row % OH\n    nc = row // OH\n\n    if ALIGN_CORNERS:\n        if OH > 1:\n            real_h = oh.to(tl.float32) * ((IH - 1.0) / (OH - 1.0))\n        else:\n            real_h = tl.zeros([BLOCK], dtype=tl.float32)\n        if OW > 1:\n            real_w = ow.to(tl.float32) * ((IW - 1.0) / (OW - 1.0))\n        else:\n            real_w = tl.zeros([BLOCK], dtype=tl.float32)\n    else:\n        real_h = tl.maximum((oh.to(tl.float32) + 0.5) * rh - 0.5, 0.0)\n        real_w = tl.maximum((ow.to(tl.float32) + 0.5) * rw - 0.5, 0.0)\n\n    h0 = real_h.to(tl.int32)\n    w0 = real_w.to(tl.int32)\n    hl = real_h - h0.to(tl.float32)\n    wl = real_w - w0.to(tl.float32)\n\n    h0 = tl.minimum(h0, IH - 1)\n    w0 = tl.minimum(w0, IW - 1)\n    h1 = tl.minimum(h0 + 1, IH - 1)\n    w1 = tl.minimum(w0 + 1, IW - 1)\n\n    n = nc // C\n    c = nc - n * C\n    base = n * s_n + c * s_c\n    r0 = base + h0 * s_h\n    r1 = base + h1 * s_h\n    c0 = w0 * s_w\n    c1 = w1 * s_w\n\n    v00 = tl.load(ptr_i + (r0 + c0), mask=mask, other=0.0).to(tl.float32)\n    v01 = tl.load(ptr_i + (r0 + c1), mask=mask, other=0.0).to(tl.float32)\n    v10 = tl.load(ptr_i + (r1 + c0), mask=mask, other=0.0).to(tl.float32)\n    v11 = tl.load(ptr_i + (r1 + c1), mask=mask, other=0.0).to(tl.float32)\n\n    w0l = 1.0 - wl\n    h0l = 1.0 - hl\n    top = w0l * v00 + wl * v01\n    bot = w0l * v10 + wl * v11\n    val = h0l * top + hl * bot\n\n    tl.store(ptr_o + offs, val.to(ptr_o.dtype.element_ty), mask=mask)\n\n\n# --------------------------------------------------------------------------\n# host side\n# --------------------------------------------------------------------------\ndef _reciprocal_scale(in_size, out_size, align_corners, scale):\n    \"\"\"PyTorch ``area_pixel_compute_scale`` (accscalar_t == float32 path).\"\"\"\n    if align_corners:\n        if out_size > 1:\n            return (in_size - 1) / (out_size - 1)\n        return 0.0\n    if scale is not None and scale > 0:\n        return 1.0 / float(scale)\n    return in_size / out_size\n\n\ndef _pick_flat_block(total):\n    if total >= (1 << 20):\n        return _FLAT_ELEMS\n    if total >= (1 << 16):\n        return 1024\n    if total >= (1 << 12):\n        return 512\n    return 256\n\n\ndef _pick_rows_per_program(iwp, n_rows):\n    \"\"\"Rows per program: bounded by the UB tile budget and by a program count\n    that keeps per-program launch overhead small.\"\"\"\n    cap = max(1, _UB_ELEMS // iwp)\n    want = max(1, triton.cdiv(n_rows, _TARGET_PROGRAMS))\n    br = min(cap, want)\n    br = 1 << (br.bit_length() - 1)\n    # prefer a divisor of n_rows so the row mask is entirely unnecessary\n    while br > 1 and n_rows % br != 0:\n        br >>= 1\n    return max(1, br)\n\n\ndef _resolve(shape, strides, out_size, ac, scales_h, scales_w):\n    \"\"\"Resolve everything that depends only on tensor *metadata*.\n\n    Only scalars are produced; no tensor, storage or data pointer is cached,\n    and the caller's cache key contains shape, strides, dtype, output size and\n    the coordinate options, so a different view or layout derives its own\n    entry instead of reusing a stale one.\n    \"\"\"\n    N, C, IH, IW = shape\n    OH, OW = out_size\n    s_n, s_c, s_h, s_w = strides\n    n_rows = N * C * OH\n\n    rh = _reciprocal_scale(IH, OH, ac, scales_h)\n    rw = _reciprocal_scale(IW, OW, ac, scales_w)\n\n    if (\n        not ac\n        and scales_h is None\n        and scales_w is None\n        and s_w == 1\n        and IW > 1\n        and OW == 2 * IW\n    ):\n        iwp = triton.next_power_of_2(IW)\n        br = _pick_rows_per_program(iwp, n_rows)\n        return (True, (triton.cdiv(n_rows, br),),\n                (n_rows, s_n, s_c, s_h, rh, C, IH, IW, OH, OW, br, iwp))\n    total = N * C * OH * OW\n    block = _pick_flat_block(total)\n    return (False, (triton.cdiv(total, block),),\n            (total, s_n, s_c, s_h, s_w, rh, rw, C, OH, OW, IH, IW, ac, block))\n\n\n_LAUNCH_CACHE = {}\n\n\ndef run(input, output_size, align_corners=False, scales_h=None, scales_w=None):\n    N, C, IH, IW = input.shape\n    OH = int(output_size[0])\n    OW = int(output_size[1])\n\n    out = torch.empty((N, C, OH, OW), device=input.device, dtype=input.dtype)\n    if N * C * OH * OW == 0:\n        return out\n\n    key = (N, C, IH, IW, OH, OW, bool(align_corners), scales_h, scales_w,\n           input.stride(), input.dtype)\n    ent = _LAUNCH_CACHE.get(key)\n    if ent is None:\n        ent = _resolve((N, C, IH, IW), input.stride(), (OH, OW),\n                       bool(align_corners), scales_h, scales_w)\n        _LAUNCH_CACHE[key] = ent\n\n    if ent[0]:\n        n_rows, s_n, s_c, s_h, rh, kc, kih, kiw, koh, kow, br, iwp = ent[2]\n        _bilinear_int_kernel[ent[1]](\n            out,\n            input,\n            n_rows,\n            s_n,\n            s_c,\n            s_h,\n            rh,\n            C=kc,\n            IH=kih,\n            IW=kiw,\n            OH=koh,\n            OW=kow,\n            BR=br,\n            IWP=iwp,\n        )\n    else:\n        total, s_n, s_c, s_h, s_w, rh, rw, kc, koh, kow, kih, kiw, ac, block = ent[2]\n        _bilinear_flat_kernel[ent[1]](\n            out,\n            input,\n            total,\n            s_n,\n            s_c,\n            s_h,\n            s_w,\n            rh,\n            rw,\n            C=kc,\n            OH=koh,\n            OW=kow,\n            IH=kih,\n            IW=kiw,\n            ALIGN_CORNERS=ac,\n            BLOCK=block,\n        )\n    return out\n",
+  "search_best_geo_mean": 0.3449652048912934,
+  "final_verification": {
+    "status": "PASSED",
+    "reason_code": "VERIFIED",
+    "geo_mean": 0.35033663945409593,
+    "measured_geo_mean": 0.35033663945409593,
+    "comparisons": [
+      {
+        "uuid": "upsample_bilinear2d-timing-0",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.030471055624592958,
+          "latency_ms": 0.10127223754740022
+        },
+        "after": {
+          "reference_latency_ms": 0.03223636549351,
+          "latency_ms": 0.10270175742604844
+        },
+        "ratios": {
+          "reference_latency_ms": 1.057933991216644,
+          "latency_ms": 1.0141156146370236
+        }
+      },
+      {
+        "uuid": "upsample_bilinear2d-timing-1",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.2063739846456453,
+          "latency_ms": 0.629297706255559
+        },
+        "after": {
+          "reference_latency_ms": 0.20608831690756524,
+          "latency_ms": 0.6297044166174633
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9986157764091702,
+          "latency_ms": 1.0006462924588178
+        }
+      },
+      {
+        "uuid": "upsample_bilinear2d-timing-2",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.04014451243616043,
+          "latency_ms": 0.10469893940781443
+        },
+        "after": {
+          "reference_latency_ms": 0.03913955897085678,
+          "latency_ms": 0.10204645466229
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9749666042923857,
+          "latency_ms": 0.9746656006209127
+        }
+      },
+      {
+        "uuid": "upsample_bilinear2d-timing-3",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.2699537910585072,
+          "latency_ms": 0.6316405452199889
+        },
+        "after": {
+          "reference_latency_ms": 0.26929775571189096,
+          "latency_ms": 0.6316891305440107
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9975698235463044,
+          "latency_ms": 1.000076919261104
+        }
+      },
+      {
+        "uuid": "upsample_bilinear2d-timing-4",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.03033023785503239,
+          "latency_ms": 0.102408553875455
+        },
+        "after": {
+          "reference_latency_ms": 0.03164834785834678,
+          "latency_ms": 0.1005331897858791
+        },
+        "ratios": {
+          "reference_latency_ms": 1.04345861082971,
+          "latency_ms": 0.9816874272840858
+        }
+      },
+      {
+        "uuid": "upsample_bilinear2d-timing-5",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.2203007435930109,
+          "latency_ms": 0.6260413593784171
+        },
+        "after": {
+          "reference_latency_ms": 0.21896296819864794,
+          "latency_ms": 0.6262259494019018
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9939275039541654,
+          "latency_ms": 1.0002948527612745
+        }
+      }
+    ],
+    "drift": [],
+    "drift_factor": 2.0,
+    "compared_to": "original_round",
+    "attempt_path": ".kernelgen/retests/2054ca728198ae2a395addf604834a00f67f4e5352acc84adb93250457bee84b/6278955ec06d39d24ba7c86fb9fb2f4cf2e13d3b7ffffc8f9b21152e932e1742/attempt-0001.json",
+    "round_num": 3,
+    "solution_sha256": "2054ca728198ae2a395addf604834a00f67f4e5352acc84adb93250457bee84b"
+  },
+  "rounds": 4,
+  "summary": "All 24 frozen workloads (incl. the 1x1 triples that previously failed to compile) pass numerically at a best geo-mean speedup of 0.344965x (round 3, up from the 0.001633x seed baseline), still below the 0.8x goal. Target measurements showed the Ascend block-load path needs an aligned base (a +-1-element row load costs ~25x more, which was the whole 21.3 ms break) and that UB tl.gather is nearly free, so the winning architecture is a row-tiled kernel with aligned row loads, two clamped register gathers and an affine 2-tap expansion, plus a shape/stride/dtype-keyed scalar-only launch cache. Remaining gap: the large fixtures are device-bound (~0.62 ms for 8.4M outputs vs a ~0.05 ms copy floor) in row-base loads plus gathers, and the small fixtures sit at a ~0.09 ms floor set by a 0.057 ms bare Triton launch versus a 0.030 ms full aten reference call.",
+  "workspace": "/data/hanle/ascend-optimization/runs/remaining-five-20261023-v2/kg-runs/upsample_bilinear2d-remaining-five-20261023-v2-attempt-1/stages/optimize/work"
+}

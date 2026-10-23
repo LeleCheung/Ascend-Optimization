@@ -8,6 +8,8 @@
 
 ## 当前状态
 
+2026-10-24的[会议剩余五算子交付](project/Ascend-Optimization-v1/operators/会议剩余五算子交付-20261024.md)：`scatter_add` **1.900×**，完整正确且达标；`upsample_bilinear2d` **0.340×**，正确性修复、性能未达标。`fractional_max_pool3d` **4.599×**、`_conj_physical` **115.519×**均完成正确接口与数值验证，但本机参考含CPU回退，单列为功能和执行路径成果。`cumulative_trapezoid`的同输入FP16参考重复运行出现380处容差区间无交集，无有效完整交付。**五项没有全部达标。**四份最终源码、逐case数据与补充门禁已核验；采用固定版本、物理卡7、KGS19659完整调用walltime和一次正式复验。详情与复现见[批次README](project/Ascend-Optimization-v1/operators/campaigns/remaining-five-20261023-v2/README.md)。早期参考适配失败、旧scatter数值反例、未采纳候选均保留。
+
 [六算子夜间连续优化](project/Ascend-Optimization-v1/operators/夜间连续优化交付-20261023.md)已完成搜索与完整评测：`gelu_and_mul` **2.271×**、修复标准 Philox 的 `uniform` **1.325×**、`rad2deg_` **1.117×**、`selu_` **0.837×**；均为 KGS 完整调用 walltime。SELU 同批实际加速1.042×。`scatter_add` 完整通过但为0.419×，`cumulative_trapezoid` 没有通过全部数值检查的交付。uniform旧1.497×源码的随机数机制错误已由独立整数反例定位并修复，使用新批结果替代；SELU和rad2deg_的KGS metrics仍有明确采集缺口。源码、逐case证据及复现入口见交付报告。
 
 最新[缓冲与搬运批次](project/Ascend-Optimization-v1/operators/campaigns/buffer-pointwise-20261022/README.md)已闭环：`log10_` **0.875×**、`selu_` **0.898×**，各36项正式测试与42＋12＋9项补充检查通过，最终真机采集及48项证据核验通过。log10_相对同批父版实际加速**1.125×**；SELU保留上一轮源码，本次分数属于复测结果。新增源码、失败机制、中文简报和一次完整复现命令见该批次；历史成绩如下保留。
@@ -105,7 +107,7 @@ square 的 KG+KGS 烟雾测试已完成，记录见 [烟雾测试归档](project
 
 ### 第 5 步：交付
 
-每个正式算子交付一个入口报告：PyTorch/FlagGems 基线、KG 无 profiler、KG 原生 profiler、我们分析指导的版本，附关键优化、完整正确性、逐 case 性能、版本、源码和复现命令。
+每个正式算子交付一个入口报告：区分Excel原记录、固定FlagGems实测及当前优化版，附关键优化、完整正确性、逐case性能、版本、源码和复现命令。Codex参与后的结果写明实际贡献；需要对照实验时再展开运行配置，不能把历史profiling开关等同于纯原生KG独立效果。CPU回退参考单列。
 
 目标是完整正确性通过并超过 0.8×；超过 1× 表示快于 PyTorch。未达标则直接写结果和已定位的问题，保留有效尝试。`narrow_copy` 的 CANN D2D 混合实现须与 Triton 版本分开标注。
 

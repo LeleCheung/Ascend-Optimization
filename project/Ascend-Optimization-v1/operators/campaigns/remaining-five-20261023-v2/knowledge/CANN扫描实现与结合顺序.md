@@ -1,0 +1,9 @@
+# 本机CANN扫描源码：FP16与BF16路径及加法顺序
+
+Codex只读找到当前CANN9自带的Cumsum实现。动态入口ops_legacy/dynamic/cumsum.py调用cum_computer.CumsumComputer；其初始化只把BF16升FP32，FP16保持原dtype。源码SHA与关键函数全文见installed-cann-cumsum-source.json。
+
+源码存在转置后跨扫描位置顺序vadd的路径，例如_calc_add_base_attr和_calc_add_for_last_dim_small中的循环把上一个位置累计值加到下一个位置。FP16输入保留FP16缓冲意味着每步可能舍入，不能默认和并行树形FP32 cumsum一致。这和之前NPU探针“FP16 inc.cumsum对齐而先升FP32不对齐”相容，但仍需核对实际case对应的tiling/执行分支；不要将源码存在直接写成实际调用证明。
+
+优先用小型KGS debug探针对比同一FP16增量的NPU参考、tl.cumsum原dtype、FP32树形、CPU顺序FP16模型与分组模型，定位偏差来自结合顺序还是dtype。顺序模型可在CPU提前计算，不对CPU参考放宽容差。若需匹配顺序累加，可评估沿独立序列并行、循环推进扫描轴，明确每步舍入后再写输出；随后优化多序列矢量化与阶段/数据布局。不要先重复Cube前缀方案并假设精度会自然通过。
+
+CANN同时自带CumsumCube等实现；路径选择可能依赖dtype/shape，不把它们混为一套。当前三种dtype、末轴与非末轴必须分别验证；全部9项timing输入数值是硬门禁。不允许直接调用PyTorch cumsum作为候选数学核心。
