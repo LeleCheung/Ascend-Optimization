@@ -1,0 +1,460 @@
+CANN_SOURCE /usr/local/Ascend/cann-9.0.0/include/aclnnop/aclnn_cumsum.h /**
+ * Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+#ifndef OP_API_INC_LEVEL2_ACLNN_CUMSUM_H_
+#define OP_API_INC_LEVEL2_ACLNN_CUMSUM_H_
+
+#include "aclnn/aclnn_base.h"
+#include "aclnn_util.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * 算子功能：对输入张量self的元素，按照指定维度dim依次进行累加，并将结果保存到输出张量out中
+ * 计算公式：
+ * $x_{i}$是输入张量self中，从维度dim视角来看的某个元素（其它维度下标不变，只dim维度下标依次递增），
+ * $y_{i}$是输出张量out中对应位置的元素，则
+ *
+ * $$
+ * y_{i} = x_{1} + x_{2} + x_{3} + ...... + x_{i}
+ * $$
+ *
+ * 实现说明：
+ * api计算的基本路径：
+ * ```mermaid
+ * graph LR
+ *     A[(self)] --> B([l0op::Contiguous])
+ *     B --> C([l0op::Cast])
+ *     C --> D([l0op::Cumsum])
+ *     E((dim)) --> D
+ *     F((dtype)) --> C
+ *     D --> G([l0op::ViewCopy])
+ *     G --> H[(out)]
+ * ```
+ */
+
+/**
+ * @brief aclnnCumsum的第一段接口，根据具体的计算流程，计算workspace大小。
+ * @domain aclnn_math
+ * @param [in] self: npu
+ * device侧的aclTensor，数据类型支持FLOAT、DOUBLE、COMPLEX64、COMPLEX128、UINT8、INT8、INT16、INT32、
+ * INT64、FLOAT16、BFLOAT16、BOOL，数据类型需要能转换成out的数据类型，支持非连续的Tensor，数据格式支持ND，数据维度不支持8维以上。
+ * @param [in] dim: host侧的整数，数据类型支持INT64。
+ * @param [in]
+ * dtype：host侧的数据类型枚举，表示输出张量所需的数据类型，支持FLOAT、FLOAT16、INT32、DOUBLE、UINT8、INT8、INT16、
+ * INT64、COMPLEX64、COMPLEX128、BFLOAT16（910B支持），且需与输出张量out的数据类型一致。
+ * @param [in] out：npu device侧的aclTensor，数据类型支持FLOAT、FLOAT16、INT32、DOUBLE、UINT8、INT8、INT16、INT64、
+ * COMPLEX64、COMPLEX128、BFLOAT16（910B支持），且数据类型需要与传入的dtype一致，shape需要与self一致，支持非连续的Tensor，数据
+ * 格式支持ND，数据维度不支持8维以上。
+ * @param [out] workspaceSize: 返回用户需要在npu device侧申请的workspace大小。
+ * @param [out] executor: 返回op执行器，包含了算子计算流程。
+ * @return aclnnStatus: 返回状态码。
+ */
+ACLNN_API aclnnStatus aclnnCumsumGetWorkspaceSize(const aclTensor* self, int64_t dim, aclDataType dtype, aclTensor* out,
+                                                  uint64_t* workspaceSize, aclOpExecutor** executor);
+
+/**
+ * @brief aclnnCumsum的第二段接口，用于执行计算。
+ * @param [in] workspace: 在npu device侧申请的workspace内存起址。
+ * @param [in] workspaceSize: 在npu device侧申请的workspace大小，由第一段接口aclnnCumsumGetWorkspaceSize获取。
+ * @param [in] executor: op执行器，包含了算子计算流程。
+ * @param [in] stream: acl stream流。
+ * @return aclnnStatus: 返回状态码。
+ */
+ACLNN_API aclnnStatus aclnnCumsum(void* workspace, uint64_t workspaceSize, aclOpExecutor* executor, aclrtStream stream);
+
+/**
+ * @brief aclnnCumsumV2的第一段接口，根据具体的计算流程，计算workspace大小。
+ * @domain aclnn_math
+ */
+ACLNN_API aclnnStatus aclnnCumsumV2GetWorkspaceSize(const aclTensor* self, int64_t dim, bool exclusive, bool reverse,
+                                                    aclTensor* out, uint64_t* workspaceSize, aclOpExecutor** executor);
+
+ACLNN_API aclnnStatus aclnnCumsumV2(void* workspace, uint64_t workspaceSize, aclOpExecutor* executor,
+                                    aclrtStream stream);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif  // OP_API_INC_LEVEL2_ACLNN_CUMSUM_H_
+
+CANN_SOURCE /usr/local/Ascend/cann-9.0.0/opp/built-in/op_impl/ai_core/tbe/impl/ops_math/ascendc/cumsum/cumsum_apt.cpp /**
+* Copyright (c) 2025 Huawei Technologies Co., Ltd.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ */
+
+/*!
+ * \file cumsum_apt.cpp
+ * \brief calculate the prefix accumulation sum of tensor specified dimension
+ */
+#include "arch35/cumsum_4_int.h"
+#include "arch35/cumsum_core_ss_oneway_ss.h"
+#include "arch35/cumsum_core_ss_twoway_ss.h"
+#include "arch35/cumsum_core_ss_ub_ss_oneway_ss.h"
+#include "arch35/cumsum_core_ss_ub_ss_twoway_ss.h"
+#include "arch35/cumsum_oneway_ss.h"
+#include "arch35/cumsum_twoway_ss.h"
+#include "arch35/cumsum_ub_ss_oneway_ss.h"
+#include "arch35/cumsum_ub_ss_twoway_ss.h"
+
+using namespace AscendC;
+using namespace Cumsum;
+using namespace Cum;
+
+#define CUMSUM_ONEWAY_SS_TILING_KEY 1001
+#define CUMSUM_TWOWAY_SS_TILING_KEY 1002
+#define CUMSUM_UB_SS_ONEWAY_SS_TILING_KEY 1011
+#define CUMSUM_UB_SS_TWOWAY_SS_TILING_KEY 1012
+#define CUMSUM_CORE_SS_ONEWAY_SS_TILING_KEY 1101
+#define CUMSUM_CORE_SS_TWOWAY_SS_TILING_KEY 1102
+#define CUMSUM_CORE_SS_UB_SS_ONEWAY_SS_TILING_KEY 1111
+#define CUMSUM_CORE_SS_UB_SS_TWOWAY_SS_TILING_KEY 1112
+#define CUM_NO_SPLIT 11000
+#define CUM_AR_SPLIT 11001
+#define CUM_WITH_GROUP 11002
+
+extern "C" __aicore__ inline void cumsumSimd(GM_ADDR x, GM_ADDR axis, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    TPipe pipe;
+    using PromoteType = __cumsumType::GetPromoteType<DTYPE_X>::T;
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+
+    if (TILING_KEY_IS(CUMSUM_ONEWAY_SS_TILING_KEY)) {
+        GET_TILING_DATA_WITH_STRUCT(CumsumSklanskyTilingData, tilingDataIn, tiling);
+        const CumsumSklanskyTilingData* __restrict tilingData = &tilingDataIn;
+        if constexpr (
+            std::is_same<DTYPE_X, half>::value || std::is_same<DTYPE_X, float>::value ||
+            std::is_same<DTYPE_X, bfloat16_t>::value) {
+            CumsumOnewaySs<DTYPE_X, PromoteType> op(pipe);
+            op.Init(x, y, tilingData, workspace);
+            op.Process();
+        }
+    } else if (TILING_KEY_IS(CUMSUM_TWOWAY_SS_TILING_KEY)) {
+        GET_TILING_DATA_WITH_STRUCT(CumsumSklanskyTilingData, tilingDataIn, tiling);
+        const CumsumSklanskyTilingData* __restrict tilingData = &tilingDataIn;
+        if constexpr (
+            std::is_same<DTYPE_X, half>::value || std::is_same<DTYPE_X, float>::value ||
+            std::is_same<DTYPE_X, bfloat16_t>::value) {
+            CumsumTwowaySs<DTYPE_X, PromoteType> op(pipe);
+            op.Init(x, y, tilingData, workspace);
+            op.Process();
+        }
+
+    } else if (TILING_KEY_IS(CUMSUM_UB_SS_ONEWAY_SS_TILING_KEY)) {
+        GET_TILING_DATA_WITH_STRUCT(CumsumSklanskyTilingData, tilingDataIn, tiling);
+        const CumsumSklanskyTilingData* __restrict tilingData = &tilingDataIn;
+        if constexpr (
+            std::is_same<DTYPE_X, half>::value || std::is_same<DTYPE_X, float>::value ||
+            std::is_same<DTYPE_X, bfloat16_t>::value) {
+            CumsumUbSsOnewaySs<DTYPE_X, PromoteType> op(pipe);
+            op.Init(x, y, tilingData, workspace);
+            op.Process();
+        }
+    } else if (TILING_KEY_IS(CUMSUM_UB_SS_TWOWAY_SS_TILING_KEY)) {
+        GET_TILING_DATA_WITH_STRUCT(CumsumSklanskyTilingData, tilingDataIn, tiling);
+        const CumsumSklanskyTilingData* __restrict tilingData = &tilingDataIn;
+        if constexpr (
+            std::is_same<DTYPE_X, half>::value || std::is_same<DTYPE_X, float>::value ||
+            std::is_same<DTYPE_X, bfloat16_t>::value) {
+            CumsumUbSsTwowaySs<DTYPE_X, PromoteType> op(pipe);
+            op.Init(x, y, tilingData, workspace);
+            op.Process();
+        }
+    } else if (TILING_KEY_IS(CUMSUM_CORE_SS_ONEWAY_SS_TILING_KEY)) {
+        GET_TILING_DATA_WITH_STRUCT(CumsumSklanskyTilingData, tilingDataIn, tiling);
+        const CumsumSklanskyTilingData* __restrict tilingData = &tilingDataIn;
+        if constexpr (
+            std::is_same<DTYPE_X, half>::value || std::is_same<DTYPE_X, float>::value ||
+            std::is_same<DTYPE_X, bfloat16_t>::value) {
+            KERNEL_TASK_TYPE(CUMSUM_CORE_SS_ONEWAY_SS_TILING_KEY, KERNEL_TYPE_MIX_AIV_1_0);
+            CumsumCoreSsOnewaySs<DTYPE_X, PromoteType, CumsumOnewaySklansky<DTYPE_X, PromoteType>> op(pipe);
+            op.Init(x, y, tilingData, workspace);
+            op.Process();
+        }
+    } else if (TILING_KEY_IS(CUMSUM_CORE_SS_TWOWAY_SS_TILING_KEY)) {
+        GET_TILING_DATA_WITH_STRUCT(CumsumSklanskyTilingData, tilingDataIn, tiling);
+        const CumsumSklanskyTilingData* __restrict tilingData = &tilingDataIn;
+        if constexpr (
+            std::is_same<DTYPE_X, half>::value || std::is_same<DTYPE_X, float>::value ||
+            std::is_same<DTYPE_X, bfloat16_t>::value) {
+            KERNEL_TASK_TYPE(CUMSUM_CORE_SS_TWOWAY_SS_TILING_KEY, KERNEL_TYPE_MIX_AIV_1_0);
+            CumsumCoreSsTwowaySs<DTYPE_X, PromoteType, CumsumTwowaySklansky<DTYPE_X, PromoteType>> op(pipe);
+            op.Init(x, y, tilingData, workspace);
+            op.Process();
+        }
+    } else if (TILING_KEY_IS(CUMSUM_CORE_SS_UB_SS_ONEWAY_SS_TILING_KEY)) {
+        GET_TILING_DATA_WITH_STRUCT(CumsumSklanskyTilingData, tilingDataIn, tiling);
+        const CumsumSklanskyTilingData* __restrict tilingData = &tilingDataIn;
+        if constexpr (
+            std::is_same<DTYPE_X, half>::value || std::is_same<DTYPE_X, float>::value ||
+            std::is_same<DTYPE_X, bfloat16_t>::value) {
+            KERNEL_TASK_TYPE(CUMSUM_CORE_SS_UB_SS_ONEWAY_SS_TILING_KEY, KERNEL_TYPE_MIX_AIV_1_0);
+            CumsumCoreSsUbSsOnewaySs<
+                DTYPE_X, PromoteType,
+                CumsumUbSklansky<DTYPE_X, PromoteType, CumsumOnewaySklansky<DTYPE_X, PromoteType>>>
+                op(pipe);
+            op.Init(x, y, tilingData, workspace);
+            op.Process();
+        }
+    } else if (TILING_KEY_IS(CUMSUM_CORE_SS_UB_SS_TWOWAY_SS_TILING_KEY)) {
+        GET_TILING_DATA_WITH_STRUCT(CumsumSklanskyTilingData, tilingDataIn, tiling);
+        const CumsumSklanskyTilingData* __restrict tilingData = &tilingDataIn;
+        if constexpr (
+            std::is_same<DTYPE_X, half>::value || std::is_same<DTYPE_X, float>::value ||
+            std::is_same<DTYPE_X, bfloat16_t>::value) {
+            KERNEL_TASK_TYPE(CUMSUM_CORE_SS_UB_SS_TWOWAY_SS_TILING_KEY, KERNEL_TYPE_MIX_AIV_1_0);
+            CumsumCoreSsUbSsTwowaySs<
+                DTYPE_X, PromoteType,
+                CumsumUbSklansky<DTYPE_X, PromoteType, CumsumTwowaySklansky<DTYPE_X, PromoteType>>>
+                op(pipe);
+            op.Init(x, y, tilingData, workspace);
+            op.Process();
+        }
+    }
+}
+
+extern "C" __aicore__ inline void cumsumSimdInt(GM_ADDR x, GM_ADDR axis, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    if (workspace == nullptr) {
+        return;
+    }
+    SetSysWorkspace(workspace);
+
+    TPipe pipe;
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+
+    if (TILING_KEY_IS(CUM_NO_SPLIT)) {
+        GET_TILING_DATA_WITH_STRUCT(Cum4IntTilingData, tilingDataInt, tiling);
+        if constexpr (
+            std::is_same<DTYPE_X, int32_t>::value || std::is_same<DTYPE_X, int64_t>::value ||
+            std::is_same<DTYPE_X, int8_t>::value || std::is_same<DTYPE_X, uint8_t>::value ||
+            std::is_same<DTYPE_X, uint64_t>::value) {
+            CumNoSplit<DTYPE_X> op;
+            op.Init(x, y, &tilingDataInt, &pipe);
+            op.Process();
+        }
+    } else if (TILING_KEY_IS(CUM_AR_SPLIT)) {
+        GET_TILING_DATA_WITH_STRUCT(Cum4IntTilingData, tilingDataInt, tiling);
+        if constexpr (
+            std::is_same<DTYPE_X, int32_t>::value || std::is_same<DTYPE_X, int64_t>::value ||
+            std::is_same<DTYPE_X, int8_t>::value || std::is_same<DTYPE_X, uint8_t>::value ||
+            std::is_same<DTYPE_X, uint64_t>::value) {
+            CumSplitAR<DTYPE_X> op;
+            op.Init(x, y, &tilingDataInt, &pipe);
+            op.Process();
+        }
+    } else if (TILING_KEY_IS(CUM_WITH_GROUP)) {
+        GET_TILING_DATA_WITH_STRUCT(Cum4IntTilingData, tilingDataInt, tiling);
+        KERNEL_TASK_TYPE(CUM_WITH_GROUP, KERNEL_TYPE_MIX_AIV_1_0);
+        if constexpr (
+            std::is_same<DTYPE_X, int32_t>::value || std::is_same<DTYPE_X, int64_t>::value ||
+            std::is_same<DTYPE_X, int8_t>::value || std::is_same<DTYPE_X, uint8_t>::value ||
+            std::is_same<DTYPE_X, uint64_t>::value) {
+            CumWithGroup<DTYPE_X> op;
+            op.Init(x, y, &tilingDataInt, &pipe);
+            op.Process();
+        }
+    }
+}
+
+extern "C" __global__ __aicore__ void cumsum(GM_ADDR x, GM_ADDR axis, GM_ADDR y, GM_ADDR workspace, GM_ADDR tiling)
+{
+    if constexpr (
+        std::is_same<DTYPE_X, half>::value || std::is_same<DTYPE_X, float>::value ||
+        std::is_same<DTYPE_X, bfloat16_t>::value) {
+        cumsumSimd(x, axis, y, workspace, tiling);
+    } else if constexpr (
+        std::is_same<DTYPE_X, int32_t>::value || std::is_same<DTYPE_X, int64_t>::value ||
+        std::is_same<DTYPE_X, int8_t>::value || std::is_same<DTYPE_X, uint8_t>::value ||
+        std::is_same<DTYPE_X, uint64_t>::value) {
+        cumsumSimdInt(x, axis, y, workspace, tiling);
+    }
+}
+
+CANN_SOURCE /usr/local/Ascend/cann-9.0.0/opp/built-in/op_impl/ai_core/tbe/impl/ops_legacy/dynamic/cumsum.py from impl.ops_legacy.util.platform_adapter import tik
+from impl.ops_legacy.util.platform_adapter import tbe_context
+from impl.ops_legacy.util.platform_adapter import para_check
+from impl.ops_legacy.util.platform_adapter import register_operator
+from impl.ops_legacy.dynamic.cum_computer import CumsumComputer
+
+
+@register_operator("Cumsum")
+@para_check.check_op_params(para_check.REQUIRED_INPUT, para_check.REQUIRED_INPUT, para_check.REQUIRED_OUTPUT,
+                            para_check.OPTION_ATTR_BOOL, para_check.OPTION_ATTR_BOOL, para_check.KERNEL_NAME)
+def cumsum(x, axis, y, exclusive=False, reverse=False, kernel_name="cumsum"):
+    obj = CumsumComputer(x, axis, y, exclusive, reverse, kernel_name)
+    tik_instance = obj.cum_computer()
+    return tik_instance
+
+CUMSUM_TREE ['cumsum_apt.cpp']
+API_CONTEXT /usr/local/Ascend/cann-9.0.0/include/aclnnop/aclnn_cumsum.h  * @param [out] workspaceSize: 返回用户需要在npu device侧申请的workspace大小。
+ * @param [out] executor: 返回op执行器，包含了算子计算流程。
+ * @return aclnnStatus: 返回状态码。
+ */
+ACLNN_API aclnnStatus aclnnCumsumGetWorkspaceSize(const aclTensor* self, int64_t dim, aclDataType dtype, aclTensor* out,
+                                                  uint64_t* workspaceSize, aclOpExecutor** executor);
+
+/**
+ * @brief aclnnCumsum的第二段接口，用于执行计算。
+ * @param [in] workspace: 在npu device侧申请的workspace内存起址。
+ * @param [in] workspaceSize: 在npu device侧申请的workspace大小，由第一段接口aclnnCumsumGetWorkspaceSize获取。
+ * @param [in] executor: op执行器，包含了算子计算流程。
+ * @param [in] stream: acl stream流。
+ * @return aclnnStatus: 返回状态码。
+ */
+ACLNN_API aclnnStatus aclnnCumsum(void* workspace, uint64_t workspaceSize, aclOpExecutor* executor, aclrtStream stream);
+API_CONTEXT /usr/local/Ascend/cann-9.0.0/include/aclnnop/aclnn_cumsum.h 
+/**
+ * @brief aclnnCumsum的第二段接口，用于执行计算。
+ * @param [in] workspace: 在npu device侧申请的workspace内存起址。
+ * @param [in] workspaceSize: 在npu device侧申请的workspace大小，由第一段接口aclnnCumsumGetWorkspaceSize获取。
+ * @param [in] executor: op执行器，包含了算子计算流程。
+ * @param [in] stream: acl stream流。
+ * @return aclnnStatus: 返回状态码。
+ */
+ACLNN_API aclnnStatus aclnnCumsum(void* workspace, uint64_t workspaceSize, aclOpExecutor* executor, aclrtStream stream);
+
+/**
+ * @brief aclnnCumsumV2的第一段接口，根据具体的计算流程，计算workspace大小。
+ * @domain aclnn_math
+ */
+ACLNN_API aclnnStatus aclnnCumsumV2GetWorkspaceSize(const aclTensor* self, int64_t dim, bool exclusive, bool reverse,
+API_CONTEXT /usr/local/Ascend/cann-9.0.0/include/aclnnop/aclnn_cumsum.h  */
+ACLNN_API aclnnStatus aclnnCumsum(void* workspace, uint64_t workspaceSize, aclOpExecutor* executor, aclrtStream stream);
+
+/**
+ * @brief aclnnCumsumV2的第一段接口，根据具体的计算流程，计算workspace大小。
+ * @domain aclnn_math
+ */
+ACLNN_API aclnnStatus aclnnCumsumV2GetWorkspaceSize(const aclTensor* self, int64_t dim, bool exclusive, bool reverse,
+                                                    aclTensor* out, uint64_t* workspaceSize, aclOpExecutor** executor);
+
+ACLNN_API aclnnStatus aclnnCumsumV2(void* workspace, uint64_t workspaceSize, aclOpExecutor* executor,
+                                    aclrtStream stream);
+
+#ifdef __cplusplus
+}
+#endif
+API_CONTEXT /usr/local/Ascend/cann-9.0.0/include/aclnnop/aclnn_cumsum.h /**
+ * @brief aclnnCumsumV2的第一段接口，根据具体的计算流程，计算workspace大小。
+ * @domain aclnn_math
+ */
+ACLNN_API aclnnStatus aclnnCumsumV2GetWorkspaceSize(const aclTensor* self, int64_t dim, bool exclusive, bool reverse,
+                                                    aclTensor* out, uint64_t* workspaceSize, aclOpExecutor** executor);
+
+ACLNN_API aclnnStatus aclnnCumsumV2(void* workspace, uint64_t workspaceSize, aclOpExecutor* executor,
+                                    aclrtStream stream);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif  // OP_API_INC_LEVEL2_ACLNN_CUMSUM_H_
+API_CONTEXT /usr/local/Ascend/cann-9.0.0/include/aclnnop/aclnn_cumsum.h  */
+ACLNN_API aclnnStatus aclnnCumsumV2GetWorkspaceSize(const aclTensor* self, int64_t dim, bool exclusive, bool reverse,
+                                                    aclTensor* out, uint64_t* workspaceSize, aclOpExecutor** executor);
+
+ACLNN_API aclnnStatus aclnnCumsumV2(void* workspace, uint64_t workspaceSize, aclOpExecutor* executor,
+                                    aclrtStream stream);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif  // OP_API_INC_LEVEL2_ACLNN_CUMSUM_H_
+API_CONTEXT /usr/local/Ascend/cann-9.0.0/include/aclnnop/level2/aclnn_cumsum.h  * @param [out] workspaceSize: 返回用户需要在npu device侧申请的workspace大小。
+ * @param [out] executor: 返回op执行器，包含了算子计算流程。
+ * @return aclnnStatus: 返回状态码。
+ */
+ACLNN_API aclnnStatus aclnnCumsumGetWorkspaceSize(const aclTensor* self, int64_t dim, aclDataType dtype, aclTensor* out,
+                                                  uint64_t* workspaceSize, aclOpExecutor** executor);
+
+/**
+ * @brief aclnnCumsum的第二段接口，用于执行计算。
+ * @param [in] workspace: 在npu device侧申请的workspace内存起址。
+ * @param [in] workspaceSize: 在npu device侧申请的workspace大小，由第一段接口aclnnCumsumGetWorkspaceSize获取。
+ * @param [in] executor: op执行器，包含了算子计算流程。
+ * @param [in] stream: acl stream流。
+ * @return aclnnStatus: 返回状态码。
+ */
+ACLNN_API aclnnStatus aclnnCumsum(void* workspace, uint64_t workspaceSize, aclOpExecutor* executor, aclrtStream stream);
+API_CONTEXT /usr/local/Ascend/cann-9.0.0/include/aclnnop/level2/aclnn_cumsum.h 
+/**
+ * @brief aclnnCumsum的第二段接口，用于执行计算。
+ * @param [in] workspace: 在npu device侧申请的workspace内存起址。
+ * @param [in] workspaceSize: 在npu device侧申请的workspace大小，由第一段接口aclnnCumsumGetWorkspaceSize获取。
+ * @param [in] executor: op执行器，包含了算子计算流程。
+ * @param [in] stream: acl stream流。
+ * @return aclnnStatus: 返回状态码。
+ */
+ACLNN_API aclnnStatus aclnnCumsum(void* workspace, uint64_t workspaceSize, aclOpExecutor* executor, aclrtStream stream);
+
+/**
+ * @brief aclnnCumsumV2的第一段接口，根据具体的计算流程，计算workspace大小。
+ * @domain aclnn_math
+ */
+ACLNN_API aclnnStatus aclnnCumsumV2GetWorkspaceSize(const aclTensor* self, int64_t dim, bool exclusive, bool reverse,
+API_CONTEXT /usr/local/Ascend/cann-9.0.0/include/aclnnop/level2/aclnn_cumsum.h  */
+ACLNN_API aclnnStatus aclnnCumsum(void* workspace, uint64_t workspaceSize, aclOpExecutor* executor, aclrtStream stream);
+
+/**
+ * @brief aclnnCumsumV2的第一段接口，根据具体的计算流程，计算workspace大小。
+ * @domain aclnn_math
+ */
+ACLNN_API aclnnStatus aclnnCumsumV2GetWorkspaceSize(const aclTensor* self, int64_t dim, bool exclusive, bool reverse,
+                                                    aclTensor* out, uint64_t* workspaceSize, aclOpExecutor** executor);
+
+ACLNN_API aclnnStatus aclnnCumsumV2(void* workspace, uint64_t workspaceSize, aclOpExecutor* executor,
+                                    aclrtStream stream);
+
+#ifdef __cplusplus
+}
+#endif
+API_CONTEXT /usr/local/Ascend/cann-9.0.0/include/aclnnop/level2/aclnn_cumsum.h /**
+ * @brief aclnnCumsumV2的第一段接口，根据具体的计算流程，计算workspace大小。
+ * @domain aclnn_math
+ */
+ACLNN_API aclnnStatus aclnnCumsumV2GetWorkspaceSize(const aclTensor* self, int64_t dim, bool exclusive, bool reverse,
+                                                    aclTensor* out, uint64_t* workspaceSize, aclOpExecutor** executor);
+
+ACLNN_API aclnnStatus aclnnCumsumV2(void* workspace, uint64_t workspaceSize, aclOpExecutor* executor,
+                                    aclrtStream stream);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif  // OP_API_INC_LEVEL2_ACLNN_CUMSUM_H_
+API_CONTEXT /usr/local/Ascend/cann-9.0.0/include/aclnnop/level2/aclnn_cumsum.h  */
+ACLNN_API aclnnStatus aclnnCumsumV2GetWorkspaceSize(const aclTensor* self, int64_t dim, bool exclusive, bool reverse,
+                                                    aclTensor* out, uint64_t* workspaceSize, aclOpExecutor** executor);
+
+ACLNN_API aclnnStatus aclnnCumsumV2(void* workspace, uint64_t workspaceSize, aclOpExecutor* executor,
+                                    aclrtStream stream);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif  // OP_API_INC_LEVEL2_ACLNN_CUMSUM_H_
+COMPILE_METHODS ['Optional', '_get_deterministic_level', 'deterministic', 'disable_deterministic_with_backward', 'enable_deterministic_with_backward', 'is_jit_compile_false', 'set_compile_mode', 'set_deterministic_level', 'set_option']
+TORCH_NPU_VERSION __version__ = '2.9.0.post2'
+git_version = '912882db09313e70f5312212669cd71e02e5c5d8'
+
+
+ERR 

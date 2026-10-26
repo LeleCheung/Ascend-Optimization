@@ -1,0 +1,411 @@
+{
+  "api_version": "v6.2",
+  "definition": {
+    "api_version": "v6.2",
+    "name": "fractional_max_pool3d",
+    "description": "",
+    "parameters": [
+      {
+        "name": "input",
+        "kind": "positional_or_keyword",
+        "required": true,
+        "default": null,
+        "type_hint": null
+      },
+      {
+        "name": "kernel_size",
+        "kind": "positional_or_keyword",
+        "required": true,
+        "default": null,
+        "type_hint": null
+      },
+      {
+        "name": "output_size",
+        "kind": "positional_or_keyword",
+        "required": false,
+        "default": null,
+        "type_hint": null
+      },
+      {
+        "name": "output_ratio",
+        "kind": "positional_or_keyword",
+        "required": false,
+        "default": null,
+        "type_hint": null
+      },
+      {
+        "name": "return_indices",
+        "kind": "positional_or_keyword",
+        "required": false,
+        "default": true,
+        "type_hint": null
+      },
+      {
+        "name": "_random_samples",
+        "kind": "positional_or_keyword",
+        "required": false,
+        "default": null,
+        "type_hint": null
+      }
+    ],
+    "outputs": [
+      "out"
+    ],
+    "effects": {
+      "mutates": [],
+      "returns_alias_of": {}
+    },
+    "reference": "\"\"\"夜间体检的独立 PyTorch 参考与输入构建；不进入候选源码。\"\"\"\nimport torch\nimport torch.nn.functional as F\n\nREFERENCE_DEVICE = 'target'\nOPERATOR = 'fractional_max_pool3d'\n\n\ndef gen_inputs(ctx, device):\n    s = ctx['inputs']['spec']\n    dtype = getattr(torch, s.get('dtype', 'float32'))\n    g = torch.Generator().manual_seed(ctx.get('seed', 0))\n    def random(shape):\n        return torch.randn(shape, generator=g).to(dtype=dtype, device=device)\n    op = OPERATOR\n    if op == 'value_selecting_reduction_backward':\n        sizes, dim, keep = s['sizes'], s['dim'], s['keepdim']\n        axis = dim % len(sizes)\n        shape = list(sizes)\n        if keep:\n            shape[axis] = 1\n        else:\n            shape.pop(axis)\n        grad = random(shape)\n        indices = torch.randint(sizes[axis], shape, generator=g).to(device)\n        if s.get('strided') and shape:\n            # 相同逻辑shape，但两倍物理跨度；grad与indices均测试stride。\n            grad_base = torch.empty((*shape, 2), dtype=dtype, device=device)\n            index_base = torch.empty((*shape, 2), dtype=torch.int64, device=device)\n            grad_base[..., 0] = grad\n            index_base[..., 0] = indices\n            grad, indices = grad_base[..., 0], index_base[..., 0]\n        return dict(grad=grad, dim=dim, indices=indices, sizes=sizes, keepdim=keep)\n    if op == 'scatter_add':\n        shape, dim = s['shape'], s['dim']\n        x, src = random(shape), random(shape)\n        indices = torch.randint(shape[dim], shape, generator=g).to(device)\n        return dict(inp=x, dim=dim, index=indices, src=src)\n    if op == 'fractional_max_pool3d':\n        x = random(s['shape'])\n        samples = torch.rand((s['shape'][0], s['shape'][1], 3), generator=g).to(dtype=dtype, device=device)\n        return dict(input=x, kernel_size=s['kernel_size'], output_size=s['output_size'],\n                    return_indices=True, _random_samples=samples)\n    if op == 'upsample_bilinear2d':\n        return dict(input=random(s['shape']), output_size=s['output_size'], align_corners=s['align_corners'])\n    if op == 'cumulative_trapezoid':\n        y = random(s['shape'])\n        if s.get('transpose'):\n            y = y.transpose(-1, -2)\n        return dict(y=y, dx=s['dx'], dim=s['dim'])\n    x = random(s['shape'])\n    if op == 'conj_physical':\n        if dtype.is_complex:\n            x = torch.complex(torch.randn(s['shape'], generator=g), torch.randn(s['shape'], generator=g)).to(dtype=dtype, device=device)\n        if s.get('transpose'):\n            x = x.transpose(-1, -2)\n        if s.get('conj'):\n            x = x.conj()\n        return dict(input=x)\n    if op == 'uniform':\n        return dict(self=x, from_=s['from_'], to=s['to'])\n    if op == 'log10_':\n        x = x.abs() + 0.05\n    if s.get('strided'):\n        base = torch.empty((*x.shape, 2), dtype=dtype, device=device)\n        base[..., 0] = x\n        x = base[..., 0]\n    return dict(A=x)\n\n\ndef run(input, kernel_size, output_size=None, output_ratio=None, return_indices=True, _random_samples=None):\n    kwargs = locals().copy()\n    op = OPERATOR\n    if op in {'selu_', 'rad2deg_', 'log10_'}:\n        a = kwargs['A']\n        return {'selu_': torch.selu_, 'rad2deg_': torch.rad2deg_, 'log10_': torch.log10_}[op](a)\n    if op == 'value_selecting_reduction_backward':\n        return torch.ops.aten.value_selecting_reduction_backward(**kwargs)\n    if op == 'cumulative_trapezoid':\n        return torch.cumulative_trapezoid(**kwargs)\n    if op == 'scatter_add':\n        return torch.scatter_add(kwargs['inp'], kwargs['dim'], kwargs['index'], kwargs['src'])\n    if op == 'upsample_bilinear2d':\n        return torch.ops.aten.upsample_bilinear2d(**kwargs)\n    if op == 'fractional_max_pool3d':\n        return F.fractional_max_pool3d(**kwargs)\n    if op == 'conj_physical':\n        return torch.conj_physical(kwargs['input'])\n    if op == 'uniform':\n        return torch.ops.aten.uniform(kwargs['self'], kwargs['from_'], kwargs['to'])\n    raise ValueError(op)\n\n",
+    "reference_device": "target",
+    "source_policy_id": null
+  },
+  "implementation": {
+    "name": "acceptance-pool-parent",
+    "definition": "fractional_max_pool3d",
+    "language": "triton",
+    "entrypoint": "main.py::run",
+    "sources": [
+      {
+        "path": "main.py",
+        "content": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n#\n# Generated by KernelGen: https://github.com/flagos-ai/KernelGen\n\nimport logging\n\nimport torch\nimport triton\nimport triton.language as tl\n\nfrom flag_gems.utils import libentry\n\nlogger = logging.getLogger(__name__)\n\n\n# Neutral element of the \"first maximum lane\" minimum; larger than any lane.\n_BIG = tl.constexpr(1 << 24)\n\n\n# ---------------------------------------------------------------------------\n# Shared reduction primitive.\n#\n# PyTorch scans a pooling window in (kd, kh, kw) order and keeps an element\n# when it is strictly greater than the current best, or when it is NaN (a NaN\n# therefore always propagates and the *last* NaN of the window wins, while\n# ordinary ties keep the first occurrence).\n# ---------------------------------------------------------------------------\n@triton.jit\ndef _combine_max_idx(a_val, a_idx, b_val, b_idx):\n    take_b = (b_val > a_val) | (b_val != b_val)\n    return tl.where(take_b, b_val, a_val), tl.where(take_b, b_idx, a_idx)\n\n\n# ---------------------------------------------------------------------------\n# General fallback: arbitrary (possibly fractional, data dependent) window\n# starts.  Each program owns one (n, c) plane at one output depth and a tile of\n# output rows/columns; every window tap is a strided load addressed with the\n# real input strides.\n# ---------------------------------------------------------------------------\n@triton.jit\ndef _round_coordinate(value, DT: tl.constexpr):\n    # Nonnegative coordinate arithmetic, round-to-nearest-even without a\n    # trunc/extend pair that may disappear in the installed compiler pipeline.\n    if DT == tl.float16:\n        a = tl.abs(value)\n        bits = a.to(tl.int32, bitcast=True)\n        rounded = ((bits + 4095 + ((bits >> 13) & 1)) & -8192).to(tl.float32, bitcast=True)\n        units = tl.minimum(a, 0.00006103515625) * 16777216.0\n        lower = tl.floor(units)\n        fraction = units - lower\n        add = (fraction > 0.5) | ((fraction == 0.5) & ((lower.to(tl.int32) & 1) != 0))\n        subnormal = (lower + add.to(tl.float32)) * 0.000000059604644775390625\n        rounded = tl.where(a < 0.00006103515625, subnormal, rounded)\n        rounded = tl.where(rounded > 65504.0, float('inf'), rounded)\n        return tl.where(value < 0.0, -rounded, rounded)\n    elif DT == tl.bfloat16:\n        bits = value.to(tl.int32, bitcast=True)\n        rounded = ((bits + 32767 + ((bits >> 16) & 1)) & -65536).to(tl.float32, bitcast=True)\n        return tl.where(tl.abs(value) < float('inf'), rounded, value)\n    else:\n        return value\n\n\n@libentry()\n@triton.jit\ndef _fractional_max_pool3d_general_kernel(\n    in_ptr,\n    out_ptr,\n    idx_ptr,\n    samp_ptr,\n    s_n,\n    s_c,\n    s_d,\n    s_h,\n    s_w,\n    ss_n,\n    ss_c,\n    in_c,\n    in_d,\n    in_h,\n    in_w,\n    out_d,\n    out_h,\n    out_w,\n    alpha_d,\n    alpha_h,\n    alpha_w,\n    KD: tl.constexpr,\n    KH: tl.constexpr,\n    KW: tl.constexpr,\n    BLOCK_H: tl.constexpr,\n    BLOCK_W: tl.constexpr,\n    WRITE_IDX: tl.constexpr,\n):\n    pid_nc = tl.program_id(0)\n    pid_dhw = tl.program_id(1)\n\n    num_w_blocks = tl.cdiv(out_w, BLOCK_W)\n    num_hw_blocks = tl.cdiv(out_h, BLOCK_H) * num_w_blocks\n    d_idx = pid_dhw // num_hw_blocks\n    hw = pid_dhw % num_hw_blocks\n    h_block = hw // num_w_blocks\n    w_block = hw % num_w_blocks\n\n    n_idx = pid_nc // in_c\n    c_idx = pid_nc % in_c\n\n    ho = h_block * BLOCK_H + tl.arange(0, BLOCK_H)\n    wo = w_block * BLOCK_W + tl.arange(0, BLOCK_W)\n    h_mask = ho < out_h\n    w_mask = wo < out_w\n\n    neg_inf = float(\"-inf\")\n    base = in_ptr + n_idx * s_n + c_idx * s_c\n\n    samp = samp_ptr + n_idx * ss_n + c_idx * ss_c\n    sample_d = tl.load(samp).to(tl.float32)\n    sample_h = tl.load(samp + 1).to(tl.float32)\n    sample_w = tl.load(samp + 2).to(tl.float32)\n\n    scalar_dtype: tl.constexpr = samp_ptr.dtype.element_ty\n    alpha_d = _round_coordinate(_round_coordinate(tl.cast(in_d - KD, tl.float32), scalar_dtype) / _round_coordinate(tl.cast(tl.maximum(out_d - 1, 1), tl.float32), scalar_dtype), scalar_dtype)\n    alpha_h = _round_coordinate(_round_coordinate(tl.cast(in_h - KH, tl.float32), scalar_dtype) / _round_coordinate(tl.cast(tl.maximum(out_h - 1, 1), tl.float32), scalar_dtype), scalar_dtype)\n    alpha_w = _round_coordinate(_round_coordinate(tl.cast(in_w - KW, tl.float32), scalar_dtype) / _round_coordinate(tl.cast(tl.maximum(out_w - 1, 1), tl.float32), scalar_dtype), scalar_dtype)\n    base_h = _round_coordinate(sample_h * alpha_h, scalar_dtype).to(tl.int32)\n    base_w = _round_coordinate(sample_w * alpha_w, scalar_dtype).to(tl.int32)\n    base_d = _round_coordinate(sample_d * alpha_d, scalar_dtype).to(tl.int32)\n    shifted_h = _round_coordinate(ho.to(tl.float32) + sample_h, scalar_dtype)\n    shifted_w = _round_coordinate(wo.to(tl.float32) + sample_w, scalar_dtype)\n    shifted_d = _round_coordinate(d_idx.to(tl.float32) + sample_d, scalar_dtype)\n    h_start = _round_coordinate(shifted_h * alpha_h, scalar_dtype).to(tl.int32) - base_h\n    w_start = _round_coordinate(shifted_w * alpha_w, scalar_dtype).to(tl.int32) - base_w\n    d_start = _round_coordinate(shifted_d * alpha_d, scalar_dtype).to(tl.int32) - base_d\n    h_start = tl.where(ho == out_h - 1, in_h - KH, h_start)\n    w_start = tl.where(wo == out_w - 1, in_w - KW, w_start)\n    d_start = tl.where(d_idx == out_d - 1, in_d - KD, d_start)\n\n    h_base = h_start[:, None]\n    w_base = w_start[None, :]\n\n    # First legal position of the window: all -inf and all-tie windows keep it.\n    best_i = d_start * in_h * in_w + h_base * in_w + w_base\n    best_v = tl.full((BLOCK_H, BLOCK_W), neg_inf, dtype=in_ptr.type.element_ty)\n\n    for kd in tl.static_range(KD):\n        d_in = d_start + kd\n        for kh in tl.static_range(KH):\n            h_in = h_base + kh\n            for kw in tl.static_range(KW):\n                w_in = w_base + kw\n                m = (\n                    h_mask[:, None]\n                    & w_mask[None, :]\n                    & (d_in >= 0)\n                    & (d_in < in_d)\n                    & (h_in >= 0)\n                    & (h_in < in_h)\n                    & (w_in >= 0)\n                    & (w_in < in_w)\n                )\n                val = tl.load(\n                    base + d_in * s_d + h_in * s_h + w_in * s_w, mask=m, other=neg_inf\n                )\n                idx = d_in * in_h * in_w + h_in * in_w + w_in\n                best_v, best_i = _combine_max_idx(best_v, best_i, val, idx)\n\n    out_off = ((pid_nc * out_d + d_idx) * out_h + ho[:, None]) * out_w + wo[None, :]\n    store_mask = h_mask[:, None] & w_mask[None, :]\n    tl.store(out_ptr + out_off, best_v, mask=store_mask)\n    if WRITE_IDX:\n        tl.store(idx_ptr + out_off, best_i.to(tl.int64), mask=store_mask)\n\n\ndef _triple(value):\n    if isinstance(value, int):\n        return value, value, value\n    if len(value) == 1:\n        return value[0], value[0], value[0]\n    return value[0], value[1], value[2]\n\n\ndef fractional_max_pool3d(\n    input: torch.Tensor,\n    kernel_size,\n    output_size=None,\n    output_ratio=None,\n    return_indices: bool = True,\n    _random_samples=None,\n):\n    \"\"\"Fractional max pooling 3d (stochastic pooling regions).\n\n    Args:\n        input: 5D (N, C, D, H, W) or 4D (C, D, H, W) input tensor.\n        kernel_size: Pooling window size (int or triple).\n        output_size: Target output spatial size (int or triple).\n        output_ratio: Alternative to output_size, output as a ratio.\n        return_indices: Whether to also return the max indices.\n        _random_samples: Optional tensor of shape (N, C, 3) (or (C, 3)) with\n            values in [0, 1) selecting the pooling region offsets.\n    \"\"\"\n    squeeze = False\n    if input.dim() == 4:\n        input = input.unsqueeze(0)\n        squeeze = True\n        if _random_samples is not None and _random_samples.dim() == 2:\n            _random_samples = _random_samples.unsqueeze(0)\n    elif input.dim() != 5:\n        raise AssertionError(f\"Expected 5D input, got {input.dim()}D\")\n\n    in_n, in_c, in_d, in_h, in_w = input.shape\n    kernel_d, kernel_h, kernel_w = _triple(kernel_size)\n\n    if output_size is not None:\n        out_d, out_h, out_w = _triple(output_size)\n    elif output_ratio is not None:\n        if isinstance(output_ratio, float):\n            ratio_d = ratio_h = ratio_w = output_ratio\n        else:\n            ratio_d, ratio_h, ratio_w = output_ratio\n        out_d = int(in_d * ratio_d)\n        out_h = int(in_h * ratio_h)\n        out_w = int(in_w * ratio_w)\n    else:\n        raise ValueError(\"Either output_size or output_ratio must be specified\")\n\n    out_d = int(out_d)\n    out_h = int(out_h)\n    out_w = int(out_w)\n\n    assert out_d + kernel_d - 1 <= in_d, (\n        f\"fractional_max_pool3d: kernel_d ({kernel_d}) + output_d ({out_d}) - 1 \"\n        f\"exceeds input_d ({in_d})\"\n    )\n    assert out_h + kernel_h - 1 <= in_h, (\n        f\"fractional_max_pool3d: kernel_h ({kernel_h}) + output_h ({out_h}) - 1 \"\n        f\"exceeds input_h ({in_h})\"\n    )\n    assert out_w + kernel_w - 1 <= in_w, (\n        f\"fractional_max_pool3d: kernel_w ({kernel_w}) + output_w ({out_w}) - 1 \"\n        f\"exceeds input_w ({in_w})\"\n    )\n\n    out_shape = (in_n, in_c, out_d, out_h, out_w)\n    output = torch.empty(out_shape, dtype=input.dtype, device=input.device)\n    if return_indices:\n        indices = torch.empty(out_shape, dtype=torch.int64, device=input.device)\n    else:\n        indices = output\n    if output.numel() == 0:\n        if squeeze:\n            output = output.squeeze(0)\n            if return_indices:\n                indices = indices.squeeze(0)\n        return (output, indices) if return_indices else output\n\n    alpha_d = (in_d - kernel_d) / (out_d - 1) if out_d > 1 else 0.0\n    alpha_h = (in_h - kernel_h) / (out_h - 1) if out_h > 1 else 0.0\n    alpha_w = (in_w - kernel_w) / (out_w - 1) if out_w > 1 else 0.0\n\n    s_n, s_c, s_d, s_h, s_w = input.stride()\n\n    # Integer ratio: every pooling window is a fixed offset of its output index,\n    # so windows tile the input exactly and the block becomes contiguous.\n    if _random_samples is None:\n        _random_samples = torch.rand(\n            (in_n, in_c, 3), device=input.device, dtype=input.dtype\n        )\n    else:\n        assert _random_samples.shape == (in_n, in_c, 3), (\n            f\"_random_samples must have shape ({in_n}, {in_c}, 3), \"\n            f\"got {_random_samples.shape}\"\n        )\n        if _random_samples.stride(-1) != 1:\n            _random_samples = _random_samples.contiguous()\n\n    block_h = 4\n    block_w = 8\n    grid = (\n        in_n * in_c,\n        out_d * triton.cdiv(out_h, block_h) * triton.cdiv(out_w, block_w),\n    )\n    _fractional_max_pool3d_general_kernel[grid](\n        input,\n        output,\n        indices,\n        _random_samples,\n        s_n,\n        s_c,\n        s_d,\n        s_h,\n        s_w,\n        _random_samples.stride(0),\n        _random_samples.stride(1),\n        in_c,\n        in_d,\n        in_h,\n        in_w,\n        out_d,\n        out_h,\n        out_w,\n        alpha_d,\n        alpha_h,\n        alpha_w,\n        kernel_d,\n        kernel_h,\n        kernel_w,\n        block_h,\n        block_w,\n        return_indices,\n    )\n\n    if squeeze:\n        output = output.squeeze(0)\n        if return_indices:\n            indices = indices.squeeze(0)\n    return (output, indices) if return_indices else output\n\n\nrun = fractional_max_pool3d\n"
+      }
+    ]
+  },
+  "correctness_workloads": [
+    {
+      "name": "fractional_max_pool3d-correctness-0",
+      "inputs": {
+        "spec": {
+          "dtype": "float16",
+          "shape": [
+            1,
+            2,
+            7,
+            9,
+            11
+          ],
+          "kernel_size": [
+            2,
+            2,
+            2
+          ],
+          "output_size": [
+            3,
+            4,
+            5
+          ]
+        }
+      },
+      "seed": 1729,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "fractional_max_pool3d-correctness-1",
+      "inputs": {
+        "spec": {
+          "dtype": "bfloat16",
+          "shape": [
+            1,
+            2,
+            7,
+            9,
+            11
+          ],
+          "kernel_size": [
+            2,
+            2,
+            2
+          ],
+          "output_size": [
+            3,
+            4,
+            5
+          ]
+        }
+      },
+      "seed": 1730,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "fractional_max_pool3d-correctness-2",
+      "inputs": {
+        "spec": {
+          "dtype": "float32",
+          "shape": [
+            1,
+            2,
+            7,
+            9,
+            11
+          ],
+          "kernel_size": [
+            2,
+            2,
+            2
+          ],
+          "output_size": [
+            3,
+            4,
+            5
+          ]
+        }
+      },
+      "seed": 1731,
+      "tolerance": {
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    }
+  ],
+  "timing_workloads": [
+    {
+      "name": "fractional_max_pool3d-timing-0",
+      "inputs": {
+        "spec": {
+          "dtype": "float16",
+          "shape": [
+            1,
+            8,
+            16,
+            16,
+            16
+          ],
+          "kernel_size": [
+            2,
+            2,
+            2
+          ],
+          "output_size": [
+            8,
+            8,
+            8
+          ]
+        }
+      },
+      "seed": 1729,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "fractional_max_pool3d-timing-1",
+      "inputs": {
+        "spec": {
+          "dtype": "float16",
+          "shape": [
+            2,
+            16,
+            32,
+            32,
+            32
+          ],
+          "kernel_size": [
+            2,
+            2,
+            2
+          ],
+          "output_size": [
+            16,
+            16,
+            16
+          ]
+        }
+      },
+      "seed": 1730,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "fractional_max_pool3d-timing-2",
+      "inputs": {
+        "spec": {
+          "dtype": "bfloat16",
+          "shape": [
+            1,
+            8,
+            16,
+            16,
+            16
+          ],
+          "kernel_size": [
+            2,
+            2,
+            2
+          ],
+          "output_size": [
+            8,
+            8,
+            8
+          ]
+        }
+      },
+      "seed": 1731,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "fractional_max_pool3d-timing-3",
+      "inputs": {
+        "spec": {
+          "dtype": "bfloat16",
+          "shape": [
+            2,
+            16,
+            32,
+            32,
+            32
+          ],
+          "kernel_size": [
+            2,
+            2,
+            2
+          ],
+          "output_size": [
+            16,
+            16,
+            16
+          ]
+        }
+      },
+      "seed": 1732,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "fractional_max_pool3d-timing-4",
+      "inputs": {
+        "spec": {
+          "dtype": "float32",
+          "shape": [
+            1,
+            8,
+            16,
+            16,
+            16
+          ],
+          "kernel_size": [
+            2,
+            2,
+            2
+          ],
+          "output_size": [
+            8,
+            8,
+            8
+          ]
+        }
+      },
+      "seed": 1733,
+      "tolerance": {
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "fractional_max_pool3d-timing-5",
+      "inputs": {
+        "spec": {
+          "dtype": "float32",
+          "shape": [
+            2,
+            16,
+            32,
+            32,
+            32
+          ],
+          "kernel_size": [
+            2,
+            2,
+            2
+          ],
+          "output_size": [
+            16,
+            16,
+            16
+          ]
+        }
+      },
+      "seed": 1734,
+      "tolerance": {
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    }
+  ],
+  "settings": {
+    "warmup_ms": 1000,
+    "benchmark_ms": 100,
+    "num_trials": 3,
+    "tolerance_mode": "strict",
+    "rtol": 0.01,
+    "atol": 0.01,
+    "timeout_seconds": 1200
+  }
+}

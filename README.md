@@ -8,6 +8,8 @@
 
 ## 当前状态
 
+2026-10-26完成[会议10算子最终验收汇总](project/Ascend-Optimization-v1/operators/会议10算子最终验收-20261026.md)：**7项默认条件达标、1项官方确定性条件达标、2项完成补充NPU分解对照**，不称10项默认全部达标。新池化连续输出分块相对同批父版实际加速**1.547×**；原PyTorch参考含CPU回退，17.683×与自建NPU分解对照10.066×分别报告。共轭复用既有源码，自建NPU分解对照2.296×；DMA候选未更快。累计积分默认参考固定输入16次再次出现4处容差区间无交集，官方V2扫描接口仍不稳定；前批确定性0.812×交付保留。96项证据核验、成对trace、实际IR和复现入口见[本批README](project/Ascend-Optimization-v1/operators/campaigns/acceptance-three-20261026/README.md)。本批Codex实现与历史KG候选贡献分开记录。
+
 2026-10-24的[两算子收尾交付](project/Ascend-Optimization-v1/operators/两算子收尾交付-20261024.md)：`upsample_bilinear2d`最终**0.915×**，原合同24/24及48＋36项补充检查通过，相对本批父版实际延迟改善**2.559×**。`cumulative_trapezoid`在显式官方确定性条件下**0.812×**，33/33及18项补充、9项性能输入数值／stream检查通过；默认FP16非末轴参考仍不稳定，已交付256×8固定输入反例，不能称为默认条件达标。最终源码、逐case、真实路径、IR和复现入口见[批次README](project/Ascend-Optimization-v1/operators/campaigns/two-closure-20261024/README.md)。CPU回退参考两项仍单列，上采样msprof指标采集缺口保留；271项证据检查通过。以下旧批次状态保留为历史记录。
 
 2026-10-24的[会议剩余五算子交付](project/Ascend-Optimization-v1/operators/会议剩余五算子交付-20261024.md)：`scatter_add` **1.900×**，完整正确且达标；`upsample_bilinear2d` **0.340×**，正确性修复、性能未达标。`fractional_max_pool3d` **4.599×**、`_conj_physical` **115.519×**均完成正确接口与数值验证，但本机参考含CPU回退，单列为功能和执行路径成果。`cumulative_trapezoid`的同输入FP16参考重复运行出现380处容差区间无交集，无有效完整交付。**五项没有全部达标。**四份最终源码、逐case数据与补充门禁已核验；采用固定版本、物理卡7、KGS19659完整调用walltime和一次正式复验。详情与复现见[批次README](project/Ascend-Optimization-v1/operators/campaigns/remaining-five-20261023-v2/README.md)。早期参考适配失败、旧scatter数值反例、未采纳候选均保留。

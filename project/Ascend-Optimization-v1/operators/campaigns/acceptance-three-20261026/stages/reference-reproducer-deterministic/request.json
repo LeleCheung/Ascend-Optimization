@@ -1,0 +1,18 @@
+{
+  "command": [
+    "{python}",
+    "run.py",
+    "--input",
+    "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/campaigns/two-closure-20261024/research/reference-stability/default-256x8-cumulative_trapezoid-input.bin",
+    "--output",
+    "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/campaigns/acceptance-three-20261026/research/reference-reproducer/reference-deterministic.json",
+    "--deterministic"
+  ],
+  "files": [
+    {
+      "path": "run.py",
+      "content": "#!/usr/bin/env python3\n\"\"\"固定字节复现累计积分参考不稳定，输出原容差无公共交集的逐点证据。\"\"\"\nimport argparse\nimport hashlib\nimport json\nfrom pathlib import Path\nimport os\nimport sys\nsys.dont_write_bytecode=True\n\n\ndef main():\n    import numpy as np\n    import torch\n    import torch_npu\n    p=argparse.ArgumentParser(description=__doc__)\n    p.add_argument('--input',required=True,type=Path)\n    p.add_argument('--output',required=True,type=Path)\n    p.add_argument('--deterministic',action='store_true')\n    a=p.parse_args()\n    assert not a.output.exists()\n    assert os.environ.get('ASCEND_RT_VISIBLE_DEVICES')=='7' and torch.npu.device_count()==1\n    data=a.input.read_bytes()\n    expected='f5874ea96d99dcc5b9399c8ccea5a50015d99d1e52936425b28d65e842b3ed19'\n    assert hashlib.sha256(data).hexdigest()==expected\n    y=torch.from_numpy(np.frombuffer(data,dtype=np.float16).copy().reshape(256,8)).to('npu:0')\n    torch.use_deterministic_algorithms(a.deterministic)\n    outputs=[]\n    # 只测参考，不调用候选，也不设定候选专有状态。\n    for _ in range(16):\n        value=torch.cumulative_trapezoid(y,dx=1,dim=0)\n        torch.npu.synchronize()\n        outputs.append(value.cpu().double().numpy())\n    stack=np.stack(outputs)\n    radii=.015+.015*np.abs(stack)\n    lower=(stack-radii).max(0)\n    upper=(stack+radii).min(0)\n    empty=lower>upper\n    points=[]\n    for position in np.argwhere(empty)[:16]:\n        at=tuple(int(x) for x in position)\n        points.append(dict(position=list(at),sixteen_reference_values=[float(x[at]) for x in stack],\n            maximum_lower_bound=float(lower[at]),minimum_upper_bound=float(upper[at]),\n            gap=float(lower[at]-upper[at])))\n    result=dict(status='reference_inconsistent' if empty.any() else 'no_counterexample_in_this_run',\n        input_sha256=expected,shape=[256,8],dtype='float16',dim=0,dx=1,repetitions=16,\n        tolerance=dict(atol=.015,rtol=.015,required_matched_ratio=1.),\n        deterministic=a.deterministic,bitwise_stable=all(np.array_equal(stack[0],x) for x in stack[1:]),\n        empty_intersections=int(empty.sum()),counterexamples=points,\n        maximum_repeat_difference=float((stack.max(0)-stack.min(0)).max()),physical_card=7,\n        torch_version=torch.__version__,torch_npu_version=torch_npu.__version__,\n        conclusion='区间为空的位置不存在同时满足这些参考输出的固定结果；无反例不等于证明默认稳定')\n    a.output.parent.mkdir(parents=True,exist_ok=True)\n    np.save(a.output.with_suffix('.outputs.npy'),stack)\n    a.output.write_text(json.dumps(result,ensure_ascii=False,indent=2)+chr(10))\n    print(json.dumps(result,ensure_ascii=False),flush=True)\n\n\nif __name__=='__main__':main()\n"
+    }
+  ],
+  "timeout_seconds": 600
+}

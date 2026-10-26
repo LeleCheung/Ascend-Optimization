@@ -1,5 +1,7 @@
 # HG-KDA 分阶段体检与 KG 接入
 
+2026-10-26新增[剩余三项验收与参考路径诊断](../../../operators/campaigns/acceptance-three-20261026/README.md)：池化连续输出分块较同批父版完整调用实际加速1.547×；共轭既有源码完成独立NPU分解对照；累计积分默认参考16次出现4处原容差区间无交集，V2接口仍不稳定。新增[参考可信性与NPU分解](skills/hgkda/references/性能指标/参考可信性与NPU分解.md)，按叶子注册、trace、稳定性、分解及源码／IR组织诊断。补充参考不替换官方原参考，本批由Codex实现和编排，未新增CC搜索。96项证据核验通过，正式复现入口为`reproduce-acceptance.py`；扫描反例入口为`reproduce-scan-reference.py`。
+
 [夜间连续大goal](../../../operators/夜间连续优化交付-20261023.md)已取得完整结果：GELU 2.271×、标准Philox修复uniform 1.325×、rad2deg_ 1.117×、SELU 0.837×；scatter_add 0.419×未达标，累计积分未通过全部数值检查。`run-endurance.py`与独立补充队列在宿主tmux串行执行，自动衔接有限搜索、门禁、一次正式完整KGS、采集与证据审计。
 
 新增[uniform整数机制知识](research/uniform无符号整数修复-20261023.md)：通过确定性设备反例区分乘法、逻辑右移与参数状态；显式有符号移位加掩码、位运算counter进位绕过固定后端的错误与不支持转换。最终标准Philox逐位16项、语义18项、随机状态3项和完整KGS18项通过。原错误高分、失败修复与最终版分别归档，CC生成与Codex机制修复分别登记。
