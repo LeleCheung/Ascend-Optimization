@@ -1,0 +1,915 @@
+{
+  "api_version": "v6.2",
+  "definition": {
+    "api_version": "v6.2",
+    "name": "cumulative_trapezoid",
+    "description": "",
+    "parameters": [
+      {
+        "name": "y",
+        "kind": "positional_or_keyword",
+        "required": true,
+        "default": null,
+        "type_hint": null
+      },
+      {
+        "name": "dx",
+        "kind": "keyword_only",
+        "required": false,
+        "default": 1,
+        "type_hint": null
+      },
+      {
+        "name": "dim",
+        "kind": "keyword_only",
+        "required": false,
+        "default": -1,
+        "type_hint": null
+      }
+    ],
+    "outputs": [
+      "out"
+    ],
+    "effects": {
+      "mutates": [],
+      "returns_alias_of": {}
+    },
+    "reference": "\"\"\"\u591c\u95f4\u4f53\u68c0\u7684\u72ec\u7acb PyTorch \u53c2\u8003\u4e0e\u8f93\u5165\u6784\u5efa\uff1b\u4e0d\u8fdb\u5165\u5019\u9009\u6e90\u7801\u3002\"\"\"\nimport torch\nimport torch.nn.functional as F\n\nREFERENCE_DEVICE = 'target'\nOPERATOR = 'cumulative_trapezoid'\n\n\ndef gen_inputs(ctx, device):\n    s = ctx['inputs']['spec']\n    dtype = getattr(torch, s.get('dtype', 'float32'))\n    g = torch.Generator().manual_seed(ctx.get('seed', 0))\n    def random(shape):\n        return torch.randn(shape, generator=g).to(dtype=dtype, device=device)\n    op = OPERATOR\n    if op == 'value_selecting_reduction_backward':\n        sizes, dim, keep = s['sizes'], s['dim'], s['keepdim']\n        axis = dim % len(sizes)\n        shape = list(sizes)\n        if keep:\n            shape[axis] = 1\n        else:\n            shape.pop(axis)\n        grad = random(shape)\n        indices = torch.randint(sizes[axis], shape, generator=g).to(device)\n        if s.get('strided') and shape:\n            # \u76f8\u540c\u903b\u8f91shape\uff0c\u4f46\u4e24\u500d\u7269\u7406\u8de8\u5ea6\uff1bgrad\u4e0eindices\u5747\u6d4b\u8bd5stride\u3002\n            grad_base = torch.empty((*shape, 2), dtype=dtype, device=device)\n            index_base = torch.empty((*shape, 2), dtype=torch.int64, device=device)\n            grad_base[..., 0] = grad\n            index_base[..., 0] = indices\n            grad, indices = grad_base[..., 0], index_base[..., 0]\n        return dict(grad=grad, dim=dim, indices=indices, sizes=sizes, keepdim=keep)\n    if op == 'scatter_add':\n        shape, dim = s['shape'], s['dim']\n        x, src = random(shape), random(shape)\n        indices = torch.randint(shape[dim], shape, generator=g).to(device)\n        return dict(inp=x, dim=dim, index=indices, src=src)\n    if op == 'fractional_max_pool3d':\n        x = random(s['shape'])\n        samples = torch.rand((s['shape'][0], s['shape'][1], 3), generator=g).to(dtype=dtype, device=device)\n        return dict(input=x, kernel_size=s['kernel_size'], output_size=s['output_size'],\n                    return_indices=True, _random_samples=samples)\n    if op == 'upsample_bilinear2d':\n        return dict(input=random(s['shape']), output_size=s['output_size'], align_corners=s['align_corners'])\n    if op == 'cumulative_trapezoid':\n        y = random(s['shape'])\n        if s.get('transpose'):\n            y = y.transpose(-1, -2)\n        return dict(y=y, dx=s['dx'], dim=s['dim'])\n    x = random(s['shape'])\n    if op == 'conj_physical':\n        if dtype.is_complex:\n            x = torch.complex(torch.randn(s['shape'], generator=g), torch.randn(s['shape'], generator=g)).to(dtype=dtype, device=device)\n        if s.get('transpose'):\n            x = x.transpose(-1, -2)\n        if s.get('conj'):\n            x = x.conj()\n        return dict(input=x)\n    if op == 'uniform':\n        return dict(self=x, from_=s['from_'], to=s['to'])\n    if op == 'log10_':\n        x = x.abs() + 0.05\n    if s.get('strided'):\n        base = torch.empty((*x.shape, 2), dtype=dtype, device=device)\n        base[..., 0] = x\n        x = base[..., 0]\n    return dict(A=x)\n\n\ndef run(y, *, dx=1, dim=-1):\n    kwargs = locals().copy()\n    op = OPERATOR\n    if op in {'selu_', 'rad2deg_', 'log10_'}:\n        a = kwargs['A']\n        return {'selu_': torch.selu_, 'rad2deg_': torch.rad2deg_, 'log10_': torch.log10_}[op](a)\n    if op == 'value_selecting_reduction_backward':\n        return torch.ops.aten.value_selecting_reduction_backward(**kwargs)\n    if op == 'cumulative_trapezoid':\n        return torch.cumulative_trapezoid(**kwargs)\n    if op == 'scatter_add':\n        return torch.scatter_add(kwargs['inp'], kwargs['dim'], kwargs['index'], kwargs['src'])\n    if op == 'upsample_bilinear2d':\n        return torch.ops.aten.upsample_bilinear2d(**kwargs)\n    if op == 'fractional_max_pool3d':\n        return F.fractional_max_pool3d(**kwargs)\n    if op == 'conj_physical':\n        return torch.conj_physical(kwargs['input'])\n    if op == 'uniform':\n        return torch.ops.aten.uniform(kwargs['self'], kwargs['from_'], kwargs['to'])\n    raise ValueError(op)\n\n",
+    "reference_device": "target",
+    "source_policy_id": null
+  },
+  "implementation": {
+    "name": "cumulative-trapezoid-cann-contiguous-deterministic",
+    "definition": "cumulative_trapezoid",
+    "language": "triton",
+    "entrypoint": "main.py::run",
+    "sources": [
+      {
+        "path": "main.py",
+        "content": "\"\"\"Triton\u878d\u5408\u589e\u91cf\uff0bCANN\u626b\u63cf\u5f02\u6b65\u5019\u9009\uff1b\u8d44\u6e90\u4ec5\u4fdd\u7559\u81f3\u5f53\u524dstream\u7684\u5b8c\u6210\u4e8b\u4ef6\u3002\"\"\"\nimport ctypes as ct\nfrom collections import deque\nimport threading\nimport torch\nimport triton\nimport triton.language as tl\nfrom flag_gems.utils import libentry\n\n\n@libentry()\n@triton.jit\ndef _increments(Y, Z, TOTAL: tl.constexpr, SHAPE: tl.constexpr,\n                STRIDES: tl.constexpr, AXIS: tl.constexpr,\n                SCALE: tl.constexpr, BLOCK: tl.constexpr):\n    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    remainder = offsets\n    address = tl.full((BLOCK,), 0, tl.int64)\n    for i in tl.static_range(len(SHAPE) - 1, -1, -1):\n        coord = remainder % SHAPE[i]\n        remainder = remainder // SHAPE[i]\n        address += coord * STRIDES[i]\n    left = tl.load(Y + address, offsets < TOTAL, other=0).to(tl.float32)\n    right = tl.load(Y + address + STRIDES[AXIS], offsets < TOTAL, other=0).to(tl.float32)\n    summed = (left + right).to(Y.dtype.element_ty).to(tl.float32)\n    scaled = summed * SCALE\n    tl.store(Z + offsets, scaled.to(Z.dtype.element_ty), offsets < TOTAL)\n\n\n\n\n@libentry()\n@triton.jit\ndef _increments_last(Y,Z,N:tl.constexpr,SCALE:tl.constexpr,BLOCK:tl.constexpr):\n    tile=tl.program_id(0)\n    row=tl.program_id(1)\n    extended=tile*BLOCK+tl.arange(0,2*BLOCK)\n    values=tl.load(Y+row*N+extended,extended<N,other=0).to(tl.float32)\n    k=tl.arange(0,BLOCK)\n    a=tl.gather(values,k,0)\n    z=tl.gather(values,k+1,0)\n    added=(a+z).to(Y.dtype.element_ty).to(tl.float32)\n    off=tile*BLOCK+k\n    tl.store(Z+row*(N-1)+off,(added*SCALE).to(Z.dtype.element_ty),off<N-1)\n\n\n@libentry()\n@triton.jit\ndef _increments_first(Y,Z,TOTAL:tl.constexpr,INNER:tl.constexpr,SCALE:tl.constexpr,BLOCK:tl.constexpr):\n    off=tl.program_id(0)*BLOCK+tl.arange(0,BLOCK)\n    a=tl.load(Y+off,off<TOTAL,other=0).to(tl.float32)\n    z=tl.load(Y+off+INNER,off<TOTAL,other=0).to(tl.float32)\n    added=(a+z).to(Y.dtype.element_ty).to(tl.float32)\n    tl.store(Z+off,(added*SCALE).to(Z.dtype.element_ty),off<TOTAL)\n\n_LIB = None\n_PENDING = deque()\n_LOCK = threading.Lock()\n\n\ndef _library():\n    global _LIB\n    if _LIB is not None:\n        return _LIB\n    lib = ct.CDLL('libopapi.so')\n    i64p = ct.POINTER(ct.c_int64)\n    lib.aclCreateTensor.argtypes = [i64p, ct.c_uint64, ct.c_int, i64p,\n        ct.c_int64, ct.c_int, i64p, ct.c_uint64, ct.c_void_p]\n    lib.aclCreateTensor.restype = ct.c_void_p\n    lib.aclDestroyTensor.argtypes = [ct.c_void_p]\n    lib.aclDestroyTensor.restype = ct.c_int\n    lib.aclnnCumsumGetWorkspaceSize.argtypes = [ct.c_void_p, ct.c_int64,\n        ct.c_int, ct.c_void_p, ct.POINTER(ct.c_uint64), ct.POINTER(ct.c_void_p)]\n    lib.aclnnCumsumGetWorkspaceSize.restype = ct.c_int\n    lib.aclnnCumsum.argtypes = [ct.c_void_p, ct.c_uint64, ct.c_void_p, ct.c_void_p]\n    lib.aclnnCumsum.restype = ct.c_int\n    _LIB = lib\n    return lib\n\n\ndef _check(code, operation):\n    if code:\n        raise RuntimeError('%s returned %s' % (operation, code))\n\n\ndef _descriptor(lib, tensor, dtype):\n    assert tensor.is_contiguous() and tensor.storage_offset() == 0\n    rank = tensor.dim()\n    dims = (ct.c_int64 * rank)(*tensor.shape)\n    strides = (ct.c_int64 * rank)(*tensor.stride())\n    descriptor = lib.aclCreateTensor(dims, rank, dtype, strides, 0, 2,\n        dims, rank, ct.c_void_p(tensor.data_ptr()))\n    if not descriptor:\n        raise RuntimeError('aclCreateTensor returned NULL')\n    return descriptor\n\n\ndef run(y, *, dx=1, dim=-1):\n    if y.ndim == 0 or not -y.ndim <= dim < y.ndim:\n        raise IndexError('cumulative_trapezoid: invalid dimension')\n    axis = dim % y.ndim\n    shape = list(y.shape)\n    shape[axis] = max(0, shape[axis] - 1)\n    out = torch.empty(shape, dtype=y.dtype, device=y.device)\n    if out.numel() == 0:\n        return out\n    dtype = {torch.float32: 0, torch.float16: 1, torch.float64: 11, torch.bfloat16: 27}[y.dtype]\n    increments = torch.empty(shape, dtype=y.dtype, device=y.device)\n    stream = torch.npu.current_stream(y.device)\n    if y.is_contiguous() and axis == y.ndim - 1:\n        n = int(y.shape[axis])\n        _increments_last[(triton.cdiv(n-1,1024),out.numel()//(n-1))](y,increments,n,float(dx)/2.,1024)\n    elif y.is_contiguous() and axis == 0:\n        inner = y.numel() // int(y.shape[axis])\n        _increments_first[(triton.cdiv(out.numel(),2048),)](y,increments,out.numel(),inner,float(dx)/2.,2048)\n    else:\n        _increments[(triton.cdiv(out.numel(), 2048),)](y, increments, out.numel(),\n            tuple(shape), tuple(y.stride()), axis, float(dx) / 2., 2048)\n    lib = _library()\n    # Never reuse an input, output, descriptor or executor for a new call.\n    # These references only keep asynchronous resources alive until completion.\n    with _LOCK:\n        remaining = deque()\n        while _PENDING:\n            event, tensors, descriptors = _PENDING.popleft()\n            if event.query():\n                for descriptor in descriptors:\n                    _check(lib.aclDestroyTensor(descriptor), 'aclDestroyTensor(completed)')\n            else:\n                remaining.append((event, tensors, descriptors))\n        _PENDING.extend(remaining)\n    desc_in = desc_out = None\n    workspace = None\n    try:\n        desc_in = _descriptor(lib, increments, dtype)\n        desc_out = _descriptor(lib, out, dtype)\n        size = ct.c_uint64()\n        executor = ct.c_void_p()\n        _check(lib.aclnnCumsumGetWorkspaceSize(desc_in, axis, dtype, desc_out,\n            ct.byref(size), ct.byref(executor)), 'aclnnCumsumGetWorkspaceSize')\n        workspace = torch.empty((size.value,), dtype=torch.uint8, device=y.device)\n        _check(lib.aclnnCumsum(ct.c_void_p(workspace.data_ptr()), size.value,\n            executor, ct.c_void_p(stream.npu_stream)), 'aclnnCumsum')\n        done = torch.npu.Event()\n        done.record(stream)\n        with _LOCK:\n            _PENDING.append((done, (y, increments, out, workspace), (desc_out, desc_in)))\n        desc_in = desc_out = None\n    except Exception:\n        # Error cleanup cannot free resources before their device work finishes.\n        stream.synchronize()\n        raise\n    finally:\n        if desc_out:\n            _check(lib.aclDestroyTensor(desc_out), 'aclDestroyTensor(out)')\n        if desc_in:\n            _check(lib.aclDestroyTensor(desc_in), 'aclDestroyTensor(in)')\n    return out\n"
+      }
+    ]
+  },
+  "correctness_workloads": [
+    {
+      "name": "cumulative_trapezoid-correctness-0",
+      "inputs": {
+        "spec": {
+          "dtype": "float16",
+          "shape": [
+            3,
+            17
+          ],
+          "dim": -1,
+          "dx": 1,
+          "transpose": false
+        }
+      },
+      "seed": 1729,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-1",
+      "inputs": {
+        "spec": {
+          "dtype": "float16",
+          "shape": [
+            3,
+            17
+          ],
+          "dim": -1,
+          "dx": 0.25,
+          "transpose": false
+        }
+      },
+      "seed": 1730,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-2",
+      "inputs": {
+        "spec": {
+          "dtype": "float16",
+          "shape": [
+            7,
+            9
+          ],
+          "dim": 0,
+          "dx": 1,
+          "transpose": false
+        }
+      },
+      "seed": 1731,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-3",
+      "inputs": {
+        "spec": {
+          "dtype": "float16",
+          "shape": [
+            7,
+            9
+          ],
+          "dim": 0,
+          "dx": 0.25,
+          "transpose": false
+        }
+      },
+      "seed": 1732,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-4",
+      "inputs": {
+        "spec": {
+          "dtype": "float16",
+          "shape": [
+            7,
+            9
+          ],
+          "dim": -1,
+          "dx": 1,
+          "transpose": true
+        }
+      },
+      "seed": 1733,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-5",
+      "inputs": {
+        "spec": {
+          "dtype": "float16",
+          "shape": [
+            7,
+            9
+          ],
+          "dim": -1,
+          "dx": 0.25,
+          "transpose": true
+        }
+      },
+      "seed": 1734,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-6",
+      "inputs": {
+        "spec": {
+          "dtype": "float16",
+          "shape": [
+            3,
+            1
+          ],
+          "dim": -1,
+          "dx": 1,
+          "transpose": false
+        }
+      },
+      "seed": 1735,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-7",
+      "inputs": {
+        "spec": {
+          "dtype": "float16",
+          "shape": [
+            3,
+            1
+          ],
+          "dim": -1,
+          "dx": 0.25,
+          "transpose": false
+        }
+      },
+      "seed": 1736,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-8",
+      "inputs": {
+        "spec": {
+          "dtype": "bfloat16",
+          "shape": [
+            3,
+            17
+          ],
+          "dim": -1,
+          "dx": 1,
+          "transpose": false
+        }
+      },
+      "seed": 1737,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-9",
+      "inputs": {
+        "spec": {
+          "dtype": "bfloat16",
+          "shape": [
+            3,
+            17
+          ],
+          "dim": -1,
+          "dx": 0.25,
+          "transpose": false
+        }
+      },
+      "seed": 1738,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-10",
+      "inputs": {
+        "spec": {
+          "dtype": "bfloat16",
+          "shape": [
+            7,
+            9
+          ],
+          "dim": 0,
+          "dx": 1,
+          "transpose": false
+        }
+      },
+      "seed": 1739,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-11",
+      "inputs": {
+        "spec": {
+          "dtype": "bfloat16",
+          "shape": [
+            7,
+            9
+          ],
+          "dim": 0,
+          "dx": 0.25,
+          "transpose": false
+        }
+      },
+      "seed": 1740,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-12",
+      "inputs": {
+        "spec": {
+          "dtype": "bfloat16",
+          "shape": [
+            7,
+            9
+          ],
+          "dim": -1,
+          "dx": 1,
+          "transpose": true
+        }
+      },
+      "seed": 1741,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-13",
+      "inputs": {
+        "spec": {
+          "dtype": "bfloat16",
+          "shape": [
+            7,
+            9
+          ],
+          "dim": -1,
+          "dx": 0.25,
+          "transpose": true
+        }
+      },
+      "seed": 1742,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-14",
+      "inputs": {
+        "spec": {
+          "dtype": "bfloat16",
+          "shape": [
+            3,
+            1
+          ],
+          "dim": -1,
+          "dx": 1,
+          "transpose": false
+        }
+      },
+      "seed": 1743,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-15",
+      "inputs": {
+        "spec": {
+          "dtype": "bfloat16",
+          "shape": [
+            3,
+            1
+          ],
+          "dim": -1,
+          "dx": 0.25,
+          "transpose": false
+        }
+      },
+      "seed": 1744,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-16",
+      "inputs": {
+        "spec": {
+          "dtype": "float32",
+          "shape": [
+            3,
+            17
+          ],
+          "dim": -1,
+          "dx": 1,
+          "transpose": false
+        }
+      },
+      "seed": 1745,
+      "tolerance": {
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-17",
+      "inputs": {
+        "spec": {
+          "dtype": "float32",
+          "shape": [
+            3,
+            17
+          ],
+          "dim": -1,
+          "dx": 0.25,
+          "transpose": false
+        }
+      },
+      "seed": 1746,
+      "tolerance": {
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-18",
+      "inputs": {
+        "spec": {
+          "dtype": "float32",
+          "shape": [
+            7,
+            9
+          ],
+          "dim": 0,
+          "dx": 1,
+          "transpose": false
+        }
+      },
+      "seed": 1747,
+      "tolerance": {
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-19",
+      "inputs": {
+        "spec": {
+          "dtype": "float32",
+          "shape": [
+            7,
+            9
+          ],
+          "dim": 0,
+          "dx": 0.25,
+          "transpose": false
+        }
+      },
+      "seed": 1748,
+      "tolerance": {
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-20",
+      "inputs": {
+        "spec": {
+          "dtype": "float32",
+          "shape": [
+            7,
+            9
+          ],
+          "dim": -1,
+          "dx": 1,
+          "transpose": true
+        }
+      },
+      "seed": 1749,
+      "tolerance": {
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-21",
+      "inputs": {
+        "spec": {
+          "dtype": "float32",
+          "shape": [
+            7,
+            9
+          ],
+          "dim": -1,
+          "dx": 0.25,
+          "transpose": true
+        }
+      },
+      "seed": 1750,
+      "tolerance": {
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-22",
+      "inputs": {
+        "spec": {
+          "dtype": "float32",
+          "shape": [
+            3,
+            1
+          ],
+          "dim": -1,
+          "dx": 1,
+          "transpose": false
+        }
+      },
+      "seed": 1751,
+      "tolerance": {
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-correctness-23",
+      "inputs": {
+        "spec": {
+          "dtype": "float32",
+          "shape": [
+            3,
+            1
+          ],
+          "dim": -1,
+          "dx": 0.25,
+          "transpose": false
+        }
+      },
+      "seed": 1752,
+      "tolerance": {
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    }
+  ],
+  "timing_workloads": [
+    {
+      "name": "cumulative_trapezoid-timing-0",
+      "inputs": {
+        "spec": {
+          "dtype": "float16",
+          "shape": [
+            128,
+            1024
+          ],
+          "dim": -1,
+          "dx": 1
+        }
+      },
+      "seed": 1729,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-timing-1",
+      "inputs": {
+        "spec": {
+          "dtype": "float16",
+          "shape": [
+            1024,
+            4096
+          ],
+          "dim": -1,
+          "dx": 1
+        }
+      },
+      "seed": 1730,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-timing-2",
+      "inputs": {
+        "spec": {
+          "dtype": "float16",
+          "shape": [
+            1024,
+            128
+          ],
+          "dim": 0,
+          "dx": 1
+        }
+      },
+      "seed": 1731,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-timing-3",
+      "inputs": {
+        "spec": {
+          "dtype": "bfloat16",
+          "shape": [
+            128,
+            1024
+          ],
+          "dim": -1,
+          "dx": 1
+        }
+      },
+      "seed": 1732,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-timing-4",
+      "inputs": {
+        "spec": {
+          "dtype": "bfloat16",
+          "shape": [
+            1024,
+            4096
+          ],
+          "dim": -1,
+          "dx": 1
+        }
+      },
+      "seed": 1733,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-timing-5",
+      "inputs": {
+        "spec": {
+          "dtype": "bfloat16",
+          "shape": [
+            1024,
+            128
+          ],
+          "dim": 0,
+          "dx": 1
+        }
+      },
+      "seed": 1734,
+      "tolerance": {
+        "rtol": 0.015,
+        "atol": 0.015,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-timing-6",
+      "inputs": {
+        "spec": {
+          "dtype": "float32",
+          "shape": [
+            128,
+            1024
+          ],
+          "dim": -1,
+          "dx": 1
+        }
+      },
+      "seed": 1735,
+      "tolerance": {
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-timing-7",
+      "inputs": {
+        "spec": {
+          "dtype": "float32",
+          "shape": [
+            1024,
+            4096
+          ],
+          "dim": -1,
+          "dx": 1
+        }
+      },
+      "seed": 1736,
+      "tolerance": {
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    },
+    {
+      "name": "cumulative_trapezoid-timing-8",
+      "inputs": {
+        "spec": {
+          "dtype": "float32",
+          "shape": [
+            1024,
+            128
+          ],
+          "dim": 0,
+          "dx": 1
+        }
+      },
+      "seed": 1737,
+      "tolerance": {
+        "rtol": 0.0001,
+        "atol": 0.0001,
+        "atol_scale": 1.0,
+        "required_matched_ratio": 1.0,
+        "equal_nan": false
+      },
+      "source_condition": null,
+      "input_path": null,
+      "output_path": null
+    }
+  ],
+  "settings": {
+    "warmup_ms": 1000,
+    "benchmark_ms": 100,
+    "num_trials": 3,
+    "tolerance_mode": "strict",
+    "rtol": 0.01,
+    "atol": 0.01,
+    "timeout_seconds": 1800
+  }
+}

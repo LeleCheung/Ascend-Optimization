@@ -1,0 +1,54 @@
+{
+  "schema_version": "1.0",
+  "round_num": 2,
+  "evaluation_fingerprint": "21da4d8250853a927b375b167f4a1e5709be04858e885db5b4f4b11d1db77afa",
+  "status": "failed",
+  "solution_sha256": "d58d192f3e30bd33db7f979569fbf51cb632fc7498a8a7a0f55cf7c13ef8c1cf",
+  "backend": "npu",
+  "profiler": "msprof",
+  "capabilities": [
+    "performance_counters",
+    "pipeline_utilization",
+    "kernel_profile",
+    "instruction_listing"
+  ],
+  "dominant_bound": "unknown",
+  "profiled_workloads": [],
+  "findings": [],
+  "performance_interpretation": "Round 2's frozen hypothesis is supported by the authoritative eval: contiguous multi-KB block loads cut the large geometries from about 0.629 ms to 0.264-0.278 ms (timing-1 0.329x -> 0.783x, timing-5 0.347x -> 0.816x, timing-3 0.435x -> 0.954x) and geo_mean from 0.5756 to 0.9345. The small geometries (0.0308-0.0322 ms, 0.89-1.26x) are host/launch bound and already at or above reference, so the whole remaining deficit sits on timing-1/3/5 and equals about 57, 13 and 50 us respectively. Structural reading of the delivered source: every GM address in _blk2x_kernel is affine (two contiguous multi-KB loads, two 2-D stores with row stride 2*OW), so the only data-dependent, non-affine operations left are the four axis-1 tl.gather calls that produce the +-1 column neighbours, plus the tile-wide mixes and join/reshape interleaves that consume them. That makes the horizontal stage, not data movement, the place to test next. This is a source-level inference, not a measurement: the profiler produced no AIV/MTE counters this round, so it neither confirms nor refutes the split between vector, scalar and MTE time, and it cannot say whether the gathers lower to a per-lane scalar loop or a vector shuffle.",
+  "next_experiment": {
+    "action_category": "eliminate_merge_gathers",
+    "action_description": "Keep _blk2x_kernel's block geometry, two contiguous block loads, stores and all fallback paths unchanged, and replace the four (QB,IW) axis-1 gathers per program with two gathers on doubled-width interleaved tiles. Build Qf = tl.reshape(tl.join(vf, vf), (QB, OW)) and Qo = tl.reshape(tl.join(vo, vo), (QB, OW)) once per program, then take both column neighbours from a single gather per source tile with the parity permutation P where P[2k] = max(2k-2, 0) and P[2k+1] = min(2k+2, OW-1). The output tile becomes 0.75*Q + 0.25*tl.gather(Q, P, 1), stored directly with the same (QB,OW) rows and row stride 2*OW, so the two even/odd mix pairs and the two post-mix join/reshape interleaves disappear. This is option (a), tested in its cheapest falsifiable form.",
+    "expected_impact": "Halves the gather operation count (4 -> 2) at unchanged gathered-element volume and removes the two post-mix joins. If the gather cost is dominated by per-operation setup/control, large-case latency falls by 30-60 us: timing-1 from 0.264 ms toward 0.20-0.23 ms (0.783x -> about 0.90-1.00x), with similar movement on timing-3 and timing-5, moving geo_mean from 0.9345 toward 1.00-1.05. If the cost is per-element, the change is neutral - that is the falsification, and it redirects effort to mix/join vector work or a cube formulation.",
+    "risks_and_rollback": "The gather index must match the source on every non-axis dimension and the axis must stay minor; the parity permutation must clamp both ends so no lane leaves the tile, or boundary values differ from PyTorch's i1p rule. Doubled-width (QB,2IW) tiles raise UB pressure even though they replace the existing post-mix (QB,OW) tiles; if QB=16 with IW=128 overflows the 192 KiB UB, verify the compiled buffer report and drop to QB=8 rather than weakening the math. A 2x wider index tensor may hit a backend restriction and must be recorded as a compile failure, not worked around by changing the computation. Keep the round-2 kernel reachable behind a module flag and revert if geo_mean is not strictly better than 0.9345; do not accept a gain that appears only in per-iteration-synced probes.",
+    "validation_workloads": [
+      "upsample_bilinear2d-timing-0",
+      "upsample_bilinear2d-timing-1",
+      "upsample_bilinear2d-timing-2",
+      "upsample_bilinear2d-timing-3",
+      "upsample_bilinear2d-timing-4",
+      "upsample_bilinear2d-timing-5"
+    ],
+    "success_criteria": [
+      "Full evaluation correctness: all 18 upsample_bilinear2d-correctness workloads PASS with frozen tolerances (fp16/bf16 atol=rtol=0.015, fp32 1e-4), including 1x1 output and align_corners cases.",
+      "All six timing workloads PASS and headline geo_mean exceeds the round-2 value 0.9344638621311885.",
+      "Large-geometry latency drops at least 10% on at least two of timing-1 (0.26405 ms), timing-3 (0.27837 ms), timing-5 (0.27433 ms).",
+      "Small geometries do not regress: timing-0/2/4 stay within 3% of 0.03082/0.03196/0.03224 ms, since they are host/launch bound and carry the geo_mean.",
+      "Supplemental gates (remaining-semantics 48 items, special 36 items, two repeats, stream switch) still pass."
+    ]
+  },
+  "warnings": [
+    "Profiling is nominally supported (msprof, metrics + instruction) but all four requests on this candidate - metrics on timing-1/5/0/3 and instruction on timing-1 - returned 'msprof base collection exited successfully without profile completion marker' with zero artifacts. The failure is systematic, not transient, and it is a collection failure rather than a device error: the eval on the same candidate PASSED.",
+    "No AIV vec/scalar/MTE2/MTE3 counters and no instruction listing exist for round 2. The lowering of tl.gather could not be determined and must not be described as measured.",
+    "This workspace keeps round-2 device-probe artifacts under .kernelgen/debug-jobs/429c9b7670ec4223af1b74b2b5ad5324 (probe_block), aa52b329685d43bc8be039f9c7403115 (probe_shift), a6a30927b24e4e9f997f1429d0eac50f (probe_slice) and 974db8348637418d9f320f4ccb993f36 (probe_small). They were not accepted as profile evidence because they are probe outputs, not profiler artifacts, and they carry known caveats: per-iteration synchronization, a harness floor of about 60-65 us, and a full-kernel variant that runs markedly faster than the delivered source at the same geometry.",
+    "The delivered candidate guards its raw-int compiled-launch path with _cacheable() against TRITON_REGISTER_TENSOR_MSPROF (main.py, host section), so the profiler failure is unlikely to be the int-pointer metadata incompatibility seen on earlier kernels; the real cause needs the collection-side log, which is absent.",
+    "Re-profiling the delivered source is a prerequisite for any AIV/MTE split or instruction-level claim; until it succeeds, conclusions rest on the authoritative eval plus same-harness probes."
+  ],
+  "open_questions": [
+    "Why does msprof base collection exit without a completion marker for this candidate, when the same service profile previously succeeded for this operator's earlier kernel? The collection-side log is not present in the workspace, so the delivery candidate cannot be checked for a launcher/metadata incompatibility.",
+    "Is tl.gather along axis=1 lowered to a per-lane scalar loop, a vector shuffle, or a GM round trip on the fixed FlagTree c286cba6 build? Unanswerable without the instruction listing.",
+    "Do the four tile-wide mixes plus two join/reshape interleaves cost as much as the gathers on the delivered kernel, or was the round-2 no-gather ablation distorted by folded arithmetic?",
+    "Is the remaining large-case gap to reference reachable on the AIV path at all, or does it require a cube formulation of the horizontal expansion?"
+  ],
+  "error": "msprof base collection exited successfully without profile completion marker (profile ids cff3deed8e984a7c8c0b6aed273bdf99, a08ac4ca74d943428038ea4ee3bfe857, 8c76024e1a5b40fcb78424a6ebd28030, e05a57a898894ad2970243589f39fffd, 87fb7a0120c34bf8a133d7ef1db2cd7f). Zero artifacts downloaded; no counters and no instruction listing."
+}

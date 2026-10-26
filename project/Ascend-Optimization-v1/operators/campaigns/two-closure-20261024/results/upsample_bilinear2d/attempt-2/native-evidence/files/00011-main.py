@@ -1,0 +1,551 @@
+# Copyright 2026, The FlagOS Contributors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Triton implementation of ``aten.upsample_bilinear2d`` (NCHW bilinear).
+
+Round 3 architecture
+--------------------
+Round 2 measured the cost structure of the previous single-output-row kernel:
+on the 4x32x128x128 -> 256x256 geometry it issued two 256-byte row loads per
+output row (65536 transfers, ~45 GB/s effective, 316 us of 576 us device
+time), while the whole 16.8 MB store cost only ~19 us.  The addressing, not
+the volume, was the bottleneck.
+
+``_blk2x_kernel`` (exact 2x fast path)
+    One program owns ``QB`` consecutive input rows of one channel image and
+    reads two *multi-KB contiguous blocks* (rows ``lb .. lb+QB-1`` and
+    ``lb+1 .. lb+QB``), so the whole vertical neighbourhood of 2*QB output
+    rows arrives in two DMA transfers instead of 4*QB row fragments.
+
+    For the fixed 2x coordinate map (``align_corners=False``, no explicit
+    scales, ``OH == 2*IH``, ``OW == 2*IW``) the weights are exactly
+    ``1/4, 3/4``, so the source row pair ``(r-1, r)`` determines both output
+    rows that depend on it:
+        even row 2r       = 0.25*V[r-1] + 0.75*V[r]
+        odd  row 2(r-1)+1 = 0.75*V[r-1] + 0.25*V[r]
+    i.e. one pair of mixed tiles serves two output rows and the odd tile is
+    stored one row lower.  No per-row index vector is ever built; the only
+    data-dependent scalar is the row base ``lb``.
+
+    The horizontal expansion uses only ONE ``tl.gather`` per row set.  The odd
+    column ``k`` and the even column ``k+1`` are both mixtures of the same pair
+    ``(V[k], V[k+1])`` with swapped weights, so the interleaved output row is
+    ``interleave(A, B)`` placed one element higher, where
+    ``A[k] = 0.75 V[k] + 0.25 V[k+1]`` lands on column ``2k+1`` and
+    ``B[k] = 0.25 V[k] + 0.75 V[k+1]`` on column ``2k+2``.  Only the +1
+    neighbour is needed (2 gathers per program instead of 4, measured -11% on
+    the large geometry), the tail slot of the shifted store is masked, and
+    column 0 of every row is written by a separate per-row store of the
+    vertically mixed source column 0 -- which is exactly the reference value
+    there because ``w0 = 0`` makes the horizontal pair ``1.0/0.0``.
+
+    Alternatives measured and rejected on this target: CANN
+    ``insert_slice``/``extract_slice`` static-offset slices (flat form
+    overflows UB, 2-D form is 7x slower than the gather) and +-1 element
+    shifted block loads (6x slower, their arithmetic leaves the 2-D tile
+    shape).
+
+    ``lb = max(r0 - 1, 0)`` makes the first block of every image use rows
+    ``(0, 1)``, which reproduces PyTorch's clamped top edge exactly because
+    ``0.25*x + 0.75*x == x``.  The block grid then covers output rows
+    ``1 .. OH-2``, so ``NB``-th program of every image (``b == NB``) writes the
+    two clamped end rows, whose reference value is the horizontally resampled
+    edge input row.  Both kinds of program live in the same launch, so the
+    whole op is a single kernel: on the small geometries the per-launch host
+    cost (~20 us) dominates the device work.
+
+    Every store of the block grid is in bounds and adjacent blocks only ever
+    write the same value to a shared row, so no store mask is needed.
+
+``_bilinear_int_kernel`` / ``_bilinear_flat_kernel``
+    Unchanged round-2 kernels covering the whole remaining domain: 2x width
+    with non-contiguous strides, non-2x ratios, ``align_corners=True``,
+    explicit scales, 1x1 outputs and non power-of-two widths.
+
+All three paths reproduce PyTorch's coordinate mapping:
+``src = idx*(in-1)/(out-1)`` for ``align_corners`` (0 when ``out == 1``),
+otherwise ``src = max((idx + 0.5)*scale - 0.5, 0)`` with ``scale = 1/scales_*``
+when given and positive, else ``in/out``; the right/bottom neighbour is
+``min(i0 + 1, size - 1)``, matching PyTorch's ``i1p`` edge rule.
+"""
+
+import torch
+import torch_npu  # noqa: F401  (raw current-stream query, as in round 2)
+import triton
+import triton.language as tl
+
+# tuning knobs (overridable by diagnostics)
+_TARGET_PROGRAMS = 256
+_UB_ELEMS = 2048
+_FLAT_ELEMS = 2048
+# elements per contiguous input block (QB * IW); the UB budget is in bytes, so
+# a 16-bit dtype may double the element count (validated: QB*IW = 2048 in
+# float32 and 4096 in float16 both compile, the next power of two overflows).
+_BLK_ELEMS_32 = 2048
+_BLK_MIN_PROGRAMS = 128
+
+
+# --------------------------------------------------------------------------
+# exact 2x fast path: contiguous input blocks, two output rows per mix
+# --------------------------------------------------------------------------
+@triton.jit
+def _blk2x_kernel(
+    ptr_o,
+    ptr_i,
+    IH: tl.constexpr,
+    IW: tl.constexpr,
+    OH: tl.constexpr,
+    OW: tl.constexpr,
+    NB: tl.constexpr,
+    QB: tl.constexpr,
+    H16: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    img = pid // (NB + 1)
+    b = pid - img * (NB + 1)
+
+    if b < NB:
+        r0 = b * QB
+        # the first block of an image starts at row 0 so both loads stay in
+        # bounds; 0.25*x + 0.75*x == x reproduces the clamped top edge.
+        lb = tl.maximum(r0 - 1, 0)
+        L: tl.constexpr = QB * IW
+        offs = tl.arange(0, L)
+        ibase = img * (IH * IW) + lb * IW
+        f = tl.load(ptr_i + ibase + offs)
+        g = tl.load(ptr_i + ibase + IW + offs)
+
+        if H16:
+            vf = tl.reshape(0.25 * f + 0.75 * g, (QB, IW))
+            vo = tl.reshape(0.75 * f + 0.25 * g, (QB, IW))
+        else:
+            ff = f.to(tl.float32)
+            gg = g.to(tl.float32)
+            vf = tl.reshape(0.25 * ff + 0.75 * gg, (QB, IW))
+            vo = tl.reshape(0.75 * ff + 0.25 * gg, (QB, IW))
+
+        # One shift per row set.  The odd column k and the even column k+1 are
+        # both mixtures of the pair (V[k], V[k+1]) with swapped weights, so the
+        # interleaved output row is interleave(A, B) placed one element higher:
+        #   A[k] = 0.75 V[k] + 0.25 V[k+1]  -> column 2k+1
+        #   B[k] = 0.25 V[k] + 0.75 V[k+1]  -> column 2k+2
+        # Only the +1 neighbour is required, i.e. two gathers instead of four.
+        k = tl.arange(0, IW)
+        ir = tl.broadcast_to(tl.minimum(k + 1, IW - 1)[None, :], (QB, IW))
+        pfr = tl.gather(vf, ir, 1)
+        por = tl.gather(vo, ir, 1)
+        pe = tl.reshape(tl.join(0.75 * vf + 0.25 * pfr,
+                                0.25 * vf + 0.75 * pfr), (QB, OW))
+        po = tl.reshape(tl.join(0.75 * vo + 0.25 * por,
+                                0.25 * vo + 0.75 * por), (QB, OW))
+
+        c = tl.arange(0, OW)
+        # the tile's last slot is the non-existent even column IW, so the tail
+        # element of the shifted store is dropped
+        m = tl.broadcast_to((c < OW - 1)[None, :], (QB, OW))
+        rowb = 2 * (lb + tl.arange(0, QB)) * OW
+        obase = img * (OH * OW)
+        tl.store(ptr_o + obase + (rowb + 2 * OW)[:, None] + 1 + c[None, :],
+                 pe.to(ptr_o.dtype.element_ty), mask=m)
+        tl.store(ptr_o + obase + (rowb + OW)[:, None] + 1 + c[None, :],
+                 po.to(ptr_o.dtype.element_ty), mask=m)
+        # column 0 of each row is the reference's 1.0/0.0 horizontal pair, i.e.
+        # exactly the vertically mixed source column 0
+        zf = tl.zeros((QB, IW), vf.dtype)
+        k0 = tl.broadcast_to((k == 0)[None, :], (QB, IW))
+        c0 = tl.join(tl.sum(tl.where(k0, vo, zf), 1),
+                     tl.sum(tl.where(k0, vf, zf), 1))
+        tl.store(ptr_o + obase + rowb[:, None] + OW
+                 + tl.arange(0, 2)[None, :] * OW, c0.to(ptr_o.dtype.element_ty))
+    else:
+        # clamped end rows: the vertical pair is (edge row, edge row), so the
+        # value is just the horizontally resampled edge input row.
+        k = tl.arange(0, IW)
+        ibase = img * (IH * IW)
+        obase = img * (OH * OW)
+        j = tl.arange(0, OW)
+        v0 = tl.load(ptr_i + ibase + k)
+        v1 = tl.load(ptr_i + ibase + (IH - 1) * IW + k)
+        if H16:
+            e0 = 0.25 * tl.gather(v0, tl.maximum(k - 1, 0), 0) + 0.75 * v0
+            d0 = 0.75 * v0 + 0.25 * tl.gather(v0, tl.minimum(k + 1, IW - 1), 0)
+            e1 = 0.25 * tl.gather(v1, tl.maximum(k - 1, 0), 0) + 0.75 * v1
+            d1 = 0.75 * v1 + 0.25 * tl.gather(v1, tl.minimum(k + 1, IW - 1), 0)
+        else:
+            w0 = v0.to(tl.float32)
+            w1 = v1.to(tl.float32)
+            e0 = 0.25 * tl.gather(w0, tl.maximum(k - 1, 0), 0) + 0.75 * w0
+            d0 = 0.75 * w0 + 0.25 * tl.gather(w0, tl.minimum(k + 1, IW - 1), 0)
+            e1 = 0.25 * tl.gather(w1, tl.maximum(k - 1, 0), 0) + 0.75 * w1
+            d1 = 0.75 * w1 + 0.25 * tl.gather(w1, tl.minimum(k + 1, IW - 1), 0)
+        p0 = tl.reshape(tl.join(e0, d0), (OW,))
+        p1 = tl.reshape(tl.join(e1, d1), (OW,))
+        tl.store(ptr_o + obase + j, p0.to(ptr_o.dtype.element_ty))
+        tl.store(ptr_o + obase + (OH - 1) * OW + j, p1.to(ptr_o.dtype.element_ty))
+
+
+# --------------------------------------------------------------------------
+# round-2 fast path: exact 2x horizontal expansion, per-output-row loads
+# --------------------------------------------------------------------------
+@triton.jit
+def _bilinear_int_kernel(
+    ptr_o,
+    ptr_i,
+    n_rows,
+    s_n,
+    s_c,
+    s_h,
+    rh,
+    C: tl.constexpr,
+    IH: tl.constexpr,
+    IW: tl.constexpr,
+    OH: tl.constexpr,
+    OW: tl.constexpr,
+    BR: tl.constexpr,
+    IWP: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    rows = pid * BR + tl.arange(0, BR)
+    oh = rows % OH
+    nc = rows // OH
+    n = nc // C
+    c = nc - n * C
+
+    real_h = tl.maximum((oh.to(tl.float32) + 0.5) * rh - 0.5, 0.0)
+    h0f = real_h.to(tl.int32)
+    hl = real_h - h0f.to(tl.float32)
+    h0 = tl.minimum(h0f, IH - 1)
+    h1 = tl.minimum(h0 + 1, IH - 1)
+
+    base = n * s_n + c * s_c
+    rr0 = (base + h0 * s_h)[:, None]
+    rr1 = (base + h1 * s_h)[:, None]
+
+    k = tl.arange(0, IWP)
+    ka = k[None, :]
+    lm = tl.broadcast_to((ka < IW) & (rows[:, None] < n_rows), (BR, IWP))
+    il = tl.broadcast_to(tl.maximum(k - 1, 0)[None, :], (BR, IWP))
+    ir = tl.broadcast_to(tl.minimum(k + 1, IW - 1)[None, :], (BR, IWP))
+
+    hl2 = hl[:, None]
+    h0l2 = 1.0 - hl2
+
+    v = h0l2 * tl.load(ptr_i + (rr0 + ka), mask=lm, other=0.0).to(tl.float32) \
+        + hl2 * tl.load(ptr_i + (rr1 + ka), mask=lm, other=0.0).to(tl.float32)
+
+    vm = tl.gather(v, il, 1)
+    vp = tl.gather(v, ir, 1)
+
+    even = 0.25 * vm + 0.75 * v
+    odd = 0.75 * v + 0.25 * vp
+
+    val = tl.join(even, odd)
+    j = tl.arange(0, 2)
+    ooff = (rows * OW)[:, None, None] + (ka * 2)[:, :, None] + j[None, None, :]
+    om = tl.broadcast_to(
+        (ka < IW)[:, :, None] & (rows[:, None, None] < n_rows), (BR, IWP, 2)
+    )
+    tl.store(ptr_o + ooff, val.to(ptr_o.dtype.element_ty), mask=om)
+
+
+# --------------------------------------------------------------------------
+# general path: flat 1-D tile, neighbours read through the real strides
+# --------------------------------------------------------------------------
+@triton.jit
+def _bilinear_flat_kernel(
+    ptr_o,
+    ptr_i,
+    total,
+    s_n,
+    s_c,
+    s_h,
+    s_w,
+    rh,
+    rw,
+    C: tl.constexpr,
+    OH: tl.constexpr,
+    OW: tl.constexpr,
+    IH: tl.constexpr,
+    IW: tl.constexpr,
+    ALIGN_CORNERS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total
+
+    ow = offs % OW
+    row = offs // OW
+    oh = row % OH
+    nc = row // OH
+
+    if ALIGN_CORNERS:
+        if OH > 1:
+            real_h = oh.to(tl.float32) * ((IH - 1.0) / (OH - 1.0))
+        else:
+            real_h = tl.zeros([BLOCK], dtype=tl.float32)
+        if OW > 1:
+            real_w = ow.to(tl.float32) * ((IW - 1.0) / (OW - 1.0))
+        else:
+            real_w = tl.zeros([BLOCK], dtype=tl.float32)
+    else:
+        real_h = tl.maximum((oh.to(tl.float32) + 0.5) * rh - 0.5, 0.0)
+        real_w = tl.maximum((ow.to(tl.float32) + 0.5) * rw - 0.5, 0.0)
+
+    h0 = real_h.to(tl.int32)
+    w0 = real_w.to(tl.int32)
+    hl = real_h - h0.to(tl.float32)
+    wl = real_w - w0.to(tl.float32)
+
+    h0 = tl.minimum(h0, IH - 1)
+    w0 = tl.minimum(w0, IW - 1)
+    h1 = tl.minimum(h0 + 1, IH - 1)
+    w1 = tl.minimum(w0 + 1, IW - 1)
+
+    n = nc // C
+    c = nc - n * C
+    base = n * s_n + c * s_c
+    r0 = base + h0 * s_h
+    r1 = base + h1 * s_h
+    c0 = w0 * s_w
+    c1 = w1 * s_w
+
+    v00 = tl.load(ptr_i + (r0 + c0), mask=mask, other=0.0).to(tl.float32)
+    v01 = tl.load(ptr_i + (r0 + c1), mask=mask, other=0.0).to(tl.float32)
+    v10 = tl.load(ptr_i + (r1 + c0), mask=mask, other=0.0).to(tl.float32)
+    v11 = tl.load(ptr_i + (r1 + c1), mask=mask, other=0.0).to(tl.float32)
+
+    w0l = 1.0 - wl
+    h0l = 1.0 - hl
+    top = w0l * v00 + wl * v01
+    bot = w0l * v10 + wl * v11
+    val = h0l * top + hl * bot
+
+    tl.store(ptr_o + offs, val.to(ptr_o.dtype.element_ty), mask=mask)
+
+
+# --------------------------------------------------------------------------
+# host side
+# --------------------------------------------------------------------------
+def _reciprocal_scale(in_size, out_size, align_corners, scale):
+    """PyTorch ``area_pixel_compute_scale`` (accscalar_t == float32 path)."""
+    if align_corners:
+        if out_size > 1:
+            return (in_size - 1) / (out_size - 1)
+        return 0.0
+    if scale is not None and scale > 0:
+        return 1.0 / float(scale)
+    return in_size / out_size
+
+
+def _pick_flat_block(total):
+    if total >= (1 << 20):
+        return _FLAT_ELEMS
+    if total >= (1 << 16):
+        return 1024
+    if total >= (1 << 12):
+        return 512
+    return 256
+
+
+def _pick_rows_per_program(iwp, n_rows):
+    cap = max(1, _UB_ELEMS // iwp)
+    want = max(1, triton.cdiv(n_rows, _TARGET_PROGRAMS))
+    br = min(cap, want)
+    br = 1 << (br.bit_length() - 1)
+    while br > 1 and n_rows % br != 0:
+        br >>= 1
+    return max(1, br)
+
+
+def _pick_block_rows(ih, iw, images, elem_bytes):
+    """Input rows per program for the exact-2x block kernel.
+
+    Bounded by the per-tile element budget ``QB * IW``: 2048 elements when the
+    accumulators are float32 (float32 and bfloat16 inputs), 4096 when every
+    tile stays in float16, whose UB footprint is half.  Measured on this
+    target: 2048 float32 elements compile and the next power of two overflows
+    the 192 KiB UB; 4096 float16 elements compile.  Also bounded by
+    ``ih // 2`` so every image is split across at least two block programs,
+    and by a soft program-count floor.  Derived from the workload only; no
+    physical core count is assumed.
+    """
+    budget = 2 * _BLK_ELEMS_32 if elem_bytes == 2 else _BLK_ELEMS_32
+    qb = min(max(1, ih // 2), max(1, budget // iw))
+    qb = 1 << (qb.bit_length() - 1)
+    while qb > 1 and (ih % qb != 0 or images * (ih // qb) < _BLK_MIN_PROGRAMS):
+        qb >>= 1
+    return max(1, qb)
+
+
+def _plan(shape, strides, out_size, ac, scales_h, scales_w, dtype):
+    """Resolve everything that depends only on tensor *metadata*.
+
+    Only scalars are produced; no tensor, storage or data pointer is cached.
+    The caller's cache key contains shape, strides, dtype, output size and the
+    coordinate options, so a different view or layout derives its own entry
+    instead of reusing a stale one.
+    """
+    N, C, IH, IW = shape
+    OH, OW = out_size
+    s_n, s_c, s_h, s_w = strides
+    images = N * C
+    n_rows = images * OH
+
+    rh = _reciprocal_scale(IH, OH, ac, scales_h)
+    rw = _reciprocal_scale(IW, OW, ac, scales_w)
+
+    contiguous = (s_w == 1 and s_h == IW and s_c == IH * IW
+                  and s_n == C * IH * IW)
+    if (
+        not ac
+        and scales_h is None
+        and scales_w is None
+        and contiguous
+        and OW == 2 * IW
+        and OH == 2 * IH
+        and IW >= 8
+        and (IW & (IW - 1)) == 0
+        and IH >= 4
+        and dtype in (torch.float16, torch.bfloat16, torch.float32)
+    ):
+        h16 = dtype is torch.float16
+        qb = _pick_block_rows(IH, IW, images, 2 if h16 else 4)
+        nb = IH // qb
+        # (kind, grid, payload, h16)
+        return (0, (images * (nb + 1),), (IH, IW, OH, OW, nb, qb), h16)
+
+    if (
+        not ac
+        and scales_h is None
+        and scales_w is None
+        and s_w == 1
+        and IW > 1
+        and OW == 2 * IW
+    ):
+        iwp = triton.next_power_of_2(IW)
+        br = _pick_rows_per_program(iwp, n_rows)
+        return (1, (triton.cdiv(n_rows, br),),
+                (n_rows, s_n, s_c, s_h, rh, C, IH, IW, OH, OW, br, iwp), False)
+
+    total = images * OH * OW
+    block = _pick_flat_block(total)
+    return (2, (triton.cdiv(total, block),),
+            (total, s_n, s_c, s_h, s_w, rh, rw, C, OH, OW, IH, IW, ac, block),
+            False)
+
+
+_PLAN_CACHE = {}
+_LAUNCH_CACHE = {}
+_RAW_STREAM_GETTERS = {}
+
+
+def _current_raw_stream(device_index):
+    getter = _RAW_STREAM_GETTERS.get(device_index)
+    if getter is None:
+        raw = getattr(torch_npu._C, "_npu_getCurrentRawStreamNoWait", None)
+        expected = int(torch.npu.current_stream(device_index).npu_stream)
+        if raw is not None:
+            try:
+                if int(raw(device_index)) == expected:
+                    getter = lambda: raw(device_index)
+            except TypeError:
+                if int(raw()) == expected:
+                    getter = raw
+        if getter is None:
+            from triton.runtime import driver
+            getter = lambda: driver.active.get_current_stream(device_index)
+        _RAW_STREAM_GETTERS[device_index] = getter
+    return getter()
+
+
+def _ordinary(input, output_size, align_corners, scales_h, scales_w):
+    """Plan-compiling launch path; also the one that fills _LAUNCH_CACHE."""
+    N, C, IH, IW = input.shape
+    OH = int(output_size[0])
+    OW = int(output_size[1])
+    out = torch.empty((N, C, OH, OW), device=input.device, dtype=input.dtype)
+    if N * C * OH * OW == 0:
+        return out
+
+    key = (N, C, IH, IW, OH, OW, bool(align_corners), scales_h, scales_w,
+           input.stride(), input.dtype)
+    plan = _PLAN_CACHE.get(key)
+    if plan is None:
+        plan = _plan((N, C, IH, IW), input.stride(), (OH, OW),
+                     bool(align_corners), scales_h, scales_w, input.dtype)
+        _PLAN_CACHE[key] = plan
+
+    kind = plan[0]
+    if kind == 0:
+        ih, iw, oh, ow, nb, qb = plan[2]
+        compiled = _blk2x_kernel[plan[1]](out, input, IH=ih, IW=iw, OH=oh,
+                                          OW=ow, NB=nb, QB=qb, H16=plan[3])
+        lkey = (input.shape, input.stride(), input.dtype, OH, OW,
+                align_corners, scales_h, scales_w, input.device.index,
+                input.data_ptr() & 15, out.data_ptr() & 15)
+        if lkey not in _LAUNCH_CACHE and _cacheable(compiled):
+            _LAUNCH_CACHE[lkey] = (compiled.run.launch, compiled.function,
+                                   compiled.packed_metadata, plan[1][0],
+                                   input.device.index)
+    elif kind == 1:
+        n_rows, s_n, s_c, s_h, rh, kc, kih, kiw, koh, kow, br, iwp = plan[2]
+        _bilinear_int_kernel[plan[1]](
+            out, input, n_rows, s_n, s_c, s_h, rh,
+            C=kc, IH=kih, IW=kiw, OH=koh, OW=kow, BR=br, IWP=iwp)
+    else:
+        (total, s_n, s_c, s_h, s_w, rh, rw, kc, koh, kow, kih, kiw, ac,
+         block) = plan[2]
+        _bilinear_flat_kernel[plan[1]](
+            out, input, total, s_n, s_c, s_h, s_w, rh, rw,
+            C=kc, OH=koh, OW=kow, IH=kih, IW=kiw,
+            ALIGN_CORNERS=ac, BLOCK=block)
+    return out
+
+
+def _cacheable(compiled):
+    """True when the compiled kernel may be re-launched through its own
+    generated launcher: no compile-only run, no profiling hook registration
+    and no debugger attachment."""
+    launcher = compiled.run
+    if getattr(launcher, "compile_only", False):
+        return False
+    if getattr(launcher, "enable_msprof_register_tensor", False):
+        return False
+    metadata = getattr(launcher, "metadata", None)
+    if metadata is not None and (getattr(metadata, "debug_enabled", False)
+                                 or getattr(metadata, "debug", False)):
+        return False
+    return True
+
+
+def run(input, output_size, align_corners=False, scales_h=None, scales_w=None):
+    N, C, IH, IW = input.shape
+    OH = int(output_size[0])
+    OW = int(output_size[1])
+    out = torch.empty((N, C, OH, OW), device=input.device, dtype=input.dtype)
+    if N * C * OH * OW == 0:
+        return out
+    in_ptr = input.data_ptr()
+    out_ptr = out.data_ptr()
+    entry = _LAUNCH_CACHE.get(
+        (input.shape, input.stride(), input.dtype, OH, OW, align_corners,
+         scales_h, scales_w, input.device.index, in_ptr & 15, out_ptr & 15))
+    if entry is None:
+        return _ordinary(input, output_size, align_corners, scales_h, scales_w)
+    # All pointers are from this call; no input/output tensors or historical
+    # streams are cached.  Every scalar specialization is part of the key.
+    entry[0](entry[3], 1, 1, _current_raw_stream(entry[4]), entry[1], entry[2],
+             None, None, None, out_ptr, in_ptr,
+             None, None, None, None, None, None, None)
+    return out

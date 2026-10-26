@@ -1,0 +1,15 @@
+{
+  "command": [
+    "{python}",
+    "probe.py",
+    "--variant",
+    "flat_store_launch"
+  ],
+  "files": [
+    {
+      "path": "probe.py",
+      "content": "import sys\nsys.dont_write_bytecode=True\nfrom pathlib import Path\nimport argparse,hashlib,importlib.util,json,time\nimport torch,torch_npu\n\ndef load(name,p):\n s=importlib.util.spec_from_file_location(name,p);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);return m\n\ndef main():\n p=argparse.ArgumentParser();p.add_argument('--variant',required=True);a=p.parse_args()\n batch=Path('/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/campaigns/two-closure-20261024')\n out=batch/'research/dataflow-probes'/a.variant\n source=batch/'knowledge'/('upsample-'+a.variant+'.py')\n candidate=load('independent_candidate',source)\n parent=load('independent_parent',batch/'seeds/upsample_bilinear2d.py')\n oracle=load('independent_oracle',batch/'catalog/ops/upsample_bilinear2d/oracle.py')\n cases=[json.loads(l) for l in (batch/'catalog/ops/upsample_bilinear2d/timing.jsonl').read_text().splitlines()][:2]\n rows=[]\n for case in cases:\n  args=oracle.gen_inputs(case,'npu:0');expected=oracle.run(**args);torch.npu.synchronize()\n  for label,module in [('parent',parent),(a.variant,candidate)]:\n   got=module.run(**args);torch.npu.synchronize()\n   tol=case['tolerance'];torch.testing.assert_close(got.cpu(),expected.cpu(),atol=tol['atol'],rtol=tol['rtol'])\n   for _ in range(3):module.run(**args);torch.npu.synchronize()\n   timings=[]\n   for _ in range(9):\n    t=time.perf_counter();got=module.run(**args);torch.npu.synchronize();timings.append((time.perf_counter()-t)*1000)\n   timings.sort();row=dict(case=case['name'],variant=label,correct=True,median_ms=timings[4],samples_ms=timings);rows.append(row);print('TIMING',json.dumps(row),flush=True)\n  (out/'timings.json').write_text(json.dumps(dict(source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),rows=rows),indent=2)+'\\n')\n\nif __name__=='__main__':main()\n"
+    }
+  ],
+  "timeout_seconds": 300
+}

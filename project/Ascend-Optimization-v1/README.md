@@ -34,6 +34,8 @@ Ascend-Optimization-v1/
 
 ## 阅读入口
 
+最新[两算子收尾交付](operators/两算子收尾交付-20261024.md)：上采样**0.915×**、原合同24/24，累计积分**0.812×（官方确定性条件）**、33/33。默认累计积分参考不稳定的固定输入反例及复现步骤一并交付；不将确定性成绩混成默认合同通过。完整源码、门禁、原始证据和单次复现命令见[本批README](operators/campaigns/two-closure-20261024/README.md)。
+
 [六算子夜间连续优化已结束](operators/夜间连续优化交付-20261023.md)：`gelu_and_mul` 2.271×、`uniform` 1.325×、`rad2deg_` 1.117×、`selu_` 0.837×；SELU 同批实际加速1.042×。`scatter_add` 0.419×未达标，`cumulative_trapezoid`未通过数值门禁。七份完整原始快照共4507个文件、62项离线证据核验通过；SELU/rad2deg_的KGS metrics缺口单列。最终源码与结果以[机器清单](operators/夜间连续优化交付-20261023.json)为准，uniform已替换为标准Philox修复版，旧1.497×不作为交付。
 
 上轮结果：[log10_、selu_缓冲与搬运优化](operators/campaigns/buffer-pointwise-20261022/README.md)。最终0.875×、0.898×；log10_相对同批父版实际加速1.125×，SELU保留旧源码。各36项正式测试及42＋12＋9项补充检查通过，最终采集和48项证据核验闭环。源码、简报和一次完整复现命令均在该批次内；上轮0.737×、0.790×保留在[历史成对批次](operators/campaigns/paired-pointwise-20261022/README.md)。
