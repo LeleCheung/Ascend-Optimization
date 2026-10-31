@@ -82,8 +82,9 @@ def main():
     for op in ['linalg_inv_ex','cumulative_trapezoid']:
         best=state.get('operators',{}).get(op,{}).get('best');checked=verify(best);searches[op]=checked
         if checked.get('status')=='verified' and checked.get('correctness_passed') and checked.get('extra_status')=='passed' and checked.get('score',0)>.8:
+            checked['original_numerical_contract_passed']=True
             if op=='cumulative_trapezoid':checked['reference_status']='默认参考稳定性仍需单列核验'
-            else:new_regular.append(op)
+            else:checked['reference_status']='原PyTorch参考含CPU回退，数值通过与公平NPU性能分列'
     unknown=[]
     for request in BATCH.rglob('*.request.json'):
         payload=read(request)
