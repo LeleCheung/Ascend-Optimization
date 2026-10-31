@@ -1,5 +1,7 @@
 # 910B 算子优化项目
 
+2026-10-31夜间六项仍在推进，当前入口为[30项验收总表](operators/campaigns/reference-closure-20261031/30项验收总表.md)和[CANN参考工具](tools/profiling/hgkda/reference_closure/README.md)。24项原参考稳定达标继续保留；CANN兼容组合、命名NPU分解与原参考条件分别报告。
+
 2026-10-31完成[最后两项攻关交付](operators/campaigns/remaining-final-20261031/交付报告.md)：`fix` **0.862×**、`expm1_` **0.879×**新增稳定达标，各自同源码两次完整评测30/30、原扩展、24项原生路径与30项冻结新形状检查通过。30项目标累计**24项常规稳定达标、1项求逆正确性未通过、5项特殊参考条件单列**。本轮是Codex自写Ascend C＋Triton特殊布局回退，未新增CC/DeepSeek生成。新增执行路径诊断入口，分别核算候选/参考延迟变化；14份正式请求、12条设备路径、2份真实Triton IR已核验。[复现工具](tools/profiling/hgkda/remaining_final/README.md)和本批`delivery.json`为最新入口，下列旧日期内容保留为历史记录。
 
 2026-10-30接续[剩余九项攻关交付](operators/campaigns/remaining-nine-20261030/交付报告.md)：新增稳定达标6项——`negative_` 0.937×、`log2_` 0.915×、`round_out` 1.412×、`special_round_out` 1.247×、`hardswish` 0.905×、`fmod_tensor_` 1.242×。均为自写Ascend C＋Triton布局回退，通过同源码两次完整KGS、原扩展及对齐路径检查。`fix`第三次0.766×未过线，`expm1_`0.697×及求逆5/7继续列为未完成。30项累计22项常规达标，另有5项特殊参考条件；37份正式请求、52条设备路径、9份实际IR已核验。[复现工具](tools/profiling/hgkda/remaining/README.md)和交付清单提供源码、附件身份及单次新复测入口。

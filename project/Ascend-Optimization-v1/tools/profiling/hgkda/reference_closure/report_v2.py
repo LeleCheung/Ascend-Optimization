@@ -39,6 +39,9 @@ def main():
         for f in leaf.iterdir():
             if f.is_file():track(f)
         checked.update(backend=rec.get('backend'),reference_leaf=str(leaf),reference_oracle_sha256=sha(leaf/'oracle.py'))
+        timing=[r for r in raw.get('per_workload',[]) if r.get('phase')=='timing']
+        checked['timing_summary']=dict(total=len(timing),below_threshold=sum(isinstance(r.get('speedup'),(int,float)) and r['speedup']<.8 for r in timing),
+            worst=[{k:r.get(k) for k in ['uuid','speedup','latency_ms','reference_latency_ms']} for r in sorted(timing,key=lambda r:r.get('speedup') if isinstance(r.get('speedup'),(int,float)) else float('inf'))[:3]])
         return checked
     def extra(p,op,source,leaf):
         if not p.exists():return dict(status='not_run')
@@ -48,6 +51,17 @@ def main():
         command=value.get('reproduce_command',[])
         if '--leaf' in command:assert sha(Path(command[command.index('--leaf')+1])/'oracle.py')==sha(leaf/'oracle.py')
         return dict(status=supplement_status(op,value,sha(source)),passed=value.get('passed'),total=value.get('total'),evidence=str(p))
+    def dynamic(op,source,leaf):
+        p=source.parent/'dynamic-semantics.json'
+        if not p.exists():return dict(status='not_run')
+        value=read(p);track(p)
+        assert value['operator']==op and value['source_sha256']==sha(source)
+        assert value['contract_sha256']=={n:sha(leaf/n) for n in ['definition.json','oracle.py','correctness.jsonl','timing.jsonl']}
+        track(value['checker_source']['path'],value['checker_source']['sha256'])
+        assert value['total']==9 and len(value['cases'])==9
+        assert value['passed']==sum(bool(r['passed']) for r in value['cases'])
+        return dict(status='passed' if value['passed']==9 else 'failed',passed=value['passed'],total=9,evidence=str(p),
+            failures=[r for r in value['cases'] if not r['passed']])
     for index in [BATCH/'reference-index.json']+sorted(BATCH.glob('reference-index-v*.json')):
         if not index.exists():continue
         track(index)
@@ -63,10 +77,10 @@ def main():
             rows.append(dict(operator=op,revision=ref.get('revision','v1'),kind=ref['kind'],scope=ref['scope'],
                 qualification=dict(status=q.get('status',qjob.get('status','not_run')),passed=q.get('passed'),total=q.get('total'),eligible_full_contract=q.get('eligible_full_contract',False),error=qjob.get('error')),
                 cann_vs_original=formal('cann-formal'+version+':'+op,op,leaf),cann_supplementary=extra(source.parent/'extra-checks.json',op,source,leaf),path=path_result,
-                source=str(source),source_sha256=sha(source),binary_sha256=ref['binary_sha256']))
+                source=str(source),source_sha256=sha(source),binary_sha256=ref['binary_sha256'],dynamic_semantics=dynamic(op,source,leaf)))
     comparisons=[]
-    for op in ['fake_quantize_per_tensor_affine_cachemask_out','batch_norm_with_update_functional','fractional_max_pool3d','_conj_physical']:
-        cann=op in ['fake_quantize_per_tensor_affine_cachemask_out','batch_norm_with_update_functional'];kind='CANN-direct' if cann else 'NPU-decomposition'
+    for op in ['fix','fake_quantize_per_tensor_affine_cachemask_out','batch_norm_with_update_functional','fractional_max_pool3d','_conj_physical']:
+        cann=op in ['fix','fake_quantize_per_tensor_affine_cachemask_out','batch_norm_with_update_functional'];kind='CANN-direct' if cann else 'NPU-decomposition'
         key=('candidate-vs-cann:' if cann else 'supplemental-full:')+op
         if not cann and state['jobs'].get('supplemental-full-v2:'+op,{}).get('result'):
             key='supplemental-full-v2:'+op;kind='NPU-decomposition-v2'
@@ -75,12 +89,45 @@ def main():
             comparisons.append(dict(operator=op,reference=kind,status=job.get('status','pending'),error=job.get('error')));continue
         result=Path(rec['result']);label=result.name.split('-1.result.json')[0];leaf=BATCH/'catalog-snapshots'/('formal-'+label+'-'+op)/'ops'/op
         source=Path(rec['source']);checked=formal(key,op,leaf);gates=extra(BATCH/'comparisons'/op/kind/'extra-checks.json',op,source,leaf)
-        ok=checked.get('correctness_passed') and gates['status']=='passed' and checked.get('score',0)>.8
+        reference_dynamic=dict(status='not_applicable')
+        if op in ['fake_quantize_per_tensor_affine_cachemask_out','batch_norm_with_update_functional']:
+            revision='v2' if op.startswith('fake_') else 'v3'
+            reference=read(BATCH/('reference-index-'+revision+'.json'))[op]
+            reference_dynamic=dynamic(op,Path(reference['source']),BATCH/records[op]['catalog_leaf'])
+        ok=checked.get('correctness_passed') and gates['status']=='passed' and checked.get('score',0)>.8 and reference_dynamic['status'] in {'passed','not_applicable'}
         comparisons.append(dict(operator=op,reference=kind,formal=checked,supplementary=gates,threshold_passed=bool(ok),
+            reference_dynamic_semantics=reference_dynamic,
             attribution='既有候选复测；本轮未新生成该实现',scope='独立命名NPU参考，不替代原PyTorch默认合同'))
+    isolated_path=BATCH/'references/linalg_inv_ex/isolated-audit-v1/summary.json'
+    inverse_isolated=read(isolated_path) if isolated_path.exists() else dict(status='pending')
+    if isolated_path.exists():
+        track(isolated_path)
+        assert inverse_isolated['source_sha256']==sha(inverse_isolated['source']) and inverse_isolated['eligible_full_inv_ex_contract'] is False
+        for f in isolated_path.parent.rglob('*'):
+            if f.is_file():track(f)
+    proposal=None;proposal_source=BATCH/'proposals/linalg_inv_ex/padded-block-v1/main.py'
+    if proposal_source.exists():
+        track(proposal_source);directory=proposal_source.parent;op='linalg_inv_ex'
+        for path in directory.glob('*.json'):track(path)
+        diagnostic=read(directory/'diagnostic.json') if (directory/'diagnostic.json').exists() else dict(status='pending')
+        if diagnostic.get('source_sha256'):assert diagnostic['source_sha256']==sha(proposal_source)
+        proposal=dict(attribution='Codex修改CC候选的一般性最小分块；非KG独立自动结果',diagnostic=diagnostic,
+            formal=formal('inverse-padded-formal',op,BATCH/'catalog-snapshots/formal-HG-KDA-padded-block-linalg_inv_ex/ops/linalg_inv_ex'),
+            supplementary=extra(directory/'extra-checks.json',op,proposal_source,BATCH/records[op]['catalog_leaf']))
     new_regular=[];searches={}
     for op in ['linalg_inv_ex','cumulative_trapezoid']:
         best=state.get('operators',{}).get(op,{}).get('best');checked=verify(best);searches[op]=checked
+        manifest=BATCH/'results'/op/'search-1/native-evidence/archive-manifest.json'
+        if manifest.exists():
+            native=read(manifest);track(manifest);rounds=[]
+            for item in native['files']:
+                path=manifest.parent/item['archived_path'];track(path,item['sha256'])
+                if '/round-' in item['source_path'] and item['source_path'].endswith('/result.json'):
+                    raw=read(path);rounds.append(dict(round=item['source_path'],status=raw.get('status'),passed=raw.get('num_passed'),
+                        total=raw.get('num_workloads'),score=raw.get('geo_mean') if raw.get('status')=='PASSED' else None,evidence=str(path)))
+            checked['native_search']=dict(state=native.get('state'),rounds=rounds,manifest=str(manifest))
+        job=state['jobs'].get('search:'+op+':1',{})
+        if not best:checked['status']=job.get('result',{}).get('status',job.get('status','pending'))
         if checked.get('status')=='verified' and checked.get('correctness_passed') and checked.get('extra_status')=='passed' and checked.get('score',0)>.8:
             checked['original_numerical_contract_passed']=True
             if op=='cumulative_trapezoid':checked['reference_status']='默认参考稳定性仍需单列核验'
@@ -94,21 +141,23 @@ def main():
         else:unknown.append(str(request))
     accepted=list(dict.fromkeys(initial['accepted']+new_regular))
     data=dict(schema='hgkda-reference-closure-delivery-v2',queue_status=state.get('status'),current_job=state.get('current_job'),initial_regular=24,regular_accepted=len(accepted),total=30,
-        new_regular=new_regular,accepted=accepted,references=rows,comparisons=comparisons,searches=searches,unresolved_requests=unknown,audit_issues=issues,evidence_sha256=evidence,
+        new_regular=new_regular,accepted=accepted,references=rows,comparisons=comparisons,searches=searches,inverse_isolated=inverse_isolated,inverse_padded_proposal=proposal,unresolved_requests=unknown,audit_issues=issues,evidence_sha256=evidence,
         rule='CANN/自建NPU参考不替代原PyTorch合同；资格失败、补测失败及参考冲突不能计为常规达标',attribution='Codex封装CANN参考和控制器；KG/CC/DeepSeek搜索以实际记录为准')
     (BATCH/'delivery.json').write_text(json.dumps(data,ensure_ascii=False,indent=2)+chr(10),encoding='utf8')
     def score(v):return '%.3f×'%v['score'] if isinstance(v.get('score'),(int,float)) else v.get('raw_status',v.get('status','未完成'))
     def count(v):return str(v.get('passed','—'))+'/'+str(v.get('total','—'))
     lines=['# 夜间六项与CANN参考交付','','原合同常规达标：'+str(len(accepted))+'/30；当前队列：'+str(state.get('status'))+'。',
         'CANN单算子、FP32兼容组合和NPU分解参考分列；换参考不自动增加原合同达标数。','',
-        '|算子|CANN版本|资格|相对原PyTorch|额外检查|','|---|---|---|---|---|']
-    for r in rows:lines.append('|'+r['operator']+'|'+r['revision']+' / '+r['kind']+'|'+r['qualification']['status']+' '+count(r['qualification'])+'|'+score(r['cann_vs_original'])+'|'+r['cann_supplementary']['status']+'|')
+        '|算子|CANN版本|资格|相对原PyTorch|额外检查|动态参数检查|','|---|---|---|---|---|---|']
+    for r in rows:lines.append('|'+r['operator']+'|'+r['revision']+' / '+r['kind']+'|'+r['qualification']['status']+' '+count(r['qualification'])+'|'+score(r['cann_vs_original'])+'|'+r['cann_supplementary']['status']+'|'+r['dynamic_semantics']['status']+' '+count(r['dynamic_semantics'])+'|')
     lines+=['','## 候选与NPU参考','','|算子|参考|加速比|完整评测|额外检查|','|---|---|---|---|---|']
     for r in comparisons:
         f=r.get('formal',{});e=r.get('supplementary',{})
         lines.append('|'+r['operator']+'|'+r['reference']+'|'+score(f)+'|'+count(f)+'|'+e.get('status','未完成')+' '+count(e)+'|')
     lines+=['','## 原合同继续攻关','']
     for op,v in searches.items():lines.append('- '+op+'：'+score(v)+'；'+str(v.get('reference_status','详见搜索、原始结果和补测'))+'。')
+    if inverse_isolated.get('total'):lines.append('- CANN求逆逐case隔离：逆矩阵数值通过'+str(inverse_isolated['inverse_values_passed'])+'/'+str(inverse_isolated['total'])+'；aclnnInverse不提供info，仍不是完整inv_ex参考。')
+    if proposal:lines.append('- 求逆最小分块候选：诊断'+count(proposal['diagnostic'])+'；正式'+score(proposal['formal'])+'；补测'+proposal['supplementary']['status']+'。')
     lines+=['','CANN包装由Codex实现，厂商实现只作参考；生成优化以KG/CC实际记录为准。',
         'expm1_原合同通过但极小数值补测失败，不能称扩展精度条件下已合格。所有失败版本保留。',
         '核验项：'+str(len(evidence))+'；未结束请求：'+str(len(unknown))+'；核验问题：'+str(len(issues))+'。']

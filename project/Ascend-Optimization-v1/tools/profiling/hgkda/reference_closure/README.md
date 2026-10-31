@@ -9,6 +9,10 @@
 - HG-KDA候选可以是KG生成Triton、Codex改写Triton，或自写Ascend C＋布局回退。厂商目标API只进入明确命名的参考列，不冒充自主优化。
 - 没有对应单算子时采用已审计NPU分解作为补充对照，并独立命名。存在API头文件不等于910B和全部dtype/目标语义已经支持。
 
+不是所有实现都由人工从头手写：历史候选包含KG＋CC/DeepSeek生成、HG-KDA证据辅助生成、Codex改写Triton，以及近期自写Ascend C。归属以每份源码和运行记录为准。CANN是可直接调用的厂商实现，Ascend C是编写自定义设备算子的语言／接口；包装CANN参考不算新设计了该算子。
+
+`scan_cann_support.py`只读本机9.0.0头文件及`libopapi.so`导出符号，生成[30项目标接口清单](../../../../operators/campaigns/reference-closure-20261031/research/cann-api-inventory.json)。接口存在只作为下一步资格检查的依据；例如`aclnnInverse`没有`info`输出，`aclnnCumsum`只是累计积分的扫描部分，不能直接声称整个目标已有合格单算子参考。
+
 ## 夜间顺序
 
 1. 冻结六项源码、原合同、固定软件版本和前批成果；不重跑已有24项搜索。
@@ -24,3 +28,11 @@
 宿主tmux独立运行，控制端关机不影响已提交任务。设备任务仅物理卡7串行，不重启共享服务、修改镜像或升级固定FlagGems/FlagTree/CANN。使用独立构建目录，单CPU编译；每个新源码默认一次完整KGS，临界确认须预先登记，不反复挑高分。未知请求保留并等待核验，不自动重发。
 
 方法重点是将“参考支持核验→设备路径→差异诊断→完整验证”接入现有HG-KDA，而非仅增加算子分数。是否全部达标由最后完整结果决定。
+
+## 本批进度与复现
+
+最新状态见批次`next-state.json`与`heartbeat.json`；`30项验收总表.md`区分原参考常规达标和命名NPU参考。服务器tmux会话为`hanle-reference-closure-20261031`及`hanle-reference-finish-20261031`，使用同一物理卡7项目锁。后续队列等待锁时没有设备子进程。
+
+`check_cann_semantics.py`额外检查伪量化动态scale／zero_point和BatchNorm动态eps／momentum、缺省仿射参数，覆盖三种dtype、非连续布局、独立out及调用者stream。`probe_inverse_isolated.py`对每个求逆输入启动独立子进程，避免一次设备异常污染后续规格；只核对逆矩阵、残差，不伪造`info`。
+
+`report_v2.py`核验请求、冻结合同、源码／二进制SHA、额外语义检查和逐case低分；`acceptance_table.py`核对既有24项交付后汇总30项。它们是离线报告入口，不启动设备评测。
