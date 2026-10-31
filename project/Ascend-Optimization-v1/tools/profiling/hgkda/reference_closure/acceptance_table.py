@@ -43,10 +43,16 @@ def main():
             comp=next((r for r in current['comparisons'] if r['operator']==op),None)
             if comp:row['named_reference_comparison']=comp
             if op in current.get('searches',{}):row['new_search']=current['searches'][op]
+            if op=='cumulative_trapezoid':
+                candidate=current.get('scan_hybrid_proposal') or {};conditional=candidate.get('deterministic_condition') or {}
+                if conditional.get('status')=='PASSED' and conditional.get('supplementary',{}).get('status')=='passed':
+                    row['conditional_result']=conditional
+                    row['status']='双方官方确定性条件通过；默认参考不自洽单列；Triton＋CANN混合实现'
         rows.append(row)
     lock=read(BATCH/'software-lock.json')
     table=dict(schema='hgkda-30-reference-qualified-table-v1',regular_accepted=sum(r['regular_accepted'] for r in rows),total=30,
         named_reference_qualified=sum(r.get('named_reference_comparison',{}).get('threshold_passed',False) for r in rows),
+        conditional_qualified=sum(bool(r.get('conditional_result')) for r in rows),
         rows=rows,software_lock=lock,evidence_sha256=tracked,queue_status=current['queue_status'],current_job=current.get('current_job'),
         scope='既有原合同交付与本轮命名NPU参考分列；固定原实现的再次对照不是新优化；完整调用walltime')
     (BATCH/'30项验收总表.json').write_text(json.dumps(table,ensure_ascii=False,indent=2)+chr(10),encoding='utf8')
@@ -59,8 +65,10 @@ def main():
             score='%.3f×'%r['score'] if r['score'] is not None else '—';comp=r.get('named_reference_comparison',{});f=comp.get('formal',{});e=comp.get('supplementary',{})
             named=('%.3f×'%f['score']+' / '+comp['reference']) if isinstance(f.get('score'),(int,float)) else '—'
             if named!='—':named+='；补测'+e.get('status','未完成')
+            if r.get('conditional_result'):
+                v=r['conditional_result'];named='%.3f× / 双方官方确定性'%v['score']+'；补测'+v['supplementary']['status']
             lines.append('|'+r['operator']+'|'+score+'|'+named+'|'+r['status']+'|')
     lines+=['','常规24项沿用已核验交付，不重跑或挑选更高分。本轮CANN参考和旧候选复测分别记录；0.8×为验收线，超过1.0×才快于对应参考。']
     (BATCH/'30项验收总表.md').write_text(chr(10).join(lines)+chr(10),encoding='utf8')
-    print(json.dumps(dict(regular_accepted=table['regular_accepted'],named_reference_qualified=table['named_reference_qualified'],total=30,evidence=len(tracked))))
+    print(json.dumps(dict(regular_accepted=table['regular_accepted'],named_reference_qualified=table['named_reference_qualified'],conditional_qualified=table['conditional_qualified'],total=30,evidence=len(tracked))))
 if __name__=='__main__':main()

@@ -9,6 +9,14 @@ import run
 def main():
     with (run.ROOT/'runs/physical-card-7-campaign.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX);r=run.Runner(run.BATCH.name);r.state['status']='running';r.save()
+        def scan_repair_prepare():
+            r._cmd('prepare-scan-layout-repair',[run.base.PY,HERE/'prepare_scan_repair.py'],120)
+            return run.read(run.BATCH/'proposals/cumulative_trapezoid/layout-restore-v1/proposal.json')
+        prepared=r.job('scan-layout-repair-prepare',scan_repair_prepare)
+        if prepared:
+            op='cumulative_trapezoid';out=run.BATCH/'proposals'/op/'layout-restore-v1';source=out/'main.py'
+            result=r.job('scan-layout-repair-formal',lambda:r.formal(op,source,out/'formal','HG-KDA-layout-restore',kind='CC_generated_Codex_layout_repair_Triton'))
+            r.job('scan-layout-repair-extra',lambda:r.supplementary(op,source,out/'extra-checks.json','scan-layout-repair-extra'))
         def inverse_audit():
             op='linalg_inv_ex';reference=run.read(run.BATCH/'reference-index.json')[op]
             out=run.BATCH/'references'/op/'isolated-audit-v1'

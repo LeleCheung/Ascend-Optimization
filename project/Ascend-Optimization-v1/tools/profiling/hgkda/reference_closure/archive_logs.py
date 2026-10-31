@@ -7,7 +7,9 @@ BATCH=PROJECT/'operators/campaigns/reference-closure-20261031'
 
 def main():
     runtime=ROOT/'runs'/BATCH.name
-    candidates=list(runtime.glob('*.log'))+[ROOT/'runs/reference-closure-controller.log',ROOT/'runs/reference-closure-finish.log']
+    candidates=list(runtime.glob('*.log'))+[ROOT/'runs'/name for name in [
+        'reference-closure-controller.log','reference-closure-finish.log','reference-closure-layout.log',
+        'reference-closure-hybrid.log','reference-closure-evidence.log','reference-closure-cumsum-build.log']]
     records=[]
     for source in candidates:
         if not source.exists():continue

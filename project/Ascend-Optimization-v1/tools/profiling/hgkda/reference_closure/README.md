@@ -36,3 +36,20 @@
 `check_cann_semantics.py`额外检查伪量化动态scale／zero_point和BatchNorm动态eps／momentum、缺省仿射参数，覆盖三种dtype、非连续布局、独立out及调用者stream。`probe_inverse_isolated.py`对每个求逆输入启动独立子进程，避免一次设备异常污染后续规格；只核对逆矩阵、残差，不伪造`info`。
 
 `report_v2.py`核验请求、冻结合同、源码／二进制SHA、额外语义检查和逐case低分；`acceptance_table.py`核对既有24项交付后汇总30项。它们是离线报告入口，不启动设备评测。
+
+本轮队列已完成。`finish_layout.py`保存纯Triton通用布局修复的失败反例；`finish_hybrid.py`改用非末轴Triton增量＋直接CANN扫描，`conditional_scan.py`在独立进程同时对候选与参考启用官方确定性条件。默认、确定性结果及补测分开归档，不缓存计算结果、不更改原容差。混合版的厂商扫描桥由`build_cumsum.py`单线程构建，原源码、头文件接口及二进制SHA保留。
+
+复现已交付混合版时，在服务器项目根目录使用以下命令；应先取得物理卡7项目锁，并确认本项目KGS空闲。选择新输出目录，不能覆盖未知请求。
+
+```bash
+# 在现有tle_yy容器内，保持CANN 9.0.0、Python 3.11.15和软件锁版本。
+source /usr/local/Ascend/cann-9.0.0/set_env.sh
+export ASCEND_RT_VISIBLE_DEVICES=7
+export PYTHONPATH=/data/hanle/ascend-optimization/Ascend-Optimization/third_party/FlagGems/src:/data/hanle/ascend-optimization/Ascend-Optimization/sources/kernelgen_server/client:/data/hanle/ascend-optimization/Ascend-Optimization/sources/kernelgen_server:/data/hanle/ascend-optimization/Ascend-Optimization/sources
+/usr/local/python3.11.15/bin/python3.11 tools/profiling/hgkda/reference_closure/conditional_scan.py \
+  --source operators/campaigns/reference-closure-20261031/proposals/cumulative_trapezoid/hybrid-cann-v3/main.py \
+  --leaf operators/campaigns/reference-closure-20261031/catalog/ops/cumulative_trapezoid \
+  --output /data/hanle/ascend-optimization/runs/scan-hybrid-deterministic-new
+```
+
+脚本同时完成原33项KGS和36项新数据／stream补测；确定性4.476×的参考条件不同，不能写成默认PyTorch下的加速比。服务器原Git HEAD和工作文件同步分别记录，不能只因文件已复制就声称三端Git HEAD相同。

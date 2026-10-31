@@ -12,7 +12,7 @@ CANN的aclnn接口可以直接作为厂商参考；Ascend C用于编写自定义
 
 |对象|本轮厂商参考|关键区别|
 |---|---|---|
-|fix|aclnnTrunc|已完成原合同与补充检查；候选与厂商同合同对照继续排队|
+|fix|aclnnTrunc|同合同直接对照1.212×，原合同30/30、补充39/39通过|
 |expm1_|aclnnInplaceExpm1／aclnnExpm1|BF16需显式兼容路径；极小数值补测存在失败|
 |fake_quantize_per_tensor_affine_cachemask_out|aclnnFakeQuantPerTensorAffineCachemask|本轮以FP32兼容组合覆盖低精度；不是低精度单kernel|
 |batch_norm_with_update_functional|aclnnBatchNorm|需复制运行状态、适配形状与统计输出；组合整体成本计入|

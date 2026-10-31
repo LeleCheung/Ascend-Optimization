@@ -1,6 +1,6 @@
 # 910B 算子优化项目
 
-2026-10-31夜间六项仍在推进，当前入口为[30项验收总表](operators/campaigns/reference-closure-20261031/30项验收总表.md)和[CANN参考工具](tools/profiling/hgkda/reference_closure/README.md)。24项原参考稳定达标继续保留；CANN兼容组合、命名NPU分解与原参考条件分别报告。
+2026-10-31夜间队列完成，见[结果简报](operators/campaigns/reference-closure-20261031/夜间结果简报.md)：24项原参考稳定达标、4项独立NPU对照通过、1项累计积分新版确定性条件通过、1项求逆仍未通过。累计积分Triton＋CANN混合版在双方确定性条件下4.476×、33/33与36/36补测通过；默认0.830×及补测34/36单列。[30项验收总表](operators/campaigns/reference-closure-20261031/30项验收总表.md)与[CANN参考工具](tools/profiling/hgkda/reference_closure/README.md)保留原参考、厂商兼容组合及命名分解的区别。
 
 2026-10-31完成[最后两项攻关交付](operators/campaigns/remaining-final-20261031/交付报告.md)：`fix` **0.862×**、`expm1_` **0.879×**新增稳定达标，各自同源码两次完整评测30/30、原扩展、24项原生路径与30项冻结新形状检查通过。30项目标累计**24项常规稳定达标、1项求逆正确性未通过、5项特殊参考条件单列**。本轮是Codex自写Ascend C＋Triton特殊布局回退，未新增CC/DeepSeek生成。新增执行路径诊断入口，分别核算候选/参考延迟变化；14份正式请求、12条设备路径、2份真实Triton IR已核验。[复现工具](tools/profiling/hgkda/remaining_final/README.md)和本批`delivery.json`为最新入口，下列旧日期内容保留为历史记录。
 

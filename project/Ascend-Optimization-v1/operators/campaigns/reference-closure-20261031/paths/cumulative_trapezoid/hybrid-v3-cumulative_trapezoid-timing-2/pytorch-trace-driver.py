@@ -1,0 +1,4 @@
+import torch,torch_npu,runpy,sys
+torch.use_deterministic_algorithms(True)
+sys.argv=['/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/tools/profiling/hgkda/next_phase/driver.py', '--spec', '/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/campaigns/reference-closure-20261031/paths/cumulative_trapezoid/hybrid-v3-cumulative_trapezoid-timing-2/spec.json', '--side', 'pytorch', '--trace', '/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/campaigns/reference-closure-20261031/paths/cumulative_trapezoid/hybrid-v3-cumulative_trapezoid-timing-2/pytorch-trace.json']
+runpy.run_path('/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/tools/profiling/hgkda/next_phase/driver.py',run_name='__main__')

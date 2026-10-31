@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import sys
 sys.dont_write_bytecode=True
+CHECKER_BYTES=Path(__file__).read_bytes()
 def sha(p):return hashlib.sha256(Path(p).read_bytes()).hexdigest()
 def load(n,p):
     s=importlib.util.spec_from_file_location(n,p);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);return m
@@ -64,8 +65,11 @@ def main():
                 except Exception as e:row['error']=type(e).__name__+': '+str(e)[:2000]
                 rows.append(row)
         else:raise ValueError(a.operator)
-    result=dict(status='passed' if len(rows)==9 and all(r['passed'] for r in rows) else 'failed',operator=a.operator,source=str(source),source_sha256=sha(source),checker_sha256=sha(__file__),
-        checker_source=dict(path=str(Path(__file__).resolve()),sha256=sha(__file__)),
+    digest=hashlib.sha256(CHECKER_BYTES).hexdigest();checker=out.with_name('dynamic-validator-'+digest+'.py')
+    if checker.exists():assert checker.read_bytes()==CHECKER_BYTES
+    else:checker.write_bytes(CHECKER_BYTES)
+    result=dict(status='passed' if len(rows)==9 and all(r['passed'] for r in rows) else 'failed',operator=a.operator,source=str(source),source_sha256=sha(source),checker_sha256=digest,
+        checker_source=dict(path=str(checker),sha256=digest),
         contract_sha256={n:sha(leaf/n) for n in ['definition.json','oracle.py','correctness.jsonl','timing.jsonl']},
         reproduce_command=[sys.executable,str(Path(__file__).resolve()),'--operator',a.operator,'--source',str(source),'--leaf',str(leaf),'--output',str(out)],physical_device=7,
         passed=sum(r['passed'] for r in rows),total=len(rows),cases=rows,scope='动态参数、非连续独立布局和调用者stream的附加参考检查；不替代原合同')

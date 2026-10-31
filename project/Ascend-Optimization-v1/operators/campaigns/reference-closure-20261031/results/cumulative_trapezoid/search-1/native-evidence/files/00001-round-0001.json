@@ -1,0 +1,87 @@
+{
+  "schema_version": "1.0",
+  "round_num": 1,
+  "evaluation_fingerprint": "4a10a29132e1bc8b45e90533b6fb559a5952bf33011b5a62ba7096ec062a560f",
+  "status": "failed",
+  "solution_sha256": "593faa20512a58b026f181ff405893367547b42787ac13e47957d213de1d9879",
+  "backend": "npu",
+  "profiler": "msprof",
+  "capabilities": [
+    "performance_counters",
+    "pipeline_utilization",
+    "kernel_profile",
+    "instruction_listing"
+  ],
+  "dominant_bound": "unknown",
+  "profiled_workloads": [
+    {
+      "uuid": "cumulative_trapezoid-timing-2",
+      "axes": {},
+      "eval_speedup": 0.22788697372589287,
+      "eval_latency_ms": 0.25671266359994127,
+      "eval_reference_latency_ms": 0.05850147202490379,
+      "selection_reason": "Lowest eval speedup among timing workloads (0.2279x, fp16 [1024,128] dim=0, latency 0.2567 ms vs reference 0.0585 ms); the dim=0 non-last-axis regime is the worst-scoring regime.",
+      "profile_ids": [],
+      "manifest_paths": [],
+      "status": "failed"
+    },
+    {
+      "uuid": "cumulative_trapezoid-timing-4",
+      "axes": {},
+      "eval_speedup": 0.7172482811096689,
+      "eval_latency_ms": 0.44332002992610614,
+      "eval_reference_latency_ms": 0.3179705294459866,
+      "selection_reason": "Highest eval latency among timing workloads (0.4433 ms, bf16 [1024,4096] dim=-1); largest working set, distinguishes memory/scan cost from fixed per-call overhead.",
+      "profile_ids": [],
+      "manifest_paths": [],
+      "status": "failed"
+    },
+    {
+      "uuid": "cumulative_trapezoid-timing-7",
+      "axes": {},
+      "eval_speedup": 0.7405787523974391,
+      "eval_latency_ms": 0.42954077354679826,
+      "eval_reference_latency_ms": 0.31810877017711875,
+      "selection_reason": "Highest-latency control in a different dtype (fp32 [1024,4096] dim=-1, 0.4295 ms) to separate dtype-driven cost from size-driven cost.",
+      "profile_ids": [],
+      "manifest_paths": [],
+      "status": "failed"
+    }
+  ],
+  "findings": [],
+  "performance_interpretation": "No profiler evidence was collected: the msprof metrics request for timing-2/timing-4/timing-7 was cancelled during the DURING_PROFILE stage by the service (reason_code=user_cancelled, nightly per-item search budget expired). cached_profiles was empty and no manifests or report artifacts were downloaded, so no pipeline, bandwidth, instruction, or kernel-duration facts exist for this round. The only authoritative facts are the eval snapshot: all 24 correctness workloads PASSED and all 9 timing workloads PASSED, with geo_mean speedup 0.4016 against the seed baseline. Eval latencies reveal two distinguishable regimes in the candidate (not yet causally explained): the small-shape workloads timing-0/2/3/6/8 all cluster at 0.253-0.262 ms despite element counts spanning 128x1024 and 1024x128, while the 1024x4096 workloads timing-4/7 reach 0.443/0.430 ms. The flat small-shape latency is consistent with a shape-independent per-call cost, but without msprof artifacts this remains an untested hypothesis, not a measurement.",
+  "next_experiment": {
+    "action_category": "host_launch_overhead_reduction",
+    "action_description": "Keep the CANN aclnnCumsum scan and the Triton increment kernels numerics exactly as-is; target only per-call host/launch work in run(): cache aclnnCumsumGetWorkspaceSize results per (shape, stride, dtype, axis, device) so the workspace-size query is not re-issued, reuse a preallocated workspace buffer instead of allocating a fresh uint8 tensor each call, and avoid constructing a new torch.npu.Event per call where a pooled completion event can be used without changing stream-completion semantics. Do not merge or reorder the increment and cumsum steps in this experiment.",
+    "expected_impact": "If the flat ~0.255 ms latency of the small workloads is fixed per-call control overhead rather than device work, removing repeated workspace queries and allocation can move timing-2, timing-8, timing-0, timing-3 and timing-6 materially; the 1024x4096 workloads (timing-4/7) are expected to respond little, which itself falsifies the overhead hypothesis if small-shape latency does not move.",
+    "risks_and_rollback": "Risk: caching workspace size or a buffer across concurrent streams can cause overlapping writes and wrong results; a pooled event must still record on the current stream so no tensor is freed early. Mitigate by keying every cache entry on (shape, stride, dtype, axis, device) and by keeping the existing FIFO completion drain unchanged. Roll back by restoring the per-call torch.empty workspace and per-call Event; the seed source at solution_sha256 593faa20512a58b026f181ff405893367547b42787ac13e47957d213de1d9879 is the rollback point.",
+    "validation_workloads": [
+      "cumulative_trapezoid-timing-2",
+      "cumulative_trapezoid-timing-8",
+      "cumulative_trapezoid-timing-0",
+      "cumulative_trapezoid-timing-3",
+      "cumulative_trapezoid-timing-6",
+      "cumulative_trapezoid-timing-4",
+      "cumulative_trapezoid-timing-7"
+    ],
+    "success_criteria": [
+      "All 24 correctness workloads (cumulative_trapezoid-correctness-0..23) still PASSED with the original tolerances, including the dim=0, transpose and fp32 cases.",
+      "Headline geo_mean speedup strictly above the round-1 baseline 0.40164839439736927.",
+      "Per-workload speedups for timing-2, timing-8, timing-0, timing-3 and timing-6 increase versus round 1, while timing-4 and timing-7 do not regress; a null result on the small shapes is treated as falsifying the host-overhead hypothesis and should redirect the next experiment to device-side layout/scan cost.",
+      "No change to default determinism mode or stream semantics: results remain identical across two consecutive runs of the same input."
+    ]
+  },
+  "warnings": [
+    "Profiling was cancelled by the service before collection: status=RUN_CANCELLED, reason_code=user_cancelled, stage=DURING_PROFILE, reason='夜间单项搜索预算到期，保留已通过轮次并转下项'. This analysis records a cancelled attempt, not a measurement.",
+    "No artifacts were downloaded: cached_profiles was empty, so profile_ids and manifest_paths are empty for all three selected workloads. Findings are deliberately empty because every finding requires a downloaded artifact path plus a locatable metric.",
+    "The service instructed stopping further server/agent calls after the cancellation; only this mandatory terminal record call was made.",
+    "The eval snapshot is authoritative and unaffected by the cancellation: eval_status=PASSED, geo_mean 0.4016, all 24 correctness and all 9 timing workloads PASSED."
+  ],
+  "open_questions": [
+    "Why do timing-0/2/3/6/8 all report ~0.255 ms even though shape and element count differ (128x1024 vs 1024x128)? Fixed launch/host cost versus shape-specific device work cannot be separated without msprof kernel duration.",
+    "Is the extra Triton increment kernel plus the separate aclnnCumsum pass memory-bound on the 1024x4096 cases (timing-4/7 at 0.43-0.44 ms), which would imply a fuse-into-single-pass direction, or is it bandwidth-saturated already?",
+    "For the dim=0 workloads the increment kernel reads strided columns (stride[0] = 128 elements apart); does that access pattern dominate, or is the cumsum along axis 0 the expensive stage?",
+    "Does the ~0.25 ms floor correspond to many tiny programs (grid cdiv(numel,2048) = 64 for 128x1024) or to per-call host-side aclnn descriptor/workspace/event handling? This decides between device-side tiling changes and host-overhead changes."
+  ],
+  "error": "Profiler collection cancelled by the service: status=RUN_CANCELLED, reason_code=user_cancelled, stage=DURING_PROFILE, reason='夜间单项搜索预算到期，保留已通过轮次并转下项' (nightly per-item search budget expired; keep already-passed rounds and move to next item). The msprof metrics request for cumulative_trapezoid-timing-2, timing-4 and timing-7 produced no artifacts; cached_profiles was empty and no manifest or report files were downloaded, so no kernel duration, pipeline, bandwidth or instruction evidence exists for round 1."
+}

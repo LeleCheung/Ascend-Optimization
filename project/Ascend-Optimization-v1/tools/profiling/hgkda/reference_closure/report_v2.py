@@ -114,6 +114,47 @@ def main():
         proposal=dict(attribution='Codex修改CC候选的一般性最小分块；非KG独立自动结果',diagnostic=diagnostic,
             formal=formal('inverse-padded-formal',op,BATCH/'catalog-snapshots/formal-HG-KDA-padded-block-linalg_inv_ex/ops/linalg_inv_ex'),
             supplementary=extra(directory/'extra-checks.json',op,proposal_source,BATCH/records[op]['catalog_leaf']))
+    scan_proposal=None;scan_source=BATCH/'proposals/cumulative_trapezoid/layout-restore-v1/main.py'
+    if scan_source.exists():
+        track(scan_source);directory=scan_source.parent;op='cumulative_trapezoid'
+        if (directory/'proposal.json').exists():track(directory/'proposal.json')
+        scan_proposal=dict(attribution='CC生成第三轮候选＋Codex通用布局还原修复',
+            formal=formal('scan-layout-repair-formal',op,BATCH/'catalog-snapshots/formal-HG-KDA-layout-restore-cumulative_trapezoid/ops/cumulative_trapezoid'),
+            supplementary=extra(directory/'extra-checks.json',op,scan_source,BATCH/records[op]['catalog_leaf']),
+            reference_status='原默认PyTorch合同；参考重复稳定性问题独立保留')
+    scan_v2=None;scan_source_v2=BATCH/'proposals/cumulative_trapezoid/tiled-restore-v2/main.py'
+    if scan_source_v2.exists():
+        track(scan_source_v2);directory=scan_source_v2.parent;op='cumulative_trapezoid'
+        if (directory/'proposal.json').exists():track(directory/'proposal.json')
+        scan_v2=dict(attribution='Codex在CC候选上修复首轴分块还原；不是纯自动生成结果',
+            formal=formal('scan-tiled-restore-v2-formal',op,BATCH/'catalog-snapshots/formal-HG-KDA-tiled-restore-v2-cumulative_trapezoid/ops/cumulative_trapezoid'),
+            supplementary=extra(directory/'extra-checks.json',op,scan_source_v2,BATCH/records[op]['catalog_leaf']),
+            reference_status='默认参考稳定性问题独立保留')
+        conditional=directory/'deterministic-condition';conditions=conditional/'conditions.json';conditional_result=conditional/'deterministic-1.result.json'
+        if conditions.exists() and conditional_result.exists():
+            c=read(conditions);raw=read(conditional_result);request=conditional/'deterministic-1.request.json';payload=read(request)
+            assert c['source_sha256']==sha(scan_source_v2) and c['deterministic'] is True and c['applies_to']=='reference_and_candidate'
+            assert c['contract_sha256']==records[op]['contract_sha256'] and payload['implementation']['sources'][0]['content']==scan_source_v2.read_text()
+            for path in [conditions,conditional_result,request,conditional/'preflight.json']:track(path)
+            gates=extra(conditional/'extra-checks.json',op,scan_source_v2,BATCH/records[op]['catalog_leaf'])
+            scan_v2['deterministic_condition']=dict(status=raw.get('status'),score=raw.get('geo_mean'),passed=raw.get('num_passed'),total=raw.get('num_workloads'),
+                supplementary=gates,scope='官方确定性同时适用于参考与候选；不计入默认24项常规交付')
+    scan_hybrid=None;hybrid_source=BATCH/'proposals/cumulative_trapezoid/hybrid-cann-v3/main.py'
+    if hybrid_source.exists():
+        op='cumulative_trapezoid';directory=hybrid_source.parent;track(hybrid_source);track(directory/'proposal.json')
+        build=read(BATCH/'cann-cumsum-build.json');track(BATCH/'cann-cumsum-build.json');track(build['source'],build['source_sha256']);track(build['binary'],build['binary_sha256'])
+        scan_hybrid=dict(attribution='CC末轴Triton扫描＋Codex非末轴增量及直接CANN扫描桥；混合实现',
+            formal=formal('scan-hybrid-v3-formal',op,BATCH/'catalog-snapshots/formal-HG-KDA-hybrid-cann-v3-cumulative_trapezoid/ops/cumulative_trapezoid'),
+            supplementary=extra(directory/'extra-checks.json',op,hybrid_source,BATCH/records[op]['catalog_leaf']))
+        conditional=directory/'deterministic-condition';conditions=conditional/'conditions.json';conditional_result=conditional/'deterministic-1.result.json'
+        if conditions.exists() and conditional_result.exists():
+            c=read(conditions);raw=read(conditional_result);request=conditional/'deterministic-1.request.json';payload=read(request)
+            assert c['source_sha256']==sha(hybrid_source) and c['deterministic'] is True and c['applies_to']=='reference_and_candidate'
+            assert c['contract_sha256']==records[op]['contract_sha256'] and payload['implementation']['sources'][0]['content']==hybrid_source.read_text()
+            for path in [conditions,conditional_result,request,conditional/'preflight.json']:track(path)
+            gates=extra(conditional/'extra-checks.json',op,hybrid_source,BATCH/records[op]['catalog_leaf'])
+            scan_hybrid['deterministic_condition']=dict(status=raw.get('status'),score=raw.get('geo_mean'),passed=raw.get('num_passed'),total=raw.get('num_workloads'),
+                supplementary=gates,scope='双方官方确定性；厂商扫描混合实现；不计默认稳定达标')
     new_regular=[];searches={}
     for op in ['linalg_inv_ex','cumulative_trapezoid']:
         best=state.get('operators',{}).get(op,{}).get('best');checked=verify(best);searches[op]=checked
@@ -132,6 +173,20 @@ def main():
             checked['original_numerical_contract_passed']=True
             if op=='cumulative_trapezoid':checked['reference_status']='默认参考稳定性仍需单列核验'
             else:checked['reference_status']='原PyTorch参考含CPU回退，数值通过与公平NPU性能分列'
+    scan_paths=[]
+    for directory in sorted((BATCH/'paths/cumulative_trapezoid').glob('hybrid-v3-*')):
+        spec=read(directory/'spec.json');assert spec['source_sha256']==sha(hybrid_source) and spec['deterministic'] is True
+        track(directory/'spec.json')
+        for side in ['candidate','pytorch']:
+            path=directory/(side+'-summary.json')
+            if path.exists():
+                summary=read(path);track(path);track(summary['trace'],summary['trace_sha256'])
+                scan_paths.append(dict(case=spec['case']['name'],side=side,**{k:v for k,v in summary.items() if k!='device_tasks'}))
+        manifest=directory/'candidate-ir/manifest.json'
+        if manifest.exists():
+            value=read(manifest);track(manifest);assert value['entries'] and value['spec']==spec
+            for entry in value['entries']:
+                for artifact in entry['artifacts']:track(artifact['path'],artifact['sha256'])
     unknown=[]
     for request in BATCH.rglob('*.request.json'):
         payload=read(request)
@@ -141,7 +196,7 @@ def main():
         else:unknown.append(str(request))
     accepted=list(dict.fromkeys(initial['accepted']+new_regular))
     data=dict(schema='hgkda-reference-closure-delivery-v2',queue_status=state.get('status'),current_job=state.get('current_job'),initial_regular=24,regular_accepted=len(accepted),total=30,
-        new_regular=new_regular,accepted=accepted,references=rows,comparisons=comparisons,searches=searches,inverse_isolated=inverse_isolated,inverse_padded_proposal=proposal,unresolved_requests=unknown,audit_issues=issues,evidence_sha256=evidence,
+        new_regular=new_regular,accepted=accepted,references=rows,comparisons=comparisons,searches=searches,inverse_isolated=inverse_isolated,inverse_padded_proposal=proposal,scan_layout_proposal=scan_proposal,scan_tiled_proposal=scan_v2,scan_hybrid_proposal=scan_hybrid,scan_execution_paths=scan_paths,unresolved_requests=unknown,audit_issues=issues,evidence_sha256=evidence,
         rule='CANN/自建NPU参考不替代原PyTorch合同；资格失败、补测失败及参考冲突不能计为常规达标',attribution='Codex封装CANN参考和控制器；KG/CC/DeepSeek搜索以实际记录为准')
     (BATCH/'delivery.json').write_text(json.dumps(data,ensure_ascii=False,indent=2)+chr(10),encoding='utf8')
     def score(v):return '%.3f×'%v['score'] if isinstance(v.get('score'),(int,float)) else v.get('raw_status',v.get('status','未完成'))
@@ -158,6 +213,14 @@ def main():
     for op,v in searches.items():lines.append('- '+op+'：'+score(v)+'；'+str(v.get('reference_status','详见搜索、原始结果和补测'))+'。')
     if inverse_isolated.get('total'):lines.append('- CANN求逆逐case隔离：逆矩阵数值通过'+str(inverse_isolated['inverse_values_passed'])+'/'+str(inverse_isolated['total'])+'；aclnnInverse不提供info，仍不是完整inv_ex参考。')
     if proposal:lines.append('- 求逆最小分块候选：诊断'+count(proposal['diagnostic'])+'；正式'+score(proposal['formal'])+'；补测'+proposal['supplementary']['status']+'。')
+    if scan_proposal:lines.append('- 累计积分布局修复候选：正式'+score(scan_proposal['formal'])+' '+count(scan_proposal['formal'])+'；补测'+scan_proposal['supplementary']['status']+' '+count(scan_proposal['supplementary'])+'；默认参考稳定性问题单列。')
+    if scan_v2:lines.append('- 累计积分分块还原候选：正式'+score(scan_v2['formal'])+' '+count(scan_v2['formal'])+'；补测'+scan_v2['supplementary']['status']+' '+count(scan_v2['supplementary'])+'；默认参考稳定性问题单列。')
+    if scan_v2 and scan_v2.get('deterministic_condition'):
+        v=scan_v2['deterministic_condition'];lines.append('- 同一分块候选在双方官方确定性条件下：'+score(v)+' '+count(v)+'；补测'+v['supplementary']['status']+'；条件成果单列。')
+    if scan_hybrid:
+        lines.append('- 累计积分Triton＋CANN混合候选：默认'+score(scan_hybrid['formal'])+' '+count(scan_hybrid['formal'])+'；补测'+scan_hybrid['supplementary']['status']+'。')
+        if scan_hybrid.get('deterministic_condition'):
+            v=scan_hybrid['deterministic_condition'];lines.append('- 同一混合候选在双方官方确定性条件下：'+score(v)+' '+count(v)+'；补测'+v['supplementary']['status']+' '+count(v['supplementary'])+'；条件成果单列。')
     lines+=['','CANN包装由Codex实现，厂商实现只作参考；生成优化以KG/CC实际记录为准。',
         'expm1_原合同通过但极小数值补测失败，不能称扩展精度条件下已合格。所有失败版本保留。',
         '核验项：'+str(len(evidence))+'；未结束请求：'+str(len(unknown))+'；核验问题：'+str(len(issues))+'。']
