@@ -1,0 +1,25 @@
+{
+  "api_version": "v6.2",
+  "binding": {
+    "bundle_id": "sha256:7b92842fc885465d86307bd773f8c284368a1826ec05afe174e6b402b0003f0d",
+    "definition": "sigmoid_"
+  },
+  "implementation": {
+    "name": "sigmoid_-baseline-1",
+    "definition": "sigmoid_",
+    "language": "triton",
+    "entrypoint": "main.py::run",
+    "sources": [
+      {
+        "path": "main.py",
+        "content": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\nimport logging\n\nimport triton\nimport triton.language as tl\n\nfrom flag_gems.utils import pointwise_dynamic, tl_extra_shim\n\nlogger = logging.getLogger(__name__)\nexp2 = tl_extra_shim.exp2\n\n\n@pointwise_dynamic(promotion_methods=[(0, \"INT_TO_FLOAT\")])\n@triton.jit\ndef sigmoid_forward(x):\n    # log2e: tl.constexpr = math.log2(math.e)\n    # triton 3.0.0 disallow calling non-jitted function inside jitted function, even if it is in\n    # the rhs of an assignment to a constexpr, so we use numeric literal instead to work around this.\n    log2e: tl.constexpr = 1.4426950408889634\n    return 1 / (1 + exp2(-x.to(tl.float32) * log2e))\n\n\n@pointwise_dynamic(promotion_methods=[(0, \"INT_TO_FLOAT\")])\n@triton.jit\ndef sigmoid_backward_kernel(dy, y):\n    y_f32 = y.to(tl.float32)\n    dy_f32 = dy.to(tl.float32)\n    return dy_f32 * (1.0 - y_f32) * y_f32\n\n\ndef sigmoid(self):\n    logger.debug(\"GEMS SIGMOID_FORWARD\")\n    output = sigmoid_forward(self)\n    return output\n\n\ndef sigmoid_backward(grad_output, output):\n    logger.debug(\"GEMS SIGMOID_BACKWARD\")\n    grad_input = sigmoid_backward_kernel(grad_output, output)\n    return grad_input\n\n\ndef sigmoid_(A):\n    logger.debug(\"GEMS SIGMOID__FORWARD\")\n    out = sigmoid_forward(A, out0=A)\n    return out\n\nrun=sigmoid_\n"
+      }
+    ]
+  },
+  "settings": {
+    "warmup_ms": 1000,
+    "benchmark_ms": 100,
+    "num_trials": 3,
+    "timeout_seconds": 1800
+  }
+}

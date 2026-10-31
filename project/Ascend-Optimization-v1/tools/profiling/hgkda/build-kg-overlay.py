@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parents[4]
 
 
-def build(output: Path, *, repo=REPO, native_context=False, paired_evidence=None):
+def build(output: Path, *, repo=REPO, native_context=False, paired_evidence=None, roofline_evidence=None):
     source = repo / 'sources/kernelgen'
     skill = ROOT / 'skills/hgkda'
     if output.exists():
@@ -52,6 +52,26 @@ def build(output: Path, *, repo=REPO, native_context=False, paired_evidence=None
             '以下是冻结seed与PyTorch的独立对照，不是本轮新候选的测量。核对operator、'
             '源码SHA和case参数；它用于提出修改，不能替代本轮KGS profiling或正式评测。'
             '如新候选改变执行路径，需要重新采集以检验机制。\n\n'
+            + json.dumps(evidence, ensure_ascii=False, indent=2) + '\n')
+    roofline_extension = {}
+    if roofline_evidence:
+        raw = Path(roofline_evidence).read_bytes()
+        evidence = json.loads(raw)
+        if evidence.get('schema_version') != 'hgkda-roofline-v1' or not evidence.get('cases'):
+            raise ValueError('Roofline摘要缺少schema或case')
+        if len(raw) > 128 * 1024 or not evidence.get('source', {}).get('sha256'):
+            raise ValueError('Roofline摘要过大或缺少完整分析SHA')
+        for case in evidence['cases']:
+            if not case.get('spec', {}).get('source_sha256') or not case.get('paths'):
+                raise ValueError('Roofline case缺少源码或有效路径')
+        (dest_skill / 'roofline-evidence.json').write_bytes(raw)
+        roofline_extension = {'source': str(Path(roofline_evidence).resolve()),
+            'sha256': hashlib.sha256(raw).hexdigest(), 'cases': len(evidence['cases'])}
+        appended += ('\n\n## 本批冻结的Roofline数值证据\n\n'
+            '先核对源码SHA、shape、dtype和采集范围。它是起点证据，不是新候选测量。'
+            '有效算法FLOPs、硬件内部操作、官方模型和经验参考分别解释；'
+            'PyTorch GEMM组件不代表完整融合算子。结合IR提出可证伪修改，'
+            '新候选须重新采集并完成KGS正式评测。\n\n'
             + json.dumps(evidence, ensure_ascii=False, indent=2) + '\n')
     context_extension = {}
     if native_context:
@@ -99,6 +119,8 @@ def get_profile_context(workspace, context, round_num):
         data['native_context_extension'] = context_extension
     if paired_extension:
         data['paired_evidence_extension'] = paired_extension
+    if roofline_extension:
+        data['roofline_evidence_extension'] = roofline_extension
     (output / 'hgkda-overlay.json').write_text(
         json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     return data
@@ -111,9 +133,11 @@ def main():
                    help='仅新覆盖层：从冻结Native快照补充准确输入规格；不改变既有批次')
     p.add_argument('--paired-evidence', type=Path,
                    help='本批seed成对采集的结构化摘要；只注入新覆盖层，保留来源身份')
+    p.add_argument('--roofline-evidence', type=Path,
+                   help='本批已校验的Roofline紧凑摘要；保留算法量、计数和参考来源')
     a = p.parse_args()
     print(json.dumps(build(a.output, native_context=a.native_context,
-                           paired_evidence=a.paired_evidence), ensure_ascii=False))
+                           paired_evidence=a.paired_evidence, roofline_evidence=a.roofline_evidence), ensure_ascii=False))
 
 
 if __name__ == '__main__':

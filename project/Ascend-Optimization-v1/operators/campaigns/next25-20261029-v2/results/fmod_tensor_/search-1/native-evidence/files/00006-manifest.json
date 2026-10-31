@@ -1,0 +1,108 @@
+{
+  "request": {
+    "api_version": "v6.2",
+    "evaluation_id": "7de352d221a487349c5c25a7e5d821eedfee6d785c7151d41536754608abf7c6:round-1",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:fd003b8f137a697674f9009b6045e148b2f9b0ece8b52301c04cdcf0326f1d21",
+      "definition": "fmod_tensor_"
+    },
+    "implementation": {
+      "name": "kernelgen-candidate-fmod_tensor_",
+      "definition": "fmod_tensor_",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "# Copyright 2026 FlagOS Contributors\n# SPDX-License-Identifier: Apache-2.0\n\"\"\"In-place fmod with independent operand layouts and current-stream launches.\"\"\"\nimport torch\nimport torch_npu\nimport triton\nimport triton.language as tl\n\n_BLOCK = 4096\n_ENTRIES = {}\n\n\n@triton.jit\ndef _fmod_value(a, b):\n    x = a.to(tl.float32)\n    y = b.to(tl.float32)\n    quotient = x / y\n    magnitude = tl.floor(tl.abs(quotient))\n    sign = quotient.to(tl.int32, bitcast=True) & (-2147483648)\n    # Fixed NPU reference truncates zero quotients to positive zero before\n    # multiplication. Exact negative multiples then subtract to positive zero.\n    sign = tl.where(magnitude == 0.0, 0, sign)\n    truncated = (magnitude.to(tl.int32, bitcast=True) | sign).to(tl.float32, bitcast=True)\n    product = truncated * y\n    return x - product\n\n@triton.jit\ndef _fmod_flat(A, B, N: tl.constexpr, BLOCK: tl.constexpr):\n    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offset < N\n    a = tl.load(A + offset, mask, other=0)\n    b = tl.load(B + offset, mask, other=1)\n    tl.store(A + offset, _fmod_value(a, b), mask)\n\n\n@triton.jit\ndef _fmod_strided(A, B, N: tl.constexpr, SHAPE: tl.constexpr,\n                   SA: tl.constexpr, SB: tl.constexpr, BLOCK: tl.constexpr):\n    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offset < N\n    remaining = offset\n    oa = tl.zeros((BLOCK,), tl.int64)\n    ob = tl.zeros((BLOCK,), tl.int64)\n    for axis in tl.static_range(len(SHAPE) - 1, -1, -1):\n        coordinate = remaining % SHAPE[axis]\n        remaining = remaining // SHAPE[axis]\n        oa += coordinate.to(tl.int64) * SA[axis]\n        ob += coordinate.to(tl.int64) * SB[axis]\n    a = tl.load(A + oa, mask, other=0)\n    b = tl.load(B + ob, mask, other=1)\n    tl.store(A + oa, _fmod_value(a, b), mask)\n\n\ndef _stream(device):\n    raw = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\n    if raw is not None:\n        try:\n            return raw(device)\n        except TypeError:\n            return raw()\n    return torch.npu.current_stream(device).npu_stream\n\n\ndef _entry(A, B, n):\n    try:\n        compiled = _fmod_flat.warmup(A, B, n, _BLOCK, grid=(1,), enable_fp_fusion=False)\n        launcher = compiled.run\n        if not (getattr(launcher, 'compile_only', False) or\n                getattr(launcher, 'enable_msprof_register_tensor', False) or\n                getattr(launcher.metadata, 'debug_enabled', False) or\n                getattr(launcher.metadata, 'debug', False)):\n            return launcher.launch, compiled.function, compiled.packed_metadata\n    except Exception:\n        pass\n    return None\n\n\ndef _generic(A, B, n):\n    if tuple(torch.broadcast_shapes(A.shape, B.shape)) != tuple(A.shape):\n        raise ValueError('broadcast would change the in-place destination shape')\n    aligned_shape = (1,) * (A.ndim - B.ndim) + tuple(B.shape)\n    aligned_stride = (0,) * (A.ndim - B.ndim) + tuple(B.stride())\n    sb = tuple(0 if size == 1 else stride for size, stride in zip(aligned_shape, aligned_stride))\n    shape = tuple(A.shape) or (1,)\n    sa = tuple(A.stride()) or (0,)\n    sb = sb or (0,)\n    _fmod_strided[(((n + 255) // 256),)](A, B, n, shape, sa, sb, 256, enable_fp_fusion=False)\n\n\ndef run(A, B):\n    n = A.numel()\n    if not n:\n        return A\n    if A.is_contiguous() and B.is_contiguous() and A.shape == B.shape:\n        pa, pb = A.data_ptr(), B.data_ptr()\n        if not ((pa | pb) & 15):\n            key = (A.dtype, B.dtype, A.device.index, n)\n            if key not in _ENTRIES:\n                _ENTRIES[key] = _entry(A, B, n)\n            entry = _ENTRIES[key]\n            if entry is not None:\n                entry[0](((n + _BLOCK - 1) // _BLOCK), 1, 1, _stream(A.device.index),\n                         entry[1], entry[2], None, None, None, pa, pb, n, _BLOCK)\n                return A\n        _fmod_flat[(((n + _BLOCK - 1) // _BLOCK),)](A, B, n, _BLOCK, enable_fp_fusion=False)\n    else:\n        _generic(A, B, n)\n    return A\n"
+        }
+      ]
+    },
+    "benchmark_fingerprint": "sha256:b4232be300d811a6717837fb05bdce292d8b618146b63040979a7aeec780fbeb",
+    "case_id": "fmod_tensor_-timing-8",
+    "expected_backend": "npu",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "identity": {
+      "solution_sha256": "70609fe93ec0e0de2d6eb52084da61f5e442d6345b066525932d9562538bb4a7",
+      "workload_sha256": "83559f8dfe267b651ad43afeff83d97f1abaf9733b0f71a93120fa28a4d88d41"
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "profile_id": "38f7cb734e86465b92f0cf16ca8e3b57",
+    "created_at": "2026-10-29T23:57:23.537791+00:00",
+    "status": "failed",
+    "backend": "npu",
+    "profiler": "msprof",
+    "device": "npu:0",
+    "hardware": {
+      "target": {
+        "backend": "ascend",
+        "vendor": "huawei",
+        "device": "Ascend910B4-1",
+        "architecture": "dav-c220-cube",
+        "devices": [
+          {
+            "logical_device": "npu:0",
+            "device_id": 0,
+            "name": "Ascend910B4-1",
+            "l2_cache_size": 176160768,
+            "num_sm": 20,
+            "compute_capability": "",
+            "total_memory": 65452113920
+          }
+        ]
+      },
+      "software": {
+        "language": "triton",
+        "language_version": "3.5.1",
+        "compiler": "flagtree",
+        "compiler_version": "0.6.0+ascend.gitc286cba6",
+        "runtime": "cann",
+        "runtime_version": "9.0.0",
+        "driver_version": "25.2.0"
+      },
+      "metadata": {
+        "complete": true,
+        "missing": [],
+        "sources": {
+          "target.backend": "server configuration",
+          "target.vendor": "server configuration",
+          "software.language": "server configuration",
+          "software.compiler": "python package metadata",
+          "software.runtime": "server configuration",
+          "target.device": "device probe",
+          "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+          "software.language_version": "triton module metadata",
+          "software.compiler_version": "python package metadata",
+          "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+          "software.driver_version": "/usr/local/Ascend/driver/version.info"
+        }
+      }
+    },
+    "evaluation_id": "7de352d221a487349c5c25a7e5d821eedfee6d785c7151d41536754608abf7c6:round-1",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "capabilities": [],
+    "summary": {
+      "stage_count": 1
+    },
+    "metrics": {},
+    "artifacts": [],
+    "warnings": [],
+    "error": "msprof base collection exited successfully without profile completion marker",
+    "workload_uuid": "fmod_tensor_-timing-8"
+  }
+}

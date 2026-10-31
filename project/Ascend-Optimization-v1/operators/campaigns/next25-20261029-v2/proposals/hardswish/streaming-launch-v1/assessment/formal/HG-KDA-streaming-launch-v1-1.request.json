@@ -1,0 +1,25 @@
+{
+  "api_version": "v6.2",
+  "binding": {
+    "bundle_id": "sha256:bdb88cb9e15f17106a96f01b28b3be1181b44399609936d399a813aeb9209ec5",
+    "definition": "hardswish"
+  },
+  "implementation": {
+    "name": "hardswish-HG-KDA-streaming-launch-v1-1",
+    "definition": "hardswish",
+    "language": "triton",
+    "entrypoint": "main.py::run",
+    "sources": [
+      {
+        "path": "main.py",
+        "content": "# Copyright 2026 FlagOS Contributors\n# SPDX-License-Identifier: Apache-2.0\n\"\"\"FlagGems hardswish math with bounded streaming tiles and compiled launches.\"\"\"\nimport torch\nimport torch_npu\nimport triton\nimport triton.language as tl\n\n_ENTRIES = {}\n_STREAM = {}\n\n\n@triton.jit\ndef _hardswish_stream(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):\n    lane = tl.arange(0, BLOCK)\n    step = tl.num_programs(0) * BLOCK\n    for start in range(tl.program_id(0) * BLOCK, N, step):\n        offset = start + lane\n        x = tl.load(X + offset, offset < N, other=0).to(tl.float32)\n        inner = tl.minimum(tl.maximum(x + 3.0, 0.0), 6.0)\n        result = x * inner * (1.0 / 6.0)\n        tl.store(Y + offset, result, offset < N)\n\n\ndef _stream_getter(device):\n    getter = _STREAM.get(device)\n    if getter is not None:\n        return getter\n    raw = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\n    if raw is not None:\n        try:\n            expected = int(torch.npu.current_stream(device).npu_stream)\n            try:\n                if int(raw(device)) == expected:\n                    getter = lambda: raw(device)\n            except TypeError:\n                if int(raw()) == expected:\n                    getter = raw\n        except Exception:\n            getter = None\n    if getter is None:\n        from triton.runtime import driver\n        getter = lambda: driver.active.get_current_stream(device)\n    _STREAM[device] = getter\n    return getter\n\n\ndef _entry(x, out, n, block, device):\n    entry = None\n    try:\n        compiled = _hardswish_stream.warmup(x, out, n, block, grid=(1,))\n        launcher = compiled.run\n        if not (getattr(launcher, 'compile_only', False) or\n                getattr(launcher, 'enable_msprof_register_tensor', False) or\n                getattr(launcher.metadata, 'debug_enabled', False) or\n                getattr(launcher.metadata, 'debug', False)):\n            entry = (launcher.launch, compiled.function, compiled.packed_metadata,\n                     _stream_getter(device))\n    except Exception:\n        entry = None\n    return entry\n\n\ndef _compute(x, out):\n    n = x.numel()\n    if not n:\n        return out\n    block = min(4096, max(32, triton.next_power_of_2(n)))\n    grid = min(40, triton.cdiv(n, block)) if n >= 131072 else triton.cdiv(n, block)\n    xp, yp = x.data_ptr(), out.data_ptr()\n    if (xp | yp) & 15:\n        _hardswish_stream[(grid,)](x, out, n, block)\n        return out\n    device = x.device.index\n    key = (x.dtype, out.dtype, device, n, block)\n    if key not in _ENTRIES:\n        _ENTRIES[key] = _entry(x, out, n, block, device)\n    entry = _ENTRIES[key]\n    if entry is None:\n        _hardswish_stream[(grid,)](x, out, n, block)\n    else:\n        entry[0](grid, 1, 1, entry[3](), entry[1], entry[2],\n                 None, None, None, xp, yp, n, block)\n    return out\n\n\ndef run(x):\n    contiguous = x.contiguous()\n    out = torch.empty_like(contiguous)\n    return _compute(contiguous, out)\n"
+      }
+    ]
+  },
+  "settings": {
+    "warmup_ms": 1000,
+    "benchmark_ms": 100,
+    "num_trials": 3,
+    "timeout_seconds": 1800
+  }
+}

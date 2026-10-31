@@ -1,0 +1,117 @@
+{
+  "schema_version": "1.0",
+  "round_num": 1,
+  "evaluation_fingerprint": "7de352d221a487349c5c25a7e5d821eedfee6d785c7151d41536754608abf7c6",
+  "status": "failed",
+  "solution_sha256": "70609fe93ec0e0de2d6eb52084da61f5e442d6345b066525932d9562538bb4a7",
+  "backend": "npu",
+  "profiler": "msprof",
+  "capabilities": [
+    "performance_counters",
+    "pipeline_utilization",
+    "kernel_profile",
+    "instruction_listing"
+  ],
+  "dominant_bound": "mixed",
+  "profiled_workloads": [
+    {
+      "uuid": "fmod_tensor_-timing-3",
+      "axes": {},
+      "eval_speedup": 0.508131440680796,
+      "eval_latency_ms": 0.16267194752201755,
+      "eval_reference_latency_ms": 0.08265873105271361,
+      "selection_reason": "Lowest eval speedup of the round (0.5081); fp16 4096x4096 = 16.78M elements, the narrow-dtype large regime that is the main competing hypothesis",
+      "profile_ids": [
+        "d4e500cc6f4249dda7f258a4aaef6f5e"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0001/fmod_tensor_-timing-3/19c925f340e844f999b0474d6ff535b9/manifest.json"
+      ],
+      "status": "failed"
+    },
+    {
+      "uuid": "fmod_tensor_-timing-11",
+      "axes": {},
+      "eval_speedup": 0.9477170958988144,
+      "eval_latency_ms": 0.19035051035906622,
+      "eval_reference_latency_ms": 0.18039843288035143,
+      "selection_reason": "Highest eval latency (0.1904 ms); fp32 4096x4096 same element count as timing-3, the dtype control for the widening hypothesis; retried alone after the first failure",
+      "profile_ids": [
+        "174cda55b59342d2afdf0d63d99691d3",
+        "3643dc062e444932a5fd2ce4947aa61b"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0001/fmod_tensor_-timing-11/223aaf9f51c6422b9b39f4db9f81255b/manifest.json",
+        ".kernelgen/profiles/round-0001/fmod_tensor_-timing-11/c0c9ff22e4564066897cff8e8071e970/manifest.json"
+      ],
+      "status": "failed"
+    },
+    {
+      "uuid": "fmod_tensor_-timing-8",
+      "axes": {},
+      "eval_speedup": 0.6301003055829518,
+      "eval_latency_ms": 0.01605777354723778,
+      "eval_reference_latency_ms": 0.010118008019096366,
+      "selection_reason": "Smallest fp32 case (1024 elements = 1 program at BLOCK=4096); needed to separate fixed per-call overhead from device work",
+      "profile_ids": [
+        "38f7cb734e86465b92f0cf16ca8e3b57"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0001/fmod_tensor_-timing-8/e772846524764599b97de0b08e20fbdf/manifest.json"
+      ],
+      "status": "failed"
+    },
+    {
+      "uuid": "fmod_tensor_-timing-0",
+      "axes": {},
+      "eval_speedup": 0.6861687578565498,
+      "eval_latency_ms": 0.01647286518143704,
+      "eval_reference_latency_ms": 0.011303165439885063,
+      "selection_reason": "Smallest fp16 case (1024 elements = 1 program); paired with timing-8 to compare the fixed floor across dtypes at negligible work",
+      "profile_ids": [
+        "5ed6d75a37934cdfad37c324a2f8e88c"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0001/fmod_tensor_-timing-0/7e4ec8fb0f1241438983c3382155ed13/manifest.json"
+      ],
+      "status": "failed"
+    }
+  ],
+  "findings": [],
+  "performance_interpretation": "No profiler counters exist this round, so the following is arithmetic on authoritative eval latencies from get_profile_context plus the frozen workload specs in hgkda_workloads; it is inference, not measurement, and is stated as such.\n\n(1) Two regimes, established by latency invariance. Nine of twelve timing workloads (n = 1024, 65536, 1048576 for fp16/bf16/fp32) all land in 15.860-18.701 us candidate vs 10.118-11.630 us reference. Work spans 1024x (1 program vs 256 programs at BLOCK=4096) with essentially no latency change: timing-0 (1024 fp16) 16.473 us vs timing-2 (1048576 fp16) 16.297 us. A workload cannot do 1024x more device work in the same time, so a fixed per-call floor of about 16 us dominates all nine. fp32 is the sharpest: timing-8 (1024) 16.058 us vs timing-10 (1048576) 18.701 us, i.e. +2.64 us of marginal time for 1M elements -> about 397 Gelem/s marginal, far above the sustained rate of the large cases (about 88-107 Gelem/s), so the marginal work really is small and the floor is not compute.\n\n(2) The floor gap versus the reference is fixed, not proportional. Excess over reference at n=1024 is 4.44 us (fp16), 5.94 us (fp32), 4.51 us (bf16); at n=1048576 it is 4.67 / 7.91 / 6.05 us. A gap that stays constant across a 1024x work range is the signature of per-call cost, not of per-element or per-byte cost. The reference (torch_npu native op) is also flat at 10.1-11.6 us, so the device-side fixed cost cannot exceed about 10 us; the candidate's roughly 5-8 us excess is therefore most plausibly host/Python launch-path work in run() (contiguity checks, data_ptr, device.index, tuple key construction, the _stream getattr+call, and the 13-argument low-level launch) plus possibly a longer device kernel for a masked 4096-lane program. This split is exactly what profiling was supposed to resolve and did not.\n\n(3) Large cases split by dtype. fp32 4096x4096 (timing-11) is at 0.9477, essentially parity: 201.33 MB of read+read+write traffic in 190.351 us = 1.058 TB/s candidate vs 1.116 TB/s reference. fp16/bf16 4096x4096 are 0.5081 and 0.5146. Candidate fp16 (162.672 us) is only 14.5% below candidate fp32 (190.351 us) although its logical traffic is exactly half (100.66 MB vs 201.33 MB), while reference fp16 (82.659 us) is 54% below reference fp32 (180.398 us). Under max(compute, bytes/BW) with the candidate's own achieved fp32 rate, the fp16 case's 100.66 MB should finish in about 95 us but took 162.672 us, and the candidate fp32 case is already at its bandwidth ceiling, so the fp16 path looks compute-limited at a cost that is dtype-independent (about 162.7 us for 16.78M elements, about 103 Gelem/s). That is consistent with the mandatory a.to(tl.float32)/b.to(tl.float32) widening making the arithmetic identical to the fp32 case, but it is indirect: whether cvt/F2F widening and fp32 division sequences are actually emitted, and how many vector instructions per element the div/floor/bitcast/where chain costs, is unverified without the instruction listing.\n\n(4) Per-program distribution is unmeasured. At BLOCK=4096 the eight 1M-element cases are 256 programs and the 4096x4096 cases are 4096 programs on a 20-SM (AIC) / dav-c220 device; wave quantization, core idle time, and whether a larger or smaller BLOCK changes occupancy could not be observed.\n\nProfiler evidence neither supports nor contradicts the round-1 baseline hypothesis (it is silent), and it likewise cannot adjudicate the fp16-widening hypothesis; the arithmetic above is suggestive but indirect.",
+  "next_experiment": {
+    "action_category": "reduce_per_call_host_launch_overhead",
+    "action_description": "Attack the fixed ~16 us per-call floor rather than per-element work. In run(), move everything that does not depend on the current call out of the hot path and into cache fill: store per cache key a pre-bound tuple of (launcher.launch, compiled.function, compiled.packed_metadata, grid=(n+BLOCK-1)//BLOCK); resolve the raw-stream accessor function object ONCE at module import (torch_npu._C._npu_getCurrentRawStreamNoWait) so the hot path no longer does a getattr on the C module each call, while still invoking it every call with the live device index so the current stream is always passed; build a single precomputed integer cache key (dtype code, device index, n) instead of a tuple, and read A.device.index once; keep the aligned fast path, the non-aligned fallback, the generic strided path, in-place semantics (return A) and every numeric operation byte-identical. Do not change BLOCK, the math, or the stream source in this round, so the measurement stays attributable to host overhead alone.",
+    "expected_impact": "If the ~16 us floor is host-side (the reading supported by the flat latency across 1024x work and the constant 4.4-7.9 us excess over a reference that is itself flat), removing 3-5 us lifts all nine overhead-dominated workloads from 0.58-0.72 to roughly 0.85-1.0 and moves geo_mean from 0.6565 to about 0.82-0.89. With nine workloads currently near 0.66 and only three large ones, this single change is worth far more than the fp16/bf16 large-case fix, whose ceiling is geo_mean 0.734 even if both large narrow-dtype cases reached parity. The three large cases also shed the same absolute few microseconds (timing-3 162.7 -> about 158, timing-11 190.4 -> about 186).",
+    "risks_and_rollback": "Risk is confined to launch plumbing, not arithmetic: caching the stream accessor function object is safe, but caching the resolved stream value would be unsafe (the current stream, current pointers and current runtime parameters must be passed on every invocation), so keep the call per invocation. Any precomputed key must still include device index and dtype so a dtype/shape/layout switch cannot hit a stale entry. Rollback is trivial: the round-1 main.py at .kernelgen/evals/round-0001/main.py (sha256 70609fe9...) stays as the fallback and is restored if any correctness or supplementary check regresses.",
+    "validation_workloads": [
+      "fmod_tensor_-timing-0",
+      "fmod_tensor_-timing-8",
+      "fmod_tensor_-timing-4",
+      "fmod_tensor_-timing-2",
+      "fmod_tensor_-timing-6",
+      "fmod_tensor_-timing-10",
+      "fmod_tensor_-timing-3",
+      "fmod_tensor_-timing-11"
+    ],
+    "success_criteria": [
+      "Full round correctness stays 30/30 PASS with the same zero-error tolerance behavior, and the supplementary layout/stream/parameter-switch checks still pass (the 57-check set used for this operator must not regress; in-place identity, stride, broadcast and special-value semantics unchanged).",
+      "Headline geo_mean improves from 0.6565 to at least 0.75, with each of the nine overhead-dominated workloads at or below 13.5 us candidate latency (from 15.86-18.70 us).",
+      "Falsification test: if the nine workloads stay at or above 15.8 us while the large cases are unchanged, the ~16 us floor is device-side kernel launch/latency rather than host enqueue, and the next round must switch to the device-side branch instead of further host micro-optimization."
+    ]
+  },
+  "warnings": [
+    "Profiling failed identically on 5 requests covering 4 timing workloads (timing-11 was retried alone); error: 'msprof base collection exited successfully without profile completion marker'. All results had capabilities=[], metrics={}, artifacts=[], stage_count=1.",
+    "Manifests under .kernelgen/profiles/round-0001/ preserve only the request block and the failure result; no vendor OpProf text, no kernel report, no simulation output was downloaded, so there is no partial evidence to analyze.",
+    "The instruction level was not attempted after the base collection stage failed, because on this backend the simulator/instruction stage requires the device OpProf to complete first; otherwise it fails in the simulator stage and must not be recorded as an instruction_listing.",
+    "Scheduler state at request time: npu:0 available, incidents 11 (all recovered), last incident 'profile cancelled by client'; the repeated identical failure across independent requests suggests an environment-side msprof problem rather than a per-workload issue.",
+    "Per the seed-identity note, the paired-capture evidence does not match the round-1 seed (solution_sha256 70609fe9...), so no earlier captured metrics were reused for this analysis."
+  ],
+  "open_questions": [
+    "Is the ~16 us fixed floor host enqueue time in run(), or device-side kernel launch latency for a masked BLOCK=4096 program? Only a device kernel-duration measurement can separate them.",
+    "Are fp16/bf16 inputs actually widened by emitted cvt/F2F instructions, and how many vector instructions does the div -> floor -> bitcast -> where -> mul -> sub chain emit per element (is x/y a software Newton-Raphson sequence)?",
+    "At 4096 programs on 20 AIC cores, what is the wave quantization and AIV idle fraction for the large cases, and would a different BLOCK change it?",
+    "Why did msprof base collection fail (missing completion marker) and can a later round collect it, so the large-case bound can be settled by counters rather than by latency arithmetic?"
+  ],
+  "error": "msprof base collection exited successfully without profile completion marker (identical error on all 5 requests: timing-3, timing-11, timing-8, timing-0 at level=metrics, plus timing-11 retried alone). Every result returned status=failed, capabilities=[], metrics={}, artifacts=[]. No device kernel duration, AIV/MTE counters, or instruction listing was obtainable, so the requested host-vs-device split, pipeline utilization, per-program distribution and fp16-widening evidence could not be measured this round."
+}

@@ -1,0 +1,52 @@
+{
+  "config_ids": [
+    "dual-n-group4",
+    "dual-n-stage1"
+  ],
+  "hypothesis": "父版FP16双N tile(128x128x256)保留A面板一次复用、两只累加器，结构本身正确；Roofline中父版1024/2048的cube与mte1活跃比例偏低，同时aic_scalar_mte1_stall非零，说明存在搬运/标量等待造成的发射空档，而不是计算绝对受限。dual-n-constexpr(1.027x)与dual-m-reuse-b(1.056x)在1024上仅小幅优于父版，证明多输出结构仍有空间但默认调度已接近上限。追加两项选择改变平铺发射顺序与流水级数而不触碰tile形状与输出数量：group4按M组内蛇形重排tile以改善跨program的A/B面板L2局部性，期望降低GM/L2读事件为算法字节的倍数以及mte2均值；stage1减少多缓冲深度，期望降低UB压力与mte1等待，但可能因重叠不足而拖慢。两项都以1024/2048大形状交错真实设备计时裁决，不以限值侧或流水比例相加作解释。",
+  "predictions": [
+    {
+      "metric": "float16-1024端到端device计时(speedup)",
+      "config": "dual-n-group4",
+      "direction": "小幅改善，预期1.00–1.06x"
+    },
+    {
+      "metric": "float16-2048端到端device计时(speedup)",
+      "config": "dual-n-group4",
+      "direction": "中性到小幅改善，预期0.99–1.05x，需交错测量确认"
+    },
+    {
+      "metric": "GM/L2 Read+Write事件字节（cache-miss模型）",
+      "config": "dual-n-group4",
+      "direction": "可能小幅下降，逻辑A/B元素下界不变"
+    },
+    {
+      "metric": "aic_mte2_ratio均值",
+      "config": "dual-n-group4",
+      "direction": "可能下降或持平，单列不解释为带宽富余"
+    },
+    {
+      "metric": "float16-1024端到端device计时(speedup)",
+      "config": "dual-n-stage1",
+      "direction": "不确定，预期0.95–1.03x，可能因重叠减少而退化"
+    },
+    {
+      "metric": "float16-2048端到端device计时(speedup)",
+      "config": "dual-n-stage1",
+      "direction": "不确定，预期0.95–1.02x"
+    },
+    {
+      "metric": "aic_scalar_mte1_stall_time",
+      "config": "dual-n-stage1",
+      "direction": "可能下降，但流水比例不求和为利用率"
+    }
+  ],
+  "limitations": [
+    "本轮候选只覆盖半精度快路径；float32、bf16大K(K>=4096)与不规则形状回退父版，结论不外推到FP32",
+    "limiting_side=compute仅表示经验参考线哪侧更低，不证明实际计算受限；低达成率来自IR/流水/计时组合判断",
+    "流水活跃比例(aic_cube/mte1/mte2/scalar、aiv_vec)不可相加，也不等同整卡利用率",
+    "GM字节为官方cache-miss/eviction模型结果，逻辑字节、Memory.csv接口流量与算法FLOPs分别单列，不混用",
+    "本轮实测仅1024 float16筛选且双输出仅1.027x，1024/2048交错与归一化速度仍需KGS一次完整裁决，未完成项目不推断收益",
+    "group4与stage1均未测，收益与退化可能共存；历史单输出(M复用)结果不能替代双输出判定"
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "api_version": "v6.2",
+  "binding": {
+    "bundle_id": "sha256:8e87d014ec2f5b0966064bd84a3d7d0a5954b6ea1ad0a6db6a4654eadd85a483",
+    "definition": "fix"
+  },
+  "implementation": {
+    "name": "fix-HG-KDA-host-metadata-v4-1",
+    "definition": "fix",
+    "language": "triton",
+    "entrypoint": "main.py::run",
+    "sources": [
+      {
+        "path": "main.py",
+        "content": "# SPDX-License-Identifier: Apache-2.0\n\"\"\"Triton 向零截断：保留 IEEE 正负零，直接支持非连续输入。\n\n浮点值先精确扩展到 FP32，再清除小数对应的尾数位；NaN/Inf 不变。\n仅缓存已编译代码与启动元数据，每次重新分配输出、读取输入指针和当前流。\n\"\"\"\nimport torch\nimport torch_npu\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef _trunc_bits(x):\n    xf = x.to(tl.float32)\n    truncated = tl.where(xf >= 0, tl.floor(xf), tl.ceil(xf))\n    sign = xf.to(tl.uint32, bitcast=True) & 0x80000000\n    magnitude = truncated.to(tl.uint32, bitcast=True) & 0x7fffffff\n    return (magnitude | sign).to(tl.float32, bitcast=True)\n\n@triton.jit\ndef _fix_contiguous(X, Y, N, BLOCK: tl.constexpr):\n    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    x = tl.load(X + index, index < N, other=0)\n    tl.store(Y + index, _trunc_bits(x).to(Y.dtype.element_ty), index < N)\n\n\n@triton.jit\ndef _fix_strided(X, Y, N, SHAPE: tl.constexpr, STRIDES: tl.constexpr, BLOCK: tl.constexpr):\n    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    remainder = index\n    offset = tl.full((BLOCK,), 0, tl.int64)\n    for axis in tl.static_range(len(SHAPE) - 1, -1, -1):\n        coordinate = remainder % SHAPE[axis]\n        remainder = remainder // SHAPE[axis]\n        offset += coordinate.to(tl.int64) * STRIDES[axis]\n    x = tl.load(X + offset, index < N, other=0)\n    tl.store(Y + index, _trunc_bits(x).to(Y.dtype.element_ty), index < N)\n\n\n_ENTRIES = {}\n\n\ndef _stream(device):\n    raw = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\n    if raw is not None:\n        try:\n            return raw(device)\n        except TypeError:\n            return raw()\n    return torch.npu.current_stream(device).npu_stream\n\n\ndef run(self):\n    if self.dtype not in (torch.float16, torch.bfloat16, torch.float32):\n        raise TypeError('Supported floating dtypes: float16, bfloat16, float32')\n    out = torch.empty_like(self, memory_format=torch.contiguous_format)\n    n = self.numel()\n    if not n:\n        return out\n    if not self.is_contiguous():\n        _fix_strided[((n + 255) // 256,)](self, out, n, tuple(self.shape), tuple(self.stride()), BLOCK=256)\n        return out\n    device = self.device.index\n    key = (device, self.dtype, n)\n    entry = _ENTRIES.get(key)\n    if entry is None:\n        block = min(4096, max(256, 1 << (((n + 7) // 8) - 1).bit_length()))\n        grid = (n + block - 1) // block\n        launch = None\n        try:\n            compiled = _fix_contiguous.warmup(self, out, n, BLOCK=block, grid=(1,))\n            launcher = compiled.run\n            if not (getattr(launcher, 'compile_only', False) or\n                    getattr(launcher, 'enable_msprof_register_tensor', False) or\n                    getattr(launcher.metadata, 'debug_enabled', False) or\n                    getattr(launcher.metadata, 'debug', False)):\n                launch = (launcher.launch, compiled.function, compiled.packed_metadata)\n        except Exception:\n            pass\n        entry = (grid, block, launch)\n        _ENTRIES[key] = entry\n    launch = entry[2]\n    if launch and not ((self.data_ptr() | out.data_ptr()) & 15):\n        launch[0](entry[0], 1, 1, _stream(device), launch[1], launch[2], None, None, None,\n                  self.data_ptr(), out.data_ptr(), n, None)\n    else:\n        _fix_contiguous[(entry[0],)](self, out, n, BLOCK=entry[1])\n    return out\n"
+      }
+    ]
+  },
+  "settings": {
+    "warmup_ms": 1000,
+    "benchmark_ms": 100,
+    "num_trials": 3,
+    "timeout_seconds": 1800
+  }
+}

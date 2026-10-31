@@ -1,0 +1,139 @@
+﻿  1 | # Copyright 2026 FlagOS Contributors
+  2 | #
+  3 | # Licensed under the Apache License, Version 2.0 (the "License");
+  4 | # you may not use this file except in compliance with the License.
+  5 | # You may obtain a copy of the License at
+  6 | #
+  7 | #     http://www.apache.org/licenses/LICENSE-2.0
+  8 | #
+  9 | # Unless required by applicable law or agreed to in writing, software
+ 10 | # distributed under the License is distributed on an "AS IS" BASIS,
+ 11 | # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ 12 | # See the License for the specific language governing permissions and
+ 13 | # limitations under the License.
+ 14 | 
+ 15 | import logging
+ 16 | 
+ 17 | import torch
+ 18 | import triton
+ 19 | import triton.language as tl
+ 20 | 
+ 21 | logger = logging.getLogger(__name__)
+ 22 | 
+ 23 | _RAD2DEG = 57.29577951308232
+ 24 | 
+ 25 | _MIN_GRID = 2048
+ 26 | _MAX_GRID = 32768
+ 27 | _TARGET_ELEMS_PER_PROGRAM = 4096
+ 28 | 
+ 29 | 
+ 30 | def _numel(x):
+ 31 |     n = 1
+ 32 |     for s in x.shape:
+ 33 |         n *= s
+ 34 |     return n
+ 35 | 
+ 36 | 
+ 37 | @triton.jit
+ 38 | def _rad2deg_kernel(
+ 39 |     x_ptr,
+ 40 |     n_elements,
+ 41 |     BLOCK: tl.constexpr,
+ 42 |     EVEN: tl.constexpr,
+ 43 |     ITERS: tl.constexpr,
+ 44 | ):
+ 45 |     pid = tl.program_id(0)
+ 46 |     num_progs = tl.num_programs(0)
+ 47 |     offs = tl.arange(0, BLOCK)
+ 48 |     total = num_progs * BLOCK
+ 49 |     if EVEN:
+ 50 |         base = pid * BLOCK
+ 51 |         for _ in tl.static_range(ITERS):
+ 52 |             off = base + offs
+ 53 |             x = tl.load(x_ptr + off)
+ 54 |             y = (x.to(tl.float32) * 57.29577951308232).to(x.dtype)
+ 55 |             tl.store(x_ptr + off, y)
+ 56 |             base += total
+ 57 |     else:
+ 58 |         for i in range(0, ITERS):
+ 59 |             off = pid * BLOCK + i * total + offs
+ 60 |             mask = off < n_elements
+ 61 |             x = tl.load(x_ptr + off, mask=mask)
+ 62 |             y = (x.to(tl.float32) * 57.29577951308232).to(x.dtype)
+ 63 |             tl.store(x_ptr + off, y, mask=mask)
+ 64 | 
+ 65 | 
+ 66 | def _plan(n):
+ 67 |     block = 1024
+ 68 |     iters = 1
+ 69 |     while block <= 8192 and (n % (block * 2)) == 0 and block * 2 * 2 <= n:
+ 70 |         block *= 2
+ 71 |     while block * (iters + 1) * 4 <= n and iters < 1024:
+ 72 |         iters += 1
+ 73 |     grid = (n + block * iters - 1) // (block * iters)
+ 74 |     if grid < _MIN_GRID:
+ 75 |         grid = min(_MIN_GRID, max(1, n // block))
+ 76 |     if grid > _MAX_GRID:
+ 77 |         grid = _MAX_GRID
+ 78 |     while iters > 1 and grid * block * (iters - 1) >= n:
+ 79 |         iters -= 1
+ 80 |     return int(block), int(iters), int(grid)
+ 81 | 
+ 82 | 
+ 83 | def _launch(x):
+ 84 |     n = _numel(x)
+ 85 |     if n == 0:
+ 86 |         return
+ 87 |     if not x.is_contiguous():
+ 88 |         x = x.contiguous()
+ 89 |     block, iters, grid = _plan(n)
+ 90 |     even = (n % (block * iters)) == 0
+ 91 |     _rad2deg_kernel[(grid,)](
+ 92 |         x,
+ 93 |         n,
+ 94 |         BLOCK=block,
+ 95 |         EVEN=even,
+ 96 |         ITERS=iters,
+ 97 |         num_warps=4,
+ 98 |         num_stages=2,
+ 99 |     )
+100 | 
+101 | 
+102 | def rad2deg(A):
+103 |     logger.debug("GEMS RAD2DEG")
+104 |     if not A.is_contiguous():
+105 |         A = A.contiguous()
+106 |     out = torch.empty_like(A)
+107 |     _launch(out) if False else None
+108 |     _launch_kernel_out(A, out)
+109 |     return out
+110 | 
+111 | 
+112 | def _launch_kernel_out(src, dst):
+113 |     n = _numel(src)
+114 |     if n == 0:
+115 |         return
+116 |     block, iters, grid = _plan(n)
+117 |     even = (n % (block * iters)) == 0
+118 |     _rad2deg_kernel[(grid,)](
+119 |         dst if src.is_contiguous() and dst.is_contiguous() else src,
+120 |         n,
+121 |         BLOCK=block,
+122 |         EVEN=even,
+123 |         ITERS=iters,
+124 |         num_warps=4,
+125 |         num_stages=2,
+126 |     )
+127 |     if not (src.is_contiguous() and dst.is_contiguous()):
+128 |         dst.copy_(src)
+129 | 
+130 | 
+131 | def rad2deg_(A):
+132 |     logger.debug("GEMS RAD2DEG_")
+133 |     if not A.is_contiguous():
+134 |         A = A.contiguous()
+135 |     _launch(A)
+136 |     return A
+137 | 
+138 | 
+139 | run = rad2deg_

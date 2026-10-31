@@ -1,5 +1,15 @@
 # 910B 算子优化项目
 
+2026-10-31完成[最后两项攻关交付](operators/campaigns/remaining-final-20261031/交付报告.md)：`fix` **0.862×**、`expm1_` **0.879×**新增稳定达标，各自同源码两次完整评测30/30、原扩展、24项原生路径与30项冻结新形状检查通过。30项目标累计**24项常规稳定达标、1项求逆正确性未通过、5项特殊参考条件单列**。本轮是Codex自写Ascend C＋Triton特殊布局回退，未新增CC/DeepSeek生成。新增执行路径诊断入口，分别核算候选/参考延迟变化；14份正式请求、12条设备路径、2份真实Triton IR已核验。[复现工具](tools/profiling/hgkda/remaining_final/README.md)和本批`delivery.json`为最新入口，下列旧日期内容保留为历史记录。
+
+2026-10-30接续[剩余九项攻关交付](operators/campaigns/remaining-nine-20261030/交付报告.md)：新增稳定达标6项——`negative_` 0.937×、`log2_` 0.915×、`round_out` 1.412×、`special_round_out` 1.247×、`hardswish` 0.905×、`fmod_tensor_` 1.242×。均为自写Ascend C＋Triton布局回退，通过同源码两次完整KGS、原扩展及对齐路径检查。`fix`第三次0.766×未过线，`expm1_`0.697×及求逆5/7继续列为未完成。30项累计22项常规达标，另有5项特殊参考条件；37份正式请求、52条设备路径、9份实际IR已核验。[复现工具](tools/profiling/hgkda/remaining/README.md)和交付清单提供源码、附件身份及单次新复测入口。
+
+2026-10-30完成[三路对照与新增达标](operators/三路对照与新增达标-20261030.md)：`cross_out` **3.891×**、`nan_to_num_` **0.866×**、`native_group_norm` **0.814×**新增达标，`log10_` **0.938×**恢复稳定达标；四项完整评测和补测通过，既有12项原样复验通过。30项累计16项常规达标，CANN三项直接对照、最终源码、实际IR和单命令复现均已保存。
+
+当前新增任务见[2026-10-29新25算子计划](operators/下一阶段计划-20261029.md)，执行工具位于[tools/profiling/hgkda/next_phase](tools/profiling/hgkda/next_phase/README.md)。旧阶段成果和原始合同继续保留，以下2026-10-15目标属于历史阶段。
+
+2026-10-30新25项首遍已完成：六项本批新达标、三项历史复验达标、十二项正确但性能未达标，累计积分与矩阵求逆未交付，两个原版高分因参考CPU回退单列。[精简汇报](operators/campaigns/next25-20261029-v2/本批精简汇报-20261030.md)、[25项全表](operators/campaigns/next25-20261029-v2/已核验进展.md)及[接续说明](operators/campaigns/next25-20261029-v2/夜间接续-20261030.md)已更新；本轮为KGS完整调用计时，不混入历史设备成绩。
+
 当前按 2026-10-15 会议推进[下一阶段](operators/下一阶段计划-20261015.md)：固定 FlagGems/FlagTree，登记 10 项指定算子与 5 项 SGLang 候选，构建可插入 KG 的分阶段 HG-KDA 体检流程，评测使用 KGS。指定精度失败对象先修正确性。此前低于 0.8× 的四算子阶段已完成。完整步骤见 [总 README](../../README.md)。
 
 2026-10-26最新[10项最终验收](operators/会议10算子最终验收-20261026.md)：7项默认达标、1项确定性条件达标、2项补充NPU分解对照通过。本轮池化较同批父版实际加速1.547×；默认扫描参考反例和两项CPU回退叶子算子均已定位。源码、两种参考、成对trace与实际IR、96项证据核验和复现见[本批交付](operators/campaigns/acceptance-three-20261026/README.md)。

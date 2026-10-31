@@ -1,5 +1,19 @@
 # HG-KDA 分阶段体检与 KG 接入
 
+2026-10-31完成[最后两项交付](../../../operators/campaigns/remaining-final-20261031/交付报告.md)：`fix` 0.862×、`expm1_` 0.879×，累计24/30常规稳定达标。[remaining_final/](remaining_final/README.md)串联Ascend C设备与C++宿主变体、固定一次确认、原生路径及冻结新形状检查。本轮新增[执行路径诊断脚本](skills/hgkda/scripts/analyze_execution_paths.py)：核验源码/请求/合同，按逐case对数贡献排序，分离候选与参考耗时变化，关联已核验trace，并给出宿主或设备方向的待验证动作。它可离线复用；复杂机制与实现选择仍由Codex完成，本轮未新增CC/DeepSeek调用、RTL或完整关键路径重建。已完成14份正式请求、12条设备路径、2份真实Triton IR及5项离线测试核验。
+
+2026-10-30完成[剩余九项攻关](../../../operators/campaigns/remaining-nine-20261030/交付报告.md)，入口为[remaining/](remaining/README.md)：复用固定KGS合同，新增来源可见Ascend C＋Triton布局回退、对齐原生路径语义门禁、临界项确认和结构化交付。六项新增稳定达标，fix第三次低于0.8×、expm1_性能和求逆逐值合同问题单列；52条设备路径、9份实际IR及37份正式请求已核验。分类知识保留双缓冲选择、启动与设备计时分离、特殊值必须经过快速路径等经验；Codex实现与CC/DeepSeek搜索分别记录。
+
+2026-10-27完成[单算子三步演示](../../../operators/campaigns/agent-demo-20261027/三步演示-核验版.md)，统一入口见[agent_demo/](agent_demo/README.md)：同输入成对采集→Agent选择证据工具→源码／IR／Roofline及热点诊断→有限动作→完整KGS→新采集与预测复核。CC＋DeepSeek真实执行三次角色调用，模板和控制器由Codex实现。共享B候选本批实际1.023×起点，相对PyTorch0.884×，两版42/42及18＋24检查通过；复现历史同字节成功源码。起点1087条、候选926条模拟器指令，部分证据与子进程退出异常单列；核验版报告更正模型过度归因，原回执保留。
+
+2026-10-27完成[矩阵乘复用与流水优化](../../../operators/campaigns/matmul-pipeline-20261027/精简汇报.md)：新增[matmul_pipeline/](matmul_pipeline/README.md)，把Roofline／IR证据转成有限多输出块变换，并由CC＋DeepSeek实际选择追加流水方案。最终共享B候选较同批父版实际设备加速1.040×，相对PyTorch0.895×，42/42及18＋24补充检查通过；同模板复用方向四项确认1.059×。硬件总流量基本不变，不能归为减少HBM搬运。成功与失败知识已分类保存；本轮由Codex实现通用模板、编排和核验，模型调用及输入快照独立留证。
+
+2026-10-27完成[数值Roofline与矩阵乘闭环](../../../operators/campaigns/roofline-20261027/最终报告.md)：新增[roofline/](roofline/README.md)，复用导师分析器并校验固定910B计数、GM／L2范围与同精度经验参考；12项同输入数值采集、中文图表和可注入KG角色的摘要已交付，CC＋DeepSeek实际消费留证。完整42/42＋18/18通过，但单输出tile候选相对父版0.888×，保留父版，无新增性能收益。官方GM0.8TB/s模型与本机观测不匹配，物理上界保持未决；经验线不称峰值利用率。旧批次“不具备数值Roofline”的记录按原时间保留。
+
+2026-10-26完成[设备机制系统闭环](../../../operators/设备机制系统闭环-20261026.md)：归约原合同27/27，机制组设备计时相对PyTorch1.509×、相对本批父版1.083×；独立新形状完整调用1.113×、24/24。矩阵乘未获设备改善，保留父版。新增[device_mechanism/](device_mechanism/README.md)，连续执行设备干预、分层补测、同预算模型配置、完整评测、冻结后检验及自动报告。方法/评测213项、附件/CSV976项核验通过；模拟器失败与RTL预留单列，原合同计时错误标签以源码快照更正。本轮没有证明结构化诊断在独立集上优于原始证据组。
+
+2026-10-26新增[机制闭环原型](../../../operators/机制闭环原型-20261026.md)：同编译产物调用干预→竞争假设→模型选动作→通用模板变换→完整评测→预测核验。开发SELU和冻结后独立asinh分别相对本批FlagGems＋共享适配为1.457×、1.448×，均51/51＋21/21；307项证据核验通过。规则、探针、检查器及变换器在独立检验时保持相同SHA，未加入asinh专用数学改写。模块与复现入口见[mechanism/](mechanism/README.md)；早期重复执行、上游布局错误和tanh暖态JIT不可捕获均保留。本模块是调用机制原型，未实现设备内部依赖重建；不改写历史成果归属。
+
 2026-10-26新增[剩余三项验收与参考路径诊断](../../../operators/campaigns/acceptance-three-20261026/README.md)：池化连续输出分块较同批父版完整调用实际加速1.547×；共轭既有源码完成独立NPU分解对照；累计积分默认参考16次出现4处原容差区间无交集，V2接口仍不稳定。新增[参考可信性与NPU分解](skills/hgkda/references/性能指标/参考可信性与NPU分解.md)，按叶子注册、trace、稳定性、分解及源码／IR组织诊断。补充参考不替换官方原参考，本批由Codex实现和编排，未新增CC搜索。96项证据核验通过，正式复现入口为`reproduce-acceptance.py`；扫描反例入口为`reproduce-scan-reference.py`。
 
 [夜间连续大goal](../../../operators/夜间连续优化交付-20261023.md)已取得完整结果：GELU 2.271×、标准Philox修复uniform 1.325×、rad2deg_ 1.117×、SELU 0.837×；scatter_add 0.419×未达标，累计积分未通过全部数值检查。`run-endurance.py`与独立补充队列在宿主tmux串行执行，自动衔接有限搜索、门禁、一次正式完整KGS、采集与证据审计。
@@ -33,6 +47,8 @@
 本批已观察到原生KG主动从metrics升级到CANN模拟器；首次instruction请求超时，成功metrics与失败采集分别保留。配置、预算及后续方法问题见[指令采集观察](research/原生KG指令采集预算-20261021.md)。该记录不改变运行中的冻结覆盖层。
 
 ## 方法与实现
+
+导师总工程图的中文转录、Mermaid流程与HG-KDA实际贡献对照见[导师总工程与HG-KDA贡献](../../../../../docs/导师总工程与HG-KDA贡献.md)。HG-KDA目前是可接入KG的skill、知识和脚本模块，采集与评测依赖KGS；不将它等同于整套融合提取、wrapper、JIT与发布平台。
 
 入口 skill 是 [skills/hgkda/SKILL.md](skills/hgkda/SKILL.md)。知识同时按算子类型和性能指标分类，路由见[知识索引](skills/hgkda/references/知识索引.md)。
 

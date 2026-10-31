@@ -1,0 +1,89 @@
+{
+  "schema_version": "1.0",
+  "round_num": 1,
+  "evaluation_fingerprint": "e6e03d6d694afbd5d8e08b9b8aa0f606a1309cb5bea38111150db4694cec3d42",
+  "status": "failed",
+  "solution_sha256": "fa1b008bc63686c3e9a0b2bbe656cb2a221ad6a43207e448aae4d6fb7d19d226",
+  "backend": "npu",
+  "profiler": "msprof",
+  "capabilities": [
+    "performance_counters",
+    "pipeline_utilization",
+    "kernel_profile",
+    "instruction_listing"
+  ],
+  "dominant_bound": "unknown",
+  "profiled_workloads": [
+    {
+      "uuid": "log2_-timing-3",
+      "axes": {},
+      "eval_speedup": 0.23850270137101634,
+      "eval_latency_ms": 0.0664320954752395,
+      "eval_reference_latency_ms": 0.01584423422858189,
+      "selection_reason": "Lowest-speedup and highest-latency workload of the round (float16 4096x4096, 16.7M elements, 0.2385x); primary target for the memory-vs-vector-vs-dispatch question.",
+      "profile_ids": [
+        "f20e67cf67d14c5da5bda8da43af6295",
+        "a5405fc2a68f468f8bef9be1ecc8493f",
+        "7be7d766dcb74a51bb35340dcdec6eb5"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0001/log2_-timing-3/71af315058d443b4975b7f5daea8c725/manifest.json",
+        ".kernelgen/profiles/round-0001/log2_-timing-3/2e2804a873e04acf8ae72a11e8929628/manifest.json",
+        ".kernelgen/profiles/round-0001/log2_-timing-3/5ac6ba7b99d742c6a99755f6d66a4d7e/manifest.json"
+      ],
+      "status": "failed"
+    },
+    {
+      "uuid": "log2_-timing-0",
+      "axes": {},
+      "eval_speedup": 0.7040561413919159,
+      "eval_latency_ms": 0.012891368016339019,
+      "eval_reference_latency_ms": 0.009076246822846806,
+      "selection_reason": "Small-size control (float16 1024 elements, 1 program, 0.7041x) needed to separate the device and host parts of the flat ~12.5 us floor.",
+      "profile_ids": [
+        "382a910f11924792825cc0db6b6af85a",
+        "f21b7e6d872246aa8d50a6883abe0e9a"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0001/log2_-timing-0/4ae11aa5b2b04260859f11eda9567510/manifest.json",
+        ".kernelgen/profiles/round-0001/log2_-timing-0/7ec264d8f9a04d259ccbc93a39f0e233/manifest.json"
+      ],
+      "status": "failed"
+    }
+  ],
+  "findings": [],
+  "performance_interpretation": "No profiler artifact exists, so this section is derived only from the authoritative eval timings in get_profile_context, the frozen workload specs, and the candidate source; it is inference, not measurement. (1) FLOOR: across n=1024 (grid=1), n=65536 (grid=4) and n=1048576 (grid=64) the candidate stays in a 12.1-13.8 us band while elements change 1024x; only 0.87 us of added cost for 1024x more elements means measured latency there is a fixed per-call floor, not element throughput. The reference floor is 7.5-9.9 us, so the residual gap is ~3-4 us per call; the frozen host-wrapper hypothesis is confirmed as largely fixed (the seed was 17-25x slower at these sizes). (2) THE 4096x4096 CASES ARE NOT HBM-LIMITED: the fp16/bf16 working set is 64 MiB (33.6 read + 33.6 write) and fp32 is 128 MiB, both under the target-reported L2 of 176160768 B (168 MiB), and the timing loop reuses one buffer for the whole loop, so the traffic is L2-resident. The reference's 15.84 us for 67.1 MB of fp16 traffic equals 4.25 TB/s effective, reachable only from L2 - further proof that even the reference is not HBM-bound here. (3) BYTE VS ELEMENT SCALING: candidate fp32 (80.87 us) costs only 1.22x of fp16 (66.43 us) while moving exactly 2x the bytes at an identical 16.7M element count. A memory-path-dominated kernel would scale ~2x, an element-dominated one ~1.0x; 1.22x therefore places most of the cost on the per-element path (dtype convert + fp32 log2 lowering) with a secondary transfer term. (4) DISPATCH IS NOT THE PRIME SUSPECT: 1024 programs over 20 reported AI cores is ~51 waves at 16384 elements per program, so per-program prologue is heavily amortized; the 1M case (64 programs) and the 16.7M case (1024 programs) differ by 52 us, far more than any plausible prologue cost. (5) STRUCTURAL SUSPECT: the contiguous kernel takes the whole BLOCK=16384 tile in a single shot (32 KiB source staged to 64 KiB fp32, ~96 KiB of the 192 KiB UB per stage) and has no inner loop, so the compiler has no stage boundary at which to double-buffer MTE2 against AIV; each program is a serialized load -> convert -> log2 -> convert -> store. Combined with the fp32 round trip, that is the most plausible cause of the 4.2x gap at equal element count, and it is exactly what a loopy pipelined contiguous kernel would either fix or falsify.",
+  "next_experiment": {
+    "action_category": "kernel_structure_pipelining",
+    "action_description": "Restructure ONLY the contiguous flat path of main.py into a persistent, looped kernel: keep grid small and fixed at a multiple of the 20 AI cores (grid = 40, i.e. 2 programs per core; compare against 20 in the same measurement), and inside each program loop over sub-tiles with tl.range in chunks of SUB_TILE = 4096 elements (both 2-byte and 4-byte dtypes), with num_stages = 2 (kernel kwarg or tl.range(..., num_stages=2)) so MTE2 loads overlap AIV work. Keep the fp32 staging of the transcendental, the exact store dtype, the in-place write-back to the same pointer, and the unmasked/masked split (use the masked sub-tile variant for the ragged last sub-tile of a program and for non-multiple n). Leave _log2_scaled and _log2_nd and the whole host launcher/stream path unchanged, and keep the current single-tile behaviour for n <= 1048576 so the 9 floor-bound workloads cannot regress. Parameter delta: BLOCK 16384/8192 single-shot -> grid 40 persistent programs x SUB_TILE 4096 looped with num_stages=2.",
+    "expected_impact": "If, as inferred, the 4096x4096 gap is a serialized load->compute->store with no MTE2/AIV overlap, overlapping the two paths should cut the 54-68 us of device time roughly toward max(load, compute) and move fp16/bf16 from ~66-69 us toward ~35-45 us (speedup 0.24/0.37 -> ~0.40/0.55) and fp32 from 80.9 us toward ~50 us. That is worth up to +0.10 to +0.13 on geo_mean over the three large workloads (0.552 -> ~0.65-0.68) with the other nine workloads unchanged. If instead the kernel is dominated by the fp32 log2 lowering itself, latency will stay flat, which is itself the decisive falsification result and redirects the next round to the transcendental (native fp16 log2 / mantissa-exponent reformulation) rather than to transfer overlap.",
+    "risks_and_rollback": "Risks: (a) a persistent grid of 40 programs can serialize if the compiler maps one program per core strictly, leaving 20 idle - mitigate by comparing grid 40 vs 20 in one measurement; (b) the loop introduces a masked tail path that must still produce exact -inf/NaN/0 handling, so a wrong mask can corrupt the last elements - the masked sub-tile load already uses other=1.0 and must keep that; (c) larger per-program element counts could overflow UB if SUB_TILE x num_stages exceeds the 192 KiB budget - 4096 elements x 4 B x 2 stages = 32 KiB is safe, do not raise SUB_TILE above 8192 at num_stages=2; (d) a regression on the small floor-bound workloads - guarded by leaving n<=1048576 on the existing path. Rollback: revert main.py to the round-1 solution sha256 fa1b008bc63686c3e9a0b2bbe656cb2a221ad6a43207e448aae4d6fb7d19d226, which is a known 30/30-passing 0.5521 geo_mean; the contiguous kernel is the only edited region, so restore _log2_flat/_pick_block and re-run preflight.",
+    "validation_workloads": [
+      "log2_-timing-3",
+      "log2_-timing-7",
+      "log2_-timing-11",
+      "log2_-timing-2",
+      "log2_-timing-0"
+    ],
+    "success_criteria": [
+      "Full eval correctness 30/30 PASSED, including the special-value NaN/Inf cases (correctness-0..17) and the strided 7x9 and 1025 views that failed in the seed.",
+      "geo_mean strictly above the 0.5520872110331337 baseline of this round (target >= 0.62) with no workload regressed by more than 2%.",
+      "Each 4096x4096 workload improves by at least 1.3x: log2_-timing-3 below ~51 us, log2_-timing-7 below ~53 us, log2_-timing-11 below ~62 us.",
+      "The <=1048576 control workloads (timing-0, timing-2, timing-9) stay within 2% of 12.1-13.8 us, proving the host path and the small-size fast path were not disturbed.",
+      "Either outcome of the overlap test is recorded: a flat latency on the 4096x4096 cases falsifies the no-overlap hypothesis and must be reported so the next round attacks the transcendental instead."
+    ]
+  },
+  "warnings": [
+    "All five msprof collection attempts failed at the base stage (stage 1 of 1); no performance counters, physical byte counts, pipeline utilization, or instruction listing were obtained for any workload.",
+    "No artifact was registered for round 1, so no evidence-backed profiler finding could be recorded; the performance interpretation and next experiment come from authoritative eval timings plus the frozen workload specs and candidate source and are inference with medium confidence.",
+    "The device-vs-host split of the ~12.5 us small-size floor remains unmeasured; separating it needs a DMA-only or kernel-only counter that the collector did not deliver.",
+    "The per-workload manifests written under .kernelgen/profiles/round-0001/ are not registered artifacts, so their error text was transcribed into this analysis rather than cited as evidence."
+  ],
+  "open_questions": [
+    "Is the ~12.5 us small-size floor host Python/launcher cost or a device-side minimum kernel latency, given the reference also pays ~9 us?",
+    "What is the actual MTE2/MTE3 busy time and physical byte count for the 4096x4096 case, i.e. is the traffic L2-served as the 168 MiB cache size suggests?",
+    "Does the Ascend lowering of tl.log2 on fp32 emit a polynomial expansion, and how many vector instructions per element does that cost versus a native log2?",
+    "Is the msprof base-collection failure specific to this run environment, and will it reproduce on a later round?"
+  ],
+  "error": "msprof base collection exited successfully without profile completion marker (5 attempts: log2_-timing-3 level=metrics twice and level=instruction once, log2_-timing-0 level=metrics twice). Every attempt stopped at stage 1 of 1 with status=failed, capabilities=[], metrics={}, artifacts=[], and stage_count=1. No report, csv, or db was left anywhere under the run directory, so no counter evidence could be cited."
+}

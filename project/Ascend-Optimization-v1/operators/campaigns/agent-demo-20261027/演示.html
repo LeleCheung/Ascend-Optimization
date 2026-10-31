@@ -1,0 +1,90 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>HG-KDA 三步演示</title><style>body{margin:0;background:#f5f7fb;color:#17243b;font:16px/1.7 system-ui,sans-serif}main{max-width:1080px;margin:40px auto;padding:36px;background:white;border-radius:16px}h1{margin:0;color:#153e75}section{display:flex;gap:16px;margin:28px 0}.card{flex:1;padding:20px;background:#edf4ff;border-radius:12px}.n{color:#2363b8;font-size:26px;font-weight:700}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.7 ui-monospace,monospace}a{color:#185ab0}</style><main><h1>HG-KDA：从硬件证据到优化验证</h1><p>matmul_bias_activation · Ascend 910B</p><section><div class="card"><div class="n">01 自动对比</div>同输入PyTorch／候选<br>指标聚合与差异</div><div class="card"><div class="n">02 形成诊断</div>Agent选择工具<br>源码＋IR＋Roofline</div><div class="card"><div class="n">03 深入定位</div>热点指令映射<br>修改＋完整KGS验证</div></section><p><strong>相对本批起点 1.023× · 完整评测42/42 · 补充18＋24项</strong></p><p>历史成功方法的新采集与流程复现；模拟器退出异常按部分证据记录。</p><p><a href="三步演示.md">打开Markdown</a> · <a href="正式逐case.csv">逐case数据</a></p><pre># HG-KDA 单算子三步演示
+
+对象：matmul_bias_activation，计算 ReLU(A×B+bias)。一条宿主命令串联真机对比、模型选工具、结构化诊断、指令热点、通用源码变换、完整KGS与预测复核。
+
+本批最终候选相对历史优化起点实际设备加速 **1.023×**，相对PyTorch **0.884×**。两版各42/42、补充18＋24项通过。候选与此前成功源码同字节，本批展示新采集、新模型调用与优化方法复现，不称全新发现。
+
+## 第一步：自动对比
+
+同一输入生成器、相同seed、shape和dtype分别运行PyTorch与起点。脚本核对卡7和目标kernel，整理搬运、指令数、流水、等待与冲突；按block保留均值、极值、总数及缺失值。
+
+| FP16规模 | 起点融合kernel μs | PyTorch GEMM组件 μs |
+|---|---:|---:|
+| 512³ | 13.700 | 7.060 |
+| 1024³ | 36.161 | 16.200 |
+
+PyTorch该表只采GEMM组件，候选包含bias/ReLU；这些profiling时间不作为完整算子加速比。原件见seed-profile，指标差异见paired/*/comparison.json。
+
+## 第二步：形成诊断
+
+Agent主动选择：read_source、read_ir、read_hotspots、read_paired_metrics、read_knowledge。控制器实际读取并返回所选原件，工具调用记录见agent/tool-results，真实CC＋DeepSeek请求见agent/route和agent/plan。
+
+输入包括源码、编译器实际生成的TTIR／bcmlir、成对硬件指标、同精度经验Roofline及历史知识。Roofline回答距离参考线有多远；源码／IR和实验用于判断具体原因。
+
+模型选择的动作：dual-m-reuse-b、dual-n-interleave。修改由已有通用模板生成：共享B改变相邻输出块的复用方向；交错加载改变K循环中的load/dot顺序。模板和控制器由Codex实现，模型负责证据选择与动作决策。
+
+开发六组结果：
+
+| 动作 | 同批起点实际加速 |
+|---|---:|
+| dual-m-reuse-b | 1.043× |
+| dual-n-interleave | 1.008× |
+
+正式前冻结开发优胜者，不依据正式结果重新调参。经验Roofline采用同环境参考，未证明物理峰值；源码debug位置不等于因果归因。
+
+## 第三步：深入定位并验证修改
+
+通过KGS的Ascend指令解析器读取模拟器清单，再由HG-KDA按候选JIT符号过滤、按单指令观测时间排序，并保留实际源码映射。下表是起点的少量示例：
+
+| 核 | 指令 | 模拟器μs | 源码行与片段 |
+|---|---|---:|---|
+| core0.cubecore0 | MOV_OUT_TO_L1_MULTI_ND2NZ | 4.520 | 454：b1_ptrs = b0_ptrs + BLOCK_SIZE_N * stride_bn |
+| core0.cubecore0 | SET_FLAG | 4.500 | 454：b1_ptrs = b0_ptrs + BLOCK_SIZE_N * stride_bn |
+| core0.veccore0 | WAIT_FLAG_DEVI | 5.290 | 473：v0 = acc0 + bias0[None, :] |
+| core0.veccore0 | BAR | 1.610 | 475：v0 = tl.maximum(v0, v0 * 0.0) |
+| core0.veccore1 | WAIT_FLAG_DEVI | 5.290 | 473：v0 = acc0 + bias0[None, :] |
+| core0.veccore1 | BAR | 1.320 | 475：v0 = tl.maximum(v0, v0 * 0.0) |
+
+起点模拟器共1087条指令，983条附源码映射。模拟器在计算／导出后子进程退出异常，记录为部分证据；不能将其时间当正式延迟或相加重建关键路径。编译debug映射表明来源位置，不证明该Python表达式独占硬件指令耗时。
+
+| 版本 | 相对PyTorch设备加速比 | 完整KGS | 补充语义 |
+|---|---:|---:|---:|
+| 起点 | 0.865× | 42/42 | 18＋24项 |
+| 候选 | 0.884× | 42/42 | 18＋24项 |
+
+15项相同case实际延迟比几何平均为 **1.023×**；最终保留candidate。不是用两组对PyTorch分数相除。原始正式结果见validation，最终源码为validation/delivered.py。
+
+修改后的同输入采集：
+
+| FP16规模 | 起点μs | 候选μs | GM字节比 候选/起点 | L2字节比 |
+|---|---:|---:|---:|---:|
+| 512³ | 13.700 | 13.200 | 1.000 | 0.999 |
+| 1024³ | 36.161 | 34.341 | 1.000 | 0.999 |
+
+模型回看预测的原回执见feedback/agent-review。以下是待审阅的模型总结，最终数据以表格与原件为准：
+
+dual-m-reuse-b已在1024 FP16 档修复，15 个 case 的总体实际提升为1.0231×（按actual_candidate_over_seed计算），落在预测的1.02–1.05×区间内；收益集中在4096 FP16 约1.06×，512 档配对 profile 为1.038×，略超预测区间，fp32 与 2048 档基本持平。
+流量证据明确否定了“减少总搬运量”这一解释：各层总字节比都在0.996–1.0之间，变化主要来自 AIV 侧更少、更大的搬运（行数0.818×、每次字节1.217×）以及调度等待结构。
+AIV 尾处理 WAIT_FLAG_DEVI 在模拟器中仍为7.0us，seed为5.29us，说明复用方向没有消除尾处理串行，这也与模拟器的部分证据一致；1024 档 aic_scalar_mte1_stall_time为7.85us，seed为7.29us，等待没有下降。
+dual-n-interleave单独效果没有被本批数据单独检验，暂不下结论；建议后续按下述结论记录的方法：方向复用只作为1.02×级别的微调手段，下一步应针对 AIV 尾处理与 M/N 交错做受控对照。
+
+## 演示时怎么讲
+
+“我们把同输入profiling、源码／IR和经验Roofline整理成Agent可读的证据。Agent先选需要查看的工具，再结合热点和历史知识选择修改。改完后用同一合同完整测试，并重新采集指标，检查原先的解释是否成立。”
+
+“这个矩阵乘演示中，Agent选择共享B和交错加载；共享B在开发集胜出并通过完整评测。最终源码复现了历史成功方案，证明这段人工分析经验能够通过统一入口运行。复杂因果解释仍需交叉核验。”
+
+## 复现入口
+
+在910B宿主固定控制器环境运行，输出使用新批次目录。源码和经验参考需先按项目清单同步。
+
+~~~bash
+/data/hanle/ascend-optimization/runtime/kg-controller/venv/bin/python \
+  /data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/tools/profiling/hgkda/agent_demo/run.py \
+  --batch /data/hanle/ascend-optimization/runs/新的三步演示
+~~~
+
+用tmux运行该命令可在Windows关机后继续。控制器使用卡7项目锁、固定tle_yy容器和KGS19659；每源码一次正式评测。状态未知的操作不自动重发。新运行的模拟器可能出现已记录的退出异常，保留指令证据与状态，不假装完整成功。
+
+本批首次真机采集、三次模拟器调试和模型调用在统一控制器完成前已执行；workflow-state明确登记为恢复采用本批原件。最终入口对新目录能串联同样阶段，人工调试与模型调用分别归档。Windows同步排除可再生compiler-cache，原始指令CSV、trace、源码、IR、计时与模型回执保留；排除清单见transfers。
+</pre></main></html>

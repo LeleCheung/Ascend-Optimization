@@ -1,0 +1,108 @@
+{
+  "request": {
+    "api_version": "v6.2",
+    "evaluation_id": "39935395e04255b38fdd01b7acbe1441b99a293b352f461fdb700b4c4cf54783:round-2",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:4930515738bd2b1ff71fb46e39fe8998ad1aaf42a4ce0becbd1427725d194a89",
+      "definition": "xlogy_scalar_tensor"
+    },
+    "implementation": {
+      "name": "kernelgen-candidate-xlogy_scalar_tensor",
+      "definition": "xlogy_scalar_tensor",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "\"\"\"xlogy_scalar_tensor : out = xlogy(self_scalar, other), self-contained Triton.\n\nReference semantics (``torch.xlogy(scalar, tensor)``, fp32 math):\n  * ``y != y``    -> NaN   (aten precedence: checked before the zero rule)\n  * ``self == 0`` -> +0.0  (even for y == 0, y < 0, y == +-inf)\n  * otherwise     -> ``float(self) * log(y)``\n  * output dtype/shape always follow ``other``; ``other`` is never mutated.\n\nFor ``self != 0`` the two special cases collapse into plain IEEE arithmetic\n(``s * log(NaN)`` is already NaN, and the ``self == 0`` arm is unreachable), so\nthe timed path is one fused multiply-by-log.  For ``self == 0`` the\ntranscendental is compiled away and only the NaN positions of ``y`` survive.\n\nLayout: contiguous inputs take a flat kernel, non-contiguous views take an\nindex-math kernel driven by their real element strides so ``base[..., 0]``\nstyle views are read correctly, and the result is always dense.\n\nDispatch: the first call per (dtype, numel, scalar class, device) compiles the\nspecialisation once and caches a closure that drives the compiled Ascend\nlauncher directly (grid, raw current-stream handle, device pointers).  That is\nwhere ``JITFunction.run`` ends anyway, minus the per-call binder/cache-key work\nwhich is what dominates these small workloads; the stream handle is re-queried\non every call so a caller that switches streams still launches on the stream\nthat is current now.  Any unaligned pointer falls back to the bound JIT call so\ncompiled alignment assumptions can never be violated.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\ntry:  # cheapest faithful current-stream query on this target\n    import torch_npu\n\n    _RAW_STREAM = getattr(torch_npu._C, \"_npu_getCurrentRawStreamNoWait\", None)\nexcept Exception:  # pragma: no cover\n    torch_npu = None\n    _RAW_STREAM = None\n\n_BLOCK_MIN = 1024\n_BLOCK_CAP_2B = 16384      # 32 KiB source tile for 2-byte dtypes\n_BLOCK_CAP_4B = 8192       # 32 KiB source tile for 4-byte dtypes\n_TARGET_PROGS = 32\n_BLOCK_STRIDED = 512\n_MAX_DIMS = 8\n\n_PLANS = {}\n_GETTERS = {}\n\n\n@triton.jit\ndef _xlogy_flat_masked(Y, OUT, n, s, BLOCK: tl.constexpr, HAS_LOG: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    y = tl.load(Y + offs, mask=mask, other=1.0).to(tl.float32)\n    if HAS_LOG:\n        val = s * tl.log(y)\n    else:\n        val = tl.where(y != y, float(\"nan\"), 0.0)\n    tl.store(OUT + offs, val.to(OUT.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _xlogy_flat(Y, OUT, s, BLOCK: tl.constexpr, HAS_LOG: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    y = tl.load(Y + offs).to(tl.float32)\n    if HAS_LOG:\n        val = s * tl.log(y)\n    else:\n        val = tl.where(y != y, float(\"nan\"), 0.0)\n    tl.store(OUT + offs, val.to(OUT.dtype.element_ty))\n\n\n@triton.jit\ndef _xlogy_strided(Y, OUT, n, s, SHAPE: tl.constexpr, YS: tl.constexpr,\n                   BLOCK: tl.constexpr, HAS_LOG: tl.constexpr):\n    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = idx < n\n    rem = idx.to(tl.int64)\n    off = tl.zeros((BLOCK,), dtype=tl.int64)\n    for ax in tl.static_range(len(SHAPE) - 1, -1, -1):\n        coord = rem % SHAPE[ax]\n        rem = rem // SHAPE[ax]\n        off += coord * YS[ax]\n    y = tl.load(Y + off, mask=mask, other=1.0).to(tl.float32)\n    if HAS_LOG:\n        val = s * tl.log(y)\n    else:\n        val = tl.where(y != y, float(\"nan\"), 0.0)\n    tl.store(OUT + idx, val.to(OUT.dtype.element_ty), mask=mask)\n\n\ndef _stream_getter(device):\n    getter = _GETTERS.get(device)\n    if getter is not None:\n        return getter\n    if _RAW_STREAM is not None:\n        try:\n            want = int(torch.npu.current_stream(device).npu_stream)\n            if int(_RAW_STREAM(device)) == want:\n                getter = lambda: _RAW_STREAM(device)\n        except Exception:\n            getter = None\n    if getter is None:\n        try:\n            from triton.runtime import driver as _driver\n\n            getter = lambda: _driver.active.get_current_stream(device)\n        except Exception:  # pragma: no cover\n            getter = lambda: torch.npu.current_stream(device).npu_stream\n    _GETTERS[device] = getter\n    return getter\n\n\ndef _pick_block(n, esize):\n    cap = _BLOCK_CAP_2B if esize < 4 else _BLOCK_CAP_4B\n    target = -(-n // _TARGET_PROGS)\n    block = _BLOCK_MIN\n    while block < target:\n        block <<= 1\n    return block if block < cap else cap\n\n\ndef _make_plan(y, out, n, s, key):\n    \"\"\"Compile this specialisation once and cache a ready-to-call closure.\"\"\"\n    block = _pick_block(n, y.element_size())\n    grid = (n + block - 1) // block\n    masked = bool(n % block)\n    has_log = 1 if s != 0.0 else 0\n    jitfn = _xlogy_flat_masked if masked else _xlogy_flat\n    if masked:\n        tail = (n, s, block, has_log)\n\n        def slow(y, out, _f=jitfn, _g=(grid,), _n=n, _s=s, _b=block, _h=has_log):\n            _f[_g](y, out, _n, _s, BLOCK=_b, HAS_LOG=_h)\n    else:\n        tail = (s, block, has_log)\n\n        def slow(y, out, _f=jitfn, _g=(grid,), _s=s, _b=block, _h=has_log):\n            _f[_g](y, out, _s, BLOCK=_b, HAS_LOG=_h)\n\n    entry = slow\n    try:\n        if masked:\n            ck = jitfn.warmup(y, out, n, s, BLOCK=block, HAS_LOG=has_log, grid=(1,))\n        else:\n            ck = jitfn.warmup(y, out, s, BLOCK=block, HAS_LOG=has_log, grid=(1,))\n        launcher = ck.run\n        md = launcher.metadata\n        if not (getattr(launcher, \"compile_only\", False)\n                or getattr(launcher, \"enable_msprof_register_tensor\", False)\n                or getattr(md, \"debug_enabled\", False) or getattr(md, \"debug\", False)):\n            launch = launcher.launch\n            fn = ck.function\n            packed = ck.packed_metadata\n            stream = _stream_getter(key[3])\n\n            def fast(y, out, _l=launch, _f=fn, _p=packed, _g=grid, _t=tail,\n                     _r=stream, _s=slow):\n                pa = y.data_ptr()\n                pb = out.data_ptr()\n                if (pa | pb) & 15:\n                    _s(y, out)\n                else:\n                    _l(_g, 1, 1, _r(), _f, _p, None, None, None, pa, pb, *_t)\n\n            entry = fast\n    except Exception:\n        entry = slow\n    _PLANS[key] = entry\n    return entry\n\n\ndef _launch_strided(y, out, n, s):\n    shape = y.shape\n    has_log = 1 if s != 0.0 else 0\n    if len(shape) > _MAX_DIMS:\n        for i in range(shape[0]):\n            sub = y.select(0, i)\n            m = sub.numel()\n            if m:\n                _launch_strided(sub, out.select(0, i), m, s)\n        return\n    grid = ((n + _BLOCK_STRIDED - 1) // _BLOCK_STRIDED,)\n    _xlogy_strided[grid](y, out, n, s, SHAPE=tuple(shape), YS=tuple(y.stride()),\n                         BLOCK=_BLOCK_STRIDED, HAS_LOG=has_log)\n\n\ndef run(self, other):\n    y = other\n    out = y.new_empty(y.shape)\n    n = y.numel()\n    if n == 0:\n        return out\n    s = float(self)\n    if y.is_contiguous():\n        key = (y.dtype, n, s != 0.0, y.get_device())\n        entry = _PLANS.get(key)\n        if entry is None:\n            entry = _make_plan(y, out, n, s, key)\n        entry(y, out)\n    else:\n        _launch_strided(y, out, n, s)\n    return out\n"
+        }
+      ]
+    },
+    "benchmark_fingerprint": "sha256:692012c738a29dddb0f6680425fbad91bf1ba4385dd78f620d909a7572c1b368",
+    "case_id": "xlogy_scalar_tensor-timing-0",
+    "expected_backend": "npu",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "identity": {
+      "solution_sha256": "5858b8c97b8e7b05382be672f5af129566b1be90f058cf564cb0e002f27b78d9",
+      "workload_sha256": "e826c2075e9c7f38ff33bf3400fd28e6bdaa2a7fc4fd300a4a96aeca44b7e4de"
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "profile_id": "8e9de1a7109a4b64b1646fa80c8ce02e",
+    "created_at": "2026-10-29T18:02:05.357374+00:00",
+    "status": "failed",
+    "backend": "npu",
+    "profiler": "msprof",
+    "device": "npu:0",
+    "hardware": {
+      "target": {
+        "backend": "ascend",
+        "vendor": "huawei",
+        "device": "Ascend910B4-1",
+        "architecture": "dav-c220-cube",
+        "devices": [
+          {
+            "logical_device": "npu:0",
+            "device_id": 0,
+            "name": "Ascend910B4-1",
+            "l2_cache_size": 176160768,
+            "num_sm": 20,
+            "compute_capability": "",
+            "total_memory": 65452113920
+          }
+        ]
+      },
+      "software": {
+        "language": "triton",
+        "language_version": "3.5.1",
+        "compiler": "flagtree",
+        "compiler_version": "0.6.0+ascend.gitc286cba6",
+        "runtime": "cann",
+        "runtime_version": "9.0.0",
+        "driver_version": "25.2.0"
+      },
+      "metadata": {
+        "complete": true,
+        "missing": [],
+        "sources": {
+          "target.backend": "server configuration",
+          "target.vendor": "server configuration",
+          "software.language": "server configuration",
+          "software.compiler": "python package metadata",
+          "software.runtime": "server configuration",
+          "target.device": "device probe",
+          "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+          "software.language_version": "triton module metadata",
+          "software.compiler_version": "python package metadata",
+          "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+          "software.driver_version": "/usr/local/Ascend/driver/version.info"
+        }
+      }
+    },
+    "evaluation_id": "39935395e04255b38fdd01b7acbe1441b99a293b352f461fdb700b4c4cf54783:round-2",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "capabilities": [],
+    "summary": {
+      "stage_count": 1
+    },
+    "metrics": {},
+    "artifacts": [],
+    "warnings": [],
+    "error": "msprof base collection exited successfully without profile completion marker",
+    "workload_uuid": "xlogy_scalar_tensor-timing-0"
+  }
+}

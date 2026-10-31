@@ -1,0 +1,25 @@
+{
+  "api_version": "v6.2",
+  "binding": {
+    "bundle_id": "sha256:a2cbcd2c26345ee33c8e095ecd8065ef6453c6753c785f74012e7cbfc0400eb8",
+    "definition": "special_xlogy_"
+  },
+  "implementation": {
+    "name": "special_xlogy_-HG-KDA-current-1",
+    "definition": "special_xlogy_",
+    "language": "triton",
+    "entrypoint": "main.py::run",
+    "sources": [
+      {
+        "path": "main.py",
+        "content": "# Copyright 2026 FlagOS Contributors\n# SPDX-License-Identifier: Apache-2.0\n\"\"\"In-place xlogy with independent operand layouts, wide tiles and a lean host path.\"\"\"\nimport torch\nimport torch_npu\nimport triton\nimport triton.language as tl\n\n_BLOCK_MAX = 8192\n_ENTRIES = {}\n\n_RAW_STREAM = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\n\n\n@triton.jit\ndef _xlogy_value(a, b):\n    x = a.to(tl.float32)\n    y = b.to(tl.float32)\n    product = x * tl.log(y)\n    return tl.where(y != y, float('nan'), tl.where(x == 0.0, 0.0, product))\n\n\n@triton.jit\ndef _xlogy_flat(A, B, N: tl.constexpr, BLOCK: tl.constexpr):\n    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offset < N\n    a = tl.load(A + offset, mask, other=0)\n    b = tl.load(B + offset, mask, other=1)\n    tl.store(A + offset, _xlogy_value(a, b), mask)\n\n\n@triton.jit\ndef _xlogy_strided(A, B, N: tl.constexpr, SHAPE: tl.constexpr,\n                   SA: tl.constexpr, SB: tl.constexpr, BLOCK: tl.constexpr):\n    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offset < N\n    remaining = offset\n    oa = tl.zeros((BLOCK,), tl.int64)\n    ob = tl.zeros((BLOCK,), tl.int64)\n    for axis in tl.static_range(len(SHAPE) - 1, -1, -1):\n        coordinate = remaining % SHAPE[axis]\n        remaining = remaining // SHAPE[axis]\n        oa += coordinate.to(tl.int64) * SA[axis]\n        ob += coordinate.to(tl.int64) * SB[axis]\n    a = tl.load(A + oa, mask, other=0)\n    b = tl.load(B + ob, mask, other=1)\n    tl.store(A + oa, _xlogy_value(a, b), mask)\n\n\ndef _stream(device):\n    return torch.npu.current_stream(device).npu_stream\n\n\ndef _bind_stream():\n    \"\"\"Resolve the current-stream getter once so the hot path makes a single call.\"\"\"\n    raw = _RAW_STREAM\n    if raw is not None:\n        try:\n            raw(0)\n            return raw\n        except TypeError:\n            def _noarg(device, _raw=raw):\n                return _raw()\n            return _noarg\n        except Exception:\n            return _stream\n    return _stream\n\n\n_GET_STREAM = _bind_stream()\n\n\ndef _block_for(n):\n    if n >= _BLOCK_MAX:\n        return _BLOCK_MAX\n    block = 256\n    while block < n:\n        block <<= 1\n    return block\n\n\ndef _compile(A, B, n):\n    block = _block_for(n)\n    grid = (n + block - 1) // block\n    entry = None\n    try:\n        compiled = _xlogy_flat.warmup(A, B, n, block, grid=(1,))\n        launcher = compiled.run\n        if not (getattr(launcher, 'compile_only', False) or\n                getattr(launcher, 'enable_msprof_register_tensor', False) or\n                getattr(launcher.metadata, 'debug_enabled', False) or\n                getattr(launcher.metadata, 'debug', False)):\n            entry = (launcher.launch, compiled.function, compiled.packed_metadata,\n                     grid, block, A.device.index)\n    except Exception:\n        entry = None\n    return entry\n\n\ndef _generic(A, B, n):\n    if tuple(torch.broadcast_shapes(A.shape, B.shape)) != tuple(A.shape):\n        raise ValueError('broadcast would change the in-place destination shape')\n    aligned_shape = (1,) * (A.ndim - B.ndim) + tuple(B.shape)\n    aligned_stride = (0,) * (A.ndim - B.ndim) + tuple(B.stride())\n    sb = tuple(0 if size == 1 else stride for size, stride in zip(aligned_shape, aligned_stride))\n    shape = tuple(A.shape) or (1,)\n    sa = tuple(A.stride()) or (0,)\n    sb = sb or (0,)\n    _xlogy_strided[(triton.cdiv(n, 256),)](A, B, n, shape, sa, sb, 256)\n\n\ndef run(A, B):\n    n = A.numel()\n    if not n:\n        return A\n    if A.is_contiguous() and B.is_contiguous() and A.shape == B.shape:\n        key = (A.dtype, B.dtype, n)\n        try:\n            entry = _ENTRIES[key]\n        except KeyError:\n            entry = _ENTRIES[key] = _compile(A, B, n)\n        if entry is not None:\n            pa = A.data_ptr()\n            pb = B.data_ptr()\n            if not ((pa | pb) & 15):\n                launch, function, metadata, grid, block, device = entry\n                launch(grid, 1, 1, _GET_STREAM(device), function, metadata,\n                       None, None, None, pa, pb, n, block)\n                return A\n        block = _block_for(n)\n        _xlogy_flat[((n + block - 1) // block,)](A, B, n, block)\n    else:\n        _generic(A, B, n)\n    return A\n"
+      }
+    ]
+  },
+  "settings": {
+    "warmup_ms": 1000,
+    "benchmark_ms": 100,
+    "num_trials": 3,
+    "timeout_seconds": 1800
+  }
+}

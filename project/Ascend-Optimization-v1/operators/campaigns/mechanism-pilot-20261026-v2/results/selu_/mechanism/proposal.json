@@ -1,0 +1,4 @@
+{
+  "hypothesis": "起点耗时主要花在每次调用的 Triton JIT 分派（Python 侧、包装层）上：直接提交同一编译产物可比常规 JIT 路径快约 2 倍，且这一差异在小输入与 1M 输入上都在。设备侧分块探针在 1024 附近噪声大，但较大输入上 BLOCK=4096 与 BLOCK=2048 相对 1024 有微弱优势、512 明显更差。因此候选保持与起点完全相同的数值表达式（fp32 计算 + alpha/scale 常量 + where 结构），只做两件事：一是按 numel 选取 1024/2048/4096 分块以减少程序数；二是在 JIT 热路径之上加一条版本受限的直接提交快路——先走正常 JIT 拿到本次调用的编译产物，再从当前 device 的 device_caches 取 binder，用与 JIT 相同的选项（debug 与 _flagprism.apply_compile_options）重新绑定本次输入指针和 n_elements，确认绑定参数与本���调用一致后，用当前 stream 的 launch_metadata 和 compiled.run 提交；任何不一致（新 dtype/shape/stride/设备、版本布局变化）都回落到正常 JIT 路径，非连续或非支持 dtype 仍走 aten.selu_ 原地回退。",
+  "expected_effect": "小输入（1024）与 1M 输入的包装层延迟预计下降，接近直接提交探针的水平（约减半，探针中位数约 43–51us vs 约 91–99us）；1M 输入因 BLOCK=4096 使程序数约降到 256，配合直接提交，设备侧与提交开销合计有进一步下降空间。正确性、原地返回同一张量、shape/dtype/stride 语义与特殊值行为与起点一致，非连续与不支持 dtype 仍走 aten 回退。"
+}

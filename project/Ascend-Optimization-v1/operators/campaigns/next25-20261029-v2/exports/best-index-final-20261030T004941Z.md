@@ -1,0 +1,38 @@
+# 本批最佳源码索引
+
+KGS19659 walltime完整调用，相对同环境PyTorch。保持导师目标顺序；代码链接相对项目根目录。
+
+|算子|加速比|完整评测|补测|结论|源码|
+|---|---:|---|---|---|---|
+|negative_|0.643×|30/30|60/60|正确，性能未达标|`operators/campaigns/next25-20261029-v2/proposals/negative_/streaming-tiles-v4/main.py`|
+|selu_|0.905×|36/36|42/42|历史源码复验达标|`operators/campaigns/next25-20261029-v2/starting-points/selu_.py`|
+|xlogy_scalar_tensor|1.253×|30/30|72/72|本批新达标|`operators/campaigns/next25-20261029-v2/proposals/xlogy_scalar_tensor/runtime-scalar-v3/main.py`|
+|nan_to_num_|0.758×|30/30|54/54|正确，性能未达标|`operators/campaigns/next25-20261029-v2/proposals/nan_to_num_/parameter-semantics-v1/main.py`|
+|cross_out|0.769×|21/21|45/45|正确，性能未达标|`operators/campaigns/next25-20261029-v2/proposals/cross_out/ub-permutation-v2/main.py`|
+|expm1_|0.466×|30/30|63/63|正确，性能未达标|`operators/campaigns/next25-20261029-v2/proposals/expm1_/short-series-v6/main.py`|
+|hardshrink_backward|0.868×|30/30|45/45|本批新达标|`operators/campaigns/next25-20261029-v2/proposals/hardshrink_backward/strided-buffer-v6/main.py`|
+|subtract_|1.100×|30/30|72/72|本批新达标|`operators/campaigns/next25-20261029-v2/proposals/subtract_/independent-strides-v1/main.py`|
+|native_group_norm|0.728×|27/27|42/42|正确，性能未达标|`operators/campaigns/next25-20261029-v2/proposals/native_group_norm/separate-output-v2/main.py`|
+|log2_|0.593×|30/30|36/36|正确，性能未达标|`operators/campaigns/next25-20261029-v2/results/log2_/search-1/selected.py`|
+|rad2deg_|1.111×|36/36|42/42|历史源码复验达标|`operators/campaigns/next25-20261029-v2/starting-points/rad2deg_.py`|
+|transform_bias_rescale_qkv|0.924×|21/21|48/48|本批新达标|`operators/campaigns/next25-20261029-v2/proposals/transform_bias_rescale_qkv/fp32-q-accumulation-v4/main.py`|
+|fix|0.677×|30/30|39/39|正确，性能未达标|`operators/campaigns/next25-20261029-v2/results/fix/search-2/selected.py`|
+|log10_|0.701×|36/36|66/66|正确，性能未达标|`operators/campaigns/next25-20261029-v2/proposals/log10_/streaming-aligned-v3/main.py`|
+|round_out|0.615×|30/30|48/48|正确，性能未达标|`operators/campaigns/next25-20261029-v2/proposals/round_out/host-metadata-v3/main.py`|
+|cumulative_trapezoid|—|—|—|暂无完整合格实现|—|
+|hardswish_out|0.900×|30/30|42/42|本批新达标|`operators/campaigns/next25-20261029-v2/proposals/hardswish_out/paired-fp32-stream-v4/main.py`|
+|fake_quantize_per_tensor_affine_cachemask_out|8.651×|30/30|36/36|参考条件单列|`operators/campaigns/next25-20261029-v2/seeds/fake_quantize_per_tensor_affine_cachemask_out.py`|
+|special_round_out|0.632×|30/30|48/48|正确，性能未达标|`operators/campaigns/next25-20261029-v2/results/special_round_out/search-1/selected.py`|
+|special_xlogy_|0.856×|30/30|45/45|本批新达标|`operators/campaigns/next25-20261029-v2/results/special_xlogy_/search-1/selected.py`|
+|hardswish|0.683×|30/30|42/42|正确，性能未达标|`operators/campaigns/next25-20261029-v2/results/hardswish/search-1/selected.py`|
+|fmod_tensor_|0.727×|30/30|57/57|正确，性能未达标|`operators/campaigns/next25-20261029-v2/results/fmod_tensor_/search-1/selected.py`|
+|uniform|1.361×|18/18|31/31|历史源码复验达标|`operators/campaigns/next25-20261029-v2/starting-points/uniform.py`|
+|linalg_inv_ex|—|—|—|暂无完整合格实现|—|
+|batch_norm_with_update_functional|100.912×|27/27|36/36|参考条件单列|`operators/campaigns/next25-20261029-v2/seeds/batch_norm_with_update_functional.py`|
+
+JSON索引保存相对路径、逐文件SHA、固定合同、正式请求及补测原件位置。
+索引是当前时间点快照；后续队列仍可产生更佳版本。验证命令不占用NPU：
+
+```bash
+python tools/profiling/hgkda/next_phase/export_best.py --verify <本索引.json>
+```

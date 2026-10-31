@@ -1,0 +1,56 @@
+{
+  "config": {
+    "bm": 128,
+    "bn": 64,
+    "bk32": 128,
+    "bk16": 128,
+    "group": 8,
+    "multi": true
+  },
+  "hypothesis": "开发集上只有 group4 相对重表达对照是正收益（FP16 1.018×、FP32 1.001×，几何均值 1.009×），说明分组调度改善 L2 复用是被支持的方向。对照中 Cube 活跃仅约 15%，Cube 等待比例 0.29 且主要卡在 aic_scalar_mte1_stall，即时间耗在每次 K 迭代搬入的面板数据等待上，而非累加吞吐。本配置在保持 BM=128、K=1024 整除（bk16=128 为 8 个 BK、bk32=128 为 8 个 BK，满足 K>=2*BK）的前提下，把 BN 由 128 收到 64：单个累加器由 128×128 降为 128×64，双累加器共用的 UB/L0 缓冲减半，从而让 multi 双缓冲真正重叠 MTE2 搬运与 Cube 计算，针对 scalar_mte1_stall 这一主要等待源；同时把 BN 减半带来的 A 重复请求用更大的 group=8 蛇形分块来抵消，保持 L2 局部性。历史 compact_n 的失败是 BN=64 且 group=0 时 A 请求翻倍、复用为零，因此本候选必须与 group=8 一起验证，不能把它单独当作 tile 缩减的结论。若缓冲压力不是主因，预期收益不会超过 group4 的场景。",
+  "predictions": [
+    {
+      "metric": "paired_speedup_vs_parent_fp16_1024",
+      "baseline": 1.0,
+      "expected_change": "+1% 至 +3%（相对父版的配对加速比）",
+      "rationale": "group=8 继承 group4 的复用正效应；BN=64 若缓解搬运等待则进一步放大"
+    },
+    {
+      "metric": "paired_speedup_vs_parent_fp32_1024",
+      "baseline": 1.0,
+      "expected_change": "0% 至 +2%",
+      "rationale": "FP32 中间值仍为 FP32，累加器减半带来的缓冲收益大于 FP16，但 group4 在 FP32 上仅 1.001×，上限有限"
+    },
+    {
+      "metric": "aic_scalar_mte1_stall_time_us",
+      "baseline": 7.21,
+      "expected_change": "-15% 至 -30%",
+      "rationale": "缓冲占用减半后双缓冲可以掩盖更多 A/B 面板搬运，scalar 不再长期等待 MTE1"
+    },
+    {
+      "metric": "cube_utilization_pct",
+      "baseline": 14.39,
+      "expected_change": "+2 至 +5 个百分点",
+      "rationale": "等待缩短意味着 Cube 空闲间隙收窄，总量不变所以利用率上升幅度有限"
+    },
+    {
+      "metric": "requested_B_bytes",
+      "baseline": 16777216,
+      "expected_change": "不变（n//(2*bn) 仍为 8，程序数仍 32）",
+      "rationale": "n/(2*bn) 与父版相同，B 的逻辑请求量不增加；A 逻辑请求也不变"
+    },
+    {
+      "metric": "max_abs_error",
+      "baseline_16": 0.125,
+      "baseline_32": 0.00012969970703125,
+      "expected_change": "保持不变",
+      "rationale": "只改分块和调度，K 迭代顺序不变，累加顺序不变，数学计算不改变"
+    },
+    {
+      "metric": "compile_status",
+      "baseline": "passed",
+      "expected_change": "passed（cbuf 余量与父版相同，降低 BN 只会减小缓冲需求）",
+      "rationale": "父版 shared_mem_dynamic_size=221184 已在预算内，BN 减半不会引入超限"
+    }
+  ]
+}

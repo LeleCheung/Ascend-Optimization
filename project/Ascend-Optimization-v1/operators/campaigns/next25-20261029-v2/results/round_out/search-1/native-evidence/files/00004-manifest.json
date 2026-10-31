@@ -1,0 +1,108 @@
+{
+  "request": {
+    "api_version": "v6.2",
+    "evaluation_id": "c7ddaf8aef678288f9ab1c62a7b2a12cb6477aaffcb36b1afc193d47947d2220:round-1",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:33c43f10475c9c843cf516d8c1de1477d9fb875e8b0295410fffd5b38f27a31b",
+      "definition": "round_out"
+    },
+    "implementation": {
+      "name": "kernelgen-candidate-round_out",
+      "definition": "round_out",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "# SPDX-License-Identifier: Apache-2.0\n\"\"\"支持输入/out非连续布局的偶数舍入；使用FP32计算，保留特殊值和零符号。\"\"\"\nimport torch\nimport torch_npu\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef _round_value(x, DECIMALS: tl.constexpr):\n    xf = x.to(tl.float32)\n    scale: tl.constexpr = 10.0 ** DECIMALS\n    value = xf * scale\n    magnitude = tl.abs(value)\n    whole = tl.floor(magnitude)\n    fraction = magnitude - whole\n    safe_integer = tl.minimum(whole, 8388607.0).to(tl.int32)\n    up = (fraction > 0.5) | ((fraction == 0.5) & ((safe_integer & 1) != 0))\n    rounded = tl.where(up, whole + 1.0, whole)\n    rounded = tl.where(magnitude >= 8388608.0, magnitude, rounded)\n    sign = value.to(tl.uint32, bitcast=True) & 0x80000000\n    signed = ((rounded.to(tl.uint32, bitcast=True) & 0x7fffffff) | sign).to(tl.float32, bitcast=True)\n    if DECIMALS != 0:\n        signed = tl.div_rn(signed, scale)\n    # NaN和原有Inf直接保留；避免它们进入整数奇偶判断后改变语义。\n    return tl.where((xf != xf) | (tl.abs(xf) == float('inf')), xf, signed)\n\n\n@triton.jit\ndef _round_flat(X, Y, N, DECIMALS: tl.constexpr, BLOCK: tl.constexpr):\n    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    x = tl.load(X + index, index < N, other=0)\n    tl.store(Y + index, _round_value(x, DECIMALS).to(Y.dtype.element_ty), index < N)\n\n\n@triton.jit\ndef _round_strided(X, Y, N, SHAPE: tl.constexpr, XS: tl.constexpr, YS: tl.constexpr,\n                   DECIMALS: tl.constexpr, BLOCK: tl.constexpr):\n    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    remainder = index\n    xi = tl.full((BLOCK,), 0, tl.int64)\n    yi = tl.full((BLOCK,), 0, tl.int64)\n    for axis in tl.static_range(len(SHAPE) - 1, -1, -1):\n        coordinate = remainder % SHAPE[axis]\n        remainder = remainder // SHAPE[axis]\n        xi += coordinate.to(tl.int64) * XS[axis]\n        yi += coordinate.to(tl.int64) * YS[axis]\n    x = tl.load(X + xi, index < N, other=0)\n    tl.store(Y + yi, _round_value(x, DECIMALS).to(Y.dtype.element_ty), index < N)\n\n\n_ENTRIES = {}\n\n\ndef _stream(device):\n    raw = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\n    if raw is not None:\n        try:return raw(device)\n        except TypeError:return raw()\n    return torch.npu.current_stream(device).npu_stream\n\n\ndef _dispatch(x, out, decimals):\n    if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):\n        raise TypeError('当前实现支持float16、bfloat16、float32')\n    if out is None:out = torch.empty_like(x, memory_format=torch.contiguous_format)\n    if out.shape != x.shape or out.dtype != x.dtype or out.device != x.device:\n        raise ValueError('out必须与输入具有相同形状、dtype和设备')\n    n = x.numel()\n    if not n:return out\n    if not x.is_contiguous() or not out.is_contiguous():\n        _round_strided[((n + 255) // 256,)](x, out, n, tuple(x.shape), tuple(x.stride()),\n                                          tuple(out.stride()), decimals, BLOCK=256)\n        return out\n    device = x.device.index\n    key = (device, x.dtype, n, decimals)\n    entry = _ENTRIES.get(key)\n    if entry is None:\n        block = min(4096, max(256, 1 << (((n + 7) // 8) - 1).bit_length()))\n        grid = (n + block - 1) // block\n        launch = None\n        try:\n            compiled = _round_flat.warmup(x, out, n, decimals, BLOCK=block, grid=(1,))\n            launcher = compiled.run\n            if not (getattr(launcher, 'compile_only', False) or\n                    getattr(launcher, 'enable_msprof_register_tensor', False) or\n                    getattr(launcher.metadata, 'debug_enabled', False) or\n                    getattr(launcher.metadata, 'debug', False)):\n                launch = (launcher.launch, compiled.function, compiled.packed_metadata)\n        except Exception:\n            pass\n        entry = grid, block, launch\n        _ENTRIES[key] = entry\n    launch = entry[2]\n    if launch and not ((x.data_ptr() | out.data_ptr()) & 15):\n        launch[0](entry[0], 1, 1, _stream(device), launch[1], launch[2], None, None, None,\n                  x.data_ptr(), out.data_ptr(), n, decimals, entry[1])\n    else:\n        _round_flat[(entry[0],)](x, out, n, decimals, BLOCK=entry[1])\n    return out\n\n\ndef run(input, *, decimals=0, out=None):\n    return _dispatch(input, out, decimals)\n"
+        }
+      ]
+    },
+    "benchmark_fingerprint": "sha256:09498b3e3fceb9a6b964cba850e04de3a6b17fd8468c669dc49e74048abc616f",
+    "case_id": "round_out-timing-3",
+    "expected_backend": "npu",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "identity": {
+      "solution_sha256": "dc887ca9a2e564835716805aa2343c465ebf5585ca7331302116739ca7856abc",
+      "workload_sha256": "363a6e2a3285f604687edd0975773c5ec9e070c8f2b5cef530ae8bf9ccc444dd"
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "profile_id": "7cec192ae4d84ef7b97b9c99f923c882",
+    "created_at": "2026-10-29T20:37:31.708376+00:00",
+    "status": "failed",
+    "backend": "npu",
+    "profiler": "msprof",
+    "device": "npu:0",
+    "hardware": {
+      "target": {
+        "backend": "ascend",
+        "vendor": "huawei",
+        "device": "Ascend910B4-1",
+        "architecture": "dav-c220-cube",
+        "devices": [
+          {
+            "logical_device": "npu:0",
+            "device_id": 0,
+            "name": "Ascend910B4-1",
+            "l2_cache_size": 176160768,
+            "num_sm": 20,
+            "compute_capability": "",
+            "total_memory": 65452113920
+          }
+        ]
+      },
+      "software": {
+        "language": "triton",
+        "language_version": "3.5.1",
+        "compiler": "flagtree",
+        "compiler_version": "0.6.0+ascend.gitc286cba6",
+        "runtime": "cann",
+        "runtime_version": "9.0.0",
+        "driver_version": "25.2.0"
+      },
+      "metadata": {
+        "complete": true,
+        "missing": [],
+        "sources": {
+          "target.backend": "server configuration",
+          "target.vendor": "server configuration",
+          "software.language": "server configuration",
+          "software.compiler": "python package metadata",
+          "software.runtime": "server configuration",
+          "target.device": "device probe",
+          "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+          "software.language_version": "triton module metadata",
+          "software.compiler_version": "python package metadata",
+          "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+          "software.driver_version": "/usr/local/Ascend/driver/version.info"
+        }
+      }
+    },
+    "evaluation_id": "c7ddaf8aef678288f9ab1c62a7b2a12cb6477aaffcb36b1afc193d47947d2220:round-1",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "capabilities": [],
+    "summary": {
+      "stage_count": 1
+    },
+    "metrics": {},
+    "artifacts": [],
+    "warnings": [],
+    "error": "msprof base collection exited successfully without profile completion marker",
+    "workload_uuid": "round_out-timing-3"
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "config": {
+    "bm": 128,
+    "bn": 128,
+    "bk32": 128,
+    "bk16": 256,
+    "group": 2,
+    "multi": true
+  },
+  "hypothesis": "候选1失败源于 bn=64 和 bk16=128：bn 减半使 N 方向任务数翻倍，A 面板重复请求、Cube 单次计算量下降；bk16 从 256 降到 128 使半精度 FP16 的 K 迭代从 4 次升到 8 次，标量与 mte2 同步开销放大（父版半精度已观察到 aic_scalar/mte2 占比高）。恢复父版大 tile（bm=128,bn=128,bk16=256）与默认 bk32=128，只把 group 从 0 改为 2：分组调度让同一 M 带内相邻 N tile 在时间上邻近执行，提高 L2 中 A 面板与 B 列块的命中率（父版实测 aic_read_hit_rate 87.5%，C 写全 miss 由分组无法改善），且不改变 tile 形状、UB 占用、K 迭代次数与双缓冲流水（K=1024 满足 K≥2*BK 的新路径条件），也不改变数学累加顺序以外的任何表达。",
+  "predictions": [
+    {
+      "metric": "device_geomean_speedup_vs_parent",
+      "expected": ">=1.0",
+      "change": "从候选1的0.889变为约1.00-1.02；group4 干预证据约1.01-1.02×"
+    },
+    {
+      "metric": "case_float16_1024_paired_speedup",
+      "expected": ">=1.0",
+      "change": "候选1的0.572→约1.00-1.02，恢复bk16=256使K循环减半"
+    },
+    {
+      "metric": "case_float32_1024_paired_speedup",
+      "expected": ">=1.0",
+      "change": "候选1的0.821→约1.00（bk32=128与父版FP32路径相同）"
+    },
+    {
+      "metric": "cube_utilization_pct",
+      "expected": "持平或略升",
+      "change": "父版14.4%→14.4%-15%，分组只改善缓存局部性不动计算密度"
+    },
+    {
+      "metric": "aic_read_hit_rate",
+      "expected": "略升",
+      "change": "父版87.5%→88%-90%，同组内A面板复用"
+    },
+    {
+      "metric": "semantic_cases_passed",
+      "expected": "18/18",
+      "change": "候选1的18/18保持不变"
+    },
+    {
+      "metric": "compile_status",
+      "expected": "passed",
+      "change": "128x128x256/128 与父版已验证配置同资源占用，不触�� cbuf 溢出"
+    },
+    {
+      "metric": "development_latency_ms",
+      "expected": "<0.1688",
+      "change": "候选1的0.1688ms→接近父版水平，目标同或略优"
+    }
+  ]
+}

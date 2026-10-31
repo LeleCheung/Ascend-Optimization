@@ -1,0 +1,107 @@
+{
+  "schema_version": "1.0",
+  "round_num": 2,
+  "evaluation_fingerprint": "f884616869611dffa8fa3c74c5d6f4247b28da1684bbd2a369a2cf6e573e9b5e",
+  "status": "failed",
+  "solution_sha256": "c325334cf500f803ee54d917c2c37fdef7eca3a2ecff61460fce9f62c6b85cf4",
+  "backend": "npu",
+  "profiler": "msprof",
+  "capabilities": [],
+  "dominant_bound": "mixed",
+  "profiled_workloads": [
+    {
+      "uuid": "fix-timing-3",
+      "axes": {},
+      "eval_speedup": 0.26863827142529006,
+      "eval_latency_ms": 0.08217965789860611,
+      "eval_reference_latency_ms": 0.022076601244203232,
+      "selection_reason": "Lowest-speedup timing workload (0.2686x, 82.18 us vs 22.08 us); primary target of the question.",
+      "profile_ids": [
+        "1564c7b5b9db4acc9d18a76321c1f2f4",
+        "1620b5fb6aed4f1987383beb1772dbf5",
+        "54c683c811384fdb933dc5169d0e7424"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0002/fix-timing-3/69ee28f589864168be14618b37aea1df/manifest.json",
+        ".kernelgen/profiles/round-0002/fix-timing-3/1fe40d4794844e7d8829b127ae0a669f/manifest.json",
+        ".kernelgen/profiles/round-0002/fix-timing-3/d2e66c27658a4e99b8f6fcf9fd16be49/manifest.json"
+      ],
+      "status": "failed"
+    },
+    {
+      "uuid": "fix-timing-11",
+      "axes": {},
+      "eval_speedup": 0.8028940535905053,
+      "eval_latency_ms": 0.11333324052599963,
+      "eval_reference_latency_ms": 0.09099458489246758,
+      "selection_reason": "Highest-latency timing workload (113.33 us); contrasts byte count with fix-timing-3 to expose the byte-independent cost term.",
+      "profile_ids": [
+        "0419e298a4cf472983192d782a61f6e8"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0002/fix-timing-11/2ae96e019dec44e0954db2543ddd6f07/manifest.json"
+      ],
+      "status": "failed"
+    },
+    {
+      "uuid": "fix-timing-0",
+      "axes": {},
+      "eval_speedup": 0.8139931399742907,
+      "eval_latency_ms": 0.024384782706888902,
+      "eval_reference_latency_ms": 0.019849045843171282,
+      "selection_reason": "Control workload: smallest case (24.38 us) used to establish the host-submit floor and to test whether the msprof failure was workload-specific rather than infrastructure-wide.",
+      "profile_ids": [
+        "5f5538a7326948638598e33e3520c955"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0002/fix-timing-0/99185241521f49f698ce41d1e7ecd62a/manifest.json"
+      ],
+      "status": "failed"
+    }
+  ],
+  "findings": [],
+  "performance_interpretation": "PROFILER UNAVAILABLE - the following is derived only from trusted eval numbers in get_profile_context plus the round-2 source (solution_sha256 c325334cf5...); it is inference, not measurement. (1) Host floor: the eval loop overlaps host submit with device execution, so per-iteration latency ~= max(host_submit, device). All nine submit-limited cases sit at 24.1-25.9 us regardless of n in {1024, 65536, 1048576}, so the candidate host floor is ~24 us while the reference floor is ~19.7-22.4 us. (2) Large cases are far from memory-bound: fix-timing-3 moves 16.7M elems x (2 B read + 2 B write) = 67.1 MB in 82.18 us = 0.82 TB/s effective; fix-timing-11 moves 134.2 MB in 113.33 us = 1.18 TB/s. The reference reaches 67.1 MB / 22.08 us = 3.04 TB/s on the same fp16 case and 134.2 / 90.99 = 1.47 TB/s on fp32, so the candidate runs at ~27% of reference achieved bandwidth on fp16 but ~80% on fp32. Device L2 is 176160768 B (168 MiB) against a 64 MiB fp16 working set, consistent with the reference's 3 TB/s being L2-served, though L2 counters were not delivered. (3) Byte-independence proves a large non-DMA cost: fp32 carries 2x the bytes of fp16 but only 1.38x the latency (113.33/82.18). A two-term fit gives ~2.16 TB/s marginal rate for the extra 67.1 MB and a byte-independent component of ~51 us per 16.7M elements, i.e. roughly 60% of fix-timing-3 device time is not explained by data movement. Six 32-bit vector ops per element (cvt->fp32, and 0x7fffffff, floor, and 0x80000000, or, cvt back) over 20 AIV at ~1.8 GHz with ~64 32-bit lanes each predict ~44 us, matching that residual, so vector-instruction issue is the best-supported dominant term for fp16/bf16. (4) Per-program prologue is real but cannot be separated from op count: round 1 (9 ops, 4096 programs, masked, BLOCK=4096) gave 152.2 us; round 2 (6 ops, 2048 programs, unmasked, BLOCK=8192) gives 82.18 us. A pure op-count model predicts 152.2*6/9 = 101.5 us, a pure program-count model predicts 76.1 us; the measured 82.18 us sits near the program-count prediction, which indicates the halved block count contributed at least as much as the arithmetic reduction and that a block-prologue plus non-overlapped-DMA component survives. With 8192 fp16 elements per program the kernel materializes several 32 KiB fp32 temporaries in a 192 KiB UB, leaving no room for double buffering, so each program serializes MTE2 -> vector -> MTE3 with no intra-program overlap; that serialization plausibly costs several tens of microseconds. (5) Eval-only answers to the parent's questions: Q1 mixed, vector-issue dominant with DMA and block latency not overlapped, NOT memory-bandwidth bound; Q2 logical bytes 67.1 MB / 134.2 MB (no physical counter available) with achieved 0.82 / 1.18 TB/s versus the reference's 3.04 / 1.47 TB/s; Q3 no direct L2 evidence, only the inference that a 168 MiB L2 versus a 64 MiB fp16 working set makes the reference's 3 TB/s L2-plausible.",
+  "next_experiment": {
+    "action_category": "loop_and_pipeline_restructure",
+    "action_description": "In the unmasked contiguous fast path only, replace the single 8192-element one-shot tile with an inner pipelined loop: keep the per-program element budget at 16K-32K, but make the loop tile 2048-4096 elements and iterate 4-8 times with tl.range(..., num_stages=2) (try 3 if UB allows), i.e. grid = n/(tile*K) (512-1024 programs instead of 2048). Keep the same _trunc math, dtype handling, strided path, NaN/Inf/zero-sign semantics, the host launch path and the masked fallback; select the loop path only when n is divisible by tile*K.",
+    "expected_impact": "Mechanism: a multi-tile loop is the only form in which the Triton-Ascend backend can multi-buffer UB and software-pipeline, so MTE2 of tile i+1, vector work of tile i and MTE3 of tile i-1 overlap instead of serializing inside each one-shot program; smaller loop tiles also keep the fp32 temporaries small enough that double buffering fits in the 192 KiB UB, and the 4x lower program count cuts block prologue/DMA-descriptor cost. If overlap is achieved, fix-timing-3/7 device time should fall from ~82 us toward the max(memory ~45 us, vector ~44 us) limit, i.e. latency 82 -> 55-65 us (speedup 0.27 -> ~0.35-0.40) and fix-timing-11 from 113 -> ~95-100 us (0.80 -> ~0.90), worth roughly +4 to +6 percent on headline geo_mean (0.684 -> ~0.72). Falsifiable: if device time stays flat, vector issue dominates and the next lever is op count, not layout.",
+    "risks_and_rollback": "Risk 1: num_stages>1 may be ignored or rejected by this backend, or the extra buffers may exceed UB and fail to compile (historical precedent: a 32768-element fp32 tile needed 384 KiB against 192 KiB available). Mitigate by keeping loop tiles small (2048, ascending to 4096 only if it compiles) and by preflighting the loop path before the formal eval. Risk 2: fewer programs (512-1024) could under-fill 20 AIV cores for the 1M cases, but those are host-submit-limited at ~24 us, so use an adaptive rule that selects the loop only above a few million elements. Risk 3: correctness regressions from the new grid/divisibility condition on non-divisible n (e.g. 1025). Rollback: keep the entry list keyed by (dtype, n) and revert to the single-tile BLOCK=8192 kernel if preflight fails, if UB overflows, or if geo_mean does not exceed 0.684; round 2 stays frozen at solution_sha256 c325334cf500f803ee54d917c2c37fdef7eca3a2ecff61460fce9f62c6b85cf4.",
+    "validation_workloads": [
+      "fix-timing-3",
+      "fix-timing-7",
+      "fix-timing-11",
+      "fix-timing-2",
+      "fix-timing-6",
+      "fix-timing-10",
+      "fix-correctness-2",
+      "fix-correctness-8",
+      "fix-correctness-14",
+      "fix-correctness-3",
+      "fix-correctness-9",
+      "fix-correctness-15"
+    ],
+    "success_criteria": [
+      "All 30 KGS workloads PASS with full correctness (18 correctness cases including special NaN/Inf/zero-sign and strided cases, plus 12 timing cases).",
+      "Headline geo_mean strictly greater than the round-2 value 0.6842.",
+      "fix-timing-3 latency below 70 us (speedup above 0.31) and fix-timing-7 similarly, versus 82.18 / 84.57 us now.",
+      "fix-timing-11 latency at or below 105 us (speedup at or above 0.86) versus 113.33 us now.",
+      "No regression on the nine submit-limited cases: each stays at or below ~25.5 us (within 1 us of the current 24.1-25.9 us band).",
+      "Preflight confirms the pipelined loop path compiles for fp16/bf16/fp32 at the chosen tile and num_stages."
+    ]
+  },
+  "warnings": [
+    "msprof profiling failed for all 4 attempts (3 distinct runs on fix-timing-3, 1 each on fix-timing-11 and the fix-timing-0 control) with 'msprof base collection exited successfully without profile completion marker'; zero artifacts and empty metrics were returned.",
+    "Both advertised levels (metrics, instruction) failed, so no pipeline_utilization, performance_counters, kernel_profile or instruction_listing evidence exists for this round despite service.profile.supported=true.",
+    "The total failure on the 1024-element control workload shows this is infrastructure-level, not a property of the 16.7M-element kernel or of the candidate's direct compiled-launch path.",
+    "All performance statements in this analysis are eval-number inference, not profile measurements; physical byte counters, L2 hit rate and AIV/MTE busy ratios remain unmeasured.",
+    "For the record: the candidate disables its direct compiled launch when runner.enable_msprof_register_tensor is set, so a future successful msprof run may measure a slightly slower host path than the timed eval."
+  ],
+  "open_questions": [
+    "What are the measured MTE2/MTE3 active ratios and AIV vector-busy ratio for fix-timing-3 and fix-timing-11, and do they overlap or serialize?",
+    "What physical read/write byte counts does msprof report for these cases, and what is the weighted L2 hit/miss ratio compared with torch.fix on the same 4096x4096 input?",
+    "What UB footprint and buffering factor did the compiler choose for BLOCK=8192 with three 32-bit temporaries, and is there any intra-program double buffering today?",
+    "How much of the 82.18 us is block prologue/launch versus per-element vector issue?",
+    "Is there a cheaper exact truncation on the AIV for 16-bit dtypes (fp16/bf16 floor plus copysign in 16-bit lanes, or a truncating float-to-int conversion guarded for NaN/Inf), and what instruction does the backend actually emit for the current six ops?"
+  ],
+  "error": "msprof base collection exited successfully without profile completion marker (service.profile.supported=true, profiler=msprof, levels=[metrics, instruction]); 4 collection attempts across fix-timing-3 (x3, both levels), fix-timing-11 and fix-timing-0 all failed with zero artifacts and no downloaded reports."
+}

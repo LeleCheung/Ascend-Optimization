@@ -1,0 +1,108 @@
+{
+  "request": {
+    "api_version": "v6.2",
+    "evaluation_id": "65f26dbac36e955699623eff8a0c6b9be162c36e6e93cc03737c65b4fd3b680e:round-3",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:982bc685d203184ab3110741af78400514996b0126a3acfb00fb7733a355ca66",
+      "definition": "expm1_"
+    },
+    "implementation": {
+      "name": "kernelgen-candidate-expm1_",
+      "definition": "expm1_",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "\"\"\"expm1_ : in-place elementwise ``expm1(A)`` on Ascend, self-contained Triton.\n\nSemantics reproduced from the reference:\n  * ``out = expm1(A)`` is written back into ``A`` storage and ``A`` is returned.\n  * Input dtype (float16 / bfloat16 / float32) is preserved on the output.\n  * Strided (non-contiguous) views are read *and* written through their real\n    element strides so the mutation lands in the right storage slots; the view\n    object itself is returned unchanged.\n\nLayout dispatch (metadata-only decisions in the wrapper):\n  1. contiguous            -> flat kernel, unit stride\n  2. uniformly strided (all element strides == k * contiguous stride, k >= 1)\n                           -> flat kernel with a constexpr stride multiplier\n                              (this covers ``base[..., 0]`` style views)\n  3. anything else         -> generic up-to-8D index math kernel\n\nLaunch path: for the hot contiguous case the wrapper resolves the compiled\nkernel once per (dtype, numel) and then launches that exact Triton kernel\nthrough its own compiled launcher (grid + raw stream handle + device pointer),\nwhich is the same code path ``JITFunction.run`` ends in, minus the per-call\nbinder / cache-key / dispatch work that dominates this tiny workload.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\nfrom triton.runtime import driver as _driver\n\n_BLOCK = 32768\n# Strided (gather/scatter) tiles materialise one address vector per element, so\n# the UB budget forces a much smaller tile than the contiguous path.\n_BLOCK_STRIDED = 512\n\n\n@triton.jit\ndef _expm1_flat(a_ptr, n, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    x = tl.load(a_ptr + offs, mask=mask, other=0.0)\n    y = tl.exp(x.to(tl.float32)) - 1.0\n    tl.store(a_ptr + offs, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _expm1_scaled(a_ptr, n, SCALE: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    idx = offs * SCALE\n    x = tl.load(a_ptr + idx, mask=mask, other=0.0)\n    y = tl.exp(x.to(tl.float32)) - 1.0\n    tl.store(a_ptr + idx, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _expm1_nd(a_ptr, n,\n              s0, s1, s2, s3, s4, s5, s6, s7,\n              t0, t1, t2, t3, t4, t5, t6, t7,\n              NDIM: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    shapes = (s0, s1, s2, s3, s4, s5, s6, s7)\n    strides = (t0, t1, t2, t3, t4, t5, t6, t7)\n    rem = offs\n    off = tl.zeros((BLOCK,), dtype=tl.int32)\n    for i in tl.static_range(8):\n        if i < NDIM:\n            stride = strides[NDIM - 1 - i]\n            size = shapes[NDIM - 1 - i]\n            off += (rem % size) * stride\n            rem = rem // size\n    x = tl.load(a_ptr + off, mask=mask, other=0.0)\n    y = tl.exp(x.to(tl.float32)) - 1.0\n    tl.store(a_ptr + off, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n_DEVICE = [-1]\n_ENTRIES = {}\n\n\ndef _current_stream():\n    \"\"\"Raw rtStream_t handle of the caller's current stream.\"\"\"\n    try:\n        return torch.npu.current_stream().npu_stream\n    except AttributeError:\n        dev = _DEVICE[0]\n        if dev < 0:\n            dev = _driver.active.get_current_device()\n            _DEVICE[0] = dev\n        return _driver.active.get_current_stream(dev)\n\n\ndef _build_entry(A, n):\n    \"\"\"Resolve the compiled flat kernel for this (dtype, numel) once.\"\"\"\n    grid0 = (n + _BLOCK - 1) // _BLOCK\n    try:\n        ck = _expm1_flat.warmup(A, n, BLOCK=_BLOCK, grid=(grid0,))\n        entry = (ck.run, ck.function, ck.packed_metadata, grid0)\n    except Exception:  # pragma: no cover - fall back to the standard JIT path\n        entry = None\n    _ENTRIES[(A.dtype, n)] = entry\n    return entry\n\n\ndef _launch_general(A, n):\n    \"\"\"Non-contiguous fallback: real element strides, in place.\"\"\"\n    shape = A.shape\n    stride = A.stride()\n    dims = []  # (size, stride) inner -> outer\n    for d in range(len(shape) - 1, -1, -1):\n        s = shape[d]\n        if s == 1:\n            continue\n        st = stride[d]\n        if dims and st == dims[-1][0] * dims[-1][1]:\n            dims[-1] = (dims[-1][0] * s, dims[-1][1])\n        else:\n            dims.append((s, st))\n    dims.reverse()\n    if len(dims) == 1:\n        _expm1_scaled[((n + _BLOCK_STRIDED - 1) // _BLOCK_STRIDED,)](\n            A, n, SCALE=dims[0][1], BLOCK=_BLOCK_STRIDED)\n        return\n    if len(dims) > 8:\n        raise RuntimeError(\"expm1_: unsupported tensor rank for strided path\")\n    sizes = [d[0] for d in dims] + [1] * (8 - len(dims))\n    sts = [d[1] for d in dims] + [0] * (8 - len(dims))\n    _expm1_nd[((n + _BLOCK_STRIDED - 1) // _BLOCK_STRIDED,)](\n        A, n, *sizes, *sts, NDIM=len(dims), BLOCK=_BLOCK_STRIDED)\n\n\ndef run(A):\n    n = A.numel()\n    if n == 0:\n        return A\n    if not A.is_contiguous():\n        _launch_general(A, n)\n        return A\n    entry = _ENTRIES.get((A.dtype, n))\n    if entry is None:\n        entry = _build_entry(A, n)\n        if entry is None:\n            _expm1_flat[((n + _BLOCK - 1) // _BLOCK,)](A, n, BLOCK=_BLOCK)\n            return A\n    entry[0](entry[3], 1, 1, _current_stream(), entry[1], entry[2],\n             None, None, None, A.data_ptr(), n, _BLOCK)\n    return A\n"
+        }
+      ]
+    },
+    "benchmark_fingerprint": "sha256:aa03c0dc110cbee77a50a1201de79d1ef372601f9cf0adc0f66eafb5a04dbb24",
+    "case_id": "expm1_-timing-0",
+    "expected_backend": "npu",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "identity": {
+      "solution_sha256": "e780df8df04cd801dd747f456900b3caabfb9d529eb4956e6735746275827f1c",
+      "workload_sha256": "e55d17a25973081e1aa42d3efa1845bbc79ba6c9939917723a465fecf0caf28e"
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "profile_id": "807119c3d52348eb84e2eab9d7ac65f9",
+    "created_at": "2026-10-29T13:20:16.208187+00:00",
+    "status": "failed",
+    "backend": "npu",
+    "profiler": "msprof",
+    "device": "npu:0",
+    "hardware": {
+      "target": {
+        "backend": "ascend",
+        "vendor": "huawei",
+        "device": "Ascend910B4-1",
+        "architecture": "dav-c220-cube",
+        "devices": [
+          {
+            "logical_device": "npu:0",
+            "device_id": 0,
+            "name": "Ascend910B4-1",
+            "l2_cache_size": 176160768,
+            "num_sm": 20,
+            "compute_capability": "",
+            "total_memory": 65452113920
+          }
+        ]
+      },
+      "software": {
+        "language": "triton",
+        "language_version": "3.5.1",
+        "compiler": "flagtree",
+        "compiler_version": "0.6.0+ascend.gitc286cba6",
+        "runtime": "cann",
+        "runtime_version": "9.0.0",
+        "driver_version": "25.2.0"
+      },
+      "metadata": {
+        "complete": true,
+        "missing": [],
+        "sources": {
+          "target.backend": "server configuration",
+          "target.vendor": "server configuration",
+          "software.language": "server configuration",
+          "software.compiler": "python package metadata",
+          "software.runtime": "server configuration",
+          "target.device": "device probe",
+          "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+          "software.language_version": "triton module metadata",
+          "software.compiler_version": "python package metadata",
+          "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+          "software.driver_version": "/usr/local/Ascend/driver/version.info"
+        }
+      }
+    },
+    "evaluation_id": "65f26dbac36e955699623eff8a0c6b9be162c36e6e93cc03737c65b4fd3b680e:round-3",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "capabilities": [],
+    "summary": {
+      "stage_count": 1
+    },
+    "metrics": {},
+    "artifacts": [],
+    "warnings": [],
+    "error": "msprof base collection exited successfully without profile completion marker",
+    "workload_uuid": "expm1_-timing-0"
+  }
+}

@@ -1,0 +1,93 @@
+{
+  "schema_version": "1.0",
+  "round_num": 1,
+  "evaluation_fingerprint": "989bb2cfb2cec195aff217dd2266ae741ff7aa99c428bb54c729f24667768737",
+  "status": "failed",
+  "solution_sha256": "d6aff85cf89b593e3912364179bb57cdb0fea28da8ddb86bb3f9740bac4ac983",
+  "backend": "npu",
+  "profiler": "msprof",
+  "capabilities": [],
+  "dominant_bound": "launch",
+  "profiled_workloads": [
+    {
+      "uuid": "native_group_norm-timing-1",
+      "axes": {},
+      "eval_speedup": 0.5434704680690636,
+      "eval_latency_ms": 0.06142805260976533,
+      "eval_reference_latency_ms": 0.03338433250440023,
+      "selection_reason": "Lowest eval speedup (0.5435) and highest candidate latency (0.06143 ms) of the 9 timing workloads; largest fp16 input, shape (8,64,64,64) = 2,097,152 elements. Attempted twice at metrics level and once at instruction level.",
+      "profile_ids": [
+        "bcd62a2e14664ce4b4f299a75de599dd",
+        "450e26510aab4b889602aa8e495c6265",
+        "3a4a50aa91fc472ab10280c6bca35a5f"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0001/native_group_norm-timing-1/6a9126f626fe43c080522b162e8aa917/manifest.json",
+        ".kernelgen/profiles/round-0001/native_group_norm-timing-1/557bc82289ce4d5a9a13b2fbf6585d5b/manifest.json",
+        ".kernelgen/profiles/round-0001/native_group_norm-timing-1/b44c8e88db7e4512a4c5331dd27a66c9/manifest.json"
+      ],
+      "status": "failed"
+    },
+    {
+      "uuid": "native_group_norm-timing-2",
+      "axes": {},
+      "eval_speedup": 0.6247337264233769,
+      "eval_latency_ms": 0.05491824347316574,
+      "eval_reference_latency_ms": 0.03430927889361713,
+      "selection_reason": "Highest eval speedup (0.6247) as a control regime; identical element count to timing-1 (2,097,152) but a different shape (16,128,32,32), so it separates shape effects from size effects.",
+      "profile_ids": [
+        "e6200193f0b54cab99e597e70d461c5e"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0001/native_group_norm-timing-2/83ec40ad9f724eaab13cd46f66c1e036/manifest.json"
+      ],
+      "status": "failed"
+    }
+  ],
+  "findings": [],
+  "performance_interpretation": "No profiler counter backs the numbers below; only trusted eval data from get_profile_context is used. Round 1 is the frozen baseline and the round-1 candidate is the seed source verbatim (manifest request.implementation.sources[0].content equals the seed text, identity.solution_sha256=d6aff85c...). All 18 correctness workloads PASSED and all 9 timing workloads PASSED, geo_mean=0.5917464299202004, with every timing workload slower than the ATen reference. The decisive measured pattern is latency invariance to work size: input payload spans 0.25 MiB (timing-0/3, fp16/bf16 4x32x32x32 = 131,072 elements), 0.5 MiB (timing-6, fp32 same shape), 4 MiB (timing-1/2/4/5, 2,097,152 fp16/bf16 elements) and 8 MiB (timing-7/8, 2,097,152 fp32 elements) - a 32x spread - while candidate latency moves only between 0.05357 ms (timing-7) and 0.06143 ms (timing-1), a 1.15x spread, and the reference moves 0.03263-0.03676 ms, a 1.13x spread. A bandwidth- or compute-limited kernel cannot be flat over a 32x payload change, so device work is a small part of the ~56 us call and a fixed per-call term dominates. The candidate-minus-reference delta is systematic in every workload: 23.84, 28.04, 20.61, 22.63, 23.35, 25.93, 20.44, 20.94 and 23.23 us for timing-0..8 (mean ~23.2 us, spread ~7.4 us) across that 32x payload range, isolating a roughly constant ~20-28 us of extra per-call cost relative to the reference. In source terms that points at host-side work in run(): two torch.empty allocations (out plus a (2,N,group) buffer followed by two Python-level buf[0]/buf[1] views), six data_ptr() calls, a 20-element tuple key rebuilt every call, a dict lookup, then the compiled-kernel launch entry. The ~6.5 us device duration quoted in the seed docstring and the VECTOR/MTE2/MTE3 active ratios in the supplied starting-point context were not re-measured this round and are not round-1 evidence, though their magnitude is consistent with the flat-latency pattern. Confidence in 'launch' as dominant_bound is medium: it rests on eval-latency size-invariance plus a matching per-workload delta, not on device counters.",
+  "next_experiment": {
+    "action_category": "launch_parallelism",
+    "action_description": "Attack the fixed per-call host cost in run() while keeping the single fused Triton kernel, the same grid (group, N), the same fp32 accumulation order and the same returned (out, mean, rstd) contract. (a) Verify the compiled-kernel fast path actually engages: instrument once per specialization to see whether _CK_CACHE stores a launch tuple or falls through to _CK_CACHE[key]=False, because a False entry means every call pays full Triton JIT dispatch and that alone could be most of the ~23 us delta. (b) On the fast path, prebind and reuse the launch argument list instead of rebuilding it, and replace the six data_ptr() calls plus the 20-field tuple key with a cached last-key fast-path check that still compares every specialization-relevant field (dtype, wsrc/bsrc dtype, has_affine, the six 16-byte alignment masks, hw, cg, group, ns, cs, ss, count, eps, block, even). (c) Reuse one mean/rstd buffer and its two views instead of re-slicing buf[0]/buf[1] on every call. Do not touch the numerical body, the masking branches, or the double read of X in this experiment.",
+    "expected_impact": "If host per-call overhead is the ~23 us delta, latency falls toward the reference on every workload, i.e. geo_mean from 0.5917 toward 0.85-1.0; a partial recovery to ~0.70-0.80 is the realistic first step because part of the delta may live inside the Triton launch entry rather than in the Python wrapper.",
+    "risks_and_rollback": "Risk 1: the version-specific ck.run.launch(function, packed_metadata, ...) signature can silently take wrong arguments and produce wrong results or a device fault; mitigate by keeping the existing generic _gn_kernel[(group, N)](...) path as a fallback and only enabling the fast path after an explicit successful first-call capture. Risk 2: a cheapened cache key that omits a specialization field would reuse a compiled kernel with stale strides or eps and corrupt the stride- and dtype-varied correctness workloads; the fast-path check must compare the full specialization set named above. Risk 3: caching mean/rstd views must not alias caller-retained outputs - cache only the internal view objects, never the backing storage across calls, and keep returning a fresh out each call. Rollback: revert to the round-1 source (solution_sha256 d6aff85c...) if any correctness workload regresses; the change is host-side only and touches no kernel math, so a revert cannot change numerics.",
+    "validation_workloads": [
+      "native_group_norm-timing-0",
+      "native_group_norm-timing-1",
+      "native_group_norm-timing-2",
+      "native_group_norm-timing-3",
+      "native_group_norm-timing-4",
+      "native_group_norm-timing-5",
+      "native_group_norm-timing-6",
+      "native_group_norm-timing-7",
+      "native_group_norm-timing-8",
+      "native_group_norm-correctness-0",
+      "native_group_norm-correctness-2",
+      "native_group_norm-correctness-5",
+      "native_group_norm-correctness-10",
+      "native_group_norm-correctness-13",
+      "native_group_norm-correctness-16"
+    ],
+    "success_criteria": [
+      "Full formal eval passes: all 18 correctness workloads PASSED at the frozen tolerances (fp16/bf16 rtol=atol=0.015, fp32 rtol=atol=1e-4, required_matched_ratio=1.0, equal_nan=true) with no new errors, and all 9 timing workloads PASSED with no RUNTIME_ERROR.",
+      "Headline geo_mean strictly improves on round 1's 0.5917464299202004; target > 0.70 for this round and report the achieved value explicitly.",
+      "Causal check on the host-overhead hypothesis: the absolute latency reduction is roughly uniform across the smallest payloads (timing-0/3 at 0.25 MiB, timing-6 at 0.5 MiB) and the largest (timing-1/4/7 at 4-8 MiB). If only the 4-8 MiB workloads improve, the hypothesis is falsified and the next round must target the kernel's double read of X and device-side work instead.",
+      "No per-workload speedup among the 9 timing workloads drops below its round-1 value."
+    ]
+  },
+  "warnings": [
+    "Profiling is advertised as supported (msprof, levels metrics+instruction, capabilities performance_counters/pipeline_utilization/kernel_profile/instruction_listing) but no collection succeeded: 4 attempts over timing-1 (metrics x2, instruction x1) and timing-2 (metrics x1) all returned status=failed with metrics={}, artifacts=[] and capabilities=[].",
+    "No device duration, pipeline utilization, memory traffic or instruction listing exists for round 1, so findings is empty by construction: evidence requires a downloaded artifact and none was produced.",
+    "The 'launch' dominant_bound is inferred from trusted eval latencies (flat latency across a 32x payload range plus a constant ~23 us delta versus the reference), not confirmed by device counters.",
+    "The ~6.5 us device-kernel figure and the VECTOR/MTE2/MTE3 active ratios present in the supplied starting-point context were not re-measured in this round and must not be attributed to this candidate.",
+    "PyTorch and CANN comparison capture both failed ('AssertionError: 基本信息不唯一'); the evaluator's ATen timing reference remains authoritative for speedup, but no kernel-level PyTorch/CANN profiler pairing exists.",
+    "The round-1 candidate source is byte-identical to the seed, so this analysis describes the seed architecture, not a tuned variant."
+  ],
+  "open_questions": [
+    "What is the actual device duration of _gn_kernel per workload this round, and what fraction of the ~56 us call time does it explain?",
+    "Is the _CK_CACHE fast-launch path actually engaged for these shapes, or silently disabled (entry False) so every call pays full Triton dispatch?",
+    "How is the ~23 us candidate-minus-reference delta split between the two torch.empty allocations, the Python wrapper bookkeeping, the launch entry and stream resolution?",
+    "Was the msprof collection failure transient, so that a later-round retry could yield counters and confirm or falsify the launch-bound inference?"
+  ],
+  "error": "Profiler collection failed for every attempted workload: 'msprof base collection exited successfully without profile completion marker'. Attempts: timing-1 metrics (profile_id bcd62a2e14664ce4b4f299a75de599dd), timing-2 metrics (e6200193f0b54cab99e597e70d461c5e), timing-1 metrics retry (450e26510aab4b889602aa8e495c6265), timing-1 instruction (3a4a50aa91fc472ab10280c6bca35a5f). All returned status=failed with metrics={}, zero artifacts and capabilities=[]; the persisted manifests contain only the request, hardware/software identity and the error, no measurements, so no evidence-backed finding can be produced this round."
+}

@@ -1,0 +1,25 @@
+{
+  "api_version": "v6.2",
+  "binding": {
+    "bundle_id": "sha256:4930515738bd2b1ff71fb46e39fe8998ad1aaf42a4ce0becbd1427725d194a89",
+    "definition": "xlogy_scalar_tensor"
+  },
+  "implementation": {
+    "name": "xlogy_scalar_tensor-HG-KDA-direct-launch-v2-1",
+    "definition": "xlogy_scalar_tensor",
+    "language": "triton",
+    "entrypoint": "main.py::run",
+    "sources": [
+      {
+        "path": "main.py",
+        "content": "\"\"\"xlogy_scalar_tensor : out = xlogy(self_scalar, other), self-contained Triton.\n\nReference semantics (``torch.xlogy(scalar, tensor)``, fp32 math):\n  * ``y != y``            -> NaN      (checked first, matches aten precedence)\n  * ``self == 0``         -> +0.0     (even for y == 0, y < 0, y == +-inf)\n  * otherwise             -> ``float(self) * log(y)``\n  * output dtype/shape always follow ``other``; the scalar path never mutates it.\n\nFor ``self != 0`` the two special cases collapse into plain IEEE arithmetic\n(``s * log(NaN)`` is already NaN), so the timed path is a single fused\nmultiply-by-log.  For ``self == 0`` the transcendental is dropped entirely and\nonly the NaN positions of ``y`` survive.\n\nLayout: contiguous inputs take a flat kernel; non-contiguous views take an\nindex-math kernel driven by their real element strides, so ``base[..., 0]``\nstyle views are read correctly.\n\"\"\"\n\nimport torch\nimport torch_npu\nimport triton\nimport triton.language as tl\n\n_BLOCK_MIN = 1024\n_BLOCK_CAP_2B = 16384      # 32 KiB source tile for 2-byte dtypes\n_BLOCK_CAP_4B = 8192       # 32 KiB source tile for 4-byte dtypes\n_TARGET_PROGS = 32\n_BLOCK_STRIDED = 512\n\n\n@triton.jit\ndef _xlogy_flat(Y, OUT, n, s, BLOCK: tl.constexpr, HAS_LOG: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    y = tl.load(Y + offs, mask=mask, other=1.0).to(tl.float32)\n    if HAS_LOG:\n        val = s * tl.log(y)\n    else:\n        val = tl.where(y != y, float(\"nan\"), 0.0)\n    tl.store(OUT + offs, val.to(OUT.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _xlogy_strided(Y, OUT, n, s, SHAPE: tl.constexpr, YS: tl.constexpr,\n                   BLOCK: tl.constexpr, HAS_LOG: tl.constexpr):\n    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = idx < n\n    rem = idx\n    off = tl.zeros((BLOCK,), dtype=tl.int32)\n    for ax in tl.static_range(len(SHAPE) - 1, -1, -1):\n        coord = rem % SHAPE[ax]\n        rem = rem // SHAPE[ax]\n        off += coord * YS[ax]\n    y = tl.load(Y + off, mask=mask, other=1.0).to(tl.float32)\n    if HAS_LOG:\n        val = s * tl.log(y)\n    else:\n        val = tl.where(y != y, float(\"nan\"), 0.0)\n    tl.store(OUT + idx, val.to(OUT.dtype.element_ty), mask=mask)\n\n\ndef _pick_block(n, esize):\n    cap = _BLOCK_CAP_2B if esize < 4 else _BLOCK_CAP_4B\n    target = -(-n // _TARGET_PROGS)\n    block = _BLOCK_MIN\n    while block < target:\n        block <<= 1\n    return block if block < cap else cap\n\n\n_ENTRIES = {}\n_RAW = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\n\n\ndef _stream(device):\n    if _RAW is not None:\n        try:return _RAW(device)\n        except TypeError:return _RAW()\n    return torch.npu.current_stream(device).npu_stream\n\n\ndef run(self, other):\n    y = other\n    out = torch.empty_like(y, memory_format=torch.contiguous_format)\n    n = y.numel()\n    if n == 0:\n        return out\n    s = float(self)\n    has_log = s != 0.0\n    if not y.is_contiguous():\n        _xlogy_strided[((n + _BLOCK_STRIDED - 1) // _BLOCK_STRIDED,)](\n            y, out, n, s, SHAPE=tuple(y.shape), YS=tuple(y.stride()),\n            BLOCK=_BLOCK_STRIDED, HAS_LOG=has_log)\n        return out\n    device = y.device.index\n    key = (device, y.dtype, n, has_log)\n    entry = _ENTRIES.get(key)\n    if entry is None:\n        block = _pick_block(n, y.element_size())\n        grid = (n + block - 1) // block\n        launch = None\n        try:\n            compiled = _xlogy_flat.warmup(y, out, n, s, BLOCK=block, HAS_LOG=has_log, grid=(1,))\n            launcher = compiled.run\n            if not (getattr(launcher, 'compile_only', False) or\n                    getattr(launcher, 'enable_msprof_register_tensor', False) or\n                    getattr(launcher.metadata, 'debug_enabled', False) or\n                    getattr(launcher.metadata, 'debug', False)):\n                launch = (launcher.launch, compiled.function, compiled.packed_metadata)\n        except Exception:\n            pass\n        entry = (grid, block, launch)\n        _ENTRIES[key] = entry\n    launch = entry[2]\n    if launch and not ((y.data_ptr() | out.data_ptr()) & 15):\n        launch[0](entry[0], 1, 1, _stream(device), launch[1], launch[2], None, None, None,\n                  y.data_ptr(), out.data_ptr(), n, s, entry[1], has_log)\n    else:\n        _xlogy_flat[(entry[0],)](y, out, n, s, BLOCK=entry[1], HAS_LOG=has_log)\n    return out\n"
+      }
+    ]
+  },
+  "settings": {
+    "warmup_ms": 1000,
+    "benchmark_ms": 100,
+    "num_trials": 3,
+    "timeout_seconds": 1800
+  }
+}

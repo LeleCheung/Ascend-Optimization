@@ -1,0 +1,86 @@
+{
+  "config": {
+    "bo": 16,
+    "last_br": 256,
+    "bc": 256,
+    "middle_br": 16,
+    "native": true,
+    "multi": true
+  },
+  "hypothesis": "在2D末轴，先前候选把BO16/BR512的收益放在FP16和FP32上分别达到1.38x和1.15x。父版OpProf显示MTE2占比0.86，标量流水在MTE2上停滞约9.9us，说明搬运粒度是主要限制；每行BR512的16行平铺会占用较多UB，搬运需要更长等待。新配置保持BO=16并把last_br减到256，让每次搬运更短、与多缓冲形成更细的重叠，减少MTE2等待，同时保留同一program内同时归约多行的收益；在FP16原生中间值下，FP32/BF16同样走FP32中间值，BC=256只影响3D中间轴，此前在3D非整除边界使用BC=1024且带mask时出现0.34x明显退化，收紧到256在这两个形状上都不会触发mask退化。预期在4Kx4K 2D用例上相较父版和候选1（1.14 geomean）都不退化。",
+  "predictions": [
+    {
+      "metric": "device_paired_speedup",
+      "case": "4096x4096 float16 dim=1",
+      "direction": "increase",
+      "expected_range": [
+        1.35,
+        1.55
+      ]
+    },
+    {
+      "metric": "device_paired_speedup",
+      "case": "4096x4096 float32 dim=1",
+      "direction": "increase",
+      "expected_range": [
+        1.1,
+        1.25
+      ]
+    },
+    {
+      "metric": "device_paired_speedup",
+      "case": "64x512x512 float16 dim=1",
+      "direction": "flat",
+      "expected_range": [
+        0.97,
+        1.03
+      ]
+    },
+    {
+      "metric": "device_paired_speedup",
+      "case": "64x512x512 float32 dim=1",
+      "direction": "flat",
+      "expected_range": [
+        0.97,
+        1.03
+      ]
+    },
+    {
+      "metric": "device_geomean_speedup",
+      "case": "all_four",
+      "direction": "increase",
+      "expected_range": [
+        1.14,
+        1.25
+      ]
+    },
+    {
+      "metric": "aiv_mte2_wait_ratio",
+      "case": "2D FP16",
+      "direction": "decrease",
+      "expected_range": [
+        0.75,
+        0.92
+      ]
+    },
+    {
+      "metric": "fp32_vec_time_share_3d",
+      "case": "3D FP16",
+      "direction": "flat",
+      "expected_range": [
+        0.63,
+        0.73
+      ]
+    },
+    {
+      "metric": "max_abs_error",
+      "case": "all",
+      "direction": "flat",
+      "expected_range": [
+        0.0,
+        0.0
+      ]
+    }
+  ],
+  "risk": "若UB多缓冲深度对短搬运不敏感，256可能带来更多循环开销，导致2D收益低于候选1；3D用BC=256替换父版形状表里的512会有2倍program增加，在shape[2]=512时列分块数从1变2，可能轻微增加冗余索引计算。K维（R）与历史单K迭代超时条件无关，2D的R=4096/BR256仍为16次迭代，不会触发该风险。"
+}

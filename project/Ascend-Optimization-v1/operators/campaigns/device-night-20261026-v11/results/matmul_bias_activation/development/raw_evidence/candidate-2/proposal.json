@@ -1,0 +1,49 @@
+{
+  "config": {
+    "bm": 128,
+    "bn": 128,
+    "bk32": 128,
+    "bk16": 256,
+    "group": 8,
+    "multi": true
+  },
+  "hypothesis": "在前一次 group=4、bk16=128 的候选相对默认配置明显变慢（设备几何平均 0.898×，其中 float16 与 float32 的 256 方阵、float16 的 1024 方阵都低于 0.89×）之后，问题很可能来自 bk16=128 带来的块数减少和 K 迭代变短，未必来自分组本身。这次把 K 分块恢复为默认的 bk32=128 / bk16=256，只把 group 从 0 调到 8，并按默认值把 M/N 块边界对齐到 128/128。这样矩阵为 (m/128)×(n/256)×(k/256) 个程序，在 1024 输入下为 32 个程序，正好对应 32 个 AI Core 各跑一次，同时按 8 个 M 块一组做行优先重排，让同一批程序共享 B 面板的 L2 驻留（父路径证据中 AIC 的 L2 读命中率约 87.5%）。K=1024 时 K 被 256 整除，正好 2 个 BK 迭代，满足‘K≥2×BK’的新路径门槛；该路径走通用变换器生成的 hg_device_* 内核，不改动原数学内核。预期 group=8 相对默认的收益幅度介于历史 group=4 的 +1.8%（float16）与 +0.08%（float32）之间，总体小幅为正；不作为大幅加速的预期。",
+  "predictions": [
+    {
+      "metric": "paired_speedup",
+      "case": "1024x1024x1024 float16",
+      "change": "+0.5%~+2.0%，区间 1.000~1.020"
+    },
+    {
+      "metric": "paired_speedup",
+      "case": "1024x1024x1024 float32",
+      "change": "0%~+1.0%，区间 0.995~1.010"
+    },
+    {
+      "metric": "paired_speedup",
+      "case": "256x256x256 float16",
+      "change": "回到默认分块水平，约 1.00±0.02（相比上次 group4+bk16=128 的 0.890 回升）"
+    },
+    {
+      "metric": "paired_speedup",
+      "case": "256x256x256 float32",
+      "change": "回到默认分块水平，约 1.00±0.02（相比上次的 0.830 回升）"
+    },
+    {
+      "metric": "device_geomean",
+      "change": "≥0.95，主要要求不再复现上次的 0.898"
+    },
+    {
+      "metric": "aic_l2_read_hit_rate",
+      "change": "≥默认配置的 85%，不超过 95%"
+    },
+    {
+      "metric": "compile_status",
+      "change": "窗口内全部编译通过，无 cbuf overflow；K=1024 下 K/BK=2，满足至少 2 个 BK 迭代的门槛"
+    },
+    {
+      "metric": "max_abs_error",
+      "change": "与默认路径一致（float16 0.125、float32 1.2969970703125e-4）"
+    }
+  ]
+}

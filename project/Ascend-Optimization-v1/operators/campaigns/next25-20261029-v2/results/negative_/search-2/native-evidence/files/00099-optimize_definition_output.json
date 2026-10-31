@@ -1,0 +1,217 @@
+{
+  "definition_name": "negative_",
+  "op_type": "",
+  "status": "PASSED",
+  "best_geo_mean": 0.40253157689377983,
+  "best_code": "# Copyright 2026, The FlagOS Contributors.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"In-place negation (``negative_`` / ``neg_``) as a Triton kernel.\n\nSemantics preserved from the reference ``a.neg_()``:\n  * mutates ``A``'s storage in place and returns the same tensor object,\n  * IEEE negation for every element (NaN -> NaN, inf -> -inf, -0.0 -> 0.0),\n  * non-contiguous (strided) views are negated through their real strides,\n    so no neighbouring storage (garbage) is touched.\n\nHost path: the whole operator is one device kernel, so the measured cost of\nsmall tensors is the Triton *launch* cost, not the device work.  ``run`` keeps\na per-specialisation handle to the already compiled kernel and launches it\nthrough Triton's own compiled-kernel entry point, which skips the per-call\nPython argument binding / cache lookup of the ``kernel[grid](...)`` wrapper.\nEvery launch still goes through the same Triton launcher, stream and grid; the\ndevice kernel is unchanged.  If the direct entry point is unavailable for any\nreason the standard ``kernel[grid](...)`` call is used instead.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\ntry:\n    from triton.runtime import driver as _triton_driver\nexcept Exception:  # pragma: no cover - standard launch path still works\n    _triton_driver = None\n\n\n@triton.jit\ndef _neg_exact(X, BLOCK: tl.constexpr):\n    \"\"\"Contiguous negation of one tile; the grid covers the tensor exactly.\"\"\"\n    o = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    tl.store(X + o, -tl.load(X + o))\n\n\n@triton.jit\ndef _neg_tail(X, n, BLOCK: tl.constexpr):\n    \"\"\"Contiguous negation of one tile with a tail mask.\"\"\"\n    o = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    m = o < n\n    tl.store(X + o, -tl.load(X + o, mask=m, other=0.0), mask=m)\n\n\n@triton.jit\ndef _neg_strided(X, n, d1, d2, d3, s0, s1, s2, s3, RANK: tl.constexpr, BLOCK: tl.constexpr):\n    \"\"\"Negation of a non-contiguous view, addressed through collapsed strides.\"\"\"\n    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    m = idx < n\n    if RANK == 1:\n        off = idx * s0\n    elif RANK == 2:\n        r0 = idx // d1\n        off = r0 * s0 + (idx - r0 * d1) * s1\n    elif RANK == 3:\n        r0 = idx // (d1 * d2)\n        rem = idx - r0 * (d1 * d2)\n        r1 = rem // d2\n        off = r0 * s0 + r1 * s1 + (rem - r1 * d2) * s2\n    else:\n        p1 = d1 * d2 * d3\n        r0 = idx // p1\n        rem0 = idx - r0 * p1\n        r1 = rem0 // (d2 * d3)\n        rem1 = rem0 - r1 * (d2 * d3)\n        r2 = rem1 // d3\n        off = r0 * s0 + r1 * s1 + r2 * s2 + (rem1 - r2 * d3) * s3\n    tl.store(X + off, -tl.load(X + off, mask=m, other=0.0), mask=m)\n\n\n# ---------------------------------------------------------------------------\n# launch plumbing\n# ---------------------------------------------------------------------------\n\n_ENTRIES = {}          # per-specialisation compiled-kernel handles\n_DEVICE = [None]\n_DIRECT = [True]       # False as soon as the direct entry point is unusable\n\n\ndef _device_index():\n    dev = _DEVICE[0]\n    if dev is None:\n        dev = _triton_driver.active.get_current_device()\n        _DEVICE[0] = dev\n    return dev\n\n\ndef _entry(kernel, key, t, rt, ce_names, ce_vals):\n    \"\"\"Compile (cached) and keep the launcher handles for one specialisation.\"\"\"\n    entry = _ENTRIES.get(key)\n    if entry is None:\n        try:\n            compiled = kernel.warmup(\n                t, *rt, grid=(1,), **dict(zip(ce_names, ce_vals))\n            )\n            entry = (compiled.run, compiled.function, compiled.packed_metadata,\n                     tuple(rt) + tuple(ce_vals))\n        except Exception:\n            entry = False\n        _ENTRIES[key] = entry\n    return entry\n\n\ndef _direct_launch(key, kernel, t, rt, ce_names, ce_vals, grid):\n    \"\"\"Launch the precompiled kernel; return False when the ordinary path must be used.\"\"\"\n    if not _DIRECT[0] or _triton_driver is None:\n        return False\n    entry = _entry(kernel, key, t, rt, ce_names, ce_vals)\n    if entry is False:\n        return False\n    launch, function, packed, tail = entry\n    try:\n        stream = _triton_driver.active.get_current_stream(_device_index())\n        launch(grid, 1, 1, stream, function, packed, None, None, None, t, *tail)\n        return True\n    except Exception:\n        _DIRECT[0] = False\n        return False\n\n\ndef _collapse(t):\n    \"\"\"Collapse a shape/stride list to the minimal equivalent (size, stride) pairs.\"\"\"\n    dims = [(sz, st) for sz, st in zip(t.shape, t.stride()) if sz != 1]\n    out = []\n    for sz, st in reversed(dims):\n        if out and out[-1][1] == st * sz:\n            out[-1] = (out[-1][0] * sz, st)\n        else:\n            out.append((sz, st))\n    out.reverse()\n    return out\n\n\ndef _launch_strided(t):\n    dims = _collapse(t)\n    if len(dims) > 4:\n        for i in range(t.shape[0]):\n            _launch_strided(t[i])\n        return\n    n = t.numel()\n    if n == 0:\n        return\n    pad = dims + [(1, 0)] * (4 - len(dims))\n    block = 1024\n    grid = ((n + block - 1) // block,)\n    _neg_strided[grid](\n        t, n,\n        pad[1][0], pad[2][0], pad[3][0],\n        pad[0][1], pad[1][1], pad[2][1], pad[3][1],\n        RANK=len(dims), BLOCK=block,\n    )\n\n\ndef _tile(itemsize):\n    \"\"\"One 64 KiB tile per program: the largest element-wise tile that keeps the\n    staged input and output buffers inside the vector core's unified buffer.\"\"\"\n    return 65536 // itemsize\n\n\ndef run(A):\n    if not A.is_contiguous():\n        _launch_strided(A)\n        return A\n    n = A.numel()\n    if n == 0:\n        return A\n    if n <= 4096:\n        block = 1 << max(0, (n - 1).bit_length())\n        grid = 1\n    else:\n        block = _tile(A.element_size())\n        grid = (n + block - 1) // block\n    if block == n or (n > 4096 and n % block == 0):\n        key = (\"e\", A.dtype, block)\n        if _direct_launch(key, _neg_exact, A, (), (\"BLOCK\",), (block,), grid):\n            return A\n        _neg_exact[(grid,)](A, BLOCK=block)\n    else:\n        key = (\"t\", A.dtype, n, block)\n        if _direct_launch(key, _neg_tail, A, (n,), (\"BLOCK\",), (block,), grid):\n            return A\n        _neg_tail[(grid,)](A, n, BLOCK=block)\n    return A\n",
+  "search_best_geo_mean": 0.4128810206452792,
+  "final_verification": {
+    "status": "PASSED",
+    "reason_code": "VERIFIED",
+    "geo_mean": 0.40253157689377983,
+    "measured_geo_mean": 0.40253157689377983,
+    "comparisons": [
+      {
+        "uuid": "negative_-timing-0",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011468232548515851,
+          "latency_ms": 0.030431921763033064
+        },
+        "after": {
+          "reference_latency_ms": 0.012782810737726235,
+          "latency_ms": 0.03249603361039982
+        },
+        "ratios": {
+          "reference_latency_ms": 1.1146277932235085,
+          "latency_ms": 1.0678271935449741
+        }
+      },
+      {
+        "uuid": "negative_-timing-1",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.01209657029809,
+          "latency_ms": 0.03154278345045266
+        },
+        "after": {
+          "reference_latency_ms": 0.012209263468716577,
+          "latency_ms": 0.03266962736602185
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0093161257984316,
+          "latency_ms": 1.0357243017991495
+        }
+      },
+      {
+        "uuid": "negative_-timing-2",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011827069688530192,
+          "latency_ms": 0.029827667485376685
+        },
+        "after": {
+          "reference_latency_ms": 0.012164039800664666,
+          "latency_ms": 0.03344979535406831
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0284914286470523,
+          "latency_ms": 1.1214351698961176
+        }
+      },
+      {
+        "uuid": "negative_-timing-3",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.01251483349109945,
+          "latency_ms": 0.03036399103631451
+        },
+        "after": {
+          "reference_latency_ms": 0.012828450445842028,
+          "latency_ms": 0.03247346045354022
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0250596186489913,
+          "latency_ms": 1.0694727321814461
+        }
+      },
+      {
+        "uuid": "negative_-timing-4",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011896958053133408,
+          "latency_ms": 0.031548520245519636
+        },
+        "after": {
+          "reference_latency_ms": 0.01175172897856353,
+          "latency_ms": 0.03265412883888333
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9877927556001067,
+          "latency_ms": 1.035044705259059
+        }
+      },
+      {
+        "uuid": "negative_-timing-5",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.012927713118659846,
+          "latency_ms": 0.030610339883164434
+        },
+        "after": {
+          "reference_latency_ms": 0.012113490395315127,
+          "latency_ms": 0.03176204151216345
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9370172654767941,
+          "latency_ms": 1.0376245946106741
+        }
+      },
+      {
+        "uuid": "negative_-timing-6",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.012702143337318615,
+          "latency_ms": 0.030896236161076854
+        },
+        "after": {
+          "reference_latency_ms": 0.011820896197789366,
+          "latency_ms": 0.031915614209737854
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9306221701230402,
+          "latency_ms": 1.0329935997170172
+        }
+      },
+      {
+        "uuid": "negative_-timing-7",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.019145862367639894,
+          "latency_ms": 0.034015966382656505
+        },
+        "after": {
+          "reference_latency_ms": 0.019027008226108918,
+          "latency_ms": 0.033990083466641056
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9937921761240767,
+          "latency_ms": 0.9992390950848116
+        }
+      },
+      {
+        "uuid": "negative_-timing-8",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011703662275119075,
+          "latency_ms": 0.030459241395309367
+        },
+        "after": {
+          "reference_latency_ms": 0.012078319115130102,
+          "latency_ms": 0.03225939220956712
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0320119319238656,
+          "latency_ms": 1.0591003167444273
+        }
+      },
+      {
+        "uuid": "negative_-timing-9",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011085190725244403,
+          "latency_ms": 0.03031171530949996
+        },
+        "after": {
+          "reference_latency_ms": 0.011990177017272029,
+          "latency_ms": 0.03207291640907632
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0816392170832652,
+          "latency_ms": 1.058102983667981
+        }
+      },
+      {
+        "uuid": "negative_-timing-10",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.011235199482069172,
+          "latency_ms": 0.030662466620721834
+        },
+        "after": {
+          "reference_latency_ms": 0.012415581279625568,
+          "latency_ms": 0.031403188844138404
+        },
+        "ratios": {
+          "reference_latency_ms": 1.105061044927616,
+          "latency_ms": 1.024157294081357
+        }
+      },
+      {
+        "uuid": "negative_-timing-11",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.022697187526102374,
+          "latency_ms": 0.04144856910047245
+        },
+        "after": {
+          "reference_latency_ms": 0.022545698546636298,
+          "latency_ms": 0.04143394850679705
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9933256497400015,
+          "latency_ms": 0.9996472593869293
+        }
+      }
+    ],
+    "drift": [],
+    "drift_factor": 2.0,
+    "compared_to": "original_round",
+    "attempt_path": ".kernelgen/retests/6dd8338ba1b49783cc0f274f7e494b3d25878cb9363e9dd014efcee4b470c97a/41e292e2aeafdcbe70439c37ea690dbff41913301a08aafaeb38d7695dc5d5f4/attempt-0001.json",
+    "round_num": 3,
+    "solution_sha256": "6dd8338ba1b49783cc0f274f7e494b3d25878cb9363e9dd014efcee4b470c97a"
+  },
+  "rounds": 3,
+  "summary": "The winning implementation is a single-kernel in-place negation whose cost is dominated by host launch overhead, so the seed's per-call Triton launch path was replaced with a pre-compiled, pre-bound compiled-kernel launch (one closure per dtype/element count) and its 16 KiB device tile was enlarged to one safe 64 KiB tile per program; all 30 frozen workloads pass and geo_mean rose 0.1597 -> 0.2831 -> 0.4129 (round 3, min_speedup 0.366), with the three 4096x4096 workloads dropping from 152 us to 30.4/34.0/41.4 us. Key lesson: on this Ascend/FlagTriton stack a 1 KiB-scale elementwise operator is launch-bound, so measured per-call host cost (55 us through kernel[grid] vs 17 us through the compiled-kernel entry point) mattered far more than arithmetic, while the device side only needed a tile large enough for efficient DMA — and oversized or unrolled tiles (fp32 32768, static_range loops) silently poisoned the device.",
+  "workspace": "/data/hanle/ascend-optimization/runs/next25-20261029-v2/kg-runs/negative_-next25-20261029-v2-attempt-2/stages/optimize/work"
+}

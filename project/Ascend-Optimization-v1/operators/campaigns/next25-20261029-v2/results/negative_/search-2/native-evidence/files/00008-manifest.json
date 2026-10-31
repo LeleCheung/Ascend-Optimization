@@ -1,0 +1,238 @@
+{
+  "request": {
+    "api_version": "v6.2",
+    "evaluation_id": "2a97cc873195c3b12b68113ecf0ca8d9e7418a40be701fcc23384559c69aa6fe:round-3",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:051d30e5c707acdcbeb8458b454df8ec1eaab70612e535d7cc6de59959f20c6d",
+      "definition": "negative_"
+    },
+    "implementation": {
+      "name": "kernelgen-candidate-negative_",
+      "definition": "negative_",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "# Copyright 2026, The FlagOS Contributors.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"In-place negation (``negative_`` / ``neg_``) as a Triton kernel.\n\nSemantics preserved from the reference ``a.neg_()``:\n  * mutates ``A``'s storage in place and returns the same tensor object,\n  * IEEE negation for every element (NaN -> NaN, inf -> -inf, -0.0 -> 0.0),\n  * non-contiguous (strided) views are negated through their real strides,\n    so no neighbouring storage (garbage) is touched.\n\nHost path: the whole operator is one device kernel, so the measured cost of\nsmall tensors is the Triton *launch* cost, not the device work.  ``run`` keeps\na per-specialisation handle to the already compiled kernel and launches it\nthrough Triton's own compiled-kernel entry point, which skips the per-call\nPython argument binding / cache lookup of the ``kernel[grid](...)`` wrapper.\nEvery launch still goes through the same Triton launcher, stream and grid; the\ndevice kernel is unchanged.  If the direct entry point is unavailable for any\nreason the standard ``kernel[grid](...)`` call is used instead.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\ntry:\n    from triton.runtime import driver as _triton_driver\nexcept Exception:  # pragma: no cover - standard launch path still works\n    _triton_driver = None\n\n\n@triton.jit\ndef _neg_exact(X, BLOCK: tl.constexpr):\n    \"\"\"Contiguous negation of one tile; the grid covers the tensor exactly.\"\"\"\n    o = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    tl.store(X + o, -tl.load(X + o))\n\n\n@triton.jit\ndef _neg_tail(X, n, BLOCK: tl.constexpr):\n    \"\"\"Contiguous negation of one tile with a tail mask.\"\"\"\n    o = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    m = o < n\n    tl.store(X + o, -tl.load(X + o, mask=m, other=0.0), mask=m)\n\n\n@triton.jit\ndef _neg_strided(X, n, d1, d2, d3, s0, s1, s2, s3, RANK: tl.constexpr, BLOCK: tl.constexpr):\n    \"\"\"Negation of a non-contiguous view, addressed through collapsed strides.\"\"\"\n    idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    m = idx < n\n    if RANK == 1:\n        off = idx * s0\n    elif RANK == 2:\n        r0 = idx // d1\n        off = r0 * s0 + (idx - r0 * d1) * s1\n    elif RANK == 3:\n        r0 = idx // (d1 * d2)\n        rem = idx - r0 * (d1 * d2)\n        r1 = rem // d2\n        off = r0 * s0 + r1 * s1 + (rem - r1 * d2) * s2\n    else:\n        p1 = d1 * d2 * d3\n        r0 = idx // p1\n        rem0 = idx - r0 * p1\n        r1 = rem0 // (d2 * d3)\n        rem1 = rem0 - r1 * (d2 * d3)\n        r2 = rem1 // d3\n        off = r0 * s0 + r1 * s1 + r2 * s2 + (rem1 - r2 * d3) * s3\n    tl.store(X + off, -tl.load(X + off, mask=m, other=0.0), mask=m)\n\n\n# ---------------------------------------------------------------------------\n# launch plumbing\n# ---------------------------------------------------------------------------\n\n_ENTRIES = {}          # per-specialisation compiled-kernel handles\n_DEVICE = [None]\n_DIRECT = [True]       # False as soon as the direct entry point is unusable\n\n\ndef _device_index():\n    dev = _DEVICE[0]\n    if dev is None:\n        dev = _triton_driver.active.get_current_device()\n        _DEVICE[0] = dev\n    return dev\n\n\ndef _entry(kernel, key, t, rt, ce_names, ce_vals):\n    \"\"\"Compile (cached) and keep the launcher handles for one specialisation.\"\"\"\n    entry = _ENTRIES.get(key)\n    if entry is None:\n        try:\n            compiled = kernel.warmup(\n                t, *rt, grid=(1,), **dict(zip(ce_names, ce_vals))\n            )\n            entry = (compiled.run, compiled.function, compiled.packed_metadata,\n                     tuple(rt) + tuple(ce_vals))\n        except Exception:\n            entry = False\n        _ENTRIES[key] = entry\n    return entry\n\n\ndef _direct_launch(key, kernel, t, rt, ce_names, ce_vals, grid):\n    \"\"\"Launch the precompiled kernel; return False when the ordinary path must be used.\"\"\"\n    if not _DIRECT[0] or _triton_driver is None:\n        return False\n    entry = _entry(kernel, key, t, rt, ce_names, ce_vals)\n    if entry is False:\n        return False\n    launch, function, packed, tail = entry\n    try:\n        stream = _triton_driver.active.get_current_stream(_device_index())\n        launch(grid, 1, 1, stream, function, packed, None, None, None, t, *tail)\n        return True\n    except Exception:\n        _DIRECT[0] = False\n        return False\n\n\ndef _collapse(t):\n    \"\"\"Collapse a shape/stride list to the minimal equivalent (size, stride) pairs.\"\"\"\n    dims = [(sz, st) for sz, st in zip(t.shape, t.stride()) if sz != 1]\n    out = []\n    for sz, st in reversed(dims):\n        if out and out[-1][1] == st * sz:\n            out[-1] = (out[-1][0] * sz, st)\n        else:\n            out.append((sz, st))\n    out.reverse()\n    return out\n\n\ndef _launch_strided(t):\n    dims = _collapse(t)\n    if len(dims) > 4:\n        for i in range(t.shape[0]):\n            _launch_strided(t[i])\n        return\n    n = t.numel()\n    if n == 0:\n        return\n    pad = dims + [(1, 0)] * (4 - len(dims))\n    block = 1024\n    grid = ((n + block - 1) // block,)\n    _neg_strided[grid](\n        t, n,\n        pad[1][0], pad[2][0], pad[3][0],\n        pad[0][1], pad[1][1], pad[2][1], pad[3][1],\n        RANK=len(dims), BLOCK=block,\n    )\n\n\ndef _tile(itemsize):\n    \"\"\"One 64 KiB tile per program: the largest element-wise tile that keeps the\n    staged input and output buffers inside the vector core's unified buffer.\"\"\"\n    return 65536 // itemsize\n\n\ndef run(A):\n    if not A.is_contiguous():\n        _launch_strided(A)\n        return A\n    n = A.numel()\n    if n == 0:\n        return A\n    if n <= 4096:\n        block = 1 << max(0, (n - 1).bit_length())\n        grid = 1\n    else:\n        block = _tile(A.element_size())\n        grid = (n + block - 1) // block\n    if block == n or (n > 4096 and n % block == 0):\n        key = (\"e\", A.dtype, block)\n        if _direct_launch(key, _neg_exact, A, (), (\"BLOCK\",), (block,), grid):\n            return A\n        _neg_exact[(grid,)](A, BLOCK=block)\n    else:\n        key = (\"t\", A.dtype, n, block)\n        if _direct_launch(key, _neg_tail, A, (n,), (\"BLOCK\",), (block,), grid):\n            return A\n        _neg_tail[(grid,)](A, n, BLOCK=block)\n    return A\n"
+        }
+      ]
+    },
+    "benchmark_fingerprint": "sha256:b5d56d88c941e4874fdd1a2adaa135fdf040a9149b83efc919547a20e6798ddf",
+    "case_id": "negative_-timing-10",
+    "expected_backend": "npu",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "identity": {
+      "solution_sha256": "d50a48306bb16c31835d61828ef00bee5329648e33779103894cf6013b3e651d",
+      "workload_sha256": "5a9ec227899a218d36f1ae75951f2d41f3ad8943a5573cc8c3e4686c48a906bc"
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "profile_id": "3fd529b63a9d477abe9b0f43cf6c7a44",
+    "created_at": "2026-10-29T14:06:18.269635+00:00",
+    "status": "completed",
+    "backend": "npu",
+    "profiler": "msprof",
+    "device": "npu:0",
+    "hardware": {
+      "target": {
+        "backend": "ascend",
+        "vendor": "huawei",
+        "device": "Ascend910B4-1",
+        "architecture": "dav-c220-cube",
+        "devices": [
+          {
+            "logical_device": "npu:0",
+            "device_id": 0,
+            "name": "Ascend910B4-1",
+            "l2_cache_size": 176160768,
+            "num_sm": 20,
+            "compute_capability": "",
+            "total_memory": 65452113920
+          }
+        ]
+      },
+      "software": {
+        "language": "triton",
+        "language_version": "3.5.1",
+        "compiler": "flagtree",
+        "compiler_version": "0.6.0+ascend.gitc286cba6",
+        "runtime": "cann",
+        "runtime_version": "9.0.0",
+        "driver_version": "25.2.0"
+      },
+      "metadata": {
+        "complete": true,
+        "missing": [],
+        "sources": {
+          "target.backend": "server configuration",
+          "target.vendor": "server configuration",
+          "software.language": "server configuration",
+          "software.compiler": "python package metadata",
+          "software.runtime": "server configuration",
+          "target.device": "device probe",
+          "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+          "software.language_version": "triton module metadata",
+          "software.compiler_version": "python package metadata",
+          "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+          "software.driver_version": "/usr/local/Ascend/driver/version.info"
+        }
+      }
+    },
+    "evaluation_id": "2a97cc873195c3b12b68113ecf0ca8d9e7418a40be701fcc23384559c69aa6fe:round-3",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "capabilities": [
+      "performance_counters",
+      "kernel_profile",
+      "pipeline_utilization",
+      "execution_timeline"
+    ],
+    "summary": {
+      "avg_time_us": 5.231,
+      "operation_count": 1,
+      "top_operations": [
+        {
+          "op_name": "_neg_exact",
+          "op_type": "_neg_exact",
+          "task_type": "AI_VECTOR_CORE",
+          "measured_invocations": 100,
+          "total_duration_us": 523.075,
+          "avg_duration_us": 5.231,
+          "min_duration_us": 4.801,
+          "max_duration_us": 5.82,
+          "aicore_time_us": 0.0,
+          "aic_total_cycles": 0.0,
+          "aic_mac_time_us": 0.0,
+          "aic_mac_ratio": 0.0,
+          "aic_scalar_time_us": 0.0,
+          "aic_scalar_ratio": 0.0,
+          "aic_mte1_time_us": 0.0,
+          "aic_mte1_ratio": 0.0,
+          "aic_mte2_time_us": 0.0,
+          "aic_mte2_ratio": 0.0,
+          "aic_fixpipe_time_us": 0.0,
+          "aic_fixpipe_ratio": 0.0,
+          "aic_icache_miss_rate": 0.0,
+          "aiv_time_us": 3.9877,
+          "aiv_total_cycles": 210547.58,
+          "aiv_vec_time_us": 0.725,
+          "aiv_vec_ratio": 0.182,
+          "aiv_scalar_time_us": 1.0679,
+          "aiv_scalar_ratio": 0.2672,
+          "aiv_mte2_time_us": 1.0429,
+          "aiv_mte2_ratio": 0.2616,
+          "aiv_mte3_time_us": 1.1294,
+          "aiv_mte3_ratio": 0.2835,
+          "aiv_icache_miss_rate": 0.0,
+          "cube_utilization_pct": 0.0
+        }
+      ],
+      "stage_count": 1
+    },
+    "metrics": {
+      "avg_time_us": 5.231,
+      "ops": [
+        {
+          "op_name": "_neg_exact",
+          "op_type": "_neg_exact",
+          "task_type": "AI_VECTOR_CORE",
+          "measured_invocations": 100,
+          "total_duration_us": 523.075,
+          "avg_duration_us": 5.231,
+          "min_duration_us": 4.801,
+          "max_duration_us": 5.82,
+          "aicore_time_us": 0.0,
+          "aic_total_cycles": 0.0,
+          "aic_mac_time_us": 0.0,
+          "aic_mac_ratio": 0.0,
+          "aic_scalar_time_us": 0.0,
+          "aic_scalar_ratio": 0.0,
+          "aic_mte1_time_us": 0.0,
+          "aic_mte1_ratio": 0.0,
+          "aic_mte2_time_us": 0.0,
+          "aic_mte2_ratio": 0.0,
+          "aic_fixpipe_time_us": 0.0,
+          "aic_fixpipe_ratio": 0.0,
+          "aic_icache_miss_rate": 0.0,
+          "aiv_time_us": 3.9877,
+          "aiv_total_cycles": 210547.58,
+          "aiv_vec_time_us": 0.725,
+          "aiv_vec_ratio": 0.182,
+          "aiv_scalar_time_us": 1.0679,
+          "aiv_scalar_ratio": 0.2672,
+          "aiv_mte2_time_us": 1.0429,
+          "aiv_mte2_ratio": 0.2616,
+          "aiv_mte3_time_us": 1.1294,
+          "aiv_mte3_ratio": 0.2835,
+          "aiv_icache_miss_rate": 0.0,
+          "cube_utilization_pct": 0.0
+        }
+      ]
+    },
+    "artifacts": [
+      {
+        "id": "a001",
+        "kind": "profile_log",
+        "format": "text",
+        "filename": "msprof-base-collection.log",
+        "media_type": "text/plain",
+        "size_bytes": 5031,
+        "download_url": "/profile_artifacts/3fd529b63a9d477abe9b0f43cf6c7a44/a001",
+        "local_path": "/data/hanle/ascend-optimization/runs/next25-20261029-v2/kg-runs/negative_-next25-20261029-v2-attempt-2/stages/optimize/work/.kernelgen/profiles/round-0003/negative_-timing-10/142c3946fdb74ac5bdf5a0aeebc9ef20/msprof-base-collection.log",
+        "download_error": null
+      },
+      {
+        "id": "a002",
+        "kind": "vendor_report",
+        "format": "msprof-tar-gz",
+        "filename": "msprof-report.tar.gz",
+        "media_type": "application/gzip",
+        "size_bytes": 141651,
+        "download_url": "/profile_artifacts/3fd529b63a9d477abe9b0f43cf6c7a44/a002",
+        "local_path": "/data/hanle/ascend-optimization/runs/next25-20261029-v2/kg-runs/negative_-next25-20261029-v2-attempt-2/stages/optimize/work/.kernelgen/profiles/round-0003/negative_-timing-10/142c3946fdb74ac5bdf5a0aeebc9ef20/msprof-report.tar.gz",
+        "download_error": null
+      },
+      {
+        "id": "a003",
+        "kind": "op_summary",
+        "format": "csv",
+        "filename": "op_summary.csv",
+        "media_type": "text/csv",
+        "size_bytes": 31408,
+        "download_url": "/profile_artifacts/3fd529b63a9d477abe9b0f43cf6c7a44/a003",
+        "local_path": "/data/hanle/ascend-optimization/runs/next25-20261029-v2/kg-runs/negative_-next25-20261029-v2-attempt-2/stages/optimize/work/.kernelgen/profiles/round-0003/negative_-timing-10/142c3946fdb74ac5bdf5a0aeebc9ef20/op_summary.csv",
+        "download_error": null
+      },
+      {
+        "id": "a004",
+        "kind": "execution_timeline",
+        "format": "trace-json",
+        "filename": "execution-trace.json",
+        "media_type": "application/json",
+        "size_bytes": 141078,
+        "download_url": "/profile_artifacts/3fd529b63a9d477abe9b0f43cf6c7a44/a004",
+        "local_path": "/data/hanle/ascend-optimization/runs/next25-20261029-v2/kg-runs/negative_-next25-20261029-v2-attempt-2/stages/optimize/work/.kernelgen/profiles/round-0003/negative_-timing-10/142c3946fdb74ac5bdf5a0aeebc9ef20/execution-trace.json",
+        "download_error": null
+      }
+    ],
+    "warnings": [
+      "msprof and simulator timing is diagnostic and is not eval latency"
+    ],
+    "error": null,
+    "workload_uuid": "negative_-timing-10"
+  }
+}

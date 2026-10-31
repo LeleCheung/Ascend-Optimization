@@ -1,0 +1,104 @@
+{
+  "schema_version": "1.0",
+  "round_num": 1,
+  "evaluation_fingerprint": "99ae9a069c7e7f1a75d65ae42c9f92762d150d9c7641c6a768a0564213da67ab",
+  "status": "failed",
+  "solution_sha256": "99eb82b91e4eb38deee8197de90daa0bf08d4c4a54e7aebe5326a89d317c23c1",
+  "backend": "npu",
+  "profiler": "msprof",
+  "capabilities": [
+    "performance_counters",
+    "pipeline_utilization",
+    "kernel_profile",
+    "instruction_listing"
+  ],
+  "dominant_bound": "unknown",
+  "profiled_workloads": [
+    {
+      "uuid": "hardswish-timing-0",
+      "axes": {},
+      "eval_speedup": 0.7235381391389315,
+      "eval_latency_ms": 0.026670512579069845,
+      "eval_reference_latency_ms": 0.01929713304134166,
+      "selection_reason": "Smallest timing workload (f16, n=1024, 4 KiB logical traffic); intended to separate fixed per-call host/launch cost from device work in the ~26.7 us full-call time.",
+      "profile_ids": [
+        "9a287a8247fe417cb3387611bd06d889"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0001/hardswish-timing-0/f25e867a2abd4169a41eb275c63e8a7f/manifest.json"
+      ],
+      "status": "failed"
+    },
+    {
+      "uuid": "hardswish-timing-3",
+      "axes": {},
+      "eval_speedup": 0.43189594158752104,
+      "eval_latency_ms": 0.09738174690884756,
+      "eval_reference_latency_ms": 0.04205878127463438,
+      "selection_reason": "Lowest-speedup workload (0.432x) and the large f16 case; 4096x4096 f16 exercises the n>=131072 branch where grid is capped at 40 programs, giving ~103 serial tile iterations per program at BLOCK=4096.",
+      "profile_ids": [
+        "ae0aa1c2d5984f919b3b02c914ccdbd3",
+        "10ede2d664e549eaa95fced732c12e44"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0001/hardswish-timing-3/acce456f8eb04d95a68d5b381b0ec649/manifest.json",
+        ".kernelgen/profiles/round-0001/hardswish-timing-3/aaa669bf5fc2407e9221524bc5d31fae/manifest.json"
+      ],
+      "status": "failed"
+    },
+    {
+      "uuid": "hardswish-timing-11",
+      "axes": {},
+      "eval_speedup": 0.8003755146933444,
+      "eval_latency_ms": 0.11572827862804762,
+      "eval_reference_latency_ms": 0.09262608057149839,
+      "selection_reason": "Highest absolute latency (0.1157 ms) and highest-speedup large case (0.800x); f32 4096x4096 doubles bytes per tile iteration versus timing-3, so the pair separates byte-proportional cost from fixed per-iteration cost.",
+      "profile_ids": [
+        "b0840d263f234d949f786ec9c461f0ee"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0001/hardswish-timing-11/b6cfc6af41174a7db838caf5681ec7a7/manifest.json"
+      ],
+      "status": "failed"
+    }
+  ],
+  "findings": [],
+  "performance_interpretation": "No profiler artifact exists this round, so no counter-based claim is made. The following is arithmetic on the authoritative round-1 eval table (geo_mean 0.6537, 30/30 PASSED). (1) Fixed per-call cost: across the ten workloads with n <= 1048576, candidate minus reference latency is 7.37, 7.93, 8.59, 8.13, 8.13, 8.41, 8.49, 7.79, 8.05 and 8.03 us (timing-0..2, 4..6, 8..10). It is flat across a 1024x range of n and across f16/bf16/f32, the signature of a size-independent per-call cost rather than device work. timing-0 moves only 4 KiB, so its 26.67 us cannot be dominated by memory traffic. (2) Large-case scaling: for 4096x4096 the candidate goes 97.38 us (f16, 64 MiB logical traffic) -> 115.73 us (f32, 128 MiB logical traffic), a factor 1.188 for double the bytes, whereas the reference goes 42.06 -> 92.63 us, a factor 2.202; the candidate large-case time is therefore largely byte-insensitive. Implied logical (NOT measured HBM) throughput: f16 689 GB/s, bf16 674 GB/s, f32 1160 GB/s, against 1596 / 1516 / 1449 GB/s for the reference side. Fitting candidate time as fixed-per-tile-iteration plus byte-proportional over the two 4096x4096 dtypes gives roughly 0.77 us fixed and 0.18 us (f16) / 0.36 us (f32) byte-proportional per iteration, i.e. about 80 percent of the f16 large-case time behaves like per-iteration latency. At the seed geometry (BLOCK=4096, grid capped at 40, so 4096 tiles / 40 programs = 103 serial iterations) each program holds only one 16 KiB read and one 16 KiB write in flight, so concurrency is set by blocks-per-core (about 2) rather than by in-flight bytes. Marginal throughput from 1Mi to 16Mi elements is 901 GB/s (f16) but 1418 GB/s (f32), inconsistent with a single shared bandwidth ceiling and consistent with a per-iteration fixed cost that penalizes the narrower dtype. The reference organization reaches 1.45-1.60 TB/s logical on the same device, so a materially better organization exists on this hardware. Caveat: because host and device could not be separated, part of the ~0.77 us per-iteration figure may be per-call host cost folded into the same total; the 2x-bytes/1.19x-time relationship is unaffected by that ambiguity.",
+  "next_experiment": {
+    "action_category": "launch_parallelism",
+    "action_description": "Change only the launch geometry of the n >= 131072 branch: replace the fixed 'grid = min(40, cdiv(N, BLOCK))' with a grid that oversubscribes the 20 AI cores, e.g. grid = min(cdiv(N, BLOCK), 160) (8 blocks per core), keeping BLOCK capped at 4096, keeping the current masked tl.load/tl.store, the f32 upcast and the streaming loop body unchanged. Leave the n < 131072 branch, the cached-launch plumbing, the strided path and the o/out/in-place semantics untouched. Rationale: at 40 programs each program carries 103 serial tile iterations with only one 16 KiB read and one 16 KiB write in flight, and the eval data shows large-case time barely responds to doubling bytes (1.188x for 2x bytes). If that serialization is the limit, more concurrently resident blocks per core should raise effective throughput; if instead the limit is per-block setup or host-side grid handling, this change will be neutral or negative, which is equally informative. If 160 is neutral, the next point in the same category is the fully parallel grid = cdiv(N, BLOCK) (4096 blocks for 4096x4096, loop collapses away).",
+    "expected_impact": "If the dominant large-case limit is in-flight bytes per program, timing-3 (f16 4096x4096) should move from 97.4 us toward 60-75 us (speedup 0.43 -> 0.55-0.70) and timing-11 (f32) from 115.7 us toward 95-105 us (0.80 -> 0.88-0.97); an optimistic ceiling is the reference-like ~45 us / ~93 us. Small cases (n <= 1048576) are expected unchanged because they already run one tile per program and are dominated by the fixed ~8 us per-call excess. Realistic geo_mean movement in the +0.02 to +0.05 range from this change alone.",
+    "risks_and_rollback": "Risk: a larger grid may add host-side launch/setup cost and thereby regress the medium cases (1 MiB, currently ~27 us and host-bound), and Ascend block-scheduling overhead at very large grids may offset the gain. Risk: more concurrent blocks per core raise UB pressure per core; BLOCK stays at 4096, and batch history already shows 8192 for 4-byte elements overflowed UB, so do not raise BLOCK to compensate. Rollback: the change is a one-line grid expression; revert to min(40, cdiv(N, BLOCK)) if any timing workload regresses or preflight reports UB overflow. No numerical or layout semantics change, so correctness risk is limited to indexing, which is unaffected because the loop bound is still driven by N and the masks remain.",
+    "validation_workloads": [
+      "hardswish-timing-3",
+      "hardswish-timing-7",
+      "hardswish-timing-11",
+      "hardswish-timing-2",
+      "hardswish-timing-6",
+      "hardswish-timing-10",
+      "hardswish-timing-0",
+      "hardswish-timing-4",
+      "hardswish-timing-8"
+    ],
+    "success_criteria": [
+      "Full KGS evaluation returns 30/30 PASSED including all correctness and special-value cases (no NaN/Inf, strided or broadcast regressions).",
+      "geo_mean strictly above the round-1 baseline 0.6537.",
+      "timing-3 (f16 4096x4096) at or below 0.060 ms and timing-7 (bf16 4096x4096) at or below 0.062 ms, versus the 0.0974 / 0.0995 ms baseline.",
+      "timing-11 (f32 4096x4096) at or below 0.095 ms versus the 0.1157 ms baseline.",
+      "No small or medium workload regresses by more than 2 percent (timing-0/4/8 at ~0.0267 ms, timing-2/6/10 at ~0.0276 ms); if the large cases improve only by consuming a small-case regression, treat the experiment as a wash and say so."
+    ]
+  },
+  "warnings": [
+    "Profiler collection is broken for this round: msprof base collection exits without a completion marker on every attempt, so no device timing, pipeline utilization or instruction artifact exists and no evidence item could be attached. All quantitative statements in performance_interpretation are arithmetic on the authoritative eval latencies, not measured counters.",
+    "Five profile attempts (timing-0; timing-3 at metrics twice and at instruction once; timing-11) produced the identical error 'msprof base collection exited successfully without profile completion marker' and left only manifest.json files with empty metrics and empty artifacts arrays; do not cite any MTE2/MTE3/Vector ratio or HBM bandwidth figure for this round.",
+    "The frozen experiment plan's hypothesis states the host-cost mechanism with stale absolute numbers (0.115 ms tiny, geo_mean 0.148). Round-1 actuals are 0.0267 ms and 0.6537. The host-cost mechanism is supported by the eval data; the claim that host cost alone explains the result is contradicted by the 4096x4096 byte-insensitivity (1.188x time for 2x bytes versus 2.202x on the reference side).",
+    "The manifests were inspected at .kernelgen/profiles/round-0001/<uuid>/<hash>/manifest.json under the workspace; they are not registered as downloadable artifacts, so they could not be used as finding evidence."
+  ],
+  "open_questions": [
+    "What is the standalone device-task duration for timing-0 (f16, 1024 elements)? Without it the ~24 us residual above a few microseconds cannot be attributed between host launch, allocation and device time.",
+    "Do the 4096x4096 cases show a low MTE2 active ratio together with high Scalar/wait, which would directly confirm the per-iteration serialization hypothesis, or a high MTE2 active ratio that would instead point at redundant traffic or a bandwidth ceiling?",
+    "How much of the flat ~8 us per-call excess over the reference is the per-call torch.empty_like allocation plus x.contiguous() versus the direct launcher call itself?",
+    "Would the instruction-level mapping show per-iteration scalar overhead from the element-wise mask comparisons that a mask-free divisible-N path could remove?"
+  ],
+  "error": "msprof base collection exited successfully without profile completion marker"
+}

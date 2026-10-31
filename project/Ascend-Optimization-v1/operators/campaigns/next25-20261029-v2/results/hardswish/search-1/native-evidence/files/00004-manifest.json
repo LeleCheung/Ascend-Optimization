@@ -1,0 +1,108 @@
+{
+  "request": {
+    "api_version": "v6.2",
+    "evaluation_id": "99ae9a069c7e7f1a75d65ae42c9f92762d150d9c7641c6a768a0564213da67ab:round-1",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:bdb88cb9e15f17106a96f01b28b3be1181b44399609936d399a813aeb9209ec5",
+      "definition": "hardswish"
+    },
+    "implementation": {
+      "name": "kernelgen-candidate-hardswish",
+      "definition": "hardswish",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "# Copyright 2026 FlagOS Contributors\n# SPDX-License-Identifier: Apache-2.0\n\"\"\"FlagGems hardswish math with bounded streaming tiles and compiled launches.\"\"\"\nimport torch\nimport torch_npu\nimport triton\nimport triton.language as tl\n\n_ENTRIES = {}\n_STREAM = {}\n\n\n@triton.jit\ndef _hardswish_stream(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):\n    lane = tl.arange(0, BLOCK)\n    step = tl.num_programs(0) * BLOCK\n    for start in range(tl.program_id(0) * BLOCK, N, step):\n        offset = start + lane\n        x = tl.load(X + offset, offset < N, other=0).to(tl.float32)\n        inner = tl.minimum(tl.maximum(x + 3.0, 0.0), 6.0)\n        result = x * inner * (1.0 / 6.0)\n        tl.store(Y + offset, result, offset < N)\n\n\ndef _stream_getter(device):\n    getter = _STREAM.get(device)\n    if getter is not None:\n        return getter\n    raw = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\n    if raw is not None:\n        try:\n            expected = int(torch.npu.current_stream(device).npu_stream)\n            try:\n                if int(raw(device)) == expected:\n                    getter = lambda: raw(device)\n            except TypeError:\n                if int(raw()) == expected:\n                    getter = raw\n        except Exception:\n            getter = None\n    if getter is None:\n        from triton.runtime import driver\n        getter = lambda: driver.active.get_current_stream(device)\n    _STREAM[device] = getter\n    return getter\n\n\ndef _entry(x, out, n, block, device):\n    entry = None\n    try:\n        compiled = _hardswish_stream.warmup(x, out, n, block, grid=(1,))\n        launcher = compiled.run\n        if not (getattr(launcher, 'compile_only', False) or\n                getattr(launcher, 'enable_msprof_register_tensor', False) or\n                getattr(launcher.metadata, 'debug_enabled', False) or\n                getattr(launcher.metadata, 'debug', False)):\n            entry = (launcher.launch, compiled.function, compiled.packed_metadata,\n                     _stream_getter(device))\n    except Exception:\n        entry = None\n    return entry\n\n\ndef _compute(x, out):\n    n = x.numel()\n    if not n:\n        return out\n    block = min(4096, max(32, 1 << (n - 1).bit_length()))\n    grid = min(40, ((n + block - 1) // block)) if n >= 131072 else ((n + block - 1) // block)\n    xp, yp = x.data_ptr(), out.data_ptr()\n    if (xp | yp) & 15:\n        _hardswish_stream[(grid,)](x, out, n, block)\n        return out\n    device = x.device.index\n    key = (x.dtype, out.dtype, device, n, block)\n    if key not in _ENTRIES:\n        _ENTRIES[key] = _entry(x, out, n, block, device)\n    entry = _ENTRIES[key]\n    if entry is None:\n        _hardswish_stream[(grid,)](x, out, n, block)\n    else:\n        entry[0](grid, 1, 1, entry[3](), entry[1], entry[2],\n                 None, None, None, xp, yp, n, block)\n    return out\n\n\ndef run(x):\n    contiguous = x.contiguous()\n    out = torch.empty_like(contiguous)\n    return _compute(contiguous, out)\n"
+        }
+      ]
+    },
+    "benchmark_fingerprint": "sha256:e238528e59046b779af6e7021f6718bf481efab44a973f81e9f9a0efa3afcdd0",
+    "case_id": "hardswish-timing-3",
+    "expected_backend": "npu",
+    "options": {
+      "level": "instruction",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "identity": {
+      "solution_sha256": "99eb82b91e4eb38deee8197de90daa0bf08d4c4a54e7aebe5326a89d317c23c1",
+      "workload_sha256": "6646a628a6ee225cb13ffc162686fde91db7e11a3fcdf3401007dcbfca4ae52a"
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "profile_id": "10ede2d664e549eaa95fced732c12e44",
+    "created_at": "2026-10-29T23:32:55.849909+00:00",
+    "status": "failed",
+    "backend": "npu",
+    "profiler": "msprof",
+    "device": "npu:0",
+    "hardware": {
+      "target": {
+        "backend": "ascend",
+        "vendor": "huawei",
+        "device": "Ascend910B4-1",
+        "architecture": "dav-c220-cube",
+        "devices": [
+          {
+            "logical_device": "npu:0",
+            "device_id": 0,
+            "name": "Ascend910B4-1",
+            "l2_cache_size": 176160768,
+            "num_sm": 20,
+            "compute_capability": "",
+            "total_memory": 65452113920
+          }
+        ]
+      },
+      "software": {
+        "language": "triton",
+        "language_version": "3.5.1",
+        "compiler": "flagtree",
+        "compiler_version": "0.6.0+ascend.gitc286cba6",
+        "runtime": "cann",
+        "runtime_version": "9.0.0",
+        "driver_version": "25.2.0"
+      },
+      "metadata": {
+        "complete": true,
+        "missing": [],
+        "sources": {
+          "target.backend": "server configuration",
+          "target.vendor": "server configuration",
+          "software.language": "server configuration",
+          "software.compiler": "python package metadata",
+          "software.runtime": "server configuration",
+          "target.device": "device probe",
+          "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+          "software.language_version": "triton module metadata",
+          "software.compiler_version": "python package metadata",
+          "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+          "software.driver_version": "/usr/local/Ascend/driver/version.info"
+        }
+      }
+    },
+    "evaluation_id": "99ae9a069c7e7f1a75d65ae42c9f92762d150d9c7641c6a768a0564213da67ab:round-1",
+    "options": {
+      "level": "instruction",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "capabilities": [],
+    "summary": {
+      "stage_count": 1
+    },
+    "metrics": {},
+    "artifacts": [],
+    "warnings": [],
+    "error": "msprof base collection exited successfully without profile completion marker",
+    "workload_uuid": "hardswish-timing-3"
+  }
+}

@@ -1,0 +1,238 @@
+{
+  "request": {
+    "api_version": "v6.2",
+    "evaluation_id": "e7176b8fde007d9cd678ad4a34d377cb11e56765d09e5909a715aadbe80adb80:round-1",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:809fa64bb25154581a31259d1628c1620944578587192066c9b9f549cafc14e4",
+      "definition": "special_round_out"
+    },
+    "implementation": {
+      "name": "kernelgen-candidate-special_round_out",
+      "definition": "special_round_out",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "# SPDX-License-Identifier: Apache-2.0\n\"\"\"out-of-place round(decimals) with real stride support, FP32 math.\n\nround-half-to-even is implemented with the 2**23 shift trick:\nfor |v| < 2**23, `(m + 2**23) - 2**23` rounds m to an integer with ties to\neven in IEEE round-to-nearest-even.  Values with |v| >= 2**23 already have no\nfractional bits.  NaN / Inf are passed through unchanged and the sign of the\ninput (including -0.0) is restored from the sign bit.\n\"\"\"\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef _rnd_value(x, SCALE, INV_SCALE, DECIMALS: tl.constexpr):\n    xf = x.to(tl.float32)\n    v = xf * SCALE\n    vb = v.to(tl.int32, bitcast=True)\n    magb = vb & 2147483647\n    mag = magb.to(tl.float32, bitcast=True)\n    r = (mag + 8388608.0) - 8388608.0\n    r = tl.where(mag >= 8388608.0, mag, r)\n    rb = r.to(tl.int32, bitcast=True)\n    outb = (rb & 2147483647) | (vb & -2147483648)\n    val = outb.to(tl.float32, bitcast=True)\n    if DECIMALS != 0:\n        val = val * INV_SCALE\n    # NaN / +-Inf keep the original value (bit pattern) untouched.\n    return tl.where(magb < 2139095040, val, xf)\n\n\n@triton.jit\ndef _round_flat(X, Y, N, SCALE, INV_SCALE, DECIMALS: tl.constexpr, BLOCK: tl.constexpr):\n    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = index < N\n    x = tl.load(X + index, mask=mask, other=0.0)\n    y = _rnd_value(x, SCALE, INV_SCALE, DECIMALS)\n    tl.store(Y + index, y.to(Y.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _round_strided(X, Y, N, SCALE, INV_SCALE, SHAPE: tl.constexpr, XS: tl.constexpr,\n                   YS: tl.constexpr, DECIMALS: tl.constexpr, BLOCK: tl.constexpr):\n    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = index < N\n    rem = index\n    xi = tl.zeros((BLOCK,), tl.int32)\n    yi = tl.zeros((BLOCK,), tl.int32)\n    for axis in tl.static_range(len(SHAPE) - 1, -1, -1):\n        coordinate = rem % SHAPE[axis]\n        rem = rem // SHAPE[axis]\n        xi += coordinate * XS[axis]\n        yi += coordinate * YS[axis]\n    x = tl.load(X + xi, mask=mask, other=0.0)\n    y = _rnd_value(x, SCALE, INV_SCALE, DECIMALS)\n    tl.store(Y + yi, y.to(Y.dtype.element_ty), mask=mask)\n\n\n_FLAT_BLOCK = 4096\n_STRIDED_BLOCK = 1024\n\n\ndef _dispatch(x, out, decimals):\n    if out is None:\n        out = torch.empty_like(x, memory_format=torch.contiguous_format)\n    if out.shape != x.shape or out.dtype != x.dtype:\n        raise ValueError('out must match input shape/dtype')\n    n = x.numel()\n    if n == 0:\n        return out\n    scale = 10.0 ** decimals\n    inv_scale = 1.0 / scale\n    if x.is_contiguous() and out.is_contiguous():\n        grid = ((n + _FLAT_BLOCK - 1) // _FLAT_BLOCK,)\n        _round_flat[grid](x, out, n, scale, inv_scale, decimals, BLOCK=_FLAT_BLOCK)\n    else:\n        grid = ((n + _STRIDED_BLOCK - 1) // _STRIDED_BLOCK,)\n        _round_strided[grid](x, out, n, scale, inv_scale, tuple(x.shape),\n                             tuple(x.stride()), tuple(out.stride()), decimals,\n                             BLOCK=_STRIDED_BLOCK)\n    return out\n\n\ndef run(self, out, *, decimals=0):\n    return _dispatch(self, out, decimals)\n"
+        }
+      ]
+    },
+    "benchmark_fingerprint": "sha256:740d3f8446e4304f2566a10fd5143e732b8944633bed65e8c1bcd5f5aaaa9565",
+    "case_id": "special_round_out-timing-11",
+    "expected_backend": "npu",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "identity": {
+      "solution_sha256": "12f337bd339b2aa0ef4e412cc0aa9dea80e426af4ceaa41166806f599086303e",
+      "workload_sha256": "14400e0b37168b9793b41a964b318618b9b9ee40a0c04af52ec962198e65d060"
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "profile_id": "0d898e3dd4f9456e864fb916979cab62",
+    "created_at": "2026-10-29T22:39:40.229620+00:00",
+    "status": "completed",
+    "backend": "npu",
+    "profiler": "msprof",
+    "device": "npu:0",
+    "hardware": {
+      "target": {
+        "backend": "ascend",
+        "vendor": "huawei",
+        "device": "Ascend910B4-1",
+        "architecture": "dav-c220-cube",
+        "devices": [
+          {
+            "logical_device": "npu:0",
+            "device_id": 0,
+            "name": "Ascend910B4-1",
+            "l2_cache_size": 176160768,
+            "num_sm": 20,
+            "compute_capability": "",
+            "total_memory": 65452113920
+          }
+        ]
+      },
+      "software": {
+        "language": "triton",
+        "language_version": "3.5.1",
+        "compiler": "flagtree",
+        "compiler_version": "0.6.0+ascend.gitc286cba6",
+        "runtime": "cann",
+        "runtime_version": "9.0.0",
+        "driver_version": "25.2.0"
+      },
+      "metadata": {
+        "complete": true,
+        "missing": [],
+        "sources": {
+          "target.backend": "server configuration",
+          "target.vendor": "server configuration",
+          "software.language": "server configuration",
+          "software.compiler": "python package metadata",
+          "software.runtime": "server configuration",
+          "target.device": "device probe",
+          "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+          "software.language_version": "triton module metadata",
+          "software.compiler_version": "python package metadata",
+          "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+          "software.driver_version": "/usr/local/Ascend/driver/version.info"
+        }
+      }
+    },
+    "evaluation_id": "e7176b8fde007d9cd678ad4a34d377cb11e56765d09e5909a715aadbe80adb80:round-1",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "capabilities": [
+      "performance_counters",
+      "kernel_profile",
+      "pipeline_utilization",
+      "execution_timeline"
+    ],
+    "summary": {
+      "avg_time_us": 185.658,
+      "operation_count": 1,
+      "top_operations": [
+        {
+          "op_name": "_round_flat",
+          "op_type": "_round_flat",
+          "task_type": "AI_VECTOR_CORE",
+          "measured_invocations": 100,
+          "total_duration_us": 18565.751,
+          "avg_duration_us": 185.658,
+          "min_duration_us": 183.424,
+          "max_duration_us": 188.824,
+          "aicore_time_us": 0.0,
+          "aic_total_cycles": 0.0,
+          "aic_mac_time_us": 0.0,
+          "aic_mac_ratio": 0.0,
+          "aic_scalar_time_us": 0.0,
+          "aic_scalar_ratio": 0.0,
+          "aic_mte1_time_us": 0.0,
+          "aic_mte1_ratio": 0.0,
+          "aic_mte2_time_us": 0.0,
+          "aic_mte2_ratio": 0.0,
+          "aic_fixpipe_time_us": 0.0,
+          "aic_fixpipe_ratio": 0.0,
+          "aic_icache_miss_rate": 0.0,
+          "aiv_time_us": 184.9897,
+          "aiv_total_cycles": 12138198.22,
+          "aiv_vec_time_us": 107.9202,
+          "aiv_vec_ratio": 0.5834,
+          "aiv_scalar_time_us": 27.8524,
+          "aiv_scalar_ratio": 0.1505,
+          "aiv_mte2_time_us": 36.9748,
+          "aiv_mte2_ratio": 0.1998,
+          "aiv_mte3_time_us": 20.1092,
+          "aiv_mte3_ratio": 0.1087,
+          "aiv_icache_miss_rate": 0.0,
+          "cube_utilization_pct": 0.0
+        }
+      ],
+      "stage_count": 1
+    },
+    "metrics": {
+      "avg_time_us": 185.658,
+      "ops": [
+        {
+          "op_name": "_round_flat",
+          "op_type": "_round_flat",
+          "task_type": "AI_VECTOR_CORE",
+          "measured_invocations": 100,
+          "total_duration_us": 18565.751,
+          "avg_duration_us": 185.658,
+          "min_duration_us": 183.424,
+          "max_duration_us": 188.824,
+          "aicore_time_us": 0.0,
+          "aic_total_cycles": 0.0,
+          "aic_mac_time_us": 0.0,
+          "aic_mac_ratio": 0.0,
+          "aic_scalar_time_us": 0.0,
+          "aic_scalar_ratio": 0.0,
+          "aic_mte1_time_us": 0.0,
+          "aic_mte1_ratio": 0.0,
+          "aic_mte2_time_us": 0.0,
+          "aic_mte2_ratio": 0.0,
+          "aic_fixpipe_time_us": 0.0,
+          "aic_fixpipe_ratio": 0.0,
+          "aic_icache_miss_rate": 0.0,
+          "aiv_time_us": 184.9897,
+          "aiv_total_cycles": 12138198.22,
+          "aiv_vec_time_us": 107.9202,
+          "aiv_vec_ratio": 0.5834,
+          "aiv_scalar_time_us": 27.8524,
+          "aiv_scalar_ratio": 0.1505,
+          "aiv_mte2_time_us": 36.9748,
+          "aiv_mte2_ratio": 0.1998,
+          "aiv_mte3_time_us": 20.1092,
+          "aiv_mte3_ratio": 0.1087,
+          "aiv_icache_miss_rate": 0.0,
+          "cube_utilization_pct": 0.0
+        }
+      ]
+    },
+    "artifacts": [
+      {
+        "id": "a001",
+        "kind": "profile_log",
+        "format": "text",
+        "filename": "msprof-base-collection.log",
+        "media_type": "text/plain",
+        "size_bytes": 5468,
+        "download_url": "/profile_artifacts/0d898e3dd4f9456e864fb916979cab62/a001",
+        "local_path": "/data/hanle/ascend-optimization/runs/next25-20261029-v2/kg-runs/special_round_out-next25-20261029-v2-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0001/special_round_out-timing-11/e8a1f612bd7e4de884c9f7f4717f9725/msprof-base-collection.log",
+        "download_error": null
+      },
+      {
+        "id": "a002",
+        "kind": "vendor_report",
+        "format": "msprof-tar-gz",
+        "filename": "msprof-report.tar.gz",
+        "media_type": "application/gzip",
+        "size_bytes": 150337,
+        "download_url": "/profile_artifacts/0d898e3dd4f9456e864fb916979cab62/a002",
+        "local_path": "/data/hanle/ascend-optimization/runs/next25-20261029-v2/kg-runs/special_round_out-next25-20261029-v2-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0001/special_round_out-timing-11/e8a1f612bd7e4de884c9f7f4717f9725/msprof-report.tar.gz",
+        "download_error": null
+      },
+      {
+        "id": "a003",
+        "kind": "op_summary",
+        "format": "csv",
+        "filename": "op_summary.csv",
+        "media_type": "text/csv",
+        "size_bytes": 33432,
+        "download_url": "/profile_artifacts/0d898e3dd4f9456e864fb916979cab62/a003",
+        "local_path": "/data/hanle/ascend-optimization/runs/next25-20261029-v2/kg-runs/special_round_out-next25-20261029-v2-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0001/special_round_out-timing-11/e8a1f612bd7e4de884c9f7f4717f9725/op_summary.csv",
+        "download_error": null
+      },
+      {
+        "id": "a004",
+        "kind": "execution_timeline",
+        "format": "trace-json",
+        "filename": "execution-trace.json",
+        "media_type": "application/json",
+        "size_bytes": 170886,
+        "download_url": "/profile_artifacts/0d898e3dd4f9456e864fb916979cab62/a004",
+        "local_path": "/data/hanle/ascend-optimization/runs/next25-20261029-v2/kg-runs/special_round_out-next25-20261029-v2-attempt-1/stages/optimize/work/.kernelgen/profiles/round-0001/special_round_out-timing-11/e8a1f612bd7e4de884c9f7f4717f9725/execution-trace.json",
+        "download_error": null
+      }
+    ],
+    "warnings": [
+      "msprof and simulator timing is diagnostic and is not eval latency"
+    ],
+    "error": null,
+    "workload_uuid": "special_round_out-timing-11"
+  }
+}

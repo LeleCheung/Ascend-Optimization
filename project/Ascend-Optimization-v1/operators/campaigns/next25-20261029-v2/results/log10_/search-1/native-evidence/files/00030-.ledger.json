@@ -1,0 +1,1615 @@
+{
+  "schema_version": "3.0",
+  "definition_name": "log10_",
+  "target_hardware": "Ascend910B",
+  "implementation_language": "triton",
+  "best_geo_mean": 0.7932561045048275,
+  "best_round": 2,
+  "best_code": "\"\"\"log10_ : in-place elementwise ``log10(A)`` on Ascend, self-contained Triton.\n\nReference semantics reproduced (``A.log10_()``):\n  * ``log10`` is written back into ``A`` storage and the same tensor object is\n    returned (evaluation observes the mutation of ``A``).\n  * float16 / bfloat16 / float32 output dtype preserved exactly.\n  * the transcendental is staged in float32, which is what the reference does\n    for half/bfloat16, so ``0 -> -inf``, ``-0.0 -> -inf``, ``x < 0 -> NaN``,\n    ``+inf -> +inf`` and ``NaN -> NaN`` agree with the oracle.\n  * non-contiguous views are read *and* written through their real element\n    strides, so the mutation lands in the right storage slots and the padding\n    slots of the parent storage are left alone; the view object is returned\n    unchanged.\n\nLayout dispatch (metadata-only host decisions):\n  1. contiguous            -> flat kernel, unit stride\n  2. uniformly strided     -> flat kernel with a constexpr stride multiplier\n                              (covers ``base[..., 0]`` style views)\n  3. anything else         -> generic up-to-8D index-math kernel\n\nTile choice: measured on the 4096x4096 workloads, per-tile cost is dominated by\na roughly constant fixed latency (~750 ns for a 2048-element tile, ~790 ns for\nan 8192-element tile), so the launch is fastest when the number of tiles is\nminimised rather than when the grid is widened. Elements per program are\ntherefore pushed to the largest tile this backend compiles without a UB\noverflow (32768 elements) instead of being spread over ~32 programs, and\n4-byte data is issued as two independent 16384-element loads hoisted ahead of\nthe two stores, which measured faster than one monolithic 32768-element tile\n(54.5 us vs 60.4 us on fp32 4096x4096). Masked sizes keep the single-tile form.\n\nLaunch path: the compiled kernel is resolved once per (dtype, numel, device) --\nwhich is the complete set of host-visible launch inputs -- and then driven\nthrough its own compiled launcher (grid + raw current-stream handle + device\npointer); that is where ``JITFunction.run`` ends anyway, minus the per-call\nbinder / cache-key / argument-parsing work that dominates these tiny workloads.\nThe pointer and the stream handle are re-read on every call, so a different\ntensor at the same extent, or a caller that switches streams, is still launched\ncorrectly.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\ntry:  # cheapest faithful current-stream query on this target\n    import torch_npu\n\n    _RAW_STREAM = getattr(torch_npu._C, \"_npu_getCurrentRawStreamNoWait\", None)\nexcept Exception:  # pragma: no cover\n    torch_npu = None\n    _RAW_STREAM = None\n\n_TILE_MAX = 32768          # largest tile this backend compiles for both dtypes\n_TILE_MIN = 1024\n_HOIST_MIN = 8192          # 4-byte data: 2-way hoist once a tile has 2 halves\n_BLOCK_STRIDED = 512       # gather/scatter tiles materialise address vectors\n_MAX_DIMS = 8\n_LOG10E = 0.4342944819032518\n\n_ENTRIES = {}\n_STREAM_GETTERS = {}\n\n\n@triton.jit\ndef _log10_flat(x_ptr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    x = tl.load(x_ptr + offs).to(tl.float32)\n    y = tl.log(x) * 0.4342944819032518\n    tl.store(x_ptr + offs, y.to(x_ptr.dtype.element_ty))\n\n\n@triton.jit\ndef _log10_flat_masked(x_ptr, n, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    x = tl.load(x_ptr + offs, mask=mask, other=1.0).to(tl.float32)\n    y = tl.log(x) * 0.4342944819032518\n    tl.store(x_ptr + offs, y.to(x_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _log10_pair(x_ptr, SUB: tl.constexpr):\n    \"\"\"Two independent loads issued before either store: more memory in flight.\"\"\"\n    off0 = tl.program_id(0) * (2 * SUB) + tl.arange(0, SUB)\n    off1 = off0 + SUB\n    a = tl.load(x_ptr + off0).to(tl.float32)\n    b = tl.load(x_ptr + off1).to(tl.float32)\n    ya = tl.log(a) * 0.4342944819032518\n    yb = tl.log(b) * 0.4342944819032518\n    tl.store(x_ptr + off0, ya.to(x_ptr.dtype.element_ty))\n    tl.store(x_ptr + off1, yb.to(x_ptr.dtype.element_ty))\n\n\n@triton.jit\ndef _log10_scaled(x_ptr, n, SCALE: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    idx = offs * SCALE\n    x = tl.load(x_ptr + idx, mask=mask, other=1.0).to(tl.float32)\n    y = tl.log(x) * 0.4342944819032518\n    tl.store(x_ptr + idx, y.to(x_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _log10_nd(x_ptr, n,\n              s0, s1, s2, s3, s4, s5, s6, s7,\n              t0, t1, t2, t3, t4, t5, t6, t7,\n              NDIM: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    shapes = (s0, s1, s2, s3, s4, s5, s6, s7)\n    strides = (t0, t1, t2, t3, t4, t5, t6, t7)\n    rem = offs\n    off = tl.zeros((BLOCK,), dtype=tl.int32)\n    for i in tl.static_range(8):\n        if i < NDIM:\n            size = shapes[NDIM - 1 - i]\n            stride = strides[NDIM - 1 - i]\n            off += (rem % size) * stride\n            rem = rem // size\n    x = tl.load(x_ptr + off, mask=mask, other=1.0).to(tl.float32)\n    y = tl.log(x) * 0.4342944819032518\n    tl.store(x_ptr + off, y.to(x_ptr.dtype.element_ty), mask=mask)\n\n\ndef _pick_tile(n):\n    \"\"\"Elements per program: cover the input with as few tiles as UB allows.\"\"\"\n    if n >= _TILE_MAX:\n        return _TILE_MAX\n    tile = _TILE_MIN\n    while tile < n:\n        tile <<= 1\n    return tile\n\n\ndef _resolve_stream(device):\n    \"\"\"Cheapest faithful current-stream accessor for this device, resolved once.\n\n    The getter itself is re-evaluated on every call, so a caller that switches\n    streams still launches on the stream that is current now.\n    \"\"\"\n    getter = _STREAM_GETTERS.get(device)\n    if getter is not None:\n        return getter\n    getter = None\n    if _RAW_STREAM is not None:\n        try:\n            want = int(torch.npu.current_stream().npu_stream)\n            if int(_RAW_STREAM(device)) == want:\n                getter = lambda: _RAW_STREAM(device)\n        except Exception:\n            getter = None\n    if getter is None:\n        try:\n            from triton.runtime import driver as _driver\n\n            def getter(device=device):\n                return _driver.active.get_current_stream(device)\n        except Exception:  # pragma: no cover - last resort\n            def getter():\n                return torch.npu.current_stream().npu_stream\n    _STREAM_GETTERS[device] = getter\n    return getter\n\n\ndef _build_entry(A, n, key):\n    tile = _pick_tile(n)\n    esize = A.element_size()\n    masked = bool(n % tile)\n    if masked or esize < 4 or tile < _HOIST_MIN:\n        jitfn = _log10_flat_masked if masked else _log10_flat\n        grid = (triton.cdiv(n, tile),)\n        # Tail of the compiled launcher's positional argument list: every kernel\n        # parameter after the data pointer, constexprs included (the Ascend\n        # launcher builds one PyArg format unit per parameter).\n        tail = (n, tile) if masked else (tile,)\n        if masked:\n            def fallback(A, _f=jitfn, _g=grid, _n=n, _b=tile):\n                _f[_g](A, _n, BLOCK=_b)\n            warm = lambda: jitfn.warmup(A, n, BLOCK=tile, grid=(1,))\n        else:\n            def fallback(A, _f=jitfn, _g=grid, _b=tile):\n                _f[_g](A, BLOCK=_b)\n            warm = lambda: jitfn.warmup(A, BLOCK=tile, grid=(1,))\n    else:\n        sub = tile >> 1\n        jitfn = _log10_pair\n        grid = (n // tile,)\n        tail = (sub,)\n\n        def fallback(A, _f=jitfn, _g=grid, _b=sub):\n            _f[_g](A, SUB=_b)\n        warm = lambda: jitfn.warmup(A, SUB=sub, grid=(1,))\n\n    entry = (None, None, None, grid[0], tail, None, fallback)\n    try:\n        ck = warm()\n        launcher = ck.run\n        if getattr(launcher, \"compile_only\", False) or getattr(\n                launcher, \"enable_msprof_register_tensor\", False):\n            pass\n        else:\n            md = launcher.metadata\n            if not (getattr(md, \"debug_enabled\", False) or getattr(md, \"debug\", False)):\n                entry = (launcher.launch, ck.function, ck.packed_metadata,\n                         grid[0], tail, _resolve_stream(key[2]), fallback)\n    except Exception:\n        entry = (None, None, None, grid[0], tail, None, fallback)\n    _ENTRIES[key] = entry\n    return entry\n\n\ndef _launch_strided(A, n):\n    \"\"\"Non-contiguous in-place path: real element strides, view object untouched.\"\"\"\n    shape = A.shape\n    stride = A.stride()\n    dims = []  # (size, stride) inner -> outer, adjacent dims merged when compact\n    for d in range(len(shape) - 1, -1, -1):\n        s = shape[d]\n        if s == 1:\n            continue\n        st = stride[d]\n        if dims and st == dims[-1][0] * dims[-1][1]:\n            dims[-1] = (dims[-1][0] * s, dims[-1][1])\n        else:\n            dims.append((s, st))\n    dims.reverse()\n    if len(dims) <= 1:\n        scale = dims[0][1] if dims else 1\n        _log10_scaled[((n + _BLOCK_STRIDED - 1) // _BLOCK_STRIDED,)](\n            A, n, SCALE=scale, BLOCK=_BLOCK_STRIDED)\n        return\n    if len(dims) > _MAX_DIMS:\n        # Extremely rare (>8 non-mergeable axes): peel the outermost axis.\n        for i in range(shape[0]):\n            sub = A.select(0, i)\n            m = sub.numel()\n            if m:\n                _launch_strided(sub, m)\n        return\n    sizes = [d[0] for d in dims] + [1] * (_MAX_DIMS - len(dims))\n    sts = [d[1] for d in dims] + [0] * (_MAX_DIMS - len(dims))\n    _log10_nd[((n + _BLOCK_STRIDED - 1) // _BLOCK_STRIDED,)](\n        A, n, *sizes, *sts, NDIM=len(dims), BLOCK=_BLOCK_STRIDED)\n\n\ndef run(A):\n    n = A.numel()\n    if n == 0:\n        return A\n    if not A.is_contiguous():\n        _launch_strided(A, n)\n        return A\n    key = (A.dtype, n, A.get_device())\n    entry = _ENTRIES.get(key)\n    if entry is None:\n        entry = _build_entry(A, n, key)\n    launch = entry[0]\n    if launch is not None:\n        launch(entry[3], 1, 1, entry[5](), entry[1], entry[2],\n               None, None, None, A.data_ptr(), *entry[4])\n    else:\n        entry[6](A)\n    return A\n",
+  "rounds": [
+    {
+      "round_num": 1,
+      "experiment_parent_round_num": null,
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Replace the seed's per-(numel,ptr) closure cache and modulo-loop strided kernel with a (dtype,numel,device)-keyed compiled-launcher entry plus a uniformly-strided fast path, keeping fp32-staged log10 math and in-place storage semantics.",
+        "code_changes": "Seed -> new candidate: entry cache keyed on (dtype, numel, device) instead of (numel, ptr) so address churn cannot recompile; strided dispatch now merges adjacent axes and, for base[..., 0]-style views, launches a single SCALE-constexpr stride-2 kernel instead of int64 modulo/div index math; explicit .to(tl.float32) staging before tl.log; UB-capped tiles (16384 elems for 2-byte dtypes, 8192 for 4-byte) aiming at ~32 programs.",
+        "hypothesis": "The seed's 3 non-finite-mismatch failures (correctness-7/15/23, all the strided [7,9] case) come from its strided index kernel, and its 164us small-shape latency comes from rebuilding the per-(numel,ptr) specialization instead of reusing the compiled launcher. Replacing the strided path with a uniform-stride kernel and reusing a (dtype,numel,device)-keyed compiled launcher should make all 36 workloads pass and cut small-shape latency to the ~13us floor the log2_ sibling reached.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "Correct strided in-place writes plus reusable compiled launcher entry"
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {
+          "BLOCK_CAP_2B": 16384,
+          "BLOCK_CAP_4B": 8192,
+          "BLOCK_STRIDED": 512,
+          "TARGET_PROGS": 32
+        },
+        "knowledge_uses": [
+          {
+            "concept_ref": "",
+            "source_ref": {
+              "resource": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/campaigns/next25-20261029-v2/results/log2_/search-1/selected.py",
+              "revision": "3b1cc89abe52d638245bc1bc983b30c4cdd182ec40ee600bd5b9ec85a542d8bc",
+              "locator": "run/_build_entry/_launch_strided/_pick_block"
+            },
+            "query_event_id": "source-query:log2-selected-launch-template",
+            "role": "implementation",
+            "disposition": "adapted",
+            "application_note": "Used as the architecture template for this operator family: compiled-launcher entry keyed on dtype/numel/device, grid+raw current-stream handle+data_ptr per call; uniform-stride merging for base[...,0] views; UB-capped tile sizes. Math changed to log10 and the in-place (no out tensor) storage contract applied.",
+            "affected_parts": [
+              "run",
+              "_build_entry",
+              "_launch_strided",
+              "_pick_block",
+              "_resolve_stream"
+            ]
+          },
+          {
+            "concept_ref": "",
+            "source_ref": {
+              "resource": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/tools/profiling/hgkda/skills/hgkda/references/算子类型/逐元素与原地.md",
+              "revision": "d41750ac0acc4d533e4065c41dd7babaca647cf4445f3029620bb941d416317b",
+              "locator": "原地操作不能通过将 A 替换成 A.contiguous()/ UB 分块上限"
+            },
+            "query_event_id": "source-query:elementwise-inplace-constraints",
+            "role": "constraint",
+            "disposition": "adopted",
+            "application_note": "Applied the in-place constraints: the view object is returned unchanged, writes go through the real element strides so parent-storage padding slots are untouched, and the non-contiguous path is never replaced by A.contiguous()/a copy. Applied the UB ceiling by capping the fp32 tile at 8192 and the 2-byte tile at 16384 elements rather than 32768.",
+            "affected_parts": [
+              "run",
+              "_launch_strided",
+              "_log10_scaled",
+              "_pick_block"
+            ]
+          },
+          {
+            "concept_ref": "",
+            "source_ref": {
+              "resource": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/tools/profiling/hgkda/skills/hgkda/references/性能指标/搬运与执行路径.md",
+              "revision": "3929c1694c137893c11d6c98bbbf9c98048ffb5357b2d579d4b9f7826412c715",
+              "locator": "小输入的编译产物启动"
+            },
+            "query_event_id": "source-query:move-execution-path-host-launch",
+            "role": "implementation",
+            "disposition": "adapted",
+            "application_note": "Applied the small-input host-path guidance: keep the compiled launch artifact and packed metadata cached, pass the current pointer and re-read the current stream handle on every call, and fall back to the ordinary JIT launch when the compiled launcher is unavailable.",
+            "affected_parts": [
+              "_build_entry",
+              "_resolve_stream",
+              "run"
+            ]
+          }
+        ]
+      },
+      "solution": {
+        "sha256": "04ba069ca6c985f17d04c79a598000f59c0a3d417b4090024910b07c6dbffc5d",
+        "snapshot_path": ".kernelgen/evals/round-0001",
+        "candidate_path": "tmp/main.py",
+        "code": "\"\"\"log10_ : in-place elementwise ``log10(A)`` on Ascend, self-contained Triton.\n\nReference semantics reproduced (``A.log10_()``):\n  * ``log10`` is written back into ``A`` storage and the same tensor object is\n    returned (evaluation observes the mutation of ``A``).\n  * float16 / bfloat16 / float32 output dtype preserved exactly.\n  * the transcendental is staged in float32, which is what the reference does\n    for half/bfloat16, so ``0 -> -inf``, ``-0.0 -> -inf``, ``x < 0 -> NaN``,\n    ``+inf -> +inf`` and ``NaN -> NaN`` agree with the oracle.\n  * non-contiguous views are read *and* written through their real element\n    strides, so the mutation lands in the right storage slots and the padding\n    slots of the parent storage are left alone; the view object is returned\n    unchanged.\n\nLayout dispatch (metadata-only host decisions):\n  1. contiguous            -> flat kernel, unit stride\n  2. uniformly strided     -> flat kernel with a constexpr stride multiplier\n                              (covers ``base[..., 0]`` style views)\n  3. anything else         -> generic up-to-8D index-math kernel\n\nTile choice: ~32 programs per launch, capped by the UB budget of a float32\nstaged element (8 KiB elements for 4-byte dtypes, 16 KiB for 2-byte dtypes are\nthe sizes this backend compiles without UB overflow).\n\nLaunch path: the compiled kernel is resolved once per (dtype, numel, device) --\nwhich is the complete set of host-visible launch inputs -- and then driven\nthrough its own compiled launcher (grid + raw current-stream handle + device\npointer); that is where ``JITFunction.run`` ends anyway, minus the per-call\nbinder / cache-key / argument-parsing work that dominates these tiny workloads.\nThe pointer and the stream handle are re-read on every call, so a different\ntensor at the same extent, or a caller that switches streams, is still launched\ncorrectly.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\ntry:  # cheapest faithful current-stream query on this target\n    import torch_npu\n\n    _RAW_STREAM = getattr(torch_npu._C, \"_npu_getCurrentRawStreamNoWait\", None)\nexcept Exception:  # pragma: no cover\n    torch_npu = None\n    _RAW_STREAM = None\n\n_BLOCK_MIN = 1024\n_BLOCK_CAP_2B = 16384      # 2-byte dtypes: 32 KiB staged source tile\n_BLOCK_CAP_4B = 8192       # 4-byte dtypes: 32 KiB staged source tile\n_TARGET_PROGS = 32\n_BLOCK_STRIDED = 512       # gather/scatter tiles materialise address vectors\n_MAX_DIMS = 8\n\n_ENTRIES = {}\n_STREAM_GETTERS = {}\n\n\n@triton.jit\ndef _log10_flat(x_ptr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    x = tl.load(x_ptr + offs).to(tl.float32)\n    y = tl.log(x) * 0.4342944819032518\n    tl.store(x_ptr + offs, y.to(x_ptr.dtype.element_ty))\n\n\n@triton.jit\ndef _log10_flat_masked(x_ptr, n, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    x = tl.load(x_ptr + offs, mask=mask, other=1.0).to(tl.float32)\n    y = tl.log(x) * 0.4342944819032518\n    tl.store(x_ptr + offs, y.to(x_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _log10_scaled(x_ptr, n, SCALE: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    idx = offs * SCALE\n    x = tl.load(x_ptr + idx, mask=mask, other=1.0).to(tl.float32)\n    y = tl.log(x) * 0.4342944819032518\n    tl.store(x_ptr + idx, y.to(x_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _log10_nd(x_ptr, n,\n              s0, s1, s2, s3, s4, s5, s6, s7,\n              t0, t1, t2, t3, t4, t5, t6, t7,\n              NDIM: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    shapes = (s0, s1, s2, s3, s4, s5, s6, s7)\n    strides = (t0, t1, t2, t3, t4, t5, t6, t7)\n    rem = offs\n    off = tl.zeros((BLOCK,), dtype=tl.int32)\n    for i in tl.static_range(8):\n        if i < NDIM:\n            size = shapes[NDIM - 1 - i]\n            stride = strides[NDIM - 1 - i]\n            off += (rem % size) * stride\n            rem = rem // size\n    x = tl.load(x_ptr + off, mask=mask, other=1.0).to(tl.float32)\n    y = tl.log(x) * 0.4342944819032518\n    tl.store(x_ptr + off, y.to(x_ptr.dtype.element_ty), mask=mask)\n\n\ndef _pick_block(n, esize):\n    \"\"\"Elements per program: aim for ~32 programs, capped at the staging tile.\"\"\"\n    cap = _BLOCK_CAP_2B if esize < 4 else _BLOCK_CAP_4B\n    target = -(-n // _TARGET_PROGS)\n    block = _BLOCK_MIN\n    while block < target:\n        block <<= 1\n    if block > cap:\n        block = cap\n    return block\n\n\ndef _resolve_stream(device):\n    \"\"\"Cheapest faithful current-stream accessor for this device, resolved once.\n\n    The getter itself is re-evaluated on every call, so a caller that switches\n    streams still launches on the stream that is current now.\n    \"\"\"\n    getter = _STREAM_GETTERS.get(device)\n    if getter is not None:\n        return getter\n    getter = None\n    if _RAW_STREAM is not None:\n        try:\n            want = int(torch.npu.current_stream().npu_stream)\n            if int(_RAW_STREAM(device)) == want:\n                getter = lambda: _RAW_STREAM(device)\n        except Exception:\n            getter = None\n    if getter is None:\n        try:\n            from triton.runtime import driver as _driver\n\n            def getter(device=device):\n                return _driver.active.get_current_stream(device)\n        except Exception:  # pragma: no cover - last resort\n            def getter():\n                return torch.npu.current_stream().npu_stream\n    _STREAM_GETTERS[device] = getter\n    return getter\n\n\ndef _build_entry(A, n, key):\n    block = _pick_block(n, A.element_size())\n    grid = (triton.cdiv(n, block),)\n    masked = bool(n % block)\n    jitfn = _log10_flat_masked if masked else _log10_flat\n    # Tail of the compiled launcher's positional argument list: every kernel\n    # parameter after the data pointer, constexprs included (the Ascend launcher\n    # builds one PyArg format unit per parameter, `constexpr` included).\n    tail = (n, block) if masked else (block,)\n    if masked:\n        def fallback(A, _f=jitfn, _g=grid, _n=n, _b=block):\n            _f[_g](A, _n, BLOCK=_b)\n    else:\n        def fallback(A, _f=jitfn, _g=grid, _b=block):\n            _f[_g](A, BLOCK=_b)\n    entry = (None, None, None, grid[0], tail, None, fallback)\n    try:\n        if masked:\n            ck = jitfn.warmup(A, n, BLOCK=block, grid=(1,))\n        else:\n            ck = jitfn.warmup(A, BLOCK=block, grid=(1,))\n        launcher = ck.run\n        if getattr(launcher, \"compile_only\", False) or getattr(\n                launcher, \"enable_msprof_register_tensor\", False):\n            pass\n        else:\n            md = launcher.metadata\n            if not (getattr(md, \"debug_enabled\", False) or getattr(md, \"debug\", False)):\n                entry = (launcher.launch, ck.function, ck.packed_metadata,\n                         grid[0], tail, _resolve_stream(key[2]), fallback)\n    except Exception:\n        entry = (None, None, None, grid[0], tail, None, fallback)\n    _ENTRIES[key] = entry\n    return entry\n\n\ndef _launch_strided(A, n):\n    \"\"\"Non-contiguous in-place path: real element strides, view object untouched.\"\"\"\n    shape = A.shape\n    stride = A.stride()\n    dims = []  # (size, stride) inner -> outer, adjacent dims merged when compact\n    for d in range(len(shape) - 1, -1, -1):\n        s = shape[d]\n        if s == 1:\n            continue\n        st = stride[d]\n        if dims and st == dims[-1][0] * dims[-1][1]:\n            dims[-1] = (dims[-1][0] * s, dims[-1][1])\n        else:\n            dims.append((s, st))\n    dims.reverse()\n    if len(dims) <= 1:\n        scale = dims[0][1] if dims else 1\n        _log10_scaled[((n + _BLOCK_STRIDED - 1) // _BLOCK_STRIDED,)](\n            A, n, SCALE=scale, BLOCK=_BLOCK_STRIDED)\n        return\n    if len(dims) > _MAX_DIMS:\n        # Extremely rare (>8 non-mergeable axes): peel the outermost axis.\n        for i in range(shape[0]):\n            sub = A.select(0, i)\n            m = sub.numel()\n            if m:\n                _launch_strided(sub, m)\n        return\n    sizes = [d[0] for d in dims] + [1] * (_MAX_DIMS - len(dims))\n    sts = [d[1] for d in dims] + [0] * (_MAX_DIMS - len(dims))\n    _log10_nd[((n + _BLOCK_STRIDED - 1) // _BLOCK_STRIDED,)](\n        A, n, *sizes, *sts, NDIM=len(dims), BLOCK=_BLOCK_STRIDED)\n\n\ndef run(A):\n    n = A.numel()\n    if n == 0:\n        return A\n    if not A.is_contiguous():\n        _launch_strided(A, n)\n        return A\n    key = (A.dtype, n, A.get_device())\n    entry = _ENTRIES.get(key)\n    if entry is None:\n        entry = _build_entry(A, n, key)\n    launch = entry[0]\n    if launch is not None:\n        launch(entry[3], 1, 1, entry[5](), entry[1], entry[2],\n               None, None, None, A.data_ptr(), *entry[4])\n    else:\n        entry[6](A)\n    return A\n"
+      },
+      "evaluation": {
+        "evaluated_at": "2026-10-29T19:39:12.311899Z",
+        "api_version": "v6.2",
+        "status": "PASSED",
+        "is_hack": false,
+        "hack_reason": "",
+        "geo_mean": 0.6798957369451449,
+        "min_speedup": 0.3338695668137261,
+        "worst_workload_uuid": "log10_-timing-11",
+        "latency_ms": 0.07732874350715643,
+        "max_abs_error": 0.0009765625,
+        "max_rel_error": 0.0009718172950670123,
+        "num_workloads": 36,
+        "num_passed": 36,
+        "timing_skipped": false,
+        "requested_hardware": "Ascend910B",
+        "server_backend": "npu",
+        "log": "",
+        "workloads": [
+          {
+            "uuid": "log10_-correctness-0",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-1",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-2",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-3",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 6.103515625e-05,
+            "rel_err": 0.000587198999710381
+          },
+          {
+            "uuid": "log10_-correctness-4",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0009765625,
+            "rel_err": 0.0009718172950670123
+          },
+          {
+            "uuid": "log10_-correctness-5",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0009765625,
+            "rel_err": 0.0009661834337748587
+          },
+          {
+            "uuid": "log10_-correctness-6",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0009765625,
+            "rel_err": 0.000936329597607255
+          },
+          {
+            "uuid": "log10_-correctness-7",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0009765625,
+            "rel_err": 0.0009025270701386034
+          },
+          {
+            "uuid": "log10_-correctness-8",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-9",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-10",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-11",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-12",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-13",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-14",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-15",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-16",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-17",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-18",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-19",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-20",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-21",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-22",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-23",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-timing-0",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.012392738551528436,
+            "reference_latency_ms": 0.010283348580839504,
+            "speedup": 0.8297882294604872,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-1",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.012620777422295832,
+            "reference_latency_ms": 0.010286551751722323,
+            "speedup": 0.8150489789598958,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-2",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.01268340700622791,
+            "reference_latency_ms": 0.010198408164876454,
+            "speedup": 0.8040748167955778,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-3",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.04281349071365936,
+            "reference_latency_ms": 0.01582563509002902,
+            "speedup": 0.36964131693611135,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-4",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.0123214865597537,
+            "reference_latency_ms": 0.010129006932021775,
+            "speedup": 0.8220604618526037,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-5",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.012905747346507465,
+            "reference_latency_ms": 0.010448361003226998,
+            "speedup": 0.8095897682403118,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-6",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.01266084213590063,
+            "reference_latency_ms": 0.010176567897265095,
+            "speedup": 0.8037828596258052,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-7",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.04443337533758978,
+            "reference_latency_ms": 0.025295779564997345,
+            "speedup": 0.5692968263790125,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-8",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.012360142081742423,
+            "reference_latency_ms": 0.009889585689191818,
+            "speedup": 0.8001190944075031,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-9",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.012594344553444261,
+            "reference_latency_ms": 0.00964306000537239,
+            "speedup": 0.7656658879270726,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-10",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.013151166643368543,
+            "reference_latency_ms": 0.010247716649655507,
+            "speedup": 0.7792249104244225,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-11",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.07732874350715643,
+            "reference_latency_ms": 0.02581771409698405,
+            "speedup": 0.3338695668137261,
+            "abs_err": null,
+            "rel_err": null
+          }
+        ],
+        "comparison": {
+          "performance_baseline_round_num": null,
+          "geo_mean_before": null,
+          "geo_mean_after": 0.6798957369451449,
+          "geo_mean_delta_pct": null,
+          "workloads": []
+        },
+        "fingerprint": "326483aac6e2d0051386013d0e330495a600a1943be10b97798b0194bb29b8e5"
+      },
+      "profile": {
+        "required": true,
+        "status": "failed",
+        "analysis_path": ".kernelgen/profile-analysis/round-0001.json",
+        "summary": "failed: msprof base collection exited successfully without profile completion marker - 5 collection attempts (log10_-timing-3, log10_-timing-7, log10_-timing-11, log10_-timing-0 at level=metrics; then log10_-timing-11 alone; then log10_-timing-7 at level=instruction; then log10_-timing-11 and log10_-timing-3 alone) all returned status=failed with capabilities=[], metrics={}, artifacts=[]. Manifests retain stage_count=1, metrics {}, artifacts [], and this error (e.g. .kernelgen/profiles/round-000"
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "Two independent costs defined this baseline. (1) Host: the seed rebuilt its per-(numel,ptr) specialization on every pointer change, costing ~164 us per small call; caching the compiled launcher per (dtype,numel,device) and passing the pointer/stream per call removed it, leaving ~12.4 us. (2) Device: for the 16.7M-element shapes a single tile-per-program kernel with one monolithic load/store leaves the MTE2 and MTE3 phases serialized, delivering ~1.6 TB/s against the reference's 2.7-5.2 TB/s.",
+        "perf_gap_analysis": "First measured round of this workspace; the seed it replaces was PARTIAL_PASS (33/36, three non-finite mismatches) at 0.164 ms small / 0.238 ms large. Observed now: 36/36 PASSED, small shapes 12.32-13.15 us (0.77-0.83x of a 9.6-10.5 us ATen reference), and the three 16.8M-element cases at 42.81 us (0.370x), 44.43 us (0.569x) and 77.33 us (0.334x) = 1.51-1.74 TB/s logical against the reference's 2.65-5.20 TB/s on identical shapes and buffers. Since all three execute the same number of logs and cost scales with bytes (fp32 is 1.806x fp16 for a 2.0x byte ratio, bf16 within 3.8% of fp16), the transcendental is not the limiter and neither is tile pressure (the smaller fp32 tile has the highest throughput); the remaining candidate cause is that each program issues one monolithic load, one vector chain and one monolithic store with no loop body for the pipeliner to multi-buffer, leaving MTE2 and MTE3 unoverlapped.",
+        "next_suggestion": "Restructure only the flat kernels into an inner pipelined loop (for k in tl.range(0, BLOCK, CHUNK, num_stages=2)) over 4096-element (2-byte) / 2048-element (4-byte) sub-tiles so the backend can double-buffer MTE2 against MTE3 instead of running one monolithic load/store per program; keep the strided paths, _pick_block, entry cache and launcher signature unchanged.",
+        "optimization_level": "L1_architecture",
+        "debug_lesson": "Service-side msprof collection fails on this campaign (same error string as log2_/nan_to_num_/expm1_); device-side root cause must be inferred from per-workload latencies, which is workable here because all three large cases execute exactly 16,777,216 logs and cost tracks bytes proportionally.",
+        "strategy_evolution": "Baseline established: correctness fully repaired and the host launch path is at the family floor, so all remaining headroom is on device-side pipeline overlap for the three large shapes.",
+        "knowledge_assessments": [
+          {
+            "concept_ref": "",
+            "source_ref": {
+              "resource": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/operators/campaigns/next25-20261029-v2/results/log2_/search-1/selected.py",
+              "revision": "3b1cc89abe52d638245bc1bc983b30c4cdd182ec40ee600bd5b9ec85a542d8bc",
+              "locator": "run/_build_entry/_launch_strided/_pick_block"
+            },
+            "assessment": "confirmed",
+            "rationale": "Adopting the sibling architecture reproduced its outcome on this operator: 36/36 PASSED including the strided [7,9] cases that the previous seed failed, and small-shape latency landed at 12.32-13.15 us, matching the 12.8 us floor that the same launch path reached for log2_. The (dtype,numel,device) entry key plus uniform-stride dispatch was directly responsible for the correctness fix."
+          },
+          {
+            "concept_ref": "",
+            "source_ref": {
+              "resource": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/tools/profiling/hgkda/skills/hgkda/references/算子类型/逐元素与原地.md",
+              "revision": "d41750ac0acc4d533e4065c41dd7babaca647cf4445f3029620bb941d416317b",
+              "locator": "原地操作不能通过将 A 替换成 A.contiguous()/ UB 分块上限"
+            },
+            "assessment": "confirmed",
+            "rationale": "All four strided in-place workloads now pass with matched_ratio 1 and the parent-storage padding slots untouched (no copy/contiguous path). The UB-capped tiles (8192 for 4-byte, 16384 for 2-byte) compiled and ran without overflow, and the fp32 tile that is smaller shows the highest effective throughput, so the constraint bound was respected."
+          },
+          {
+            "concept_ref": "",
+            "source_ref": {
+              "resource": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/tools/profiling/hgkda/skills/hgkda/references/性能指标/搬运与执行路径.md",
+              "revision": "3929c1694c137893c11d6c98bbbf9c98048ffb5357b2d579d4b9f7826412c715",
+              "locator": "小输入的编译产物启动"
+            },
+            "assessment": "partially_confirmed",
+            "rationale": "Keeping the compiled launch artifact with per-call pointer/stream refresh produced a stable 12.3-13.2 us small-shape path and no stale-pointer or stale-stream failure across 24 correctness workloads, matching the historical failure constraint. However it did not beat the reference dispatch: the ATen log10_ path costs 9.6-10.5 us on the same shapes, so ~2.1-2.5 us of host work remains unclosed, and the document's device-side guidance could not be verified because msprof collection failed on this service."
+          }
+        ]
+      },
+      "next_verdict": {
+        "should_continue": true,
+        "code": "continue",
+        "reason": "no stop trigger"
+      }
+    },
+    {
+      "round_num": 2,
+      "experiment_parent_round_num": 1,
+      "plan": {
+        "kind": "performance",
+        "strategy": "Minimise the number of load/compute/store tile sequences per launch: raise elements per program to the UB-safe maximum and split 4-byte tiles into two hoisted independent loads before the stores.",
+        "code_changes": "Replaced the \"~32 programs per launch\" rule with a tile-count-minimising rule: elements per program is pushed to 32768 (the largest tile this backend compiles) instead of being spread over many small programs; a tile smaller than the input is rounded up to the next power of two so small inputs still use one program. 4-byte dtypes with a tile >= 8192 now issue two independent 16384-element loads hoisted ahead of the two stores (_log10_pair) instead of one monolithic tile. Masked sizes and 2-byte dtypes keep the single-tile _log10_flat/_log10_flat_masked form.",
+        "hypothesis": "Measured per-tile cost on 4096x4096 is nearly flat in tile size (2048-element tile 751 ns, 8192-element tile 792 ns), so device time is set by the number of load/compute/store sequences, not by bytes. Cutting the fp32 16.7M-element launch from 2048 tiles to 512 tiles with two hoisted loads each should move log10_-timing-11 from 77.3 us to about 54 us, leave the nine host-bound small cases unchanged, and raise geo_mean from 0.680 to about 0.71.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Fewer fixed-latency load/compute/store sequences per launch, plus two loads in flight per sequence"
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": null
+        },
+        "key_params": {
+          "TILE_MAX": 32768,
+          "HOIST_MIN": 8192,
+          "fp32_pair_sub_tile": 16384
+        },
+        "knowledge_uses": [
+          {
+            "concept_ref": "",
+            "source_ref": {
+              "resource": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/tools/profiling/hgkda/skills/hgkda/references/性能指标/搬运与执行路径.md",
+              "revision": "3929c1694c137893c11d6c98bbbf9c98048ffb5357b2d579d4b9f7826412c715",
+              "locator": "先区分完整调用与设备任务 / 读取 OpProf 搬运和缓存计数"
+            },
+            "query_event_id": "source-query:move-execution-path-host-launch",
+            "role": "diagnostic",
+            "disposition": "adapted",
+            "application_note": "Applied the document's distinction between full-call cost and device-task cost: the 16.7M-element shapes are device-bound (77 us call vs ~12 us host floor), so the tuning target is tile/transfer organisation. Also applied the warning that a high pipeline-active ratio is only a direction to check, which is why the tile-size hypothesis was tested with a bounded device sweep (including a copy/no-math control and a 2048-element-tile arm) instead of assuming bandwidth saturation.",
+            "affected_parts": [
+              "_pick_tile",
+              "_log10_pair",
+              "_build_entry"
+            ]
+          },
+          {
+            "concept_ref": "",
+            "source_ref": {
+              "resource": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/tools/profiling/hgkda/skills/hgkda/references/算子类型/逐元素与原地.md",
+              "revision": "d41750ac0acc4d533e4065c41dd7babaca647cf4445f3029620bb941d416317b",
+              "locator": "UB 分块上限"
+            },
+            "query_event_id": "source-query:elementwise-inplace-constraints",
+            "role": "constraint",
+            "disposition": "adapted",
+            "application_note": "Applied the UB-ceiling constraint that bounded the previous tile at 8192/16384: measured on this backend a 32768-element fp32 tile still compiles and is correct, while a 65536-element 2-byte tile fails the BiShengIR multi-buffer stage, so the cap was raised to exactly 32768 for both dtypes and no further.",
+            "affected_parts": [
+              "_TILE_MAX",
+              "_pick_tile"
+            ]
+          }
+        ]
+      },
+      "solution": {
+        "sha256": "ff91ae6e4f0015b4e6d1f178e5207b7a4858e9abbb16c716bf04823f26012380",
+        "snapshot_path": ".kernelgen/evals/round-0002",
+        "candidate_path": "tmp/main.py",
+        "code": "\"\"\"log10_ : in-place elementwise ``log10(A)`` on Ascend, self-contained Triton.\n\nReference semantics reproduced (``A.log10_()``):\n  * ``log10`` is written back into ``A`` storage and the same tensor object is\n    returned (evaluation observes the mutation of ``A``).\n  * float16 / bfloat16 / float32 output dtype preserved exactly.\n  * the transcendental is staged in float32, which is what the reference does\n    for half/bfloat16, so ``0 -> -inf``, ``-0.0 -> -inf``, ``x < 0 -> NaN``,\n    ``+inf -> +inf`` and ``NaN -> NaN`` agree with the oracle.\n  * non-contiguous views are read *and* written through their real element\n    strides, so the mutation lands in the right storage slots and the padding\n    slots of the parent storage are left alone; the view object is returned\n    unchanged.\n\nLayout dispatch (metadata-only host decisions):\n  1. contiguous            -> flat kernel, unit stride\n  2. uniformly strided     -> flat kernel with a constexpr stride multiplier\n                              (covers ``base[..., 0]`` style views)\n  3. anything else         -> generic up-to-8D index-math kernel\n\nTile choice: measured on the 4096x4096 workloads, per-tile cost is dominated by\na roughly constant fixed latency (~750 ns for a 2048-element tile, ~790 ns for\nan 8192-element tile), so the launch is fastest when the number of tiles is\nminimised rather than when the grid is widened. Elements per program are\ntherefore pushed to the largest tile this backend compiles without a UB\noverflow (32768 elements) instead of being spread over ~32 programs, and\n4-byte data is issued as two independent 16384-element loads hoisted ahead of\nthe two stores, which measured faster than one monolithic 32768-element tile\n(54.5 us vs 60.4 us on fp32 4096x4096). Masked sizes keep the single-tile form.\n\nLaunch path: the compiled kernel is resolved once per (dtype, numel, device) --\nwhich is the complete set of host-visible launch inputs -- and then driven\nthrough its own compiled launcher (grid + raw current-stream handle + device\npointer); that is where ``JITFunction.run`` ends anyway, minus the per-call\nbinder / cache-key / argument-parsing work that dominates these tiny workloads.\nThe pointer and the stream handle are re-read on every call, so a different\ntensor at the same extent, or a caller that switches streams, is still launched\ncorrectly.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\ntry:  # cheapest faithful current-stream query on this target\n    import torch_npu\n\n    _RAW_STREAM = getattr(torch_npu._C, \"_npu_getCurrentRawStreamNoWait\", None)\nexcept Exception:  # pragma: no cover\n    torch_npu = None\n    _RAW_STREAM = None\n\n_TILE_MAX = 32768          # largest tile this backend compiles for both dtypes\n_TILE_MIN = 1024\n_HOIST_MIN = 8192          # 4-byte data: 2-way hoist once a tile has 2 halves\n_BLOCK_STRIDED = 512       # gather/scatter tiles materialise address vectors\n_MAX_DIMS = 8\n_LOG10E = 0.4342944819032518\n\n_ENTRIES = {}\n_STREAM_GETTERS = {}\n\n\n@triton.jit\ndef _log10_flat(x_ptr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    x = tl.load(x_ptr + offs).to(tl.float32)\n    y = tl.log(x) * 0.4342944819032518\n    tl.store(x_ptr + offs, y.to(x_ptr.dtype.element_ty))\n\n\n@triton.jit\ndef _log10_flat_masked(x_ptr, n, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    x = tl.load(x_ptr + offs, mask=mask, other=1.0).to(tl.float32)\n    y = tl.log(x) * 0.4342944819032518\n    tl.store(x_ptr + offs, y.to(x_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _log10_pair(x_ptr, SUB: tl.constexpr):\n    \"\"\"Two independent loads issued before either store: more memory in flight.\"\"\"\n    off0 = tl.program_id(0) * (2 * SUB) + tl.arange(0, SUB)\n    off1 = off0 + SUB\n    a = tl.load(x_ptr + off0).to(tl.float32)\n    b = tl.load(x_ptr + off1).to(tl.float32)\n    ya = tl.log(a) * 0.4342944819032518\n    yb = tl.log(b) * 0.4342944819032518\n    tl.store(x_ptr + off0, ya.to(x_ptr.dtype.element_ty))\n    tl.store(x_ptr + off1, yb.to(x_ptr.dtype.element_ty))\n\n\n@triton.jit\ndef _log10_scaled(x_ptr, n, SCALE: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    idx = offs * SCALE\n    x = tl.load(x_ptr + idx, mask=mask, other=1.0).to(tl.float32)\n    y = tl.log(x) * 0.4342944819032518\n    tl.store(x_ptr + idx, y.to(x_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _log10_nd(x_ptr, n,\n              s0, s1, s2, s3, s4, s5, s6, s7,\n              t0, t1, t2, t3, t4, t5, t6, t7,\n              NDIM: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    shapes = (s0, s1, s2, s3, s4, s5, s6, s7)\n    strides = (t0, t1, t2, t3, t4, t5, t6, t7)\n    rem = offs\n    off = tl.zeros((BLOCK,), dtype=tl.int32)\n    for i in tl.static_range(8):\n        if i < NDIM:\n            size = shapes[NDIM - 1 - i]\n            stride = strides[NDIM - 1 - i]\n            off += (rem % size) * stride\n            rem = rem // size\n    x = tl.load(x_ptr + off, mask=mask, other=1.0).to(tl.float32)\n    y = tl.log(x) * 0.4342944819032518\n    tl.store(x_ptr + off, y.to(x_ptr.dtype.element_ty), mask=mask)\n\n\ndef _pick_tile(n):\n    \"\"\"Elements per program: cover the input with as few tiles as UB allows.\"\"\"\n    if n >= _TILE_MAX:\n        return _TILE_MAX\n    tile = _TILE_MIN\n    while tile < n:\n        tile <<= 1\n    return tile\n\n\ndef _resolve_stream(device):\n    \"\"\"Cheapest faithful current-stream accessor for this device, resolved once.\n\n    The getter itself is re-evaluated on every call, so a caller that switches\n    streams still launches on the stream that is current now.\n    \"\"\"\n    getter = _STREAM_GETTERS.get(device)\n    if getter is not None:\n        return getter\n    getter = None\n    if _RAW_STREAM is not None:\n        try:\n            want = int(torch.npu.current_stream().npu_stream)\n            if int(_RAW_STREAM(device)) == want:\n                getter = lambda: _RAW_STREAM(device)\n        except Exception:\n            getter = None\n    if getter is None:\n        try:\n            from triton.runtime import driver as _driver\n\n            def getter(device=device):\n                return _driver.active.get_current_stream(device)\n        except Exception:  # pragma: no cover - last resort\n            def getter():\n                return torch.npu.current_stream().npu_stream\n    _STREAM_GETTERS[device] = getter\n    return getter\n\n\ndef _build_entry(A, n, key):\n    tile = _pick_tile(n)\n    esize = A.element_size()\n    masked = bool(n % tile)\n    if masked or esize < 4 or tile < _HOIST_MIN:\n        jitfn = _log10_flat_masked if masked else _log10_flat\n        grid = (triton.cdiv(n, tile),)\n        # Tail of the compiled launcher's positional argument list: every kernel\n        # parameter after the data pointer, constexprs included (the Ascend\n        # launcher builds one PyArg format unit per parameter).\n        tail = (n, tile) if masked else (tile,)\n        if masked:\n            def fallback(A, _f=jitfn, _g=grid, _n=n, _b=tile):\n                _f[_g](A, _n, BLOCK=_b)\n            warm = lambda: jitfn.warmup(A, n, BLOCK=tile, grid=(1,))\n        else:\n            def fallback(A, _f=jitfn, _g=grid, _b=tile):\n                _f[_g](A, BLOCK=_b)\n            warm = lambda: jitfn.warmup(A, BLOCK=tile, grid=(1,))\n    else:\n        sub = tile >> 1\n        jitfn = _log10_pair\n        grid = (n // tile,)\n        tail = (sub,)\n\n        def fallback(A, _f=jitfn, _g=grid, _b=sub):\n            _f[_g](A, SUB=_b)\n        warm = lambda: jitfn.warmup(A, SUB=sub, grid=(1,))\n\n    entry = (None, None, None, grid[0], tail, None, fallback)\n    try:\n        ck = warm()\n        launcher = ck.run\n        if getattr(launcher, \"compile_only\", False) or getattr(\n                launcher, \"enable_msprof_register_tensor\", False):\n            pass\n        else:\n            md = launcher.metadata\n            if not (getattr(md, \"debug_enabled\", False) or getattr(md, \"debug\", False)):\n                entry = (launcher.launch, ck.function, ck.packed_metadata,\n                         grid[0], tail, _resolve_stream(key[2]), fallback)\n    except Exception:\n        entry = (None, None, None, grid[0], tail, None, fallback)\n    _ENTRIES[key] = entry\n    return entry\n\n\ndef _launch_strided(A, n):\n    \"\"\"Non-contiguous in-place path: real element strides, view object untouched.\"\"\"\n    shape = A.shape\n    stride = A.stride()\n    dims = []  # (size, stride) inner -> outer, adjacent dims merged when compact\n    for d in range(len(shape) - 1, -1, -1):\n        s = shape[d]\n        if s == 1:\n            continue\n        st = stride[d]\n        if dims and st == dims[-1][0] * dims[-1][1]:\n            dims[-1] = (dims[-1][0] * s, dims[-1][1])\n        else:\n            dims.append((s, st))\n    dims.reverse()\n    if len(dims) <= 1:\n        scale = dims[0][1] if dims else 1\n        _log10_scaled[((n + _BLOCK_STRIDED - 1) // _BLOCK_STRIDED,)](\n            A, n, SCALE=scale, BLOCK=_BLOCK_STRIDED)\n        return\n    if len(dims) > _MAX_DIMS:\n        # Extremely rare (>8 non-mergeable axes): peel the outermost axis.\n        for i in range(shape[0]):\n            sub = A.select(0, i)\n            m = sub.numel()\n            if m:\n                _launch_strided(sub, m)\n        return\n    sizes = [d[0] for d in dims] + [1] * (_MAX_DIMS - len(dims))\n    sts = [d[1] for d in dims] + [0] * (_MAX_DIMS - len(dims))\n    _log10_nd[((n + _BLOCK_STRIDED - 1) // _BLOCK_STRIDED,)](\n        A, n, *sizes, *sts, NDIM=len(dims), BLOCK=_BLOCK_STRIDED)\n\n\ndef run(A):\n    n = A.numel()\n    if n == 0:\n        return A\n    if not A.is_contiguous():\n        _launch_strided(A, n)\n        return A\n    key = (A.dtype, n, A.get_device())\n    entry = _ENTRIES.get(key)\n    if entry is None:\n        entry = _build_entry(A, n, key)\n    launch = entry[0]\n    if launch is not None:\n        launch(entry[3], 1, 1, entry[5](), entry[1], entry[2],\n               None, None, None, A.data_ptr(), *entry[4])\n    else:\n        entry[6](A)\n    return A\n"
+      },
+      "evaluation": {
+        "evaluated_at": "2026-10-29T19:52:32.194892Z",
+        "api_version": "v6.2",
+        "status": "PASSED",
+        "is_hack": false,
+        "hack_reason": "",
+        "geo_mean": 0.7932561045048275,
+        "min_speedup": 0.4389485341221395,
+        "worst_workload_uuid": "log10_-timing-3",
+        "latency_ms": 0.03600556101639154,
+        "max_abs_error": 0.0009765625,
+        "max_rel_error": 0.0009718172950670123,
+        "num_workloads": 36,
+        "num_passed": 36,
+        "timing_skipped": false,
+        "requested_hardware": "Ascend910B",
+        "server_backend": "npu",
+        "log": "",
+        "workloads": [
+          {
+            "uuid": "log10_-correctness-0",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-1",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-2",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-3",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 6.103515625e-05,
+            "rel_err": 0.000587198999710381
+          },
+          {
+            "uuid": "log10_-correctness-4",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0009765625,
+            "rel_err": 0.0009718172950670123
+          },
+          {
+            "uuid": "log10_-correctness-5",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0009765625,
+            "rel_err": 0.0009661834337748587
+          },
+          {
+            "uuid": "log10_-correctness-6",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0009765625,
+            "rel_err": 0.000936329597607255
+          },
+          {
+            "uuid": "log10_-correctness-7",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0009765625,
+            "rel_err": 0.0009025270701386034
+          },
+          {
+            "uuid": "log10_-correctness-8",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-9",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-10",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-11",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-12",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-13",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-14",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-15",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-16",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-17",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-18",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-19",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-20",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-21",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-22",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-correctness-23",
+            "axes": {},
+            "phase": "correctness",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": null,
+            "reference_latency_ms": null,
+            "speedup": null,
+            "abs_err": 0.0,
+            "rel_err": 0.0
+          },
+          {
+            "uuid": "log10_-timing-0",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.012620031563049113,
+            "reference_latency_ms": 0.010628729470672832,
+            "speedup": 0.8422110053823697,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-1",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.013073687055735889,
+            "reference_latency_ms": 0.011197649840171754,
+            "speedup": 0.856502820698844,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-2",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.014573949091783155,
+            "reference_latency_ms": 0.012611595409513773,
+            "speedup": 0.8653519598627002,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-3",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.03600556101639154,
+            "reference_latency_ms": 0.01580458822839032,
+            "speedup": 0.4389485341221395,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-4",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.01327014969241373,
+            "reference_latency_ms": 0.012001189413092306,
+            "speedup": 0.9043748330852015,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-5",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.014191906678398453,
+            "reference_latency_ms": 0.012232758830334168,
+            "speedup": 0.86195316158284,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-6",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.01386834327625068,
+            "reference_latency_ms": 0.011977513619201755,
+            "speedup": 0.8636585769918933,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-7",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.03808130690380114,
+            "reference_latency_ms": 0.025337734053188624,
+            "speedup": 0.6653588364809901,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-8",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.013704789287921614,
+            "reference_latency_ms": 0.012033321165040104,
+            "speedup": 0.8780376634936943,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-9",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.014053081676574852,
+            "reference_latency_ms": 0.01178355126300363,
+            "speedup": 0.8385030083932187,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-10",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.013598444357268447,
+            "reference_latency_ms": 0.011186183357819873,
+            "speedup": 0.8226075765674471,
+            "abs_err": null,
+            "rel_err": null
+          },
+          {
+            "uuid": "log10_-timing-11",
+            "axes": {},
+            "phase": "timing",
+            "status": "PASSED",
+            "skip_reason": "",
+            "latency_ms": 0.031052601993426077,
+            "reference_latency_ms": 0.025933572469782108,
+            "speedup": 0.8351497396344537,
+            "abs_err": null,
+            "rel_err": null
+          }
+        ],
+        "comparison": {
+          "performance_baseline_round_num": 1,
+          "geo_mean_before": 0.6798957369451449,
+          "geo_mean_after": 0.7932561045048275,
+          "geo_mean_delta_pct": 16.673198756771832,
+          "workloads": [
+            {
+              "uuid": "log10_-correctness-0",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-1",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-2",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-3",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-4",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-5",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-6",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-7",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-8",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-9",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-10",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-11",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-12",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-13",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-14",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-15",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-16",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-17",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-18",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-19",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-20",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-21",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-22",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-correctness-23",
+              "axes": {},
+              "before_latency_ms": null,
+              "after_latency_ms": null,
+              "latency_delta_ms": null,
+              "latency_delta_pct": null,
+              "before_speedup": null,
+              "after_speedup": null,
+              "speedup_delta": null,
+              "speedup_delta_pct": null
+            },
+            {
+              "uuid": "log10_-timing-0",
+              "axes": {},
+              "before_latency_ms": 0.012392738551528436,
+              "after_latency_ms": 0.012620031563049113,
+              "latency_delta_ms": 0.0002272930115206767,
+              "latency_delta_pct": 1.8340821972125276,
+              "before_speedup": 0.8297882294604872,
+              "after_speedup": 0.8422110053823697,
+              "speedup_delta": 0.012422775921882456,
+              "speedup_delta_pct": 1.4971019690119625
+            },
+            {
+              "uuid": "log10_-timing-1",
+              "axes": {},
+              "before_latency_ms": 0.012620777422295832,
+              "after_latency_ms": 0.013073687055735889,
+              "latency_delta_ms": 0.00045290963344005696,
+              "latency_delta_pct": 3.5886032871473357,
+              "before_speedup": 0.8150489789598958,
+              "after_speedup": 0.856502820698844,
+              "speedup_delta": 0.04145384173894817,
+              "speedup_delta_pct": 5.086055293492723
+            },
+            {
+              "uuid": "log10_-timing-2",
+              "axes": {},
+              "before_latency_ms": 0.01268340700622791,
+              "after_latency_ms": 0.014573949091783155,
+              "latency_delta_ms": 0.0018905420855552454,
+              "latency_delta_pct": 14.905632884184323,
+              "before_speedup": 0.8040748167955778,
+              "after_speedup": 0.8653519598627002,
+              "speedup_delta": 0.0612771430671224,
+              "speedup_delta_pct": 7.620826045930134
+            },
+            {
+              "uuid": "log10_-timing-3",
+              "axes": {},
+              "before_latency_ms": 0.04281349071365936,
+              "after_latency_ms": 0.03600556101639154,
+              "latency_delta_ms": -0.006807929697267824,
+              "latency_delta_pct": -15.901365629819573,
+              "before_speedup": 0.36964131693611135,
+              "after_speedup": 0.4389485341221395,
+              "speedup_delta": 0.06930721718602817,
+              "speedup_delta_pct": 18.74985668823575
+            },
+            {
+              "uuid": "log10_-timing-4",
+              "axes": {},
+              "before_latency_ms": 0.0123214865597537,
+              "after_latency_ms": 0.01327014969241373,
+              "latency_delta_ms": 0.0009486631326600312,
+              "latency_delta_pct": 7.699258754691971,
+              "before_speedup": 0.8220604618526037,
+              "after_speedup": 0.9043748330852015,
+              "speedup_delta": 0.08231437123259777,
+              "speedup_delta_pct": 10.013177260355434
+            },
+            {
+              "uuid": "log10_-timing-5",
+              "axes": {},
+              "before_latency_ms": 0.012905747346507465,
+              "after_latency_ms": 0.014191906678398453,
+              "latency_delta_ms": 0.0012861593318909872,
+              "latency_delta_pct": 9.965787314432788,
+              "before_speedup": 0.8095897682403118,
+              "after_speedup": 0.86195316158284,
+              "speedup_delta": 0.05236339334252815,
+              "speedup_delta_pct": 6.467892184006091
+            },
+            {
+              "uuid": "log10_-timing-6",
+              "axes": {},
+              "before_latency_ms": 0.01266084213590063,
+              "after_latency_ms": 0.01386834327625068,
+              "latency_delta_ms": 0.0012075011403500507,
+              "latency_delta_pct": 9.537289284463187,
+              "before_speedup": 0.8037828596258052,
+              "after_speedup": 0.8636585769918933,
+              "speedup_delta": 0.0598757173660881,
+              "speedup_delta_pct": 7.44924038240412
+            },
+            {
+              "uuid": "log10_-timing-7",
+              "axes": {},
+              "before_latency_ms": 0.04443337533758978,
+              "after_latency_ms": 0.03808130690380114,
+              "latency_delta_ms": -0.006352068433788639,
+              "latency_delta_pct": -14.295714393803685,
+              "before_speedup": 0.5692968263790125,
+              "after_speedup": 0.6653588364809901,
+              "speedup_delta": 0.09606201010197768,
+              "speedup_delta_pct": 16.873800388626066
+            },
+            {
+              "uuid": "log10_-timing-8",
+              "axes": {},
+              "before_latency_ms": 0.012360142081742423,
+              "after_latency_ms": 0.013704789287921614,
+              "latency_delta_ms": 0.001344647206179191,
+              "latency_delta_pct": 10.878897647668744,
+              "before_speedup": 0.8001190944075031,
+              "after_speedup": 0.8780376634936943,
+              "speedup_delta": 0.07791856908619121,
+              "speedup_delta_pct": 9.738371403808426
+            },
+            {
+              "uuid": "log10_-timing-9",
+              "axes": {},
+              "before_latency_ms": 0.012594344553444261,
+              "after_latency_ms": 0.014053081676574852,
+              "latency_delta_ms": 0.0014587371231305907,
+              "latency_delta_pct": 11.582477491706069,
+              "before_speedup": 0.7656658879270726,
+              "after_speedup": 0.8385030083932187,
+              "speedup_delta": 0.0728371204661461,
+              "speedup_delta_pct": 9.512911782362652
+            },
+            {
+              "uuid": "log10_-timing-10",
+              "axes": {},
+              "before_latency_ms": 0.013151166643368543,
+              "after_latency_ms": 0.013598444357268447,
+              "latency_delta_ms": 0.00044727771389990387,
+              "latency_delta_pct": 3.401049701742188,
+              "before_speedup": 0.7792249104244225,
+              "after_speedup": 0.8226075765674471,
+              "speedup_delta": 0.04338266614302455,
+              "speedup_delta_pct": 5.567412638206752
+            },
+            {
+              "uuid": "log10_-timing-11",
+              "axes": {},
+              "before_latency_ms": 0.07732874350715643,
+              "after_latency_ms": 0.031052601993426077,
+              "latency_delta_ms": -0.04627614151373036,
+              "latency_delta_pct": -59.84338994134529,
+              "before_speedup": 0.3338695668137261,
+              "after_speedup": 0.8351497396344537,
+              "speedup_delta": 0.5012801728207277,
+              "speedup_delta_pct": 150.14251751205705
+            }
+          ]
+        },
+        "fingerprint": "f0c2c6c37dd060e137acd5764583b57390e06ea86fcf0e266689852c40a6487d"
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "met",
+        "root_cause": "Round 1's kernels ran one load/compute/store sequence per 8192- or 16384-element tile, so the 16.7M-element workloads paid 1024-2048 fixed tile latencies. Reducing that to 512 tiles and issuing two independent 16384-element loads before either store cut the fp32 large case from 77.3 to 31.05 us. The 2-byte dtypes still use one monolithic 32768-element tile per program, so they pay a single serialized load-then-store latency per program and remain at 0.44-0.67x.",
+        "perf_gap_analysis": "Frozen expectation: fp32 16.7M from 77.3 us to about 54 us and geo_mean from 0.680 to about 0.71, with the nine host-bound small cases unchanged. Observed: geo_mean 0.7933, well above the prediction. The fp32 large case went 77.3 -> 31.05 us (0.334x -> 0.835x), i.e. the hoisted pair recovered far more than the debug sweep estimated, so the per-tile fixed-cost model was directionally right but the hoisted structure also improved per-tile memory-level parallelism. The nine small cases stayed in the 12.6-14.6 us band as predicted (0.82-0.90x; the ATen reference itself measured 10.6-12.6 us this round versus 9.6-10.5 us in round 1, so part of that apparent gain is reference drift). The remaining gap is now concentrated in the two 2-byte large cases, which still run the monolithic single-tile kernel: timing-3 36.0 us (0.439x) and timing-7 38.1 us (0.665x) versus 31.05 us for fp32 with twice the bytes, which is direct evidence that the 2-byte path is the un-optimised one.",
+        "next_suggestion": "Extend the two-way hoisted-load structure to the 2-byte dtypes (SUB=16384, total 32768 elements per program) instead of the monolithic single-tile form they use now, since log10_-timing-3 (fp16 4096x4096, 0.439x) and log10_-timing-7 (bf16, 0.665x) are the two worst workloads while the hoisted fp32 path reaches 0.835x at twice the bytes.",
+        "optimization_level": "L2_memory",
+        "debug_lesson": "The bounded device sweep predicted fp32 16.7M would land near 54 us with two 16384-element hoisted loads; the authoritative eval measured 31.05 us. Small-scale microbenchmarks in the debug harness reproduced the un-hoisted monolithic numbers (79.7 vs 77.3 us) but systematically underestimated the hoisted structure's benefit and overestimated 2-byte dtypes (59.2 vs 42.8 us for the identical fp16 kernel), so structure decisions must be arbitrated by eval_round, not by the harness.",
+        "strategy_evolution": "Moved from host-path repair (round 1) to device-side transfer organisation: the dominant cost is the count of serialized load/compute/store sequences, addressed by maximising tile size and overlapping two independent loads per program. The same lever has not yet been applied to float16/bfloat16, which are now the worst workloads.",
+        "knowledge_assessments": [
+          {
+            "concept_ref": "",
+            "source_ref": {
+              "resource": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/tools/profiling/hgkda/skills/hgkda/references/性能指标/搬运与执行路径.md",
+              "revision": "3929c1694c137893c11d6c98bbbf9c98048ffb5357b2d579d4b9f7826412c715",
+              "locator": "先区分完整调用与设备任务 / 读取 OpProf 搬运和缓存计数"
+            },
+            "assessment": "partially_confirmed",
+            "rationale": "The document's split between full-call and device-task cost correctly identified the 16.7M-element shapes as device-bound and pointed tuning at transfer organisation, and its warning against assuming bandwidth saturation was right: the gap was per-tile fixed latency, not HBM. But its framing of high MTE activity as a transport-organisation issue did not identify that the number of load/compute/store sequences (not bytes, not pipeline ratios) was the cost driver; that came from the tile-size sweep, and the device-side counters that would have settled it remain unavailable because msprof collection fails on this service."
+          },
+          {
+            "concept_ref": "",
+            "source_ref": {
+              "resource": "/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1/tools/profiling/hgkda/skills/hgkda/references/算子类型/逐元素与原地.md",
+              "revision": "d41750ac0acc4d533e4065c41dd7babaca647cf4445f3029620bb941d416317b",
+              "locator": "UB 分块上限"
+            },
+            "assessment": "confirmed",
+            "rationale": "The raised cap is exactly at this backend's edge: 32768-element tiles compile and are numerically exact for both dtypes (36/36 PASSED), while the sweep showed a 65536-element 2-byte tile failing the BiShengIR multi-buffer stage. Keeping the cap at 32768 for both dtypes was the maximum safe step and delivered 77.3 -> 31.05 us on the fp32 large case."
+          }
+        ]
+      },
+      "next_verdict": {
+        "should_continue": false,
+        "code": "user_cancelled",
+        "reason": "夜间单项搜索预算到期，保留已通过轮次并转下项"
+      }
+    }
+  ],
+  "rounds_without_improvement": 0
+}

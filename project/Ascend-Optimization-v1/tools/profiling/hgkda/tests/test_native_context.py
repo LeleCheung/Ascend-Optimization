@@ -85,6 +85,18 @@ class NativeContextTests(unittest.TestCase):
             self.assertEqual(paired['paired_evidence_extension']['sha256'],
                              __import__('hashlib').sha256(evidence.read_bytes()).hexdigest())
             self.assertEqual((source/'tools/profile_round.py').read_bytes(), original)
+            roofline = root/'roofline.json'
+            roofline.write_text(json.dumps({'schema_version':'hgkda-roofline-v1',
+                'source':{'sha256':'a'*64},'cases':[{'spec':{'source_sha256':'b'*64},
+                'paths':[{'path':'GM Read + Write','reference_kind':'经验参考'}]}]}),encoding='utf8')
+            roof = overlay.build(root/'roof',repo=root/'repo',roofline_evidence=roofline)
+            self.assertEqual((root/'roof/kernelgen/.kernelgen/skills/hgkda/roofline-evidence.json').read_bytes(),roofline.read_bytes())
+            self.assertEqual(roof['roofline_evidence_extension']['sha256'],__import__('hashlib').sha256(roofline.read_bytes()).hexdigest())
+            for role in ['kernel-profile-analyzer','kernel-knowledge-profile-analyzer']:
+                content=(root/'roof/kernelgen/.kernelgen/agents'/(role+'.md')).read_text(encoding='utf8')
+                self.assertIn('本批冻结的Roofline数值证据',content)
+                self.assertIn('经验参考',content)
+            self.assertEqual((source/'tools/profile_round.py').read_bytes(),original)
 
 
 if __name__ == '__main__':unittest.main()

@@ -2,11 +2,29 @@
 
 本仓库用于优化华为昇腾 910B 上的 FlagGems 算子，并保存 KG/KGS 源码、实验候选、评测证据和复现方法。
 
-**当前目标：按 2026-10-15 会议指定的 10 项算子与 5 项 FlagGems-sglang 候选推进优化，固定 FlagGems/FlagTree 基线，将 HG-KDA 接入 KG，形成指标、指令与热点分阶段体检；正确性失败对象先修复，再报告性能。此前低于 0.8× 的四算子阶段已完成。**
+**当前目标：在固定FlagGems/FlagTree与KGS条件下，将HG-KDA从个例优化推进到可检验的设备机制工作流：绑定源码与输入、选择真机／IR／有限模拟器补测，在同预算模型对照和冻结后的新形状中验证收益。RTL只预留接口。会议指定10项与SGLang成果继续维护；此前低于0.8×的四算子阶段已完成。**
+
+2026-10-29启动[新25算子夜间计划](project/Ascend-Optimization-v1/operators/下一阶段计划-20261029.md)：现有HG-KDA先推进优化，同步接入CANN/Ascend C参考核验、带绝对值和差值的成对证据、模拟器热点区域/可观测空闲与结构化知识整理。工具入口为[next_phase](project/Ascend-Optimization-v1/tools/profiling/hgkda/next_phase/README.md)。25项保留导师顺序，独立合同均已准备，其中两项显式映射到固定版本的下划线内部接口；实际结果见批次进展，不将排队状态写成交付。
 
 2026-10-09 导师确认：Excel 数字是加速比，绿色验收门槛为大于 0.8×，FlagGems 使用 `master`。筛选依据是华为列实际数字；黄色底色不作为立项依据。旧实验锁定的版本不是新的 master 基线。
 
 ## 当前状态
+
+2026-10-31完成[最后两项攻关交付](project/Ascend-Optimization-v1/operators/campaigns/remaining-final-20261031/交付报告.md)：`fix` **0.862×**、`expm1_` **0.879×**新增稳定达标，均为同源码两次完整KGS成绩的几何平均，各次30/30且均超过0.8×，原扩展、24项原生路径检查和30项冻结新形状检查全部通过。累计30项中**24项常规稳定达标、1项求逆正确性未通过、5项特殊参考条件单列**。两项采用Codex自写Ascend C＋Triton布局回退，当前仍低于PyTorch；本轮未新增CC/DeepSeek生成。新增离线执行路径诊断，分开计算候选与参考耗时变化，关联设备trace后提出验证方向；14份正式请求、12条设备路径、2份真实Triton IR及附件已核验。[复现入口](project/Ascend-Optimization-v1/tools/profiling/hgkda/remaining_final/README.md)保留全部失败方案与固定确认，不用追加高分覆盖低分。
+
+2026-10-30完成[剩余九项攻关](project/Ascend-Optimization-v1/operators/campaigns/remaining-nine-20261030/交付报告.md)：新增六项稳定达标，`negative_` **0.937×**、`log2_` **0.915×**、`round_out` **1.412×**、`special_round_out` **1.247×**、`hardswish` **0.905×**、`fmod_tensor_` **1.242×**；均为同源码两次完整KGS及补测通过。实现为自写Ascend C＋Triton布局回退，包含Codex源码与机制诊断贡献。`fix`三次约0.892/0.803/0.766×，不计稳定达标；`expm1_`约0.697×，求逆仍5/7且已定位重复行参考数值差异。累计30项中**22项常规达标、2项性能待优化、1项正确性未通过、5项特殊参考条件单列**。37份正式请求、52条设备路径、9份实际IR核验完成；[复现入口](project/Ascend-Optimization-v1/tools/profiling/hgkda/remaining/README.md)提供一次新完整评测和补测命令。
+
+2026-10-30完成[三路对照与新增达标](project/Ascend-Optimization-v1/operators/三路对照与新增达标-20261030.md)：`cross_out` **3.891×**、`nan_to_num_` **0.866×**、`native_group_norm` **0.814×**新增达标，`log10_` **0.938×**恢复稳定达标；原有12项源码复验通过。完成三项CANN直接参考、四项最终独立确认、补充语义检查、设备trace与叉积实际IR；累计30项中16项常规达标。复现见[本轮工具](project/Ascend-Optimization-v1/tools/profiling/hgkda/threeway/README.md)。
+
+2026-10-27完成[HG-KDA单算子三步演示](project/Ascend-Optimization-v1/operators/campaigns/agent-demo-20261027/三步演示-核验版.md)：同一矩阵乘串联新采集的PyTorch成对指标、源码／IR／经验Roofline、候选指令热点、Agent选工具及优化动作、完整KGS与预测复核。共享B候选相对本批历史优化起点实际设备加速 **1.023×**，相对PyTorch **0.884×**，两版42/42及18＋24补充检查通过；入选源码与历史成功版相同，记作工作流复现。GM／L2／L1基本不变，UB读写约降16.9%；模拟器导出后异常退出按部分证据记录，模型不准确归因经原件核对更正。入口见[agent_demo](project/Ascend-Optimization-v1/tools/profiling/hgkda/agent_demo/README.md)，可直接打开[演示HTML](project/Ascend-Optimization-v1/operators/campaigns/agent-demo-20261027/演示-核验版.html)。
+
+2026-10-27完成[矩阵乘片内复用与流水优化](project/Ascend-Optimization-v1/operators/campaigns/matmul-pipeline-20261027/精简汇报.md)：保留多个小累加块，将相邻N块共享A改为相邻M块共享B；候选相对本批历史优化父版的15项同case实际设备加速为 **1.040×**，相对PyTorch **0.895×**，父版为0.862×。两版各42/42及18＋24项补充检查通过。冻结后的同模板四项确认平均1.059×；真机GM／L2／L1流量基本不变，收益体现为执行组织改善。CC＋DeepSeek读取冻结Roofline证据选择追加方案，Codex实现模板、编排与核验。源码、失败候选、逐case和复现入口见[本批目录](project/Ascend-Optimization-v1/operators/campaigns/matmul-pipeline-20261027/README.md)，方法见[matmul_pipeline](project/Ascend-Optimization-v1/tools/profiling/hgkda/matmul_pipeline/README.md)。本批Windows与910B同步，不提交推送GitHub；不替换历史FlagGems成绩。
+
+2026-10-27完成[数值Roofline接入与矩阵乘验证](project/Ascend-Optimization-v1/operators/campaigns/roofline-20261027/最终报告.md)：复用导师分析器，定位CSV固定8192计数与tile工作量的差异，建立12项同输入数值证据、同精度经验参考及中文图表；GM参考与矩阵点使用同事件模型，物理HBM峰值匹配仍未决。摘要已接入KG分析角色并由CC＋DeepSeek实际消费。矩阵父版与候选各42/42＋18/18，候选相对父版实际仅0.888×，保留父版（本批0.862× PyTorch），没有新增性能收益。入口见[Roofline模块](project/Ascend-Optimization-v1/tools/profiling/hgkda/roofline/README.md)；旧批次的“数值Roofline未建立”属于当时状态，不改写历史证据。
+
+2026-10-26完成[设备机制系统闭环](project/Ascend-Optimization-v1/operators/设备机制系统闭环-20261026.md)：`amin`机制组在原合同设备计时下相对PyTorch **1.509×**，较本批历史优化父版实际加速 **1.083×**，27/27；独立新形状完整调用较父版 **1.113×**，24/24。矩阵乘候选变慢，保留父版。两组同预算实验、213＋976项核验和19,658文件传输核验已完成。原合同设备计时与Native完整调用分开报告，错误标签以源码依据更正、原件保留；本批未证明机制提示在独立集上优于原始证据组。入口见[设备机制模块](project/Ascend-Optimization-v1/tools/profiling/hgkda/device_mechanism/README.md)。
+
+2026-10-26完成[机制闭环原型与冻结后独立检验](project/Ascend-Optimization-v1/operators/机制闭环原型-20261026.md)：以同编译产物的调用路径干预识别分派成本，再通过通用受约束变换减少暖态JIT分派。开发算子`selu_`与独立算子`asinh_`相对本批FlagGems＋共享正确性适配分别加速**1.457×、1.448×**，均通过51项完整KGS和21项补充检查；原始证据自由生成对照为0.755×、0.882×。307项证据核验通过，失败与不支持对象保留。此为调用机制系统验证，不替换历史最佳成绩；设备指令依赖图及硅前／硅后统一重放仍待实现。入口见[机制模块](project/Ascend-Optimization-v1/tools/profiling/hgkda/mechanism/README.md)。
 
 2026-10-26完成[会议10算子最终验收汇总](project/Ascend-Optimization-v1/operators/会议10算子最终验收-20261026.md)：**7项默认条件达标、1项官方确定性条件达标、2项完成补充NPU分解对照**，不称10项默认全部达标。新池化连续输出分块相对同批父版实际加速**1.547×**；原PyTorch参考含CPU回退，17.683×与自建NPU分解对照10.066×分别报告。共轭复用既有源码，自建NPU分解对照2.296×；DMA候选未更快。累计积分默认参考固定输入16次再次出现4处容差区间无交集，官方V2扫描接口仍不稳定；前批确定性0.812×交付保留。96项证据核验、成对trace、实际IR和复现入口见[本批README](project/Ascend-Optimization-v1/operators/campaigns/acceptance-three-20261026/README.md)。本批Codex实现与历史KG候选贡献分开记录。
 

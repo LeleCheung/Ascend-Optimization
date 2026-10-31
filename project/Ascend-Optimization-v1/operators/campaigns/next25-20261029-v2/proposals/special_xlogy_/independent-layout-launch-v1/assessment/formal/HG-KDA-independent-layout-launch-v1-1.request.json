@@ -1,0 +1,25 @@
+{
+  "api_version": "v6.2",
+  "binding": {
+    "bundle_id": "sha256:a2cbcd2c26345ee33c8e095ecd8065ef6453c6753c785f74012e7cbfc0400eb8",
+    "definition": "special_xlogy_"
+  },
+  "implementation": {
+    "name": "special_xlogy_-HG-KDA-independent-layout-launch-v1-1",
+    "definition": "special_xlogy_",
+    "language": "triton",
+    "entrypoint": "main.py::run",
+    "sources": [
+      {
+        "path": "main.py",
+        "content": "# Copyright 2026 FlagOS Contributors\n# SPDX-License-Identifier: Apache-2.0\n\"\"\"In-place xlogy with independent operand layouts and current-stream launches.\"\"\"\nimport torch\nimport torch_npu\nimport triton\nimport triton.language as tl\n\n_BLOCK = 4096\n_ENTRIES = {}\n\n\n@triton.jit\ndef _xlogy_value(a, b):\n    x = a.to(tl.float32)\n    y = b.to(tl.float32)\n    product = x * tl.log(y)\n    return tl.where(y != y, float('nan'), tl.where(x == 0.0, 0.0, product))\n\n\n@triton.jit\ndef _xlogy_flat(A, B, N: tl.constexpr, BLOCK: tl.constexpr):\n    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offset < N\n    a = tl.load(A + offset, mask, other=0)\n    b = tl.load(B + offset, mask, other=1)\n    tl.store(A + offset, _xlogy_value(a, b), mask)\n\n\n@triton.jit\ndef _xlogy_strided(A, B, N: tl.constexpr, SHAPE: tl.constexpr,\n                   SA: tl.constexpr, SB: tl.constexpr, BLOCK: tl.constexpr):\n    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offset < N\n    remaining = offset\n    oa = tl.zeros((BLOCK,), tl.int64)\n    ob = tl.zeros((BLOCK,), tl.int64)\n    for axis in tl.static_range(len(SHAPE) - 1, -1, -1):\n        coordinate = remaining % SHAPE[axis]\n        remaining = remaining // SHAPE[axis]\n        oa += coordinate.to(tl.int64) * SA[axis]\n        ob += coordinate.to(tl.int64) * SB[axis]\n    a = tl.load(A + oa, mask, other=0)\n    b = tl.load(B + ob, mask, other=1)\n    tl.store(A + oa, _xlogy_value(a, b), mask)\n\n\ndef _stream(device):\n    raw = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\n    if raw is not None:\n        try:\n            return raw(device)\n        except TypeError:\n            return raw()\n    return torch.npu.current_stream(device).npu_stream\n\n\ndef _entry(A, B, n):\n    try:\n        compiled = _xlogy_flat.warmup(A, B, n, _BLOCK, grid=(1,))\n        launcher = compiled.run\n        if not (getattr(launcher, 'compile_only', False) or\n                getattr(launcher, 'enable_msprof_register_tensor', False) or\n                getattr(launcher.metadata, 'debug_enabled', False) or\n                getattr(launcher.metadata, 'debug', False)):\n            return launcher.launch, compiled.function, compiled.packed_metadata\n    except Exception:\n        pass\n    return None\n\n\ndef _generic(A, B, n):\n    if tuple(torch.broadcast_shapes(A.shape, B.shape)) != tuple(A.shape):\n        raise ValueError('broadcast would change the in-place destination shape')\n    aligned_shape = (1,) * (A.ndim - B.ndim) + tuple(B.shape)\n    aligned_stride = (0,) * (A.ndim - B.ndim) + tuple(B.stride())\n    sb = tuple(0 if size == 1 else stride for size, stride in zip(aligned_shape, aligned_stride))\n    shape = tuple(A.shape) or (1,)\n    sa = tuple(A.stride()) or (0,)\n    sb = sb or (0,)\n    _xlogy_strided[(triton.cdiv(n, 256),)](A, B, n, shape, sa, sb, 256)\n\n\ndef run(A, B):\n    n = A.numel()\n    if not n:\n        return A\n    if A.is_contiguous() and B.is_contiguous() and A.shape == B.shape:\n        pa, pb = A.data_ptr(), B.data_ptr()\n        if not ((pa | pb) & 15):\n            key = (A.dtype, B.dtype, A.device.index, n)\n            if key not in _ENTRIES:\n                _ENTRIES[key] = _entry(A, B, n)\n            entry = _ENTRIES[key]\n            if entry is not None:\n                entry[0](triton.cdiv(n, _BLOCK), 1, 1, _stream(A.device.index),\n                         entry[1], entry[2], None, None, None, pa, pb, n, _BLOCK)\n                return A\n        _xlogy_flat[(triton.cdiv(n, _BLOCK),)](A, B, n, _BLOCK)\n    else:\n        _generic(A, B, n)\n    return A\n"
+      }
+    ]
+  },
+  "settings": {
+    "warmup_ms": 1000,
+    "benchmark_ms": 100,
+    "num_trials": 3,
+    "timeout_seconds": 1800
+  }
+}

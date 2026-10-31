@@ -1,0 +1,108 @@
+{
+  "request": {
+    "api_version": "v6.2",
+    "evaluation_id": "a89c7fd4734a0586d6c2283e210a0c3893e719ee56fb3cbd08938c4b88d6b093:round-1",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:3f10770d35a9f237e5a1d94c78d01bebbc29d6cf758c494bc40d86a57c631140",
+      "definition": "nan_to_num_"
+    },
+    "implementation": {
+      "name": "kernelgen-candidate-nan_to_num_",
+      "definition": "nan_to_num_",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "# Copyright 2026 FlagOS Contributors\n# SPDX-License-Identifier: Apache-2.0\n\"\"\"nan_to_num_ : in-place NaN/+-Inf replacement on Ascend, self-contained Triton.\n\nReference semantics reproduced:\n  * ``A.nan_to_num_(nan, posinf, neginf)`` mutates ``A`` storage in place and\n    returns the same tensor object (evaluation observes the mutation of ``A``).\n  * ``nan is None``      -> NaN replaced by 0.0\n  * ``posinf is None``   -> +Inf replaced by ``finfo(dtype).max``\n  * ``neginf is None``   -> -Inf replaced by ``finfo(dtype).min``\n  * every other value (including -0.0) passes through bit-exactly; the fp32\n    staging used by the general path is an exact round trip for\n    float16/bfloat16/float32.\n\nKernel selection (metadata-only host decisions):\n  1. saturating request (``posinf >= finfo.max`` and ``neginf <= finfo.min``,\n     which is what the defaults give) on a 2-byte float dtype: replacing both\n     infinities degenerates into a saturating clamp, so\n     ``max(min(x, pos), neg)`` replaces two compare/select pairs and the kernel\n     can stay in the input dtype.  Measured on 4096x4096 float16: 58.5 us vs\n     84.4 us for the staged compare/select kernel.  float32 keeps the staged\n     path (the native clamp measured 120.7 us there).\n  2. anything else -> fp32-staged compare/select kernel.\n  3. non-contiguous -> stride-aware kernels (uniform element stride, or up to\n     8D index math); every path reads and writes real storage slots.\n\nTiles are capped at 32 KiB of staging because the compiler reports UB overflow\nabove that (bfloat16/float16: 16384 elements, float32: 8192).\n\nLaunch path: the compiled kernel is resolved once per (dtype, numel, mode) and\nthen driven directly (grid + raw current-stream handle + device pointer), which\nis where ``JITFunction.run`` ends anyway, minus the per-call binder/cache-key\nwork that dominates these tiny workloads.  ``nan``/``posinf``/``neginf`` stay\nordinary runtime arguments, so their values neither recompile nor invalidate an\nentry.  Any build failure falls back to the validated staged kernel, and from\nthat to the ordinary ``kernel[grid](...)`` launch.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n_BLOCK_MIN = 1024\n_BLOCK_TARGET_PROGRAMS = 8\n_BLOCK_STAGE = 8192          # validated fp32-staging tile (32 KiB at 4 bytes)\n_BLOCK_CLAMP_2B = 16384      # native-dtype tile, 32 KiB at 2 bytes\n_BLOCK_STRIDED = 512\n\n\n@triton.jit\ndef _nan_to_num_stage(a_ptr, n, nan_v, pos_v, neg_v, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    x = tl.load(a_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    y = tl.where(x != x, nan_v, x)\n    y = tl.where(x == float(\"inf\"), pos_v, y)\n    y = tl.where(x == float(\"-inf\"), neg_v, y)\n    tl.store(a_ptr + offs, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _nan_to_num_clamp(a_ptr, n, nan_v, pos_v, neg_v, BLOCK: tl.constexpr):\n    dt = a_ptr.dtype.element_ty\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    x = tl.load(a_ptr + offs)\n    y = tl.maximum(tl.minimum(x, pos_v.to(dt)), neg_v.to(dt))\n    y = tl.where(x != x, nan_v.to(dt), y)\n    tl.store(a_ptr + offs, y)\n\n\n@triton.jit\ndef _nan_to_num_clamp_masked(a_ptr, n, nan_v, pos_v, neg_v, BLOCK: tl.constexpr):\n    dt = a_ptr.dtype.element_ty\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    x = tl.load(a_ptr + offs, mask=mask, other=0.0)\n    y = tl.maximum(tl.minimum(x, pos_v.to(dt)), neg_v.to(dt))\n    y = tl.where(x != x, nan_v.to(dt), y)\n    tl.store(a_ptr + offs, y, mask=mask)\n\n\n@triton.jit\ndef _nan_to_num_scaled(a_ptr, n, nan_v, pos_v, neg_v,\n                       SCALE: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    idx = offs * SCALE\n    x = tl.load(a_ptr + idx, mask=mask, other=0.0).to(tl.float32)\n    y = tl.where(x != x, nan_v, x)\n    y = tl.where(x == float(\"inf\"), pos_v, y)\n    y = tl.where(x == float(\"-inf\"), neg_v, y)\n    tl.store(a_ptr + idx, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _nan_to_num_nd(a_ptr, n, nan_v, pos_v, neg_v,\n                   s0, s1, s2, s3, s4, s5, s6, s7,\n                   t0, t1, t2, t3, t4, t5, t6, t7,\n                   NDIM: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    shapes = (s0, s1, s2, s3, s4, s5, s6, s7)\n    strides = (t0, t1, t2, t3, t4, t5, t6, t7)\n    rem = offs\n    off = tl.zeros((BLOCK,), dtype=tl.int32)\n    for i in tl.static_range(8):\n        if i < NDIM:\n            size = shapes[NDIM - 1 - i]\n            stride = strides[NDIM - 1 - i]\n            off += (rem % size) * stride\n            rem = rem // size\n    x = tl.load(a_ptr + off, mask=mask, other=0.0).to(tl.float32)\n    y = tl.where(x != x, nan_v, x)\n    y = tl.where(x == float(\"inf\"), pos_v, y)\n    y = tl.where(x == float(\"-inf\"), neg_v, y)\n    tl.store(a_ptr + off, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n_FINFO = {}\n_ENTRIES = {}\n_STREAM = {}\n_FAIL = object()\n\n\ndef _pick_block(n, cap, masked_cap):\n    \"\"\"Elements per program: small tensors keep a small tile, large ones the cap.\"\"\"\n    if n >= cap * _BLOCK_TARGET_PROGRAMS:\n        block = cap\n    else:\n        target = -(-n // _BLOCK_TARGET_PROGRAMS)\n        block = _BLOCK_MIN\n        while block < target:\n            block <<= 1\n        if block > cap:\n            block = cap\n    if n % block and block > masked_cap:\n        block = masked_cap\n    return block\n\n\ndef _resolve_stream(device):\n    \"\"\"Cheapest faithful current-stream accessor for this device, resolved once.\n\n    The getter is re-evaluated on every call, so a caller that switches streams\n    (the evaluator does) still launches on the stream that is current now.\n    \"\"\"\n    getter = _STREAM.get(device)\n    if getter is not None:\n        return getter\n    getter = None\n    raw = None\n    try:\n        import torch_npu  # noqa: F401\n        raw = getattr(torch_npu._C, \"_npu_getCurrentRawStreamNoWait\", None)\n    except Exception:\n        raw = None\n    want = None\n    try:\n        want = int(torch.npu.current_stream().npu_stream)\n    except Exception:\n        want = None\n    if raw is not None and want is not None:\n        try:\n            if int(raw(device)) == want:\n                getter = lambda: raw(device)\n        except TypeError:\n            try:\n                if int(raw()) == want:\n                    getter = raw\n            except Exception:\n                getter = None\n        except Exception:\n            getter = None\n    if getter is None:\n        try:\n            from triton.runtime import driver as _driver\n\n            def getter(device=device):\n                return _driver.active.get_current_stream(device)\n        except Exception:\n            def getter():\n                return torch.npu.current_stream().npu_stream\n    _STREAM[device] = getter\n    return getter\n\n\ndef _try_build(jitfn, A, n, block):\n    \"\"\"Resolve (launcher, function, metadata, grid, block, stream) or _FAIL.\"\"\"\n    grid = triton.cdiv(n, block)\n    try:\n        ck = jitfn.warmup(A, n, 0.0, 0.0, 0.0, BLOCK=block, grid=(1,))\n        launcher = ck.run\n        if getattr(launcher, \"compile_only\", False) or getattr(\n                launcher, \"enable_msprof_register_tensor\", False):\n            return _FAIL\n        md = launcher.metadata\n        if getattr(md, \"debug_enabled\", False) or getattr(md, \"debug\", False):\n            return _FAIL\n        return (launcher.launch, ck.function, ck.packed_metadata, grid, block,\n                _resolve_stream(A.device.index or 0))\n    except Exception:\n        return _FAIL\n\n\ndef _build_entry(A, n, fast):\n    \"\"\"Try the native-dtype clamp tile first, then the staged compare/select.\"\"\"\n    if fast:\n        block = _pick_block(n, _BLOCK_CLAMP_2B, _BLOCK_STAGE)\n        entry = _try_build(_nan_to_num_clamp_masked if n % block\n                           else _nan_to_num_clamp, A, n, block)\n        if entry is not _FAIL:\n            return entry\n    block = _pick_block(n, _BLOCK_STAGE, _BLOCK_STAGE)\n    return _try_build(_nan_to_num_stage, A, n, block)\n\n\ndef _launch_strided(A, n, nan, posinf, neginf):\n    shape = A.shape\n    stride = A.stride()\n    dims = []  # (size, stride), inner -> outer, adjacent dims merged when compact\n    for d in range(len(shape) - 1, -1, -1):\n        s = shape[d]\n        if s == 1:\n            continue\n        st = stride[d]\n        if dims and st == dims[-1][0] * dims[-1][1]:\n            dims[-1] = (dims[-1][0] * s, dims[-1][1])\n        else:\n            dims.append((s, st))\n    dims.reverse()\n    if len(dims) <= 1:\n        scale = dims[0][1] if dims else 1\n        grid = (triton.cdiv(n, _BLOCK_STRIDED),)\n        _nan_to_num_scaled[grid](A, n, nan, posinf, neginf,\n                                 SCALE=scale, BLOCK=_BLOCK_STRIDED)\n        return\n    if len(dims) > 8:\n        # Extremely rare (>8 non-mergeable axes): peel the outer axis on the host.\n        for i in range(A.shape[0]):\n            sub = A.select(0, i)\n            _dispatch(sub, sub.numel(), nan, posinf, neginf, False)\n        return\n    sizes = [d[0] for d in dims] + [1] * (8 - len(dims))\n    sts = [d[1] for d in dims] + [0] * (8 - len(dims))\n    grid = (triton.cdiv(n, _BLOCK_STRIDED),)\n    _nan_to_num_nd[grid](A, n, nan, posinf, neginf, *sizes, *sts,\n                         NDIM=len(dims), BLOCK=_BLOCK_STRIDED)\n\n\ndef _dispatch(A, n, nan, posinf, neginf, fast):\n    if not A.is_contiguous():\n        _launch_strided(A, n, nan, posinf, neginf)\n        return\n    key = (A.dtype, n, fast)\n    entry = _ENTRIES.get(key)\n    if entry is None:\n        entry = _build_entry(A, n, fast)\n        _ENTRIES[key] = entry\n    if entry is not _FAIL:\n        entry[0](entry[3], 1, 1, entry[5](), entry[1], entry[2],\n                 None, None, None,\n                 A.data_ptr(), n, nan, posinf, neginf, entry[4])\n        return\n    block = _pick_block(n, _BLOCK_STAGE, _BLOCK_STAGE)\n    _nan_to_num_stage[(triton.cdiv(n, block),)](A, n, nan, posinf, neginf,\n                                                BLOCK=block)\n\n\ndef _legacy_run(A, nan=None, posinf=None, neginf=None):\n    if not A.is_floating_point():\n        return A\n    n = A.numel()\n    if n == 0:\n        return A\n    finfo = _FINFO.get(A.dtype)\n    if finfo is None:\n        finfo = torch.finfo(A.dtype)\n        _FINFO[A.dtype] = finfo\n    if posinf is None and neginf is None:\n        # Defaults give the saturating case; keep the hot path comparison-free.\n        fast = A.element_size() == 2\n        posinf = finfo.max\n        neginf = finfo.min\n    else:\n        if posinf is None:\n            posinf = finfo.max\n        if neginf is None:\n            neginf = finfo.min\n        fast = (A.element_size() == 2 and posinf >= finfo.max\n                and neginf <= finfo.min)\n    if nan is None:\n        nan = 0.0\n    _dispatch(A, n, nan, posinf, neginf, fast)\n    return A\n\n\n_DEFAULT_PLANS = {}\n_DEFAULT_LIMITS = {torch.float16: 65504.0, torch.bfloat16: 3.3895313892515355e38,\n                   torch.float32: 3.4028234663852886e38}\n\n\ndef run(A, nan=None, posinf=None, neginf=None):\n    if posinf is not None or neginf is not None:\n        return _legacy_run(A, nan, posinf, neginf)\n    dtype = A.dtype\n    limit = _DEFAULT_LIMITS.get(dtype)\n    if limit is None:\n        return _legacy_run(A, nan, posinf, neginf)\n    n = A.numel()\n    if not n:\n        return A\n    pointer = A.data_ptr()\n    if not A.is_contiguous() or pointer & 15:\n        return _legacy_run(A, nan, posinf, neginf)\n    key = (dtype, n, A.get_device())\n    entry = _DEFAULT_PLANS.get(key)\n    if entry is None:\n        entry = _build_entry(A, n, dtype != torch.float32)\n        _DEFAULT_PLANS[key] = entry\n    if entry is _FAIL:\n        return _legacy_run(A, nan, posinf, neginf)\n    entry[0](entry[3], 1, 1, entry[5](), entry[1], entry[2], None, None, None,\n             pointer, n, 0.0 if nan is None else nan, limit, -limit, entry[4])\n    return A\n"
+        }
+      ]
+    },
+    "benchmark_fingerprint": "sha256:639db4a65665bf109cfb76bfabb10c913e9b77e8a6b48ebcaff8a09c4bdbbd0c",
+    "case_id": "nan_to_num_-timing-8",
+    "expected_backend": "npu",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "identity": {
+      "solution_sha256": "2aaa7508bbeb4de745106d3987e0152b0b479ee47ae194eea7a9149c89f576bf",
+      "workload_sha256": "1e1ec98244a1050b9ef19048075d0a2e0d7104af7639eef47edd480a4195f7eb"
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "profile_id": "eb63dcc9a8f54bdbb78d4bdf37d1eb69",
+    "created_at": "2026-10-30T06:52:12.047065+00:00",
+    "status": "failed",
+    "backend": "npu",
+    "profiler": "msprof",
+    "device": "npu:0",
+    "hardware": {
+      "target": {
+        "backend": "ascend",
+        "vendor": "huawei",
+        "device": "Ascend910B4-1",
+        "architecture": "dav-c220-cube",
+        "devices": [
+          {
+            "logical_device": "npu:0",
+            "device_id": 0,
+            "name": "Ascend910B4-1",
+            "l2_cache_size": 176160768,
+            "num_sm": 20,
+            "compute_capability": "",
+            "total_memory": 65452113920
+          }
+        ]
+      },
+      "software": {
+        "language": "triton",
+        "language_version": "3.5.1",
+        "compiler": "flagtree",
+        "compiler_version": "0.6.0+ascend.gitc286cba6",
+        "runtime": "cann",
+        "runtime_version": "9.0.0",
+        "driver_version": "25.2.0"
+      },
+      "metadata": {
+        "complete": true,
+        "missing": [],
+        "sources": {
+          "target.backend": "server configuration",
+          "target.vendor": "server configuration",
+          "software.language": "server configuration",
+          "software.compiler": "python package metadata",
+          "software.runtime": "server configuration",
+          "target.device": "device probe",
+          "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+          "software.language_version": "triton module metadata",
+          "software.compiler_version": "python package metadata",
+          "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+          "software.driver_version": "/usr/local/Ascend/driver/version.info"
+        }
+      }
+    },
+    "evaluation_id": "a89c7fd4734a0586d6c2283e210a0c3893e719ee56fb3cbd08938c4b88d6b093:round-1",
+    "options": {
+      "level": "metrics",
+      "warmup": 10,
+      "iterations": 100,
+      "timeout_sec": 600,
+      "backend_options": {}
+    },
+    "capabilities": [],
+    "summary": {
+      "stage_count": 1
+    },
+    "metrics": {},
+    "artifacts": [],
+    "warnings": [],
+    "error": "msprof base collection exited successfully without profile completion marker",
+    "workload_uuid": "nan_to_num_-timing-8"
+  }
+}

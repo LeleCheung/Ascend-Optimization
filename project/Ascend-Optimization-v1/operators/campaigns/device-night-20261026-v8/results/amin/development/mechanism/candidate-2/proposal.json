@@ -1,0 +1,45 @@
+{
+  "config": {
+    "bo": 8,
+    "last_br": 512,
+    "bc": 512,
+    "middle_br": 16,
+    "native": true,
+    "multi": true
+  },
+  "hypothesis": "上一次候选 more_rows(bo=16,last_br=512) 在开发集配对测量里是唯一方向一致的干预（4096x4096 上 fp16 1.11x、fp32 1.05x），但端到端失败；诊断给出的关键事实是：more_rows 的编译后 kernel 元数据哈希与 reexpress_parent 的完全一致（case-2/3 的 amin_native_middle_kernel hash 都是 c802ee…），即中间轴路径上 bo 提高行数并没有改变实际搬运/归约结构，收益只能来自末轴路径。所以本候选改为只改末轴可整除的 last_br：把末轴归约片从 1024 缩短到 512，bo 保持 8，4096%512==0 仍可整除去 mask，归约循环从 4 次变 8 次。目的是把归约片宽度与中间轴默认的有效片宽 512（BC=512）对齐，让两条路径使用相同的片宽和搬运粒度，同时保留多缓冲、native 精度与多行分块不变；父版 OpProf 显示 vec 时间占 88%、mte2 占 37% 且 vec_wait 约 32%，说明缩短归约片后每轮 load 与 minimum 的交替更有机会被多缓冲覆盖，代价是循环指令与标量开销增加。",
+  "predictions": [
+    {
+      "metric": "paired_speedup_4096x4096_fp16",
+      "expected_change": "相对父版 1.00-1.05x；若搬运重叠未改善则可能持平或轻微回退（短归约片在开发集 short_reduction_tile 中曾降到 0.85x，需警惕）"
+    },
+    {
+      "metric": "paired_speedup_4096x4096_fp32",
+      "expected_change": "0.98-1.03x，fp32 字节量大，mte2 压力更高，缩短片后可能因循环开销略降"
+    },
+    {
+      "metric": "paired_speedup_64x512x512_fp16",
+      "expected_change": "落在 1.00±0.02，中间轴路径 kernel 不变（hash 预期与父版一致）"
+    },
+    {
+      "metric": "paired_speedup_64x512x512_fp32",
+      "expected_change": "落在 1.00±0.02，同上"
+    },
+    {
+      "metric": "aiv_vec_ratio",
+      "expected_change": "4096x4096 方向不定：若标量/循环变多则轻微下降，若 stall 减少则上升"
+    },
+    {
+      "metric": "aiv_mte2_ratio",
+      "expected_change": "与 vec 交替更细，可能上升 2-5 个百分点，单次搬运字节减半"
+    },
+    {
+      "metric": "masked",
+      "expected_change": "4096x4096 为 False（4096%512==0、4096%8==0）；64x512x512 仍为 False（512%16==0、512%512==0），非整除形状自动回退 masked=True"
+    },
+    {
+      "metric": "max_abs_error",
+      "expected_change": "不增加（fp16 仍 native 精度，min 运算结果与父版逐值一致）"
+    }
+  ]
+}

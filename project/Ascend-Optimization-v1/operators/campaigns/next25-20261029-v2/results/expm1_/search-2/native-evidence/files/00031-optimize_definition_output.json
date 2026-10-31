@@ -1,0 +1,217 @@
+{
+  "definition_name": "expm1_",
+  "op_type": "",
+  "status": "PASSED",
+  "best_geo_mean": 0.25254005496178433,
+  "best_code": "\"\"\"expm1_ : in-place elementwise ``expm1(A)`` on Ascend, self-contained Triton.\n\nSemantics reproduced from the reference:\n  * ``out = expm1(A)`` is written back into ``A`` storage and ``A`` is returned.\n  * Input dtype (float16 / bfloat16 / float32) is preserved on the output.\n  * Strided (non-contiguous) views are read *and* written through their real\n    element strides so the mutation lands in the right storage slots; the view\n    object itself is returned unchanged.\n\nLayout dispatch (metadata-only decisions in the wrapper):\n  1. contiguous            -> flat kernel, unit stride\n  2. uniformly strided (all element strides == k * contiguous stride, k >= 1)\n                           -> flat kernel with a constexpr stride multiplier\n                              (this covers ``base[..., 0]`` style views)\n  3. anything else         -> generic up-to-8D index math kernel\n\nLaunch path: for the hot contiguous case the wrapper resolves the compiled\nkernel once per (dtype, numel) and then launches that exact Triton kernel\nthrough its own compiled launcher (grid + raw stream handle + device pointer),\nwhich is the same code path ``JITFunction.run`` ends in, minus the per-call\nbinder / cache-key / dispatch work that dominates this tiny workload.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\nfrom triton.runtime import driver as _driver\n\n_BLOCK = 32768\n# Strided (gather/scatter) tiles materialise one address vector per element, so\n# the UB budget forces a much smaller tile than the contiguous path.\n_BLOCK_STRIDED = 512\n\n\n@triton.jit\ndef _expm1_flat(a_ptr, n, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    x = tl.load(a_ptr + offs, mask=mask, other=0.0)\n    y = tl.exp(x.to(tl.float32)) - 1.0\n    tl.store(a_ptr + offs, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _expm1_scaled(a_ptr, n, SCALE: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    idx = offs * SCALE\n    x = tl.load(a_ptr + idx, mask=mask, other=0.0)\n    y = tl.exp(x.to(tl.float32)) - 1.0\n    tl.store(a_ptr + idx, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _expm1_nd(a_ptr, n,\n              s0, s1, s2, s3, s4, s5, s6, s7,\n              t0, t1, t2, t3, t4, t5, t6, t7,\n              NDIM: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    shapes = (s0, s1, s2, s3, s4, s5, s6, s7)\n    strides = (t0, t1, t2, t3, t4, t5, t6, t7)\n    rem = offs\n    off = tl.zeros((BLOCK,), dtype=tl.int32)\n    for i in tl.static_range(8):\n        if i < NDIM:\n            stride = strides[NDIM - 1 - i]\n            size = shapes[NDIM - 1 - i]\n            off += (rem % size) * stride\n            rem = rem // size\n    x = tl.load(a_ptr + off, mask=mask, other=0.0)\n    y = tl.exp(x.to(tl.float32)) - 1.0\n    tl.store(a_ptr + off, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n_DEVICE = [-1]\n_ENTRIES = {}\n\n\ndef _current_stream():\n    \"\"\"Raw rtStream_t handle of the caller's current stream.\"\"\"\n    try:\n        return torch.npu.current_stream().npu_stream\n    except AttributeError:\n        dev = _DEVICE[0]\n        if dev < 0:\n            dev = _driver.active.get_current_device()\n            _DEVICE[0] = dev\n        return _driver.active.get_current_stream(dev)\n\n\ndef _build_entry(A, n):\n    \"\"\"Resolve the compiled flat kernel for this (dtype, numel) once.\"\"\"\n    grid0 = (n + _BLOCK - 1) // _BLOCK\n    try:\n        ck = _expm1_flat.warmup(A, n, BLOCK=_BLOCK, grid=(grid0,))\n        entry = (ck.run, ck.function, ck.packed_metadata, grid0)\n    except Exception:  # pragma: no cover - fall back to the standard JIT path\n        entry = None\n    _ENTRIES[(A.dtype, n)] = entry\n    return entry\n\n\ndef _launch_general(A, n):\n    \"\"\"Non-contiguous fallback: real element strides, in place.\"\"\"\n    shape = A.shape\n    stride = A.stride()\n    dims = []  # (size, stride) inner -> outer\n    for d in range(len(shape) - 1, -1, -1):\n        s = shape[d]\n        if s == 1:\n            continue\n        st = stride[d]\n        if dims and st == dims[-1][0] * dims[-1][1]:\n            dims[-1] = (dims[-1][0] * s, dims[-1][1])\n        else:\n            dims.append((s, st))\n    dims.reverse()\n    if len(dims) == 1:\n        _expm1_scaled[((n + _BLOCK_STRIDED - 1) // _BLOCK_STRIDED,)](\n            A, n, SCALE=dims[0][1], BLOCK=_BLOCK_STRIDED)\n        return\n    if len(dims) > 8:\n        raise RuntimeError(\"expm1_: unsupported tensor rank for strided path\")\n    sizes = [d[0] for d in dims] + [1] * (8 - len(dims))\n    sts = [d[1] for d in dims] + [0] * (8 - len(dims))\n    _expm1_nd[((n + _BLOCK_STRIDED - 1) // _BLOCK_STRIDED,)](\n        A, n, *sizes, *sts, NDIM=len(dims), BLOCK=_BLOCK_STRIDED)\n\n\ndef run(A):\n    n = A.numel()\n    if n == 0:\n        return A\n    if not A.is_contiguous():\n        _launch_general(A, n)\n        return A\n    entry = _ENTRIES.get((A.dtype, n))\n    if entry is None:\n        entry = _build_entry(A, n)\n        if entry is None:\n            _expm1_flat[((n + _BLOCK - 1) // _BLOCK,)](A, n, BLOCK=_BLOCK)\n            return A\n    entry[0](entry[3], 1, 1, _current_stream(), entry[1], entry[2],\n             None, None, None, A.data_ptr(), n, _BLOCK)\n    return A\n",
+  "search_best_geo_mean": 0.2787167951498178,
+  "final_verification": {
+    "status": "PASSED",
+    "reason_code": "VERIFIED",
+    "geo_mean": 0.25254005496178433,
+    "measured_geo_mean": 0.25254005496178433,
+    "comparisons": [
+      {
+        "uuid": "expm1_-timing-0",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.009917705213967962,
+          "latency_ms": 0.04539607292243957
+        },
+        "after": {
+          "reference_latency_ms": 0.01031756657343375,
+          "latency_ms": 0.052568776385328496
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0403179315011934,
+          "latency_ms": 1.1580027302172962
+        }
+      },
+      {
+        "uuid": "expm1_-timing-1",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.009892424742220308,
+          "latency_ms": 0.04574721528970079
+        },
+        "after": {
+          "reference_latency_ms": 0.011499306631052392,
+          "latency_ms": 0.052021251737045325
+        },
+        "ratios": {
+          "reference_latency_ms": 1.1624355939726287,
+          "latency_ms": 1.1371457564709304
+        }
+      },
+      {
+        "uuid": "expm1_-timing-2",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.009627598582247458,
+          "latency_ms": 0.0450434424019971
+        },
+        "after": {
+          "reference_latency_ms": 0.011195905634527424,
+          "latency_ms": 0.05132415286653033
+        },
+        "ratios": {
+          "reference_latency_ms": 1.1628970130902427,
+          "latency_ms": 1.139436733286947
+        }
+      },
+      {
+        "uuid": "expm1_-timing-3",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.023039529849627743,
+          "latency_ms": 0.045402049409729285
+        },
+        "after": {
+          "reference_latency_ms": 0.023017264026225937,
+          "latency_ms": 0.05125605567425898
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9990335816942825,
+          "latency_ms": 1.1289370488917891
+        }
+      },
+      {
+        "uuid": "expm1_-timing-4",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.009944462537742171,
+          "latency_ms": 0.04547795982997007
+        },
+        "after": {
+          "reference_latency_ms": 0.010413746427761024,
+          "latency_ms": 0.05123070480587413
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0471904729127173,
+          "latency_ms": 1.1264952297203312
+        }
+      },
+      {
+        "uuid": "expm1_-timing-5",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.009955760211338966,
+          "latency_ms": 0.04584364242048122
+        },
+        "after": {
+          "reference_latency_ms": 0.010418354534691749,
+          "latency_ms": 0.051878862663512805
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0464649924800236,
+          "latency_ms": 1.131647921595673
+        }
+      },
+      {
+        "uuid": "expm1_-timing-6",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.009635313246871589,
+          "latency_ms": 0.0459868076472601
+        },
+        "after": {
+          "reference_latency_ms": 0.010036880349244619,
+          "latency_ms": 0.05152280461157286
+        },
+        "ratios": {
+          "reference_latency_ms": 1.0416766006547231,
+          "latency_ms": 1.1203822845624858
+        }
+      },
+      {
+        "uuid": "expm1_-timing-7",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.02504129064731588,
+          "latency_ms": 0.045377510879314804
+        },
+        "after": {
+          "reference_latency_ms": 0.02505962371174604,
+          "latency_ms": 0.05109292628977565
+        },
+        "ratios": {
+          "reference_latency_ms": 1.000732113399759,
+          "latency_ms": 1.1259525985385461
+        }
+      },
+      {
+        "uuid": "expm1_-timing-8",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.009973718906925236,
+          "latency_ms": 0.04607831157120167
+        },
+        "after": {
+          "reference_latency_ms": 0.00984625856468609,
+          "latency_ms": 0.05112261196633178
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9872203795365995,
+          "latency_ms": 1.1094723357503127
+        }
+      },
+      {
+        "uuid": "expm1_-timing-9",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.00984327612535515,
+          "latency_ms": 0.046168773833611315
+        },
+        "after": {
+          "reference_latency_ms": 0.009824777779289966,
+          "latency_ms": 0.05025922214530615
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9981207124711726,
+          "latency_ms": 1.0885977246533878
+        }
+      },
+      {
+        "uuid": "expm1_-timing-10",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.01005050832419934,
+          "latency_ms": 0.04626160022559537
+        },
+        "after": {
+          "reference_latency_ms": 0.009979314308226956,
+          "latency_ms": 0.05110599703705462
+        },
+        "ratios": {
+          "reference_latency_ms": 0.9929163765974934,
+          "latency_ms": 1.1047174500630215
+        }
+      },
+      {
+        "uuid": "expm1_-timing-11",
+        "axes": {},
+        "before": {
+          "reference_latency_ms": 0.03963093638261659,
+          "latency_ms": 0.05086695700433444
+        },
+        "after": {
+          "reference_latency_ms": 0.032658924491765835,
+          "latency_ms": 0.05914489147984777
+        },
+        "ratios": {
+          "reference_latency_ms": 0.8240765289131825,
+          "latency_ms": 1.1627369703835038
+        }
+      }
+    ],
+    "drift": [],
+    "drift_factor": 2.0,
+    "compared_to": "original_round",
+    "attempt_path": ".kernelgen/retests/89108e3e97ed0b47df1ccf534de1224b2909c9c04db52ad3ba73f0180c57924c/6f34815d3fd9efd53c87a39244ecda2457cfc4af8370f999b619bd6707c8d837/attempt-0001.json",
+    "round_num": 3,
+    "solution_sha256": "89108e3e97ed0b47df1ccf534de1224b2909c9c04db52ad3ba73f0180c57924c"
+  },
+  "rounds": 3,
+  "summary": "A self-contained Triton candidate now passes all 30 authoritative workloads (geo_mean 0.2787, round 3, up from 0.1713 in round 2 and a PARTIAL_PASS seed) by combining a stride-aware in-place kernel (flat kernel for contiguous input, 512-element gather/scatter tiles for views, real element strides so 7x9 strided special-value cases match exactly) with a pre-resolved CompiledKernel launch path that bypasses Triton's per-call JIT binder/cache-key dispatch. Bounded target probes localized the remaining bottleneck precisely: device time is program-count bound (~36 ns/program, so a 32768 tile took the 16.7M cases from ~100 us to ~28 us of device time and speedup 0.15 to 0.51-0.78), while the nine <=1M-element cases are host-bound at ~45 us per call against torch's 5-7 us submit and a 16.8 us bare-launcher floor, so the last ~28 us is wrapper host work (the per-call stream query being the prime suspect).",
+  "workspace": "/data/hanle/ascend-optimization/runs/next25-20261029-v2/kg-runs/expm1_-next25-20261029-v2-attempt-2/stages/optimize/work"
+}
