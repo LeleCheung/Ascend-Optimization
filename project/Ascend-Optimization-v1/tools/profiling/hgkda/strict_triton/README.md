@@ -10,7 +10,7 @@
 2. `gate.py`按AST查找已知禁止的外部库、厂商接口及宿主Tensor计算；`review.py`记录实际人工逐文件、逐分支审查与固定依赖身份。静态扫描不是完整程序证明，不能仅凭“导入Triton”或backend标签准入。
 3. `runtime_audit.py`在候选调用范围内使用TorchDispatchMode拒绝非许可ATen计算，输入和参考生成在范围外。全部原正确性输入与最大性能输入检查；未触发分支由源码审查补齐。该检查不替代数值测试，也不作性能计时。
 4. 使用原PyTorch语义做独立补测和一次完整KGS；使用本机已完成资格验证的CANN参考作性能及语义对照。候选源码完全相同且合同、参数和补测一致时，复用已有CANN原始请求，不重新测高分。
-5. 数值通过的候选采集一项代表输入trace。采到文件不等于捕获设备任务：本轮发现厂商解析器未输出设备任务，原空trace如实保留。`verify_compiled.py`在完整队列结束后持同一卡锁，提取代表输入实际调用返回的Triton编译对象，核验TTIR、npubin及逐文件SHA；与源码全路径、依赖和运行时审查共同作为后端证据。实际IR不能伪称为成功的硬件trace。
+5. 数值通过的候选采集一项代表输入trace。采到文件不等于捕获设备任务：首遍selu_、rad2deg_、log10_选到shape[0]空输入，原空trace保留，`complete_delivery.py`在原合同非空输入补采。`verify_compiled.py`在完整队列结束后持同一卡锁，提取代表输入实际调用返回的Triton编译对象，核验TTIR、npubin及逐文件SHA；与源码全路径、依赖和运行时审查共同作为后端证据。实际IR不能伪称为成功的硬件trace。
 6. `report.py`核验源码、请求、计时参数和逐case几何平均，重建两张中文表。原语义／补测失败、相对CANN未过0.8×、参考资格不足分别列示。
 
 ## 无人值守运行
@@ -31,6 +31,8 @@ cd /data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimizati
 ```
 
 QKV历史C++宿主桥经逐函数审查后允许恢复：只分配、取元数据与当前stream、打包参数并调用Triton生成启动器。`restore_host_glue.py`将候选、C++源码和二进制绑定SHA；未审查外部库仍被拒绝。旧纯Python宿主复核结果单独归档，不覆写。对同字节、同合同、同计时的既有完整结果保留原始请求，复用时明确标记，不重测挑分。
+
+复用CANN成绩时，最终bundle审计使用该请求实际提交的历史catalog；本批重新拼接的CANN包装少了一行说明注释，因此tar哈希不同。审计同时核对输入文件逐字节相同、参考包装AST相同以及历史bundle哈希与请求一致，不把新生成的bundle冒充历史请求身份。
 
 `delivery.json`中的当前达标数要求原合同与补测通过、后端审查通过、相对合格CANN参考超过0.8×，以及实际Triton编译路径核验通过。单接口与兼容／组合参考在表内分开标注；参考不合格或缺失不能算作CANN对照达标。
 

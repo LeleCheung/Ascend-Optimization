@@ -81,7 +81,7 @@ def main():
         '所有加速比为KGS完整调用；合格CANN单接口与兼容／组合分别标注。历史混合实现不计入。','']
     for group in ['1015','1029']:
         lines+=['## '+group+'（%d/%d）'%(groups[group]['accepted'],groups[group]['total']),'',
-            '|算子|参考类型|相对CANN|相对PyTorch|原合同|状态|','|---|---|---:|---:|---|---|']
+            '|算子|候选后端|参考类型|相对CANN|相对PyTorch|原合同|补测|状态|','|---|---|---|---:|---:|---|---|---|']
         for r in rows:
             if r['group']!=group:continue
             fmt=lambda x:'%.3f×'%x['score'] if x.get('status')=='PASSED' and x.get('score') is not None else '—'
@@ -96,9 +96,14 @@ def main():
                   'CANN_FP32_state_compatibility_composition':'CANN FP32状态组合',
                   'CANN_Add_Muls_Cumsum_composition':'CANN累计积分组合',
                   }.get(r['reference_kind'],r['reference_kind'] or '无同语义参考')
-            lines.append('|'+r['operator']+'|'+kind+'|'+fmt(r['cann'])+'|'+fmt(p)+'|'+complete+'|'+r['status']+'|')
+            backend='Triton＋C++宿主' if r['review'].get('reviewed_host_bridges') else 'Triton'
+            gates=lambda v:('%s/%s'%(v['passed'],v['total'])) if v.get('passed') is not None and v.get('total') else v.get('status','—')
+            extra='原：'+gates(r['supplementary'])+'；CANN：'+gates(r['cann_supplementary'])
+            source=Path(r['source']).relative_to(BATCH).as_posix()
+            lines.append('|['+r['operator']+']('+source+')|'+backend+'|'+kind+'|'+fmt(r['cann'])+'|'+fmt(p)+'|'+complete+'|'+extra+'|'+r['status']+'|')
         lines.append('')
     lines+=['`fractional_max_pool3d`、`_conj_physical`的PyTorch参考含CPU回退；该列只保留原合同结果，不能解释为相对纯NPU实现的收益。',
+        '算子名链接本轮冻结源码；来源、审查、归属与SHA见`candidate-index.json`及每项`review.json`。完整原始成绩和复用标记见`delivery.json`。',
         '所有门槛使用未舍入的原始加速比判断。参考资格、原正确性、补测、后端与编译路径任何一项未通过，均不计为本轮达标。','']
     (BATCH/'严格Triton30项总表.md').write_bytes((chr(10).join(lines)+chr(10)).encode('utf8'))
     print('STRICT_REPORT',result['accepted'],groups,flush=True)

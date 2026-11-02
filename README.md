@@ -12,7 +12,9 @@
 
 ## 当前状态
 
-2026-11-02目标纠偏：此前把部分候选改成Ascend C／CANN／DMA混合实现，偏离了严格Triton目标。历史25/30、7/10＋18/20和原PyTorch口径总数不能直接作为严格Triton达标数；**当前严格Triton总数待按源码与全部调用路径重建**。以下日期记录及其附件保留历史口径，不覆盖此硬约束。
+2026-11-02目标纠偏：此前把部分候选改成Ascend C／CANN／DMA混合实现，偏离了严格Triton目标。历史25/30、7/10＋18/20和原PyTorch口径总数不能直接作为严格Triton达标数；**现已重新核验：严格Triton达标16/30，1015为6/10、1029为10/20**。以下日期记录及其附件保留历史口径，不覆盖此硬约束。
+
+2026-11-02完成[严格Triton重新核验](project/Ascend-Optimization-v1/operators/campaigns/strict-triton-20261102/复核结果简报.md)：**16/30达标（原10项6项、新20项10项）**，相对合格CANN参考超过0.8×；另9项性能未过线、2项原语义或补测失败、3项因参考不合格／缺失单列。30项后端、原合同与请求身份、运行时及实际TTIR／设备二进制核验完成；25项CANN参考资格重核。QKV只用C++宿主胶水，设备计算仍为Triton。本轮为源码恢复、存储路径修复和重新验收，未新增CC／DeepSeek搜索；历史混合后端记录保留。见[10＋20总表](project/Ascend-Optimization-v1/operators/campaigns/strict-triton-20261102/严格Triton30项总表.md)和[一次复测入口](project/Ascend-Optimization-v1/tools/profiling/hgkda/strict_triton/README.md)。
 
 2026-11-02完成[CANN优先对照与优化](project/Ascend-Optimization-v1/operators/campaigns/cann-priority-20261102/结果简报.md)：30项中建立25项合格CANN参考，25项候选相对各自参考超过0.8×；其中20项为直接CANN接口，5项为明确命名的兼容／组合参考。新增跨线`hardswish_out` **1.395×**、`rad2deg_` **1.297×**、`transform_bias_rescale_qkv` **0.931×**，相对同批起点的候选实际加速分别为2.184×、1.600×、1.224×。三项由Codex直接实现宿主桥／自写Ascend C，保留历史KG Triton布局路径；未额外运行模型搜索。原PyTorch24项成绩另列，Uniform范围、Expm1小值精度、累计积分不稳定以及池化／求逆参考缺口继续保留。详见[30项总表](project/Ascend-Optimization-v1/operators/campaigns/cann-priority-20261102/CANN优先30项总表.md)与[复现工具](project/Ascend-Optimization-v1/tools/profiling/hgkda/cann_priority/README.md)。
 

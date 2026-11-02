@@ -2,7 +2,9 @@
 
 **用户硬约束：CANN／Ascend C用于baseline，优化候选严格使用Triton。** 所有计算、复制、归约、扫描、布局转换和回退路径均须由Triton kernel实现；Python／C++仅可作宿主胶水。完整规则见[硬性规则](../../docs/Triton候选与CANN参考硬性规则.md)。
 
-2026-11-02纠偏：下列25/30、24项及其他历史汇总包含Ascend C／CANN／DMA混合候选，不能直接计作严格Triton成果。**严格Triton最新达标数量待重建**；先按源码逐路径审核，再恢复Triton候选并使用KGS验证，原始证据保留。
+2026-11-02纠偏：下列25/30、24项及其他历史汇总包含Ascend C／CANN／DMA混合候选，不能直接计作严格Triton成果。**严格Triton已重新核验为16/30（1015为6/10、1029为10/20）**；先按源码逐路径审核，再恢复Triton候选并使用KGS验证，原始证据保留。
+
+2026-11-02完成[严格Triton复核](operators/campaigns/strict-triton-20261102/复核结果简报.md)：**16项超过合格CANN参考0.8×门槛，9项性能未达标，2项数值／补测失败，3项参考缺口单列**。30项源码、原输入/容差、正式请求、运行时和实际编译产物核验完成；所有设备工作严格Triton，QKV仅使用C++宿主启动胶水。见[新10＋20总表](operators/campaigns/strict-triton-20261102/严格Triton30项总表.md)和[复现工具](tools/profiling/hgkda/strict_triton/README.md)。
 
 2026-11-02完成[CANN优先批次](operators/campaigns/cann-priority-20261102/结果简报.md)：25项合格CANN参考下，25项候选超过0.8×；20项直接接口、5项兼容／组合分别登记。新跨线三项为`hardswish_out` 1.395×、`rad2deg_` 1.297×、`transform_bias_rescale_qkv` 0.931×。自写核通过60项专项检查，三项通过原PyTorch与CANN完整KGS、布局补测及成对路径采集。新增源码由Codex直接实现，历史KG Triton路径保留，本批没有追加CC模型搜索。原PyTorch24项与其余5项参考问题继续单列；见[30项表](operators/campaigns/cann-priority-20261102/CANN优先30项总表.md)及[复现步骤](tools/profiling/hgkda/cann_priority/README.md)。
 

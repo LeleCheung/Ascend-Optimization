@@ -44,8 +44,10 @@ def execute(operators=None):
         if row.get('runtime',{}).get('status')!='passed':continue
         leaf=BATCH/runner.q.records[op]['catalog_leaf']
         cases=[json.loads(x) for x in (leaf/'correctness.jsonl').read_text().splitlines() if x.strip()]
-        case=next((v for v in cases if v.get('inputs')),cases[0])
-        directory=source.parent/'actual-compiled-v1';manifest=directory/'ir/manifest.json'
+        timing=[json.loads(x) for x in (leaf/'timing.jsonl').read_text().splitlines() if x.strip()]
+        # 正确性首项可能是空张量；取原性能合同的首个非空工作负载，不更改输入。
+        case=timing[0] if timing else cases[-1]
+        directory=source.parent/'actual-compiled-v2';manifest=directory/'ir/manifest.json'
         directory.mkdir(parents=True,exist_ok=True)
         spec=directory/'spec.json';payload=dict(operator=op,source=str(source),source_sha256=sha(source),leaf=str(leaf),case=case)
         if spec.exists():assert read(spec)==payload
