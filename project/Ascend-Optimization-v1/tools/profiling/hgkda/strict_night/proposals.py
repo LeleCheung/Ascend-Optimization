@@ -137,6 +137,25 @@ def process(runner):
                     entry['out_api_probe']=str(probe)
                     entry['out_api_probe_checker']=str(frozen)
                     if not out_api_probe.qualified(read(probe),sha(source)):entry['qualification']='failed_out_api_probe'
+                if spec.get('exact_expm1_probe') and entry['qualification']=='passed':
+                    assert op=='expm1_'
+                    from expm1_exact_probe import qualified
+                    checker=HERE/'expm1_exact_probe.py'
+                    probe=out/'exact-expm1-probe'
+                    result_file=probe/'result.json'
+                    if result_file.exists():
+                        frozen=out/('exact-expm1-checker-'+read(result_file)['checker_sha256']+'.py')
+                        assert sha(frozen)==read(result_file)['checker_sha256']
+                    else:
+                        assert not probe.exists(), '整块补测有未知终态，不重发'
+                        frozen=out/('exact-expm1-checker-'+sha(checker)+'.py')
+                        if frozen.exists():assert frozen.read_bytes()==checker.read_bytes()
+                        else:frozen.write_bytes(checker.read_bytes())
+                        runner.cmd(key+'-exact-math',[PY,frozen,'--source',source,'--output',probe],900)
+                    entry['exact_expm1_probe']=str(result_file)
+                    entry['exact_expm1_checker']=str(frozen)
+                    if not qualified(read(result_file),sha(source)):
+                        entry['qualification']='failed_exact_expm1_probe'
                 row=runner.state['operators'].setdefault(op,dict(attempts=[]))
                 row.setdefault('proposals',[]).append(entry)
                 result=dict(status='evaluated',entry=entry)

@@ -1,0 +1,69 @@
+"""针对已证实的8192整块UB溢出，单CPU检查缓冲复用/向量化编译选项。"""
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import time
+
+
+def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+def forbidden(*args,**kwargs):raise RuntimeError('禁止设备初始化、加载和提交')
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--source',type=Path,required=True)
+    parser.add_argument('--output',type=Path,required=True)
+    args=parser.parse_args()
+    assert not args.output.exists()
+    args.output.mkdir(parents=True)
+    os.sched_setaffinity(0,{min(os.sched_getaffinity(0))})
+    os.environ['OMP_NUM_THREADS']='1';os.environ['TRITON_ASCEND_ARCH']='Ascend910B4'
+    os.environ['TRITON_CACHE_DIR']=str(args.output/'compiler-cache')
+    import torch
+    import torch_npu
+    torch.npu._lazy_init=forbidden
+    import triton
+    from triton.backends.compiler import GPUTarget
+    from triton.compiler import ASTSource
+    from triton.compiler.compiler import CompiledKernel
+    class NoRuntime:
+        def __getattr__(self,name):forbidden()
+    triton.runtime.driver.set_active(NoRuntime());CompiledKernel._init_handles=forbidden
+    spec=importlib.util.spec_from_file_location('expm1_ub_options',args.source)
+    candidate=importlib.util.module_from_spec(spec);spec.loader.exec_module(candidate)
+    variants=[('ubuf',dict(enable_ubuf_saving=True)),
+              ('vectorize',dict(enable_auto_vectorize_v2=True)),
+              ('ubuf-vectorize',dict(enable_ubuf_saving=True,enable_auto_vectorize_v2=True)),
+              ('single-buffer',dict(num_stages=1,multibuffer=False,enable_ubuf_saving=True))]
+    rows=[]
+    for name,options in variants:
+        for dtype in ['fp16','bf16','fp32']:
+            row=dict(variant=name,options=options,dtype=dtype,block=8192)
+            started=time.monotonic()
+            try:
+                compiled=triton.compile(ASTSource(candidate._expm1_exact,
+                    dict(a_ptr='*'+dtype,n='i32'),dict(NARROW=int(dtype!='fp32'),BLOCK=8192)),
+                    target=GPUTarget('npu','Ascend910B4',0),options=dict(num_warps=32,**options))
+                assert compiled.module is None and compiled.function is None and compiled._run is None
+                folder=args.output/name/dtype;folder.mkdir(parents=True)
+                artifacts={}
+                for kind in ['ttir','ttadapter','npubin']:
+                    raw=compiled.asm[kind]
+                    path=folder/('kernel.'+kind)
+                    path.write_bytes(raw.encode() if isinstance(raw,str) else raw)
+                    artifacts[kind]=dict(path=str(path),sha256=sha(path))
+                row.update(status='compiled_without_runtime',artifacts=artifacts)
+            except Exception as error:
+                row.update(status='compile_failed',error=type(error).__name__+': '+str(error)[:5000])
+            row['elapsed_seconds']=time.monotonic()-started;rows.append(row)
+            value=dict(source=str(args.source),source_sha256=sha(args.source),checker_sha256=sha(__file__),
+                rows=rows,device_executed=False,performance_measured=False,
+                scope='固定8192数学核，仅检查编译器缓冲复用/向量化选项是否消除UB溢出；不替代NPU数值或性能结果。')
+            (args.output/'result.json').write_text(json.dumps(value,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
+            print(json.dumps({k:v for k,v in row.items() if k not in {'artifacts','error'}}),flush=True)
+
+
+if __name__=='__main__':main()

@@ -70,6 +70,12 @@ def main():
         return target
     def materialize(row,best):
         source=track(best['source']);digest=sha(source);assert digest==best['source_sha256']
+        if best.get('exact_expm1_probe'):
+            from expm1_exact_probe import qualified as exact_qualified
+            extra=read(track(best['exact_expm1_probe']))
+            assert exact_qualified(extra,digest),'8192整块实际路径补测未通过'
+            assert sha(track(best['exact_expm1_checker']))==extra['checker_sha256']
+            row['exact_expm1_probe']=dict(path=best['exact_expm1_probe'],passed=extra['passed'],total=extra['total'])
         if best.get('out_api_probe'):
             import importlib
             import out_api_probe
