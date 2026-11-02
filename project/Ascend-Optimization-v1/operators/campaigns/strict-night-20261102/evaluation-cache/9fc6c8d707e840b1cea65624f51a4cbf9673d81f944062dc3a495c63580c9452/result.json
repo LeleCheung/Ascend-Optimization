@@ -1,0 +1,344 @@
+{
+  "identity": {
+    "source": "import torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef _round_coordinate(value, DT: tl.constexpr):\n    \"\"\"Round a coordinate expression to the scalar dtype used by the reference.\"\"\"\n    if DT == tl.float16:\n        a = tl.abs(value)\n        bits = a.to(tl.int32, bitcast=True)\n        rounded = (bits + 4095 + (bits >> 13 & 1) & -8192).to(tl.float32, bitcast=True)\n        units = tl.minimum(a, 6.103515625e-05) * 16777216.0\n        lower = tl.floor(units)\n        fraction = units - lower\n        add = (fraction > 0.5) | (fraction == 0.5) & (lower.to(tl.int32) & 1 != 0)\n        subnormal = (lower + add.to(tl.float32)) * 5.960464477539063e-08\n        rounded = tl.where(a < 6.103515625e-05, subnormal, rounded)\n        rounded = tl.where(rounded > 65504.0, float('inf'), rounded)\n        return tl.where(value < 0.0, -rounded, rounded)\n    elif DT == tl.bfloat16:\n        bits = value.to(tl.int32, bitcast=True)\n        rounded = (bits + 32767 + (bits >> 16 & 1) & -65536).to(tl.float32, bitcast=True)\n        return tl.where(tl.abs(value) < float('inf'), rounded, value)\n    else:\n        return value\n\n\n@triton.jit\ndef _alpha_of(in_size, out_size, K: tl.constexpr, DT: tl.constexpr):\n    return _round_coordinate(\n        _round_coordinate(tl.cast(in_size - K, tl.float32), DT)\n        / _round_coordinate(tl.cast(tl.maximum(out_size - 1, 1), tl.float32), DT),\n        DT)\n\n\n@triton.jit\ndef _start_of(index, sample, alpha, limit, K: tl.constexpr, DT: tl.constexpr):\n    base = _round_coordinate(sample * alpha, DT).to(tl.int32)\n    shifted = _round_coordinate(tl.cast(index, tl.float32) + sample, DT)\n    return _round_coordinate(shifted * alpha, DT).to(tl.int32) - base\n\n\n@triton.jit\ndef _pool_plane_kernel(in_ptr, out_ptr, idx_ptr, samp_ptr,\n                       s_n, s_c, s_d, s_h, s_w, ss_n, ss_c,\n                       in_c, in_d, in_h, in_w, out_d, out_h, out_w,\n                       IH: tl.constexpr, IW: tl.constexpr,\n                       OH: tl.constexpr, OW: tl.constexpr,\n                       IHB: tl.constexpr, HBLOCKS: tl.constexpr,\n                       KD: tl.constexpr, KH: tl.constexpr, KW: tl.constexpr,\n                       WRITE_IDX: tl.constexpr):\n    \"\"\"One program per (n, c, output_depth) plane.\n\n    The input plane is fetched with affine contiguous loads (row blocks) and the\n    pooling windows are applied with in-register masks, so no data-dependent\n    (scalarised) gather addresses are issued.\n    \"\"\"\n    pid = tl.program_id(0)\n    nc = pid // out_d\n    do = pid % out_d\n    ni = nc // in_c\n    ci = nc % in_c\n    samp = samp_ptr + ni * ss_n + ci * ss_c\n    sample_d = tl.load(samp).to(tl.float32)\n    sample_h = tl.load(samp + 1).to(tl.float32)\n    sample_w = tl.load(samp + 2).to(tl.float32)\n    dt: tl.constexpr = samp_ptr.dtype.element_ty\n    alpha_d = _alpha_of(in_d, out_d, KD, dt)\n    alpha_h = _alpha_of(in_h, out_h, KH, dt)\n    alpha_w = _alpha_of(in_w, out_w, KW, dt)\n    d_start = _start_of(do, sample_d, alpha_d, in_d, KD, dt)\n    d_start = tl.where(do == out_d - 1, in_d - KD, d_start)\n    ho = tl.arange(0, OH)\n    wo = tl.arange(0, OW)\n    h_start = _start_of(ho, sample_h, alpha_h, in_h, KH, dt)\n    w_start = _start_of(wo, sample_w, alpha_w, in_w, KW, dt)\n    h_start = tl.where(ho == out_h - 1, in_h - KH, h_start)\n    w_start = tl.where(wo == out_w - 1, in_w - KW, w_start)\n    ww = tl.arange(0, IW)\n    w_in = (ww[None, :] >= w_start[:, None]) & (ww[None, :] < w_start[:, None] + KW)\n    hhi = tl.arange(0, IHB)\n    plane = in_ptr + ni * s_n + ci * s_c + d_start * s_d\n    best_v = tl.full((OH, OW), float('-inf'), tl.float32)\n    best_c = tl.zeros((OH, OW), tl.int32)\n    for kd in tl.static_range(KD):\n        for hb in tl.static_range(HBLOCKS):\n            rows = hb * IHB + hhi\n            vals = tl.load(plane + kd * s_d + rows[:, None] * s_h + ww[None, :],\n                           mask=(rows[:, None] < in_h) & (ww[None, :] < in_w),\n                           other=float('-inf')).to(tl.float32)\n            row_max = tl.max(tl.where(w_in[None, :, :], vals[:, None, :], float('-inf')), axis=2)\n            w_sel = tl.min(tl.where(w_in[None, :, :] & (vals[:, None, :] == row_max[:, :, None]),\n                                    ww[None, None, :], IW), axis=2)\n            packed = rows[:, None] * in_w + w_sel\n            row_in = (rows[None, :] >= h_start[:, None]) & (rows[None, :] < h_start[:, None] + KH)\n            top = tl.max(tl.where(row_in[:, :, None], row_max[None, :, :], float('-inf')), axis=1)\n            pick = tl.min(tl.where(row_in[:, :, None] & (row_max[None, :, :] == top[:, None, :]),\n                                   packed[None, :, :], IH * in_w), axis=1)\n            take = (top > best_v) | (top != top)\n            best_v = tl.where(take, top, best_v)\n            best_c = tl.where(take, (d_start + kd) * (in_h * in_w) + pick, best_c)\n    off = ((nc * out_d + do) * out_h + ho[:, None]) * out_w + wo[None, :]\n    m = (ho[:, None] < out_h) & (wo[None, :] < out_w)\n    tl.store(out_ptr + off, best_v, mask=m)\n    if WRITE_IDX:\n        tl.store(idx_ptr + off, best_c.to(tl.int64), mask=m)\n\n\n@triton.jit\ndef _combine_max_idx(a_val, a_idx, b_val, b_idx):\n    take_b = (b_val > a_val) | (b_val != b_val)\n    return (tl.where(take_b, b_val, a_val), tl.where(take_b, b_idx, a_idx))\n\n\n@triton.jit\ndef _pool_flat_kernel(in_ptr, out_ptr, idx_ptr, samp_ptr, s_n, s_c, s_d, s_h, s_w, ss_n, ss_c, in_c, in_d, in_h, in_w, out_d, out_h, out_w, alpha_d, alpha_h, alpha_w, KD: tl.constexpr, KH: tl.constexpr, KW: tl.constexpr, BLOCK_W: tl.constexpr, WRITE_IDX: tl.constexpr):\n    \"\"\"Fallback gather kernel: any strides, any window geometry.\"\"\"\n    nc = tl.program_id(0)\n    linear = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)\n    mask = linear < out_d * out_h * out_w\n    wo = linear % out_w\n    ho = linear // out_w % out_h\n    do = linear // (out_h * out_w)\n    ni = nc // in_c\n    ci = nc % in_c\n    samp = samp_ptr + ni * ss_n + ci * ss_c\n    sd = tl.load(samp).to(tl.float32)\n    sh = tl.load(samp + 1).to(tl.float32)\n    sw = tl.load(samp + 2).to(tl.float32)\n    dt: tl.constexpr = samp_ptr.dtype.element_ty\n    ad = _alpha_of(in_d, out_d, KD, dt)\n    ah = _alpha_of(in_h, out_h, KH, dt)\n    aw = _alpha_of(in_w, out_w, KW, dt)\n    ds = _start_of(do, sd, ad, in_d, KD, dt)\n    hs = _start_of(ho, sh, ah, in_h, KH, dt)\n    ws = _start_of(wo, sw, aw, in_w, KW, dt)\n    ds = tl.where(do == out_d - 1, in_d - KD, ds)\n    hs = tl.where(ho == out_h - 1, in_h - KH, hs)\n    ws = tl.where(wo == out_w - 1, in_w - KW, ws)\n    best = tl.full((BLOCK_W,), float('-inf'), tl.float32)\n    index = ds * in_h * in_w + hs * in_w + ws\n    base = in_ptr + ni * s_n + ci * s_c\n    for di in tl.static_range(KD):\n        for hi in tl.static_range(KH):\n            for wi in tl.static_range(KW):\n                d = ds + di\n                h = hs + hi\n                w = ws + wi\n                valid = mask & (d >= 0) & (d < in_d) & (h >= 0) & (h < in_h) & (w >= 0) & (w < in_w)\n                value = tl.load(base + d * s_d + h * s_h + w * s_w, mask=valid, other=float('-inf')).to(tl.float32)\n                take = (value > best) | (value != value)\n                best = tl.where(take, value, best)\n                index = tl.where(take, d * in_h * in_w + h * in_w + w, index)\n    offset = nc * out_d * out_h * out_w + linear\n    tl.store(out_ptr + offset, best, mask)\n    if WRITE_IDX:\n        tl.store(idx_ptr + offset, index.to(tl.int64), mask)\n\n\ndef _triple(value):\n    if isinstance(value, int):\n        return (value, value, value)\n    if len(value) == 1:\n        return (value[0], value[0], value[0])\n    return (value[0], value[1], value[2])\n\n\ndef _next_pow2(n):\n    return 1 << max(0, int(n) - 1).bit_length() if n > 0 else 1\n\n\ndef fractional_max_pool3d(input: torch.Tensor, kernel_size, output_size=None, output_ratio=None, return_indices: bool=True, _random_samples=None):\n    \"\"\"Fractional max pooling 3d (stochastic pooling regions).\n\n    Args:\n        input: 5D (N, C, D, H, W) or 4D (C, D, H, W) input tensor.\n        kernel_size: Pooling window size (int or triple).\n        output_size: Target output spatial size (int or triple).\n        output_ratio: Alternative to output_size, output as a ratio.\n        return_indices: Whether to also return the max indices.\n        _random_samples: Optional tensor of shape (N, C, 3) (or (C, 3)) with\n            values in [0, 1) selecting the pooling region offsets.\n    \"\"\"\n    squeeze = False\n    if input.dim() == 4:\n        input = input.unsqueeze(0)\n        squeeze = True\n        if _random_samples is not None and _random_samples.dim() == 2:\n            _random_samples = _random_samples.unsqueeze(0)\n    elif input.dim() != 5:\n        raise AssertionError(f'Expected 5D input, got {input.dim()}D')\n    in_n, in_c, in_d, in_h, in_w = input.shape\n    kernel_d, kernel_h, kernel_w = _triple(kernel_size)\n    if output_size is not None:\n        out_d, out_h, out_w = _triple(output_size)\n    elif output_ratio is not None:\n        if isinstance(output_ratio, float):\n            ratio_d = ratio_h = ratio_w = output_ratio\n        else:\n            ratio_d, ratio_h, ratio_w = output_ratio\n        out_d = int(in_d * ratio_d)\n        out_h = int(in_h * ratio_h)\n        out_w = int(in_w * ratio_w)\n    else:\n        raise ValueError('Either output_size or output_ratio must be specified')\n    out_d = int(out_d)\n    out_h = int(out_h)\n    out_w = int(out_w)\n    assert out_d + kernel_d - 1 <= in_d, f'fractional_max_pool3d: kernel_d ({kernel_d}) + output_d ({out_d}) - 1 exceeds input_d ({in_d})'\n    assert out_h + kernel_h - 1 <= in_h, f'fractional_max_pool3d: kernel_h ({kernel_h}) + output_h ({out_h}) - 1 exceeds input_h ({in_h})'\n    assert out_w + kernel_w - 1 <= in_w, f'fractional_max_pool3d: kernel_w ({kernel_w}) + output_w ({out_w}) - 1 exceeds input_w ({in_w})'\n    out_shape = (in_n, in_c, out_d, out_h, out_w)\n    output = torch.empty(out_shape, dtype=input.dtype, device=input.device)\n    if return_indices:\n        indices = torch.empty(out_shape, dtype=torch.int64, device=input.device)\n    else:\n        indices = output\n    if output.numel() == 0:\n        if squeeze:\n            output = output.squeeze(0)\n            if return_indices:\n                indices = indices.squeeze(0)\n        return (output, indices) if return_indices else output\n    alpha_d = (in_d - kernel_d) / (out_d - 1) if out_d > 1 else 0.0\n    alpha_h = (in_h - kernel_h) / (out_h - 1) if out_h > 1 else 0.0\n    alpha_w = (in_w - kernel_w) / (out_w - 1) if out_w > 1 else 0.0\n    s_n, s_c, s_d, s_h, s_w = input.stride()\n    if _random_samples is None:\n        _random_samples = _strict_rand((in_n, in_c, 3), device=input.device, dtype=input.dtype)\n    else:\n        assert _random_samples.shape == (in_n, in_c, 3), f'_random_samples must have shape ({in_n}, {in_c}, 3), got {_random_samples.shape}'\n        if _random_samples.stride(-1) != 1:\n            _random_samples = _strict_contiguous(_random_samples)\n    ih_pad = _next_pow2(in_h)\n    iw_pad = _next_pow2(in_w)\n    oh_pad = _next_pow2(out_h)\n    ow_pad = _next_pow2(out_w)\n    ihb = 1\n    while ihb * 2 <= ih_pad and ihb * 2 * ow_pad * iw_pad <= 4096:\n        ihb *= 2\n    hblocks = ih_pad // ihb\n    contiguous_plane = (s_w == 1 and s_h == in_w and s_d == in_h * in_w)\n    if (contiguous_plane and kernel_d <= 8 and kernel_h <= 32 and kernel_w <= 32\n            and ow_pad * iw_pad * ihb <= 4096 and oh_pad * ihb * ow_pad <= 4096\n            and kernel_d * hblocks <= 64 and oh_pad * ow_pad <= 8192):\n        grid = (in_n * in_c * out_d,)\n        _pool_plane_kernel[grid](\n            input, output, indices, _random_samples,\n            s_n, s_c, s_d, s_h, s_w, _random_samples.stride(0), _random_samples.stride(1),\n            in_c, in_d, in_h, in_w, out_d, out_h, out_w,\n            ih_pad, iw_pad, oh_pad, ow_pad, ihb, hblocks,\n            kernel_d, kernel_h, kernel_w, return_indices)\n    else:\n        block_w = 128\n        grid = (in_n * in_c, triton.cdiv(out_d * out_h * out_w, block_w))\n        _pool_flat_kernel[grid](\n            input, output, indices, _random_samples,\n            s_n, s_c, s_d, s_h, s_w, _random_samples.stride(0), _random_samples.stride(1),\n            in_c, in_d, in_h, in_w, out_d, out_h, out_w, alpha_d, alpha_h, alpha_w,\n            kernel_d, kernel_h, kernel_w, block_w, return_indices)\n    if squeeze:\n        output = output.squeeze(0)\n        if return_indices:\n            indices = indices.squeeze(0)\n    return (output, indices) if return_indices else output\n\n\nrun = fractional_max_pool3d\n\n\n\"\"\"候选内嵌的Triton存储操作：复制、连续化、填充、转换均执行Triton核。\"\"\"\n\n\n@triton.jit\ndef _strict_copy_kernel(X, Y, N: tl.constexpr, SHAPE: tl.constexpr, XS: tl.constexpr, YS: tl.constexpr, BLOCK: tl.constexpr):\n    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    remain = i\n    xp = tl.full((BLOCK,), 0, tl.int64)\n    yp = tl.full((BLOCK,), 0, tl.int64)\n    for d in tl.static_range(len(SHAPE) - 1, -1, -1):\n        coord = remain % SHAPE[d]\n        remain = remain // SHAPE[d]\n        xp += coord * XS[d]\n        yp += coord * YS[d]\n    value = tl.load(X + xp, i < N, other=0)\n    tl.store(Y + yp, value, i < N)\n\n\n@triton.jit\ndef _strict_fill_kernel(Y, N: tl.constexpr, VALUE: tl.constexpr, BLOCK: tl.constexpr):\n    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    tl.store(Y + i, VALUE, i < N)\n\n\n@triton.jit\ndef _strict_random_kernel(Y, N: tl.constexpr, SEED, OFFSET, BLOCK: tl.constexpr):\n    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    # 备用随机采样路径；全部随机数计算在Triton内，生成器仅在宿主管理状态。\n    value = tl.rand(SEED, (i.to(tl.uint64) + OFFSET).to(tl.uint32))\n    tl.store(Y + i, value, i < N)\n\n\ndef _strict_empty_like(x, *, dtype=None, **kwargs):\n    return torch.empty(tuple(x.shape), device=x.device, dtype=x.dtype if dtype is None else dtype)\n\n\ndef _strict_copy_into(dst, src):\n    if tuple(dst.shape) != tuple(src.shape):\n        raise ValueError('strict copy requires equal shapes')\n    if dst.numel():\n        _strict_copy_kernel[(triton.cdiv(dst.numel(), 1024),)](src, dst, dst.numel(), tuple(dst.shape), tuple(src.stride()), tuple(dst.stride()), 1024)\n    return dst\n\n\ndef _strict_clone(x, **kwargs):\n    return _strict_copy_into(_strict_empty_like(x), x)\n\n\ndef _strict_contiguous(x, *args, **kwargs):\n    return x if x.is_contiguous() else _strict_clone(x)\n\n\ndef _strict_cast(x, dtype):\n    if dtype == x.dtype:\n        return x\n    return _strict_copy_into(_strict_empty_like(x, dtype=dtype), x)\n\n\ndef _strict_reshape(x, *shape):\n    # view只操作元数据，输入连续化由上面的Triton复制完成。\n    return _strict_contiguous(x).view(*shape)\n\n\ndef _strict_flatten(x, start_dim=0, end_dim=-1):\n    rank = x.ndim\n    first = start_dim % rank\n    last = end_dim % rank\n    size = 1\n    for n in x.shape[first:last + 1]:\n        size *= n\n    shape = tuple(x.shape[:first]) + (size,) + tuple(x.shape[last + 1:])\n    return _strict_contiguous(x).view(shape)\n\n\ndef _strict_full(shape, value, **kwargs):\n    if isinstance(shape, int):\n        shape = (shape,)\n    out = torch.empty(shape, **kwargs)\n    if out.numel():\n        _strict_fill_kernel[(triton.cdiv(out.numel(), 1024),)](out, out.numel(), value, 1024)\n    return out\n\n\ndef _strict_zeros(*shape, **kwargs):\n    shape = shape[0] if len(shape) == 1 else shape\n    return _strict_full(shape, 0, **kwargs)\n\n\ndef _strict_ones(*shape, **kwargs):\n    shape = shape[0] if len(shape) == 1 else shape\n    return _strict_full(shape, 1, **kwargs)\n\n\ndef _strict_rand(*shape, **kwargs):\n    shape = shape[0] if len(shape) == 1 else shape\n    generator = kwargs.pop('generator', None)\n    out = torch.empty(shape, **kwargs)\n    if out.numel():\n        if generator is None:\n            import torch_npu\n            generator = torch.npu.default_generators[out.device.index or 0]\n        seed = generator.initial_seed()\n        offset = generator.get_offset()\n        advance = triton.cdiv(out.numel(), 4) * 4\n        if offset + advance >= 2 ** 32:\n            raise RuntimeError('备用随机路径超过32位计数范围，明确拒绝而非静默重复')\n        generator.set_offset(offset + advance)\n        _strict_random_kernel[(triton.cdiv(out.numel(), 256),)](out, out.numel(), seed, offset, 256)\n    return out\n",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:7c92a7ea2ba9befd156334dc79cdb018642432d6c3b6542e5525e631332dd430",
+      "definition": "fractional_max_pool3d"
+    },
+    "settings": {
+      "warmup_ms": 1000,
+      "benchmark_ms": 100,
+      "num_trials": 3,
+      "tolerance_mode": "strict",
+      "rtol": 0.01,
+      "atol": 0.01,
+      "timeout_seconds": 1500
+    },
+    "target": "Ascend910B",
+    "solution": {
+      "definition": "fractional_max_pool3d",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "import torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef _round_coordinate(value, DT: tl.constexpr):\n    \"\"\"Round a coordinate expression to the scalar dtype used by the reference.\"\"\"\n    if DT == tl.float16:\n        a = tl.abs(value)\n        bits = a.to(tl.int32, bitcast=True)\n        rounded = (bits + 4095 + (bits >> 13 & 1) & -8192).to(tl.float32, bitcast=True)\n        units = tl.minimum(a, 6.103515625e-05) * 16777216.0\n        lower = tl.floor(units)\n        fraction = units - lower\n        add = (fraction > 0.5) | (fraction == 0.5) & (lower.to(tl.int32) & 1 != 0)\n        subnormal = (lower + add.to(tl.float32)) * 5.960464477539063e-08\n        rounded = tl.where(a < 6.103515625e-05, subnormal, rounded)\n        rounded = tl.where(rounded > 65504.0, float('inf'), rounded)\n        return tl.where(value < 0.0, -rounded, rounded)\n    elif DT == tl.bfloat16:\n        bits = value.to(tl.int32, bitcast=True)\n        rounded = (bits + 32767 + (bits >> 16 & 1) & -65536).to(tl.float32, bitcast=True)\n        return tl.where(tl.abs(value) < float('inf'), rounded, value)\n    else:\n        return value\n\n\n@triton.jit\ndef _alpha_of(in_size, out_size, K: tl.constexpr, DT: tl.constexpr):\n    return _round_coordinate(\n        _round_coordinate(tl.cast(in_size - K, tl.float32), DT)\n        / _round_coordinate(tl.cast(tl.maximum(out_size - 1, 1), tl.float32), DT),\n        DT)\n\n\n@triton.jit\ndef _start_of(index, sample, alpha, limit, K: tl.constexpr, DT: tl.constexpr):\n    base = _round_coordinate(sample * alpha, DT).to(tl.int32)\n    shifted = _round_coordinate(tl.cast(index, tl.float32) + sample, DT)\n    return _round_coordinate(shifted * alpha, DT).to(tl.int32) - base\n\n\n@triton.jit\ndef _pool_plane_kernel(in_ptr, out_ptr, idx_ptr, samp_ptr,\n                       s_n, s_c, s_d, s_h, s_w, ss_n, ss_c,\n                       in_c, in_d, in_h, in_w, out_d, out_h, out_w,\n                       IH: tl.constexpr, IW: tl.constexpr,\n                       OH: tl.constexpr, OW: tl.constexpr,\n                       IHB: tl.constexpr, HBLOCKS: tl.constexpr,\n                       KD: tl.constexpr, KH: tl.constexpr, KW: tl.constexpr,\n                       WRITE_IDX: tl.constexpr):\n    \"\"\"One program per (n, c, output_depth) plane.\n\n    The input plane is fetched with affine contiguous loads (row blocks) and the\n    pooling windows are applied with in-register masks, so no data-dependent\n    (scalarised) gather addresses are issued.\n    \"\"\"\n    pid = tl.program_id(0)\n    nc = pid // out_d\n    do = pid % out_d\n    ni = nc // in_c\n    ci = nc % in_c\n    samp = samp_ptr + ni * ss_n + ci * ss_c\n    sample_d = tl.load(samp).to(tl.float32)\n    sample_h = tl.load(samp + 1).to(tl.float32)\n    sample_w = tl.load(samp + 2).to(tl.float32)\n    dt: tl.constexpr = samp_ptr.dtype.element_ty\n    alpha_d = _alpha_of(in_d, out_d, KD, dt)\n    alpha_h = _alpha_of(in_h, out_h, KH, dt)\n    alpha_w = _alpha_of(in_w, out_w, KW, dt)\n    d_start = _start_of(do, sample_d, alpha_d, in_d, KD, dt)\n    d_start = tl.where(do == out_d - 1, in_d - KD, d_start)\n    ho = tl.arange(0, OH)\n    wo = tl.arange(0, OW)\n    h_start = _start_of(ho, sample_h, alpha_h, in_h, KH, dt)\n    w_start = _start_of(wo, sample_w, alpha_w, in_w, KW, dt)\n    h_start = tl.where(ho == out_h - 1, in_h - KH, h_start)\n    w_start = tl.where(wo == out_w - 1, in_w - KW, w_start)\n    ww = tl.arange(0, IW)\n    w_in = (ww[None, :] >= w_start[:, None]) & (ww[None, :] < w_start[:, None] + KW)\n    hhi = tl.arange(0, IHB)\n    plane = in_ptr + ni * s_n + ci * s_c + d_start * s_d\n    best_v = tl.full((OH, OW), float('-inf'), tl.float32)\n    best_c = tl.zeros((OH, OW), tl.int32)\n    for kd in tl.static_range(KD):\n        for hb in tl.static_range(HBLOCKS):\n            rows = hb * IHB + hhi\n            vals = tl.load(plane + kd * s_d + rows[:, None] * s_h + ww[None, :],\n                           mask=(rows[:, None] < in_h) & (ww[None, :] < in_w),\n                           other=float('-inf')).to(tl.float32)\n            row_max = tl.max(tl.where(w_in[None, :, :], vals[:, None, :], float('-inf')), axis=2)\n            w_sel = tl.min(tl.where(w_in[None, :, :] & (vals[:, None, :] == row_max[:, :, None]),\n                                    ww[None, None, :], IW), axis=2)\n            packed = rows[:, None] * in_w + w_sel\n            row_in = (rows[None, :] >= h_start[:, None]) & (rows[None, :] < h_start[:, None] + KH)\n            top = tl.max(tl.where(row_in[:, :, None], row_max[None, :, :], float('-inf')), axis=1)\n            pick = tl.min(tl.where(row_in[:, :, None] & (row_max[None, :, :] == top[:, None, :]),\n                                   packed[None, :, :], IH * in_w), axis=1)\n            take = (top > best_v) | (top != top)\n            best_v = tl.where(take, top, best_v)\n            best_c = tl.where(take, (d_start + kd) * (in_h * in_w) + pick, best_c)\n    off = ((nc * out_d + do) * out_h + ho[:, None]) * out_w + wo[None, :]\n    m = (ho[:, None] < out_h) & (wo[None, :] < out_w)\n    tl.store(out_ptr + off, best_v, mask=m)\n    if WRITE_IDX:\n        tl.store(idx_ptr + off, best_c.to(tl.int64), mask=m)\n\n\n@triton.jit\ndef _combine_max_idx(a_val, a_idx, b_val, b_idx):\n    take_b = (b_val > a_val) | (b_val != b_val)\n    return (tl.where(take_b, b_val, a_val), tl.where(take_b, b_idx, a_idx))\n\n\n@triton.jit\ndef _pool_flat_kernel(in_ptr, out_ptr, idx_ptr, samp_ptr, s_n, s_c, s_d, s_h, s_w, ss_n, ss_c, in_c, in_d, in_h, in_w, out_d, out_h, out_w, alpha_d, alpha_h, alpha_w, KD: tl.constexpr, KH: tl.constexpr, KW: tl.constexpr, BLOCK_W: tl.constexpr, WRITE_IDX: tl.constexpr):\n    \"\"\"Fallback gather kernel: any strides, any window geometry.\"\"\"\n    nc = tl.program_id(0)\n    linear = tl.program_id(1) * BLOCK_W + tl.arange(0, BLOCK_W)\n    mask = linear < out_d * out_h * out_w\n    wo = linear % out_w\n    ho = linear // out_w % out_h\n    do = linear // (out_h * out_w)\n    ni = nc // in_c\n    ci = nc % in_c\n    samp = samp_ptr + ni * ss_n + ci * ss_c\n    sd = tl.load(samp).to(tl.float32)\n    sh = tl.load(samp + 1).to(tl.float32)\n    sw = tl.load(samp + 2).to(tl.float32)\n    dt: tl.constexpr = samp_ptr.dtype.element_ty\n    ad = _alpha_of(in_d, out_d, KD, dt)\n    ah = _alpha_of(in_h, out_h, KH, dt)\n    aw = _alpha_of(in_w, out_w, KW, dt)\n    ds = _start_of(do, sd, ad, in_d, KD, dt)\n    hs = _start_of(ho, sh, ah, in_h, KH, dt)\n    ws = _start_of(wo, sw, aw, in_w, KW, dt)\n    ds = tl.where(do == out_d - 1, in_d - KD, ds)\n    hs = tl.where(ho == out_h - 1, in_h - KH, hs)\n    ws = tl.where(wo == out_w - 1, in_w - KW, ws)\n    best = tl.full((BLOCK_W,), float('-inf'), tl.float32)\n    index = ds * in_h * in_w + hs * in_w + ws\n    base = in_ptr + ni * s_n + ci * s_c\n    for di in tl.static_range(KD):\n        for hi in tl.static_range(KH):\n            for wi in tl.static_range(KW):\n                d = ds + di\n                h = hs + hi\n                w = ws + wi\n                valid = mask & (d >= 0) & (d < in_d) & (h >= 0) & (h < in_h) & (w >= 0) & (w < in_w)\n                value = tl.load(base + d * s_d + h * s_h + w * s_w, mask=valid, other=float('-inf')).to(tl.float32)\n                take = (value > best) | (value != value)\n                best = tl.where(take, value, best)\n                index = tl.where(take, d * in_h * in_w + h * in_w + w, index)\n    offset = nc * out_d * out_h * out_w + linear\n    tl.store(out_ptr + offset, best, mask)\n    if WRITE_IDX:\n        tl.store(idx_ptr + offset, index.to(tl.int64), mask)\n\n\ndef _triple(value):\n    if isinstance(value, int):\n        return (value, value, value)\n    if len(value) == 1:\n        return (value[0], value[0], value[0])\n    return (value[0], value[1], value[2])\n\n\ndef _next_pow2(n):\n    return 1 << max(0, int(n) - 1).bit_length() if n > 0 else 1\n\n\ndef fractional_max_pool3d(input: torch.Tensor, kernel_size, output_size=None, output_ratio=None, return_indices: bool=True, _random_samples=None):\n    \"\"\"Fractional max pooling 3d (stochastic pooling regions).\n\n    Args:\n        input: 5D (N, C, D, H, W) or 4D (C, D, H, W) input tensor.\n        kernel_size: Pooling window size (int or triple).\n        output_size: Target output spatial size (int or triple).\n        output_ratio: Alternative to output_size, output as a ratio.\n        return_indices: Whether to also return the max indices.\n        _random_samples: Optional tensor of shape (N, C, 3) (or (C, 3)) with\n            values in [0, 1) selecting the pooling region offsets.\n    \"\"\"\n    squeeze = False\n    if input.dim() == 4:\n        input = input.unsqueeze(0)\n        squeeze = True\n        if _random_samples is not None and _random_samples.dim() == 2:\n            _random_samples = _random_samples.unsqueeze(0)\n    elif input.dim() != 5:\n        raise AssertionError(f'Expected 5D input, got {input.dim()}D')\n    in_n, in_c, in_d, in_h, in_w = input.shape\n    kernel_d, kernel_h, kernel_w = _triple(kernel_size)\n    if output_size is not None:\n        out_d, out_h, out_w = _triple(output_size)\n    elif output_ratio is not None:\n        if isinstance(output_ratio, float):\n            ratio_d = ratio_h = ratio_w = output_ratio\n        else:\n            ratio_d, ratio_h, ratio_w = output_ratio\n        out_d = int(in_d * ratio_d)\n        out_h = int(in_h * ratio_h)\n        out_w = int(in_w * ratio_w)\n    else:\n        raise ValueError('Either output_size or output_ratio must be specified')\n    out_d = int(out_d)\n    out_h = int(out_h)\n    out_w = int(out_w)\n    assert out_d + kernel_d - 1 <= in_d, f'fractional_max_pool3d: kernel_d ({kernel_d}) + output_d ({out_d}) - 1 exceeds input_d ({in_d})'\n    assert out_h + kernel_h - 1 <= in_h, f'fractional_max_pool3d: kernel_h ({kernel_h}) + output_h ({out_h}) - 1 exceeds input_h ({in_h})'\n    assert out_w + kernel_w - 1 <= in_w, f'fractional_max_pool3d: kernel_w ({kernel_w}) + output_w ({out_w}) - 1 exceeds input_w ({in_w})'\n    out_shape = (in_n, in_c, out_d, out_h, out_w)\n    output = torch.empty(out_shape, dtype=input.dtype, device=input.device)\n    if return_indices:\n        indices = torch.empty(out_shape, dtype=torch.int64, device=input.device)\n    else:\n        indices = output\n    if output.numel() == 0:\n        if squeeze:\n            output = output.squeeze(0)\n            if return_indices:\n                indices = indices.squeeze(0)\n        return (output, indices) if return_indices else output\n    alpha_d = (in_d - kernel_d) / (out_d - 1) if out_d > 1 else 0.0\n    alpha_h = (in_h - kernel_h) / (out_h - 1) if out_h > 1 else 0.0\n    alpha_w = (in_w - kernel_w) / (out_w - 1) if out_w > 1 else 0.0\n    s_n, s_c, s_d, s_h, s_w = input.stride()\n    if _random_samples is None:\n        _random_samples = _strict_rand((in_n, in_c, 3), device=input.device, dtype=input.dtype)\n    else:\n        assert _random_samples.shape == (in_n, in_c, 3), f'_random_samples must have shape ({in_n}, {in_c}, 3), got {_random_samples.shape}'\n        if _random_samples.stride(-1) != 1:\n            _random_samples = _strict_contiguous(_random_samples)\n    ih_pad = _next_pow2(in_h)\n    iw_pad = _next_pow2(in_w)\n    oh_pad = _next_pow2(out_h)\n    ow_pad = _next_pow2(out_w)\n    ihb = 1\n    while ihb * 2 <= ih_pad and ihb * 2 * ow_pad * iw_pad <= 4096:\n        ihb *= 2\n    hblocks = ih_pad // ihb\n    contiguous_plane = (s_w == 1 and s_h == in_w and s_d == in_h * in_w)\n    if (contiguous_plane and kernel_d <= 8 and kernel_h <= 32 and kernel_w <= 32\n            and ow_pad * iw_pad * ihb <= 4096 and oh_pad * ihb * ow_pad <= 4096\n            and kernel_d * hblocks <= 64 and oh_pad * ow_pad <= 8192):\n        grid = (in_n * in_c * out_d,)\n        _pool_plane_kernel[grid](\n            input, output, indices, _random_samples,\n            s_n, s_c, s_d, s_h, s_w, _random_samples.stride(0), _random_samples.stride(1),\n            in_c, in_d, in_h, in_w, out_d, out_h, out_w,\n            ih_pad, iw_pad, oh_pad, ow_pad, ihb, hblocks,\n            kernel_d, kernel_h, kernel_w, return_indices)\n    else:\n        block_w = 128\n        grid = (in_n * in_c, triton.cdiv(out_d * out_h * out_w, block_w))\n        _pool_flat_kernel[grid](\n            input, output, indices, _random_samples,\n            s_n, s_c, s_d, s_h, s_w, _random_samples.stride(0), _random_samples.stride(1),\n            in_c, in_d, in_h, in_w, out_d, out_h, out_w, alpha_d, alpha_h, alpha_w,\n            kernel_d, kernel_h, kernel_w, block_w, return_indices)\n    if squeeze:\n        output = output.squeeze(0)\n        if return_indices:\n            indices = indices.squeeze(0)\n    return (output, indices) if return_indices else output\n\n\nrun = fractional_max_pool3d\n\n\n\"\"\"候选内嵌的Triton存储操作：复制、连续化、填充、转换均执行Triton核。\"\"\"\n\n\n@triton.jit\ndef _strict_copy_kernel(X, Y, N: tl.constexpr, SHAPE: tl.constexpr, XS: tl.constexpr, YS: tl.constexpr, BLOCK: tl.constexpr):\n    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    remain = i\n    xp = tl.full((BLOCK,), 0, tl.int64)\n    yp = tl.full((BLOCK,), 0, tl.int64)\n    for d in tl.static_range(len(SHAPE) - 1, -1, -1):\n        coord = remain % SHAPE[d]\n        remain = remain // SHAPE[d]\n        xp += coord * XS[d]\n        yp += coord * YS[d]\n    value = tl.load(X + xp, i < N, other=0)\n    tl.store(Y + yp, value, i < N)\n\n\n@triton.jit\ndef _strict_fill_kernel(Y, N: tl.constexpr, VALUE: tl.constexpr, BLOCK: tl.constexpr):\n    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    tl.store(Y + i, VALUE, i < N)\n\n\n@triton.jit\ndef _strict_random_kernel(Y, N: tl.constexpr, SEED, OFFSET, BLOCK: tl.constexpr):\n    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    # 备用随机采样路径；全部随机数计算在Triton内，生成器仅在宿主管理状态。\n    value = tl.rand(SEED, (i.to(tl.uint64) + OFFSET).to(tl.uint32))\n    tl.store(Y + i, value, i < N)\n\n\ndef _strict_empty_like(x, *, dtype=None, **kwargs):\n    return torch.empty(tuple(x.shape), device=x.device, dtype=x.dtype if dtype is None else dtype)\n\n\ndef _strict_copy_into(dst, src):\n    if tuple(dst.shape) != tuple(src.shape):\n        raise ValueError('strict copy requires equal shapes')\n    if dst.numel():\n        _strict_copy_kernel[(triton.cdiv(dst.numel(), 1024),)](src, dst, dst.numel(), tuple(dst.shape), tuple(src.stride()), tuple(dst.stride()), 1024)\n    return dst\n\n\ndef _strict_clone(x, **kwargs):\n    return _strict_copy_into(_strict_empty_like(x), x)\n\n\ndef _strict_contiguous(x, *args, **kwargs):\n    return x if x.is_contiguous() else _strict_clone(x)\n\n\ndef _strict_cast(x, dtype):\n    if dtype == x.dtype:\n        return x\n    return _strict_copy_into(_strict_empty_like(x, dtype=dtype), x)\n\n\ndef _strict_reshape(x, *shape):\n    # view只操作元数据，输入连续化由上面的Triton复制完成。\n    return _strict_contiguous(x).view(*shape)\n\n\ndef _strict_flatten(x, start_dim=0, end_dim=-1):\n    rank = x.ndim\n    first = start_dim % rank\n    last = end_dim % rank\n    size = 1\n    for n in x.shape[first:last + 1]:\n        size *= n\n    shape = tuple(x.shape[:first]) + (size,) + tuple(x.shape[last + 1:])\n    return _strict_contiguous(x).view(shape)\n\n\ndef _strict_full(shape, value, **kwargs):\n    if isinstance(shape, int):\n        shape = (shape,)\n    out = torch.empty(shape, **kwargs)\n    if out.numel():\n        _strict_fill_kernel[(triton.cdiv(out.numel(), 1024),)](out, out.numel(), value, 1024)\n    return out\n\n\ndef _strict_zeros(*shape, **kwargs):\n    shape = shape[0] if len(shape) == 1 else shape\n    return _strict_full(shape, 0, **kwargs)\n\n\ndef _strict_ones(*shape, **kwargs):\n    shape = shape[0] if len(shape) == 1 else shape\n    return _strict_full(shape, 1, **kwargs)\n\n\ndef _strict_rand(*shape, **kwargs):\n    shape = shape[0] if len(shape) == 1 else shape\n    generator = kwargs.pop('generator', None)\n    out = torch.empty(shape, **kwargs)\n    if out.numel():\n        if generator is None:\n            import torch_npu\n            generator = torch.npu.default_generators[out.device.index or 0]\n        seed = generator.initial_seed()\n        offset = generator.get_offset()\n        advance = triton.cdiv(out.numel(), 4) * 4\n        if offset + advance >= 2 ** 32:\n            raise RuntimeError('备用随机路径超过32位计数范围，明确拒绝而非静默重复')\n        generator.set_offset(offset + advance)\n        _strict_random_kernel[(triton.cdiv(out.numel(), 256),)](out, out.numel(), seed, offset, 256)\n    return out\n"
+        }
+      ]
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "reference_source": "primary",
+    "status": "PASSED",
+    "device": "npu:0",
+    "server_backend": "npu",
+    "is_hack": false,
+    "hack_reason": "",
+    "geo_mean": 5.2071210050803876,
+    "min_speedup": 2.7835260996382383,
+    "worst_workload_uuid": "fractional_max_pool3d-timing-1",
+    "latency_ms": 1.9067067400327111,
+    "abs_err": 0.0,
+    "rel_err": 0.0,
+    "num_workloads": 9,
+    "num_passed": 9,
+    "timing_skipped": false,
+    "log": "",
+    "per_workload": [
+      {
+        "uuid": "fractional_max_pool3d-correctness-0",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fractional_max_pool3d-correctness-1",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fractional_max_pool3d-correctness-2",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fractional_max_pool3d-timing-0",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 8.440124342134116,
+        "latency_ms": 0.14153473809963024,
+        "reference_latency_ms": 1.194570788292266,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fractional_max_pool3d-timing-1",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 2.7835260996382383,
+        "latency_ms": 1.9067067400327111,
+        "reference_latency_ms": 5.3073679752371925,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fractional_max_pool3d-timing-2",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 8.609997975463015,
+        "latency_ms": 0.14207037577649503,
+        "reference_latency_ms": 1.223225647808892,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fractional_max_pool3d-timing-3",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 3.1465223370974638,
+        "latency_ms": 1.8541410905667224,
+        "reference_latency_ms": 5.834096357598444,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fractional_max_pool3d-timing-4",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 8.618193091551975,
+        "latency_ms": 0.14110840273286854,
+        "reference_latency_ms": 1.2160994615923415,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fractional_max_pool3d-timing-5",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 3.6340574542207857,
+        "latency_ms": 1.8204412007200643,
+        "reference_latency_ms": 6.615587915447388,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      }
+    ]
+  },
+  "service": {
+    "status": "ok",
+    "api_version": "v6.2",
+    "server_version": "v6.5.0",
+    "backend": "npu",
+    "devices": [
+      "npu:0"
+    ],
+    "workers": 1,
+    "evaluation_adapters": [
+      "native",
+      "flaggems"
+    ],
+    "scheduler": {
+      "device_slots": 1,
+      "healthy": 1,
+      "checking": 0,
+      "broken": 0,
+      "incidents": 17,
+      "recovered": 17,
+      "probe_timeout_seconds": 30.0,
+      "max_active": 1,
+      "active": 0,
+      "waiting": 0,
+      "available": 1,
+      "slots": [
+        {
+          "device": "npu:0",
+          "state": "available",
+          "reason": "",
+          "last_incident": "profile cancelled by client",
+          "incidents": 17,
+          "recovered": 17
+        }
+      ]
+    },
+    "timing": "walltime",
+    "profile": {
+      "supported": true,
+      "profiler": "msprof",
+      "levels": [
+        "metrics",
+        "instruction"
+      ],
+      "capabilities": [
+        "performance_counters",
+        "pipeline_utilization",
+        "kernel_profile",
+        "instruction_listing"
+      ]
+    },
+    "capabilities": {
+      "native_source_policy": {
+        "enabled": true,
+        "workload_conditions": true,
+        "policy_id": "flaggems/d64794e63b502cb836bc015a92a62c42de4be05a",
+        "source": {
+          "repository": "https://github.com/YaooXu/FlagGems.git",
+          "revision": "d64794e63b502cb836bc015a92a62c42de4be05a",
+          "paths": [
+            "src/flag_gems/runtime/backend/backend_utils.py",
+            "src/flag_gems/runtime/backend/_*/__init__.py"
+          ],
+          "license": "Apache-2.0",
+          "description": "VendorDescriptor defaults plus per-vendor overrides; reference/test policy, not measured capabilities"
+        },
+        "vendor": "ascend",
+        "flags": {
+          "support_fp64": false,
+          "support_bf16": true,
+          "support_int64": true
+        }
+      },
+      "operator_contract": {
+        "enabled": true,
+        "test_sources": true
+      },
+      "benchmark_reference": {
+        "enabled": true,
+        "evaluators": [
+          "flaggems"
+        ],
+        "level": "core"
+      },
+      "candidate_admission": {
+        "version": 1,
+        "policy_sha256": "bd6a7bc3f46a71e6d1b90223e911ad2ea463af4b314348de755177f46963d1dc",
+        "stages": [
+          "preflight"
+        ]
+      },
+      "operation_cancel": {
+        "enabled": true,
+        "operations": [
+          "preflight",
+          "evaluate",
+          "profile",
+          "reference"
+        ]
+      },
+      "operator_bundle_upload": {
+        "enabled": true,
+        "archive_format": "kernelgen.operator-bundle/v1",
+        "media_type": "application/vnd.kernelgen.operator-bundle.v1+tar",
+        "max_bytes": 268435456,
+        "max_files": 10000,
+        "evaluation_binding": true,
+        "evaluators": [
+          "native",
+          "flaggems"
+        ]
+      }
+    },
+    "debug": {
+      "enabled": true,
+      "runner": "local-trusted",
+      "security_boundary": false
+    },
+    "request_audit": {
+      "enabled": false
+    },
+    "trusted_clients_only": true,
+    "target": {
+      "backend": "ascend",
+      "vendor": "huawei",
+      "device": "Ascend910B4-1",
+      "architecture": "dav-c220-cube",
+      "devices": [
+        {
+          "logical_device": "npu:0",
+          "device_id": 0,
+          "name": "Ascend910B4-1",
+          "l2_cache_size": 176160768,
+          "num_sm": 20,
+          "compute_capability": "",
+          "total_memory": 65452113920
+        }
+      ]
+    },
+    "software": {
+      "language": "triton",
+      "language_version": "3.5.1",
+      "compiler": "flagtree",
+      "compiler_version": "0.6.0+ascend.gitc286cba6",
+      "runtime": "cann",
+      "runtime_version": "9.0.0",
+      "driver_version": "25.2.0"
+    },
+    "metadata": {
+      "complete": true,
+      "missing": [],
+      "sources": {
+        "target.backend": "server configuration",
+        "target.vendor": "server configuration",
+        "software.language": "server configuration",
+        "software.compiler": "python package metadata",
+        "software.runtime": "server configuration",
+        "target.device": "device probe",
+        "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+        "software.language_version": "triton module metadata",
+        "software.compiler_version": "python package metadata",
+        "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+        "software.driver_version": "/usr/local/Ascend/driver/version.info"
+      }
+    }
+  }
+}

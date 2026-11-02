@@ -430,6 +430,15 @@ class Runner:
                 if comparison.exists():
                     evidence['inverse_stage_comparison']=dict(path=str(comparison),
                         sha256=sha(comparison),facts=read(comparison))
+                minimal=BATCH/'numerical-probes/inverse-mask-reciprocal-v1/result.json'
+                if minimal.exists():
+                    value=read(minimal)
+                    facts={k:value[k] for k in ['status','source_sha256','checker_sha256','error','scope'] if k in value}
+                    facts['modes']=[{k:r[k] for k in ['steps','mode','inactive_changed','active_mismatches']}
+                        for r in value.get('modes',[])]
+                    facts['reciprocal']=[{k:r[k] for k in ['denominator','expected','old_mismatches','vector_mismatches']}
+                        for r in value.get('reciprocal',[])]
+                    evidence['inverse_mask_reciprocal_minimal']=dict(path=str(minimal),sha256=sha(minimal),facts=facts)
         return evidence
     def prepare_paired(self,op,seed):
         if self.q.records[op]['reference']!='qualified_CANN':return
