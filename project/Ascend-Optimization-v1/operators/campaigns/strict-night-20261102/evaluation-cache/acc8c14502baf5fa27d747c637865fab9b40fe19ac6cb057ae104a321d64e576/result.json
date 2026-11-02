@@ -1,0 +1,638 @@
+{
+  "identity": {
+    "source": "# SPDX-License-Identifier: Apache-2.0\n\"\"\"Triton 向零截断 (torch.fix) —— 保留特殊值语义，支持非连续输入。\n\n数值做法：对 |x| 取 vfloor（正数即 floor，负数再补回原符号位），\n因此每元素只需 6 条向量指令（cvt / and / floor / and / or / cvt），\n而不是 floor+ceil+select 的 9 条；NaN/Inf 经 floor 原样传递。\n\n性能做法：\n* 小图：一个 program 处理一个 tile，无掩码（BLOCK 整除 n 时）；\n* 大图：persistent 多 tile 内核，program 数取设备 vector_core_num\n  （运行期查询，按可用 tile 数封顶），每个 program 顺序流过多个 tile，\n  循环由编译器流水（num_stages=2），避免上千个 program 的调度与\n  单 tile load->compute->store 无法重叠的问题；\n* 宿主侧只 warmup 一次，之后直接用已编译产物与启动元数据；\n  每次重新分配输出、重新读取数据指针与当前流。\n\"\"\"\nimport torch\nimport torch_npu\nimport triton\nimport triton.language as tl\n\n_OK_DTYPE = frozenset((torch.float16, torch.bfloat16, torch.float32))\n_empty_like = torch.empty_like\n_MAX_BLOCK = 8192\n_LOOP_MIN_N = 8 * _MAX_BLOCK   # >= 8 tiles 才值得走 persistent 路径\n_STAGES = 2\n\n_RAW = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\nif _RAW is None:\n    def _raw_stream(dev):\n        return torch.npu.current_stream(dev).npu_stream\nelse:\n    _raw_stream = _RAW\n\n\n@triton.jit\ndef _trunc(v):\n    \"\"\"向零截断，保留 NaN/Inf 与零的符号位。\"\"\"\n    u = v.to(tl.float32).to(tl.uint32, bitcast=True)\n    mag = (u & 0x7FFFFFFF).to(tl.float32, bitcast=True)\n    return (tl.floor(mag).to(tl.uint32, bitcast=True) | (u & 0x80000000)).to(tl.float32, bitcast=True)\n\n\n@triton.jit\ndef _fix_nomask(X, Y, BLOCK: tl.constexpr):\n    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    x = tl.load(X + index)\n    tl.store(Y + index, _trunc(x).to(Y.dtype.element_ty))\n\n\n@triton.jit\ndef _fix_masked(X, Y, N, BLOCK: tl.constexpr):\n    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    x = tl.load(X + index, index < N, other=0)\n    tl.store(Y + index, _trunc(x).to(Y.dtype.element_ty), index < N)\n\n\n@triton.jit\ndef _fix_strided(X, Y, N, SHAPE: tl.constexpr, STRIDES: tl.constexpr, BLOCK: tl.constexpr):\n    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    remainder = index\n    offset = tl.full((BLOCK,), 0, tl.int64)\n    for axis in tl.static_range(len(SHAPE) - 1, -1, -1):\n        coordinate = remainder % SHAPE[axis]\n        remainder = remainder // SHAPE[axis]\n        offset += coordinate.to(tl.int64) * STRIDES[axis]\n    x = tl.load(X + offset, index < N, other=0)\n    tl.store(Y + index, _trunc(x).to(Y.dtype.element_ty), index < N)\n\n\n@triton.jit\ndef _fix_loop(X, Y, TILES: tl.constexpr, BLOCK: tl.constexpr):\n    \"\"\"persistent：n 是 BLOCK 的整数倍；按实际启动 program 数跨步。\"\"\"\n    pid = tl.program_id(0)\n    step = tl.num_programs(0)\n    for tile in tl.range(pid, TILES, step):\n        index = tile * BLOCK + tl.arange(0, BLOCK)\n        x = tl.load(X + index)\n        tl.store(Y + index, _trunc(x).to(Y.dtype.element_ty))\n\n\n@triton.jit\ndef _fix_loop_tail(X, Y, N: tl.constexpr, TILES: tl.constexpr, BLOCK: tl.constexpr):\n    \"\"\"persistent + 一个掩码尾块（由 0 号 program 负责）。\"\"\"\n    pid = tl.program_id(0)\n    step = tl.num_programs(0)\n    for tile in tl.range(pid, TILES - 1, step):\n        index = tile * BLOCK + tl.arange(0, BLOCK)\n        x = tl.load(X + index)\n        tl.store(Y + index, _trunc(x).to(Y.dtype.element_ty))\n    if pid == 0:\n        index = (TILES - 1) * BLOCK + tl.arange(0, BLOCK)\n        keep = index < N\n        x = tl.load(X + index, keep, other=0)\n        tl.store(Y + index, _trunc(x).to(Y.dtype.element_ty), keep)\n\n\n_ENTRIES = {}\n_CORES = {}\n\n\ndef _vector_cores(dev):\n    \"\"\"设备 vector 核数；查询失败时返回 0（改由任务规模推导 program 数）。\"\"\"\n    try:\n        return _CORES[dev]\n    except KeyError:\n        pass\n    cores = 0\n    try:\n        props = torch.npu.get_device_properties(dev)\n        for attr in ('vector_core_num', 'multi_processor_count'):\n            value = getattr(props, attr, None)\n            if value:\n                cores = int(value)\n                break\n    except Exception:\n        cores = 0\n    _CORES[dev] = cores\n    return cores\n\n\ndef _grid_for(tiles, dev):\n    cores = _vector_cores(dev)\n    if cores <= 0:\n        cores = max(1, tiles // 32)   # 任务规模推导，不硬编码物理核数\n    return tiles if tiles < cores else cores\n\n\ndef _usable(compiled):\n    runner = compiled.run\n    return not (getattr(runner, 'compile_only', False) or\n                getattr(runner, 'enable_msprof_register_tensor', False) or\n                getattr(runner.metadata, 'debug_enabled', False) or\n                getattr(runner.metadata, 'debug', False))\n\n\ndef _build(self, out, n):\n    \"\"\"编译一次并缓存启动元数据。\n\n    entry = [gridx, jit, launch, func, meta, dev, block, mode]\n    mode: 0 单 tile 无掩码 / 1 单 tile 掩码 / 2 persistent / 3 persistent+尾块\n    \"\"\"\n    dev = self.device.index\n    jit = launch = func = meta = None\n    masked = False\n    if n >= _LOOP_MIN_N:\n        block = _MAX_BLOCK\n        tiles = n // block\n        if n % block:\n            tiles += 1\n            kern = _fix_loop_tail\n            mode = 3\n        else:\n            kern = _fix_loop\n            mode = 2\n        gridx = _grid_for(tiles, dev)\n        jit = kern[(gridx,)]\n        try:\n            if mode == 3:\n                compiled = kern.warmup(self, out, N=n, TILES=tiles, BLOCK=block,\n                                       grid=(gridx,), num_stages=_STAGES)\n            else:\n                compiled = kern.warmup(self, out, TILES=tiles, BLOCK=block,\n                                       grid=(gridx,), num_stages=_STAGES)\n            if _usable(compiled):\n                launch = compiled.run.launch\n                func = compiled.function\n                meta = compiled.packed_metadata\n        except Exception:\n            launch = None\n    else:\n        low = n & -n\n        if low >= 512:\n            block = low if low < _MAX_BLOCK else _MAX_BLOCK\n            masked = False\n            kern = _fix_nomask\n        else:\n            block = 1024 if n > 1024 else 256\n            masked = True\n            kern = _fix_masked\n        gridx = (n + block - 1) // block\n        jit = kern[(gridx,)]\n        mode = 1 if masked else 0\n        try:\n            if masked:\n                compiled = kern.warmup(self, out, n, BLOCK=block, grid=(1,))\n            else:\n                compiled = kern.warmup(self, out, BLOCK=block, grid=(1,))\n            if _usable(compiled):\n                launch = compiled.run.launch\n                func = compiled.function\n                meta = compiled.packed_metadata\n        except Exception:\n            launch = None\n    entry = [gridx, jit, launch, func, meta, dev, block, mode, n]\n    _ENTRIES[(self.dtype, n, dev)] = entry\n    return entry\n\n\ndef run(self):\n    dtype = self.dtype\n    if dtype not in _OK_DTYPE:\n        raise TypeError('Supported floating dtypes: float16, bfloat16, float32')\n    n = self.numel()\n    if not n:\n        return _empty_like(self)\n    if not self.is_contiguous():\n        out = torch.empty(self.shape, dtype=dtype, device=self.device)\n        _fix_strided[((n + 255) // 256,)](self, out, n, tuple(self.shape),\n                                          tuple(self.stride()), BLOCK=256)\n        return out\n    out = _empty_like(self)\n    key = (dtype, n, self.device.index)\n    entry = _ENTRIES.get(key)\n    if entry is None:\n        entry = _build(self, out, n)\n    xp = self.data_ptr()\n    yp = out.data_ptr()\n    launch = entry[2]\n    if launch is not None and not ((xp | yp) & 15):\n        try:\n            launch(entry[0], 1, 1, _raw_stream(entry[5]), entry[3], entry[4],\n                   None, None, None, xp, yp, None)\n            return out\n        except TypeError:\n            entry[2] = None\n    mode = entry[7]\n    if mode == 2:\n        entry[1](self, out, TILES=entry[8] // entry[6], BLOCK=entry[6], num_stages=_STAGES)\n    elif mode == 3:\n        tiles = (entry[8] + entry[6] - 1) // entry[6]\n        entry[1](self, out, N=entry[8], TILES=tiles, BLOCK=entry[6], num_stages=_STAGES)\n    elif mode == 1:\n        entry[1](self, out, n, BLOCK=entry[6])\n    else:\n        entry[1](self, out, BLOCK=entry[6])\n    return out\n",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:ce07a45842dd9c48e88947199804c9fa2b8c938d9b2e2008b922d6a7130a126a",
+      "definition": "fix"
+    },
+    "settings": {
+      "warmup_ms": 1000,
+      "benchmark_ms": 100,
+      "num_trials": 3,
+      "tolerance_mode": "strict",
+      "rtol": 0.01,
+      "atol": 0.01,
+      "timeout_seconds": 1500
+    },
+    "target": "Ascend910B",
+    "solution": {
+      "definition": "fix",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "# SPDX-License-Identifier: Apache-2.0\n\"\"\"Triton 向零截断 (torch.fix) —— 保留特殊值语义，支持非连续输入。\n\n数值做法：对 |x| 取 vfloor（正数即 floor，负数再补回原符号位），\n因此每元素只需 6 条向量指令（cvt / and / floor / and / or / cvt），\n而不是 floor+ceil+select 的 9 条；NaN/Inf 经 floor 原样传递。\n\n性能做法：\n* 小图：一个 program 处理一个 tile，无掩码（BLOCK 整除 n 时）；\n* 大图：persistent 多 tile 内核，program 数取设备 vector_core_num\n  （运行期查询，按可用 tile 数封顶），每个 program 顺序流过多个 tile，\n  循环由编译器流水（num_stages=2），避免上千个 program 的调度与\n  单 tile load->compute->store 无法重叠的问题；\n* 宿主侧只 warmup 一次，之后直接用已编译产物与启动元数据；\n  每次重新分配输出、重新读取数据指针与当前流。\n\"\"\"\nimport torch\nimport torch_npu\nimport triton\nimport triton.language as tl\n\n_OK_DTYPE = frozenset((torch.float16, torch.bfloat16, torch.float32))\n_empty_like = torch.empty_like\n_MAX_BLOCK = 8192\n_LOOP_MIN_N = 8 * _MAX_BLOCK   # >= 8 tiles 才值得走 persistent 路径\n_STAGES = 2\n\n_RAW = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\nif _RAW is None:\n    def _raw_stream(dev):\n        return torch.npu.current_stream(dev).npu_stream\nelse:\n    _raw_stream = _RAW\n\n\n@triton.jit\ndef _trunc(v):\n    \"\"\"向零截断，保留 NaN/Inf 与零的符号位。\"\"\"\n    u = v.to(tl.float32).to(tl.uint32, bitcast=True)\n    mag = (u & 0x7FFFFFFF).to(tl.float32, bitcast=True)\n    return (tl.floor(mag).to(tl.uint32, bitcast=True) | (u & 0x80000000)).to(tl.float32, bitcast=True)\n\n\n@triton.jit\ndef _fix_nomask(X, Y, BLOCK: tl.constexpr):\n    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    x = tl.load(X + index)\n    tl.store(Y + index, _trunc(x).to(Y.dtype.element_ty))\n\n\n@triton.jit\ndef _fix_masked(X, Y, N, BLOCK: tl.constexpr):\n    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    x = tl.load(X + index, index < N, other=0)\n    tl.store(Y + index, _trunc(x).to(Y.dtype.element_ty), index < N)\n\n\n@triton.jit\ndef _fix_strided(X, Y, N, SHAPE: tl.constexpr, STRIDES: tl.constexpr, BLOCK: tl.constexpr):\n    index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    remainder = index\n    offset = tl.full((BLOCK,), 0, tl.int64)\n    for axis in tl.static_range(len(SHAPE) - 1, -1, -1):\n        coordinate = remainder % SHAPE[axis]\n        remainder = remainder // SHAPE[axis]\n        offset += coordinate.to(tl.int64) * STRIDES[axis]\n    x = tl.load(X + offset, index < N, other=0)\n    tl.store(Y + index, _trunc(x).to(Y.dtype.element_ty), index < N)\n\n\n@triton.jit\ndef _fix_loop(X, Y, TILES: tl.constexpr, BLOCK: tl.constexpr):\n    \"\"\"persistent：n 是 BLOCK 的整数倍；按实际启动 program 数跨步。\"\"\"\n    pid = tl.program_id(0)\n    step = tl.num_programs(0)\n    for tile in tl.range(pid, TILES, step):\n        index = tile * BLOCK + tl.arange(0, BLOCK)\n        x = tl.load(X + index)\n        tl.store(Y + index, _trunc(x).to(Y.dtype.element_ty))\n\n\n@triton.jit\ndef _fix_loop_tail(X, Y, N: tl.constexpr, TILES: tl.constexpr, BLOCK: tl.constexpr):\n    \"\"\"persistent + 一个掩码尾块（由 0 号 program 负责）。\"\"\"\n    pid = tl.program_id(0)\n    step = tl.num_programs(0)\n    for tile in tl.range(pid, TILES - 1, step):\n        index = tile * BLOCK + tl.arange(0, BLOCK)\n        x = tl.load(X + index)\n        tl.store(Y + index, _trunc(x).to(Y.dtype.element_ty))\n    if pid == 0:\n        index = (TILES - 1) * BLOCK + tl.arange(0, BLOCK)\n        keep = index < N\n        x = tl.load(X + index, keep, other=0)\n        tl.store(Y + index, _trunc(x).to(Y.dtype.element_ty), keep)\n\n\n_ENTRIES = {}\n_CORES = {}\n\n\ndef _vector_cores(dev):\n    \"\"\"设备 vector 核数；查询失败时返回 0（改由任务规模推导 program 数）。\"\"\"\n    try:\n        return _CORES[dev]\n    except KeyError:\n        pass\n    cores = 0\n    try:\n        props = torch.npu.get_device_properties(dev)\n        for attr in ('vector_core_num', 'multi_processor_count'):\n            value = getattr(props, attr, None)\n            if value:\n                cores = int(value)\n                break\n    except Exception:\n        cores = 0\n    _CORES[dev] = cores\n    return cores\n\n\ndef _grid_for(tiles, dev):\n    cores = _vector_cores(dev)\n    if cores <= 0:\n        cores = max(1, tiles // 32)   # 任务规模推导，不硬编码物理核数\n    return tiles if tiles < cores else cores\n\n\ndef _usable(compiled):\n    runner = compiled.run\n    return not (getattr(runner, 'compile_only', False) or\n                getattr(runner, 'enable_msprof_register_tensor', False) or\n                getattr(runner.metadata, 'debug_enabled', False) or\n                getattr(runner.metadata, 'debug', False))\n\n\ndef _build(self, out, n):\n    \"\"\"编译一次并缓存启动元数据。\n\n    entry = [gridx, jit, launch, func, meta, dev, block, mode]\n    mode: 0 单 tile 无掩码 / 1 单 tile 掩码 / 2 persistent / 3 persistent+尾块\n    \"\"\"\n    dev = self.device.index\n    jit = launch = func = meta = None\n    masked = False\n    if n >= _LOOP_MIN_N:\n        block = _MAX_BLOCK\n        tiles = n // block\n        if n % block:\n            tiles += 1\n            kern = _fix_loop_tail\n            mode = 3\n        else:\n            kern = _fix_loop\n            mode = 2\n        gridx = _grid_for(tiles, dev)\n        jit = kern[(gridx,)]\n        try:\n            if mode == 3:\n                compiled = kern.warmup(self, out, N=n, TILES=tiles, BLOCK=block,\n                                       grid=(gridx,), num_stages=_STAGES)\n            else:\n                compiled = kern.warmup(self, out, TILES=tiles, BLOCK=block,\n                                       grid=(gridx,), num_stages=_STAGES)\n            if _usable(compiled):\n                launch = compiled.run.launch\n                func = compiled.function\n                meta = compiled.packed_metadata\n        except Exception:\n            launch = None\n    else:\n        low = n & -n\n        if low >= 512:\n            block = low if low < _MAX_BLOCK else _MAX_BLOCK\n            masked = False\n            kern = _fix_nomask\n        else:\n            block = 1024 if n > 1024 else 256\n            masked = True\n            kern = _fix_masked\n        gridx = (n + block - 1) // block\n        jit = kern[(gridx,)]\n        mode = 1 if masked else 0\n        try:\n            if masked:\n                compiled = kern.warmup(self, out, n, BLOCK=block, grid=(1,))\n            else:\n                compiled = kern.warmup(self, out, BLOCK=block, grid=(1,))\n            if _usable(compiled):\n                launch = compiled.run.launch\n                func = compiled.function\n                meta = compiled.packed_metadata\n        except Exception:\n            launch = None\n    entry = [gridx, jit, launch, func, meta, dev, block, mode, n]\n    _ENTRIES[(self.dtype, n, dev)] = entry\n    return entry\n\n\ndef run(self):\n    dtype = self.dtype\n    if dtype not in _OK_DTYPE:\n        raise TypeError('Supported floating dtypes: float16, bfloat16, float32')\n    n = self.numel()\n    if not n:\n        return _empty_like(self)\n    if not self.is_contiguous():\n        out = torch.empty(self.shape, dtype=dtype, device=self.device)\n        _fix_strided[((n + 255) // 256,)](self, out, n, tuple(self.shape),\n                                          tuple(self.stride()), BLOCK=256)\n        return out\n    out = _empty_like(self)\n    key = (dtype, n, self.device.index)\n    entry = _ENTRIES.get(key)\n    if entry is None:\n        entry = _build(self, out, n)\n    xp = self.data_ptr()\n    yp = out.data_ptr()\n    launch = entry[2]\n    if launch is not None and not ((xp | yp) & 15):\n        try:\n            launch(entry[0], 1, 1, _raw_stream(entry[5]), entry[3], entry[4],\n                   None, None, None, xp, yp, None)\n            return out\n        except TypeError:\n            entry[2] = None\n    mode = entry[7]\n    if mode == 2:\n        entry[1](self, out, TILES=entry[8] // entry[6], BLOCK=entry[6], num_stages=_STAGES)\n    elif mode == 3:\n        tiles = (entry[8] + entry[6] - 1) // entry[6]\n        entry[1](self, out, N=entry[8], TILES=tiles, BLOCK=entry[6], num_stages=_STAGES)\n    elif mode == 1:\n        entry[1](self, out, n, BLOCK=entry[6])\n    else:\n        entry[1](self, out, BLOCK=entry[6])\n    return out\n"
+        }
+      ]
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "reference_source": "primary",
+    "status": "PASSED",
+    "device": "npu:0",
+    "server_backend": "npu",
+    "is_hack": false,
+    "hack_reason": "",
+    "geo_mean": 0.4455562756060148,
+    "min_speedup": 0.2828451320037971,
+    "worst_workload_uuid": "fix-timing-5",
+    "latency_ms": 0.0853679443391402,
+    "abs_err": 0.0,
+    "rel_err": 0.0,
+    "num_workloads": 30,
+    "num_passed": 30,
+    "timing_skipped": false,
+    "log": "",
+    "per_workload": [
+      {
+        "uuid": "fix-correctness-0",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-correctness-1",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-correctness-2",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-correctness-3",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-correctness-4",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-correctness-5",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-correctness-6",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-correctness-7",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-correctness-8",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-correctness-9",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-correctness-10",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-correctness-11",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-correctness-12",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-correctness-13",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-correctness-14",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-correctness-15",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-correctness-16",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-correctness-17",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-timing-0",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 1.0333538469932737,
+        "latency_ms": 0.023054018524318588,
+        "reference_latency_ms": 0.02382295873075881,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-timing-1",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.29757283604286683,
+        "latency_ms": 0.08183133018804725,
+        "reference_latency_ms": 0.024350781001217483,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-timing-2",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.29723083581644555,
+        "latency_ms": 0.08028926683560438,
+        "reference_latency_ms": 0.023864445888636312,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-timing-3",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.29561529585910246,
+        "latency_ms": 0.08058014840223487,
+        "reference_latency_ms": 0.023820724410297044,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-timing-4",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 1.023958445429144,
+        "latency_ms": 0.023061992590518426,
+        "reference_latency_ms": 0.02361452208148568,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-timing-5",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.2828451320037971,
+        "latency_ms": 0.0853679443391402,
+        "reference_latency_ms": 0.02414590748549691,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-timing-6",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.2859915781122497,
+        "latency_ms": 0.08767453073050295,
+        "reference_latency_ms": 0.02507417740386747,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-timing-7",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.2988249896875081,
+        "latency_ms": 0.08063237150180447,
+        "reference_latency_ms": 0.024094967582506042,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-timing-8",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 1.0235331115916295,
+        "latency_ms": 0.023586839911750618,
+        "reference_latency_ms": 0.024141911647487746,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-timing-9",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.2951779808291359,
+        "latency_ms": 0.07951410873114216,
+        "reference_latency_ms": 0.023470814062686907,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-timing-10",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.29397597011678683,
+        "latency_ms": 0.08037125684393724,
+        "reference_latency_ms": 0.02362721820020189,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "fix-timing-11",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 1.030549332401996,
+        "latency_ms": 0.08871115054077107,
+        "reference_latency_ms": 0.0914212169664046,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      }
+    ]
+  },
+  "service": {
+    "status": "ok",
+    "api_version": "v6.2",
+    "server_version": "v6.5.0",
+    "backend": "npu",
+    "devices": [
+      "npu:0"
+    ],
+    "workers": 1,
+    "evaluation_adapters": [
+      "native",
+      "flaggems"
+    ],
+    "scheduler": {
+      "device_slots": 1,
+      "healthy": 1,
+      "checking": 0,
+      "broken": 0,
+      "incidents": 15,
+      "recovered": 15,
+      "probe_timeout_seconds": 30.0,
+      "max_active": 1,
+      "active": 0,
+      "waiting": 0,
+      "available": 1,
+      "slots": [
+        {
+          "device": "npu:0",
+          "state": "available",
+          "reason": "",
+          "last_incident": "profile cancelled by client",
+          "incidents": 15,
+          "recovered": 15
+        }
+      ]
+    },
+    "timing": "walltime",
+    "profile": {
+      "supported": true,
+      "profiler": "msprof",
+      "levels": [
+        "metrics",
+        "instruction"
+      ],
+      "capabilities": [
+        "performance_counters",
+        "pipeline_utilization",
+        "kernel_profile",
+        "instruction_listing"
+      ]
+    },
+    "capabilities": {
+      "native_source_policy": {
+        "enabled": true,
+        "workload_conditions": true,
+        "policy_id": "flaggems/d64794e63b502cb836bc015a92a62c42de4be05a",
+        "source": {
+          "repository": "https://github.com/YaooXu/FlagGems.git",
+          "revision": "d64794e63b502cb836bc015a92a62c42de4be05a",
+          "paths": [
+            "src/flag_gems/runtime/backend/backend_utils.py",
+            "src/flag_gems/runtime/backend/_*/__init__.py"
+          ],
+          "license": "Apache-2.0",
+          "description": "VendorDescriptor defaults plus per-vendor overrides; reference/test policy, not measured capabilities"
+        },
+        "vendor": "ascend",
+        "flags": {
+          "support_fp64": false,
+          "support_bf16": true,
+          "support_int64": true
+        }
+      },
+      "operator_contract": {
+        "enabled": true,
+        "test_sources": true
+      },
+      "benchmark_reference": {
+        "enabled": true,
+        "evaluators": [
+          "flaggems"
+        ],
+        "level": "core"
+      },
+      "candidate_admission": {
+        "version": 1,
+        "policy_sha256": "bd6a7bc3f46a71e6d1b90223e911ad2ea463af4b314348de755177f46963d1dc",
+        "stages": [
+          "preflight"
+        ]
+      },
+      "operation_cancel": {
+        "enabled": true,
+        "operations": [
+          "preflight",
+          "evaluate",
+          "profile",
+          "reference"
+        ]
+      },
+      "operator_bundle_upload": {
+        "enabled": true,
+        "archive_format": "kernelgen.operator-bundle/v1",
+        "media_type": "application/vnd.kernelgen.operator-bundle.v1+tar",
+        "max_bytes": 268435456,
+        "max_files": 10000,
+        "evaluation_binding": true,
+        "evaluators": [
+          "native",
+          "flaggems"
+        ]
+      }
+    },
+    "debug": {
+      "enabled": true,
+      "runner": "local-trusted",
+      "security_boundary": false
+    },
+    "request_audit": {
+      "enabled": false
+    },
+    "trusted_clients_only": true,
+    "target": {
+      "backend": "ascend",
+      "vendor": "huawei",
+      "device": "Ascend910B4-1",
+      "architecture": "dav-c220-cube",
+      "devices": [
+        {
+          "logical_device": "npu:0",
+          "device_id": 0,
+          "name": "Ascend910B4-1",
+          "l2_cache_size": 176160768,
+          "num_sm": 20,
+          "compute_capability": "",
+          "total_memory": 65452113920
+        }
+      ]
+    },
+    "software": {
+      "language": "triton",
+      "language_version": "3.5.1",
+      "compiler": "flagtree",
+      "compiler_version": "0.6.0+ascend.gitc286cba6",
+      "runtime": "cann",
+      "runtime_version": "9.0.0",
+      "driver_version": "25.2.0"
+    },
+    "metadata": {
+      "complete": true,
+      "missing": [],
+      "sources": {
+        "target.backend": "server configuration",
+        "target.vendor": "server configuration",
+        "software.language": "server configuration",
+        "software.compiler": "python package metadata",
+        "software.runtime": "server configuration",
+        "target.device": "device probe",
+        "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+        "software.language_version": "triton module metadata",
+        "software.compiler_version": "python package metadata",
+        "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+        "software.driver_version": "/usr/local/Ascend/driver/version.info"
+      }
+    }
+  }
+}
