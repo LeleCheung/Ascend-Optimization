@@ -1,6 +1,6 @@
 # 910B 算子优化项目
 
-2026-11-02开始[CANN优先对照与剩余优化](tools/profiling/hgkda/cann_priority/README.md)：30项目标保留原合同，以同语义CANN原生接口为优先baseline，并继续优化相对CANN未过0.8×的候选。新批次为`operators/campaigns/cann-priority-20261102/`；直接API、兼容组合、独立NPU分解与旧PyTorch成绩分别记录。队列运行状态及实际评测决定新增交付，不能把换参考或复测分数变化算作源码优化。
+2026-11-02完成[CANN优先批次](operators/campaigns/cann-priority-20261102/结果简报.md)：25项合格CANN参考下，25项候选超过0.8×；20项直接接口、5项兼容／组合分别登记。新跨线三项为`hardswish_out` 1.395×、`rad2deg_` 1.297×、`transform_bias_rescale_qkv` 0.931×。自写核通过60项专项检查，三项通过原PyTorch与CANN完整KGS、布局补测及成对路径采集。新增源码由Codex直接实现，历史KG Triton路径保留，本批没有追加CC模型搜索。原PyTorch24项与其余5项参考问题继续单列；见[30项表](operators/campaigns/cann-priority-20261102/CANN优先30项总表.md)及[复现步骤](tools/profiling/hgkda/cann_priority/README.md)。
 
 2026-10-31夜间队列完成，见[结果简报](operators/campaigns/reference-closure-20261031/夜间结果简报.md)：24项原参考稳定达标、4项独立NPU对照通过、1项累计积分新版确定性条件通过、1项求逆仍未通过。累计积分Triton＋CANN混合版在双方确定性条件下4.476×、33/33与36/36补测通过；默认0.830×及补测34/36单列。[30项验收总表](operators/campaigns/reference-closure-20261031/30项验收总表.md)与[CANN参考工具](tools/profiling/hgkda/reference_closure/README.md)保留原参考、厂商兼容组合及命名分解的区别。
 

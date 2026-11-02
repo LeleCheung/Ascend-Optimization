@@ -15,7 +15,7 @@ def quote(parts):
 
 class Runner(base.Runner):
     def supplementary(self, op, source, gates, label):
-        if op == '_conj_physical':
+        if op in {'_conj_physical','expm1_'}:
             leaf = self.batch/self.q.records[op]['catalog_leaf']
             return self.supplement_at(op, source, gates, label, leaf)['status']
         return super().supplementary(op, source, gates, label)
@@ -79,7 +79,11 @@ class Runner(base.Runner):
         entry = dict(item, formal=formal)
         if formal and formal['status'] == 'PASSED' and not formal.get('is_hack'):
             gates = out / 'extra-checks.json'
-            qualification = self.job('reference-extra:' + op + version, lambda: dict(status=self.supplementary(op, source, gates, 'CANN-extra-' + op)))
+            checker_version = ''
+            if op == 'expm1_':
+                checker_version = ':checker-' + sha(HERE/'validate_cann.py')[:12]
+                gates = gates.with_name('extra-checks-' + sha(HERE/'validate_cann.py')[:12] + '.json')
+            qualification = self.job('reference-extra:' + op + version + checker_version, lambda: dict(status=self.supplementary(op, source, gates, 'CANN-extra-' + op)))
             entry.update(supplementary=qualification, extra_checks=str(gates))
             if qualification and qualification['status'] == 'passed':
                 leaf = self.alternate(op, source)
@@ -89,7 +93,11 @@ class Runner(base.Runner):
                 entry['comparison'] = comparison
                 if comparison and comparison['status'] == 'PASSED':
                     gates = self.batch / 'comparisons' / op / 'starting/extra-vs-cann.json'
-                    entry['comparison_supplementary'] = self.job('candidate-extra-vs-cann:' + op + version,
+                    checker_version = ''
+                    if op in {'hardshrink_backward','expm1_'}:
+                        checker_version = ':checker-' + sha(HERE/'validate_cann.py')[:12]
+                        gates = gates.with_name('extra-vs-cann-' + sha(HERE/'validate_cann.py')[:12] + '.json')
+                    entry['comparison_supplementary'] = self.job('candidate-extra-vs-cann:' + op + version + checker_version,
                         lambda: self.supplement_at(op, candidate, gates, 'starting-extra-vs-cann-' + op, leaf))
         self.state.setdefault('references', {})[op] = entry
         self.save()
@@ -98,7 +106,8 @@ class Runner(base.Runner):
     def supplement_at(self, op, source, gates, label, leaf):
         from validation_status import supplement_status
         if not gates.exists():
-            checker = HERE.parent/'reference_closure/validate_reference.py' if op == '_conj_physical' else NEXT/'validate.py'
+            checker = (HERE.parent/'reference_closure/validate_reference.py' if op == '_conj_physical' else
+                       HERE/'validate_cann.py' if op in {'hardshrink_backward','expm1_'} else NEXT/'validate.py')
             try:
                 self.cmd(label, [PY, checker, '--operator', op, '--source', source,
                          '--leaf', leaf, '--output', gates], 1200)
@@ -134,10 +143,14 @@ def main():
             r.job(key, lambda: r.cmd('build-storage-rng', [PY, HERE/'build_storage_rng.py'], 1200))
             if not (BATCH/'cann-build-storage-rng-v1.json').exists():
                 raise RuntimeError('存储与随机参考构建失败，保留错误原件')
-            r.job('reference-index-storage', lambda: r.cmd('reference-index-storage',[PY,HERE/'repair_index.py'],180))
+            index_version=sha(HERE/'repair_index.py')[:12]
+            upsample_build=BATCH/'upsample-reference-build-v2.json'
+            if upsample_build.exists():index_version+=':'+sha(upsample_build)[:12]
+            r.job('reference-index-storage:'+index_version, lambda: r.cmd('reference-index-storage',[PY,HERE/'repair_index.py'],180))
             refs = read(BATCH/'reference-index.json')
-            for op in ['uniform','_conj_physical']:
+            for op in ['uniform','_conj_physical','hardshrink_backward','expm1_','upsample_bilinear2d']:
                 r.reference(op,refs[op])
+            optimize(r)
         elif args.phase == 'search':
             from search_missing import process
             process(r)
@@ -161,6 +174,20 @@ def optimize(r):
         source = proposal.parent / item['source']
         assert sha(source) == item['source_sha256']
         out = proposal.parent
+        if op in {'hardswish','hardswish_out','rad2deg_'} and item['backend'].startswith('AscendC'):
+            native = out/'native-checks.json'
+            def native_gate(op=op,source=source,out=out,native=native):
+                if not native.exists():
+                    try:
+                        r.cmd('native-hardswish-'+op+'-'+out.name,[PY,HERE/'check_hardswish_native.py',
+                            '--operator',op,'--source',source,'--leaf',r.batch/r.q.records[op]['catalog_leaf'],'--output',native],1200)
+                    except RuntimeError:
+                        if not native.exists():raise
+                value=read(native)
+                assert value['source_sha256']==sha(source)
+                return dict(status=value['status'],passed=value['passed'],total=value['total'])
+            checked=r.job('proposal-native:'+op+':'+out.name,native_gate)
+            if not checked or checked['status']!='passed':continue
         gates = out / 'extra-checks.json'
         qualification = r.job('proposal-extra:' + op + ':' + out.name,
             lambda op=op, source=source, gates=gates, out=out: dict(status=r.supplementary(op, source, gates, 'proposal-extra-' + op + '-' + out.name)))

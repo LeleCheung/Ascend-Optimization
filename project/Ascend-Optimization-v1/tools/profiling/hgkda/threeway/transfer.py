@@ -69,7 +69,7 @@ print(json.dumps(dict(files=manifest,archive=base64.b64encode(buffer.getvalue())
     for name,expected in value['files'].items():
         assert hashlib.sha256(io_path(PROJECT/name).read_bytes()).hexdigest()==expected['sha256']
     manifest=PROJECT/'operators/campaigns'/(batch+'-windows-sync.json')
-    manifest.write_text(json.dumps(dict(status='verified',files=value['files']),ensure_ascii=False,indent=2)+'\n',encoding='utf8')
+    manifest.write_bytes((json.dumps(dict(status='verified',files=value['files']),ensure_ascii=False,indent=2)+'\n').encode('utf8'))
     print(json.dumps(dict(status='verified',files=len(value['files']),manifest=str(manifest))))
 
 

@@ -60,7 +60,8 @@ def main():
     for old in initial['table']['rows']:
         op = old['operator']
         row = dict(order=old['order'],operator=op,previous_regular=old['regular_accepted'],
-                   previous_pytorch_score=old.get('score'),cann_status='尚无合格同语义CANN参考')
+                   previous_pytorch_score=old.get('score'),previous_status=old.get('status'),
+                   cann_status='尚无合格同语义CANN参考')
         entry = state.get('references',{}).get(op)
         if entry:
             source = track(entry['source'],entry['source_sha256'])
@@ -74,15 +75,27 @@ def main():
             f = entry.get('formal')
             if f:
                 row['reference_validation'] = formal(f['result'],source)
+                if not row['reference_validation']['passed']:
+                    raw=read(f['result'])
+                    row['reference_failures']=[dict(uuid=v.get('uuid'),status=v.get('status'),
+                        log=str(v.get('log',''))[:1800]) for v in raw.get('per_workload',[]) if v.get('status')!='PASSED'][:4]
             gates = entry.get('extra_checks')
             if gates and Path(gates).exists():row['reference_supplementary'] = extra(gates,source)
             qualified = row.get('reference_validation',{}).get('passed') and row.get('reference_supplementary',{}).get('status')=='passed'
             row['cann_reference_qualified'] = bool(qualified)
             row['cann_status'] = 'CANN参考已通过资格' if qualified else 'CANN参考待完成或未通过资格'
+            if row.get('reference_validation') and not row['reference_validation']['passed']:
+                row['cann_status']='CANN参考未通过完整合同'
+            elif row.get('reference_supplementary',{}).get('status')=='failed':
+                row['cann_status']='CANN参考补测未通过'
+                raw=read(row['reference_supplementary']['path'])
+                row['reference_supplementary_failures']=[dict(case=v.get('case'),error=v.get('error'))
+                    for v in raw.get('cases',[]) if not v.get('passed')][:4]
             comp = entry.get('comparison')
             if comp:
                 row['starting_vs_cann'] = formal(comp['result'],comp['source'])
-                p = Path(comp['result']).parent/'extra-vs-cann.json'
+                p = Path((entry.get('comparison_supplementary') or {}).get('extra_checks') or
+                         Path(comp['result']).parent/'extra-vs-cann.json')
                 if p.exists():row['starting_vs_cann_supplementary'] = extra(p,comp['source'])
             candidates = []
             for proposal in sorted((BATCH/'proposals'/op).glob('*/proposal.json')):
@@ -103,9 +116,23 @@ def main():
                 if p.exists():item['cann'] = formal(p,code)
                 p = proposal.parent/'CANN/extra-checks.json'
                 if p.exists():item['cann_supplementary'] = extra(p,code)
+                if op in {'hardswish','hardswish_out','rad2deg_'} and spec['backend'].startswith('AscendC'):
+                    p = proposal.parent/'native-checks.json'
+                    item['native_supplementary'] = extra(p,code) if p.exists() else dict(status='pending')
+                path_index=BATCH/'paths'/op/proposal.parent.name/'index.json'
+                if path_index.exists():
+                    records=read(track(path_index))
+                    assert len(records)==4 and {v['side'] for v in records}=={'candidate','CANN'}
+                    for record in records:
+                        expected=sha(code) if record['side']=='candidate' else sha(source)
+                        assert record['source_sha256']==expected
+                        track(record['trace'])
+                        track(record['summary'],record['summary_sha256'])
+                    item['paired_paths']=dict(status='captured',index=str(path_index),records=len(records))
                 item['qualified'] = bool(qualified and item.get('pytorch',{}).get('passed') and
                     item.get('supplementary',{}).get('status')=='passed' and item.get('cann',{}).get('passed') and
-                    item.get('cann_supplementary',{}).get('status')=='passed')
+                    item.get('cann_supplementary',{}).get('status')=='passed' and
+                    item.get('native_supplementary',{}).get('status','passed')=='passed')
                 starting = row.get('starting_vs_cann',{})
                 if starting.get('passed') and item.get('cann',{}).get('passed'):
                     prior = {v['uuid']:v for v in starting['case_details']}
@@ -116,8 +143,15 @@ def main():
                 candidates.append(item)
             row['new_candidates'] = candidates
             good = [v for v in candidates if v['qualified']]
+            starting = row.get('starting_vs_cann',{})
+            starting_qualified = bool(qualified and starting.get('passed') and
+                row.get('starting_vs_cann_supplementary',{}).get('status')=='passed')
             if good:
                 best = min(good,key=lambda v:geometric([c['candidate_us'] for c in v['cann']['case_details']]))
+                if starting_qualified and best.get('candidate_latency_gain',0)<=1:
+                    row['new_candidates_no_latency_gain'] = True
+                    good = []
+            if good:
                 row['selected_new'] = best
                 row['selected_vs_cann'] = best['cann']['score']
                 row['cann_accepted'] = row['selected_vs_cann']>.8
@@ -134,14 +168,23 @@ def main():
         if not p.with_name(p.name.replace('.request.json','.result.json')).exists():pending.append(str(p))
     for name in ['plan.json','bootstrap.json','software-lock.json','reference-index.json','starting-acceptance.json']:
         track(BATCH/name)
+    by_kind = {}
+    for row in rows:
+        kind=row.get('reference_kind','no_reference')
+        count=by_kind.setdefault(kind,dict(attempted=0,qualified=0,accepted=0))
+        count['attempted']+=1
+        count['qualified']+=bool(row.get('cann_reference_qualified'))
+        count['accepted']+=bool(row.get('cann_accepted'))
     report = dict(schema='hgkda-cann-priority-report-v1',queue_status=state['status'],current_job=state.get('current_job'),
         previous_pytorch_regular=24,total=30,cann_references_qualified=sum(v.get('cann_reference_qualified',False) for v in rows),
         cann_accepted=sum(v.get('cann_accepted',False) for v in rows),
+        by_reference_kind=by_kind,
         newly_crossed_cann=[v['operator'] for v in rows if v.get('cann_accepted') and v.get('starting_vs_cann',{}).get('score',math.inf)<=.8 and v.get('selected_new')],
         rows=rows,pending_requests=pending,audit_issues=issues,evidence_sha256=evidence,
         rule='原PyTorch24项保留，CANN单算子和组合分列；本批复测不计新优化，逐case低分保留；>0.8通过，>1才更快')
     save(BATCH/'delivery.json',report)
     labels={'CANN_native_single_api':'原生CANN','CANN_native_uniform_with_generator_adapter':'原生CANN＋随机状态适配',
+        'CANN_layout_compatibility':'CANN＋布局兼容',
         'CANN_dtype_compatibility':'CANN＋dtype兼容','CANN_FP32_compatibility_composition':'CANN＋FP32转换',
         'CANN_FP32_state_compatibility_composition':'CANN＋FP32／状态适配',
         'CANN_zeros_scatter_composition':'CANN组合：清零＋Scatter',

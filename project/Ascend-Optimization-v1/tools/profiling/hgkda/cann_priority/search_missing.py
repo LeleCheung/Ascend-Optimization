@@ -2,12 +2,12 @@
 import math
 import shutil
 from pathlib import Path
-from common import BATCH, PROJECT, read, save, sha
+from common import BATCH, PROJECT, NEXT, load, read, save, sha
 
 
 def prepare(r, op, entry):
     """独立子批次只包含一个已核验CANN合同，避免改动原合同。"""
-    child = BATCH/'searches'/op
+    child = BATCH/'searches'/(BATCH.name+'-'+op)
     reference = Path(entry['source'])
     leaf = r.alternate(op, reference)
     seed = r.starting_source(op)
@@ -27,6 +27,7 @@ def prepare(r, op, entry):
              measurement_policy='固定本批CANN参考，3轮2400秒；最后按实际延迟保留完整候选，另做原PyTorch语义与CANN独立确认'))
         save(child/'catalog/manifest.json', dict(api_version='v6.2', name='cann-search-'+op,
              evaluator='native', layout='per-operator'))
+        save(child/'targets.json',dict(targets=[dict(operator=op,status='相对本批CANN参考未达标，继续优化')]))
         save(child/'bootstrap.json', {op:dict(path=frozen.relative_to(child).as_posix(),sha256=sha(frozen),origin=str(seed))})
         save(child/'search-provenance.json', dict(parent_batch=str(BATCH),operator=op,
              source=str(seed),source_sha256=sha(seed),reference=str(reference),reference_sha256=sha(reference),
@@ -61,7 +62,11 @@ def process(r, maximum=3):
             gates=proposal.parent/'CANN/extra-checks.json'
             if p.exists() and gates.exists():
                 v=read(p);g=read(gates)
-                if v.get('status')=='PASSED' and v.get('geo_mean',0)>.8 and g.get('status')=='passed':valid_new=True
+                spec=read(proposal)
+                native=proposal.parent/'native-checks.json'
+                requires_native=op in {'hardswish','hardswish_out','rad2deg_'} and spec['backend'].startswith('AscendC')
+                native_ok=not requires_native or (native.exists() and read(native).get('status')=='passed')
+                if v.get('status')=='PASSED' and v.get('geo_mean',0)>.8 and g.get('status')=='passed' and native_ok:valid_new=True
         if not valid_new:choices.append((comp['geo_mean'],op,entry))
     choices.sort()
     selection=BATCH/'search-selection.json'
@@ -72,7 +77,7 @@ def process(r, maximum=3):
     else:
         save(selection,dict(maximum_operators=maximum,rounds=3,budget_seconds_per_operator=2400,
              selection='本批CANN合格且当前候选低于0.8，已有新达标者排除，按实际差距排序',operators=selected))
-    from run import Runner
+    Runner=load('cann_priority_search_runner',NEXT/'run.py').Runner
     for item in selected:
         op=item['operator'];entry=r.state['references'][op]
         assert entry['source_sha256']==item['reference_sha256']
@@ -88,7 +93,7 @@ def process(r, maximum=3):
         if code.exists():assert code.read_bytes()==source.read_bytes()
         else:code.write_bytes(source.read_bytes())
         save(target/'proposal.json',dict(operator=op,id=target.name,source='main.py',source_sha256=sha(code),
-             backend=result.get('backend','KG_HG-KDA_Triton'),child_result=result,
+             backend=result.get('backend') or 'KG_HG-KDA_Triton',child_result=result,
              attribution='KG/HG-KDA＋CC/DeepSeek生成，Codex组织CANN对照证据；最终另验原PyTorch与CANN',
              prediction='模型根据本批CANN差距和实际profiling提出优化，以原合同和补测确认'))
         worker.state.update(status='search_completed',current_job=None)

@@ -57,6 +57,12 @@ def main():
                  build=str(storage),build_sha256=sha(storage),scope=note)
             save(target.parent/'provenance.json',index[op])
     save(BATCH/'reference-index.json',index)
+    upsample=BATCH/'references/upsample_bilinear2d/nchw-v2/provenance.json'
+    if upsample.exists():
+        item=read(upsample)
+        assert sha(item['source'])==item['source_sha256']
+        index['upsample_bilinear2d']=item
+        save(BATCH/'reference-index.json',index)
     print('INDEX',len(index))
 
 

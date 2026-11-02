@@ -11,6 +11,8 @@ def main():
     # 构建记录的原始文件一并核验；旧构建不覆盖。
     for key in ['binary_sha256']:
         if key in build:assert sha(binary)==build[key]
+    for path,digest in build.get('files',{}).items():
+        assert sha(path)==digest
     bootstrap=read(BATCH/'bootstrap.json')
     for op in ['hardswish_out','hardswish']:
         if op=='hardswish_out':parent=BATCH/'proposals/hardswish_out/ascendc-out-v2/main.py'
