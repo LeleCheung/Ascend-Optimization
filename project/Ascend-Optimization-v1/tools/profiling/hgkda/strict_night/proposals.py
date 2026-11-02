@@ -14,6 +14,12 @@ def evaluation_plan(reference):
     raise ValueError('不支持的冻结参考身份：'+str(reference))
 
 
+def verified_target(best):
+    return (best.get('qualification')=='passed' and best.get('reference')=='qualified_CANN'
+            and best.get('search_score',0)>.8 and best.get('compiled_status')=='verified'
+            and best.get('review_status')=='reviewed_strict_triton')
+
+
 def process(runner):
     from night_common import read,save,sha,HERE,TOOLS,PY
     for spec_file in sorted((runner.batch/'proposals').glob('*/*/spec.json')):
@@ -28,7 +34,7 @@ def process(runner):
                     source=str(source),source_sha256=spec['source_sha256'],parent_source_sha256=spec['parent_source_sha256']))
                 runner.persist();continue
         best=(runner.state['operators'].get(op) or {}).get('best') or {}
-        if spec.get('defer_if_target_already_met') and best.get('qualification')=='passed' and best.get('search_score',0)>.8:
+        if spec.get('defer_if_target_already_met') and verified_target(best):
             runner.state['jobs'][key]=dict(status='completed',result=dict(status='retained_unmeasured_target_already_met',
                 source=str(source),source_sha256=spec['source_sha256'],selected_source=best['source']))
             runner.persist();continue

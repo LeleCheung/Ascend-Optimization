@@ -12,7 +12,7 @@
 
 ## 当前状态
 
-2026-11-03续跑[严格Triton夜间优化](project/Ascend-Optimization-v1/tools/profiling/hgkda/strict_night/README.md)，已从冻结16/30推进到**24/30**：原10项为7/10，新20项为17/20。本轮新增8项，均完成完整评测、两侧补测、人工审查与实际Triton后端核验。最新新增`hardswish_out`（相对CANN **0.862×**）、`log2_`（**0.846×**）及`round_out`（**0.829×**）；分别改进宿主启动、迁移流式搬运组织、修复输出接口。`special_round_out`仍在KG／HG-KDA＋CC／DeepSeek搜索，累计积分与求逆数值问题及三项原生参考缺口继续推进。见[当前30项总表](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/严格Triton30项总表.md)、[最新三项记录](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/阶段记录-三项新增.md)和[动态进展](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/夜间优化进展.md)。这是运行中检查点，以动态进展和交付清单为准。
+2026-11-03续跑[严格Triton夜间优化](project/Ascend-Optimization-v1/tools/profiling/hgkda/strict_night/README.md)，已从冻结16/30推进到**25/30**：原10项为7/10，新20项为18/20。本轮新增9项，均完成完整评测、两侧补测、人工审查与实际Triton后端核验。最新`special_round_out`相对CANN **0.946×**、相对PyTorch **0.967×**，两侧各30/30、补测各48/48及12项接口检查通过。九项优先性能对象已全部超过0.8×；累计积分与求逆数值问题及三项原生参考缺口继续由910B独立tmux运行KG／HG-KDA＋CC／DeepSeek推进，大goal仍在进行。见[当前30项总表](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/严格Triton30项总表.md)、[舍入交付记录](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/阶段记录-special_round_out.md)、[剩余五项](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/剩余五项问题清单.md)及[动态进展](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/夜间优化进展.md)。这是运行中检查点，以动态进展和交付清单为准。
 
 2026-11-02目标纠偏：此前把部分候选改成Ascend C／CANN／DMA混合实现，偏离了严格Triton目标。历史25/30、7/10＋18/20和原PyTorch口径总数不能直接作为严格Triton达标数；**现已重新核验：严格Triton达标16/30，1015为6/10、1029为10/20**。以下日期记录及其附件保留历史口径，不覆盖此硬约束。
 

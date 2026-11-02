@@ -1,6 +1,6 @@
 # 严格Triton夜间优化30项总表
 
-冻结起点16/30；本轮已核验24/30。队列：running。
+冻结起点16/30；本轮已核验25/30。队列：running。
 加速比为KGS完整调用；CANN参考类型沿用冻结审计，PyTorch另列。待核验候选不计数。
 
 ## 1015（7/10）
@@ -18,7 +18,7 @@
 |[fractional_max_pool3d](../strict-triton-20261102/candidates/fractional_max_pool3d/restored-v1/main.py)|—|—|7.404×|9/9|原语义通过，CANN参考不合格或缺失，单列|
 |[_conj_physical](../strict-triton-20261102/candidates/_conj_physical/restored-v1/main.py)|1.153×|1.153×|45.279×|14/14|严格Triton达标|
 
-## 1029（17/20）
+## 1029（18/20）
 
 |算子|起点相对CANN|HG-KDA相对CANN|相对PyTorch|原合同|状态|
 |---|---:|---:|---:|---|---|
@@ -36,7 +36,7 @@
 |[round_out](proposals/round_out/codex-optional-out-v3/main.py)|0.585×|0.829×|0.942×|30/30|严格Triton达标|
 |[hardswish_out](proposals/hardswish_out/codex-vectorcall-out-v4/main.py)|0.637×|0.862×|1.050×|30/30|严格Triton达标|
 |[fake_quantize_per_tensor_affine_cachemask_out](../strict-triton-20261102/candidates/fake_quantize_per_tensor_affine_cachemask_out/restored-v1/main.py)|7.060×|7.060×|9.623×|30/30|严格Triton达标|
-|[special_round_out](proposals/special_round_out/codex-streaming-round-v1/main.py)|0.613×|0.676×|0.707×|30/30|严格Triton正确，性能未过0.8×|
+|[special_round_out](proposals/special_round_out/codex-required-out-v4/main.py)|0.613×|0.946×|0.967×|30/30|严格Triton达标|
 |[special_xlogy_](../strict-triton-20261102/candidates/special_xlogy_/restored-v1/main.py)|1.004×|1.004×|0.846×|30/30|严格Triton达标|
 |[hardswish](candidates/hardswish/581ad44a1694f431/main.py)|0.799×|0.882×|0.731×|30/30|严格Triton达标|
 |[fmod_tensor_](proposals/fmod_tensor_/codex-streaming-fmod-v1/main.py)|0.727×|0.818×|0.729×|30/30|严格Triton达标|

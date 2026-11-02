@@ -10,7 +10,7 @@ from unittest import mock
 
 HERE=Path(__file__).resolve().parent
 sys.path.insert(0,str(HERE))
-from proposals import evaluation_plan
+from proposals import evaluation_plan,verified_target
 from report import build
 
 controller_spec=importlib.util.spec_from_file_location('strict_proposal_test_controller',HERE/'run.py')
@@ -33,6 +33,17 @@ class ProposalReferenceTests(unittest.TestCase):
     def test_unqualified_reference_is_rejected(self):
         with self.assertRaises(ValueError):
             evaluation_plan('unqualified_CANN')
+
+    def test_unreviewed_high_score_does_not_suppress_interface_repair(self):
+        ready=dict(qualification='passed',reference='qualified_CANN',search_score=.9,
+                   compiled_status='verified',review_status='reviewed_strict_triton')
+        self.assertTrue(verified_target(ready))
+        for changes in [dict(compiled_status='pending_selected_verification'),
+                        dict(review_status='pending_Codex_manual_review'),
+                        dict(qualification='failed_out_api_probe'),
+                        dict(reference='original_PyTorch_only')]:
+            with self.subTest(changes=changes):
+                self.assertFalse(verified_target({**ready,**changes}))
 
     def test_fast_original_only_never_counts_as_cann_acceptance(self):
         rows=[dict(operator='op'+str(i),group='1015' if i<10 else '1029',accepted=False)

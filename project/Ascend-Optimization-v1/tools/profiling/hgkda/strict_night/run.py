@@ -215,6 +215,20 @@ class Runner:
             value=read(path)
             rejected.append(dict(path=str(path),sha256=sha(path),source_sha256=value['source_sha256'],reason=value['reason'],repair=value.get('repair')))
         if rejected:evidence['manual_rejected_predecessors']=rejected
+        failed_proposals=[]
+        for entry in (self.state.get('operators',{}).get(op) or {}).get('proposals',[]):
+            if entry.get('qualification')=='passed':continue
+            failed={k:entry.get(k) for k in ['source','source_sha256','search_result','search_score','reference','qualification']}
+            failed['supplementary_failures']={}
+            for side,item in (entry.get('extras') or {}).items():
+                if item.get('status')=='passed':continue
+                value=read(item['path'])
+                failed['supplementary_failures'][side]=dict(path=item['path'],sha256=sha(item['path']),
+                    status=value.get('status'),passed=value.get('passed'),total=value.get('total'),
+                    cases=[{k:c.get(k) for k in ['case','check','error']} for c in value.get('cases',[])
+                           if c.get('passed') is False][:6])
+            failed_proposals.append(failed)
+        if failed_proposals:evidence['same_operator_failed_proposals']=failed_proposals[-4:]
         transferred=[]
         for prior_op,row in self.state.get('operators',{}).items():
             best=row.get('best') or {}
@@ -277,6 +291,19 @@ class Runner:
                 evidence['diagnosis']+=('旧源码关于CPU参考转置及消元次序的docstring并非证明。'
                     '检查实际矩阵布局、除法/倒数乘法、FMA和消元结合顺序；原参考对重复行矩阵返回info=0和很大有限值。'
                     '保留奇异输入失败证据，不能放宽容差、改变奇异语义或硬编码结果来凑通过。')
+                arithmetic=PROJECT/'operators/campaigns/reference-closure-20261031/analysis/linalg_inv_ex/offline-layout-v2.json'
+                if arithmetic.exists():
+                    history=read(arithmetic)['rows']
+                    groups=sorted({(r['case'],r['matrix']) for r in history})
+                    evidence['offline_arithmetic_history']=dict(path=str(arithmetic),sha256=sha(arithmetic),
+                        scope='已有离线FP32运算顺序假设；不是本轮NPU结果，不把个别固定输入常量写进候选',
+                        cases=[dict(case=name,matrix=index,
+                            attempted=sum(r['case']==name and r['matrix']==index for r in history),
+                            matched=sum(r['case']==name and r['matrix']==index and r.get('matched',False) for r in history))
+                            for name,index in groups])
+                    evidence['diagnosis']+=('上述历史已覆盖直接/转置、逐项除法/倒数乘法、LU和求解的FMA组合等。'
+                        '不要重复无新机制的相同排列。若研究LAPACK一致性，可检查实际分块/递归分解及三角求解顺序，'
+                        '形成通用Triton算法；不能按奇异用例预存参考值。')
         return evidence
     def prepare_paired(self,op,seed):
         if self.q.records[op]['reference']!='qualified_CANN':return
