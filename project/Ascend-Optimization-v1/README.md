@@ -1,6 +1,6 @@
 # 910B 算子优化项目
 
-2026-11-02正在运行[严格Triton夜间优化](tools/profiling/hgkda/strict_night/README.md)：从冻结16/30推进到**18/30**，新增`hardswish`（相对CANN 0.882×）和`fix`（1.014×）。两项均完成KGS完整评测、补测、人工审查和实际后端核验；其余性能、数值与参考问题继续运行。见[当前30项总表](operators/campaigns/strict-night-20261102/严格Triton30项总表.md)和[动态进展](operators/campaigns/strict-night-20261102/夜间优化进展.md)。
+2026-11-02正在运行[严格Triton夜间优化](tools/profiling/hgkda/strict_night/README.md)：从冻结16/30推进到**19/30**，新增`hardswish`（相对CANN 0.882×）、`fix`（1.014×）和`hardshrink_backward`（1.042×）。三项均完成KGS完整评测、两侧补测、人工审查和实际后端核验；其余性能、数值与参考问题继续运行。见[当前30项总表](operators/campaigns/strict-night-20261102/严格Triton30项总表.md)和[动态进展](operators/campaigns/strict-night-20261102/夜间优化进展.md)。
 
 **用户硬约束：CANN／Ascend C用于baseline，优化候选严格使用Triton。** 所有计算、复制、归约、扫描、布局转换和回退路径均须由Triton kernel实现；Python／C++仅可作宿主胶水。完整规则见[硬性规则](../../docs/Triton候选与CANN参考硬性规则.md)。
 

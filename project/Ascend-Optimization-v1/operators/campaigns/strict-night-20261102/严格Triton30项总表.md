@@ -1,6 +1,6 @@
 # 严格Triton夜间优化30项总表
 
-冻结起点16/30；本轮已核验18/30。队列：running。
+冻结起点16/30；本轮已核验19/30。队列：running。
 加速比为KGS完整调用；CANN参考类型沿用冻结审计，PyTorch另列。待核验候选不计数。
 
 ## 1015（6/10）
@@ -18,7 +18,7 @@
 |[fractional_max_pool3d](../strict-triton-20261102/candidates/fractional_max_pool3d/restored-v1/main.py)|—|—|7.404×|9/9|原语义通过，CANN参考不合格或缺失，单列|
 |[_conj_physical](../strict-triton-20261102/candidates/_conj_physical/restored-v1/main.py)|1.153×|1.153×|45.279×|14/14|严格Triton达标|
 
-## 1029（12/20）
+## 1029（13/20）
 
 |算子|起点相对CANN|HG-KDA相对CANN|相对PyTorch|原合同|状态|
 |---|---:|---:|---:|---|---|
@@ -27,7 +27,7 @@
 |[nan_to_num_](../strict-triton-20261102/candidates/nan_to_num_/restored-v1/main.py)|1.100×|1.100×|0.876×|30/30|严格Triton达标|
 |[cross_out](../strict-triton-20261102/candidates/cross_out/restored-v1/main.py)|4.090×|4.090×|3.757×|21/21|严格Triton达标|
 |[expm1_](../strict-triton-20261102/candidates/expm1_/restored-v1/main.py)|—|—|0.551×|30/30|原语义通过，CANN参考不合格或缺失，单列|
-|[hardshrink_backward](../strict-triton-20261102/candidates/hardshrink_backward/restored-v1/main.py)|0.787×|0.787×|0.851×|30/30|严格Triton正确，性能未过0.8×|
+|[hardshrink_backward](proposals/hardshrink_backward/codex-npu-masked-gradient-v1/main.py)|0.787×|1.042×|1.037×|30/30|严格Triton达标|
 |[subtract_](../strict-triton-20261102/candidates/subtract_/restored-v1/main.py)|1.556×|1.556×|1.131×|30/30|严格Triton达标|
 |[native_group_norm](../strict-triton-20261102/candidates/native_group_norm/restored-v1/main.py)|0.987×|0.987×|0.783×|27/27|严格Triton达标|
 |[log2_](../strict-triton-20261102/candidates/log2_/restored-v1/main.py)|0.633×|0.633×|0.570×|30/30|严格Triton正确，性能未过0.8×|

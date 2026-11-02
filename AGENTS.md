@@ -8,6 +8,8 @@
 
 当前实验遵循[新25算子计划](project/Ascend-Optimization-v1/operators/下一阶段计划-20261029.md)：保留导师目标名称和顺序；CANN原生库与已核验Ascend C源码参考区分；PyTorch正确性和历史计时口径保留。新工具只改独立覆盖层，不修改共享服务/镜像。新知识有源码、请求、完整结果及补充检查身份才进入已验证索引；热点邻域、可观测空闲和因果瓶颈分开表述。
 
+上述16/30为纠偏复核的冻结起点。夜间持续优化的当前交付数读取`project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/progress.json`及`delivery.json`，不能用冻结起点覆盖新增成果。恢复运行前检查既有Goal、tmux和工作区状态，不重复创建Goal或启动活跃工作区。
+
 后续对话和新报告遵循[实验归属与汇报口径](docs/实验归属与汇报口径.md)。
 
 - 文档使用中文。

@@ -190,7 +190,7 @@ class Runner:
         for prior_op,row in self.state.get('operators',{}).items():
             best=row.get('best') or {}
             if prior_op==op or best.get('qualification')!='passed':continue
-            transferred.append({k:best.get(k) for k in ['source','source_sha256','search_result','search_score','pytorch_result','review_status','compiled_status']})
+            transferred.append({k:best.get(k) for k in ['source','source_sha256','search_result','search_score','pytorch_result','review_status','compiled_status','component_diagnostic']})
         evidence['same_batch_numerically_qualified_examples']=transferred[:3]
         paired=BATCH/'analysis'/op/('paired-'+sha(seed)[:16])/'summary.json'
         if paired.exists():
@@ -382,15 +382,19 @@ def evaluate_bundle(bundle, context, *, run_control=None):
         old_sha=self.previous[op]['source_sha256']
         original_id=computation_identity(BATCH/self.q.records[op]['seed'])
         seen={r['source_sha256'] for a in self.state['operators'][op]['attempts'] for r in a.get('candidates',[])}
+        seen_computations={original_id}|{computation_identity(Path(r['source']))
+            for a in self.state['operators'][op]['attempts'] for r in a.get('candidates',[])}
         for result in sorted(workspace.glob('stages/optimize/work/.kernelgen/evals/round-*/result.json')):
             source=result.with_name('main.py'); v=read(result)
             if not source.exists() or v.get('status')!='PASSED' or v.get('is_hack') or sha(source)==old_sha:continue
-            if computation_identity(source)==original_id:continue
+            computation=computation_identity(source)
+            if computation in seen_computations:continue
             if v.get('num_passed')!=v.get('num_workloads') or not v.get('num_workloads'):continue
             # 同源码只保留第一次完整评测，不按重复测量中的高分择优。
             digest=sha(source)
             if digest in seen:continue
             seen.add(digest)
+            seen_computations.add(computation)
             solution=read(result.with_name('solution.json')).get('sources',[])
             if len(solution)!=1 or solution[0].get('content')!=source.read_text(encoding='utf8'):
                 raise self.module.Attention('KG记录与实际源码不一致')
@@ -435,6 +439,9 @@ def evaluate_bundle(bundle, context, *, run_control=None):
                 except RuntimeError:
                     if not output.exists():raise
             extras[label]=dict(path=str(output),status=supplement_status(op,read(output),sha(source)))
+        if any(value['status']!='passed' for value in extras.values()):
+            return dict(qualification='failed',extras=extras,pytorch_result=None,pytorch_score=None,
+                        review_status='pending_Codex_manual_review',compiled_status='not_qualified')
         formal=Path(existing_pytorch_result) if existing_pytorch_result else out/'pytorch/strict-PyTorch-1.result.json'
         if existing_pytorch_result:
             assert self.q.records[op]['reference']=='original_PyTorch_only'

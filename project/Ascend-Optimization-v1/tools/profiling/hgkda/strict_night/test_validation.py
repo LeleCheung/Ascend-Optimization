@@ -35,6 +35,13 @@ class ValidationTests(unittest.TestCase):
                 self.assertEqual(value['pytorch_result'],str(formal))
                 (root/'catalog/ops'/op/'oracle.py').write_text('changed')
                 with self.assertRaises(AssertionError):runner.validate(op,source,out,existing_pytorch_result=formal)
+            (out/'extra-cann.json').write_text('{}')
+            runner.q.records[op]['reference']='qualified_CANN'
+            helper.supplement_status=lambda *args:'failed'
+            with patch.object(controller,'BATCH',root),patch.dict('sys.modules',validation_status=helper):
+                rejected=runner.validate(op,source,out)
+                self.assertEqual(rejected['qualification'],'failed')
+                self.assertIsNone(rejected['pytorch_result'])
 
 
 if __name__=='__main__':unittest.main()
