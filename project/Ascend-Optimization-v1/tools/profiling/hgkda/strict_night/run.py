@@ -272,6 +272,24 @@ class Runner:
             if extra.get('path'): evidence['supplementary_failures'] = read(extra['path'])
             evidence['diagnosis'] += ('这项参考或数值仍存在缺口，先严格修复原语义，不能通过修改容差或参考规避。'
                                      'uniform禁止重写原生CANN参考以掩盖下界舍入问题；fractional没有原生接口不能伪造。')
+            inventory=BATCH/'reference-probes/cann-9-interface-inventory-v1.json'
+            if inventory.exists():
+                value=read(inventory)
+                evidence['additional_CANN_interface_inventory']=dict(path=str(inventory),sha256=sha(inventory),
+                    exports=value['exports'],graph_interfaces=[{k:r[k] for k in ['name','path','sha256']}
+                        for r in value['graph_ops']],
+                    scope='当前安装版本的只读声明/符号证据，不证明设备支持，也不计作合格参考')
+            if op=='expm1_':
+                alternate=BATCH/'reference-probes/native-foreach-expm1-v1/numerics.json'
+                if alternate.exists():
+                    value=read(alternate)
+                    evidence['native_foreach_expm1_probe']=dict(path=str(alternate),sha256=sha(alternate),
+                        status=value['status'],passed=value['passed'],total=value['total'],
+                        qualified_CANN=value['qualified_CANN'],performance_measured=value['performance_measured'],
+                        cases=[{k:r.get(k) for k in ['dtype','alias_output','strided','passed','error']}
+                               for r in value['cases']])
+                    evidence['diagnosis']+=('ForeachExpm1适配只属于参考端资格探测。即使小样本通过，也需完整合同、补测和路径核验后才可作新参考；'
+                        '该CANN/C++实现不能进入严格Triton候选，不把原生数值问题当作候选必须复制的缺陷。')
             if op=='cumulative_trapezoid':
                 conflict=PROJECT/'operators/campaigns/reference-closure-20261031/analysis/cumulative_trapezoid/agent-context.json'
                 if conflict.exists():

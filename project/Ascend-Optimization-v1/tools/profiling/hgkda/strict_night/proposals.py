@@ -22,6 +22,8 @@ def verified_target(best):
 
 def process(runner):
     from night_common import read,save,sha,HERE,TOOLS,PY
+    import probe_foreach_reference
+    probe_foreach_reference.process(runner)
     for spec_file in sorted((runner.batch/'proposals').glob('*/*/spec.json')):
         spec=read(spec_file);op=spec['operator'];out=spec_file.parent;source=out/'main.py'
         assert op in runner.q.records and out.parent.name==op
