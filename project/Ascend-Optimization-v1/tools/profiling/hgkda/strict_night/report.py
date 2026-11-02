@@ -179,7 +179,7 @@ def main():
                 fmt(row['cann'].get('score'))+'|'+fmt(pt.get('score'))+'|'+
                 str(pt.get('passed','—'))+'/'+str(pt.get('total','—'))+'|'+row['status']+'|')
         lines.append('')
-    lines += ['参考不合格或缺失的算子单列；`fractional_max_pool3d`和`_conj_physical`的PyTorch参考包含CPU回退。',
+    lines += ['参考不合格或缺失的算子单列；`fractional_max_pool3d`、`_conj_physical`和`linalg_inv_ex`的PyTorch参考包含CPU回退。',
         '完整源码身份、原始测量、补测、归属、参考类型和后端证明见`delivery.json`；本脚本不触发任何设备评测。','']
     (BATCH/'严格Triton30项总表.md').write_text('\n'.join(lines),encoding='utf8')
     print(json.dumps(dict(status='snapshot_verified',accepted=result['accepted'],groups=result['groups']),ensure_ascii=False))

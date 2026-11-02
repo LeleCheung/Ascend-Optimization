@@ -34,6 +34,8 @@ def process(runner):
     inverse_stages_probe_v2.process(runner)
     import masked_update_probe
     masked_update_probe.process(runner)
+    import execution_components
+    execution_components.process(runner)
     for spec_file in sorted((runner.batch/'proposals').glob('*/*/spec.json')):
         spec=read(spec_file);op=spec['operator'];out=spec_file.parent;source=out/'main.py'
         assert op in runner.q.records and out.parent.name==op

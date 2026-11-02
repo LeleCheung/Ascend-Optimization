@@ -305,6 +305,15 @@ class Runner:
                         for r in value['graph_ops']],
                     scope='当前安装版本的只读声明/符号证据，不证明设备支持，也不计作合格参考')
             if op=='expm1_':
+                components=BATCH/'component-diagnostics/expm1-components-v1/result.json'
+                if components.exists():
+                    value=read(components)
+                    assert value['status']=='measured' and value['qualified_CANN'] is False
+                    evidence['execution_components']=dict(path=str(components),sha256=sha(components),
+                        rows=value['rows'],scope=value['scope'])
+                    evidence['diagnosis']+=('读取原PyTorch和当前候选的小/大输入宿主调用与设备任务对照；'
+                        '设备采样带profiler，不能与独立宿主样本相减或相加，也不作新的正式排名。'
+                        '先区分启动胶水和设备循环/计算差距，再选择改法；不能只归因于program数量。')
                 streaming=BATCH/'analysis/expm1_/bound-streaming-v1-summary.json'
                 if streaming.exists():
                     value=read(streaming)

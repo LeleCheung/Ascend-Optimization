@@ -15,7 +15,7 @@
 |[value_selecting_reduction_backward](../strict-triton-20261102/candidates/value_selecting_reduction_backward/restored-v1/main.py)|1.470×|1.470×|1.676×|96/96|严格Triton达标|
 |[scatter_add](../strict-triton-20261102/candidates/scatter_add/restored-v1/main.py)|1.886×|1.886×|1.880×|18/18|严格Triton达标|
 |[upsample_bilinear2d](../strict-triton-20261102/candidates/upsample_bilinear2d/restored-v1/main.py)|1.147×|1.147×|0.945×|24/24|严格Triton达标|
-|[fractional_max_pool3d](../strict-triton-20261102/candidates/fractional_max_pool3d/restored-v1/main.py)|—|—|7.404×|9/9|原语义通过，CANN参考不合格或缺失，单列|
+|[fractional_max_pool3d](candidates/fractional_max_pool3d/877b05af96cb4ebe/main.py)|—|—|33.002×|9/9|原语义通过，CANN参考不合格或缺失，单列|
 |[_conj_physical](../strict-triton-20261102/candidates/_conj_physical/restored-v1/main.py)|1.153×|1.153×|45.279×|14/14|严格Triton达标|
 
 ## 1029（18/20）
@@ -26,7 +26,7 @@
 |[xlogy_scalar_tensor](../strict-triton-20261102/candidates/xlogy_scalar_tensor/restored-v1/main.py)|1.579×|1.579×|1.234×|30/30|严格Triton达标|
 |[nan_to_num_](../strict-triton-20261102/candidates/nan_to_num_/restored-v1/main.py)|1.100×|1.100×|0.876×|30/30|严格Triton达标|
 |[cross_out](../strict-triton-20261102/candidates/cross_out/restored-v1/main.py)|4.090×|4.090×|3.757×|21/21|严格Triton达标|
-|[expm1_](../strict-triton-20261102/candidates/expm1_/restored-v1/main.py)|—|—|0.551×|30/30|原语义通过，CANN参考不合格或缺失，单列|
+|[expm1_](candidates/expm1_/7696add46b061fd8/main.py)|—|—|0.561×|30/30|原语义通过，CANN参考不合格或缺失，单列|
 |[hardshrink_backward](proposals/hardshrink_backward/codex-npu-masked-gradient-v1/main.py)|0.787×|1.042×|1.037×|30/30|严格Triton达标|
 |[subtract_](../strict-triton-20261102/candidates/subtract_/restored-v1/main.py)|1.556×|1.556×|1.131×|30/30|严格Triton达标|
 |[native_group_norm](../strict-triton-20261102/candidates/native_group_norm/restored-v1/main.py)|0.987×|0.987×|0.783×|27/27|严格Triton达标|
@@ -40,8 +40,8 @@
 |[special_xlogy_](../strict-triton-20261102/candidates/special_xlogy_/restored-v1/main.py)|1.004×|1.004×|0.846×|30/30|严格Triton达标|
 |[hardswish](candidates/hardswish/581ad44a1694f431/main.py)|0.799×|0.882×|0.731×|30/30|严格Triton达标|
 |[fmod_tensor_](proposals/fmod_tensor_/codex-streaming-fmod-v1/main.py)|0.727×|0.818×|0.729×|30/30|严格Triton达标|
-|[linalg_inv_ex](../strict-triton-20261102/candidates/linalg_inv_ex/restored-v1/main.py)|—|—|—|5/7|原语义或补测未通过|
+|[linalg_inv_ex](proposals/linalg_inv_ex/codex-masked-operands-v7/main.py)|—|—|77.743×|7/7|原语义通过，CANN参考不合格或缺失，单列|
 |[batch_norm_with_update_functional](../strict-triton-20261102/candidates/batch_norm_with_update_functional/restored-v1/main.py)|1.748×|1.748×|23.563×|27/27|严格Triton达标|
 
-参考不合格或缺失的算子单列；`fractional_max_pool3d`和`_conj_physical`的PyTorch参考包含CPU回退。
+参考不合格或缺失的算子单列；`fractional_max_pool3d`、`_conj_physical`和`linalg_inv_ex`的PyTorch参考包含CPU回退。
 完整源码身份、原始测量、补测、归属、参考类型和后端证明见`delivery.json`；本脚本不触发任何设备评测。
