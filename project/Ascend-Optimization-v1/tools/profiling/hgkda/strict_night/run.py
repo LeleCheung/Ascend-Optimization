@@ -126,6 +126,9 @@ class Runner:
                 value=read(entry['search_result'])
                 try:entry['search_score']=score(value)
                 except (AssertionError,KeyError,ValueError,TypeError):entry['qualification']='formal_failure'
+                rejection=self.manual_rejection(op,Path(entry['source']))
+                if rejection:entry.update(qualification='manual_review_rejected',manual_review_rejection=rejection,
+                                          compiled_status='not_qualified')
                 if entry.get('qualification')=='passed':qualified.append(entry)
             if qualified:
                 best=max(qualified,key=lambda x:x['search_score'])
@@ -295,6 +298,16 @@ class Runner:
                                for r in value['cases']])
                     evidence['diagnosis']+=('ForeachExpm1适配只属于参考端资格探测。即使小样本通过，也需完整合同、补测和路径核验后才可作新参考；'
                         '该CANN/C++实现不能进入严格Triton候选，不把原生数值问题当作候选必须复制的缺陷。')
+                math_inventory=BATCH/'reference-probes/cann-9-ascendc-expm1-v1.json'
+                if math_inventory.exists():
+                    value=read(math_inventory)
+                    evidence['ascendc_expm1_math_inventory']=dict(path=str(math_inventory),sha256=sha(math_inventory),
+                        headers_scanned=value['headers_scanned'],device_executed=False,qualified_CANN=False,
+                        headers=[{k:row[k] for k in ['path','sha256','frozen','direct_definitions',
+                            'architecture_guards','explicit_backend_includes']} for row in value['matches']],
+                        scope='仅SDK源码清点，不能推定这些SIMT接口在910B可用，也不能据此认定实际aclnn执行路径。')
+                    evidence['diagnosis']+=('SDK可见的Expm1Impl/expm1f仍直接使用Exp(x)-1，涉及SIMT架构条件；'
+                        '不能将该声明直接当作精度问题已解决，也不能自行重写高精度参考来增加CANN达标数。')
             if op=='cumulative_trapezoid':
                 conflict=PROJECT/'operators/campaigns/reference-closure-20261031/analysis/cumulative_trapezoid/agent-context.json'
                 if conflict.exists():

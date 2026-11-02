@@ -41,6 +41,11 @@ def process(runner):
                 source=str(source),source_sha256=spec['source_sha256'],selected_source=best['source']))
             runner.persist();continue
         assert sha(source)==spec['source_sha256']
+        rejection=runner.manual_rejection(op,source)
+        if rejection:
+            runner.state['jobs'][key]=dict(status='completed',result=dict(status='manual_review_rejected_no_measurement',
+                source=str(source),source_sha256=spec['source_sha256'],rejection=rejection))
+            runner.persist();continue
         from signature_gate import admit as admit_signature
         signature=admit_signature(source,runner.batch/'catalog/ops'/op/'definition.json')
         save(out/'signature-admission.json',signature)

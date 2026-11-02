@@ -11,6 +11,7 @@ from unittest import mock
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import measurements
+import proposals
 
 spec = importlib.util.spec_from_file_location('night_selection_controller', HERE/'run.py')
 controller = importlib.util.module_from_spec(spec)
@@ -18,6 +19,42 @@ spec.loader.exec_module(controller)
 
 
 class SelectionTests(unittest.TestCase):
+    def test_rejected_manual_proposal_does_not_submit_device_work(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);out=root/'proposals/op/known-bad';out.mkdir(parents=True)
+            source=out/'main.py';source.write_text('def run(x):\n    return x\n')
+            controller.save(out/'spec.json',dict(operator='op',source_sha256=controller.sha(source)))
+            runner=SimpleNamespace(batch=root,q=SimpleNamespace(records={'op':{}}),
+                state=dict(jobs={},operators={}),persist=mock.Mock(),
+                manual_rejection=mock.Mock(return_value='verified-review-rejection.json'),
+                wait=mock.Mock(side_effect=AssertionError('不得使用设备')),
+                cmd=mock.Mock(side_effect=AssertionError('不得提交请求')))
+            with mock.patch('probe_foreach_reference.process'):
+                proposals.process(runner)
+            result=runner.state['jobs']['proposal:op:known-bad']['result']
+            self.assertEqual(result['status'],'manual_review_rejected_no_measurement')
+            runner.wait.assert_not_called();runner.cmd.assert_not_called()
+
+    def test_rejected_fast_manual_proposal_cannot_hide_correct_repair(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);entries=[]
+            for name,points in [('bad',.95),('repair',.84)]:
+                source=root/(name+'.py');source.write_text('def run(x):\n    return x+'+str(points)+'\n')
+                result=root/(name+'.json');controller.save(result,dict(points=points))
+                entries.append(dict(source=str(source),source_sha256=controller.sha(source),
+                    search_result=str(result),qualification='passed',compiled_status='verified'))
+            rejected=root/'review-rejections/op'/(entries[0]['source_sha256']+'.json')
+            controller.save(rejected,dict(operator='op',source_sha256=entries[0]['source_sha256'],
+                status='manual_review_rejected',reason='缓存布局不完整'))
+            runner=controller.Runner.__new__(controller.Runner)
+            runner.state=dict(operators={'op':dict(attempts=[],proposals=entries,best=entries[0])})
+            runner.previous={'op':dict(pytorch=dict(status='PASSED',score=.7),supplementary=dict(status='passed'))}
+            with mock.patch.object(controller,'BATCH',root),mock.patch.object(measurements,'score',side_effect=lambda value:value['points']):
+                runner.refresh_existing_scores()
+            self.assertIs(runner.state['operators']['op']['best'],entries[1])
+            self.assertEqual(entries[0]['qualification'],'manual_review_rejected')
+            self.assertEqual(entries[0]['compiled_status'],'not_qualified')
+
     def test_new_verified_proposal_is_retained_without_starting_duplicate_search(self):
         with tempfile.TemporaryDirectory() as folder:
             runner = controller.Runner.__new__(controller.Runner)
