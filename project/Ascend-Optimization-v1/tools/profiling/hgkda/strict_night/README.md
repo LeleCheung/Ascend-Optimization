@@ -56,6 +56,8 @@
 
 `offline_leftlooking_inverse.py`用于研究求逆的运算顺序，在CPU上显式模拟FP32舍入。它根据固定版本PyTorch／OpenBLAS源码建立按列延迟更新LU的假设，区分点积后减法、逐步FMA、倒数缩放及adjoint求解；不把输入或逆矩阵常量写进候选。当前离线共同配置已匹配三个历史奇异矩阵，但仍须通用Triton实现和NPU验证。Python 3.11通过系统libm的double `fma`复放同一模型；冻结结果、检查器和上游源码位于本批`analysis/linalg_inv_ex/`，不把CPU模型结果当作设备成绩。
 
+`fp32_rounding_probe.py`将单次乘加／除法与整LU运算分开诊断，`compensated_arithmetic.py`进一步比较融合开关和纯Triton误差补偿。8192个普通指数范围／乘积消去样本中，两种融合开关下显式FMA均有4588项不同于CPU `fmaf`；补偿乘加为0项。普通商／倒数分别有451／546项不同，残差修正后均为0项。输入、逐样本结果、检查器和实际TTIR／adapter／npubin保存于`numerical-probes/`。这是当前环境的有限样本事实，不作为全IEEE证明或完整求逆成绩。诊断与提案使用同一卡锁串行执行；未知回执不重新提交，已结束结果按内容身份复用。新结果只在下一尚未启动的KG工作区进入上下文。
+
 `round_out`与`special_round_out`的out接口不同：前者可省略或传None，后者要求位置或关键字out。`signature_gate.py`在设备请求前核对冻结签名；`out_api_probe.py`分别补测12项分配、参数与尺寸路径。检查器按SHA冻结并随结果保存；恢复旧结果时使用原检查器身份。接口不合格的高分不能进入交付。
 
 ## 宿主启动与舍入公式的接续实验

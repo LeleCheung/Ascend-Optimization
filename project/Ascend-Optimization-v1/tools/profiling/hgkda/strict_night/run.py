@@ -349,6 +349,24 @@ class Runner:
                         '上三角使用先求dot再减法；下半列依次FMA更新，再pivot和倒数乘法缩放。'
                         '转置分解后按adjoint顺序解U^T、L^T并逆置换。此前右看式rank-1模型没有覆盖这一更新时序。'
                         '优先实现这种通用Triton顺序并做一次小范围核验；编译器融合/除法和CPU微内核仍可能不同。')
+                probes=[]
+                for probe_name in ['fp32-rounding-v1','fp32-compensated-v2']:
+                    path=BATCH/'numerical-probes'/probe_name/'result.json'
+                    if not path.exists():continue
+                    value=read(path)
+                    facts={k:value.get(k) for k in ['status','samples','error','exact_mismatches',
+                        'input_sha256','kernel_sha256','checker_sha256','scope']}
+                    facts['batches']=[{k:row[k] for k in ['enable_fp_fusion','exact_mismatches','artifacts']}
+                                      for row in value.get('batches',[])]
+                    probes.append(dict(path=str(path),sha256=sha(path),facts=facts))
+                if probes:
+                    evidence['direct_fp32_rounding_probes']=probes
+                    evidence['diagnosis']+=('本批直接数值诊断与整LU调试分开：8192个普通指数范围/消去样本中，'
+                        '两个融合开关下显式FMA均有4588项不同于CPU fmaf，补偿乘加0项不同；'
+                        '原除法451项、原倒数546项不同，残差修正后均0项。'
+                        '这支持在小矩阵通用LU里使用纯Triton补偿算术；不是全IEEE证明，也不能直接认定整个求逆已通过。'
+                        '实际TTIR/adapter/npubin已冻结。v1另有标量precise_div所在转换阶段失败及大矩阵offsets形状冲突，'
+                        '不要复制已知编译错误；完整合同与补测保持不变。')
         return evidence
     def prepare_paired(self,op,seed):
         if self.q.records[op]['reference']!='qualified_CANN':return
