@@ -11,7 +11,7 @@
 |[rad2deg_](proposals/rad2deg_/codex-launch-once-v1/main.py)|0.767×|0.922×|1.119×|36/36|严格Triton达标|
 |[log10_](../strict-triton-20261102/candidates/log10_/restored-v1/main.py)|0.843×|0.843×|0.806×|36/36|严格Triton达标|
 |[cumulative_trapezoid](../strict-triton-20261102/candidates/cumulative_trapezoid/restored-v1/main.py)|—|—|0.845×|33/33|原语义或补测未通过|
-|[uniform](../strict-triton-20261102/candidates/uniform/restored-v1/main.py)|—|—|1.387×|18/18|原语义通过，CANN参考不合格或缺失，单列|
+|[uniform](proposals/uniform/codex-launch-once-v1/main.py)|—|—|1.628×|18/18|原语义通过，CANN参考不合格或缺失，单列|
 |[value_selecting_reduction_backward](../strict-triton-20261102/candidates/value_selecting_reduction_backward/restored-v1/main.py)|1.470×|1.470×|1.676×|96/96|严格Triton达标|
 |[scatter_add](../strict-triton-20261102/candidates/scatter_add/restored-v1/main.py)|1.886×|1.886×|1.880×|18/18|严格Triton达标|
 |[upsample_bilinear2d](../strict-triton-20261102/candidates/upsample_bilinear2d/restored-v1/main.py)|1.147×|1.147×|0.945×|24/24|严格Triton达标|

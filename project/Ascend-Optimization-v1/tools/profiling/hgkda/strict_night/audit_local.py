@@ -29,7 +29,7 @@ def main():
     result=dict(status='verified',operators=30,accepted=delivery['accepted'],files=len(checked),
                 delivery_sha256=hashlib.sha256((BATCH/'delivery.json').read_bytes()).hexdigest(),
                 scope='本机交付快照＋冻结审计的文件实体与SHA核验；不触发设备测试，不把审计通过解释为30项性能均达标')
-    (BATCH/'local-copy-audit.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
+    (BATCH/'local-copy-audit.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n',encoding='utf8',newline='\n')
     print(json.dumps(result,ensure_ascii=False))
 
 

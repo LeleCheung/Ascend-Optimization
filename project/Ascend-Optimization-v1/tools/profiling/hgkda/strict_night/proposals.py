@@ -30,6 +30,8 @@ def process(runner):
     compensated_arithmetic.process(runner)
     import inverse_stages_probe
     inverse_stages_probe.process(runner)
+    import inverse_stages_probe_v2
+    inverse_stages_probe_v2.process(runner)
     for spec_file in sorted((runner.batch/'proposals').glob('*/*/spec.json')):
         spec=read(spec_file);op=spec['operator'];out=spec_file.parent;source=out/'main.py'
         assert op in runner.q.records and out.parent.name==op

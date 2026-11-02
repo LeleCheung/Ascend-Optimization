@@ -394,7 +394,7 @@ class Runner:
                         '实际TTIR/adapter/npubin已冻结。v1另有标量precise_div所在转换阶段失败及大矩阵offsets形状冲突，'
                         '不要复制已知编译错误；完整合同与补测保持不变。')
                 compile_checks=[]
-                for label in ['compile-static-v3','compile-reverse-v4','compile-dynamic-v5']:
+                for label in ['compile-static-v3','compile-reverse-v4','compile-dynamic-v5','compile-masked-v7']:
                     path=BATCH/'analysis/linalg_inv_ex'/label/'result.json'
                     if path.exists():
                         try:value=read(path)
@@ -405,7 +405,7 @@ class Runner:
                             rows=[{k:v for k,v in row.items() if k!='artifacts'} for row in value['rows']]))
                 if compile_checks:evidence['inverse_compile_only_checks']=compile_checks
                 models=[]
-                for label in ['cpu-literal-v5','cpu-literal-v6']:
+                for label in ['cpu-literal-v5','cpu-literal-v6','cpu-literal-v7']:
                     path=BATCH/'analysis/linalg_inv_ex'/label/'result.json'
                     if path.exists():
                         value=read(path)
@@ -413,6 +413,23 @@ class Runner:
                             checker_sha256=value['checker_sha256'],scope=value['scope'],device_executed=False,
                             rows=[{k:row[k] for k in ['case','passed','error'] if k in row} for row in value['rows']]))
                 if models:evidence['cpu_literal_source_models']=models
+                stage_probes=[]
+                for label in ['inverse-stages-v1','inverse-stages-v2']:
+                    path=BATCH/'numerical-probes'/label/'result.json'
+                    if not path.exists():continue
+                    value=read(path)
+                    facts={k:value[k] for k in ['status','source_sha256','checker_sha256',
+                        'error','scalar_operand_mismatches'] if k in value}
+                    facts['cases']=[dict(case=row['case'],
+                        instrumentation_matches_original=row['instrumentation_matches_original'])
+                        for row in value.get('cases',[])]
+                    stage_probes.append(dict(path=str(path),sha256=sha(path),facts=facts,
+                        scope='不计时的阶段诊断；先核对插桩是否改变输出，不能把诊断脚本错误当候选数值结论。'))
+                if stage_probes:evidence['inverse_stage_probes']=stage_probes
+                comparison=BATCH/'analysis/linalg_inv_ex/stage-comparison-v2.json'
+                if comparison.exists():
+                    evidence['inverse_stage_comparison']=dict(path=str(comparison),
+                        sha256=sha(comparison),facts=read(comparison))
         return evidence
     def prepare_paired(self,op,seed):
         if self.q.records[op]['reference']!='qualified_CANN':return
