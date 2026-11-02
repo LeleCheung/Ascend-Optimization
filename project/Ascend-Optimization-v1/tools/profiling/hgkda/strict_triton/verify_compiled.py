@@ -1,6 +1,5 @@
 """在原队列结束后串行提取实际Triton编译产物；空trace不作设备核验成功。"""
 import argparse
-import fcntl
 import json
 from pathlib import Path
 from common import BATCH,HERE,NEXT,ROOT,PY,read,save,sha,load
@@ -70,6 +69,7 @@ def execute(operators=None):
 
 
 def main():
+    import fcntl
     p=argparse.ArgumentParser();p.add_argument('--operator',action='append');a=p.parse_args()
     with (ROOT/'runs/physical-card-7-campaign.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)

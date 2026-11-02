@@ -44,5 +44,16 @@ class BackendGate(unittest.TestCase):
             self.assertTrue(admit(p,review)['admitted'])
             binary.write_bytes(b'tampered')
             with self.assertRaises(AssertionError):admit(p,review)
+    def test_changed_reviewed_dependency_is_rejected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder=Path(folder);p=folder/'candidate.py';p.write_bytes(b'def run(x): return x\n')
+            dependency=folder/'dependency.py';dependency.write_bytes(b'# reviewed dependency')
+            snapshot=folder/'snapshot.py';snapshot.write_bytes(dependency.read_bytes())
+            manifest=folder/'dependencies.json';save(manifest,dict(status='reviewed',files={str(dependency):dict(sha256=sha(dependency),snapshot=str(snapshot))}))
+            review=folder/'review.json';save(review,dict(status='reviewed_strict_triton',source_sha256=sha(p),
+                all_branches_reviewed=True,dependencies_reviewed=True,dependency_review_path=str(manifest),dependency_review_sha256=sha(manifest)))
+            admit(p,review)
+            dependency.write_bytes(b'# changed dependency')
+            with self.assertRaises(AssertionError):admit(p,review)
 
 if __name__=='__main__':unittest.main()

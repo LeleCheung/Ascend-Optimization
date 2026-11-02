@@ -31,6 +31,13 @@ def fixture():
 
 
 class NativeContextTests(unittest.TestCase):
+    def test_candidate_contract_precedes_role_body_and_preserves_frontmatter(self):
+        role='---\nname: kernel-coder\nmodel: inherit\n---\n\nOriginal body\n'
+        value=overlay.inject_candidate_contract(role,'STRICT CONTRACT')
+        self.assertTrue(value.startswith('---\nname: kernel-coder\nmodel: inherit\n---\n'))
+        self.assertLess(value.index('STRICT CONTRACT'),value.index('Original body'))
+        with self.assertRaises(ValueError):overlay.inject_candidate_contract('---\nname: unclosed','contract')
+
     def test_opaque_case_gets_actual_shape_and_scalar_without_mutating_measurement(self):
         context, snapshot = fixture();original = deepcopy(context)
         value = m.enrich_native_context(context, snapshot)
@@ -65,11 +72,18 @@ class NativeContextTests(unittest.TestCase):
             (source / '.kernelgen/agents').mkdir(parents=True);(source / 'tools').mkdir()
             original = b'def get_profile_context(*args): return {}\n'
             (source / 'tools/profile_round.py').write_bytes(original)
-            for name in ['kernel-profile-analyzer', 'kernel-knowledge-profile-analyzer']:
+            roles=['kernel-profile-analyzer','kernel-knowledge-profile-analyzer','kernel-coder','kernel-artifact-reviewer']
+            for name in roles:
                 (source / '.kernelgen/agents' / (name+'.md')).write_text('base role', encoding='utf8')
             base = overlay.build(root / 'default', repo=root / 'repo')
             enhanced = overlay.build(root / 'enhanced', repo=root / 'repo', native_context=True)
             self.assertNotIn('native_context_extension', base)
+            self.assertEqual(set(base['candidate_policy']['roles']),set(roles))
+            for role in roles:
+                content=(root/'default/kernelgen/.kernelgen/agents'/(role+'.md')).read_text(encoding='utf8')
+                self.assertIn('本项目实现硬约束',content)
+                self.assertIn('aclrtMemcpyAsync',content)
+                self.assertEqual((source/'.kernelgen/agents'/(role+'.md')).read_text(encoding='utf8'),'base role')
             self.assertEqual((root / 'default/kernelgen/tools/profile_round.py').read_bytes(), original)
             self.assertEqual((source / 'tools/profile_round.py').read_bytes(), original)
             self.assertIn('native_context_extension', enhanced)

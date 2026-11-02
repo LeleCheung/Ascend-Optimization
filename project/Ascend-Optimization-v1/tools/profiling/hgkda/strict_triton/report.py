@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 from common import BATCH,HERE,PREVIOUS,read,save,sha
 from gate import admit
+from verify_compiled import validate_manifest
 
 def main():
     state=read(BATCH/'state.json');index=read(BATCH/'candidate-index.json');old=read(PREVIOUS/'delivery.json')
@@ -33,6 +34,7 @@ def main():
         if compiled.get('path'):
             proof=read(track(compiled['path']))
             assert proof['source_sha256']==sha(source)
+            assert proof==validate_manifest(Path(proof['manifest']),source),'编译路径证明与实际产物不符'
             for artifact,digest in proof.get('artifacts_sha256',{}).items():
                 assert sha(track(artifact))==digest
         accepted=bool(numerical and backend and ca.get('status')=='PASSED' and ce.get('status')=='passed' and ca.get('score',0)>.8 and compiled_ok)
@@ -56,6 +58,22 @@ def main():
         accepted=sum(r['accepted'] for r in rows),total=30,groups=groups,rows=rows,evidence_sha256=evidence,
         policy='候选全部设备计算与搬运严格Triton；CANN/Ascend C仅参考；原PyTorch语义和补测保留；>0.8验收，>1快于参考')
     save(BATCH/'delivery.json',result)
+    implementations=[]
+    references=[]
+    for r in rows:
+        if r['strict_backend'] and r['pytorch'].get('status')=='PASSED' and r['supplementary'].get('status')=='passed' and r['compiled_path'].get('status')=='verified':
+            implementations.append(dict(operator=r['operator'],source=r['source'],source_sha256=r['source_sha256'],
+                review=str(Path(r['source']).parent/'review.json'),runtime=r['runtime'],compiled_path=r['compiled_path'],
+                formal=r['pytorch'],supplementary=r['supplementary'],cann=r['cann'],cann_supplementary=r['cann_supplementary'],
+                target_accepted=r['accepted'],usage='仅作已核验Triton实现上下文；新算子独立评测，引用前重新核验源码和证据SHA'))
+        historical=next(v for v in old['rows'] if v['operator']==r['operator'])
+        if historical.get('cann_reference_qualified'):
+            references.append(dict(operator=r['operator'],source=historical['reference_source'],
+                source_sha256=historical['reference_source_sha256'],kind=r['reference_kind'],
+                usage='仅用于参考侧成对对照和机制分析，不作为候选模板或参与候选择优'))
+    save(BATCH/'strict-implementation-context.json',dict(schema='hgkda-strict-implementation-context-v1',
+        delivery_sha256=sha(BATCH/'delivery.json'),implementations=implementations,references=references,
+        policy='实现模板只收录逐路径和依赖审查、运行时检查、原KGS与补测以及实际Triton编译产物核验通过的源码；历史混合后端不进入实现模板'))
     lines=['# 严格Triton 10＋20复核','','当前严格Triton达标%d/30；队列%s。'%(result['accepted'],state['status']),
         '所有加速比为KGS完整调用；合格CANN单接口与兼容／组合分别标注。历史混合实现不计入。','']
     for group in ['1015','1029']:

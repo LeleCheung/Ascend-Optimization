@@ -1,7 +1,7 @@
 """严格Triton后端准入：AST发现禁用路径＋绑定人工审查清单，非完整静态证明。"""
 import ast
 from pathlib import Path
-from common import read,save,sha
+from common import BATCH,read,save,sha
 
 FORBIDDEN_METHODS={'contiguous','clone','copy_','fill_','zero_','flatten','reshape','to','cpu','cuda','numpy','resolve_conj','resolve_neg'}
 FORBIDDEN_TORCH={'zeros','ones','full','rand','randn','arange','tensor','as_tensor','from_numpy','empty_strided'}
@@ -48,6 +48,14 @@ def admit(source,review_path):
     result=inspect(source);review=read(review_path)
     assert review['source_sha256']==result['source_sha256'] and review['status']=='reviewed_strict_triton'
     assert review['all_branches_reviewed'] and review['dependencies_reviewed']
+    if review.get('dependency_review_sha256'):
+        dependency_review=Path(review.get('dependency_review_path',BATCH/'dependency-review.json'))
+        assert sha(dependency_review)==review['dependency_review_sha256']
+        dependencies=read(dependency_review)
+        assert dependencies['status']=='reviewed' and dependencies.get('files')
+        for path,identity in dependencies['files'].items():
+            assert sha(path)==identity['sha256']
+            assert sha(identity['snapshot'])==identity['sha256']
     issues=list(result['issues'])
     bridges=review.get('reviewed_host_bridges',[])
     if bridges:

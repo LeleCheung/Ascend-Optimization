@@ -12,6 +12,16 @@ ROOT = Path(__file__).resolve().parent
 REPO = ROOT.parents[4]
 
 
+def inject_candidate_contract(role, contract):
+    """保留KG frontmatter，在每个角色正文开头加入同一实现约束。"""
+    lines=role.splitlines(keepends=True)
+    if lines and lines[0].strip()=='---':
+        end=next((i for i,line in enumerate(lines[1:],1) if line.strip()=='---'),None)
+        if end is None:raise ValueError('角色frontmatter未闭合')
+        return ''.join(lines[:end+1])+'\n\n'+contract+'\n\n'+''.join(lines[end+1:]).lstrip('\n')
+    return contract+'\n\n'+role
+
+
 def build(output: Path, *, repo=REPO, native_context=False, paired_evidence=None, roofline_evidence=None):
     source = repo / 'sources/kernelgen'
     skill = ROOT / 'skills/hgkda'
@@ -101,12 +111,17 @@ def get_profile_context(workspace, context, round_num):
                      '`inputs`、seed、tolerance及phase。先从这里读取形状、dtype、stride相关规格'
                      '与标量参数；不要根据case序号或其他算子的历史形状猜测。'
                      '它不改变正式延迟、指标、候选源码或计分合同。\n')
+    contract_path=ROOT/'strict_triton/角色硬约束.md'
+    contract=contract_path.read_text(encoding='utf8')
+    (dest_skill/'references/候选实现硬约束.md').write_bytes(contract_path.read_bytes())
     changed = {}
-    for name in ['kernel-profile-analyzer', 'kernel-knowledge-profile-analyzer']:
-        src = source / '.kernelgen/agents' / (name + '.md')
+    for src in sorted((source/'.kernelgen/agents').glob('*.md')):
+        name=src.stem
         dest = target / '.kernelgen/agents' / src.name
-        # 保留原角色工具、证据登记要求及接口，只扩展诊断方法。
-        dest.write_text(src.read_text(encoding='utf-8') + appended, encoding='utf-8')
+        # 每个角色都获得硬约束；完整诊断知识仍仅追加给两个分析角色。
+        body=inject_candidate_contract(src.read_text(encoding='utf8'),contract)
+        if name in ['kernel-profile-analyzer','kernel-knowledge-profile-analyzer']:body+=appended
+        dest.write_text(body, encoding='utf-8')
         changed[name] = {'base_sha256': hashlib.sha256(src.read_bytes()).hexdigest(),
                          'overlay_sha256': hashlib.sha256(dest.read_bytes()).hexdigest()}
     data = {'schema_version': 1, 'base_source': str(source.resolve()),
@@ -114,6 +129,9 @@ def get_profile_context(workspace, context, round_num):
             'skill_files': {p.relative_to(skill).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
                             for p in sorted(skill.rglob('*')) if p.is_file() and '__pycache__' not in p.parts},
             'integration': '原生 KG 分析角色调用 KGS；额外分阶段方法与分类知识随角色加载',
+            'candidate_policy':dict(language='Triton',reference='CANN/Ascend C',
+                contract_sha256=hashlib.sha256(contract_path.read_bytes()).hexdigest(),
+                roles=list(changed),scope='全部角色前置同一设备实现约束；只生成独立覆盖层，不修改基线源码'),
             'compiler_changed': False, 'evaluator_changed': False}
     if native_context:
         data['native_context_extension'] = context_extension
