@@ -38,4 +38,18 @@ QKV历史C++宿主桥经逐函数审查后允许恢复：只分配、取元数�
 
 新建`build-kg-overlay.py`覆盖层会把[角色硬约束](角色硬约束.md)插入全部KG角色的正文开头，保留原frontmatter，完整诊断知识仍只追加给两个分析角色。现有已冻结覆盖层不会自动改变；旧夜间控制器不能因此视为已经具备严格Triton准入。
 
+运行时首遍曾把`aten.new_empty`误判为计算操作；该接口只分配未初始化存储，符合宿主胶水边界。`repair_runtime_allocations.py`仅对因此失败的两项重做运行时检查，并执行此前尚未提交的完整评测，旧失败检查与状态保留在`revisions/`。填零、复制和实际计算未加入许可列表。
+
+`repo_identity.py`可由指定Git提交生成实体SHA清单，并比较工作区；LFS使用实体OID与字节数，指针文件不能通过实体核验。普通文本的Git规范换行与工作区换行可能不同，完整仓库审计会如实显示这些差异，不自动改写历史文件。本轮的原始合同、请求、结果、源码快照和编译附件保持采集字节，另行逐文件核验。
+
+## 一次新复测
+
+完整队列结束、卡锁空闲后，在项目目录执行以下一条命令。输出目录每次取新名字；已存在目录会拒绝重发。脚本先核验冻结源码、审查记录、依赖和服务版本，再持同一卡锁执行一次完整KGS：
+
+```bash
+/data/hanle/ascend-optimization/runtime/kg-controller/venv/bin/python tools/profiling/hgkda/strict_triton/replay.py --operator selu_ --baseline CANN --output /data/hanle/ascend-optimization/runs/strict-replay-selu-01
+```
+
+`--baseline PyTorch`用于原语义与历史计时复测；当前性能验收仍使用合格CANN／Ascend C参考。脚本不会为缺少合格CANN参考的算子自动切换参考，也不会覆盖冻结批次的源文件、请求或状态。
+
 本批是源码恢复、路径修复和重新验收。修改来自Codex，历史KG／CC／DeepSeek源码归属保留；不能表述为新一轮无人辅助模型生成或将不同后端差异直接归为算法收益。

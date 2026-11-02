@@ -19,15 +19,18 @@ def main():
             if path:
                 raw=read(track(path))
                 if k in {'pytorch','cann'}:
+                    item['is_hack']=raw.get('is_hack')
                     request=read(track(Path(path).with_name(Path(path).name.replace('.result.json','.request.json'))))
                     assert request['implementation']['sources'][0]['content']==source.read_text(encoding='utf8')
                     assert request['settings']==dict(warmup_ms=1000,benchmark_ms=100,num_trials=3,timeout_seconds=1800)
                     details=[x for x in raw.get('per_workload',[]) if x.get('phase')=='timing' and x.get('latency_ms') and x.get('reference_latency_ms')]
                     if raw.get('status')=='PASSED':
+                        assert raw['num_passed']==raw['num_workloads']>0
+                        assert len(raw['per_workload'])==raw['num_workloads'] and all(v.get('status')=='PASSED' for v in raw['per_workload'])
                         score=math.exp(sum(math.log(x['reference_latency_ms']/x['latency_ms']) for x in details)/len(details))
                         assert math.isclose(score,item['score'],rel_tol=1e-9)
                 else:assert raw['source_sha256']==sha(source)
-        numerical=pt.get('status')=='PASSED' and extra.get('status')=='passed'
+        numerical=pt.get('status')=='PASSED' and not pt.get('is_hack') and extra.get('status')=='passed'
         backend=runtime.get('status')=='passed'
         compiled=v.get('compiled_path') or {}
         compiled_ok=compiled.get('status')=='verified' and compiled.get('source_sha256')==sha(source)
@@ -37,7 +40,7 @@ def main():
             assert proof==validate_manifest(Path(proof['manifest']),source),'编译路径证明与实际产物不符'
             for artifact,digest in proof.get('artifacts_sha256',{}).items():
                 assert sha(track(artifact))==digest
-        accepted=bool(numerical and backend and ca.get('status')=='PASSED' and ce.get('status')=='passed' and ca.get('score',0)>.8 and compiled_ok)
+        accepted=bool(numerical and backend and ca.get('status')=='PASSED' and not ca.get('is_hack') and ce.get('status')=='passed' and ca.get('score',0)>.8 and compiled_ok)
         status='严格Triton达标' if accepted else ('尚未完成' if not v else '待复核或未达标')
         if v.get('status')=='运行时后端或执行失败，待修复':status=v['status']
         elif v.get('status')=='本轮已复核' and not accepted:
@@ -61,7 +64,7 @@ def main():
     implementations=[]
     references=[]
     for r in rows:
-        if r['strict_backend'] and r['pytorch'].get('status')=='PASSED' and r['supplementary'].get('status')=='passed' and r['compiled_path'].get('status')=='verified':
+        if r['strict_backend'] and r['pytorch'].get('status')=='PASSED' and not r['pytorch'].get('is_hack') and r['supplementary'].get('status')=='passed' and r['compiled_path'].get('status')=='verified':
             implementations.append(dict(operator=r['operator'],source=r['source'],source_sha256=r['source_sha256'],
                 review=str(Path(r['source']).parent/'review.json'),runtime=r['runtime'],compiled_path=r['compiled_path'],
                 formal=r['pytorch'],supplementary=r['supplementary'],cann=r['cann'],cann_supplementary=r['cann_supplementary'],
@@ -95,6 +98,8 @@ def main():
                   }.get(r['reference_kind'],r['reference_kind'] or '无同语义参考')
             lines.append('|'+r['operator']+'|'+kind+'|'+fmt(r['cann'])+'|'+fmt(p)+'|'+complete+'|'+r['status']+'|')
         lines.append('')
+    lines+=['`fractional_max_pool3d`、`_conj_physical`的PyTorch参考含CPU回退；该列只保留原合同结果，不能解释为相对纯NPU实现的收益。',
+        '所有门槛使用未舍入的原始加速比判断。参考资格、原正确性、补测、后端与编译路径任何一项未通过，均不计为本轮达标。','']
     (BATCH/'严格Triton30项总表.md').write_bytes((chr(10).join(lines)+chr(10)).encode('utf8'))
     print('STRICT_REPORT',result['accepted'],groups,flush=True)
 

@@ -25,7 +25,7 @@ class DeliveryGate(unittest.TestCase):
                 row[kind]=dict(status='passed',path=str(path))
             for kind in ['pytorch','cann']:
                 path=folder/(kind+'.result.json')
-                save(path,dict(status='PASSED',num_passed=1,num_workloads=1,per_workload=[dict(phase='timing',latency_ms=1,reference_latency_ms=1)]))
+                save(path,dict(status='PASSED',num_passed=1,num_workloads=1,per_workload=[dict(phase='timing',status='PASSED',latency_ms=1,reference_latency_ms=1)]))
                 save(folder/(kind+'.request.json'),dict(implementation=dict(sources=[dict(content=source.read_text(encoding='utf8'))]),
                     settings=dict(warmup_ms=1000,benchmark_ms=100,num_trials=3,timeout_seconds=1800)))
                 row[kind]=dict(status='PASSED',score=1.0,passed=1,total=1,path=str(path))

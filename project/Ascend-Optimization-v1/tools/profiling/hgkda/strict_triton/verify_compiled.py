@@ -29,6 +29,8 @@ def validate_manifest(manifest,source):
 def execute(operators=None):
     state=read(BATCH/'state.json')
     assert state['status']=='completed','完整队列尚未结束，禁止并行设备采集'
+    if operators is None:
+        load('strict_allocation_repair',HERE/'repair_runtime_allocations.py').execute()
     if operators is None or 'transform_bias_rescale_qkv' in operators:
         load('strict_restore_host',HERE/'restore_host_glue.py').execute()
     runner=load('strict_verify_runner',HERE/'run.py').Runner()
@@ -58,6 +60,11 @@ def execute(operators=None):
             row['compiled_path']=dict(status='verified',path=str(output),source_sha256=sha(source),kernels=[k['symbol'] for k in proof['kernels']])
             progress['operators'][op]=row['compiled_path']
             print('COMPILED_VERIFIED',op,row['compiled_path']['kernels'],flush=True)
+        except runner.module.Attention as error:
+            # 超时保留的进程可能仍在运行；禁止把观察超时当成终态，再启动下一个设备任务。
+            progress.update(status='requires_review',current_operator=op,error=type(error).__name__+': '+str(error))
+            save(verification,progress)
+            raise
         except Exception as error:
             row['compiled_path']=dict(status='failed',error=type(error).__name__+': '+str(error),source_sha256=sha(source))
             progress['operators'][op]=row['compiled_path']

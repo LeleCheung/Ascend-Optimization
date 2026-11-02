@@ -9,7 +9,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_leaves
 from common import save,sha
 
-ALLOWED={'aten.empty','aten.empty_like','aten.empty_strided','aten.detach','aten.alias','aten.view','aten._unsafe_view',
+ALLOWED={'aten.empty','aten.empty_like','aten.empty_strided','aten.new_empty','aten.detach','aten.alias','aten.view','aten._unsafe_view',
     'aten.as_strided','aten.slice','aten.select','aten.squeeze','aten.unsqueeze','aten.permute','aten.transpose',
     'aten.t','aten.unbind','aten.split','aten.split_with_sizes','aten.resize_','aten.resize_as_',
     'aten._conj','aten.conj','aten.view_as_real','aten.view_as_complex','aten.is_pinned','aten._pin_memory'}
