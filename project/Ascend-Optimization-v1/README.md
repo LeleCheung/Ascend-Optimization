@@ -1,6 +1,6 @@
 # 910B 算子优化项目
 
-2026-11-03正在运行[严格Triton夜间优化](tools/profiling/hgkda/strict_night/README.md)：从冻结16/30推进到**25/30**，原10项7/10、新20项18/20。本轮新增9项优先性能对象均完成完整评测、两侧补测、人工审查及实际后端核验；最新`special_round_out`相对CANN为**0.946×**。累计积分和求逆数值问题、uniform／expm1_／fractional_max_pool3d参考缺口继续推进。见[当前30项总表](operators/campaigns/strict-night-20261102/严格Triton30项总表.md)、[舍入交付](operators/campaigns/strict-night-20261102/阶段记录-special_round_out.md)和[动态进展](operators/campaigns/strict-night-20261102/夜间优化进展.md)。大goal保持运行，不将25项阶段目标等同全部30项已完成。
+2026-11-03正在运行[严格Triton夜间优化](tools/profiling/hgkda/strict_night/README.md)：从冻结16/30推进到**25/30**，原10项7/10、新20项18/20。本轮新增9项优先性能对象均完成完整评测、两侧补测、人工审查及实际后端核验；最新`special_round_out`相对CANN为**0.946×**。求逆原合同已修复到7/7和8/8，CANN完整参考仍缺；累计积分第二轮仍有两项FP16补测失败。`expm1_`完成小／大输入诊断与两份新提案实测，第二轮继续优化。见[当前30项总表](operators/campaigns/strict-night-20261102/严格Triton30项总表.md)、[关键简报](operators/campaigns/strict-night-20261102/关键优化简报.md)和[动态进展](operators/campaigns/strict-night-20261102/夜间优化进展.md)。大goal保持运行，不将25项阶段目标等同全部30项已完成。
 
 **用户硬约束：CANN／Ascend C用于baseline，优化候选严格使用Triton。** 所有计算、复制、归约、扫描、布局转换和回退路径均须由Triton kernel实现；Python／C++仅可作宿主胶水。完整规则见[硬性规则](../../docs/Triton候选与CANN参考硬性规则.md)。
 
