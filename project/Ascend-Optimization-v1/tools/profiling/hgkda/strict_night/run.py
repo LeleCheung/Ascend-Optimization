@@ -188,8 +188,10 @@ class Runner:
                 per_case=[{k:r.get(k) for k in ['uuid','phase','status','latency_ms','reference_latency_ms']}
                           for r in measured.get('per_workload',[]) if r.get('phase')=='timing'],
                 scope='当前seed实际已完成的测量；与冻结起点分开，不重复提交同源码')
-        evidence['diagnosis'] = (
-            '固定真实CANN参考，目标完整调用几何平均>0.8。检查大输入program数量、单program流式循环与访存组织；'
+        reference_goal=('固定合格CANN参考，目标完整调用几何平均>0.8。' if old.get('cann') else
+                        '当前没有合格CANN参考；只沿原PyTorch合同修复与优化，不计CANN达标。')
+        evidence['diagnosis'] = (reference_goal+
+            '检查大输入program数量、单program流式循环与访存组织；'
             '区分宿主发射与设备耗时。分块需控制UB，不得只调小输入延迟。对照源码/实际IR/trace按需读取；'
             '不得把待验证解释写成结论。允许编译缓存和当前stream getter，禁止缓存输出或旧stream。'
             '源码含_strict存储工具时仍须保留非连续分支。先形成一份真实可运行改进并完整evaluate；'
@@ -244,6 +246,9 @@ class Runner:
             evidence.pop('bounded_pointwise_knowledge')
             evidence['same_batch_verified_examples']=transferred[:1]
             evidence['example_scope']='逐元素历史仅作宿主启动和验证方法参考，不作为扫描、矩阵求逆或池化的数学/分块模板。'
+            evidence['diagnosis']=evidence['diagnosis'].replace(
+                '当前适合先试减少program重复调度或增大片内顺序处理；用profile验证，别只重测同源码。',
+                '先解决本算子的数学、累加或索引语义，再判断并行和启动策略；不直接套用逐元素分块经验。')
         paired=BATCH/'analysis'/op/('paired-'+sha(seed)[:16])/'summary.json'
         if paired.exists():
             value=read(paired)
@@ -322,6 +327,15 @@ class Runner:
                     evidence['diagnosis']+=('上述历史已覆盖直接/转置、逐项除法/倒数乘法、LU和求解的FMA组合等。'
                         '不要重复无新机制的相同排列。若研究LAPACK一致性，可检查实际分块/递归分解及三角求解顺序，'
                         '形成通用Triton算法；不能按奇异用例预存参考值。')
+                leftlooking=BATCH/'analysis/linalg_inv_ex/leftlooking-summary-v1.json'
+                if leftlooking.exists():
+                    evidence['new_leftlooking_arithmetic_hypothesis']=dict(path=str(leftlooking),
+                        sha256=sha(leftlooking),facts=read(leftlooking),
+                        scope='源码引导的离线FP32模型；不是NPU正式结果，不把冻结矩阵或其逆写进候选。')
+                    evidence['diagnosis']+=('新离线模型已匹配三个冻结奇异矩阵：按列延迟更新LU，当前列先应用旧置换，'
+                        '上三角使用先求dot再减法；下半列依次FMA更新，再pivot和倒数乘法缩放。'
+                        '转置分解后按adjoint顺序解U^T、L^T并逆置换。此前右看式rank-1模型没有覆盖这一更新时序。'
+                        '优先实现这种通用Triton顺序并做一次小范围核验；编译器融合/除法和CPU微内核仍可能不同。')
         return evidence
     def prepare_paired(self,op,seed):
         if self.q.records[op]['reference']!='qualified_CANN':return
