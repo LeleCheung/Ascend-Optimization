@@ -10,6 +10,8 @@
 
 ## 当前状态
 
+2026-11-02启动[CANN优先对照与优化](project/Ascend-Optimization-v1/tools/profiling/hgkda/cann_priority/README.md)：为30项目标尽量补齐同语义厂商aclnn参考，保留原PyTorch正确性及历史计时。优先优化相对CANN未达0.8×的对象，先验证`hardswish_out`的新Ascend C＋Triton布局回退候选。直接单算子、dtype／状态适配组合及独立NPU分解分别登记，最新状态以新批次实际结果为准，排队和构建成功不计达标。
+
 2026-10-31完成[夜间六项与CANN对照](project/Ascend-Optimization-v1/operators/campaigns/reference-closure-20261031/夜间结果简报.md)：**24项原参考常规稳定达标、4项独立NPU参考对照通过、1项累计积分新版确定性条件通过、1项求逆仍5/7**。累计积分混合版默认正式0.830×但补测失败；双方官方确定性条件下4.476×、33/33与36/36补测通过，条件成果单列。伪量化、BatchNorm相对CANN兼容组合6.554×／1.756×，池化、共轭相对命名NPU分解9.998×／2.167×；均为既有候选复测，不算本轮新生成收益。`fix`补齐CANN直接对照1.212×。详见[30项验收总表](project/Ascend-Optimization-v1/operators/campaigns/reference-closure-20261031/30项验收总表.md)和[复现工具](project/Ascend-Optimization-v1/tools/profiling/hgkda/reference_closure/README.md)，不能称30项默认全部达标。
 
 2026-10-31完成[最后两项攻关交付](project/Ascend-Optimization-v1/operators/campaigns/remaining-final-20261031/交付报告.md)：`fix` **0.862×**、`expm1_` **0.879×**新增稳定达标，均为同源码两次完整KGS成绩的几何平均，各次30/30且均超过0.8×，原扩展、24项原生路径检查和30项冻结新形状检查全部通过。累计30项中**24项常规稳定达标、1项求逆正确性未通过、5项特殊参考条件单列**。两项采用Codex自写Ascend C＋Triton布局回退，当前仍低于PyTorch；本轮未新增CC/DeepSeek生成。新增离线执行路径诊断，分开计算候选与参考耗时变化，关联设备trace后提出验证方向；14份正式请求、12条设备路径、2份真实Triton IR及附件已核验。[复现入口](project/Ascend-Optimization-v1/tools/profiling/hgkda/remaining_final/README.md)保留全部失败方案与固定确认，不用追加高分覆盖低分。
