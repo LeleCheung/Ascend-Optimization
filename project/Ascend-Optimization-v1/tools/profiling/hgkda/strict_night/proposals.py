@@ -11,6 +11,12 @@ def process(runner):
         assert op in runner.q.records and out.parent.name==op
         key='proposal:'+op+':'+out.name
         if runner.state['jobs'].get(key,{}).get('status')=='completed':continue
+        if spec.get('requires_qualified_parent'):
+            parents=(runner.state['operators'].get(op) or {}).get('proposals',[])
+            if not any(v.get('source_sha256')==spec['parent_source_sha256'] and v.get('qualification')=='passed' for v in parents):
+                runner.state['jobs'][key]=dict(status='completed',result=dict(status='parent_not_qualified_no_measurement',
+                    source=str(source),source_sha256=spec['source_sha256'],parent_source_sha256=spec['parent_source_sha256']))
+                runner.persist();continue
         best=(runner.state['operators'].get(op) or {}).get('best') or {}
         if spec.get('defer_if_target_already_met') and best.get('qualification')=='passed' and best.get('search_score',0)>.8:
             runner.state['jobs'][key]=dict(status='completed',result=dict(status='retained_unmeasured_target_already_met',
@@ -20,7 +26,10 @@ def process(runner):
         manual=read(out/'review.json')
         assert manual['status']=='reviewed_strict_triton' and manual['source_sha256']==sha(source)
         assert manual['all_branches_reviewed'] and manual['dependencies_reviewed']
-        assert not static(source.read_text()),'人工建议仍须通过严格Triton静态准入'
+        if spec.get('host_glue'):
+            from host_glue import admit
+            save(out/'host-glue-admission.json',admit(source,out/'review.json'))
+        else:assert not static(source.read_text()),'人工建议仍须通过严格Triton静态准入'
         # 只处理已有合格CANN参考的性能问题，不以较慢自写参考补齐名额。
         assert runner.q.records[op]['reference']=='qualified_CANN'
         normalized=computation_identity(source)
@@ -60,6 +69,7 @@ def process(runner):
                 entry=dict(kind='Codex_proposal',source=str(source),source_sha256=sha(source),search_result=str(formal),
                     search_score=score(value),search_round_score=score(value),reference='qualified_CANN',
                     provenance=spec['attribution'],proposal_spec=str(spec_file),proposal_spec_sha256=sha(spec_file))
+                if spec.get('host_glue'):entry['host_glue']=True
                 entry.update(runner.validate(op,source,out))
                 row=runner.state['operators'].setdefault(op,dict(attempts=[]))
                 row.setdefault('proposals',[]).append(entry)

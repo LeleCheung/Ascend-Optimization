@@ -176,6 +176,10 @@ class Runner:
             evidence['per_case'] = [{k:r.get(k) for k in ['uuid','phase','status','latency_ms','reference_latency_ms']}
                                     for r in v.get('per_workload',[]) if r.get('phase')=='timing']
         selected=(self.state.get('operators',{}).get(op) or {}).get('best') or {}
+        if selected:
+            evidence['same_operator_measured_best']={k:selected.get(k) for k in
+                ['source','source_sha256','search_result','search_score','pytorch_result','qualification','host_glue']}
+            evidence['same_operator_measured_best']['scope']='本算子已有独立完整测量；不是冻结起点。人工核验宿主桥不扩张CC自包含Python+Triton准入。'
         if selected.get('source_sha256')==sha(seed) and selected.get('search_result'):
             measured=read(selected['search_result'])
             evidence['selected_seed_measurement']=dict(path=selected['search_result'],
@@ -382,6 +386,9 @@ def evaluate_bundle(bundle, context, *, run_control=None):
                 self.persist()
                 return
         seed=Path((row.get('best') or {}).get('source', BATCH/self.q.records[op]['seed']))
+        if (row.get('best') or {}).get('host_glue'):
+            # 宿主桥只在人工绑定的独立提案中使用；CC搜索保持自包含Python+Triton。
+            seed=BATCH/self.q.records[op]['seed']
         self.state.update(status='running',current_job=key)
         self.state['jobs'][key]=dict(status='running',seed=str(seed),source_sha256=sha(seed));self.persist()
         self.prepare_paired(op,seed)
@@ -445,6 +452,9 @@ def evaluate_bundle(bundle, context, *, run_control=None):
         seen={r['source_sha256'] for a in self.state['operators'][op]['attempts'] for r in a.get('candidates',[])}
         seen_computations={original_id}|{computation_identity(Path(r['source']))
             for a in self.state['operators'][op]['attempts'] for r in a.get('candidates',[])}
+        # 独立提案已经实测；后续KG即使再次提交相同AST，也不能把较高复测分数算成新改进。
+        seen_computations.update(computation_identity(Path(r['source']))
+            for r in self.state['operators'][op].get('proposals',[]))
         for result in sorted(workspace.glob('stages/optimize/work/.kernelgen/evals/round-*/result.json')):
             source=result.with_name('main.py'); v=read(result)
             if not source.exists() or v.get('status')!='PASSED' or v.get('is_hack') or sha(source)==old_sha:continue

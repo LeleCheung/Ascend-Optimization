@@ -33,7 +33,11 @@ def verify(runner,op,best):
     manual=read(review)
     assert manual['status']=='reviewed_strict_triton' and manual['source_sha256']==sha(source)
     assert manual['all_branches_reviewed'] and manual['dependencies_reviewed']
-    assert not static(source.read_text()),'静态入口尚未通过'
+    host_proof=None
+    if manual.get('reviewed_host_bridges'):
+        from host_glue import admit
+        host_proof=admit(source,review)
+    else:assert not static(source.read_text()),'静态入口尚未通过'
     original=BATCH/'original-catalog/ops'/op
     runtime=out/'selected-runtime.json'
     if not runtime.exists():runner.cmd('selected-runtime-'+op,[PY,TOOLS/'strict_triton/runtime_audit.py',
@@ -64,6 +68,7 @@ def verify(runner,op,best):
                runtime=str(runtime),runtime_sha256=sha(runtime),compiled=str(directory/'compiled-verification.json'),
                trace=str(trace),trace_sha256=sha(trace),tasks=[{k:e.get(k) for k in ['name','cat','dur','args']} for e in tasks],
                scope='人工逐路径审查＋完整运行时＋代表输入实际Triton编译对象/设备trace；不冒称全形状trace')
+    if host_proof:proof['host_glue']=host_proof
     save(out/'backend-verification.json',proof)
     if op=='fix' and manual.get('diagnostic_parent_source_sha256'):
         parent=BATCH/'admissions'/op/manual['diagnostic_parent_source_sha256']/'main.py'

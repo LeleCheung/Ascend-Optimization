@@ -12,7 +12,7 @@
 
 ## 当前状态
 
-2026-11-02[严格Triton夜间优化](project/Ascend-Optimization-v1/tools/profiling/hgkda/strict_night/README.md)已从冻结16/30推进到**19/30**：新增`hardswish`（相对CANN 0.882×）、`fix`（1.014×）和`hardshrink_backward`（1.042×），均完成完整评测、两侧补测、人工审查与实际后端核验。其余性能、数值与参考问题继续由910B独立tmux运行KG／HG-KDA＋CC／DeepSeek推进。见[当前30项总表](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/严格Triton30项总表.md)、[前两项记录](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/阶段记录-hardswish-fix.md)、[hardshrink_backward记录](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/阶段记录-hardshrink_backward.md)和[动态进展](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/夜间优化进展.md)。
+2026-11-03续跑[严格Triton夜间优化](project/Ascend-Optimization-v1/tools/profiling/hgkda/strict_night/README.md)，已从冻结16/30推进到**21/30**：新增`hardswish`（相对CANN 0.882×）、`fix`（1.014×）、`hardshrink_backward`（1.042×）、`rad2deg_`（0.922×）与`fmod_tensor_`（0.818×），均完成完整评测、两侧补测、人工审查与实际后端核验。原10项为7/10，新20项为14/20。其余性能、数值与参考问题继续由910B独立tmux运行KG／HG-KDA＋CC／DeepSeek推进。见[当前30项总表](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/严格Triton30项总表.md)、[前两项记录](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/阶段记录-hardswish-fix.md)、[hardshrink_backward记录](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/阶段记录-hardshrink_backward.md)和[动态进展](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/夜间优化进展.md)。运行中快照会继续更新，以动态进展和交付清单为准。
 
 2026-11-02目标纠偏：此前把部分候选改成Ascend C／CANN／DMA混合实现，偏离了严格Triton目标。历史25/30、7/10＋18/20和原PyTorch口径总数不能直接作为严格Triton达标数；**现已重新核验：严格Triton达标16/30，1015为6/10、1029为10/20**。以下日期记录及其附件保留历史口径，不覆盖此硬约束。
 

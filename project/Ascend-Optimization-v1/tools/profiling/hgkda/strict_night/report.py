@@ -75,6 +75,11 @@ def main():
         assert manual['all_branches_reviewed'] and manual['dependencies_reviewed']
         proof=read(track(best['backend_verification']))
         assert proof['status']=='verified' and proof['source_sha256']==digest
+        if manual.get('reviewed_host_bridges'):
+            host=proof['host_glue']
+            assert host['status']=='reviewed_host_only' and host['source_sha256']==digest
+            for file,identity in host['files'].items():
+                assert sha(track(file))==identity['sha256']
         for file,key in [('review','review_sha256'),('runtime','runtime_sha256'),('trace','trace_sha256')]:
             assert sha(track(proof[file]))==proof[key]
         compiled=read(track(proof['compiled']));assert compiled['source_sha256']==digest
