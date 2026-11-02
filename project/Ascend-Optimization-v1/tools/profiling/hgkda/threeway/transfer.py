@@ -40,7 +40,7 @@ def push(names):
     items=[]
     for name in names:
         path=(PROJECT/name).resolve();path.relative_to(PROJECT)
-        data=path.read_bytes()
+        data=io_path(path).read_bytes()
         items.append(dict(path=path.relative_to(PROJECT).as_posix(),data=base64.b64encode(data).decode(),sha256=hashlib.sha256(data).hexdigest()))
     code='import base64,hashlib,json\nfrom pathlib import Path\nroot=Path('+repr(REMOTE)+')\nitems='+repr(items)+'''\nfor item in items:
     path=(root/item['path']).resolve();path.relative_to(root)
