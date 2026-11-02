@@ -96,6 +96,13 @@ class Runner:
             if helper is None:helper=module('night_backend_finalize',HERE/'finalize.py')
             helper.verify(self,op,best)
             save(self.path,self.state)
+    def manual_rejection(self,op,source):
+        path=BATCH/'review-rejections'/op/(sha(source)+'.json')
+        if not path.exists():return None
+        value=read(path)
+        assert value['operator']==op and value['source_sha256']==sha(source)
+        assert value['status']=='manual_review_rejected' and value.get('reason')
+        return str(path)
     def refresh_existing_scores(self):
         from measurements import ledger,score,baseline_score
         for op,row in self.state['operators'].items():
@@ -111,6 +118,8 @@ class Runner:
                     entry.setdefault('search_round_score',entry['search_score'])
                     entry['search_score']=value['score'];entry['measurement_ledger']=str(source.parent/'existing-measurements.json')
                     if value['status']!='passed':entry['qualification']=value['status']
+                    rejection=self.manual_rejection(op,source)
+                    if rejection:entry.update(qualification='manual_review_rejected',manual_review_rejection=rejection,compiled_status='not_qualified')
                     if entry.get('qualification')=='passed':qualified.append(entry)
             for entry in row.get('proposals',[]):
                 assert sha(entry['source'])==entry['source_sha256']
@@ -166,6 +175,15 @@ class Runner:
             v = read(formal['path'])
             evidence['per_case'] = [{k:r.get(k) for k in ['uuid','phase','status','latency_ms','reference_latency_ms']}
                                     for r in v.get('per_workload',[]) if r.get('phase')=='timing']
+        selected=(self.state.get('operators',{}).get(op) or {}).get('best') or {}
+        if selected.get('source_sha256')==sha(seed) and selected.get('search_result'):
+            measured=read(selected['search_result'])
+            evidence['selected_seed_measurement']=dict(path=selected['search_result'],
+                sha256=sha(selected['search_result']),score=selected['search_score'],
+                qualification=selected.get('qualification'),compiled_status=selected.get('compiled_status'),
+                per_case=[{k:r.get(k) for k in ['uuid','phase','status','latency_ms','reference_latency_ms']}
+                          for r in measured.get('per_workload',[]) if r.get('phase')=='timing'],
+                scope='当前seed实际已完成的测量；与冻结起点分开，不重复提交同源码')
         evidence['diagnosis'] = (
             '固定真实CANN参考，目标完整调用几何平均>0.8。检查大输入program数量、单program流式循环与访存组织；'
             '区分宿主发射与设备耗时。分块需控制UB，不得只调小输入延迟。对照源码/实际IR/trace按需读取；'
@@ -185,13 +203,29 @@ class Runner:
                 'fix本批发现新增persistent kernel后raw launcher参数仍沿用旧签名，异常后走JIT。修改形参须同步warmup、raw打包和JIT回退，constexpr也可能占launcher参数位；按当前编译产物核对，不假定跨版本固定ABI。'],
             compiler_rules=[
                 '分块放大要同时检查实际UB编译分配。hardswish本批出现需求2097408 bits超过可用1572864 bits，失败原件在admissions中；不能把tile上限一股脑套到所有算子。',
-                '完整块与尾部可以分开，但无掩码路径必须由一般边界条件保证；非连续输入、负零、NaN/Inf、参数变化及多stream不能丢失。'])
+                '完整块与尾部可以分开，但无掩码路径必须由一般边界条件保证；非连续输入、负零、NaN/Inf、参数变化及多stream不能丢失。',
+                '原地算子冷启动只warmup编译，随后执行恰好一次。不要先JIT实际计算、再读取launcher并在异常后重新计算；这会在异常路径把数据变换两次。',
+                '编译缓存必须区分实际kernel、block、dtype、device及会影响编译的标量类别；raw launcher的constexpr槽不会改变已有二进制block。'])
+        rejected=[]
+        for path in sorted((BATCH/'review-rejections'/op).glob('*.json')):
+            value=read(path)
+            rejected.append(dict(path=str(path),sha256=sha(path),source_sha256=value['source_sha256'],reason=value['reason'],repair=value.get('repair')))
+        if rejected:evidence['manual_rejected_predecessors']=rejected
         transferred=[]
         for prior_op,row in self.state.get('operators',{}).items():
             best=row.get('best') or {}
-            if prior_op==op or best.get('qualification')!='passed':continue
-            transferred.append({k:best.get(k) for k in ['source','source_sha256','search_result','search_score','pytorch_result','review_status','compiled_status','component_diagnostic']})
-        evidence['same_batch_numerically_qualified_examples']=transferred[:3]
+            if (prior_op==op or best.get('qualification')!='passed'
+                    or best.get('compiled_status')!='verified'
+                    or best.get('review_status')!='reviewed_strict_triton'):continue
+            transferred.append(dict(operator=prior_op,**{k:best.get(k) for k in ['source','source_sha256','search_result','search_score','pytorch_result','review_status','compiled_status','component_diagnostic']}))
+        # 优先同类原地/非原地接口，再按本批处理顺序选较后的已核验经验。
+        transferred.reverse()
+        transferred.sort(key=lambda v:v['operator'].endswith('_')!=op.endswith('_'))
+        evidence['same_batch_verified_examples']=transferred[:3]
+        if op in {'cumulative_trapezoid','linalg_inv_ex','fractional_max_pool3d'}:
+            evidence.pop('bounded_pointwise_knowledge')
+            evidence['same_batch_verified_examples']=transferred[:1]
+            evidence['example_scope']='逐元素历史仅作宿主启动和验证方法参考，不作为扫描、矩阵求逆或池化的数学/分块模板。'
         paired=BATCH/'analysis'/op/('paired-'+sha(seed)[:16])/'summary.json'
         if paired.exists():
             value=read(paired)
@@ -205,6 +239,15 @@ class Runner:
                 '优先使用上述独立msprof op真实证据，不反复重试同样失效的标准采集。'
                 '各分量可重叠，不能相加为总耗时；记录均值与完整任务时长区分。'
                 '独立采集如失败，明确无指标，只按源码/IR/实测提出假设；不能编造数据。')
+        if op in {'round_out','special_round_out'}:
+            history=PROJECT/'operators/campaigns/next25-20261029-v2/results/round_out/search-1/native-evidence/files/00030-stdout.log'
+            if history.exists():
+                evidence['historical_round_intrinsic_failure']=dict(path=str(history),sha256=sha(history),
+                    facts='历史本机rint_cld对float16全域65536项出现2050项数值不符，例0.5应0而输出1；低精度nearbyint直接调用不支持。',
+                    scope='历史版本负证据，不把旧debug延迟当本轮性能。当前版本实现有改变时可作一次小范围语义核验；不默认intrinsic等于一条硬件指令。')
+            evidence['diagnosis']+=('起点舍入采用FP32大常数法和符号位恢复。优先检查4096小块产生大量program的搬运组织、片上缓冲存活和宿主层次。'
+                '可尝试本批已核验的40核流式处理及完整块/尾块分离；保持half-to-even、负零、NaN/Inf、decimals和真实stride语义。'
+                '增大block须检查实际UB分配，不能将FP16算术技巧直接套到BF16。')
         if op in REMAINDER:
             evidence['unresolved'] = old['status']
             extra = old.get('supplementary') or {}
@@ -222,6 +265,14 @@ class Runner:
                     '当前源码对所有float16逐步half舍入；不要接受docstring关于参考扫描顺序的自述。'
                     '应分别检查末轴/非末轴扫描的累加精度、相邻加法和缩放的舍入位置；'
                     '可测试非末轴FP32累加这一假设，保留原输入和容差。')
+            if op=='linalg_inv_ex':
+                conflict=PROJECT/'operators/campaigns/remaining-nine-20261030/analysis/linalg_inv_ex/reference-mathematical-conflict.json'
+                if conflict.exists():
+                    evidence['historical_reference_conflict']=dict(path=str(conflict),sha256=sha(conflict),facts=read(conflict),
+                        policy='默认合同保留；不得按输入值或用例硬编码逆矩阵/info，也不得以CPU或CANN计算替代Triton。')
+                evidence['diagnosis']+=('旧源码关于CPU参考转置及消元次序的docstring并非证明。'
+                    '检查实际矩阵布局、除法/倒数乘法、FMA和消元结合顺序；原参考对重复行矩阵返回info=0和很大有限值。'
+                    '保留奇异输入失败证据，不能放宽容差、改变奇异语义或硬编码结果来凑通过。')
         return evidence
     def prepare_paired(self,op,seed):
         if self.q.records[op]['reference']!='qualified_CANN':return
@@ -319,7 +370,17 @@ def evaluate_bundle(bundle, context, *, run_control=None):
         key=op+':search-'+str(attempt)
         if self.state['jobs'].get(key,{}).get('status')=='completed':return
         workspace=self.q.runtime/'kg-runs'/(op+'-'+BATCH.name+'-attempt-'+str(attempt))
-        if not workspace.exists():self.process_proposals()
+        if not workspace.exists():
+            self.process_proposals()
+            ready=(row.get('best') or {})
+            if (ready.get('qualification')=='passed' and ready.get('reference')=='qualified_CANN'
+                    and ready.get('search_score',0)>.8 and ready.get('compiled_status')=='verified'
+                    and ready.get('review_status')=='reviewed_strict_triton'):
+                self.state['jobs'][key]=dict(status='completed',result=dict(
+                    status='verified_target_retained_no_remeasure',source=ready['source'],
+                    source_sha256=ready['source_sha256']),finished_at=self.module.now())
+                self.persist()
+                return
         seed=Path((row.get('best') or {}).get('source', BATCH/self.q.records[op]['seed']))
         self.state.update(status='running',current_job=key)
         self.state['jobs'][key]=dict(status='running',seed=str(seed),source_sha256=sha(seed));self.persist()
@@ -415,7 +476,10 @@ def evaluate_bundle(bundle, context, *, run_control=None):
             # 至多验证本次前三个不同源码；未选项保留KG完整结果。
             if len(record['candidates'])>=3:break
             existing_pt=result if self.q.records[op]['reference']=='original_PyTorch_only' else None
-            entry.update(self.validate(op,target,out,existing_pytorch_result=existing_pt))
+            rejection=self.manual_rejection(op,target)
+            if rejection:
+                entry.update(qualification='manual_review_rejected',manual_review_rejection=rejection,compiled_status='not_qualified')
+            else:entry.update(self.validate(op,target,out,existing_pytorch_result=existing_pt))
             record['candidates'].append(entry)
             row=self.state['operators'][op]
             baseline=baseline_score(self.previous[op])
