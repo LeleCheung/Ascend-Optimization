@@ -39,6 +39,25 @@ def verify(runner,op,best):
         host_proof=admit(source,review)
     else:assert not static(source.read_text()),'静态入口尚未通过'
     original=BATCH/'original-catalog/ops'/op
+    if op in {'round_out','special_round_out'}:
+        import out_api_probe
+        importlib.reload(out_api_probe)
+        probe=out/'out-api-probe.json'
+        if probe.exists():
+            frozen=out/('out-api-checker-'+read(probe)['checker_sha256']+'.py')
+            assert sha(frozen)==read(probe)['checker_sha256']
+        else:
+            checker=HERE/'out_api_probe.py'
+            frozen=out/('out-api-checker-'+sha(checker)+'.py')
+            if frozen.exists():assert frozen.read_bytes()==checker.read_bytes()
+            else:frozen.write_bytes(checker.read_bytes())
+            runner.cmd('selected-out-api-'+op,[PY,frozen,'--operator',op,
+                '--source',source,'--leaf',original,'--output',probe],900)
+        best['out_api_probe']=str(probe)
+        best['out_api_probe_checker']=str(frozen)
+        if not out_api_probe.qualified(read(probe),sha(source)):
+            best.update(qualification='failed_out_api_probe',compiled_status='not_qualified')
+            return
     runtime=out/'selected-runtime.json'
     if not runtime.exists():runner.cmd('selected-runtime-'+op,[PY,TOOLS/'strict_triton/runtime_audit.py',
          '--operator',op,'--source',source,'--leaf',original,'--output',runtime],1200)

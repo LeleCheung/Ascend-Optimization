@@ -521,7 +521,11 @@ def evaluate_bundle(bundle, context, *, run_control=None):
             assert self.q.records[op]['reference']=='original_PyTorch_only'
             for name in ['definition.json','oracle.py','correctness.jsonl','timing.jsonl']:
                 assert (BATCH/'catalog/ops'/op/name).read_bytes()==(original/name).read_bytes()
-            sources=read(formal.with_name('solution.json'))['sources']
+            request=formal.with_name(formal.name.replace('.result.json','.request.json'))
+            if formal.name.endswith('.result.json') and request.exists():
+                sources=read(request)['implementation']['sources']
+            else:
+                sources=read(formal.with_name('solution.json'))['sources']
             assert len(sources)==1 and sources[0]['content']==Path(source).read_text(encoding='utf8')
         elif not formal.exists():
             self.cmd('pytorch-'+op+'-'+sha(source)[:8],[PY,TOOLS/'cann_priority/evaluate.py','--operator',op,

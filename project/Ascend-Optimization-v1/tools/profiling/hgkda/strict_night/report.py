@@ -70,6 +70,13 @@ def main():
         return target
     def materialize(row,best):
         source=track(best['source']);digest=sha(source);assert digest==best['source_sha256']
+        if best.get('out_api_probe'):
+            import importlib
+            import out_api_probe
+            importlib.reload(out_api_probe)
+            out_api=read(track(best['out_api_probe']))
+            assert out_api_probe.qualified(out_api,digest),'out接口未完成补测'
+            assert sha(track(best['out_api_probe_checker']))==out_api['checker_sha256']
         manual=read(track(source.with_name('review.json')))
         assert manual['source_sha256']==digest and manual['status']=='reviewed_strict_triton'
         assert manual['all_branches_reviewed'] and manual['dependencies_reviewed']
