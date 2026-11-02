@@ -11,6 +11,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parent))
 import probe_foreach_reference as probe
 import fp32_rounding_probe as arithmetic_probe
 import compensated_arithmetic
+import inverse_stages_probe
 
 
 class ReferenceProbeTests(unittest.TestCase):
@@ -74,6 +75,8 @@ class ArithmeticProbeRecoveryTests(unittest.TestCase):
             root=Path(folder);out,spec=self.prepare(root)
             result=dict(status='measured',checker_sha256=self.probe.sha(self.probe.__file__),
                 spec_sha256=self.probe.sha(spec),qualified_CANN=False,performance_measured=False)
+            configuration=json.loads(spec.read_text())
+            if 'source_sha256' in configuration:result['source_sha256']=configuration['source_sha256']
             (out/'result.json').write_text(json.dumps(result))
             runner=SimpleNamespace(batch=root,state=dict(jobs={}),persist=mock.Mock(),
                 cmd=mock.Mock(side_effect=AssertionError('不得重复提交')))
@@ -93,6 +96,20 @@ class ArithmeticProbeRecoveryTests(unittest.TestCase):
 class CompensatedProbeRecoveryTests(ArithmeticProbeRecoveryTests):
     probe = compensated_arithmetic
     probe_name = 'fp32-compensated-v2'
+
+
+class InverseStagesProbeRecoveryTests(ArithmeticProbeRecoveryTests):
+    probe = inverse_stages_probe
+    probe_name = 'inverse-stages-v1'
+
+    def prepare(self, root):
+        out, spec = super().prepare(root)
+        source = out / 'candidate.py'
+        source.write_text('冻结候选身份', encoding='utf8')
+        configuration = json.loads(spec.read_text())
+        configuration.update(source=str(source), source_sha256=self.probe.sha(source))
+        spec.write_text(json.dumps(configuration))
+        return out, spec
 
 
 if __name__=='__main__':unittest.main()

@@ -234,6 +234,23 @@ class Runner:
                            if c.get('passed') is False][:6])
             failed_proposals.append(failed)
         if failed_proposals:evidence['same_operator_failed_proposals']=failed_proposals[-4:]
+        failed_admissions=[]
+        for key,job in self.state.get('jobs',{}).items():
+            if not key.startswith('proposal:'+op+':') or job.get('status')!='completed':continue
+            result=job.get('result') or {}
+            if result.get('status')=='evaluated':continue  # 已进入proposals，包含后续补测结果。
+            path=result.get('result') or result.get('runtime')
+            if not path or not Path(path).is_file():continue
+            value=read(path)
+            facts={k:value.get(k) for k in ['status','num_passed','num_workloads','geo_mean','passed','total']}
+            failures=[r for r in value.get('per_workload',[]) if r.get('status') not in {'PASSED','SKIPPED'}]
+            if not failures:failures=[r for r in value.get('cases',[]) if not r.get('passed',True)]
+            facts['failures']=[{k:str(v)[:1200] if k in {'error','log'} else v for k,v in row.items()
+                               if k in {'uuid','case','phase','status','abs_err','rel_err','matched_ratio','error','log'}}
+                               for row in failures[:4]]
+            failed_admissions.append(dict(job=key,source_sha256=job.get('source_sha256'),
+                path=path,sha256=sha(path),facts=facts))
+        if failed_admissions:evidence['same_operator_runtime_or_formal_failures']=failed_admissions[-4:]
         transferred=[]
         for prior_op,row in self.state.get('operators',{}).items():
             best=row.get('best') or {}
@@ -288,6 +305,15 @@ class Runner:
                         for r in value['graph_ops']],
                     scope='当前安装版本的只读声明/符号证据，不证明设备支持，也不计作合格参考')
             if op=='expm1_':
+                streaming=BATCH/'analysis/expm1_/bound-streaming-v1-summary.json'
+                if streaming.exists():
+                    value=read(streaming)
+                    evidence['measured_streaming_non_improvement']=dict(path=str(streaming),sha256=sha(streaming),
+                        facts={k:value[k] for k in ['status','source_sha256','parent_source_sha256',
+                            'parent_pytorch_speedup','candidate_pytorch_speedup','formal_passed','formal_total',
+                            'supplement_passed','supplement_total','method','interpretation','next_hypothesis','reference']})
+                    evidence['diagnosis']+=('本算子40program流式版本已经一次正式30/30、补测63/63，但0.466×低于其父版本0.517×。'
+                        '不要把减少program当作普遍有效规则或重复同一源码；若继续此方向，先检查循环内搬运/计算重叠与控制开销。')
                 alternate=BATCH/'reference-probes/native-foreach-expm1-v1/numerics.json'
                 if alternate.exists():
                     value=read(alternate)
@@ -367,6 +393,26 @@ class Runner:
                         '这支持在小矩阵通用LU里使用纯Triton补偿算术；不是全IEEE证明，也不能直接认定整个求逆已通过。'
                         '实际TTIR/adapter/npubin已冻结。v1另有标量precise_div所在转换阶段失败及大矩阵offsets形状冲突，'
                         '不要复制已知编译错误；完整合同与补测保持不变。')
+                compile_checks=[]
+                for label in ['compile-static-v3','compile-reverse-v4','compile-dynamic-v5']:
+                    path=BATCH/'analysis/linalg_inv_ex'/label/'result.json'
+                    if path.exists():
+                        try:value=read(path)
+                        except json.JSONDecodeError:continue  # 独立编译可能仍在写进度，不据此中断串行队列。
+                        compile_checks.append(dict(path=str(path),sha256=sha(path),
+                            source_sha256=value['source_sha256'],checker_sha256=value['checker_sha256'],
+                            device_executed=value['device_executed'],
+                            rows=[{k:v for k,v in row.items() if k!='artifacts'} for row in value['rows']]))
+                if compile_checks:evidence['inverse_compile_only_checks']=compile_checks
+                models=[]
+                for label in ['cpu-literal-v5','cpu-literal-v6']:
+                    path=BATCH/'analysis/linalg_inv_ex'/label/'result.json'
+                    if path.exists():
+                        value=read(path)
+                        models.append(dict(path=str(path),sha256=sha(path),source_sha256=value['source_sha256'],
+                            checker_sha256=value['checker_sha256'],scope=value['scope'],device_executed=False,
+                            rows=[{k:row[k] for k in ['case','passed','error'] if k in row} for row in value['rows']]))
+                if models:evidence['cpu_literal_source_models']=models
         return evidence
     def prepare_paired(self,op,seed):
         if self.q.records[op]['reference']!='qualified_CANN':return

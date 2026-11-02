@@ -28,6 +28,8 @@ def process(runner):
     fp32_rounding_probe.process(runner)
     import compensated_arithmetic
     compensated_arithmetic.process(runner)
+    import inverse_stages_probe
+    inverse_stages_probe.process(runner)
     for spec_file in sorted((runner.batch/'proposals').glob('*/*/spec.json')):
         spec=read(spec_file);op=spec['operator'];out=spec_file.parent;source=out/'main.py'
         assert op in runner.q.records and out.parent.name==op
