@@ -7,6 +7,10 @@ description: 分阶段诊断昇腾算子的性能，结合 KGS 真机指标、�
 
 围绕同一份已评测源码，回答“实际执行了什么、什么可能限制性能、下一项修改如何验证”。评测与 profiling 继续使用 KGS。
 
+## 实现硬约束
+
+**CANN／Ascend C只用于baseline；优化候选严格使用Triton。** 所有计算、复制、归约、扫描、布局转换及回退分支均由Triton kernel实现。不得向Coder建议切换Ascend C、CANN目标API或原生DMA来达标；这些历史成功实现只可作为机制参考。Python／C++仅作分配、元数据、缓存、参数和Triton启动等宿主胶水。提交和择优前先审核全部调用路径，KGS通过不替代后端资格审查；完整规则见仓库根目录`docs/Triton候选与CANN参考硬性规则.md`。
+
 ## 选择体检深度
 
 先读 [分类知识索引](references/知识索引.md)，按算子类型和实际指标选择参考文档。
@@ -35,9 +39,9 @@ description: 分阶段诊断昇腾算子的性能，结合 KGS 真机指标、�
 python tools/profiling/hgkda/skills/hgkda/scripts/analyze_execution_paths.py --result 本轮.result.json --source 本轮.py --catalog 冻结合同目录 --parent-result 同合同父版.result.json --paths 同输入设备路径目录 --output 新诊断.json
 ```
 
-模型结合该JSON、成对指标、源码/IR和分类知识选择下一项实验。允许自写Ascend C与Triton布局回退时，明确记录实际后端；分块、同步与双缓冲不统一套用。更换分配/启动路径要保证当前地址、stream顺序、独立输出及原地/out别名。分数变高但候选实际延迟基本未变时，先检查参考波动，不称为代码收益。
+模型结合该JSON、成对指标、源码/IR和分类知识选择下一项Triton实验。Ascend C和厂商原语的执行机制可以用于分析baseline，候选的计算与搬运路径保持严格Triton；分块、同步与双缓冲不统一套用。更换宿主分配/启动包装要保证当前地址、stream顺序、独立输出及原地/out别名。分数变高但候选实际延迟基本未变时，先检查参考波动，不称为代码收益。
 
-本入口不会自动生成Ascend C，也不证明KG每轮都已调用；实际调用以诊断JSON、模型上下文及请求记录为准。2026-10-31本批由Codex调用并决策，控制器完成验证与归档。
+本入口不授权生成Ascend C候选，也不证明KG每轮都已调用；实际调用以诊断JSON、模型上下文及请求记录为准。2026-10-31的混合后端实验保留为历史机制证据，不能据此放宽当前严格Triton要求。
 
 ## 输出与结束
 

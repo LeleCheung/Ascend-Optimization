@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import secrets
 from pathlib import Path
 import subprocess
 import tarfile
@@ -19,10 +20,20 @@ def io_path(path):
 
 
 def execute(code):
-    result=subprocess.run(['ssh','-o','BatchMode=yes','baai-910b','python3 -'],input=code.encode('utf8'),stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=300)
+    marker=('__HGKDA_EXEC_OK_'+secrets.token_hex(12)+'__').encode('ascii')
+    # 堡垒机可能返回退出码0但只打印资产选择错误；只有远端Python执行结束的随机标记才算成功。
+    payload=base64.b64encode(code.encode('utf8')).decode('ascii')
+    script="import base64\nexec(compile(base64.b64decode("+repr(payload)+"),'<hgkda-remote>','exec'))\nprint('\\n'+"+repr(marker.decode('ascii'))+")\n"
+    command=['ssh','-o','BatchMode=yes','-o','ConnectTimeout=20']
+    if os.environ.get('HGKDA_SSH_USER'):command+=['-l',os.environ['HGKDA_SSH_USER']]
+    command+=['baai-910b','python3 -']
+    result=subprocess.run(command,input=script.encode('ascii'),stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=300)
     if result.returncode:
         raise RuntimeError(result.stderr.decode('utf8',errors='replace')+'\n'+result.stdout.decode('utf8',errors='replace')[-3000:])
-    return result.stdout
+    suffix=b'\n'+marker+b'\n'
+    if not result.stdout.endswith(suffix):
+        raise RuntimeError('未确认远端Python执行完成：'+result.stderr.decode('utf8',errors='replace')+'\n'+result.stdout.decode('utf8',errors='replace')[-3000:])
+    return result.stdout[:-len(suffix)]
 
 
 def push(names):

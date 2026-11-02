@@ -2,6 +2,8 @@
 
 本仓库用于优化华为昇腾 910B 上的 FlagGems 算子，并保存 KG/KGS 源码、实验候选、评测证据和复现方法。
 
+**用户硬约束：baseline使用CANN原生库或来源明确的Ascend C实现；我们的优化候选严格使用Triton，所有计算、搬运及回退路径均不得改用Ascend C／CANN／原生DMA。** 宿主胶水可管理分配、元数据和Triton启动。详见[硬性规则](docs/Triton候选与CANN参考硬性规则.md)。
+
 **当前目标：在固定FlagGems/FlagTree与KGS条件下，将HG-KDA从个例优化推进到可检验的设备机制工作流：绑定源码与输入、选择真机／IR／有限模拟器补测，在同预算模型对照和冻结后的新形状中验证收益。RTL只预留接口。会议指定10项与SGLang成果继续维护；此前低于0.8×的四算子阶段已完成。**
 
 2026-10-29启动[新25算子夜间计划](project/Ascend-Optimization-v1/operators/下一阶段计划-20261029.md)：现有HG-KDA先推进优化，同步接入CANN/Ascend C参考核验、带绝对值和差值的成对证据、模拟器热点区域/可观测空闲与结构化知识整理。工具入口为[next_phase](project/Ascend-Optimization-v1/tools/profiling/hgkda/next_phase/README.md)。25项保留导师顺序，独立合同均已准备，其中两项显式映射到固定版本的下划线内部接口；实际结果见批次进展，不将排队状态写成交付。
@@ -9,6 +11,8 @@
 2026-10-09 导师确认：Excel 数字是加速比，绿色验收门槛为大于 0.8×，FlagGems 使用 `master`。筛选依据是华为列实际数字；黄色底色不作为立项依据。旧实验锁定的版本不是新的 master 基线。
 
 ## 当前状态
+
+2026-11-02目标纠偏：此前把部分候选改成Ascend C／CANN／DMA混合实现，偏离了严格Triton目标。历史25/30、7/10＋18/20和原PyTorch口径总数不能直接作为严格Triton达标数；**当前严格Triton总数待按源码与全部调用路径重建**。以下日期记录及其附件保留历史口径，不覆盖此硬约束。
 
 2026-11-02完成[CANN优先对照与优化](project/Ascend-Optimization-v1/operators/campaigns/cann-priority-20261102/结果简报.md)：30项中建立25项合格CANN参考，25项候选相对各自参考超过0.8×；其中20项为直接CANN接口，5项为明确命名的兼容／组合参考。新增跨线`hardswish_out` **1.395×**、`rad2deg_` **1.297×**、`transform_bias_rescale_qkv` **0.931×**，相对同批起点的候选实际加速分别为2.184×、1.600×、1.224×。三项由Codex直接实现宿主桥／自写Ascend C，保留历史KG Triton布局路径；未额外运行模型搜索。原PyTorch24项成绩另列，Uniform范围、Expm1小值精度、累计积分不稳定以及池化／求逆参考缺口继续保留。详见[30项总表](project/Ascend-Optimization-v1/operators/campaigns/cann-priority-20261102/CANN优先30项总表.md)与[复现工具](project/Ascend-Optimization-v1/tools/profiling/hgkda/cann_priority/README.md)。
 
