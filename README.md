@@ -52,6 +52,7 @@ HG-KDA 面向昇腾算子的性能诊断与严格 Triton 优化，将成对 prof
 
 - [skill 接口](skills/hgkda/references/interface.md)
 - [可选后端](docs/backends.md)
+- [目录与调用](docs/directory-layout.md)
 - [工程整理计划](docs/release-plan.md)
 - [验证结果](docs/validation.md)
 - [历史恢复](docs/recovery.md)
