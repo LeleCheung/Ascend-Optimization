@@ -1,0 +1,680 @@
+{
+  "identity": {
+    "source": "\"\"\"cumulative_trapezoid: 融合增量舍入 + 扫描（Triton, 单次启动优先）。\n\n参考语义（同输入实测）：先按输入 dtype 对相邻元素求和并缩放，再沿 dim 做一次\n倍增（Hillis-Steele）扫描；fp16/bf16 每步舍入回输入 dtype，fp32 在 fp32 中累加。\n本实现保持同样的结合顺序与舍入位置。\n\n分派：\n  * 末轴连续：一个 program 一条扫描向量。短行用寄存器 gather 倍增；长行改用\n    全局 scratch 的偏移加载（实测比寄存器 gather 快，三 dtype 皆然）。\n  * 连续但非末轴：[L, n, M] 视为 M 列、沿行扫描；单次启动内每个 program\n    处理一个行块，并在本 program 内重算前序行块的和作为 carry，\n    避免额外的转置/前缀 kernel（启动开销是本机主要成本）。\n  * 非连续输入：先合并转置成末轴连续，走同一条路径，再写回目标布局。\n  * 所有核函数都走缓存启动器，绕开每次调用的 JIT 派发开销。\n\"\"\"\nimport torch\nimport torch_npu  # noqa: F401\nimport triton\nimport triton.language as tl\n\n_MAX_BLOCK = 4096      # 单块扫描长度上限（UB 约束）\n_SCRATCH_MIN = 2048    # 超过该长度改用 scratch 偏移加载\n_TILE = 64             # 转置分块\n_TILE_ELEMS = 8192     # 单块元素上限（UB 实测）\n_NCH_MAX = 16          # 单次启动内允许的最大行块数（冗余前缀成本）\n_NCH_TARGET = 8        # 优先把行块数压到该值以内\n\n_RAW_STREAM = {}\n\n\ndef _raw_stream(device_index):\n    getter = _RAW_STREAM.get(device_index)\n    if getter is None:\n        raw = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\n        expected = int(torch.npu.current_stream(device_index).npu_stream)\n        if raw is not None:\n            try:\n                if int(raw(device_index)) == expected:\n                    getter = lambda: raw(device_index)  # noqa: E731\n            except TypeError:\n                if int(raw()) == expected:\n                    getter = raw\n        if getter is None:\n            from triton.runtime import driver\n            getter = lambda: driver.active.get_current_stream(device_index)  # noqa: E731\n        _RAW_STREAM[device_index] = getter\n    return getter()\n\n\nclass _Cached:\n    \"\"\"首次调用走标准 JIT 路径并缓存编译产物，之后复用启动器与本调用的指针。\"\"\"\n\n    def __init__(self, kernel):\n        self.kernel = kernel\n        self.entries = {}\n\n    def __getitem__(self, grid):\n        def invoke(*args):\n            key = (tuple(grid),) + tuple(\n                (a.data_ptr() & 15, a.shape, a.stride(), a.dtype)\n                if torch.is_tensor(a) else a for a in args)\n            entry = self.entries.get(key)\n            if entry is None:\n                compiled = self.kernel[grid](*args)\n                launcher = compiled.run\n                if (getattr(launcher, 'compile_only', False)\n                        or getattr(launcher, 'enable_msprof_register_tensor', False)\n                        or getattr(launcher.metadata, 'debug_enabled', False)\n                        or getattr(launcher.metadata, 'debug', False)):\n                    self.entries[key] = False\n                    return\n                shape = tuple(grid) + (1,) * (3 - len(grid))\n                self.entries[key] = (launcher.launch, compiled.function,\n                                     compiled.packed_metadata, shape)\n                return\n            if entry is False:\n                self.kernel[grid](*args)\n                return\n            ptrs = tuple(a.data_ptr() if torch.is_tensor(a) else None for a in args)\n            entry[0](*entry[3], _raw_stream(args[0].device.index or 0),\n                     entry[1], entry[2], None, None, None, *ptrs)\n        return invoke\n\n\n@triton.jit\ndef _scan_one(Y, O, SCALE: tl.constexpr, N: tl.constexpr, BLOCK: tl.constexpr,\n              LOG: tl.constexpr, LOW: tl.constexpr):\n    \"\"\"末轴连续、单块：一个 program 一条扫描向量，寄存器 gather 倍增。\"\"\"\n    N1: tl.constexpr = N - 1\n    row = tl.program_id(0)\n    k = tl.arange(0, BLOCK)\n    mm = k < N1\n    yb = row * N\n    ob = row * N1\n    a = tl.load(Y + yb + k, mask=mm, other=0.0).to(tl.float32)\n    b = tl.load(Y + yb + k + 1, mask=mm, other=0.0).to(tl.float32)\n    inc = (a + b) * SCALE\n    if LOW:\n        inc = inc.to(Y.dtype.element_ty)\n    s = inc\n    for j in tl.static_range(0, LOG):\n        g = tl.gather(s, tl.maximum(k - (1 << j), 0), 0)\n        if LOW:\n            s = (s + tl.where(k >= (1 << j), g, 0.0).to(Y.dtype.element_ty)).to(\n                Y.dtype.element_ty)\n        else:\n            s = s + tl.where(k >= (1 << j), g, 0.0)\n    tl.store(O + ob + k, s.to(O.dtype.element_ty), mask=mm)\n\n\n@triton.jit\ndef _scan_scr(Y, O, SCR, SCALE: tl.constexpr, N: tl.constexpr, BLOCK: tl.constexpr,\n              LOG: tl.constexpr, LOW: tl.constexpr):\n    \"\"\"末轴连续、单块：倍增的换位值来自全局 scratch 的偏移加载。\"\"\"\n    N1: tl.constexpr = N - 1\n    row = tl.program_id(0)\n    k = tl.arange(0, BLOCK)\n    sb = row * BLOCK\n    mm = k < N1\n    yb = row * N\n    ob = row * N1\n    a = tl.load(Y + yb + k, mask=mm, other=0.0).to(tl.float32)\n    b = tl.load(Y + yb + k + 1, mask=mm, other=0.0).to(tl.float32)\n    inc = (a + b) * SCALE\n    if LOW:\n        s = inc.to(Y.dtype.element_ty)\n    else:\n        s = inc\n    for j in tl.static_range(0, LOG):\n        tl.store(SCR + sb + k, s)\n        tl.debug_barrier()\n        g = tl.load(SCR + sb + k - (1 << j), mask=k >= (1 << j), other=0.0)\n        if LOW:\n            s = (s + g).to(Y.dtype.element_ty)\n        else:\n            s = s + g\n    tl.store(O + ob + k, s.to(O.dtype.element_ty), mask=mm)\n\n\n@triton.jit\ndef _scan_vec(Y, O, SCALE: tl.constexpr, N: tl.constexpr, BLOCK: tl.constexpr,\n              LOG: tl.constexpr, LOW: tl.constexpr, TILES: tl.constexpr):\n    \"\"\"末轴连续、超过单块长度：分块倍增 + 块间 carry。\"\"\"\n    N1: tl.constexpr = N - 1\n    acc16 = tl.zeros((BLOCK,), Y.dtype.element_ty)\n    acc32 = tl.zeros((BLOCK,), tl.float32)\n    k = tl.arange(0, BLOCK)\n    row = tl.program_id(0)\n    yb = row * N\n    ob = row * N1\n    carry = acc16 if LOW else acc32\n    for t in tl.static_range(0, TILES):\n        off = t * BLOCK + k\n        mm = off < N1\n        a = tl.load(Y + yb + off, mask=mm, other=0.0).to(tl.float32)\n        b = tl.load(Y + yb + off + 1, mask=mm, other=0.0).to(tl.float32)\n        inc = ((a + b) * SCALE).to(Y.dtype.element_ty)\n        s = inc if LOW else inc.to(tl.float32)\n        for j in tl.static_range(0, LOG):\n            g = tl.gather(s, tl.maximum(k - (1 << j), 0), 0)\n            if LOW:\n                s = (s + tl.where(k >= (1 << j), g, acc16)).to(Y.dtype.element_ty)\n            else:\n                s = s + tl.where(k >= (1 << j), g, acc32)\n        if LOW:\n            s = (s + carry).to(Y.dtype.element_ty)\n            carry = acc16 + tl.sum(tl.where(k == BLOCK - 1, s, acc16), 0)\n        else:\n            s = s + carry\n            carry = acc32 + tl.sum(tl.where(k == BLOCK - 1, s, acc32), 0)\n        tl.store(O + ob + off, s.to(O.dtype.element_ty), mask=mm)\n\n\n@triton.jit\ndef _dim0_scan(Y, O, SCALE: tl.constexpr, N: tl.constexpr, N1: tl.constexpr,\n               TC: tl.constexpr, MC: tl.constexpr, M: tl.constexpr,\n               NCH: tl.constexpr, LOW: tl.constexpr, CM: tl.constexpr):\n    \"\"\"连续非末轴：单次启动，program 内重算前序行块之和作为 carry。\"\"\"\n    c = tl.program_id(0)\n    cb = tl.program_id(1)\n    l = tl.program_id(2)\n    t = tl.arange(0, TC)\n    m = tl.arange(0, MC)\n    col = cb * MC + m\n    cok = col < M\n    ybase = l * N * M + col[None, :]\n    obase = l * N1 * M + col[None, :]\n    carry = tl.zeros((MC,), tl.float32)\n    carry16 = tl.zeros((MC,), Y.dtype.element_ty)\n    for p in tl.static_range(0, NCH):\n        idx = p * TC * M + t[:, None] * M\n        if p < c:\n            if CM:\n                va = tl.load(Y + ybase + idx, mask=cok[None, :], other=0.0)\n                vb = tl.load(Y + ybase + idx + M, mask=cok[None, :], other=0.0)\n            else:\n                va = tl.load(Y + ybase + idx)\n                vb = tl.load(Y + ybase + idx + M)\n            inc = (va.to(tl.float32) + vb.to(tl.float32)) * SCALE\n            if LOW:\n                inc = inc.to(Y.dtype.element_ty)\n                carry16 = carry16 + tl.sum(inc, 0).to(Y.dtype.element_ty)\n            else:\n                carry = carry + tl.sum(inc, 0)\n        elif p == c:\n            rok = (p * TC + t) < N1\n            msk = rok[:, None] & cok[None, :]\n            va = tl.load(Y + ybase + idx, mask=msk, other=0.0)\n            vb = tl.load(Y + ybase + idx + M, mask=msk, other=0.0)\n            inc = (va.to(tl.float32) + vb.to(tl.float32)) * SCALE\n            if LOW:\n                s = tl.cumsum(inc.to(Y.dtype.element_ty), 0) + carry16[None, :]\n            else:\n                s = tl.cumsum(inc, 0) + carry[None, :]\n            tl.store(O + obase + idx, s.to(O.dtype.element_ty), mask=msk)\n\n\n@triton.jit\ndef _transpose(SRC, DST, RSHAPE: tl.constexpr, YST: tl.constexpr, NDIM: tl.constexpr,\n               R: tl.constexpr, C: tl.constexpr, S: tl.constexpr, DA: tl.constexpr,\n               RB: tl.constexpr, CB: tl.constexpr):\n    \"\"\"把 [R, C] 扫描矩阵转置搬入连续缓冲：读写两侧都沿最内轴连续。\"\"\"\n    r = tl.program_id(0) * RB + tl.arange(0, RB)\n    c = tl.program_id(1) * CB + tl.arange(0, CB)\n    rem = c\n    ya = tl.zeros((CB,), tl.int32)\n    for i in tl.static_range(0, NDIM):\n        cc = rem % RSHAPE[i]\n        rem = rem // RSHAPE[i]\n        ya += cc * YST[i]\n    rm = r < R\n    cm = c < C\n    tile = tl.load(SRC + ya[None, :] + r[:, None] * S,\n                   mask=rm[:, None] & cm[None, :], other=0.0)\n    tl.store(DST + c[:, None] * DA + r[None, :], tl.trans(tile),\n             mask=cm[:, None] & rm[None, :])\n\n\n_scan_one = _Cached(_scan_one)\n_scan_scr = _Cached(_scan_scr)\n_scan_vec = _Cached(_scan_vec)\n_dim0_scan = _Cached(_dim0_scan)\n_transpose = _Cached(_transpose)\n\n\n@triton.jit\ndef _restore(SRC, DST, RSHAPE: tl.constexpr, OSTRIDES: tl.constexpr,\n             AXIS_STRIDE: tl.constexpr, ROWS: tl.constexpr, N1: tl.constexpr,\n             BLOCK: tl.constexpr):\n    linear=tl.program_id(0)*BLOCK+tl.arange(0,BLOCK)\n    row=linear//N1\n    coordinate=linear%N1\n    remainder=row\n    address=coordinate*AXIS_STRIDE\n    for d in tl.static_range(len(RSHAPE)-1,-1,-1):\n        address+=(remainder%RSHAPE[d])*OSTRIDES[d]\n        remainder=remainder//RSHAPE[d]\n    value=tl.load(SRC+linear,linear<ROWS*N1,other=0)\n    tl.store(DST+address,value,linear<ROWS*N1)\n\n_restore=_Cached(_restore)\n\n\ndef _pow2(n):\n    b = triton.next_power_of_2(max(1, n))\n    return b, b.bit_length() - 1\n\n\ndef _row_scan(y, src, dst, rows, n, n1, scale, low):\n    \"\"\"末轴连续的扫描分派：分块 / scratch / 单块。\"\"\"\n    block, log = _pow2(min(n1, _MAX_BLOCK))\n    tiles = -(-n1 // block)\n    if tiles > 1:\n        _scan_vec[(rows,)](src, dst, scale, n, block, log, low, tiles)\n    elif n1 > _SCRATCH_MIN:\n        scr = torch.empty(rows * block, dtype=y.dtype, device=y.device)\n        _scan_scr[(rows,)](src, dst, scr, scale, n, block, log, low)\n    else:\n        _scan_one[(rows,)](src, dst, scale, n, block, log, low)\n\n\ndef run(y, *, dx=1, dim=-1):\n    nd = y.ndim\n    if nd == 0 or not -nd <= dim < nd:\n        raise IndexError('cumulative_trapezoid: dimension out of range')\n    axis = dim % nd\n    yshape = y.shape\n    shape = list(yshape)\n    n = int(shape[axis])\n    shape[axis] = n - 1 if n > 0 else 0\n    out = torch.empty(shape, dtype=y.dtype, device=y.device)\n    if n < 2 or out.numel() == 0:\n        return out\n    scale = float(dx) / 2.0\n    low = 1 if y.dtype in (torch.float16, torch.bfloat16) else 0\n    n1 = n - 1\n    if y.is_contiguous():\n        if axis == nd - 1:\n            rows = out.numel() // n1\n            _row_scan(y, y, out, rows, n, n1, scale, low)\n            return out\n        m_dim = 1\n        for d in range(axis + 1, nd):\n            m_dim *= int(yshape[d])\n        l_dim = out.numel() // (n1 * m_dim)\n        mc = max(8, min(128, triton.next_power_of_2(m_dim)))\n        tc = max(1, min(_TILE_ELEMS // mc, triton.next_power_of_2(n1)))\n        nch = -(-n1 // tc)\n        while nch > _NCH_TARGET and mc > 8:\n            mc //= 2\n            tc = max(1, min(_TILE_ELEMS // mc, triton.next_power_of_2(n1)))\n            nch = -(-n1 // tc)\n        if nch <= _NCH_MAX:\n            _dim0_scan[(nch, -(-m_dim // mc), l_dim)](\n                y, out, scale, n, n1, tc, mc, m_dim, nch, low, m_dim % mc != 0)\n            return out\n    rows = out.numel() // n1\n    buf = torch.empty(rows * (n + n1), dtype=y.dtype, device=y.device)\n    flat = buf[: rows * n]\n    tmp = buf[rows * n:]\n    dims = [d for d in range(nd) if d != axis]\n    _transpose[(-(-n // _TILE), -(-rows // _TILE))](\n        y, flat, tuple(int(y.shape[d]) for d in reversed(dims)),\n        tuple(int(y.stride(d)) for d in reversed(dims)), len(dims),\n        n, rows, int(y.stride(axis)), n, _TILE, _TILE)\n    _row_scan(y, flat, tmp, rows, n, n1, scale, low)\n    if axis == 0:\n        _transpose[(-(-rows // _TILE), -(-n1 // _TILE))](\n            tmp,out,(n1,),(1,),1,rows,n1,n1,rows,_TILE,_TILE)\n    else:\n        _restore[(triton.cdiv(out.numel(),1024),)](\n            tmp,out,tuple(int(out.shape[d]) for d in dims),\n            tuple(int(out.stride(d)) for d in dims),int(out.stride(axis)),rows,n1,1024)\n    return out\n",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:eeac5b61831fd03a7564fa525168dfce99bee59c78156e875f3ad54bc6dab92d",
+      "definition": "cumulative_trapezoid"
+    },
+    "settings": {
+      "warmup_ms": 1000,
+      "benchmark_ms": 100,
+      "num_trials": 3,
+      "tolerance_mode": "strict",
+      "rtol": 0.01,
+      "atol": 0.01,
+      "timeout_seconds": 1500
+    },
+    "target": "Ascend910B",
+    "solution": {
+      "definition": "cumulative_trapezoid",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "\"\"\"cumulative_trapezoid: 融合增量舍入 + 扫描（Triton, 单次启动优先）。\n\n参考语义（同输入实测）：先按输入 dtype 对相邻元素求和并缩放，再沿 dim 做一次\n倍增（Hillis-Steele）扫描；fp16/bf16 每步舍入回输入 dtype，fp32 在 fp32 中累加。\n本实现保持同样的结合顺序与舍入位置。\n\n分派：\n  * 末轴连续：一个 program 一条扫描向量。短行用寄存器 gather 倍增；长行改用\n    全局 scratch 的偏移加载（实测比寄存器 gather 快，三 dtype 皆然）。\n  * 连续但非末轴：[L, n, M] 视为 M 列、沿行扫描；单次启动内每个 program\n    处理一个行块，并在本 program 内重算前序行块的和作为 carry，\n    避免额外的转置/前缀 kernel（启动开销是本机主要成本）。\n  * 非连续输入：先合并转置成末轴连续，走同一条路径，再写回目标布局。\n  * 所有核函数都走缓存启动器，绕开每次调用的 JIT 派发开销。\n\"\"\"\nimport torch\nimport torch_npu  # noqa: F401\nimport triton\nimport triton.language as tl\n\n_MAX_BLOCK = 4096      # 单块扫描长度上限（UB 约束）\n_SCRATCH_MIN = 2048    # 超过该长度改用 scratch 偏移加载\n_TILE = 64             # 转置分块\n_TILE_ELEMS = 8192     # 单块元素上限（UB 实测）\n_NCH_MAX = 16          # 单次启动内允许的最大行块数（冗余前缀成本）\n_NCH_TARGET = 8        # 优先把行块数压到该值以内\n\n_RAW_STREAM = {}\n\n\ndef _raw_stream(device_index):\n    getter = _RAW_STREAM.get(device_index)\n    if getter is None:\n        raw = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\n        expected = int(torch.npu.current_stream(device_index).npu_stream)\n        if raw is not None:\n            try:\n                if int(raw(device_index)) == expected:\n                    getter = lambda: raw(device_index)  # noqa: E731\n            except TypeError:\n                if int(raw()) == expected:\n                    getter = raw\n        if getter is None:\n            from triton.runtime import driver\n            getter = lambda: driver.active.get_current_stream(device_index)  # noqa: E731\n        _RAW_STREAM[device_index] = getter\n    return getter()\n\n\nclass _Cached:\n    \"\"\"首次调用走标准 JIT 路径并缓存编译产物，之后复用启动器与本调用的指针。\"\"\"\n\n    def __init__(self, kernel):\n        self.kernel = kernel\n        self.entries = {}\n\n    def __getitem__(self, grid):\n        def invoke(*args):\n            key = (tuple(grid),) + tuple(\n                (a.data_ptr() & 15, a.shape, a.stride(), a.dtype)\n                if torch.is_tensor(a) else a for a in args)\n            entry = self.entries.get(key)\n            if entry is None:\n                compiled = self.kernel[grid](*args)\n                launcher = compiled.run\n                if (getattr(launcher, 'compile_only', False)\n                        or getattr(launcher, 'enable_msprof_register_tensor', False)\n                        or getattr(launcher.metadata, 'debug_enabled', False)\n                        or getattr(launcher.metadata, 'debug', False)):\n                    self.entries[key] = False\n                    return\n                shape = tuple(grid) + (1,) * (3 - len(grid))\n                self.entries[key] = (launcher.launch, compiled.function,\n                                     compiled.packed_metadata, shape)\n                return\n            if entry is False:\n                self.kernel[grid](*args)\n                return\n            ptrs = tuple(a.data_ptr() if torch.is_tensor(a) else None for a in args)\n            entry[0](*entry[3], _raw_stream(args[0].device.index or 0),\n                     entry[1], entry[2], None, None, None, *ptrs)\n        return invoke\n\n\n@triton.jit\ndef _scan_one(Y, O, SCALE: tl.constexpr, N: tl.constexpr, BLOCK: tl.constexpr,\n              LOG: tl.constexpr, LOW: tl.constexpr):\n    \"\"\"末轴连续、单块：一个 program 一条扫描向量，寄存器 gather 倍增。\"\"\"\n    N1: tl.constexpr = N - 1\n    row = tl.program_id(0)\n    k = tl.arange(0, BLOCK)\n    mm = k < N1\n    yb = row * N\n    ob = row * N1\n    a = tl.load(Y + yb + k, mask=mm, other=0.0).to(tl.float32)\n    b = tl.load(Y + yb + k + 1, mask=mm, other=0.0).to(tl.float32)\n    inc = (a + b) * SCALE\n    if LOW:\n        inc = inc.to(Y.dtype.element_ty)\n    s = inc\n    for j in tl.static_range(0, LOG):\n        g = tl.gather(s, tl.maximum(k - (1 << j), 0), 0)\n        if LOW:\n            s = (s + tl.where(k >= (1 << j), g, 0.0).to(Y.dtype.element_ty)).to(\n                Y.dtype.element_ty)\n        else:\n            s = s + tl.where(k >= (1 << j), g, 0.0)\n    tl.store(O + ob + k, s.to(O.dtype.element_ty), mask=mm)\n\n\n@triton.jit\ndef _scan_scr(Y, O, SCR, SCALE: tl.constexpr, N: tl.constexpr, BLOCK: tl.constexpr,\n              LOG: tl.constexpr, LOW: tl.constexpr):\n    \"\"\"末轴连续、单块：倍增的换位值来自全局 scratch 的偏移加载。\"\"\"\n    N1: tl.constexpr = N - 1\n    row = tl.program_id(0)\n    k = tl.arange(0, BLOCK)\n    sb = row * BLOCK\n    mm = k < N1\n    yb = row * N\n    ob = row * N1\n    a = tl.load(Y + yb + k, mask=mm, other=0.0).to(tl.float32)\n    b = tl.load(Y + yb + k + 1, mask=mm, other=0.0).to(tl.float32)\n    inc = (a + b) * SCALE\n    if LOW:\n        s = inc.to(Y.dtype.element_ty)\n    else:\n        s = inc\n    for j in tl.static_range(0, LOG):\n        tl.store(SCR + sb + k, s)\n        tl.debug_barrier()\n        g = tl.load(SCR + sb + k - (1 << j), mask=k >= (1 << j), other=0.0)\n        if LOW:\n            s = (s + g).to(Y.dtype.element_ty)\n        else:\n            s = s + g\n    tl.store(O + ob + k, s.to(O.dtype.element_ty), mask=mm)\n\n\n@triton.jit\ndef _scan_vec(Y, O, SCALE: tl.constexpr, N: tl.constexpr, BLOCK: tl.constexpr,\n              LOG: tl.constexpr, LOW: tl.constexpr, TILES: tl.constexpr):\n    \"\"\"末轴连续、超过单块长度：分块倍增 + 块间 carry。\"\"\"\n    N1: tl.constexpr = N - 1\n    acc16 = tl.zeros((BLOCK,), Y.dtype.element_ty)\n    acc32 = tl.zeros((BLOCK,), tl.float32)\n    k = tl.arange(0, BLOCK)\n    row = tl.program_id(0)\n    yb = row * N\n    ob = row * N1\n    carry = acc16 if LOW else acc32\n    for t in tl.static_range(0, TILES):\n        off = t * BLOCK + k\n        mm = off < N1\n        a = tl.load(Y + yb + off, mask=mm, other=0.0).to(tl.float32)\n        b = tl.load(Y + yb + off + 1, mask=mm, other=0.0).to(tl.float32)\n        inc = ((a + b) * SCALE).to(Y.dtype.element_ty)\n        s = inc if LOW else inc.to(tl.float32)\n        for j in tl.static_range(0, LOG):\n            g = tl.gather(s, tl.maximum(k - (1 << j), 0), 0)\n            if LOW:\n                s = (s + tl.where(k >= (1 << j), g, acc16)).to(Y.dtype.element_ty)\n            else:\n                s = s + tl.where(k >= (1 << j), g, acc32)\n        if LOW:\n            s = (s + carry).to(Y.dtype.element_ty)\n            carry = acc16 + tl.sum(tl.where(k == BLOCK - 1, s, acc16), 0)\n        else:\n            s = s + carry\n            carry = acc32 + tl.sum(tl.where(k == BLOCK - 1, s, acc32), 0)\n        tl.store(O + ob + off, s.to(O.dtype.element_ty), mask=mm)\n\n\n@triton.jit\ndef _dim0_scan(Y, O, SCALE: tl.constexpr, N: tl.constexpr, N1: tl.constexpr,\n               TC: tl.constexpr, MC: tl.constexpr, M: tl.constexpr,\n               NCH: tl.constexpr, LOW: tl.constexpr, CM: tl.constexpr):\n    \"\"\"连续非末轴：单次启动，program 内重算前序行块之和作为 carry。\"\"\"\n    c = tl.program_id(0)\n    cb = tl.program_id(1)\n    l = tl.program_id(2)\n    t = tl.arange(0, TC)\n    m = tl.arange(0, MC)\n    col = cb * MC + m\n    cok = col < M\n    ybase = l * N * M + col[None, :]\n    obase = l * N1 * M + col[None, :]\n    carry = tl.zeros((MC,), tl.float32)\n    carry16 = tl.zeros((MC,), Y.dtype.element_ty)\n    for p in tl.static_range(0, NCH):\n        idx = p * TC * M + t[:, None] * M\n        if p < c:\n            if CM:\n                va = tl.load(Y + ybase + idx, mask=cok[None, :], other=0.0)\n                vb = tl.load(Y + ybase + idx + M, mask=cok[None, :], other=0.0)\n            else:\n                va = tl.load(Y + ybase + idx)\n                vb = tl.load(Y + ybase + idx + M)\n            inc = (va.to(tl.float32) + vb.to(tl.float32)) * SCALE\n            if LOW:\n                inc = inc.to(Y.dtype.element_ty)\n                carry16 = carry16 + tl.sum(inc, 0).to(Y.dtype.element_ty)\n            else:\n                carry = carry + tl.sum(inc, 0)\n        elif p == c:\n            rok = (p * TC + t) < N1\n            msk = rok[:, None] & cok[None, :]\n            va = tl.load(Y + ybase + idx, mask=msk, other=0.0)\n            vb = tl.load(Y + ybase + idx + M, mask=msk, other=0.0)\n            inc = (va.to(tl.float32) + vb.to(tl.float32)) * SCALE\n            if LOW:\n                s = tl.cumsum(inc.to(Y.dtype.element_ty), 0) + carry16[None, :]\n            else:\n                s = tl.cumsum(inc, 0) + carry[None, :]\n            tl.store(O + obase + idx, s.to(O.dtype.element_ty), mask=msk)\n\n\n@triton.jit\ndef _transpose(SRC, DST, RSHAPE: tl.constexpr, YST: tl.constexpr, NDIM: tl.constexpr,\n               R: tl.constexpr, C: tl.constexpr, S: tl.constexpr, DA: tl.constexpr,\n               RB: tl.constexpr, CB: tl.constexpr):\n    \"\"\"把 [R, C] 扫描矩阵转置搬入连续缓冲：读写两侧都沿最内轴连续。\"\"\"\n    r = tl.program_id(0) * RB + tl.arange(0, RB)\n    c = tl.program_id(1) * CB + tl.arange(0, CB)\n    rem = c\n    ya = tl.zeros((CB,), tl.int32)\n    for i in tl.static_range(0, NDIM):\n        cc = rem % RSHAPE[i]\n        rem = rem // RSHAPE[i]\n        ya += cc * YST[i]\n    rm = r < R\n    cm = c < C\n    tile = tl.load(SRC + ya[None, :] + r[:, None] * S,\n                   mask=rm[:, None] & cm[None, :], other=0.0)\n    tl.store(DST + c[:, None] * DA + r[None, :], tl.trans(tile),\n             mask=cm[:, None] & rm[None, :])\n\n\n_scan_one = _Cached(_scan_one)\n_scan_scr = _Cached(_scan_scr)\n_scan_vec = _Cached(_scan_vec)\n_dim0_scan = _Cached(_dim0_scan)\n_transpose = _Cached(_transpose)\n\n\n@triton.jit\ndef _restore(SRC, DST, RSHAPE: tl.constexpr, OSTRIDES: tl.constexpr,\n             AXIS_STRIDE: tl.constexpr, ROWS: tl.constexpr, N1: tl.constexpr,\n             BLOCK: tl.constexpr):\n    linear=tl.program_id(0)*BLOCK+tl.arange(0,BLOCK)\n    row=linear//N1\n    coordinate=linear%N1\n    remainder=row\n    address=coordinate*AXIS_STRIDE\n    for d in tl.static_range(len(RSHAPE)-1,-1,-1):\n        address+=(remainder%RSHAPE[d])*OSTRIDES[d]\n        remainder=remainder//RSHAPE[d]\n    value=tl.load(SRC+linear,linear<ROWS*N1,other=0)\n    tl.store(DST+address,value,linear<ROWS*N1)\n\n_restore=_Cached(_restore)\n\n\ndef _pow2(n):\n    b = triton.next_power_of_2(max(1, n))\n    return b, b.bit_length() - 1\n\n\ndef _row_scan(y, src, dst, rows, n, n1, scale, low):\n    \"\"\"末轴连续的扫描分派：分块 / scratch / 单块。\"\"\"\n    block, log = _pow2(min(n1, _MAX_BLOCK))\n    tiles = -(-n1 // block)\n    if tiles > 1:\n        _scan_vec[(rows,)](src, dst, scale, n, block, log, low, tiles)\n    elif n1 > _SCRATCH_MIN:\n        scr = torch.empty(rows * block, dtype=y.dtype, device=y.device)\n        _scan_scr[(rows,)](src, dst, scr, scale, n, block, log, low)\n    else:\n        _scan_one[(rows,)](src, dst, scale, n, block, log, low)\n\n\ndef run(y, *, dx=1, dim=-1):\n    nd = y.ndim\n    if nd == 0 or not -nd <= dim < nd:\n        raise IndexError('cumulative_trapezoid: dimension out of range')\n    axis = dim % nd\n    yshape = y.shape\n    shape = list(yshape)\n    n = int(shape[axis])\n    shape[axis] = n - 1 if n > 0 else 0\n    out = torch.empty(shape, dtype=y.dtype, device=y.device)\n    if n < 2 or out.numel() == 0:\n        return out\n    scale = float(dx) / 2.0\n    low = 1 if y.dtype in (torch.float16, torch.bfloat16) else 0\n    n1 = n - 1\n    if y.is_contiguous():\n        if axis == nd - 1:\n            rows = out.numel() // n1\n            _row_scan(y, y, out, rows, n, n1, scale, low)\n            return out\n        m_dim = 1\n        for d in range(axis + 1, nd):\n            m_dim *= int(yshape[d])\n        l_dim = out.numel() // (n1 * m_dim)\n        mc = max(8, min(128, triton.next_power_of_2(m_dim)))\n        tc = max(1, min(_TILE_ELEMS // mc, triton.next_power_of_2(n1)))\n        nch = -(-n1 // tc)\n        while nch > _NCH_TARGET and mc > 8:\n            mc //= 2\n            tc = max(1, min(_TILE_ELEMS // mc, triton.next_power_of_2(n1)))\n            nch = -(-n1 // tc)\n        if nch <= _NCH_MAX:\n            _dim0_scan[(nch, -(-m_dim // mc), l_dim)](\n                y, out, scale, n, n1, tc, mc, m_dim, nch, low, m_dim % mc != 0)\n            return out\n    rows = out.numel() // n1\n    buf = torch.empty(rows * (n + n1), dtype=y.dtype, device=y.device)\n    flat = buf[: rows * n]\n    tmp = buf[rows * n:]\n    dims = [d for d in range(nd) if d != axis]\n    _transpose[(-(-n // _TILE), -(-rows // _TILE))](\n        y, flat, tuple(int(y.shape[d]) for d in reversed(dims)),\n        tuple(int(y.stride(d)) for d in reversed(dims)), len(dims),\n        n, rows, int(y.stride(axis)), n, _TILE, _TILE)\n    _row_scan(y, flat, tmp, rows, n, n1, scale, low)\n    if axis == 0:\n        _transpose[(-(-rows // _TILE), -(-n1 // _TILE))](\n            tmp,out,(n1,),(1,),1,rows,n1,n1,rows,_TILE,_TILE)\n    else:\n        _restore[(triton.cdiv(out.numel(),1024),)](\n            tmp,out,tuple(int(out.shape[d]) for d in dims),\n            tuple(int(out.stride(d)) for d in dims),int(out.stride(axis)),rows,n1,1024)\n    return out\n"
+        }
+      ]
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "reference_source": "primary",
+    "status": "PASSED",
+    "device": "npu:0",
+    "server_backend": "npu",
+    "is_hack": false,
+    "hack_reason": "",
+    "geo_mean": 1.2276276640684751,
+    "min_speedup": 0.6573203714124637,
+    "worst_workload_uuid": "cumulative_trapezoid-timing-8",
+    "latency_ms": 0.07994026061227456,
+    "abs_err": 0.03125,
+    "rel_err": 0.05882351100444794,
+    "num_workloads": 33,
+    "num_passed": 33,
+    "timing_skipped": false,
+    "log": "",
+    "per_workload": [
+      {
+        "uuid": "cumulative_trapezoid-correctness-0",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-1",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-2",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.00390625,
+        "rel_err": 0.0012492192909121513,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-3",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.00048828125,
+        "rel_err": 0.0006915629492141306,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-4",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.00390625,
+        "rel_err": 0.01449273619800806,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-5",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.00048828125,
+        "rel_err": 0.0017391298897564411,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-6",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-7",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-8",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.03125,
+        "rel_err": 0.007633587811142206,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-9",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.00390625,
+        "rel_err": 0.03157893940806389,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-10",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-11",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-12",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.015625,
+        "rel_err": 0.05882351100444794,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-13",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.00390625,
+        "rel_err": 0.007874015718698502,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-14",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-15",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-16",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-17",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-18",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-19",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-20",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 4.76837158203125e-07,
+        "rel_err": 1.7588619130037841e-06,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-21",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 1.1920928955078125e-07,
+        "rel_err": 1.5913641391307465e-06,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-22",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-correctness-23",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-timing-0",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 1.0593297327866322,
+        "latency_ms": 0.061727823219664794,
+        "reference_latency_ms": 0.06539011847678798,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-timing-1",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 1.5460223405042373,
+        "latency_ms": 0.16630433148214666,
+        "reference_latency_ms": 0.2571102117940209,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-timing-2",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.6649013658499587,
+        "latency_ms": 0.08100100470367859,
+        "reference_latency_ms": 0.05385767866269483,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-timing-3",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.9341383679870628,
+        "latency_ms": 0.06504139689079129,
+        "reference_latency_ms": 0.0607576643431626,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-timing-4",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 1.5076053332097845,
+        "latency_ms": 0.21443007562187064,
+        "reference_latency_ms": 0.3232759256081096,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-timing-5",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 3.775015229829317,
+        "latency_ms": 0.0796457677914212,
+        "reference_latency_ms": 0.30066398640406433,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-timing-6",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 1.0468232644265205,
+        "latency_ms": 0.06043161173929892,
+        "reference_latency_ms": 0.06326121707548893,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-timing-7",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 1.5897462344451705,
+        "latency_ms": 0.20006298421246202,
+        "reference_latency_ms": 0.3180493758036251,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "cumulative_trapezoid-timing-8",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.6573203714124637,
+        "latency_ms": 0.07994026061227456,
+        "reference_latency_ms": 0.05254636179646946,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      }
+    ]
+  },
+  "service": {
+    "status": "ok",
+    "api_version": "v6.2",
+    "server_version": "v6.5.0",
+    "backend": "npu",
+    "devices": [
+      "npu:0"
+    ],
+    "workers": 1,
+    "evaluation_adapters": [
+      "native",
+      "flaggems"
+    ],
+    "scheduler": {
+      "device_slots": 1,
+      "healthy": 1,
+      "checking": 0,
+      "broken": 0,
+      "incidents": 15,
+      "recovered": 15,
+      "probe_timeout_seconds": 30.0,
+      "max_active": 1,
+      "active": 0,
+      "waiting": 0,
+      "available": 1,
+      "slots": [
+        {
+          "device": "npu:0",
+          "state": "available",
+          "reason": "",
+          "last_incident": "profile cancelled by client",
+          "incidents": 15,
+          "recovered": 15
+        }
+      ]
+    },
+    "timing": "walltime",
+    "profile": {
+      "supported": true,
+      "profiler": "msprof",
+      "levels": [
+        "metrics",
+        "instruction"
+      ],
+      "capabilities": [
+        "performance_counters",
+        "pipeline_utilization",
+        "kernel_profile",
+        "instruction_listing"
+      ]
+    },
+    "capabilities": {
+      "native_source_policy": {
+        "enabled": true,
+        "workload_conditions": true,
+        "policy_id": "flaggems/d64794e63b502cb836bc015a92a62c42de4be05a",
+        "source": {
+          "repository": "https://github.com/YaooXu/FlagGems.git",
+          "revision": "d64794e63b502cb836bc015a92a62c42de4be05a",
+          "paths": [
+            "src/flag_gems/runtime/backend/backend_utils.py",
+            "src/flag_gems/runtime/backend/_*/__init__.py"
+          ],
+          "license": "Apache-2.0",
+          "description": "VendorDescriptor defaults plus per-vendor overrides; reference/test policy, not measured capabilities"
+        },
+        "vendor": "ascend",
+        "flags": {
+          "support_fp64": false,
+          "support_bf16": true,
+          "support_int64": true
+        }
+      },
+      "operator_contract": {
+        "enabled": true,
+        "test_sources": true
+      },
+      "benchmark_reference": {
+        "enabled": true,
+        "evaluators": [
+          "flaggems"
+        ],
+        "level": "core"
+      },
+      "candidate_admission": {
+        "version": 1,
+        "policy_sha256": "bd6a7bc3f46a71e6d1b90223e911ad2ea463af4b314348de755177f46963d1dc",
+        "stages": [
+          "preflight"
+        ]
+      },
+      "operation_cancel": {
+        "enabled": true,
+        "operations": [
+          "preflight",
+          "evaluate",
+          "profile",
+          "reference"
+        ]
+      },
+      "operator_bundle_upload": {
+        "enabled": true,
+        "archive_format": "kernelgen.operator-bundle/v1",
+        "media_type": "application/vnd.kernelgen.operator-bundle.v1+tar",
+        "max_bytes": 268435456,
+        "max_files": 10000,
+        "evaluation_binding": true,
+        "evaluators": [
+          "native",
+          "flaggems"
+        ]
+      }
+    },
+    "debug": {
+      "enabled": true,
+      "runner": "local-trusted",
+      "security_boundary": false
+    },
+    "request_audit": {
+      "enabled": false
+    },
+    "trusted_clients_only": true,
+    "target": {
+      "backend": "ascend",
+      "vendor": "huawei",
+      "device": "Ascend910B4-1",
+      "architecture": "dav-c220-cube",
+      "devices": [
+        {
+          "logical_device": "npu:0",
+          "device_id": 0,
+          "name": "Ascend910B4-1",
+          "l2_cache_size": 176160768,
+          "num_sm": 20,
+          "compute_capability": "",
+          "total_memory": 65452113920
+        }
+      ]
+    },
+    "software": {
+      "language": "triton",
+      "language_version": "3.5.1",
+      "compiler": "flagtree",
+      "compiler_version": "0.6.0+ascend.gitc286cba6",
+      "runtime": "cann",
+      "runtime_version": "9.0.0",
+      "driver_version": "25.2.0"
+    },
+    "metadata": {
+      "complete": true,
+      "missing": [],
+      "sources": {
+        "target.backend": "server configuration",
+        "target.vendor": "server configuration",
+        "software.language": "server configuration",
+        "software.compiler": "python package metadata",
+        "software.runtime": "server configuration",
+        "target.device": "device probe",
+        "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+        "software.language_version": "triton module metadata",
+        "software.compiler_version": "python package metadata",
+        "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+        "software.driver_version": "/usr/local/Ascend/driver/version.info"
+      }
+    }
+  }
+}

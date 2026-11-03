@@ -1,0 +1,722 @@
+{
+  "identity": {
+    "source": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"In-place rad2deg (degrees = radians * 180/pi) as a self-contained Triton kernel.\n\nThe op is a pure elementwise scaling that must be applied in place, so the same\nbuffer is both source and destination and the pointer arithmetic has to follow\nthe tensor's actual (possibly strided) layout.\n\nDense inputs take a two-stage launch path:\n\n* the first call for a given (dtype, pointer-alignment) pair performs an\n  ordinary ``kernel[grid](...)`` launch, which compiles and caches the kernel;\n* later calls reuse that compiled kernel and invoke its generated NPU launcher\n  directly, passing the pointer, the element count and the *current* stream of\n  this call. Only the per-call launch bookkeeping is skipped -- nothing about\n  the tensor (data, shape, layout, dtype, stream) is cached.\n\nMeasured on the target: the ordinary JIT dispatch costs ~53us per call, the\npre-bound launcher ~8.9us, and the oracle's own C++ entry ~11.6us. The kernel\nitself is a few microseconds for the small sizes, so the fixed per-call host\npath is what the score is made of, and only the cheapest possible wrapper\naround the launcher pays off:\n\n* one cache dict per tile size, keyed by ``(dtype, data_ptr & 15)`` with the\n  tile size carried by the dict, so the hot path builds a 2-tuple key and never\n  has to branch on the tile size beyond picking the dict;\n* the raw stream getter is called directly instead of through a lambda, which\n  saves one Python frame per call;\n* the element count is read once and reused for the mask argument and the grid.\n\nA bounded probe on the target measured 8.93us for the launcher alone, 12.21us\nfor the whole call and 11.58us for the oracle, so the wrapper -- not the\nlauncher -- is the only part left to win.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\ntry:  # 10x cheaper than the Triton driver wrapper, same value (raw rtStream_t)\n    from torch_npu._C import _npu_getCurrentRawStreamNoWait as _get_stream\nexcept Exception:  # pragma: no cover\n    _get_stream = None\n\nif _get_stream is None:  # pragma: no cover\n    def _get_stream(device):\n        return triton.runtime.driver.active.get_current_stream(device)\n\ntry:\n    _device = torch.npu.current_device()\nexcept Exception:  # pragma: no cover\n    _device = 0\n\n# 180.0 / pi, matching the reference multiply constant.\n_INV = 57.29577951308232\n\n# Tile size per size class. A tile has to be large enough that one program's\n# prologue/epilogue is amortised over real data movement, but a tiny input\n# should not be spread over thousands of masked lanes.\n_BLOCK_SMALL = 8192\n_BLOCK_LARGE = 32768\n# Large 2-byte inputs stream over 16384-element tiles (32KB each), which leaves\n# room in the 192KB UB for the extra buffers a pipelined loop needs.\n_BLOCK_LARGE_NARROW = 16384\n_N_LARGE = 131072\n_MAX_I32 = 0x7FFFFFFF\n\n_nvec = 0\n\n# (dtype, data_ptr & 15) -> (launch, function, packed_metadata)\n_cache_small = {}\n_cache_large = {}\n\n\n@triton.jit(do_not_specialize=[\"n_elements\"])\ndef _rad2deg_contig_kernel(x_ptr, n_elements, BLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n_elements\n    x = tl.load(x_ptr + offs, mask=mask)\n    y = (x.to(tl.float32) * 57.29577951308232).to(x.dtype)\n    tl.store(x_ptr + offs, y, mask=mask)\n\n\n@triton.jit(do_not_specialize=[\"n_elements\"])\ndef _rad2deg_stream_kernel(x_ptr, y_ptr, n_elements, BLOCK: tl.constexpr):\n    \"\"\"Streaming loop over a strip of tiles per program.\n\n    ``y_ptr`` is always the same buffer as ``x_ptr`` (the op is in place). It is\n    passed as a second pointer argument on purpose: when a single pointer is\n    both loaded and stored, the next iteration's load has to be assumed to\n    alias the previous iteration's store, so the compiler keeps the two\n    serialised and the transport engine idles between tiles. Two arguments make\n    the load and the store distinct address streams, which lets consecutive\n    tiles be in flight together -- the property the oracle's 0.935 MTE2-active\n    profile shows it exploits.\n    \"\"\"\n    pid = tl.program_id(0)\n    step = BLOCK * tl.num_programs(0)\n    for start in tl.range(pid * BLOCK, n_elements, step):\n        offs = start + tl.arange(0, BLOCK)\n        mask = offs < n_elements\n        x = tl.load(x_ptr + offs, mask=mask)\n        y = (x.to(tl.float32) * 57.29577951308232).to(x.dtype)\n        tl.store(y_ptr + offs, y, mask=mask)\n\n\n@triton.jit(do_not_specialize=[\"n_elements\"])\ndef _rad2deg_strided_kernel(\n    x_ptr,\n    n_elements,\n    s0, s1, s2, s3, s4, s5, s6, s7,\n    t0, t1, t2, t3, t4, t5, t6, t7,\n    NDIM: tl.constexpr,\n    BLOCK: tl.constexpr,\n):\n    \"\"\"Generic N-d (NDIM <= 8) in-place scaling over a strided view.\n\n    A linear index over the logical element order is decomposed into the\n    multi-index (last axis fastest) and recombined with the storage strides,\n    so the write lands on exactly the same element that was read.\n    \"\"\"\n    pid = tl.program_id(0)\n    idx = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = idx < n_elements\n    rem = idx\n    off = tl.zeros_like(idx)\n\n    if NDIM >= 1:\n        off += (rem % s7) * t7\n        rem = rem // s7\n    if NDIM >= 2:\n        off += (rem % s6) * t6\n        rem = rem // s6\n    if NDIM >= 3:\n        off += (rem % s5) * t5\n        rem = rem // s5\n    if NDIM >= 4:\n        off += (rem % s4) * t4\n        rem = rem // s4\n    if NDIM >= 5:\n        off += (rem % s3) * t3\n        rem = rem // s3\n    if NDIM >= 6:\n        off += (rem % s2) * t2\n        rem = rem // s2\n    if NDIM >= 7:\n        off += (rem % s1) * t1\n        rem = rem // s1\n    if NDIM >= 8:\n        off += (rem % s0) * t0\n\n    x = tl.load(x_ptr + off, mask=mask)\n    y = (x.to(tl.float32) * 57.29577951308232).to(x.dtype)\n    tl.store(x_ptr + off, y, mask=mask)\n\n\ndef _install(a, n, ptr, cache, block):\n    \"\"\"Compile+bind the contiguous kernel for this dtype/alignment/tile.\"\"\"\n    global _device\n    _device = torch.npu.current_device()\n    grid = -(-n // block)\n    # Ordinary launch first: compiles the specialization for this dtype and\n    # proves the kernel runs; the compiled artifact is then reused.\n    _rad2deg_contig_kernel[(grid,)](a, n, BLOCK=block)\n    compiled = _rad2deg_contig_kernel.warmup(a, n, BLOCK=block, grid=(grid, 1, 1))\n    cache[(a.dtype, ptr & 15)] = (compiled.run.launch,\n                                  compiled.function,\n                                  compiled.packed_metadata)\n\n\ndef _launch_strided(a, n, block=_BLOCK_SMALL):\n    shape = list(a.shape)\n    strides = list(a.stride())\n\n    # Collapse adjacent axes whose strides compose exactly, so the ranks the\n    # kernel has to unroll stay small. This is a pure index-space rewrite.\n    i = len(shape) - 1\n    while i > 0:\n        if strides[i - 1] == strides[i] * shape[i] and shape[i] != 0:\n            shape[i - 1] *= shape[i]\n            strides[i - 1] = strides[i]\n            del shape[i]\n            del strides[i]\n        i -= 1\n\n    # Rank above the kernel's unroll width: peel the leading axes with zero-copy\n    # views (never exercised by the contracted workloads, kept for generality).\n    while len(shape) > 8:\n        for k in range(shape[0]):\n            _launch_strided(a[k], n // shape[0], block)\n        return\n\n    rank = len(shape)\n    pad_s = [1] * 8\n    pad_t = [0] * 8\n    for d in range(rank):\n        pad_s[8 - rank + d] = shape[d]\n        pad_t[8 - rank + d] = strides[d]\n\n    grid = ((n + block - 1) // block,)\n    _rad2deg_strided_kernel[grid](\n        a, n,\n        pad_s[0], pad_s[1], pad_s[2], pad_s[3],\n        pad_s[4], pad_s[5], pad_s[6], pad_s[7],\n        pad_t[0], pad_t[1], pad_t[2], pad_t[3],\n        pad_t[4], pad_t[5], pad_t[6], pad_t[7],\n        NDIM=rank,\n        BLOCK=block,\n    )\n\n\ndef _run_large(A, n):\n    \"\"\"Device-bound sizes: one tile per program for 4-byte data, and a pipelined\n    streaming loop for 2-byte data, where the tiles are small enough to keep\n    several of them in UB at once.\"\"\"\n    global _nvec\n    ptr = A.data_ptr()\n    entry = _cache_large.get((A.dtype, ptr & 15))\n    if entry is not None:\n        block = entry[3]\n        if entry[4]:\n            tiles = -(-n // block)\n            grid = tiles if tiles < _nvec else _nvec\n            entry[0](grid, 1, 1, _get_stream(_device), entry[1], entry[2],\n                     None, None, None, ptr, ptr, n, block)\n        else:\n            entry[0](-(-n // block), 1, 1, _get_stream(_device), entry[1],\n                     entry[2], None, None, None, ptr, n, block)\n        return A\n\n    if n > _MAX_I32:  # pragma: no cover - out of scope for this operator\n        _rad2deg_contig_kernel[(-(-n // _BLOCK_LARGE),)](A, n, BLOCK=_BLOCK_LARGE)\n        return A\n\n    if not _nvec:\n        try:\n            props = triton.runtime.driver.active.utils.get_device_properties(_device)\n            _nvec = int(props.get(\"num_vectorcore\") or props.get(\"num_aicore\") or 1)\n        except Exception:  # pragma: no cover\n            _nvec = 1\n    stream = A.element_size() == 2\n    block = _BLOCK_LARGE_NARROW if stream else _BLOCK_LARGE\n    tiles = -(-n // block)\n    grid = (tiles if tiles < _nvec else _nvec) if stream else tiles\n\n    try:\n        if stream:\n            _rad2deg_stream_kernel[(grid,)](A, A, n, BLOCK=block)\n            compiled = _rad2deg_stream_kernel.warmup(A, A, n, BLOCK=block,\n                                                     grid=(grid, 1, 1))\n        else:\n            _rad2deg_contig_kernel[(grid,)](A, n, BLOCK=block)\n            compiled = _rad2deg_contig_kernel.warmup(A, n, BLOCK=block,\n                                                     grid=(grid, 1, 1))\n        _cache_large[(A.dtype, ptr & 15)] = (compiled.run.launch, compiled.function,\n                                             compiled.packed_metadata, block, stream)\n    except Exception:  # pragma: no cover - keep working without the fast path\n        _rad2deg_contig_kernel[(tiles,)](A, n, BLOCK=block)\n    return A\n\n\ndef run(A):\n    n = A.numel()\n    if not A.is_contiguous():\n        if n:\n            _launch_strided(A, n)\n        return A\n    if not n:\n        return A\n    if n > _N_LARGE:\n        return _run_large(A, n)\n\n    ptr = A.data_ptr()\n    entry = _cache_small.get((A.dtype, ptr & 15))\n    if entry is not None:\n        entry[0](-(-n // _BLOCK_SMALL), 1, 1, _get_stream(_device),\n                 entry[1], entry[2], None, None, None, ptr, n, _BLOCK_SMALL)\n        return A\n\n    try:\n        _install(A, n, ptr, _cache_small, _BLOCK_SMALL)\n    except Exception:  # pragma: no cover - keep working without the fast path\n        _rad2deg_contig_kernel[(-(-n // _BLOCK_SMALL),)](A, n, BLOCK=_BLOCK_SMALL)\n    return A\n",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:7f7551575e605d7d90901c5932f60a066cb7f9a6c8048175b793bd10e85f81e2",
+      "definition": "rad2deg_"
+    },
+    "settings": {
+      "warmup_ms": 1000,
+      "benchmark_ms": 100,
+      "num_trials": 3,
+      "tolerance_mode": "strict",
+      "rtol": 0.01,
+      "atol": 0.01,
+      "timeout_seconds": 1500
+    },
+    "target": "Ascend910B",
+    "solution": {
+      "definition": "rad2deg_",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "# Copyright 2026 FlagOS Contributors\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"In-place rad2deg (degrees = radians * 180/pi) as a self-contained Triton kernel.\n\nThe op is a pure elementwise scaling that must be applied in place, so the same\nbuffer is both source and destination and the pointer arithmetic has to follow\nthe tensor's actual (possibly strided) layout.\n\nDense inputs take a two-stage launch path:\n\n* the first call for a given (dtype, pointer-alignment) pair performs an\n  ordinary ``kernel[grid](...)`` launch, which compiles and caches the kernel;\n* later calls reuse that compiled kernel and invoke its generated NPU launcher\n  directly, passing the pointer, the element count and the *current* stream of\n  this call. Only the per-call launch bookkeeping is skipped -- nothing about\n  the tensor (data, shape, layout, dtype, stream) is cached.\n\nMeasured on the target: the ordinary JIT dispatch costs ~53us per call, the\npre-bound launcher ~8.9us, and the oracle's own C++ entry ~11.6us. The kernel\nitself is a few microseconds for the small sizes, so the fixed per-call host\npath is what the score is made of, and only the cheapest possible wrapper\naround the launcher pays off:\n\n* one cache dict per tile size, keyed by ``(dtype, data_ptr & 15)`` with the\n  tile size carried by the dict, so the hot path builds a 2-tuple key and never\n  has to branch on the tile size beyond picking the dict;\n* the raw stream getter is called directly instead of through a lambda, which\n  saves one Python frame per call;\n* the element count is read once and reused for the mask argument and the grid.\n\nA bounded probe on the target measured 8.93us for the launcher alone, 12.21us\nfor the whole call and 11.58us for the oracle, so the wrapper -- not the\nlauncher -- is the only part left to win.\n\"\"\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\ntry:  # 10x cheaper than the Triton driver wrapper, same value (raw rtStream_t)\n    from torch_npu._C import _npu_getCurrentRawStreamNoWait as _get_stream\nexcept Exception:  # pragma: no cover\n    _get_stream = None\n\nif _get_stream is None:  # pragma: no cover\n    def _get_stream(device):\n        return triton.runtime.driver.active.get_current_stream(device)\n\ntry:\n    _device = torch.npu.current_device()\nexcept Exception:  # pragma: no cover\n    _device = 0\n\n# 180.0 / pi, matching the reference multiply constant.\n_INV = 57.29577951308232\n\n# Tile size per size class. A tile has to be large enough that one program's\n# prologue/epilogue is amortised over real data movement, but a tiny input\n# should not be spread over thousands of masked lanes.\n_BLOCK_SMALL = 8192\n_BLOCK_LARGE = 32768\n# Large 2-byte inputs stream over 16384-element tiles (32KB each), which leaves\n# room in the 192KB UB for the extra buffers a pipelined loop needs.\n_BLOCK_LARGE_NARROW = 16384\n_N_LARGE = 131072\n_MAX_I32 = 0x7FFFFFFF\n\n_nvec = 0\n\n# (dtype, data_ptr & 15) -> (launch, function, packed_metadata)\n_cache_small = {}\n_cache_large = {}\n\n\n@triton.jit(do_not_specialize=[\"n_elements\"])\ndef _rad2deg_contig_kernel(x_ptr, n_elements, BLOCK: tl.constexpr):\n    pid = tl.program_id(0)\n    offs = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n_elements\n    x = tl.load(x_ptr + offs, mask=mask)\n    y = (x.to(tl.float32) * 57.29577951308232).to(x.dtype)\n    tl.store(x_ptr + offs, y, mask=mask)\n\n\n@triton.jit(do_not_specialize=[\"n_elements\"])\ndef _rad2deg_stream_kernel(x_ptr, y_ptr, n_elements, BLOCK: tl.constexpr):\n    \"\"\"Streaming loop over a strip of tiles per program.\n\n    ``y_ptr`` is always the same buffer as ``x_ptr`` (the op is in place). It is\n    passed as a second pointer argument on purpose: when a single pointer is\n    both loaded and stored, the next iteration's load has to be assumed to\n    alias the previous iteration's store, so the compiler keeps the two\n    serialised and the transport engine idles between tiles. Two arguments make\n    the load and the store distinct address streams, which lets consecutive\n    tiles be in flight together -- the property the oracle's 0.935 MTE2-active\n    profile shows it exploits.\n    \"\"\"\n    pid = tl.program_id(0)\n    step = BLOCK * tl.num_programs(0)\n    for start in tl.range(pid * BLOCK, n_elements, step):\n        offs = start + tl.arange(0, BLOCK)\n        mask = offs < n_elements\n        x = tl.load(x_ptr + offs, mask=mask)\n        y = (x.to(tl.float32) * 57.29577951308232).to(x.dtype)\n        tl.store(y_ptr + offs, y, mask=mask)\n\n\n@triton.jit(do_not_specialize=[\"n_elements\"])\ndef _rad2deg_strided_kernel(\n    x_ptr,\n    n_elements,\n    s0, s1, s2, s3, s4, s5, s6, s7,\n    t0, t1, t2, t3, t4, t5, t6, t7,\n    NDIM: tl.constexpr,\n    BLOCK: tl.constexpr,\n):\n    \"\"\"Generic N-d (NDIM <= 8) in-place scaling over a strided view.\n\n    A linear index over the logical element order is decomposed into the\n    multi-index (last axis fastest) and recombined with the storage strides,\n    so the write lands on exactly the same element that was read.\n    \"\"\"\n    pid = tl.program_id(0)\n    idx = pid * BLOCK + tl.arange(0, BLOCK)\n    mask = idx < n_elements\n    rem = idx\n    off = tl.zeros_like(idx)\n\n    if NDIM >= 1:\n        off += (rem % s7) * t7\n        rem = rem // s7\n    if NDIM >= 2:\n        off += (rem % s6) * t6\n        rem = rem // s6\n    if NDIM >= 3:\n        off += (rem % s5) * t5\n        rem = rem // s5\n    if NDIM >= 4:\n        off += (rem % s4) * t4\n        rem = rem // s4\n    if NDIM >= 5:\n        off += (rem % s3) * t3\n        rem = rem // s3\n    if NDIM >= 6:\n        off += (rem % s2) * t2\n        rem = rem // s2\n    if NDIM >= 7:\n        off += (rem % s1) * t1\n        rem = rem // s1\n    if NDIM >= 8:\n        off += (rem % s0) * t0\n\n    x = tl.load(x_ptr + off, mask=mask)\n    y = (x.to(tl.float32) * 57.29577951308232).to(x.dtype)\n    tl.store(x_ptr + off, y, mask=mask)\n\n\ndef _install(a, n, ptr, cache, block):\n    \"\"\"Compile+bind the contiguous kernel for this dtype/alignment/tile.\"\"\"\n    global _device\n    _device = torch.npu.current_device()\n    grid = -(-n // block)\n    # Ordinary launch first: compiles the specialization for this dtype and\n    # proves the kernel runs; the compiled artifact is then reused.\n    _rad2deg_contig_kernel[(grid,)](a, n, BLOCK=block)\n    compiled = _rad2deg_contig_kernel.warmup(a, n, BLOCK=block, grid=(grid, 1, 1))\n    cache[(a.dtype, ptr & 15)] = (compiled.run.launch,\n                                  compiled.function,\n                                  compiled.packed_metadata)\n\n\ndef _launch_strided(a, n, block=_BLOCK_SMALL):\n    shape = list(a.shape)\n    strides = list(a.stride())\n\n    # Collapse adjacent axes whose strides compose exactly, so the ranks the\n    # kernel has to unroll stay small. This is a pure index-space rewrite.\n    i = len(shape) - 1\n    while i > 0:\n        if strides[i - 1] == strides[i] * shape[i] and shape[i] != 0:\n            shape[i - 1] *= shape[i]\n            strides[i - 1] = strides[i]\n            del shape[i]\n            del strides[i]\n        i -= 1\n\n    # Rank above the kernel's unroll width: peel the leading axes with zero-copy\n    # views (never exercised by the contracted workloads, kept for generality).\n    while len(shape) > 8:\n        for k in range(shape[0]):\n            _launch_strided(a[k], n // shape[0], block)\n        return\n\n    rank = len(shape)\n    pad_s = [1] * 8\n    pad_t = [0] * 8\n    for d in range(rank):\n        pad_s[8 - rank + d] = shape[d]\n        pad_t[8 - rank + d] = strides[d]\n\n    grid = ((n + block - 1) // block,)\n    _rad2deg_strided_kernel[grid](\n        a, n,\n        pad_s[0], pad_s[1], pad_s[2], pad_s[3],\n        pad_s[4], pad_s[5], pad_s[6], pad_s[7],\n        pad_t[0], pad_t[1], pad_t[2], pad_t[3],\n        pad_t[4], pad_t[5], pad_t[6], pad_t[7],\n        NDIM=rank,\n        BLOCK=block,\n    )\n\n\ndef _run_large(A, n):\n    \"\"\"Device-bound sizes: one tile per program for 4-byte data, and a pipelined\n    streaming loop for 2-byte data, where the tiles are small enough to keep\n    several of them in UB at once.\"\"\"\n    global _nvec\n    ptr = A.data_ptr()\n    entry = _cache_large.get((A.dtype, ptr & 15))\n    if entry is not None:\n        block = entry[3]\n        if entry[4]:\n            tiles = -(-n // block)\n            grid = tiles if tiles < _nvec else _nvec\n            entry[0](grid, 1, 1, _get_stream(_device), entry[1], entry[2],\n                     None, None, None, ptr, ptr, n, block)\n        else:\n            entry[0](-(-n // block), 1, 1, _get_stream(_device), entry[1],\n                     entry[2], None, None, None, ptr, n, block)\n        return A\n\n    if n > _MAX_I32:  # pragma: no cover - out of scope for this operator\n        _rad2deg_contig_kernel[(-(-n // _BLOCK_LARGE),)](A, n, BLOCK=_BLOCK_LARGE)\n        return A\n\n    if not _nvec:\n        try:\n            props = triton.runtime.driver.active.utils.get_device_properties(_device)\n            _nvec = int(props.get(\"num_vectorcore\") or props.get(\"num_aicore\") or 1)\n        except Exception:  # pragma: no cover\n            _nvec = 1\n    stream = A.element_size() == 2\n    block = _BLOCK_LARGE_NARROW if stream else _BLOCK_LARGE\n    tiles = -(-n // block)\n    grid = (tiles if tiles < _nvec else _nvec) if stream else tiles\n\n    try:\n        if stream:\n            _rad2deg_stream_kernel[(grid,)](A, A, n, BLOCK=block)\n            compiled = _rad2deg_stream_kernel.warmup(A, A, n, BLOCK=block,\n                                                     grid=(grid, 1, 1))\n        else:\n            _rad2deg_contig_kernel[(grid,)](A, n, BLOCK=block)\n            compiled = _rad2deg_contig_kernel.warmup(A, n, BLOCK=block,\n                                                     grid=(grid, 1, 1))\n        _cache_large[(A.dtype, ptr & 15)] = (compiled.run.launch, compiled.function,\n                                             compiled.packed_metadata, block, stream)\n    except Exception:  # pragma: no cover - keep working without the fast path\n        _rad2deg_contig_kernel[(tiles,)](A, n, BLOCK=block)\n    return A\n\n\ndef run(A):\n    n = A.numel()\n    if not A.is_contiguous():\n        if n:\n            _launch_strided(A, n)\n        return A\n    if not n:\n        return A\n    if n > _N_LARGE:\n        return _run_large(A, n)\n\n    ptr = A.data_ptr()\n    entry = _cache_small.get((A.dtype, ptr & 15))\n    if entry is not None:\n        entry[0](-(-n // _BLOCK_SMALL), 1, 1, _get_stream(_device),\n                 entry[1], entry[2], None, None, None, ptr, n, _BLOCK_SMALL)\n        return A\n\n    try:\n        _install(A, n, ptr, _cache_small, _BLOCK_SMALL)\n    except Exception:  # pragma: no cover - keep working without the fast path\n        _rad2deg_contig_kernel[(-(-n // _BLOCK_SMALL),)](A, n, BLOCK=_BLOCK_SMALL)\n    return A\n"
+        }
+      ]
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "reference_source": "primary",
+    "status": "PASSED",
+    "device": "npu:0",
+    "server_backend": "npu",
+    "is_hack": false,
+    "hack_reason": "",
+    "geo_mean": 0.8381853767037236,
+    "min_speedup": 0.7735267231934697,
+    "worst_workload_uuid": "rad2deg_-timing-10",
+    "latency_ms": 0.017179855589218872,
+    "abs_err": 0.125,
+    "rel_err": 0.0009737098589539528,
+    "num_workloads": 36,
+    "num_passed": 36,
+    "timing_skipped": false,
+    "log": "",
+    "per_workload": [
+      {
+        "uuid": "rad2deg_-correctness-0",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-1",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-2",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-3",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-4",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.125,
+        "rel_err": 0.0009727626456879079,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-5",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.125,
+        "rel_err": 0.0009737098589539528,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-6",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.125,
+        "rel_err": 0.0009727626456879079,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-7",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0625,
+        "rel_err": 0.0008779631461948156,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-8",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-9",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-10",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-11",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-12",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-13",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-14",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-15",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-16",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-17",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-18",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-19",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-20",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-21",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-22",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-correctness-23",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-timing-0",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.8221992000344818,
+        "latency_ms": 0.01615312500922519,
+        "reference_latency_ms": 0.013281086460641934,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-timing-1",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.8172981382366351,
+        "latency_ms": 0.016839257013273254,
+        "reference_latency_ms": 0.013762693406236431,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-timing-2",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.784425051523848,
+        "latency_ms": 0.017259235062086268,
+        "reference_latency_ms": 0.013538576352839225,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-timing-3",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.9617003507325249,
+        "latency_ms": 0.01762549758529301,
+        "reference_latency_ms": 0.016950447209611558,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-timing-4",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.792294634666713,
+        "latency_ms": 0.017183087645661326,
+        "reference_latency_ms": 0.01361406814866535,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-timing-5",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.7913772416802685,
+        "latency_ms": 0.01715872869308385,
+        "reference_latency_ms": 0.013579027383872774,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-timing-6",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.7793317654847396,
+        "latency_ms": 0.017541349460228086,
+        "reference_latency_ms": 0.013670530843824339,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-timing-7",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 1.0685143771824424,
+        "latency_ms": 0.017836519855466654,
+        "reference_latency_ms": 0.019058577904466217,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-timing-8",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.800760260470383,
+        "latency_ms": 0.01700704842652821,
+        "reference_latency_ms": 0.013618568527859145,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-timing-9",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.7907387206532704,
+        "latency_ms": 0.017156048481384762,
+        "reference_latency_ms": 0.01356595182763567,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-timing-10",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.7735267231934697,
+        "latency_ms": 0.017179855589218872,
+        "reference_latency_ms": 0.01328907739886549,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "rad2deg_-timing-11",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.9275734461917144,
+        "latency_ms": 0.0309737447623768,
+        "reference_latency_ms": 0.028730423170700414,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      }
+    ]
+  },
+  "service": {
+    "status": "ok",
+    "api_version": "v6.2",
+    "server_version": "v6.5.0",
+    "backend": "npu",
+    "devices": [
+      "npu:0"
+    ],
+    "workers": 1,
+    "evaluation_adapters": [
+      "native",
+      "flaggems"
+    ],
+    "scheduler": {
+      "device_slots": 1,
+      "healthy": 1,
+      "checking": 0,
+      "broken": 0,
+      "incidents": 15,
+      "recovered": 15,
+      "probe_timeout_seconds": 30.0,
+      "max_active": 1,
+      "active": 0,
+      "waiting": 0,
+      "available": 1,
+      "slots": [
+        {
+          "device": "npu:0",
+          "state": "available",
+          "reason": "",
+          "last_incident": "profile cancelled by client",
+          "incidents": 15,
+          "recovered": 15
+        }
+      ]
+    },
+    "timing": "walltime",
+    "profile": {
+      "supported": true,
+      "profiler": "msprof",
+      "levels": [
+        "metrics",
+        "instruction"
+      ],
+      "capabilities": [
+        "performance_counters",
+        "pipeline_utilization",
+        "kernel_profile",
+        "instruction_listing"
+      ]
+    },
+    "capabilities": {
+      "native_source_policy": {
+        "enabled": true,
+        "workload_conditions": true,
+        "policy_id": "flaggems/d64794e63b502cb836bc015a92a62c42de4be05a",
+        "source": {
+          "repository": "https://github.com/YaooXu/FlagGems.git",
+          "revision": "d64794e63b502cb836bc015a92a62c42de4be05a",
+          "paths": [
+            "src/flag_gems/runtime/backend/backend_utils.py",
+            "src/flag_gems/runtime/backend/_*/__init__.py"
+          ],
+          "license": "Apache-2.0",
+          "description": "VendorDescriptor defaults plus per-vendor overrides; reference/test policy, not measured capabilities"
+        },
+        "vendor": "ascend",
+        "flags": {
+          "support_fp64": false,
+          "support_bf16": true,
+          "support_int64": true
+        }
+      },
+      "operator_contract": {
+        "enabled": true,
+        "test_sources": true
+      },
+      "benchmark_reference": {
+        "enabled": true,
+        "evaluators": [
+          "flaggems"
+        ],
+        "level": "core"
+      },
+      "candidate_admission": {
+        "version": 1,
+        "policy_sha256": "bd6a7bc3f46a71e6d1b90223e911ad2ea463af4b314348de755177f46963d1dc",
+        "stages": [
+          "preflight"
+        ]
+      },
+      "operation_cancel": {
+        "enabled": true,
+        "operations": [
+          "preflight",
+          "evaluate",
+          "profile",
+          "reference"
+        ]
+      },
+      "operator_bundle_upload": {
+        "enabled": true,
+        "archive_format": "kernelgen.operator-bundle/v1",
+        "media_type": "application/vnd.kernelgen.operator-bundle.v1+tar",
+        "max_bytes": 268435456,
+        "max_files": 10000,
+        "evaluation_binding": true,
+        "evaluators": [
+          "native",
+          "flaggems"
+        ]
+      }
+    },
+    "debug": {
+      "enabled": true,
+      "runner": "local-trusted",
+      "security_boundary": false
+    },
+    "request_audit": {
+      "enabled": false
+    },
+    "trusted_clients_only": true,
+    "target": {
+      "backend": "ascend",
+      "vendor": "huawei",
+      "device": "Ascend910B4-1",
+      "architecture": "dav-c220-cube",
+      "devices": [
+        {
+          "logical_device": "npu:0",
+          "device_id": 0,
+          "name": "Ascend910B4-1",
+          "l2_cache_size": 176160768,
+          "num_sm": 20,
+          "compute_capability": "",
+          "total_memory": 65452113920
+        }
+      ]
+    },
+    "software": {
+      "language": "triton",
+      "language_version": "3.5.1",
+      "compiler": "flagtree",
+      "compiler_version": "0.6.0+ascend.gitc286cba6",
+      "runtime": "cann",
+      "runtime_version": "9.0.0",
+      "driver_version": "25.2.0"
+    },
+    "metadata": {
+      "complete": true,
+      "missing": [],
+      "sources": {
+        "target.backend": "server configuration",
+        "target.vendor": "server configuration",
+        "software.language": "server configuration",
+        "software.compiler": "python package metadata",
+        "software.runtime": "server configuration",
+        "target.device": "device probe",
+        "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+        "software.language_version": "triton module metadata",
+        "software.compiler_version": "python package metadata",
+        "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+        "software.driver_version": "/usr/local/Ascend/driver/version.info"
+      }
+    }
+  }
+}

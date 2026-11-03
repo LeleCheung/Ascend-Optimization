@@ -1,0 +1,118 @@
+{
+  "schema_version": "1.0",
+  "round_num": 1,
+  "evaluation_fingerprint": "3ca67c557d0adfb45c176d1e7e30ebae4251b00a5939bfcff203df07eca9461d",
+  "status": "failed",
+  "solution_sha256": "3a7da241fbbbdf27981cdd098c9030ed9cbc4ccc3de19710a05254e47a4482f0",
+  "backend": "npu",
+  "profiler": "msprof",
+  "capabilities": [],
+  "dominant_bound": "unknown",
+  "profiled_workloads": [
+    {
+      "uuid": "expm1_-timing-7",
+      "axes": {},
+      "eval_speedup": 0.27507667603075187,
+      "eval_latency_ms": 0.09101862325824484,
+      "eval_reference_latency_ms": 0.02503710034277327,
+      "selection_reason": "Lowest eval speedup (0.2751x) and simultaneously the highest absolute latency (0.0910 ms) among the timing set; bfloat16 4096x4096, i.e. the single worst regime and the shape that dominates the geo_mean loss. Profiled at both metrics and instruction level.",
+      "profile_ids": [
+        "3ad68d94746f4bc69586603718684773",
+        "60e058b9e74f4151805fa4d108dd7ffd",
+        "15878bbcd44c4e6a975505d458e66da1"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0001/expm1_-timing-7/fd44f1ab738243f98e0d910dc54a4dcf/manifest.json",
+        ".kernelgen/profiles/round-0001/expm1_-timing-7/f808b5facde74e02a1f77eba28036b8e/manifest.json",
+        ".kernelgen/profiles/round-0001/expm1_-timing-7/9b8f36002a6345aa9cfb1a5f5d3e91af/manifest.json"
+      ],
+      "status": "failed"
+    },
+    {
+      "uuid": "expm1_-timing-11",
+      "axes": {},
+      "eval_speedup": 0.2853963892994957,
+      "eval_latency_ms": 0.08856486576382272,
+      "eval_reference_latency_ms": 0.025276092907789528,
+      "selection_reason": "Second-worst speedup (0.2854x) at 0.0886 ms; float32 4096x4096 is a distinct regime from the 16-bit cases (no widening needed for the compare, different UB budget, different tile count), so it must be represented separately rather than inferred from bf16.",
+      "profile_ids": [
+        "69bf10cbea824d5293ca8809375701af"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0001/expm1_-timing-11/56e538a8af764692b20f7f02f28c5d91/manifest.json"
+      ],
+      "status": "failed"
+    },
+    {
+      "uuid": "expm1_-timing-3",
+      "axes": {},
+      "eval_speedup": 0.46050304077367504,
+      "eval_latency_ms": 0.05001982428734081,
+      "eval_reference_latency_ms": 0.023034281183285366,
+      "selection_reason": "Boundary workload of the large-shape regime: float16 4096x4096 at 0.4605x is the best of the three big cases while still far above the small-case floor, so it isolates whether the large-shape loss is dtype-independent or fp16-specific.",
+      "profile_ids": [
+        "5a95289a6ab74979a496899110d6c3ba"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0001/expm1_-timing-3/d3a54430aee9482f9b28c552f110e596/manifest.json"
+      ],
+      "status": "failed"
+    },
+    {
+      "uuid": "expm1_-timing-8",
+      "axes": {},
+      "eval_speedup": 0.8330356287143345,
+      "eval_latency_ms": 0.012397463194867238,
+      "eval_reference_latency_ms": 0.010327528546999051,
+      "selection_reason": "Cheapest possible control (float32, 1024 elements, 0.8330x): it sits on the host-launch floor where device work is negligible, so it separates launch-overhead cost from kernel cost and lets the large-case signal be attributed correctly. Also used to test whether the collection failure was workload-size dependent.",
+      "profile_ids": [
+        "e5f762c28cc0490ba45a928a300f24ce"
+      ],
+      "manifest_paths": [
+        ".kernelgen/profiles/round-0001/expm1_-timing-8/20d8198c65284685babdfd9cd214afeb/manifest.json"
+      ],
+      "status": "failed"
+    }
+  ],
+  "findings": [],
+  "performance_interpretation": "No profiler measurement was obtained this round, so I make no claim about pipeline utilization, DMA granularity, vector-instruction mix, or synchronization for this snapshot. The following is explicit inference from (a) the authoritative eval comparison returned by get_profile_context and (b) the candidate source at .kernelgen/evals/round-0001/main.py (sha256 3a7da241...); it is hypothesis generation, not measured truth.\n\nFACT (eval, this round): the nine <=1M-element timing cases are tightly clustered at 0.812-0.849x with latencies 0.0122-0.0133 ms against 0.0103-0.0109 ms references - a near-constant ~2.0-2.1 us additive penalty, consistent with a launch/dispatch floor rather than device work. The three 4096x4096 cases are categorically different: fp16 0.0500 ms (0.4605x), bf16 0.0910 ms (0.2751x), fp32 0.0886 ms (0.2854x). The 4096x4096 cases move 16x the data of the 1048576-element tier; since the small cases are already at the floor, essentially the entire geo_mean deficit (0.6582 vs the 0.8 target) is produced by these three cases. The bf16 and fp32 large cases take ~1.8x the fp16 large case while moving half the bytes, so whatever dominates scales inversely with element width (per-element instruction cost, not bytes).\n\nINFERENCE: per-element vector-instruction count is the leading suspect. `_expm1_value` evaluates BOTH branches of a `tl.where` for every element (SIMT vectors have no short-circuit): `tl.abs`, a compare, the 2-term series `x * (1.0 + 0.5 * x)`, `tl.exp(x)`, `tl.exp(x) - 1.0`, and the select. In this Triton-Ascend build plain Python float constants are widened to fp32 (the candidate's own comments record `arith.extf f16 -> f32` for the compare against a scalar and for `tl.fma(x, 0.5, 1.0)`), so on the 16-bit paths the series and the `- 1.0` additionally carry extf/truncf traffic around an fp32 ALU sequence, and the select crosses widths. That predicts a vector workload several times the reference's native expm1 and a cost that grows as element width shrinks (more of the tile is spent on conversion bookkeeping per useful lane), which matches the bf16 > fp32 > fp16 ordering of the eval data. The tile geometry is already a per-dtype best-effort (fp16 8192x2, bf16 8192x1, fp32 4096x2), so remaining headroom is unlikely to be in tile size.\n\nWhat this inference does NOT establish: whether `tl.exp` itself, the compare/select, or the type conversions dominate; whether the masked `tl.load(..., mask=, other=0.0)` lowers to one contiguous DMA per tile or is split; and whether the large-case time is serialized fetch->compute->writeback rather than overlapped. Those three questions are exactly what the failed msprof collection would have answered, and they remain OPEN.",
+  "next_experiment": {
+    "action_category": "instruction_efficiency",
+    "action_description": "Make `_expm1_value` branch-free: for all three dtypes return `tl.exp(x) - 1.0` computed in the input element type, and delete the `tl.where(tl.abs(x) < TINY, x * (1.0 + 0.5 * x), ...)` series selection together with its TINY tensor and the abs/compare. Change only that helper; keep the per-dtype tiles, the persistent-loop launch path, the masks and the wrapper untouched, so the measurement isolates the value function. The tolerance contract makes this numerically defensible without chasing the reference: the small-|x| error of `exp(x) - 1` is bounded by half an ulp of exp(x) ~ 1 (about 4.9e-4 for fp16/bf16, about 6e-8 for fp32), while the contract's constant term is atol=1.5e-2 for fp16/bf16 and 1e-4 for fp32. Before committing, verify this bound numerically against torch.expm1 on a dense sweep of |x| below the current thresholds at each dtype and confirm it stays inside atol + rtol*|reference|.",
+    "expected_impact": "Removes roughly half the per-element vector operations (abs, compare, 3-op series, and the extf/truncf chain around them, plus one wide select) and leaves a single transcendental against a constant. Because the small cases are already pinned at the launch floor and only the three 4096x4096 cases carry the deficit, this can move geo_mean only through them: if the compare/series/conversion terms are a large share of vector time, expect the three big cases to move materially (fp16 0.46x / bf16 0.275x / fp32 0.285x trending toward 0.55-0.70x) and geo_mean toward or past 0.70. If vector time barely moves, `tl.exp` dominates, which is itself the decisive answer and redirects effort to overlap/pipelining.",
+    "risks_and_rollback": "Accuracy risk concentrated at small |x|: relative error grows without bound as |x| shrinks, and only the absolute tolerance term absorbs it, so the full 18-case correctness suite must pass with matched_ratio 1.0 and a dense small-|x| sweep must be checked before adoption. Second risk is the sign of zero: expm1(-0.0) is -0.0 while exp(-0.0)-1.0 is +0.0; a compare-free version loses that sign, so if a correctness case or review flags negative zero, reinstate exactly one compare against zero plus a select (x==0 -> x) and re-measure - that still keeps the series and abs deleted. Third, the fp16/bf16 overflow boundary shifts by one ulp (exp(x) can overflow where expm1 does not); this band is already present in the current code for all |x| >= TINY, so it is not a new exposure, but confirm the special-value cases still pass. Rollback is a single-file revert to main.py sha256 3a7da241fbbbdf27981cdd098c9030ed9cbc4ccc3de19710a05254e47a4482f0; do not retune tiles in the same round, so the result stays attributable.",
+    "validation_workloads": [
+      "expm1_-correctness-0",
+      "expm1_-correctness-2",
+      "expm1_-correctness-4",
+      "expm1_-correctness-8",
+      "expm1_-correctness-14",
+      "expm1_-correctness-16",
+      "expm1_-timing-3",
+      "expm1_-timing-7",
+      "expm1_-timing-11",
+      "expm1_-timing-8"
+    ],
+    "success_criteria": [
+      "All 18 correctness workloads PASSED with required_matched_ratio 1.0, including the special-value and strided cases.",
+      "Headline geo_mean strictly greater than this round's 0.6582435994321065.",
+      "Each of expm1_-timing-3, expm1_-timing-7 and expm1_-timing-11 improves on its current latency (0.0500 / 0.0910 / 0.0886 ms); a change that only shifts the small cases is a failure.",
+      "The nine <=1M-element cases stay at or above 0.81x, proving no launch-path regression.",
+      "If msprof collection is restored, report aiv_vec_time for the three large cases to confirm whether the vector pipe actually shrank; record the outcome either way so the next round can distinguish a where-dominated from an exp-dominated kernel."
+    ]
+  },
+  "warnings": [
+    "Profiler collection failed deterministically: 5 attempts across 4 workloads (timing-7, timing-11, timing-3, timing-8) and both advertised levels (metrics, instruction) all returned error 'msprof base collection exited successfully without profile completion marker'. The failure is not workload-size dependent (the 1024-element case failed identically) and not level dependent.",
+    "The service advertises performance_counters, pipeline_utilization, kernel_profile and instruction_listing, and declares profile.supported=true, but none were delivered: every per-profile capabilities list is empty and every artifacts list is empty.",
+    "No artifacts were downloadable. The only files persisted are manifests recording the failed request/result (e.g. .kernelgen/profiles/round-0001/expm1_-timing-7/fd44f1ab738243f98e0d910dc54a4dcf/manifest.json), which contain the bound source snapshot and hardware/software identity but zero metrics. A glob for PROF_* and *.csv under the workspace found nothing, so no raw msprof output exists to analyze offline.",
+    "Because no evidence was collected, the findings list is intentionally empty and the recommended experiment is derived from the authoritative eval comparison plus source inspection, not from profiler data. Treat its expected_impact as a hypothesis to falsify.",
+    "Prior-round paired hardware evidence quoted in the task brief (MTE2 instruction counts, bytes per MTE2 instruction, scalar wait time, vec time ratios) belongs to an earlier cross-candidate snapshot, not to this round's solution sha256 3a7da241..., and is deliberately not recorded as a finding here."
+  ],
+  "open_questions": [
+    "Does the masked `tl.load(a_ptr + off, mask=off < n, other=0.0)` in `_expm1_streaming1` / `_expm1_streaming2` compile to one contiguous DMA descriptor per tile, or is it split into several smaller transfers? Resolvable only from MTE2 instruction counts and bytes-per-instruction in a successful metrics/instruction collection.",
+    "Within the vector pipe, what is the actual split between the `tl.exp` path, the `tl.abs`/compare/`tl.where` selection, and the fp16/bf16 <-> fp32 conversion chain? Requires an instruction listing or op-level counters for this snapshot.",
+    "Is the large-case time serialized fetch -> compute -> writeback with scalar-unit stalls waiting on DMA completion, and would enabling software pipelining / multi-buffer (num_stages > 1) or ubuf saving overlap the stages? Requires aiv_scalar_wait_time, aiv_mte2_time, aiv_mte3_time and aiv_vec_time from a successful collection.",
+    "Why does the msprof base collection exit 0 without a completion marker on this workspace? Until the collector is repaired, every optimization decision for this operator has to be made blind or from cross-candidate evidence."
+  ],
+  "error": "msprof base collection exited successfully without profile completion marker (all 5 attempts; per-profile capabilities and artifacts empty)"
+}

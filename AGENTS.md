@@ -16,6 +16,8 @@
 
 当前继续执行同一个active goal，新批次是`operators/campaigns/strict-next-20261103/`，冻结提交`9798acae1`的25/30及`expm1_`最佳0.646557×。三类型新最佳成对采集和两份FMA提案均已终态；同类型FMA为0.618492×，全部数值检查通过但不替换最佳。`optimizer-process.json`对应连续两轮KG／CC搜索，`reference-modes-process.json`等待搜索结束后探测独立进程的官方旧图Expm1精度模式。恢复须核对实际PID启动身份、`search-state.json`及KG工作区，不重新运行`prepare.py`、`launch_optimizer.py`或已有阶段入口。tmux为`hanle-strict-next-20261103`，所有设备工作仍持物理卡7项目锁串行；`progress.json`仅描述已完成采集，不代表搜索或总goal结束。搜索候选还需人工审查、整块及完整FP16域检查、实际后端核验，不能仅据搜索分数更新25/30。恢复说明见`tools/profiling/hgkda/strict_next/README.md`。
 
+本批新增`buffer-evaluator`、`bfloat-domain`和`followup-optimizer`身份：独立缓冲稿完成6项编译，设备评测排在原优化器之后；BF16全位模式检查等待前序阶段全部终态，之后后续优化器运行第3／4轮搜索，读取实际域检查、旧候选结果及人工拒绝原因。新搜索源码在既有63项及整块检查外，再检查FP16／BF16全位模式四类路径。第1轮0.658×稿因未对齐地址复用对齐编译实例被人工拒绝，不能据暂存搜索分数视作交付，也不能重用它作为已验证最佳。修改后的后续工具不改变已运行前两轮的内存版本；恢复需同时读取新身份及实际KG工作区。当前检查点已三端同步至`45ec9e0e3`，后续新增记录另行提交。
+
 后续对话和新报告遵循[实验归属与汇报口径](docs/实验归属与汇报口径.md)。
 
 - 文档使用中文。

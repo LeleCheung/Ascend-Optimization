@@ -38,6 +38,7 @@ def main():
     parser.add_argument('--identity-label', default='fma-evaluator')
     parser.add_argument('--proposal-root', choices=['proposals/expm1_', 'compile-probes'], default='proposals/expm1_')
     parser.add_argument('--after-optimizer', action='store_true')
+    parser.add_argument('--all-16bit-domains', action='store_true', help='除FP16外增加BF16四类路径全位模式检查')
     args = parser.parse_args()
     assert all(value and set(value) <= set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-')
                for value in [args.proposal, args.compile_label, args.identity_label])
@@ -144,10 +145,16 @@ def main():
                     domain_tool = HERE.parent / 'strict_five/probe_half_domain.py'
                     domain_frozen = folder / ('domain-checker-' + sha(domain_tool) + '.py')
                     domain_frozen.write_bytes(domain_tool.read_bytes())
-                    domain = folder / 'full-fp16-domain'
-                    runner.cmd('fma-v1-domain', [PY, domain_frozen, '--source', source, '--output', domain], 1200)
-                    result['full_fp16_domain'] = str(domain / 'result.json')
-                    if read(domain / 'result.json')['status'] != 'passed':
+                    passed_domains = True
+                    for dtype in (['float16', 'bfloat16'] if args.all_16bit_domains else ['float16']):
+                        domain = folder / ('full-fp16-domain' if dtype == 'float16' else 'full-bf16-domain')
+                        command = [PY, domain_frozen, '--source', source, '--output', domain]
+                        if args.all_16bit_domains:
+                            command += ['--dtype', dtype]
+                        runner.cmd('domain-' + dtype, command, 1200)
+                        result['full_fp16_domain' if dtype == 'float16' else 'full_bf16_domain'] = str(domain / 'result.json')
+                        passed_domains = passed_domains and read(domain / 'result.json')['status'] == 'passed'
+                    if not passed_domains:
                         result.update(status='domain_failed', qualified_original=False)
                     elif current > .6465574073403593:
                         best = dict(source=str(source), source_sha256=sha(source), search_result=str(formal), search_score=current,

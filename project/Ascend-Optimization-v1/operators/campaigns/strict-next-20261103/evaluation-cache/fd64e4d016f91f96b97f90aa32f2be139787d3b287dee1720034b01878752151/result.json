@@ -1,0 +1,638 @@
+{
+  "identity": {
+    "source": "\"\"\"expm1_ : in-place elementwise ``expm1(A)`` on Ascend, self-contained Triton.\n\nSemantics reproduced from the reference:\n  * ``out = expm1(A)`` is written back into ``A`` storage and ``A`` is returned.\n  * Input dtype (float16 / bfloat16 / float32) is preserved on the output.\n  * Strided (non-contiguous) views are read *and* written through their real\n    element strides so the mutation lands in the right storage slots; the view\n    object itself is returned unchanged.\n\nContiguous path (metadata-only decisions in the wrapper):\n  * The tile body is mask-free.  Only the final program, which owns the ragged\n    remainder, is predicated; every other program is guaranteed by the compiler\n    -visible invariant ``pid < n // BLOCK`` to stay inside the buffer, so its\n    load and store vectors carry no per-element predicate.  This is the general\n    boundary condition, not a size special case: any ``n`` works.\n  * Tile size is workload derived: ``BLOCK_MAX`` once there is at least one full\n    tile per vector core, otherwise ``BLOCK_MIN`` so small tensors still spread\n    over the available cores.  ``BLOCK_MAX`` is capped by the UB budget -\n    8192 elements needs 14 B/element for the fp32 value pipeline, so 16384\n    overflows the 192 KB UB and fails to compile on target.\n  * ``_expm1_value`` is branch-equivalent to the reference: the small-|x| series\n    branch also owns +/-0 (``x * (1 + x/2)`` reproduces the sign of zero), so no\n    separate zero select is needed.\n\nNon-contiguous path: real element strides, still executed by this module's\nTriton kernels (uniform-stride flat kernel, or generic up-to-8D index kernel).\n\nLaunch path: the wrapper resolves the compiled launcher once per (dtype, device,\ntile class) and then calls it directly with the grid, the current raw stream,\nthe device pointer and the two runtime scalars - the same tail ``JITFunction.run``\nends in, minus the per-call binder, cache-key and dispatch work.  The stream is\nre-read on every call; nothing about the input tensor or its contents is cached.\n\"\"\"\n\nimport torch\nimport torch_npu\nimport triton\nimport triton.language as tl\nfrom triton.runtime import driver as _driver\n\n# Largest mask-free tile that fits the UB budget for the fp32 value pipeline.\n_BLOCK_MAX = 8192\n# Small-tensor tile: keeps at least one tile per vector core available.\n_BLOCK_MIN = 1024\n# Fallback tile for unaligned bases and the masked reference path.\n_BLOCK_SAFE = 4096\n# Strided (gather/scatter) tiles materialise one address vector per element, so\n# the UB budget forces a much smaller tile than the contiguous path.\n_BLOCK_STRIDED = 512\n\n_RAW_STREAM = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\nif _RAW_STREAM is not None:\n    def _current_stream(device, _raw=_RAW_STREAM):\n        return _raw(device)\nelse:\n    def _current_stream(device):\n        return torch.npu.current_stream(device).npu_stream\n\n\n@triton.jit\ndef _expm1_value(x):\n    xf = x.to(tl.float32)\n    series = xf * (1.0 + 0.5 * xf)\n    return tl.where(tl.abs(xf) < 0.01, series, tl.exp(xf) - 1.0)\n\n\n@triton.jit\ndef _expm1_tiles(a_ptr, n, BLOCK: tl.constexpr):\n    \"\"\"Full tiles without any predicate; one final program owns the remainder.\"\"\"\n    pid = tl.program_id(0)\n    nfull = n // BLOCK\n    lane = tl.arange(0, BLOCK)\n    if pid < nfull:\n        offs = pid * BLOCK + lane\n        x = tl.load(a_ptr + offs)\n        y = _expm1_value(x)\n        tl.store(a_ptr + offs, y.to(a_ptr.dtype.element_ty))\n    else:\n        offs = nfull * BLOCK + lane\n        mask = offs < n\n        x = tl.load(a_ptr + offs, mask=mask, other=0.0)\n        y = _expm1_value(x)\n        tl.store(a_ptr + offs, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _expm1_flat(a_ptr, n, BLOCK: tl.constexpr):\n    \"\"\"Masked reference path (unaligned bases, compile fallback).\"\"\"\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    x = tl.load(a_ptr + offs, mask=mask, other=0.0)\n    y = _expm1_value(x)\n    tl.store(a_ptr + offs, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _expm1_scaled(a_ptr, n, SCALE: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    idx = offs * SCALE\n    x = tl.load(a_ptr + idx, mask=mask, other=0.0)\n    y = _expm1_value(x)\n    tl.store(a_ptr + idx, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _expm1_nd(a_ptr, n,\n              s0, s1, s2, s3, s4, s5, s6, s7,\n              t0, t1, t2, t3, t4, t5, t6, t7,\n              NDIM: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    shapes = (s0, s1, s2, s3, s4, s5, s6, s7)\n    strides = (t0, t1, t2, t3, t4, t5, t6, t7)\n    rem = offs\n    off = tl.zeros((BLOCK,), dtype=tl.int32)\n    for i in tl.static_range(8):\n        if i < NDIM:\n            stride = strides[NDIM - 1 - i]\n            size = shapes[NDIM - 1 - i]\n            off += (rem % size) * stride\n            rem = rem // size\n    x = tl.load(a_ptr + off, mask=mask, other=0.0)\n    y = _expm1_value(x)\n    tl.store(a_ptr + off, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n_ENTRIES = {}\n_VECTOR_CORES = {}\n_CUTS = {}\n\n\ndef _vector_cores(device_index):\n    \"\"\"Physical vector-core count of the running device (0 if unavailable).\"\"\"\n    cores = _VECTOR_CORES.get(device_index)\n    if cores is None:\n        cores = 0\n        try:\n            props = _driver.active.utils.get_device_properties(device_index)\n            cores = int(dict(props).get('num_vectorcore', 0) or 0)\n        except Exception:\n            cores = 0\n        _VECTOR_CORES[device_index] = cores\n    return cores\n\n\ndef _big_cut(device_index):\n    \"\"\"Workload size above which one full tile per core is guaranteed (0: n/a).\"\"\"\n    cut = _CUTS.get(device_index)\n    if cut is None:\n        cores = _vector_cores(device_index)\n        cut = _BLOCK_MAX * cores if cores else 0\n        _CUTS[device_index] = cut\n    return cut\n\n\ndef _masked_fallback(A, n):\n    _expm1_flat[((n + _BLOCK_SAFE - 1) // _BLOCK_SAFE,)](A, n, BLOCK=_BLOCK_SAFE)\n\n\ndef _build_entry(A, device_index, big):\n    block = _BLOCK_MAX if big else _BLOCK_MIN\n    entry = None\n    try:\n        ck = _expm1_tiles.warmup(A, 1, BLOCK=block, grid=(1,))\n        launcher = ck.run\n        debug = (getattr(launcher, 'compile_only', False) or\n                 getattr(launcher, 'enable_msprof_register_tensor', False) or\n                 getattr(launcher.metadata, 'debug_enabled', False) or\n                 getattr(launcher.metadata, 'debug', False))\n        entry = (launcher if debug else launcher.launch,\n                 ck.function, ck.packed_metadata, block)\n    except Exception:\n        entry = None\n    _ENTRIES[(A.dtype, device_index, big)] = entry\n    return entry\n\n\ndef _launch_general(A, n):\n    \"\"\"Non-contiguous fallback: real element strides, in place.\"\"\"\n    shape = A.shape\n    stride = A.stride()\n    dims = []  # (size, stride) inner -> outer\n    for d in range(len(shape) - 1, -1, -1):\n        s = shape[d]\n        if s == 1:\n            continue\n        st = stride[d]\n        if dims and st == dims[-1][0] * dims[-1][1]:\n            dims[-1] = (dims[-1][0] * s, dims[-1][1])\n        else:\n            dims.append((s, st))\n    dims.reverse()\n    if len(dims) == 1:\n        _expm1_scaled[((n + _BLOCK_STRIDED - 1) // _BLOCK_STRIDED,)](\n            A, n, SCALE=dims[0][1], BLOCK=_BLOCK_STRIDED)\n        return\n    if len(dims) > 8:\n        raise RuntimeError(\"expm1_: unsupported tensor rank for strided path\")\n    sizes = [d[0] for d in dims] + [1] * (8 - len(dims))\n    sts = [d[1] for d in dims] + [0] * (8 - len(dims))\n    _expm1_nd[((n + _BLOCK_STRIDED - 1) // _BLOCK_STRIDED,)](\n        A, n, *sizes, *sts, NDIM=len(dims), BLOCK=_BLOCK_STRIDED)\n\n\ndef run(A):\n    if A.is_contiguous():\n        n = A.numel()\n        if n == 0:\n            return A\n        ptr = A.data_ptr()\n        dev = A.device.index\n        if ptr & 15:\n            _masked_fallback(A, n)\n            return A\n        cut = _big_cut(dev)\n        big = (n >= cut) if cut else True\n        ent = _ENTRIES.get((A.dtype, dev, big))\n        if ent is None:\n            ent = _build_entry(A, dev, big)\n            if ent is None:\n                _masked_fallback(A, n)\n                return A\n        b = ent[3]\n        q = n // b\n        ent[0](q + 1 if q * b != n else q, 1, 1, _current_stream(dev),\n               ent[1], ent[2], None, None, None, ptr, n, b)\n        return A\n    n = A.numel()\n    if n:\n        _launch_general(A, n)\n    return A\n",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:982bc685d203184ab3110741af78400514996b0126a3acfb00fb7733a355ca66",
+      "definition": "expm1_"
+    },
+    "settings": {
+      "warmup_ms": 1000,
+      "benchmark_ms": 100,
+      "num_trials": 3,
+      "tolerance_mode": "strict",
+      "rtol": 0.01,
+      "atol": 0.01,
+      "timeout_seconds": 1500
+    },
+    "target": "Ascend910B",
+    "solution": {
+      "definition": "expm1_",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "\"\"\"expm1_ : in-place elementwise ``expm1(A)`` on Ascend, self-contained Triton.\n\nSemantics reproduced from the reference:\n  * ``out = expm1(A)`` is written back into ``A`` storage and ``A`` is returned.\n  * Input dtype (float16 / bfloat16 / float32) is preserved on the output.\n  * Strided (non-contiguous) views are read *and* written through their real\n    element strides so the mutation lands in the right storage slots; the view\n    object itself is returned unchanged.\n\nContiguous path (metadata-only decisions in the wrapper):\n  * The tile body is mask-free.  Only the final program, which owns the ragged\n    remainder, is predicated; every other program is guaranteed by the compiler\n    -visible invariant ``pid < n // BLOCK`` to stay inside the buffer, so its\n    load and store vectors carry no per-element predicate.  This is the general\n    boundary condition, not a size special case: any ``n`` works.\n  * Tile size is workload derived: ``BLOCK_MAX`` once there is at least one full\n    tile per vector core, otherwise ``BLOCK_MIN`` so small tensors still spread\n    over the available cores.  ``BLOCK_MAX`` is capped by the UB budget -\n    8192 elements needs 14 B/element for the fp32 value pipeline, so 16384\n    overflows the 192 KB UB and fails to compile on target.\n  * ``_expm1_value`` is branch-equivalent to the reference: the small-|x| series\n    branch also owns +/-0 (``x * (1 + x/2)`` reproduces the sign of zero), so no\n    separate zero select is needed.\n\nNon-contiguous path: real element strides, still executed by this module's\nTriton kernels (uniform-stride flat kernel, or generic up-to-8D index kernel).\n\nLaunch path: the wrapper resolves the compiled launcher once per (dtype, device,\ntile class) and then calls it directly with the grid, the current raw stream,\nthe device pointer and the two runtime scalars - the same tail ``JITFunction.run``\nends in, minus the per-call binder, cache-key and dispatch work.  The stream is\nre-read on every call; nothing about the input tensor or its contents is cached.\n\"\"\"\n\nimport torch\nimport torch_npu\nimport triton\nimport triton.language as tl\nfrom triton.runtime import driver as _driver\n\n# Largest mask-free tile that fits the UB budget for the fp32 value pipeline.\n_BLOCK_MAX = 8192\n# Small-tensor tile: keeps at least one tile per vector core available.\n_BLOCK_MIN = 1024\n# Fallback tile for unaligned bases and the masked reference path.\n_BLOCK_SAFE = 4096\n# Strided (gather/scatter) tiles materialise one address vector per element, so\n# the UB budget forces a much smaller tile than the contiguous path.\n_BLOCK_STRIDED = 512\n\n_RAW_STREAM = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\nif _RAW_STREAM is not None:\n    def _current_stream(device, _raw=_RAW_STREAM):\n        return _raw(device)\nelse:\n    def _current_stream(device):\n        return torch.npu.current_stream(device).npu_stream\n\n\n@triton.jit\ndef _expm1_value(x):\n    xf = x.to(tl.float32)\n    series = xf * (1.0 + 0.5 * xf)\n    return tl.where(tl.abs(xf) < 0.01, series, tl.exp(xf) - 1.0)\n\n\n@triton.jit\ndef _expm1_tiles(a_ptr, n, BLOCK: tl.constexpr):\n    \"\"\"Full tiles without any predicate; one final program owns the remainder.\"\"\"\n    pid = tl.program_id(0)\n    nfull = n // BLOCK\n    lane = tl.arange(0, BLOCK)\n    if pid < nfull:\n        offs = pid * BLOCK + lane\n        x = tl.load(a_ptr + offs)\n        y = _expm1_value(x)\n        tl.store(a_ptr + offs, y.to(a_ptr.dtype.element_ty))\n    else:\n        offs = nfull * BLOCK + lane\n        mask = offs < n\n        x = tl.load(a_ptr + offs, mask=mask, other=0.0)\n        y = _expm1_value(x)\n        tl.store(a_ptr + offs, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _expm1_flat(a_ptr, n, BLOCK: tl.constexpr):\n    \"\"\"Masked reference path (unaligned bases, compile fallback).\"\"\"\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    x = tl.load(a_ptr + offs, mask=mask, other=0.0)\n    y = _expm1_value(x)\n    tl.store(a_ptr + offs, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _expm1_scaled(a_ptr, n, SCALE: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    idx = offs * SCALE\n    x = tl.load(a_ptr + idx, mask=mask, other=0.0)\n    y = _expm1_value(x)\n    tl.store(a_ptr + idx, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _expm1_nd(a_ptr, n,\n              s0, s1, s2, s3, s4, s5, s6, s7,\n              t0, t1, t2, t3, t4, t5, t6, t7,\n              NDIM: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    shapes = (s0, s1, s2, s3, s4, s5, s6, s7)\n    strides = (t0, t1, t2, t3, t4, t5, t6, t7)\n    rem = offs\n    off = tl.zeros((BLOCK,), dtype=tl.int32)\n    for i in tl.static_range(8):\n        if i < NDIM:\n            stride = strides[NDIM - 1 - i]\n            size = shapes[NDIM - 1 - i]\n            off += (rem % size) * stride\n            rem = rem // size\n    x = tl.load(a_ptr + off, mask=mask, other=0.0)\n    y = _expm1_value(x)\n    tl.store(a_ptr + off, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n_ENTRIES = {}\n_VECTOR_CORES = {}\n_CUTS = {}\n\n\ndef _vector_cores(device_index):\n    \"\"\"Physical vector-core count of the running device (0 if unavailable).\"\"\"\n    cores = _VECTOR_CORES.get(device_index)\n    if cores is None:\n        cores = 0\n        try:\n            props = _driver.active.utils.get_device_properties(device_index)\n            cores = int(dict(props).get('num_vectorcore', 0) or 0)\n        except Exception:\n            cores = 0\n        _VECTOR_CORES[device_index] = cores\n    return cores\n\n\ndef _big_cut(device_index):\n    \"\"\"Workload size above which one full tile per core is guaranteed (0: n/a).\"\"\"\n    cut = _CUTS.get(device_index)\n    if cut is None:\n        cores = _vector_cores(device_index)\n        cut = _BLOCK_MAX * cores if cores else 0\n        _CUTS[device_index] = cut\n    return cut\n\n\ndef _masked_fallback(A, n):\n    _expm1_flat[((n + _BLOCK_SAFE - 1) // _BLOCK_SAFE,)](A, n, BLOCK=_BLOCK_SAFE)\n\n\ndef _build_entry(A, device_index, big):\n    block = _BLOCK_MAX if big else _BLOCK_MIN\n    entry = None\n    try:\n        ck = _expm1_tiles.warmup(A, 1, BLOCK=block, grid=(1,))\n        launcher = ck.run\n        debug = (getattr(launcher, 'compile_only', False) or\n                 getattr(launcher, 'enable_msprof_register_tensor', False) or\n                 getattr(launcher.metadata, 'debug_enabled', False) or\n                 getattr(launcher.metadata, 'debug', False))\n        entry = (launcher if debug else launcher.launch,\n                 ck.function, ck.packed_metadata, block)\n    except Exception:\n        entry = None\n    _ENTRIES[(A.dtype, device_index, big)] = entry\n    return entry\n\n\ndef _launch_general(A, n):\n    \"\"\"Non-contiguous fallback: real element strides, in place.\"\"\"\n    shape = A.shape\n    stride = A.stride()\n    dims = []  # (size, stride) inner -> outer\n    for d in range(len(shape) - 1, -1, -1):\n        s = shape[d]\n        if s == 1:\n            continue\n        st = stride[d]\n        if dims and st == dims[-1][0] * dims[-1][1]:\n            dims[-1] = (dims[-1][0] * s, dims[-1][1])\n        else:\n            dims.append((s, st))\n    dims.reverse()\n    if len(dims) == 1:\n        _expm1_scaled[((n + _BLOCK_STRIDED - 1) // _BLOCK_STRIDED,)](\n            A, n, SCALE=dims[0][1], BLOCK=_BLOCK_STRIDED)\n        return\n    if len(dims) > 8:\n        raise RuntimeError(\"expm1_: unsupported tensor rank for strided path\")\n    sizes = [d[0] for d in dims] + [1] * (8 - len(dims))\n    sts = [d[1] for d in dims] + [0] * (8 - len(dims))\n    _expm1_nd[((n + _BLOCK_STRIDED - 1) // _BLOCK_STRIDED,)](\n        A, n, *sizes, *sts, NDIM=len(dims), BLOCK=_BLOCK_STRIDED)\n\n\ndef run(A):\n    if A.is_contiguous():\n        n = A.numel()\n        if n == 0:\n            return A\n        ptr = A.data_ptr()\n        dev = A.device.index\n        if ptr & 15:\n            _masked_fallback(A, n)\n            return A\n        cut = _big_cut(dev)\n        big = (n >= cut) if cut else True\n        ent = _ENTRIES.get((A.dtype, dev, big))\n        if ent is None:\n            ent = _build_entry(A, dev, big)\n            if ent is None:\n                _masked_fallback(A, n)\n                return A\n        b = ent[3]\n        q = n // b\n        ent[0](q + 1 if q * b != n else q, 1, 1, _current_stream(dev),\n               ent[1], ent[2], None, None, None, ptr, n, b)\n        return A\n    n = A.numel()\n    if n:\n        _launch_general(A, n)\n    return A\n"
+        }
+      ]
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "reference_source": "primary",
+    "status": "PARTIAL_PASS",
+    "device": "npu:0",
+    "server_backend": "npu",
+    "is_hack": false,
+    "hack_reason": "",
+    "geo_mean": null,
+    "min_speedup": null,
+    "worst_workload_uuid": "expm1_-correctness-2",
+    "latency_ms": null,
+    "abs_err": 1.1594966053962708e-07,
+    "rel_err": 1.5084132428455632e-05,
+    "num_workloads": 30,
+    "num_passed": 24,
+    "timing_skipped": false,
+    "log": "return value: non-finite tensor mismatch at ()",
+    "per_workload": [
+      {
+        "uuid": "expm1_-correctness-0",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-1",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-2",
+        "axes": {},
+        "phase": "correctness",
+        "status": "INCORRECT_NUMERICAL",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": 0.0,
+        "metrics": {},
+        "log": "return value: non-finite tensor mismatch at ()"
+      },
+      {
+        "uuid": "expm1_-correctness-3",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-4",
+        "axes": {},
+        "phase": "correctness",
+        "status": "INCORRECT_NUMERICAL",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": 0.0,
+        "metrics": {},
+        "log": "return value: non-finite tensor mismatch at ()"
+      },
+      {
+        "uuid": "expm1_-correctness-5",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-6",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-7",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-8",
+        "axes": {},
+        "phase": "correctness",
+        "status": "INCORRECT_NUMERICAL",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": 0.0,
+        "metrics": {},
+        "log": "return value: non-finite tensor mismatch at ()"
+      },
+      {
+        "uuid": "expm1_-correctness-9",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-10",
+        "axes": {},
+        "phase": "correctness",
+        "status": "INCORRECT_NUMERICAL",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": 0.0,
+        "metrics": {},
+        "log": "return value: non-finite tensor mismatch at ()"
+      },
+      {
+        "uuid": "expm1_-correctness-11",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-12",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-13",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-14",
+        "axes": {},
+        "phase": "correctness",
+        "status": "INCORRECT_NUMERICAL",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": 0.0,
+        "metrics": {},
+        "log": "return value: non-finite tensor mismatch at ()"
+      },
+      {
+        "uuid": "expm1_-correctness-15",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 1.1594966053962708e-07,
+        "rel_err": 1.5084132428455632e-05,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-16",
+        "axes": {},
+        "phase": "correctness",
+        "status": "INCORRECT_NUMERICAL",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": 0.0,
+        "metrics": {},
+        "log": "return value: non-finite tensor mismatch at ()"
+      },
+      {
+        "uuid": "expm1_-correctness-17",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 7.916241884231567e-09,
+        "rel_err": 1.8598021824800526e-06,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-0",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.7047302968724417,
+        "latency_ms": 0.017328281470345274,
+        "reference_latency_ms": 0.012211764944885656,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-1",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.6838992764204603,
+        "latency_ms": 0.017319014669053705,
+        "reference_latency_ms": 0.011844461600481167,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-2",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.6735802139473591,
+        "latency_ms": 0.017331043882499817,
+        "reference_latency_ms": 0.011673848246305296,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-3",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.12830430557076364,
+        "latency_ms": 0.17939012955370437,
+        "reference_latency_ms": 0.023016525998637363,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-4",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.6716926663178998,
+        "latency_ms": 0.016818064774016924,
+        "reference_latency_ms": 0.011296570770366575,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-5",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.6799460600055002,
+        "latency_ms": 0.01804319236012006,
+        "reference_latency_ms": 0.012268397555184976,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-6",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.7404657091940229,
+        "latency_ms": 0.017717128026440942,
+        "reference_latency_ms": 0.013118925768979892,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-7",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.14477226031032653,
+        "latency_ms": 0.17308573400418303,
+        "reference_latency_ms": 0.025058012939257523,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-8",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.7041972567345108,
+        "latency_ms": 0.016287218826285827,
+        "reference_latency_ms": 0.011469414817305158,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-9",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.7262208108892166,
+        "latency_ms": 0.016688369196322838,
+        "reference_latency_ms": 0.012119441010172196,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-10",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.7283108187422321,
+        "latency_ms": 0.016999708454108257,
+        "reference_latency_ms": 0.01238107158259083,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-11",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.13959285592075152,
+        "latency_ms": 0.1847798907060846,
+        "reference_latency_ms": 0.02579395266038668,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      }
+    ]
+  },
+  "service": {
+    "status": "ok",
+    "api_version": "v6.2",
+    "server_version": "v6.5.0",
+    "backend": "npu",
+    "devices": [
+      "npu:0"
+    ],
+    "workers": 1,
+    "evaluation_adapters": [
+      "native",
+      "flaggems"
+    ],
+    "scheduler": {
+      "device_slots": 1,
+      "healthy": 1,
+      "checking": 0,
+      "broken": 0,
+      "incidents": 17,
+      "recovered": 17,
+      "probe_timeout_seconds": 30.0,
+      "max_active": 1,
+      "active": 0,
+      "waiting": 0,
+      "available": 1,
+      "slots": [
+        {
+          "device": "npu:0",
+          "state": "available",
+          "reason": "",
+          "last_incident": "profile cancelled by client",
+          "incidents": 17,
+          "recovered": 17
+        }
+      ]
+    },
+    "timing": "walltime",
+    "profile": {
+      "supported": true,
+      "profiler": "msprof",
+      "levels": [
+        "metrics",
+        "instruction"
+      ],
+      "capabilities": [
+        "performance_counters",
+        "pipeline_utilization",
+        "kernel_profile",
+        "instruction_listing"
+      ]
+    },
+    "capabilities": {
+      "native_source_policy": {
+        "enabled": true,
+        "workload_conditions": true,
+        "policy_id": "flaggems/d64794e63b502cb836bc015a92a62c42de4be05a",
+        "source": {
+          "repository": "https://github.com/YaooXu/FlagGems.git",
+          "revision": "d64794e63b502cb836bc015a92a62c42de4be05a",
+          "paths": [
+            "src/flag_gems/runtime/backend/backend_utils.py",
+            "src/flag_gems/runtime/backend/_*/__init__.py"
+          ],
+          "license": "Apache-2.0",
+          "description": "VendorDescriptor defaults plus per-vendor overrides; reference/test policy, not measured capabilities"
+        },
+        "vendor": "ascend",
+        "flags": {
+          "support_fp64": false,
+          "support_bf16": true,
+          "support_int64": true
+        }
+      },
+      "operator_contract": {
+        "enabled": true,
+        "test_sources": true
+      },
+      "benchmark_reference": {
+        "enabled": true,
+        "evaluators": [
+          "flaggems"
+        ],
+        "level": "core"
+      },
+      "candidate_admission": {
+        "version": 1,
+        "policy_sha256": "bd6a7bc3f46a71e6d1b90223e911ad2ea463af4b314348de755177f46963d1dc",
+        "stages": [
+          "preflight"
+        ]
+      },
+      "operation_cancel": {
+        "enabled": true,
+        "operations": [
+          "preflight",
+          "evaluate",
+          "profile",
+          "reference"
+        ]
+      },
+      "operator_bundle_upload": {
+        "enabled": true,
+        "archive_format": "kernelgen.operator-bundle/v1",
+        "media_type": "application/vnd.kernelgen.operator-bundle.v1+tar",
+        "max_bytes": 268435456,
+        "max_files": 10000,
+        "evaluation_binding": true,
+        "evaluators": [
+          "native",
+          "flaggems"
+        ]
+      }
+    },
+    "debug": {
+      "enabled": true,
+      "runner": "local-trusted",
+      "security_boundary": false
+    },
+    "request_audit": {
+      "enabled": false
+    },
+    "trusted_clients_only": true,
+    "target": {
+      "backend": "ascend",
+      "vendor": "huawei",
+      "device": "Ascend910B4-1",
+      "architecture": "dav-c220-cube",
+      "devices": [
+        {
+          "logical_device": "npu:0",
+          "device_id": 0,
+          "name": "Ascend910B4-1",
+          "l2_cache_size": 176160768,
+          "num_sm": 20,
+          "compute_capability": "",
+          "total_memory": 65452113920
+        }
+      ]
+    },
+    "software": {
+      "language": "triton",
+      "language_version": "3.5.1",
+      "compiler": "flagtree",
+      "compiler_version": "0.6.0+ascend.gitc286cba6",
+      "runtime": "cann",
+      "runtime_version": "9.0.0",
+      "driver_version": "25.2.0"
+    },
+    "metadata": {
+      "complete": true,
+      "missing": [],
+      "sources": {
+        "target.backend": "server configuration",
+        "target.vendor": "server configuration",
+        "software.language": "server configuration",
+        "software.compiler": "python package metadata",
+        "software.runtime": "server configuration",
+        "target.device": "device probe",
+        "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+        "software.language_version": "triton module metadata",
+        "software.compiler_version": "python package metadata",
+        "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+        "software.driver_version": "/usr/local/Ascend/driver/version.info"
+      }
+    }
+  }
+}

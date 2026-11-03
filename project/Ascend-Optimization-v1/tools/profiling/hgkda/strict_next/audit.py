@@ -62,11 +62,11 @@ def main():
     assert compiled['source_sha256'] == sha(BATCH / 'compile-probes/single-buffer-layout-v2/main.py')
     assert compiled['device_executed'] is False and compiled['performance_measured'] is False
     value = dict(status='passed', unique_snapshot_files=len(identities),
-                 typed_fma_PyTorch=score, typed_fma_retained=False,
+                 typed_fma_PyTorch=result['PyTorch'], typed_fma_retained=False,
                  buffer_v2='offline_compiled_only', frozen_accepted=25,
                  search_terminal_verified=False, checker_sha256=sha(Path(__file__)),
                  scope='只核验已终态原始附件、正式请求身份与源码、逐case分数、数值门禁及离线编译身份；不以此宣称活动搜索完成或新增达标。')
-    (BATCH / 'snapshot-audit.json').write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n', encoding='utf8')
+    (BATCH / 'snapshot-audit.json').write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n', encoding='utf8', newline='\n')
     print(json.dumps(value, ensure_ascii=False))
 
 

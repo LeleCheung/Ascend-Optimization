@@ -16,9 +16,13 @@
 4. `inventory_modes.py`：单CPU只读冻结本机910B精度入口和编译选项，已完成；不初始化NPU。
 5. `reference_modes_stage.py`：等待优化器及实际进程结束后持同一卡锁，分别在独立进程探测旧图Expm1默认／官方`high_precision`模式。只改变探测进程的选项，不修改共享KGS、设备确定性、候选或原合同。不支持或精度失败保留结果；局部成功仍不能直接赋予参考资格。
 6. `prepare_buffer.py`／`compile_fma.py --configuration`：独立离线编译缓冲与连续分块方案。v1的FP16大块超UB；`--retain-fp16`生成v2，保留FP16，仅为BF16／FP32启用正常单阶段及UB复用选项，FP32改为8192单块。6项编译通过，`buffer-evaluator-process.json`等待搜索结束后在同锁下做一次正式评测和全部补测；排队期间若KG已生成同一AST则先核对原结果，不重复提交。
+7. `bfloat_domain_stage.py`：前序阶段全部终态后，用通用的`strict_five/probe_half_domain.py --dtype bfloat16`核验冻结最佳及已通过原检查的缓冲稿。只补充数值检查，不改正式合同或原成绩；CPU逐操作舍入模型只是提出检查假设。
+8. `optimize.py --identity-label followup-optimizer --attempts 3 4 --after optimizer buffer-evaluator reference-modes bfloat-domain`：等待上述阶段终态后继续两轮搜索。后续版`search.py`把实际失败、人工拒绝和BF16证据交给模型，选中稿增加整块及FP16／BF16全位模式检查；已拒绝稿先从最佳集合移除。原前两轮保留其实际执行的方法版本，不改写历史。
 
 恢复时读取`optimizer-process.json`、`reference-modes-process.json`、`search-state.json`、`heartbeat.json`和实际工作区的`.kernelgen/run-process.json`。对照`/proc/<pid>/stat`中启动时间，不能只看PID是否存在。`search-progress.json`只列搜索与待审状态，最终是否新增达标仍按冻结验收合同。
 
 `launch_optimizer.py`是已执行的一次性部署记录，不能重新执行。所有阶段均有一次性身份；已有请求、输出或未知执行结果时不重发。
 
 Windows或910B可运行`python tools/profiling/hgkda/strict_next/audit.py`，只核验已结束附件和请求／源码身份，不使用NPU、不新增评测。910B使用宿主控制器的Python3.11。核验通过不代表活动搜索结束，旧最佳与达标数继续保留。
+
+第1轮第4稿30/30、0.658244×，人工审查发现其未对齐分支复用了仅按dtype缓存的编译实例，已登记拒绝；正式结果保留。后续必须恢复实际指针对齐与设备身份约束，不能只按较高分数复用此稿。详见本批`analysis/expm1_/round4缓存审查.md`及`review-rejections/expm1_/`。

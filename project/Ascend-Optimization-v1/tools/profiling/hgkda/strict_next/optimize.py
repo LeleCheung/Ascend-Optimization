@@ -1,4 +1,5 @@
 """等待已登记提案终态后，在同一卡锁内连续运行两轮KG/CC搜索。"""
+import argparse
 import fcntl
 import importlib.util
 import json
@@ -24,15 +25,25 @@ def save(path, value):
 
 
 def main():
-    process = BATCH / 'optimizer-process.json'
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--identity-label', default='optimizer')
+    parser.add_argument('--attempts', nargs='+', type=int, default=[1, 2])
+    parser.add_argument('--after', nargs='*', default=[])
+    args = parser.parse_args()
+    assert all(v and set(v) <= set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-')
+               for v in [args.identity_label] + args.after)
+    assert args.attempts and len(set(args.attempts)) == len(args.attempts) and all(1 <= n <= 9 for n in args.attempts)
+    process = BATCH / (args.identity_label + '-process.json')
     assert not process.exists(), '已有优化器身份，不重复启动'
     identity = dict(pid=os.getpid(), process_start=Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19],
                     status='waiting_for_proposal_and_profiles')
     save(process, identity)
     try:
-        for name in ['collector', 'typed-fma-evaluator']:
+        for name in ['collector', 'typed-fma-evaluator'] + args.after:
             path = BATCH / (name + '-process.json')
-            while not path.exists() or read(path)['status'] in ['waiting_for_compile_and_profiles', 'waiting_for_project_lock', 'running']:
+            while not path.exists() or read(path)['status'] in [
+                    'waiting_for_compile_and_profiles', 'waiting_for_project_lock', 'waiting_for_optimizer',
+                    'waiting_for_existing_stages', 'waiting_for_proposal_and_profiles', 'running']:
                 time.sleep(10)
             value = read(path)
             if value['status'] != 'completed':
@@ -50,7 +61,7 @@ def main():
             spec.loader.exec_module(search)
             identity.update(status='running', current_job=None)
             save(process, identity)
-            for attempt in [1, 2]:
+            for attempt in args.attempts:
                 identity['current_job'] = 'expm1_:search-' + str(attempt)
                 save(process, identity)
                 search.run(attempt)
