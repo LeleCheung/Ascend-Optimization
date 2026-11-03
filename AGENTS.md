@@ -14,6 +14,8 @@
 
 2026-11-03剩余五项批次现已结束，当前结论读取`operators/campaigns/strict-five-20261103/delivery.json`和`交付报告.md`：严格验收仍25/30，`expm1_`原PyTorch口径由0.561×改善至0.647×并完成全部门禁；其余数值与原生参考缺口单列。7个阶段及2个KG工作区均终态，不再执行上述旧启动入口。离线复现使用`tools/profiling/hgkda/strict_five/finish.py`，同步状态读取本批`三端同步核验.json`与实际Git提交，不能将实验终态直接表述为30/30。
 
+当前继续执行同一个active goal，新批次是`operators/campaigns/strict-next-20261103/`，冻结提交`9798acae1`的25/30及`expm1_`最佳0.646557×。三类型新最佳成对采集和两份FMA提案均已终态；同类型FMA为0.618492×，全部数值检查通过但不替换最佳。`optimizer-process.json`对应连续两轮KG／CC搜索，`reference-modes-process.json`等待搜索结束后探测独立进程的官方旧图Expm1精度模式。恢复须核对实际PID启动身份、`search-state.json`及KG工作区，不重新运行`prepare.py`、`launch_optimizer.py`或已有阶段入口。tmux为`hanle-strict-next-20261103`，所有设备工作仍持物理卡7项目锁串行；`progress.json`仅描述已完成采集，不代表搜索或总goal结束。搜索候选还需人工审查、整块及完整FP16域检查、实际后端核验，不能仅据搜索分数更新25/30。恢复说明见`tools/profiling/hgkda/strict_next/README.md`。
+
 后续对话和新报告遵循[实验归属与汇报口径](docs/实验归属与汇报口径.md)。
 
 - 文档使用中文。

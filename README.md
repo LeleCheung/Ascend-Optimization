@@ -12,6 +12,8 @@
 
 ## 当前状态
 
+2026-11-03正在继续[严格Triton剩余五项优化](project/Ascend-Optimization-v1/tools/profiling/hgkda/strict_next/README.md)，从提交`9798acae1`的25/30和`expm1_`0.647×继续。已完成最新最佳的FP16／BF16／FP32成对profiling及两份FMA提案；同类型FMA全部数值检查通过，但0.618×未优于冻结最佳，保留失败经验。910B的tmux正在连续搜索，另已排队官方精度模式参考探测；当前未增加达标数。恢复身份与新证据见[续跑记录](project/Ascend-Optimization-v1/operators/campaigns/strict-next-20261103/续跑记录.md)，原批次仍保持终态。
+
 2026-11-03完成[严格Triton剩余五项攻关](project/Ascend-Optimization-v1/operators/campaigns/strict-five-20261103/交付报告.md)，严格验收保持**25/30**（1015为7/10，1029为18/20），已有25项源码和测量不变。`expm1_`相对原PyTorch由0.561×改善为**0.647×**，通过30/30正式、63/63补测、12/12整块及4/4全部FP16位模式路径检查，实际Triton后端已核验；仍未达0.8×且CANN参考不合格。新增UniformTensor原生参考探测6/12通过，未赋予参考资格；累计积分默认参考漂移、求逆完整info及3D池化原生参考缺口单列。7个阶段与2个KG工作区均已终态，收尾时KGS空闲、卡锁释放。见[本轮30项总表](project/Ascend-Optimization-v1/operators/campaigns/strict-five-20261103/严格Triton30项总表.md)及[离线复现入口](project/Ascend-Optimization-v1/tools/profiling/hgkda/strict_five/README.md)；不得再次执行旧启动脚本。
 
 2026-11-03完成[严格Triton夜间优化](project/Ascend-Optimization-v1/tools/profiling/hgkda/strict_night/README.md)，从冻结16/30推进到**25/30**：原10项为7/10，新20项为18/20。本轮新增9项，均完成完整评测、两侧补测、人工审查与实际Triton后端核验。验收为相对合格CANN／Ascend C参考超过0.8×，候选设备路径全部为Triton。剩余5项已完成本轮真实搜索与机制排查，数值或参考缺口单列；队列及收尾正常结束。见[当前30项总表](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/严格Triton30项总表.md)、[关键简报](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/关键优化简报.md)及[剩余五项](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/剩余五项问题清单.md)。25项达标不代表全部30项已达标。
