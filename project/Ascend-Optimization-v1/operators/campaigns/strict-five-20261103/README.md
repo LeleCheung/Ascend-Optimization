@@ -20,6 +20,8 @@
 
 `proposals/expm1_/codex-native-half-v1/`是Codex提出的FP16数学提案：保留FP16指数计算，小幅值使用二阶公式；其他类型、布局和启动继承冻结最佳。Triton数学内置经正常编译链生成`math.exp`，不调用宿主CANN。六份离线编译通过及65536种FP16位模式的CPU舍入模型，只证明编译和理想公式；真机精度与性能须独立评测。可复现模型见`tools/profiling/hgkda/strict_five/model_half_formula.py`；`native-half-formula-domain-v2.json`补齐脚本SHA和中文范围说明，旧v1描述乱码原件保留。
 
+实际TTIR进一步发现v1的两个比较常量仍使FP16值扩展到FP32。`codex-half-comparisons-v2/`只将阈值和零常量显式设为FP16；六份离线编译通过，两种FP16 kernel 的TTIR均不再包含`arith.extf`。该变化只证明编译表达改变，未证明真机更快或数值通过；独立评测器等待v1终态，再持同一卡锁验证。
+
 `reference-probes/uniform-tensor-v1/`用于尚未测试的`aclnnInplaceUniformTensor`原生入口，固定原区间、三种类型及两种offset布局；不修改边界，不裁剪输出，不计性能。局部通过也不等于完整参考合格。
 
 `analysis/sdk-reference-symbols-v1/`是单CPU只读清点：扫描1763份头文件、872份910B配置及7个opapi库的公开符号。已见`aclnnInverse`，但未在本次检查范围发现完整`inv_ex`或LU接口；GE头文件里的`FractionalMaxPool`是另一种语义，不能当作PyTorch的3D固定窗口接口。清单及上游fork源码只用于找线索，不作为参考资格证明，不据此断言所有厂商版本均不支持。
@@ -28,10 +30,11 @@
 
 910B项目路径：`/data/hanle/ascend-optimization/Ascend-Optimization/project/Ascend-Optimization-v1`。复用容器`tle_yy`和现有KGS；物理卡7、项目文件锁串行，不重启共享服务或镜像。
 
-tmux会话为`hanle-strict-five-20261103`。三个阶段分别记录身份：
+tmux会话为`hanle-strict-five-20261103`。四个阶段分别记录身份：
 
 - `optimizer-process.json`：KG两轮搜索；每轮最多4稿、40分钟预算，原测量缓存复用。
 - `half-evaluator-process.json`：等待搜索完成，再执行一次正式KGS、原63项及整块12项检查；同AST已有测量先复用。
+- `half-comparisons-process.json`：等待首个提案终态，再独立验证去FP32比较扩展版本。
 - `reference-stage-process.json`：同一卡锁等待后构建及探测UniformTensor参考。
 
 必须同时检查PID和`/proc/<pid>/stat`启动时间，不能只看名称或JSON声明。`state.json`的`tasks_finished`仅指先行采集队列完成；正在搜索的是`search-state.json`。未知请求不重发，在途工作区不修改；已完成任务不重复计时。
