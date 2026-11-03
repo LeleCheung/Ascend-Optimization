@@ -10,6 +10,8 @@
 
 上述16/30为纠偏复核的冻结起点。夜间持续优化的当前交付数读取`project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/progress.json`及`delivery.json`，不能用冻结起点覆盖新增成果。恢复运行前检查既有Goal、tmux和工作区状态，不重复创建Goal或启动活跃工作区。
 
+2026-11-03的新goal位于`operators/campaigns/strict-five-20261103/`，从提交`231ba49d6`的严格25/30继续。tmux为`hanle-strict-five-20261103`，搜索状态是`search-state.json`；`state.json`只表示先行采集队列，不能因其`tasks_finished`判定整个goal结束。恢复须分别核对`optimizer-process.json`、`half-evaluator-process.json`、`reference-stage-process.json`的PID与启动时间和KG工作区终态；搜索、提案评测和参考探测在同一卡7锁下串行。已有启动脚本不得再次执行；排队成功、离线编译、局部参考探测或仅PyTorch成绩均不增加CANN交付数。工具和新批入口见`tools/profiling/hgkda/strict_five/README.md`。
+
 后续对话和新报告遵循[实验归属与汇报口径](docs/实验归属与汇报口径.md)。
 
 - 文档使用中文。

@@ -1,0 +1,638 @@
+{
+  "identity": {
+    "source": "\"\"\"expm1_ : in-place elementwise ``expm1(A)`` on Ascend, self-contained Triton.\n\nSemantics reproduced from the reference:\n  * ``out = expm1(A)`` is written back into ``A`` storage and ``A`` is returned.\n  * Input dtype (float16 / bfloat16 / float32) is preserved on the output.\n  * Strided (non-contiguous) views are read *and* written through their real\n    element strides so the mutation lands in the right storage slots; the view\n    object itself is returned unchanged.\n\nLayout dispatch (metadata-only decisions in the wrapper):\n  1. contiguous            -> flat kernel, unit stride\n  2. uniformly strided (all element strides == k * contiguous stride, k >= 1)\n                           -> flat kernel with a constexpr stride multiplier\n                              (this covers ``base[..., 0]`` style views)\n  3. anything else         -> generic up-to-8D index math kernel\n\nLaunch path: for the hot contiguous case the wrapper resolves the compiled\nkernel once per (dtype, numel) and then launches that exact Triton kernel\nthrough its own compiled launcher (grid + raw stream handle + device pointer),\nwhich is the same code path ``JITFunction.run`` ends in, minus the per-call\nbinder / cache-key / dispatch work that dominates this tiny workload.\n\"\"\"\n\nimport torch\nimport torch_npu\nimport triton\nimport triton.language as tl\nfrom triton.runtime import driver as _driver\n\n_BLOCK = 4096\n# Strided (gather/scatter) tiles materialise one address vector per element, so\n# the UB budget forces a much smaller tile than the contiguous path.\n_BLOCK_STRIDED = 512\n\n\n@triton.jit\ndef _expm1_value(x):\n    xf = x.to(tl.float32)\n    series = xf * (1.0 + 0.5 * xf)\n    value = tl.where(tl.abs(xf) < 0.01, series, tl.exp(xf) - 1.0)\n    bits = tl.where(xf == 0, xf.to(tl.uint32, bitcast=True), value.to(tl.uint32, bitcast=True))\n    return bits.to(tl.float32, bitcast=True)\n\n\n@triton.jit\ndef _expm1_flat(a_ptr, n, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    x = tl.load(a_ptr + offs, mask=mask, other=0.0)\n    y = _expm1_value(x)\n    tl.store(a_ptr + offs, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _expm1_streaming(a_ptr, n, BLOCK: tl.constexpr):\n    lane = tl.arange(0, BLOCK)\n    step = tl.num_programs(0) * BLOCK\n    for start in range(tl.program_id(0) * BLOCK, n, step):\n        offset = start + lane\n        x = tl.load(a_ptr + offset, offset < n, other=0.0)\n        y = _expm1_value(x)\n        tl.store(a_ptr + offset, y.to(a_ptr.dtype.element_ty), offset < n)\n\n\n@triton.jit\ndef _expm1_scaled(a_ptr, n, SCALE: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    idx = offs * SCALE\n    x = tl.load(a_ptr + idx, mask=mask, other=0.0)\n    y = _expm1_value(x)\n    tl.store(a_ptr + idx, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _expm1_nd(a_ptr, n,\n              s0, s1, s2, s3, s4, s5, s6, s7,\n              t0, t1, t2, t3, t4, t5, t6, t7,\n              NDIM: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    shapes = (s0, s1, s2, s3, s4, s5, s6, s7)\n    strides = (t0, t1, t2, t3, t4, t5, t6, t7)\n    rem = offs\n    off = tl.zeros((BLOCK,), dtype=tl.int32)\n    for i in tl.static_range(8):\n        if i < NDIM:\n            stride = strides[NDIM - 1 - i]\n            size = shapes[NDIM - 1 - i]\n            off += (rem % size) * stride\n            rem = rem // size\n    x = tl.load(a_ptr + off, mask=mask, other=0.0)\n    y = _expm1_value(x)\n    tl.store(a_ptr + off, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n_DEVICE = [-1]\n_ENTRIES = {}\n\n\ndef _current_stream(device):\n    raw = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\n    if raw is not None:\n        try:return raw(device)\n        except TypeError:return raw()\n    return torch.npu.current_stream(device).npu_stream\n\n\ndef _build_entry(A, n):\n    entry = None\n    for block in (4096,):\n        try:\n            grid = (n + block - 1) // block\n            kernel = _expm1_flat\n            ck = kernel.warmup(A, n, BLOCK=block, grid=(1,))\n            launcher = ck.run\n            debug = (getattr(launcher, 'compile_only', False) or\n                     getattr(launcher, 'enable_msprof_register_tensor', False) or\n                     getattr(launcher.metadata, 'debug_enabled', False) or\n                     getattr(launcher.metadata, 'debug', False))\n            entry = (launcher if debug else launcher.launch, ck.function, ck.packed_metadata, grid, block)\n            break\n        except Exception:\n            continue\n    _ENTRIES[(A.dtype, n, A.device.index)] = entry\n    return entry\n\n\ndef _launch_general(A, n):\n    \"\"\"Non-contiguous fallback: real element strides, in place.\"\"\"\n    shape = A.shape\n    stride = A.stride()\n    dims = []  # (size, stride) inner -> outer\n    for d in range(len(shape) - 1, -1, -1):\n        s = shape[d]\n        if s == 1:\n            continue\n        st = stride[d]\n        if dims and st == dims[-1][0] * dims[-1][1]:\n            dims[-1] = (dims[-1][0] * s, dims[-1][1])\n        else:\n            dims.append((s, st))\n    dims.reverse()\n    if len(dims) == 1:\n        _expm1_scaled[((n + _BLOCK_STRIDED - 1) // _BLOCK_STRIDED,)](\n            A, n, SCALE=dims[0][1], BLOCK=_BLOCK_STRIDED)\n        return\n    if len(dims) > 8:\n        raise RuntimeError(\"expm1_: unsupported tensor rank for strided path\")\n    sizes = [d[0] for d in dims] + [1] * (8 - len(dims))\n    sts = [d[1] for d in dims] + [0] * (8 - len(dims))\n    _expm1_nd[((n + _BLOCK_STRIDED - 1) // _BLOCK_STRIDED,)](\n        A, n, *sizes, *sts, NDIM=len(dims), BLOCK=_BLOCK_STRIDED)\n\n\ndef run(A):\n    n = A.numel()\n    if n == 0:\n        return A\n    if not A.is_contiguous():\n        _launch_general(A, n)\n        return A\n    ptr = A.data_ptr()\n    if ptr & 15:\n        _expm1_flat[((n + _BLOCK - 1) // _BLOCK,)](A, n, BLOCK=_BLOCK)\n        return A\n    entry = _ENTRIES.get((A.dtype, n, A.device.index))\n    if entry is None:\n        entry = _build_entry(A, n)\n        if entry is None:\n            _expm1_flat[((n + _BLOCK - 1) // _BLOCK,)](A, n, BLOCK=_BLOCK)\n            return A\n    entry[0](entry[3], 1, 1, _current_stream(A.device.index), entry[1], entry[2],\n             None, None, None, ptr, n, entry[4])\n    return A\n",
+    "binding": {
+      "catalog_name": null,
+      "bundle_id": "sha256:982bc685d203184ab3110741af78400514996b0126a3acfb00fb7733a355ca66",
+      "definition": "expm1_"
+    },
+    "settings": {
+      "warmup_ms": 1000,
+      "benchmark_ms": 100,
+      "num_trials": 3,
+      "tolerance_mode": "strict",
+      "rtol": 0.01,
+      "atol": 0.01,
+      "timeout_seconds": 1500
+    },
+    "target": "Ascend910B",
+    "solution": {
+      "definition": "expm1_",
+      "language": "triton",
+      "entrypoint": "main.py::run",
+      "sources": [
+        {
+          "path": "main.py",
+          "content": "\"\"\"expm1_ : in-place elementwise ``expm1(A)`` on Ascend, self-contained Triton.\n\nSemantics reproduced from the reference:\n  * ``out = expm1(A)`` is written back into ``A`` storage and ``A`` is returned.\n  * Input dtype (float16 / bfloat16 / float32) is preserved on the output.\n  * Strided (non-contiguous) views are read *and* written through their real\n    element strides so the mutation lands in the right storage slots; the view\n    object itself is returned unchanged.\n\nLayout dispatch (metadata-only decisions in the wrapper):\n  1. contiguous            -> flat kernel, unit stride\n  2. uniformly strided (all element strides == k * contiguous stride, k >= 1)\n                           -> flat kernel with a constexpr stride multiplier\n                              (this covers ``base[..., 0]`` style views)\n  3. anything else         -> generic up-to-8D index math kernel\n\nLaunch path: for the hot contiguous case the wrapper resolves the compiled\nkernel once per (dtype, numel) and then launches that exact Triton kernel\nthrough its own compiled launcher (grid + raw stream handle + device pointer),\nwhich is the same code path ``JITFunction.run`` ends in, minus the per-call\nbinder / cache-key / dispatch work that dominates this tiny workload.\n\"\"\"\n\nimport torch\nimport torch_npu\nimport triton\nimport triton.language as tl\nfrom triton.runtime import driver as _driver\n\n_BLOCK = 4096\n# Strided (gather/scatter) tiles materialise one address vector per element, so\n# the UB budget forces a much smaller tile than the contiguous path.\n_BLOCK_STRIDED = 512\n\n\n@triton.jit\ndef _expm1_value(x):\n    xf = x.to(tl.float32)\n    series = xf * (1.0 + 0.5 * xf)\n    value = tl.where(tl.abs(xf) < 0.01, series, tl.exp(xf) - 1.0)\n    bits = tl.where(xf == 0, xf.to(tl.uint32, bitcast=True), value.to(tl.uint32, bitcast=True))\n    return bits.to(tl.float32, bitcast=True)\n\n\n@triton.jit\ndef _expm1_flat(a_ptr, n, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    x = tl.load(a_ptr + offs, mask=mask, other=0.0)\n    y = _expm1_value(x)\n    tl.store(a_ptr + offs, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _expm1_streaming(a_ptr, n, BLOCK: tl.constexpr):\n    lane = tl.arange(0, BLOCK)\n    step = tl.num_programs(0) * BLOCK\n    for start in range(tl.program_id(0) * BLOCK, n, step):\n        offset = start + lane\n        x = tl.load(a_ptr + offset, offset < n, other=0.0)\n        y = _expm1_value(x)\n        tl.store(a_ptr + offset, y.to(a_ptr.dtype.element_ty), offset < n)\n\n\n@triton.jit\ndef _expm1_scaled(a_ptr, n, SCALE: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    idx = offs * SCALE\n    x = tl.load(a_ptr + idx, mask=mask, other=0.0)\n    y = _expm1_value(x)\n    tl.store(a_ptr + idx, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n@triton.jit\ndef _expm1_nd(a_ptr, n,\n              s0, s1, s2, s3, s4, s5, s6, s7,\n              t0, t1, t2, t3, t4, t5, t6, t7,\n              NDIM: tl.constexpr, BLOCK: tl.constexpr):\n    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)\n    mask = offs < n\n    shapes = (s0, s1, s2, s3, s4, s5, s6, s7)\n    strides = (t0, t1, t2, t3, t4, t5, t6, t7)\n    rem = offs\n    off = tl.zeros((BLOCK,), dtype=tl.int32)\n    for i in tl.static_range(8):\n        if i < NDIM:\n            stride = strides[NDIM - 1 - i]\n            size = shapes[NDIM - 1 - i]\n            off += (rem % size) * stride\n            rem = rem // size\n    x = tl.load(a_ptr + off, mask=mask, other=0.0)\n    y = _expm1_value(x)\n    tl.store(a_ptr + off, y.to(a_ptr.dtype.element_ty), mask=mask)\n\n\n_DEVICE = [-1]\n_ENTRIES = {}\n\n\ndef _current_stream(device):\n    raw = getattr(torch_npu._C, '_npu_getCurrentRawStreamNoWait', None)\n    if raw is not None:\n        try:return raw(device)\n        except TypeError:return raw()\n    return torch.npu.current_stream(device).npu_stream\n\n\ndef _build_entry(A, n):\n    entry = None\n    for block in (4096,):\n        try:\n            grid = (n + block - 1) // block\n            kernel = _expm1_flat\n            ck = kernel.warmup(A, n, BLOCK=block, grid=(1,))\n            launcher = ck.run\n            debug = (getattr(launcher, 'compile_only', False) or\n                     getattr(launcher, 'enable_msprof_register_tensor', False) or\n                     getattr(launcher.metadata, 'debug_enabled', False) or\n                     getattr(launcher.metadata, 'debug', False))\n            entry = (launcher if debug else launcher.launch, ck.function, ck.packed_metadata, grid, block)\n            break\n        except Exception:\n            continue\n    _ENTRIES[(A.dtype, n, A.device.index)] = entry\n    return entry\n\n\ndef _launch_general(A, n):\n    \"\"\"Non-contiguous fallback: real element strides, in place.\"\"\"\n    shape = A.shape\n    stride = A.stride()\n    dims = []  # (size, stride) inner -> outer\n    for d in range(len(shape) - 1, -1, -1):\n        s = shape[d]\n        if s == 1:\n            continue\n        st = stride[d]\n        if dims and st == dims[-1][0] * dims[-1][1]:\n            dims[-1] = (dims[-1][0] * s, dims[-1][1])\n        else:\n            dims.append((s, st))\n    dims.reverse()\n    if len(dims) == 1:\n        _expm1_scaled[((n + _BLOCK_STRIDED - 1) // _BLOCK_STRIDED,)](\n            A, n, SCALE=dims[0][1], BLOCK=_BLOCK_STRIDED)\n        return\n    if len(dims) > 8:\n        raise RuntimeError(\"expm1_: unsupported tensor rank for strided path\")\n    sizes = [d[0] for d in dims] + [1] * (8 - len(dims))\n    sts = [d[1] for d in dims] + [0] * (8 - len(dims))\n    _expm1_nd[((n + _BLOCK_STRIDED - 1) // _BLOCK_STRIDED,)](\n        A, n, *sizes, *sts, NDIM=len(dims), BLOCK=_BLOCK_STRIDED)\n\n\ndef run(A):\n    n = A.numel()\n    if n == 0:\n        return A\n    if not A.is_contiguous():\n        _launch_general(A, n)\n        return A\n    ptr = A.data_ptr()\n    if ptr & 15:\n        _expm1_flat[((n + _BLOCK - 1) // _BLOCK,)](A, n, BLOCK=_BLOCK)\n        return A\n    entry = _ENTRIES.get((A.dtype, n, A.device.index))\n    if entry is None:\n        entry = _build_entry(A, n)\n        if entry is None:\n            _expm1_flat[((n + _BLOCK - 1) // _BLOCK,)](A, n, BLOCK=_BLOCK)\n            return A\n    entry[0](entry[3], 1, 1, _current_stream(A.device.index), entry[1], entry[2],\n             None, None, None, ptr, n, entry[4])\n    return A\n"
+        }
+      ]
+    }
+  },
+  "result": {
+    "api_version": "v6.2",
+    "reference_source": "primary",
+    "status": "PASSED",
+    "device": "npu:0",
+    "server_backend": "npu",
+    "is_hack": false,
+    "hack_reason": "",
+    "geo_mean": 0.5171814644327923,
+    "min_speedup": 0.1481173297294044,
+    "worst_workload_uuid": "expm1_-timing-3",
+    "latency_ms": 0.15499870989025885,
+    "abs_err": 1.1920928955078125e-07,
+    "rel_err": 7.090700091794133e-05,
+    "num_workloads": 30,
+    "num_passed": 30,
+    "timing_skipped": false,
+    "log": "",
+    "per_workload": [
+      {
+        "uuid": "expm1_-correctness-0",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-1",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-2",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-3",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-4",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-5",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-6",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-7",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-8",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-9",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-10",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-11",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-12",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-13",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-14",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 1.1920928955078125e-07,
+        "rel_err": 7.090700091794133e-05,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-15",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 1.1594966053962708e-07,
+        "rel_err": 1.5084132428455632e-05,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-16",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 0.0,
+        "rel_err": 0.0,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-correctness-17",
+        "axes": {},
+        "phase": "correctness",
+        "status": "PASSED",
+        "speedup": null,
+        "latency_ms": null,
+        "reference_latency_ms": null,
+        "abs_err": 7.916241884231567e-09,
+        "rel_err": 1.8598021824800526e-06,
+        "matched_ratio": 1.0,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-0",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.8082639120294707,
+        "latency_ms": 0.013647142013379403,
+        "reference_latency_ms": 0.011030492391755783,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-1",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.7621052756653053,
+        "latency_ms": 0.01413041801302205,
+        "reference_latency_ms": 0.010768866115080164,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-2",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.740192453736171,
+        "latency_ms": 0.013670547321959896,
+        "reference_latency_ms": 0.010118835966157938,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-3",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.1481173297294044,
+        "latency_ms": 0.15499870989025885,
+        "reference_latency_ms": 0.022957995020447763,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-4",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.7691286235431163,
+        "latency_ms": 0.013725660161718264,
+        "reference_latency_ms": 0.010556798107402956,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-5",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.7804022927983993,
+        "latency_ms": 0.014251150250469134,
+        "reference_latency_ms": 0.011121630330480595,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-6",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.757177937880366,
+        "latency_ms": 0.01404331764014434,
+        "reference_latency_ms": 0.010633290291763459,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-7",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.16100957457498036,
+        "latency_ms": 0.15550375650559903,
+        "reference_latency_ms": 0.02503759367977783,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-8",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.7720103886883397,
+        "latency_ms": 0.013696444075891509,
+        "reference_latency_ms": 0.010573797114677111,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-9",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.7568415748337429,
+        "latency_ms": 0.013856618150556369,
+        "reference_latency_ms": 0.010487264702936908,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-10",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.7636315023764537,
+        "latency_ms": 0.013866306285009454,
+        "reference_latency_ms": 0.010588748300833832,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      },
+      {
+        "uuid": "expm1_-timing-11",
+        "axes": {},
+        "phase": "timing",
+        "status": "PASSED",
+        "speedup": 0.16608010429473355,
+        "latency_ms": 0.15451185502624717,
+        "reference_latency_ms": 0.025661344997531883,
+        "abs_err": null,
+        "rel_err": null,
+        "matched_ratio": null,
+        "metrics": {},
+        "log": ""
+      }
+    ]
+  },
+  "service": {
+    "status": "ok",
+    "api_version": "v6.2",
+    "server_version": "v6.5.0",
+    "backend": "npu",
+    "devices": [
+      "npu:0"
+    ],
+    "workers": 1,
+    "evaluation_adapters": [
+      "native",
+      "flaggems"
+    ],
+    "scheduler": {
+      "device_slots": 1,
+      "healthy": 1,
+      "checking": 0,
+      "broken": 0,
+      "incidents": 15,
+      "recovered": 15,
+      "probe_timeout_seconds": 30.0,
+      "max_active": 1,
+      "active": 0,
+      "waiting": 0,
+      "available": 1,
+      "slots": [
+        {
+          "device": "npu:0",
+          "state": "available",
+          "reason": "",
+          "last_incident": "profile cancelled by client",
+          "incidents": 15,
+          "recovered": 15
+        }
+      ]
+    },
+    "timing": "walltime",
+    "profile": {
+      "supported": true,
+      "profiler": "msprof",
+      "levels": [
+        "metrics",
+        "instruction"
+      ],
+      "capabilities": [
+        "performance_counters",
+        "pipeline_utilization",
+        "kernel_profile",
+        "instruction_listing"
+      ]
+    },
+    "capabilities": {
+      "native_source_policy": {
+        "enabled": true,
+        "workload_conditions": true,
+        "policy_id": "flaggems/d64794e63b502cb836bc015a92a62c42de4be05a",
+        "source": {
+          "repository": "https://github.com/YaooXu/FlagGems.git",
+          "revision": "d64794e63b502cb836bc015a92a62c42de4be05a",
+          "paths": [
+            "src/flag_gems/runtime/backend/backend_utils.py",
+            "src/flag_gems/runtime/backend/_*/__init__.py"
+          ],
+          "license": "Apache-2.0",
+          "description": "VendorDescriptor defaults plus per-vendor overrides; reference/test policy, not measured capabilities"
+        },
+        "vendor": "ascend",
+        "flags": {
+          "support_fp64": false,
+          "support_bf16": true,
+          "support_int64": true
+        }
+      },
+      "operator_contract": {
+        "enabled": true,
+        "test_sources": true
+      },
+      "benchmark_reference": {
+        "enabled": true,
+        "evaluators": [
+          "flaggems"
+        ],
+        "level": "core"
+      },
+      "candidate_admission": {
+        "version": 1,
+        "policy_sha256": "bd6a7bc3f46a71e6d1b90223e911ad2ea463af4b314348de755177f46963d1dc",
+        "stages": [
+          "preflight"
+        ]
+      },
+      "operation_cancel": {
+        "enabled": true,
+        "operations": [
+          "preflight",
+          "evaluate",
+          "profile",
+          "reference"
+        ]
+      },
+      "operator_bundle_upload": {
+        "enabled": true,
+        "archive_format": "kernelgen.operator-bundle/v1",
+        "media_type": "application/vnd.kernelgen.operator-bundle.v1+tar",
+        "max_bytes": 268435456,
+        "max_files": 10000,
+        "evaluation_binding": true,
+        "evaluators": [
+          "native",
+          "flaggems"
+        ]
+      }
+    },
+    "debug": {
+      "enabled": true,
+      "runner": "local-trusted",
+      "security_boundary": false
+    },
+    "request_audit": {
+      "enabled": false
+    },
+    "trusted_clients_only": true,
+    "target": {
+      "backend": "ascend",
+      "vendor": "huawei",
+      "device": "Ascend910B4-1",
+      "architecture": "dav-c220-cube",
+      "devices": [
+        {
+          "logical_device": "npu:0",
+          "device_id": 0,
+          "name": "Ascend910B4-1",
+          "l2_cache_size": 176160768,
+          "num_sm": 20,
+          "compute_capability": "",
+          "total_memory": 65452113920
+        }
+      ]
+    },
+    "software": {
+      "language": "triton",
+      "language_version": "3.5.1",
+      "compiler": "flagtree",
+      "compiler_version": "0.6.0+ascend.gitc286cba6",
+      "runtime": "cann",
+      "runtime_version": "9.0.0",
+      "driver_version": "25.2.0"
+    },
+    "metadata": {
+      "complete": true,
+      "missing": [],
+      "sources": {
+        "target.backend": "server configuration",
+        "target.vendor": "server configuration",
+        "software.language": "server configuration",
+        "software.compiler": "python package metadata",
+        "software.runtime": "server configuration",
+        "target.device": "device probe",
+        "target.architecture": "tbe.common.platform.get_soc_spec(COMPILER_ARCH)",
+        "software.language_version": "triton module metadata",
+        "software.compiler_version": "python package metadata",
+        "software.runtime_version": "/usr/local/Ascend/cann-9.0.0/share/info/runtime/version.info",
+        "software.driver_version": "/usr/local/Ascend/driver/version.info"
+      }
+    }
+  }
+}

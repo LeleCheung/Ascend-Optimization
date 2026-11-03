@@ -12,6 +12,8 @@
 
 ## 当前状态
 
+2026-11-03继续运行[严格Triton剩余五项攻关](project/Ascend-Optimization-v1/operators/campaigns/strict-five-20261103/README.md)，以`231ba49d6`的25/30为冻结起点；已有25项不重复计时。新批完成`expm1_`同输入成对profiling，正在执行KG搜索、FP16数学提案真机评测和原生UniformTensor参考资格探测。排队、离线编译和局部探测均不计为新增达标。恢复前检查该批控制器、搜索工作区及卡锁，不重复启动任务。
+
 2026-11-03完成[严格Triton夜间优化](project/Ascend-Optimization-v1/tools/profiling/hgkda/strict_night/README.md)，从冻结16/30推进到**25/30**：原10项为7/10，新20项为18/20。本轮新增9项，均完成完整评测、两侧补测、人工审查与实际Triton后端核验。验收为相对合格CANN／Ascend C参考超过0.8×，候选设备路径全部为Triton。剩余5项已完成本轮真实搜索与机制排查，数值或参考缺口单列；队列及收尾正常结束。见[当前30项总表](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/严格Triton30项总表.md)、[关键简报](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/关键优化简报.md)及[剩余五项](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/剩余五项问题清单.md)。25项达标不代表全部30项已达标。
 
 `uniform`冷启动修正版18/18、补测31/31，相对PyTorch1.628×。求逆v7修复掩码更新和向量倒数表达，7/7、补测8/8及实际Triton后端核验通过；77.743×的PyTorch参考含CPU回退。累计积分两轮搜索后仍有两项FP16补测失败；默认参考重复漂移的固定反例已保存。`expm1_`完成两轮搜索及整块编译／失败缓存修正，新稿30/30、63/63、12/12，但0.514×未超过0.561×最佳，完整保留无收益结果。上述四项及池化的原生CANN参考问题继续单列，详见[编译与缓存记录](project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/阶段记录-expm1整块编译与缓存.md)。
