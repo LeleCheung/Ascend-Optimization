@@ -10,7 +10,9 @@
 
 上述16/30为纠偏复核的冻结起点。夜间持续优化的当前交付数读取`project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/progress.json`及`delivery.json`，不能用冻结起点覆盖新增成果。恢复运行前检查既有Goal、tmux和工作区状态，不重复创建Goal或启动活跃工作区。
 
-2026-11-03的新goal位于`operators/campaigns/strict-five-20261103/`，从提交`231ba49d6`的严格25/30继续。tmux为`hanle-strict-five-20261103`，搜索状态是`search-state.json`；`state.json`只表示先行采集队列，不能因其`tasks_finished`判定整个goal结束。恢复须分别核对`optimizer-process.json`、`half-evaluator-process.json`、`half-comparisons-process.json`、`reference-stage-process.json`的PID与启动时间和KG工作区终态；搜索、两份FP16提案评测和参考探测在同一卡7锁下串行。已有启动脚本不得再次执行；排队成功、离线编译、局部参考探测或仅PyTorch成绩均不增加CANN交付数。工具和新批入口见`tools/profiling/hgkda/strict_five/README.md`。
+2026-11-03的新goal位于`operators/campaigns/strict-five-20261103/`，从提交`231ba49d6`的严格25/30继续。tmux为`hanle-strict-five-20261103`，搜索状态是`search-state.json`；`state.json`只表示先行采集队列，不能因其`tasks_finished`判定整个goal结束。恢复须核对本批全部`*-process.json`的PID与启动时间和KG工作区终态，当前包含`optimizer`、`half-evaluator`、`half-comparisons`、`reference-stage`、`half-domain`和`reviewed-best`；所有设备阶段在同一卡7锁下串行。新增的FP16完整域检查包含平铺、大流式、尾部和非对齐路径，不以CPU公式或小形状通过代替实际设备语义。已有启动脚本不得再次执行；排队成功、离线编译、局部参考探测或仅PyTorch成绩均不增加CANN交付数。工具和新批入口见`tools/profiling/hgkda/strict_five/README.md`。
+
+2026-11-03剩余五项批次现已结束，当前结论读取`operators/campaigns/strict-five-20261103/delivery.json`和`交付报告.md`：严格验收仍25/30，`expm1_`原PyTorch口径由0.561×改善至0.647×并完成全部门禁；其余数值与原生参考缺口单列。7个阶段及2个KG工作区均终态，不再执行上述旧启动入口。离线复现使用`tools/profiling/hgkda/strict_five/finish.py`，同步状态读取本批`三端同步核验.json`与实际Git提交，不能将实验终态直接表述为30/30。
 
 后续对话和新报告遵循[实验归属与汇报口径](docs/实验归属与汇报口径.md)。
 
