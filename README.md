@@ -1,61 +1,69 @@
 # HG-KDA / Ascend-Optimization
 
-HG-KDA 面向昇腾算子的性能诊断与严格 Triton 优化，将成对 profiling、源码与实际 IR、数值参考、指令热点及分类知识组织为可追溯的模型上下文。
+HG-KDA 面向昇腾算子的性能诊断与严格 Triton 优化，将同输入候选与参考的 profiling、源码与实际 IR、Roofline 参考、指令热点及分类知识组织为可追溯的模型上下文，支持从性能差异到机制假设、代码修改和完整评测的优化流程。
 
-实现由 **skill、独立 Python 核心与可选后端适配器** 组成。模型由调用宿主提供，KG 可作为优化执行器；KGS 负责完整评测，msprof 负责采集。离线核心不依赖 KG/KGS 或 NPU 环境。
+实现由 **skill、独立 Python 核心与可选后端适配器** 组成。模型由调用宿主提供，KernelGen（KG）可作为优化执行器；KernelGen Server（KGS）负责完整评测，msprof 负责设备采集。离线分析只依赖 Python 标准库。
 
-## 安装与快速验证
+## 核心能力
 
-需要 Python 3.10 或更高版本。在仓库根目录执行：
+| 能力 | 输出 |
+| --- | --- |
+| 成对 profiling 对比 | 两侧指标分布、计数总和、候选/参考比值及平均搬运粒度 |
+| 分阶段诊断 | 基于算子特征和指标的机制假设、下一项取证或验证建议 |
+| 指令与区域分析 | 候选 kernel 热点、源码区域，以及有时间轴时的流水活动与等待 |
+| 数值参考 | 在工作量与采集口径匹配时计算 Roofline 参考，区分经验包络与物理峰值 |
+| 上下文与知识管理 | 绑定源码身份的证据上下文、分类知识、经验去重与按条件检索 |
+| 评测接入 | 严格 Triton 静态筛查、审查记录绑定与 KGS 完整评测 |
+
+## 工作流
+
+固定源码与测试合同 → 成对采集与对照 → 按需检查源码/IR、数值参考和热点区域 → 模型提出可验证修改 → 严格 Triton 审查 → KGS 完整评测 → 记录结果与更新知识。
+
+skill 指导模型选择和调用工具；Python 核心计算与组织证据；模型负责解释机制并生成候选。模型调用与多轮优化由宿主或 KG 编排。
+
+## 安装
+
+需要 Python 3.10 或更高版本。推荐在独立虚拟环境中安装；获取仓库后，在根目录执行：
 
     git lfs pull
     python -m pip install .
     python -m hgkda doctor
-    python skills/hgkda/scripts/run_hgkda.py doctor
-    python -m unittest discover -s tests -v
 
-分析随仓库提供的真实历史证据，无需连接设备：
+Git LFS 用于获取示例合同包等原件。安装核心包不会安装 KG/KGS、FlagGems、模型客户端或 NPU 运行环境；设备采集与评测所需配置见 [可选后端](docs/backends.md)。
+
+## 快速示例
+
+以下命令分析仓库附带的真实历史采集，无需连接设备：
 
     hgkda compare --directory examples/paired-expm1/paired --output ../hgkda-output/compare.json
     hgkda context --operator expm1_ --source examples/paired-expm1/candidate.py --comparison ../hgkda-output/compare.json --output ../hgkda-output/context.json
     hgkda hotspots --listing examples/matmul-instructions/listing.json --source examples/matmul-instructions/candidate.py --output ../hgkda-output/hotspots.json
     hgkda regions --listing examples/matmul-instructions/listing.json --source-map examples/matmul-instructions/source-map.json --output ../hgkda-output/regions.json
 
-输出文件不能覆盖；再次运行时使用新目录。该示例复算已有采集记录，不代表重新运行设备实验或新增性能成果。
+compare.json 保存成对指标，context.json 将证据与分类知识组织为模型上下文；hotspots.json 和 regions.json 分别展示指令热点与源码区域。输出保留输入身份，供模型或其他应用读取，公共封装见 [JSON 合同](schemas/result.schema.json)。
 
-## 工作流
+已有输出文件不会覆盖，再次运行时使用新目录。更多示例与 KGS 评测方法见 [示例说明](examples/README.md)。
 
-固定源码与合同 → 成对采集与对照 → 按需检查源码/IR、数值参考和热点区域 → 模型提出可验证修改 → 严格 Triton 审查 → KGS 完整评测 → 记录结果与更新知识。
+## 使用 skill
 
-事实、规则假设和验证结论分别保存。活跃阈值仅提供排查优先级；经验吞吐包络不等于物理峰值；指令时间和不同流水时间不能累加为完整调用耗时。
+让支持 skill 的模型宿主加载 [HG-KDA skill](skills/hgkda/SKILL.md)，并使用安装了核心包的 Python 执行工具。统一脚本入口与 hgkda CLI 提供相同功能：
 
-## 目录
+    python skills/hgkda/scripts/run_hgkda.py doctor
 
-| 目录 | 内容 |
-| --- | --- |
-| skills/hgkda/ | 可调用 skill、执行入口及接口说明 |
-| src/hgkda/ | 标准库分析核心、知识和可选适配器 |
-| examples/ | 成对指标、指令区域及 KGS 评测示例 |
-| benchmarks/ | 暂停时三十项算子的源码与结果索引 |
-| tests/ | 身份、统计、时间轴与适配边界验证 |
-| docs/、manifests/ | 方法、配置、来源及恢复记录 |
-| sources/、third_party/ | 固定的可选开发依赖；不参与核心包安装 |
-| tools/ | 维护工具及参考后端构建工具 |
+参数和输入格式见 [接口说明](skills/hgkda/references/interface.md)。工程结构与开发方法见 [开发指引](docs/DEVELOPMENT.md)。
 
-## 实验边界
+## 适用范围与评测约定
 
-候选全部设备计算和搬运使用 Triton；CANN 原生库或来源明确的 Ascend C 实现作为参考。PyTorch 与 CANN 参考结果分别记录。源码审查、正确性、性能和附加语义检查不能互相替代。
+- 当前设备侧实例与验证以 Ascend 910B 为主，msprof 报告格式和运行环境应与采集配置匹配。
+- 优化候选的全部设备计算和搬运使用 Triton；CANN 原生库或来源明确的 Ascend C 实现用于参考，PyTorch 与 CANN 参考成绩分别记录。
+- 正式性能采用 KGS 完整调用计时，并保留完整正确性和所需的附加语义检查；独立 profiling 与模拟器耗时单列。
+- 指标阈值形成待验证假设。经验吞吐包络与物理峰值分别解释，不累加可重叠的流水或指令时间作为总耗时。
 
-暂停时严格验收为 **25/30**，详见 benchmarks/index.json。本次工程整理不恢复旧优化，也不把包安装或接口验证计为新增达标。原始实验保留在 Git 检查点 f63e6c30a0d8583ba092844e57ab90c0f6d0349f，精选文件保留来源与 SHA。
+算子源码、参考类别和结果由 [实验索引](benchmarks/index.json)统一记录，证据适用范围见 [验证说明](docs/validation.md)。
 
 ## 文档
 
+- [真实证据与运行示例](examples/README.md)
 - [skill 接口](skills/hgkda/references/interface.md)
 - [可选后端](docs/backends.md)
-- [目录与调用](docs/directory-layout.md)
-- [工程整理计划](docs/release-plan.md)
-- [验证结果](docs/validation.md)
-- [历史恢复](docs/recovery.md)
-- [维护约定](AGENTS.md)
-
-本仓库当前仅同步既有私有远端，不执行公开发布或 Release。第三方版权和许可证按来源保留；公开发布前应独立核对可分发范围。
+- [开发指引](docs/DEVELOPMENT.md)
