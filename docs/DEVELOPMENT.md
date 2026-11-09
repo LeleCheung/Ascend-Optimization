@@ -9,7 +9,8 @@
 | README.md | 面向使用者的稳定入口：项目能力、方法、安装、示例与适用范围 |
 | docs/DEVELOPMENT.md | 面向维护者的工程入口：代码组织、调用关系、开发验证、状态与待完善事项 |
 | AGENTS.md | 必须遵守的实现、证据与共享环境约束 |
-| benchmarks/index.json 及原始结果 | 算子状态、源码与性能数据；README 通过链接引用 |
+| benchmarks/current.json | 最新状态及审计原件位置，独立数学参考合同单列 |
+| benchmarks/index.json 及历史原件 | 拆分前的源码、合同和性能身份，冻结保留 |
 | docs/ 下的专题文档 | 后端配置、机器目录、验证记录和历史恢复细节 |
 
 修改接口时同步更新使用示例；修改实验状态时先更新绑定源码与合同的结果索引。安装验证、离线复算和新算子达标分别记录。
@@ -17,6 +18,8 @@
 ## 核心代码与调用关系
 
 实际主体位于 [src/hgkda/](../src/hgkda/)，skill 位于 [skills/hgkda/](../skills/hgkda/)。核心安装配置见 [pyproject.toml](../pyproject.toml)。
+
+当前入口的调用关系见[HTML 流程图](hgkda-architecture.html)，可直接用浏览器打开并打印为 PDF。
 
     模型宿主读取 SKILL.md
         → 调用 run_hgkda.py / hgkda / python -m hgkda
@@ -77,7 +80,8 @@ Windows 与 910B 的实际目录及已安装环境见 [目录与运行环境](di
 
 | 位置 | 内容 |
 | --- | --- |
-| [benchmarks/index.json](../benchmarks/index.json) | 算子分组、顺序、准入状态及证据索引 |
+| [benchmarks/current.json](../benchmarks/current.json) | 当前算子分组、顺序、验收状态及证据索引 |
+| [benchmarks/index.json](../benchmarks/index.json) | 拆分前的固定候选及合同来源 |
 | [benchmarks/operators/](../benchmarks/operators/) | 各算子的冻结源码、审查与核心结果 |
 | [examples/](../examples/) | 可运行的精选证据及 KGS 请求 |
 | [manifests/](../manifests/) | 依赖版本、迁移来源、文件身份与核验记录 |
@@ -89,6 +93,8 @@ Windows 与 910B 的实际目录及已安装环境见 [目录与运行环境](di
 ## 当前状态与后续维护
 
 截至 2026-11-04，独立核心、项目 skill、可选后端及目录整理已完成；Windows 和 910B 的安装、离线示例与一次既有严格 Triton 算子的 KGS 完整评测已有记录。旧算子优化仍暂停，验收数量和各算子状态以 [实验索引](../benchmarks/index.json)为准。
+
+2026-11-09 完成 [25 项固定候选回归](regression-20261109.md)：经独立 CLI 调用 KGS，776/776 正式用例及 2366/2366 补充检查通过，性能为 23/25 达标。修复候选、Uniform 新参考和累计积分独立数学参考合同在新批次分别记录，当前状态见 current.json。该批次与旧优化控制器分别管理，运行结果不覆盖历史原件。
 
 后续工程工作需要明确以下接口：
 

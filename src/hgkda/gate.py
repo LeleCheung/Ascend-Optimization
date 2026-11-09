@@ -5,7 +5,9 @@ import hashlib
 FORBIDDEN_METHODS = {'contiguous', 'clone', 'copy_', 'fill_', 'zero_', 'flatten',
                      'reshape', 'to', 'cpu', 'cuda', 'numpy', 'resolve_conj', 'resolve_neg'}
 TORCH_METADATA = {'empty', 'empty_like', 'empty_strided', 'device', 'dtype', 'is_tensor',
-                  'Tensor', 'Size', 'finfo', 'iinfo', 'numel', 'get_default_dtype'}
+                  'Tensor', 'Size', 'finfo', 'iinfo', 'numel', 'get_default_dtype',
+                  'broadcast_shapes', 'view_as_real', 'view_as_complex', '_C._is_alias_of',
+                  'npu.device_count', 'npu.get_device_properties'}
 
 
 def inspect_text(text):

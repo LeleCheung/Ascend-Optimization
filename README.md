@@ -59,7 +59,9 @@ compare.json 保存成对指标，context.json 将证据与分类知识组织为
 - 正式性能采用 KGS 完整调用计时，并保留完整正确性和所需的附加语义检查；独立 profiling 与模拟器耗时单列。
 - 指标阈值形成待验证假设。经验吞吐包络与物理峰值分别解释，不累加可重叠的流水或指令时间作为总耗时。
 
-算子源码、参考类别和结果由 [实验索引](benchmarks/index.json)统一记录，证据适用范围见 [验证说明](docs/validation.md)。
+当前算子状态见 [最新验收索引](benchmarks/current.json)；[拆分前索引](benchmarks/index.json)保留历史源码、参考类别和结果。证据适用范围见 [验证说明](docs/validation.md)。
+
+独立入口的最新全量回归见 [25 项固定候选结果](benchmarks/regressions/20261109/README.md)，与拆分前验收分别记录。
 
 ## 文档
 

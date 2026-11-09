@@ -127,7 +127,7 @@ def dispatch(args):
         return knowledge(args.operator, hypotheses=True), []
     if cmd == "gate":
         from .gate import admit, inspect_text
-        text = args.source.read_text(encoding="utf8")
+        text = args.source.read_bytes().decode("utf8")
         result = admit(text, read_json(args.review)) if args.review else inspect_text(text)
         return result, [identity(args.source)] + ([identity(args.review)] if args.review else [])
     if cmd == "kgs":
