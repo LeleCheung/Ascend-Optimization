@@ -1,0 +1,30 @@
+---
+name: hgkda
+description: 诊断与优化昇腾算子的性能；对同输入候选和参考比较 profiling，结合实际源码、IR、数值参考及指令热点生成可验证的严格 Triton 优化方案，并通过可选 KGS 后端评测。
+---
+
+# HG-KDA 算子性能诊断
+
+使用独立 Python 核心整理证据，由调用宿主的模型解释机制并生成候选。无需启动 KG 即可离线分析；KG 可作为可选优化执行器，KGS 提供完整评测，msprof 提供设备采集。
+
+## 开始
+
+在项目根目录执行 python -m pip install .，然后执行 python skills/hgkda/scripts/run_hgkda.py doctor。所有命令输出稳定 JSON，--output 指向新文件，禁止覆盖已有证据。完整参数见 [接口说明](references/interface.md)。
+
+先固定算子、输入、源码 SHA、测试合同、参考来源与设备。历史结果不能替代当前输入的证据；缺少实际 IR 或模拟器信息时保留未知项。
+
+## 分阶段分析
+
+1. **对照事实**：compare --directory <paired> 聚合两侧流水、搬运及冲突指标，保留缺失数量、分布及计数总和；计算候选/参考比值和平均搬运粒度。
+2. **形成上下文**：context --operator <name> --source <candidate.py> --comparison <comparison.json> 核对源码身份，组织对照证据、规则假设与分类知识。已有绑定的实际 IR、Roofline 或指令清单时，通过可选参数一并传入。
+3. **按需深入**：使用 hotspots 定位候选指令，再用 regions 查看源码循环或邻域。复杂依赖需要真实时间轴时追加采集；不得从流水汇总比例虚构空泡。
+4. **提出实验**：模型输出证据、机制假设、具体修改、预期指标变化、验证方法及未决问题。选择能区分机制的最小实验；性能收益仍由完整评测确认。
+5. **验证反馈**：先检查全部候选调用路径，再通过 KGS 完整正确性/性能评测和必要补充检查。记录失败及未采纳方案；已验证经验按算子类型、指标口径和适用条件去重更新。
+
+## 硬约束
+
+候选的所有设备计算与搬运严格使用 Triton，包含快路径、慢路径和回退。CANN/Ascend C 仅作参考，禁止原生 DMA 或 PyTorch 目标算子替代候选。保留 stride、offset、dtype、原地/out 别名、特殊值、当前设备和 stream；不缓存张量结果或旧 stream。
+
+活跃阈值是排查优先级，不是瓶颈证明。经验 microbenchmark 包络不是物理峰值。流水时间可能重叠；模拟器指令时间不可相加为正式耗时。默认一次完整正式评测，不以局部测试替代完整调用。
+
+使用 knowledge --operator <name> 获取版本化知识。接口与后端配置见 [接口说明](references/interface.md)；事实、假设、建议必须分别呈现。

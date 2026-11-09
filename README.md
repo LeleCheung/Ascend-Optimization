@@ -61,7 +61,7 @@ compare.json 保存成对指标，context.json 将证据与分类知识组织为
 
 当前算子状态见 [最新验收索引](benchmarks/current.json)；[拆分前索引](benchmarks/index.json)保留历史源码、参考类别和结果。证据适用范围见 [验证说明](docs/validation.md)。
 
-独立入口的最新全量回归见 [25 项固定候选结果](benchmarks/regressions/20261109/README.md)，与拆分前验收分别记录。
+独立入口的最新全量回归见 [25 项固定候选结果](benchmarks/regressions/20261109/README.md)，与拆分前验收分别记录。三类历史版本及实际生成验证的区别见 [版本记录](docs/version-lineage-20261109.md)。
 
 ## 文档
 
