@@ -83,8 +83,14 @@ python tools/lineage/build.py --previous-table benchmarks/lineage/20261109/input
 
 工作流补齐专项经验检索、大小输入选择，以及由完整正式结果驱动的`feedback`决策。小输入独立设备任务约1微秒，原完整调用约80微秒，主要优化对象为宿主启动；大输入同时调整分块。正式KGS完整调用与独立诊断分别归档，不混用计时口径。详情、ABI与队列依据见[性能恢复报告](selu-skill-recovery-20261109.md)。
 
-## 表格发布与同步
+## 首轮表格发布与同步（历史记录）
 
 语雀 [FlagGems Table](https://bosc.yuque.com/up3wk0/twwy86/vcqrbcy2hp7gds4g) 已按三类版本更新并回读确认，保留39项及原顺序、三张分表和固定依赖版本。页面仍以表格为主体；[发布正文](../benchmarks/lineage/20261109/published-table.md)与[更新回执](../benchmarks/lineage/20261109/yuque-update.json)保存实际发布内容。
 
 GitHub证据提交为 `d878910bc48c75105c1dfe787325efd8c4c4644d`。910B 的常规 LFS 下载超时后，使用项目SSH传输54个已逐一校验摘要的内容寻址对象，再执行本地 LFS checkout。服务器已完成296个版本文件及599份实验原件核验；没有以指针替代实验实体。运行时缓存和服务器专用日志继续保留在仓库外。
+
+## 当前恢复批次发布
+
+恢复证据与代码提交为 `29a5d742539f44380a625f1d4518c760607ba054`。语雀已更新`selu_`新生成版0.887010×，同时保留既有源码回归1.039292×；39项、三张分表、原顺序及120个源码链接均回读核对通过。当前[发布正文](../benchmarks/lineage/20261109/published-table-recovery.md)、[语雀回读正文](../benchmarks/lineage/20261109/published-table-recovery-readback.md)和[回执](../benchmarks/lineage/20261109/yuque-update-recovery.json)分别保存，首轮发布原件保持不变。
+
+本轮离线复核覆盖1175份实验原件和313个版本文件。910B同步使用项目SSH传送摘要校验的缺失LFS对象，再执行checkout及相同离线核验；最终Git提交、安装包、测试和实体文件核验记录保存在仓库外的本轮运行目录。
