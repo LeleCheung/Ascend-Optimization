@@ -3,6 +3,7 @@ import argparse
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path, PurePosixPath
 import runpy
 
@@ -15,6 +16,11 @@ def main():
     args = parser.parse_args()
     root = args.directory.resolve()
     repo = args.repository.resolve()
+    if os.name=='nt':
+        # 原始厂商采集目录可能超过MAX_PATH；保留原路径和字节身份。
+        def extended(path):
+            return path if str(path).startswith('\\\\?\\') else Path('\\\\?\\'+str(path))
+        root,repo=extended(root),extended(repo)
     assert not args.output.exists()
     read = lambda p: json.loads(p.read_bytes())
     manifest = read(root/'export-manifest.json')
@@ -48,13 +54,26 @@ def main():
                 for name in ['leaf', 'checker']:
                     spec[name] = local(spec[name])
             formal.append(audit['inspect_job'](mapped, path.parent))
-    assert len(formal) == 2, '本轮应保留一次入口失败与一次新源码正式验证'
-    assert sum(row['full_passed'] for row in formal) == 1
-    assert read(root/'offset-check-before.json')['passed'] == 3
-    assert read(root/'offset-check-final.json')['passed'] == 9
-    assert read(root/'entry-equivalence.json')['device_kernels_unchanged']
+    recovery=config.get('goal_kind')=='performance_recovery_with_formal_feedback'
+    if recovery:
+        summary=read(root/'summary.json')
+        assert len(formal)==summary['formal_requests']
+        selected=next(row for row in formal if row['source_sha256']==summary['source_sha256'])
+        assert selected['full_passed'] and selected['accepted']
+        for name in ['offset','runtime']:
+            extra=read(root/'attempts'/selected['source_sha256']/(name+'-check.json'))
+            assert extra['source_sha256']==selected['source_sha256']
+            assert extra['passed']==extra['total']>0
+        assert summary['cann_score']==selected['geo_mean']
+    else:
+        assert len(formal) == 2, '本轮应保留一次入口失败与一次新源码正式验证'
+        assert sum(row['full_passed'] for row in formal) == 1
+        assert read(root/'offset-check-before.json')['passed'] == 3
+        assert read(root/'offset-check-final.json')['passed'] == 9
+        assert read(root/'entry-equivalence.json')['device_kernels_unchanged']
     value = dict(status='passed', files_verified=len(manifest['files']), formal=formal,
-                 scope='原件身份及两次不同源码的完整请求；不重复设备评测，不将入口失败作为性能样本')
+                 scope=('启动路径恢复实验的原件、完整结果与专项补测' if recovery else
+                        '原件身份及两次不同源码的完整请求；不重复设备评测，不将入口失败作为性能样本'))
     args.output.write_text(json.dumps(value, ensure_ascii=False, indent=2)+'\n', encoding='utf8')
     print(json.dumps(dict(status=value['status'], files_verified=value['files_verified'],
                           formal=[{k:r[k] for k in ['source_sha256','full_passed','geo_mean','accepted']} for r in formal])))

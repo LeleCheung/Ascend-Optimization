@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 22,
+    "duration_ms": 184817,
+    "usage": {
+      "input_tokens": 19909,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 236800,
+      "output_tokens": 9328,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 19909,
+        "outputTokens": 9328,
+        "cacheReadInputTokens": 236800,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 0.451145,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 0,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 0.451145,
+    "result": "已完成本轮编辑与预检。\n\n## 修改内容（candidate.py）\n\n1. **连续快路径改用 raw stream**：每次调用执行\n   `stream = torch_npu._C._npu_getCurrentRawStream(idx)`，其中 `idx = x.device.index`。\n   - 使用带同步语义版本，未使用 `_npu_getCurrentRawStreamNoWait`。\n   - 每次重新查询，未缓存返回的 stream。\n   - `idx is None` 或 raw stream 查询抛异常时返回 False，走已有普通 Triton 回退。\n2. **缓存键精简**：改为 `(device_index, dtype, n_elements, block, masked)`，不再每次构造 `tuple(x.shape)`；该平铺核只依赖连续元素个数。\n3. **缓存 bound launch**：编译条目新增 `launcher.launch` 绑定方法，`_do_launch` 直接调用该绑定方法；ABI 前缀 9 项 + 显式参数 + BLOCK/F16MATH 两个 constexpr 占位未改动，grid 仍为标量。\n4. 保留当前 device 检查（切换设备时进入 `torch_npu.npu.device` 上下文）与 `_debug_forced_fallback`。\n5. 缓存仍只含编译句柄、绑定启动方法、function、packed metadata、grid、masked、元素数；不含 Tensor、结果或旧 stream。\n6. 设备 kernel、分块参数、非连续/未对齐/回退路径均未改动；`run` 仍是唯一公开入口，其余辅助函数全单下划线。\n\n## diagnosis.json 更新\n\n新增 `raw_stream_optimization` 段落，明确：\n- cProfile 有插桩开销，只用于定位机制，绝对值不能当真实每次调用成本；\n- 19.29us（`current_stream`）与 0.50us（`_npu_getCurrentRawStream`）是未插桩的独立函数测量，不是完整调用前后差值；\n- 正式整体收益仍待 KGS 完整评测验证；\n- 禁止 NoWait 版本、禁止缓存 stream 的约束与回退条件。\n\n同时更新了 changes/expected/unknowns 中过时的 shape 缓存键与 stream 描述。\n\n## 预检结果\n\n工具桥 preflight：`status = passed`，supplementary **42/42**，`failed_cases = []`，新源码 SHA `80bfefff4ff837b1771eef1618199d56885ff3e950f02a6fc14dbe09ec3d3aca`。\n\n未声明整个 goal 完成；下一步交宿主做完整逐路径审查、专项检查、正式 KGS 评测并反馈性能。"
+  }
+}

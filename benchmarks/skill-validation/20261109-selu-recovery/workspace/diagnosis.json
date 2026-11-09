@@ -1,0 +1,83 @@
+{
+  "operator": "selu_",
+  "candidate": "candidate.py",
+  "evidence": {
+    "source_sha256_baseline": "3cec1212c3b7630bbf548188693f4cd9fef8747ee78cb1f822a42dcf685a23ed",
+    "formal_score_baseline": 0.21003702985461062,
+    "small_input_full_call_us": {
+      "float16_1048576": 84.96,
+      "bfloat16_1048576": 81.90,
+      "float32_1048576": 81.03
+    },
+    "small_input_reference_us": {
+      "float16_1048576": 13.37,
+      "bfloat16_1048576": 13.15,
+      "float32_1048576": 13.04
+    },
+    "large_input_full_call_us": {
+      "float16_4096x4096": 83.95,
+      "bfloat16_4096x4096": 152.05,
+      "float32_4096x4096": 152.52
+    },
+    "device_tasks": [
+      {
+        "case": "selu_-timing-0",
+        "candidate_kernel": "_selu_flat_nomask",
+        "candidate_median_us": 1.0,
+        "reference_kernel": "aclnnInplaceSelu_SeluAiCore_Selu",
+        "reference_median_us": 1.34
+      },
+      {
+        "case": "selu_-timing-3",
+        "candidate_kernel": "_selu_flat_nomask",
+        "candidate_median_us": 78.86,
+        "reference_kernel": "aclnnInplaceSelu_SeluAiCore_Selu",
+        "reference_median_us": 60.40
+      }
+    ],
+    "observation": "多个小输入的完整调用时间几乎相同（约81-85微秒），而设备任务本体仅约1微秒，且小输入损失远大于大输入，说明主要损失在宿主启动路径而非设备分块。"
+  },
+  "mechanism": "starter.py 每次调用都经 `kernel[grid](...)` 走 Triton 的 JITFunction 解析：参数绑定、constexpr 特化、grid lambda 求值、设备/stream 处理与运行时启动器查询。编译产物与 packed metadata 本可复用，但普通调度每次重新执行这些宿主步骤，形成固定开销。直接调用当前编译产物生成的 NPULauncher 并传入已缓存的 function、packed metadata、网格和参数模板，可绕过重复绑定；设备计算仍完全由同一 Triton 产物执行。",
+  "raw_stream_optimization": {
+    "cprofile_caveat": "上一轮 cProfile 有插桩开销：逐函数计时与调用栈记录本身会放大高频热路径的耗时，cProfile 的绝对值不能当作真实每次调用成本。cProfile 只用于定位 torch_npu.npu.current_stream(dev) 每次构造 Stream 并经过通用 device 解析这一机制。",
+    "independent_measurement": "未插桩的独立函数测量：torch_npu.npu.current_stream(dev) 约 19.29us/次；torch_npu._C._npu_getCurrentRawStream(index) 约 0.50us/次，默认 stream 与非默认 stream 均与高层 .npu_stream 完全一致。19.29/0.50 是独立函数测量，不是完整调用前后差值，正式整体收益仍待 KGS 完整评测验证。",
+    "semantics": "使用带同步语义的 _npu_getCurrentRawStream，禁止 NoWait 版本；它只查询运行时元数据，不执行目标计算，符合严格 Triton。每次调用都重新查询，禁止缓存返回的 stream。",
+    "cache_key": "连续快路径缓存键改为 (device_index, dtype, n_elements, block, masked)：该核只依赖连续元素个数，无需每次构造 shape tuple。缓存的只有编译句柄、bound launch 方法与不可变元数据，不缓存 Tensor、结果或旧 stream。",
+    "fallback": "device index 无效、raw stream 查询异常、未对齐、编译失败或调试模式时，回退到已有普通 Triton 调度；当前 device 检查保留。"
+  },
+  "abi_correction": {
+    "scope": "仅修正 _do_launch 的两处 launcher.launch 调用与对应 ABI 注释；kernel 计算、编译缓存、每次读取当前指针/stream 以及回退逻辑均保持上一预检版本不变。",
+    "backend_fact": "后端 make_launcher 源码已核对：format = \"iiiKKOOOO\" + ''.join(format_of(ty) for ty in signature.values()) + debug_abi.parse_format。即 9 个常规前缀之后，严格按原函数参数顺序逐个占槽，constexpr 也保留一个 O 槽位。",
+    "root_cause": "上一预检版本沿用只有 BLOCK 一个 constexpr 的历史 kernel 示例，尾部只写了 1 个占位，少了 F16MATH 的那一个槽位；预检报错 TypeError: function takes exactly 13 arguments (12 given)。这是宿主示例少一个参数导致的，后端 ABI 没有变化。",
+    "fix_nomask": "launcher.launch(grid, 1, 1, current_stream, function, packed_metadata, None, None, None, current_pointer, None, None)，共 12 个参数。",
+    "fix_masked": "launcher.launch(grid, 1, 1, current_stream, function, packed_metadata, None, None, None, current_pointer, n, None, None)，共 13 个参数。",
+    "semantics": "两个尾 None 依次占本 kernel 显式 constexpr BLOCK、F16MATH 的槽位，是按 kernel 显式 constexpr 保留的占位，不是隐藏参数；packed_metadata 之后不得再追加任何额外槽位。",
+    "prohibition": "禁止运行时猜测 slot 数量，禁止捕获 TypeError 后循环重发，禁止 catch 执行错误后重新执行原地计算。"
+  },
+  "changes": [
+    "run(A) 直接调用 _selu_inplace(A)，去掉 *args/**kwargs 解析；kernel 计算、参数与非连续分支保持不变。",
+    "连续分支新增按 (device_index, dtype, n_elements, block, masked) 分键的编译缓存；仅在 data_ptr 16 字节对齐时走快路径，未对齐与非连续走普通 Triton。",
+    "首次缺失缓存时用 kernel.warmup(..., grid=(1,)) 仅编译，不执行原地计算；随后取 compiled.run 作为 NPULauncher。",
+    "快路径每次读取当前 A.data_ptr() 与 torch_npu._C._npu_getCurrentRawStream(A.device.index)，按 ABI 调用缓存的 bound launch(grid,1,1,stream,function,packed_metadata,None,None,None,ptr,None,None)；masked 变体在指针后多传 n，即 launch(...,ptr,n,None,None)。尾部两个 None 依次占 BLOCK、F16MATH 的 constexpr 槽位。",
+    "缓存键为 (device_index, dtype, n_elements, block, masked)，不再包含 shape；缓存只保存编译句柄、bound launch 方法、function、packed metadata、网格、masked 标记与元素数，不保存 Tensor、旧 stream 或结果。",
+    "device index 无效或 raw stream 查询异常时返回 False，走已有普通 Triton 回退；不使用 _npu_getCurrentRawStreamNoWait。",
+    "NPULauncher compile_only、enable_msprof_register_tensor 或 metadata.debug_enabled 为真、以及 warmup 抛异常时，回退到原有的普通 Triton 调度。",
+    "设备上下文仅在首次编译或当前设备与输入设备不一致时进入；缓存命中仍核对当前设备。"
+  ],
+  "expected": [
+    "小输入（1M 元素）完整调用时间显著下降，接近参考实现的十余微秒量级；设备任务本体时间保持在约1微秒。",
+    "大输入（16M 元素）设备时间不变，整体收益主要来自启动开销占比下降。",
+    "快路径用 raw stream 查询替代高层 current_stream 后，宿主固定开销应下降；实际回收幅度以 KGS 完整评测为准，不以独立微基准 19.29/0.50us 直接推断整体加速比。",
+    "42/42 预检验证通过，数值与 starter.py 一致。"
+  ],
+  "history_method": {
+    "id": "selu-compiled-launch-path",
+    "status": "historically_observed",
+    "note": "历史实现相对 CANN 约1.039×、普通调度版本约0.210×；仅为两份完整实现的观察，不是单变量因果证明。本候选需独立预检与正式完整评测，不继承历史加速比。"
+  },
+  "unknowns": [
+    "NPULauncher ABI 已按后端 make_launcher 源码固定为 9 个常规前缀 + 逐签名参数（含 constexpr 占位）；上一候选已通过 42/42 补充检查与正式 36/36，本次不改 ABI，仅改 stream 获取与缓存键。",
+    "raw stream 的 0.50us 为独立函数测量；正式完整调用能回收多少 19.29us 的 current_stream 开销，仍需 KGS 完整评测确认。",
+    "本次改动后需要重新确认 42/42 预检、stream 专项检查与正式 36/36 完整评测。"
+  ]
+}

@@ -1,0 +1,128 @@
+/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/backend_register.py
+def get_current_stream(device):
+    import mindspore
+    try:
+        return mindspore.current_stream().stream_ptr()
+    except Exception:
+        return mindspore.current_stream().id
+
+
+@backend_strategy_registry.register("torch_npu", "get_current_stream")
+def get_current_stream(device):
+    import torch
+    import torch_npu
+    if device is None:
+        device = torch.npu.current_device()
+    if hasattr(torch_npu._C, "_npu_getCurrentRawStreamNoWait"):
+        from torch_npu._C import _npu_getCurrentRawStreamNoWait
+        return _npu_getCurrentRawStreamNoWait(device)
+    else:
+        from torch_npu._C import _npu_getCurrentRawStream
+        return _npu_getCurrentRawStream(device)
+
+
+/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/backend_register.py
+def get_current_stream(device):
+    import torch
+    import torch_npu
+    if device is None:
+        device = torch.npu.current_device()
+    if hasattr(torch_npu._C, "_npu_getCurrentRawStreamNoWait"):
+        from torch_npu._C import _npu_getCurrentRawStreamNoWait
+        return _npu_getCurrentRawStreamNoWait(device)
+    else:
+        from torch_npu._C import _npu_getCurrentRawStream
+        return _npu_getCurrentRawStream(device)
+
+
+@backend_strategy_registry.register("mindspore", "header_file")
+def header_file(enable_taskqueue):
+    return f'''#include "include/utils/device_manager_conf.h"
+#include "include/runtime/hardware_abstract/device_context/device_context_manager.h"
+#include "include/mindspore/ops/kernel/ascend/aclnn/pyboost_impl/aclnn_utils.h"
+{'#include "include/pynative/utils/runtime/op_executor.h"' if {enable_taskqueue} else ''}
+{'#include "include/runtime/pipeline/pipeline.h"' if {enable_taskqueue} else ''}'''
+
+
+/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/backend_register.py
+def async_launch(func):
+    return f'''mindspore::runtime::OpExecutor::DispatchLaunchTask({func});'''
+
+
+@backend_strategy_registry.register("torch_npu", "async_launch")
+def async_launch(func):
+    return f'''at_npu::native::OpCommand cmd;
+    cmd.Name(name.c_str()).SetCustomHandler({func}).Run();'''
+/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/backend_register.py
+def async_launch(func):
+    return f'''at_npu::native::OpCommand cmd;
+    cmd.Name(name.c_str()).SetCustomHandler({func}).Run();'''
+/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/cpu_driver.py
+    def get_current_stream(self, device):
+        """
+        Get stream for current device
+        """
+        # TODO: dummy stream api for cpu backend.
+        return 0
+
+
+# the template is from triton-adapter HEAD. Wrapping the generated kernel assembly into a python module
+def generate_cpu_wrapper_src(constants, signature, kernel_name):
+
+    def _ty_to_cpp(ty):
+        if ty[0] == '*':
+            return "void*"
+        return {
+            "i1": "int32_t",
+            "i8": "int8_t",
+            "i16": "int16_t",
+            "i32": "int32_t",
+            "i64": "int64_t",
+            "u32": "uint32_t",
+            "u64": "uint64_t",
+/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/driver.py
+    def get_current_stream(self, device: Optional[int] = None) -> int:
+        """
+        Get stream for current device
+        """
+        # According to torch_npu, the content of a torch.npu.Stream is essentilly an rtStream_t
+        # TODO: use CANN API instead of torchnpu
+        return get_backend_func("get_current_stream", device)
+
+    def get_benchmarker(self):
+        from triton.testing import do_bench
+        return do_bench
+
+    def get_device_interface(self):
+        return get_backend_func("get_device_interface")
+
+    def get_empty_cache_for_benchmark(self):
+        cache_size = 192 * 1024 * 1024
+        return get_backend_func("get_empty_tensor", cache_size // 4)
+
+    def clear_cache(self, cache):
+        cache.zero_()
+
+/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/utils.py
+def get_backend_func(name, *args, **kwargs):
+    global backend_policy
+    if backend_policy is None:
+        backend_policy_env = os.getenv("TRITON_BACKEND", "default").lower()
+        if backend_policy_env == "torch_npu" or backend_policy_env == "mindspore":
+            backend_policy = backend_policy_env
+        if backend_policy is None:
+            try:
+                import torch
+                import torch_npu
+                backend_policy = "torch_npu"
+            except ImportError:
+                backend_policy = "mindspore"
+    return backend_strategy_registry.execute_func(backend_policy, name, *args, **kwargs)
+
+
+def get_logger(logger_name, logger_level_str):
+    '''
+    '''
+    logging_level_mapping = {
+        "DEBUG": logging.DEBUG,
+        "INFO": logging.INFO,

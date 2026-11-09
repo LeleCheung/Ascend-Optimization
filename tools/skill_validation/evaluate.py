@@ -71,6 +71,11 @@ def main():
                         '--run-directory', str(run), '--output', str(run/(name+'-final.json'))], check=True)
     save(parent/'formal-result-pointer.json', dict(run_directory=str(run), source_sha256=digest,
          result=read(root/'evaluation/result.json')['geo_mean'], audit=read(run/'audit-final.json')))
+    # 每次新源码正式评测后自动形成可回传的性能决策，正确性通过不代表优化结束。
+    subprocess.run([sys.executable,'-m','hgkda','feedback','--result',str(root/'evaluation/result.json'),
+        '--audit',str(run/'audit-final.json'),'--source',str(source),'--operator','selu_',
+        '--timing-cases',str(Path(job['checks']['cann_supplementary']['leaf'])/'timing.jsonl'),
+        '--threshold',str(config.get('threshold',.8)),'--output',str(run/'performance-feedback.json')],check=True)
 
 
 if __name__ == '__main__':

@@ -30,8 +30,33 @@ class KnowledgeTests(unittest.TestCase):
     def test_operator_knowledge_is_scoped(self):
         result=knowledge('expm1_')
         self.assertEqual(result['operator_type'],'pointwise')
-        self.assertEqual([r['id'] for r in result['mechanisms']],['expm1-precision-buffer'])
+        self.assertEqual([r['id'] for r in result['mechanisms'] if r['match']=='operator'],['expm1-precision-buffer'])
         self.assertTrue(all(r['source_sha256'] for r in result['mechanisms']))
+
+    def test_selu_retrieves_bound_launch_experience(self):
+        import hashlib
+        root=Path(__file__).resolve().parents[1]
+        result=knowledge('selu_')
+        self.assertFalse(result['retrieval']['empty'])
+        exact=[r for r in result['mechanisms'] if r['match']=='operator']
+        self.assertEqual(len(exact),1)
+        record=exact[0]
+        self.assertEqual(hashlib.sha256((root/record['source']).read_bytes()).hexdigest(),record['source_sha256'])
+        self.assertTrue(all((root/path).exists() for path in record['evidence']))
+        current=record['current_validation']
+        for key in ['source','formal_result','audit','summary']:
+            item=current[key]
+            self.assertEqual(hashlib.sha256((root/item['path']).read_bytes()).hexdigest(),item['sha256'])
+        self.assertTrue(current['accepted'])
+        other=knowledge('amin')
+        self.assertNotIn(record['id'],[r['id'] for r in other['mechanisms']])
+
+    def test_type_transfer_is_explicit_and_keeps_provenance(self):
+        result=knowledge('negative_')
+        transferable=[r for r in result['mechanisms'] if r['match']=='explicit_type_transfer']
+        self.assertTrue(transferable)
+        self.assertTrue(all(r['transferable_by_type'] for r in transferable))
+        self.assertTrue(all(r['operators']==['selu_'] for r in transferable))
 
 
 if __name__=='__main__':unittest.main()

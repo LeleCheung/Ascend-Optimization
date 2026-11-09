@@ -82,9 +82,12 @@ def render(index, previous_tables, fixed_version, *, github_ref=None):
             strict_text = '\n'.join(lines) or '无可报告成绩'
             strict_text=with_source(strict_text,strict.get('source'))
             latest = versions['independent_entry_verified']
+            experiment = latest.get('generated_experiment')
+            selected_generated=bool(experiment and latest.get('source',{}).get('sha256')==experiment['source']['sha256'])
             if latest['status'] == 'verified':
                 latest_text = 'CANN '+score(latest['cann_score'])
-                latest_text += '\n'+('既有源码回归' if latest['source']['sha256'] == strict['source']['sha256'] else '本轮修复候选')
+                latest_text += '\n'+('Skill新生成并验证' if selected_generated else
+                    '既有源码回归' if latest['source']['sha256'] == strict['source']['sha256'] else '本轮修复候选')
                 tests = f"{latest['formal_cases']}/{latest['formal_cases']}；双方补测通过\n原合同达标"
             else:
                 latest_text = '原合同未闭环'
@@ -97,13 +100,16 @@ def render(index, previous_tables, fixed_version, *, github_ref=None):
             latest_source=latest.get('source') or latest.get('current_record',{}).get('source')
             latest_text=with_source(latest_text,latest_source,
                                     '源码' if latest.get('source') else '候选源码（未验收）')
-            experiment = latest.get('generated_experiment')
-            if experiment:
+            if experiment and not selected_generated:
                 generated_text='Skill新生成：CANN '+score(experiment.get('cann_score'))
                 if not experiment.get('accepted'):
                     generated_text+='（未达标）'
+                else:
+                    generated_text+='（达标）'
                 latest_text=Markup(str(latest_text)+'<br/>'+with_source(generated_text,experiment.get('source'),'新生成源码'))
             method = old.get('关键实现／修改', old.get('关键优化', ''))
+            if experiment and experiment.get('accepted'):
+                method=experiment.get('method_summary',method)
             operator_link=op
             if github_ref:
                 operator_link=github_link(op,(latest_source or strict['source'])['path'],github_ref)

@@ -32,12 +32,21 @@ def main():
     workspace = run/'workspace'
     call = run/'agent-calls'/args.invocation
     call.mkdir(parents=True, exist_ok=False)
-    assert all((Path(config['paired_directory'])/side/'collection.json').exists()
-               for side in ['candidate', 'reference'])
-    tool_command = shlex.join([sys.executable, str(repo/'tools/skill_validation/agent_tools.py'),
+    if config.get('goal_kind')!='performance_recovery_with_formal_feedback':
+        assert all((Path(config['paired_directory'])/side/'collection.json').exists()
+                   for side in ['candidate', 'reference'])
+    tool_path=Path(config.get('agent_tool_path',repo/'tools/skill_validation/agent_tools.py'))
+    tool_command = shlex.join([sys.executable, str(tool_path),
                               '--config', str(args.config.resolve())])
-    save(workspace/'task.json', dict(operator='selu_', source='starter.py',
+    save(workspace/'task.json', dict(operator='selu_', source=config.get('active_source','starter.py'),
+         baseline_source='starter.py',
          required_formal_cases=36, required_supplementary_each=42, tool_command=tool_command,
+         tool_actions=dict(context=tool_command+' context',
+                           preflight=tool_command+' preflight --source '+str(workspace/'candidate.py')),
+         environment='宿主仅运行工具桥；设备依赖由桥接器在容器内调用，不在宿主venv探测Triton',
+         feedback_file=('next-performance-feedback.json' if (workspace/'next-performance-feedback.json').exists()
+                        else 'performance-feedback.json'),
+         optimization_stop='完整正式性能超过阈值且所需补测通过；模型调用返回不代表优化任务完成',
          public_entrypoint='run(A)；其余Python调用函数以单下划线命名，避免KGS公共符号冲突',
          current_best_source_read_allowed=False,
          target='同CANN参考完整调用争取超过0.8，至少相对固定起点产生有效优化'))
@@ -66,13 +75,17 @@ def main():
     command = ['claude', '-p', '--bare', '--output-format', 'stream-json', '--verbose',
                '--max-turns', str(args.max_turns), '--tools', 'Read,Write,Edit,Bash',
                '--allowedTools', 'Read', 'Write', 'Edit',
-               'Bash('+str(sys.executable)+' '+str(repo/'tools/skill_validation/agent_tools.py')+' *)',
+               'Bash('+str(sys.executable)+' '+str(tool_path)+' *)',
                '--permission-mode', 'acceptEdits', '--no-session-persistence',
                '--settings', str(call/'runtime-settings.json')]
     if configuration.get('model'):
         command += ['--model', configuration['model']]
     save(call/'host-invocation.json', dict(argv=command, model=configuration.get('model'),
          secret_environment_recorded=False,
+         runner_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+         tool_bridge_sha256=hashlib.sha256(tool_path.read_bytes()).hexdigest(),
+         config_sha256=hashlib.sha256(args.config.read_bytes()).hexdigest(),
+         prompt_sha256=hashlib.sha256(prompt.encode('utf8')).hexdigest(),
          context_settings=dict(autocompact_percent=80, max_output_tokens=8192),
          skill_sha256=hashlib.sha256((workspace/'skills/hgkda/SKILL.md').read_bytes()).hexdigest()))
     state = read(run/'controller-state.json')

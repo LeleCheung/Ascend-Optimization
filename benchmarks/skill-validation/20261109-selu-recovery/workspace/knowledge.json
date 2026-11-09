@@ -1,0 +1,73 @@
+{
+  "schema_version": "hgkda.result/v1",
+  "operation": "knowledge",
+  "status": "completed",
+  "inputs": [],
+  "result": {
+    "operator_type": "pointwise",
+    "mechanisms": [
+      {
+        "id": "selu-compiled-launch-path",
+        "operators": [
+          "selu_"
+        ],
+        "types": [
+          "pointwise",
+          "fused_pointwise",
+          "indexed_pointwise"
+        ],
+        "transferable_by_type": true,
+        "status": "historically_observed",
+        "signal": "多个小输入完整调用均约80–85微秒，CANN约13微秒；大输入与小输入的性能损失不同",
+        "mechanism": "历史实现缓存编译启动器、函数句柄、packed metadata与元数据，并按当前指针和stream直接启动Triton产物；新生成版采用普通JIT调度，未保留该路径。两份完整实现的对照尚非单变量因果证明",
+        "action": "分别选小输入与最大输入，核验当前编译启动器ABI；测试缓存编译结果并绕过重复参数绑定与设备上下文。设备计算保持Triton，普通Triton路径处理不满足快路径条件的输入",
+        "constraints": [
+          "每次读取当前stream并核对设备、dtype、numel、stride、指针对齐；不能缓存张量结果或旧stream",
+          "首调用仅执行一次原地计算；未对齐、非连续、尾块与profiling模式需正确处理",
+          "启动器ABI以当前生成产物为准；Python或C++宿主桥不得执行目标设备计算",
+          "历史相对CANN1.039292与普通调度0.210037仅为两份实现观察，新候选需完整评测，不能继承历史加速比",
+          "普通调用时间、设备事件跨度和真机任务耗时分别报告；不将事件跨度直接视作设备本体时间"
+        ],
+        "source": "benchmarks/operators/selu_/candidate.py",
+        "source_sha256": "8764018cfb2cab9444a34caf7a171f7eac7395656631698ce491e676557462f0",
+        "evidence_checkpoint": "d33cd2b55dd51d8bab732025409f52f916976370",
+        "evidence": [
+          "benchmarks/regressions/20261109/fixed-25/operators/selu_/evaluation/result.json",
+          "benchmarks/skill-validation/20261109-selu/formal-3cec1212c3b7/operators/selu_/evaluation/result.json"
+        ],
+        "match": "operator",
+        "application": "已观察到的方法；新源码、形状和编译版本仍需独立验证"
+      }
+    ],
+    "source_checkpoint": "f63e6c30a0d8583ba092844e57ab90c0f6d0349f",
+    "documents": [
+      {
+        "id": "contract.md",
+        "sha256": "e6c56b591759f3f517d5f3493ef06146943ab5b3398a6b82a28679815bc3d7d2",
+        "text": "# 候选与参考合同\n\n候选的全部设备计算、复制、归约、扫描、布局转换及回退路径严格使用 Triton。CANN 原生库及来源明确的 Ascend C 实现用于参考，不替代候选实现。Python/C++ 仅负责分配、元数据、参数、编译缓存、状态管理及 Triton 启动。\n\n保留 dtype、stride、offset、特殊值、原地/out 别名、当前设备和 stream 语义。只缓存编译结果和元数据，不缓存输入、输出、旧 stream 或运算结果。地址特化缓存必须区分对齐条件及设备。\n\n静态扫描发现已知风险，不能证明全部路径合规。候选需要绑定源码与依赖的审查记录、完整 KGS 正确性/性能评测，以及算子所需的补充检查。默认一次正式评测；额外复测须有明确原因。历史混合后端成绩不计入严格 Triton 成果。\n"
+      },
+      {
+        "id": "evidence.md",
+        "sha256": "24ae3fb6b3a9b38f36456fb4db21f1e28118a1c1df863b7ca37048a5c4cec6cd",
+        "text": "# 证据层次\n\n先核对源码、测试合同、设备、输入与采集范围。成对 profiling 比较同一输入下候选与参考的实际设备执行。正式性能来自 KGS 完整调用计时；独立 profiling 时间和模拟器时间单列。\n\n搬运量与指令数使用完整记录总和；流水时间、比例使用逐硬件核分布，保留均值、极值、有效与缺失数量。平均搬运粒度为总搬运字节数除以总搬运指令数。候选/参考比值为事实，不直接表示原因；两侧 program 数不同时必须同时查看采集范围。\n\n热点指令按报告时间、cycles 排序，再扩展到源码循环或邻域。源码映射使用已有编译调试信息；实际 IR 必须与候选绑定。不同流水可能重叠，指令时间不能累加成完整耗时。时间轴中的可见空闲不等于已证明的因果空泡。\n\nRoofline 需要同口径工作量、字节数、时间及参考吞吐。经验 microbenchmark 包络与标称物理峰值分开，接口字节与物理内存流量分开。证据不足时说明缺少什么，不用活跃比例替代峰值利用率。\n"
+      },
+      {
+        "id": "operators.md",
+        "sha256": "06577d946e2b8686263df2d17576c8ada6a7bd603eb14d7cc3ea0445679af455",
+        "text": "# 按算子类型选择机制\n\n- 逐元素与原地：检查连续快路径、分块和每 program 工作量；保留非连续输入、尾部、特殊值与别名。超越函数结合实际 IR 检查类型扩展、稳定公式和 UB 存活区间。\n- 归约与扫描：检查归约轴、转置、块间通信与确定性。改变累加精度或顺序后，完整数值复测，不只验证小输入。\n- 索引、散射与采样：检查索引边界、stride、重复索引、写冲突与原子更新。初始化和布局转换属于候选完整调用。\n- 矩阵乘与融合：先确认计算路径，再比较面板复用、K 分块、缓冲占用、同步及尾处理。源码层面复用不保证编译后搬运下降。\n- 复制：参考可能使用 DMA，候选必须使用 Triton。区分启动、地址计算、设备搬运与分配，避免从单侧比例推断参考路径。\n\n每项修改给出证据、机制假设、预期指标变化和验证方式。小规模区分性实验用于判断机制，完整候选用于验证交付效果；两者结果不能互相替代。\n"
+      },
+      {
+        "id": "rules.md",
+        "sha256": "21c57697c6f125cea5fe6b2e396cd7948078878cb2058a8fdcd082ab61dc27b2",
+        "text": "# 指标与优化方向\n\n当前规则是版本化的经验启发式，不是自动学习的硬件定律。\n\n- MTE 活跃比例 ≥ 0.7：检查连续性、搬运粒度、重复读写、分块与计算重叠。\n- Vector/Cube 活跃比例 ≥ 0.7：检查实际运算、类型转换、归约、计算效率与流水组织。\n- Scalar 活跃比例 ≥ 0.5：检查控制、索引、动态除法与每 program 覆盖的数据量。\n\n多个方向同时活跃时追加执行路径、IR 或指令证据。达到阈值只提高排查优先级，不直接判定总耗时由该组件限制。低于阈值也不排除瓶颈。\n\n知识条目包含适用算子/形状/精度、指标口径、方法、失败条件、源码与结果身份。新经验先标记待验证，完整复验后经审查合并同条件重复项；冲突记录保留适用范围，不覆盖失败证据。\n"
+      }
+    ],
+    "retrieval": {
+      "exact": 1,
+      "type_transfer": 0,
+      "empty": false,
+      "policy": "精确算子记录优先；仅显式标记可迁移的记录按类型补充，保留原适用约束"
+    },
+    "update_policy": "新记录先作待验证假设；绑定源码、合同和完整结果后，经审查按条件去重更新"
+  }
+}

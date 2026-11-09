@@ -1,0 +1,150 @@
+{
+  "schema_version": "hgkda.knowledge/v1",
+  "source_checkpoint": "f63e6c30a0d8583ba092844e57ab90c0f6d0349f",
+  "records": [
+    {
+      "id": "selu-compiled-launch-path",
+      "operators": ["selu_"],
+      "types": ["pointwise", "fused_pointwise", "indexed_pointwise"],
+      "transferable_by_type": true,
+      "status": "historically_observed",
+      "signal": "多个小输入完整调用均约80–85微秒，CANN约13微秒；大输入与小输入的性能损失不同",
+      "mechanism": "历史实现缓存编译启动器、函数句柄、packed metadata与元数据，并按当前指针和stream直接启动Triton产物；新生成版采用普通JIT调度，未保留该路径。两份完整实现的对照尚非单变量因果证明",
+      "action": "分别选小输入与最大输入，核验当前编译启动器ABI；测试缓存编译结果并绕过重复参数绑定与设备上下文。设备计算保持Triton，普通Triton路径处理不满足快路径条件的输入",
+      "constraints": [
+        "每次读取当前stream并核对设备、dtype、numel、stride、指针对齐；不能缓存张量结果或旧stream",
+        "首调用仅执行一次原地计算；未对齐、非连续、尾块与profiling模式需正确处理",
+        "启动器ABI以当前生成产物为准；Python或C++宿主桥不得执行目标设备计算",
+        "历史相对CANN1.039292与普通调度0.210037仅为两份实现观察，新候选需完整评测，不能继承历史加速比",
+        "普通调用时间、设备事件跨度和真机任务耗时分别报告；不将事件跨度直接视作设备本体时间"
+      ],
+      "source": "benchmarks/operators/selu_/candidate.py",
+      "source_sha256": "8764018cfb2cab9444a34caf7a171f7eac7395656631698ce491e676557462f0",
+      "evidence_checkpoint": "d33cd2b55dd51d8bab732025409f52f916976370",
+      "evidence": [
+        "benchmarks/regressions/20261109/fixed-25/operators/selu_/evaluation/result.json",
+        "benchmarks/skill-validation/20261109-selu/formal-3cec1212c3b7/operators/selu_/evaluation/result.json"
+      ]
+    },
+    {
+      "id": "pointwise-signed-zero",
+      "operators": [
+        "negative_"
+      ],
+      "types": [
+        "pointwise"
+      ],
+      "status": "historically_observed",
+      "signal": "普通数正确但零符号不符",
+      "mechanism": "历史 Triton 负号降低为 0-x，可能不保留目标负零语义",
+      "action": "核对实际 TTIR；可测试浮点符号位翻转，并重新验证零、NaN/Inf、全部 dtype 与布局",
+      "constraints": [
+        "不能从普通数测试推断特殊值正确",
+        "更大分块需重新检查 UB"
+      ],
+      "source": "project/Ascend-Optimization-v1/tools/profiling/hgkda/skills/hgkda/references/算子类型/逐元素与原地.md",
+      "source_sha256": "63881dea0fd3354eff97b1afc51b6a0c58ddf041157aef2f6d93f5b981a496ed"
+    },
+    {
+      "id": "expm1-precision-buffer",
+      "operators": [
+        "expm1_"
+      ],
+      "types": [
+        "pointwise"
+      ],
+      "status": "historically_observed",
+      "signal": "总读写量相同而 Vector/搬运指令与候选时间较高",
+      "mechanism": "稳定数学公式、类型扩展与缓冲存活共同影响性能",
+      "action": "按 dtype 检查小值公式、实际 IR、tile 和每轮块数；用完整调用验证",
+      "constraints": [
+        "减少 IR 转换不保证更快",
+        "FP16 域通过不能代替 BF16 域检查",
+        "近零误差、负零和首次调用语义须保持"
+      ],
+      "source": "project/Ascend-Optimization-v1/tools/profiling/hgkda/skills/hgkda/references/性能指标/expm1精度与流式分块.md",
+      "source_sha256": "370f1784885e383ab400e6aeed1c94ba1912c7eca1ece347864295cfc4672214"
+    },
+    {
+      "id": "gemm-reuse-direction",
+      "operators": [
+        "matmul_bias_activation"
+      ],
+      "types": [
+        "gemm"
+      ],
+      "status": "historically_observed",
+      "signal": "GM/L1 总量近似不变，UB 流量与 MTE 指令变化",
+      "mechanism": "相邻输出块的复用方向改变内部数据组织，收益不必来自 HBM 流量减少",
+      "action": "比较共享 A/B、K 分块及交错组织，结合实际 bcmlir、搬运粒度与完整评测",
+      "constraints": [
+        "静态 copy 数量不是动态搬运次数",
+        "热点源码映射不等于该 Python 表达式独占时间"
+      ],
+      "source": "project/Ascend-Optimization-v1/tools/profiling/hgkda/skills/hgkda/references/性能指标/成对证据到优化动作的闭环.md",
+      "source_sha256": "63a1eca1a23edb2f184e4bed2f7c6e3c2035d4b8c3e4fae3fb66f643a0fc868e"
+    },
+    {
+      "id": "scatter-scalarized-lowering",
+      "operators": [
+        "scatter_add"
+      ],
+      "types": [
+        "scatter"
+      ],
+      "status": "historically_observed",
+      "signal": "无冲突写仍慢，TTIR 到后续 IR 出现逐元素循环",
+      "mechanism": "具体 FP16 编译实例将向量原子写降低为逐 lane 存储",
+      "action": "检查候选本身的 IR 与索引表达，再测试分组或输出块归约",
+      "constraints": [
+        "不能推广到全部 dtype/形状",
+        "预处理、暂存和转换必须计入完整调用",
+        "原子累加精度独立验证"
+      ],
+      "source": "project/Ascend-Optimization-v1/tools/profiling/hgkda/skills/hgkda/references/算子类型/索引与采样.md",
+      "source_sha256": "4ad9c5ae6b3306ab3d2673d016c95fb680b36e7f07b8e1688f933d2fd880e8b7"
+    },
+    {
+      "id": "qkv-layout-precision",
+      "operators": [
+        "transform_bias_rescale_qkv"
+      ],
+      "types": [
+        "fused_pointwise"
+      ],
+      "status": "historically_observed",
+      "signal": "扁平索引产生离散读写循环与大量写回指令",
+      "mechanism": "显式序列×head_dim 二维分块改善编译后的搬运组织",
+      "action": "比较实际 ttadapter 的离散访存标记、设备写回及延迟；Q 与 bias 在相加前使用足够精度",
+      "constraints": [
+        "布局与数值问题分开验证",
+        "旧候选采集不能作为新候选实测"
+      ],
+      "source": "project/Ascend-Optimization-v1/tools/profiling/hgkda/skills/hgkda/references/算子类型/融合与执行路径.md",
+      "source_sha256": "d7f3cb7051eed4a0511d01782418c1447abf641874e8268a4f6d586146be9e26"
+    },
+    {
+      "id": "reference-stability",
+      "operators": [
+        "cumulative_trapezoid",
+        "_conj_physical",
+        "fractional_max_pool3d"
+      ],
+      "types": [
+        "scan",
+        "sampling"
+      ],
+      "status": "historically_observed",
+      "signal": "参考重复结果不自洽或 trace 出现 CPU 回退",
+      "mechanism": "参考路径、精度顺序或运行条件影响可比性",
+      "action": "固定输入检查参考允许区间、实际叶子算子及任务路径，单列不同确定性条件",
+      "constraints": [
+        "不偷偷修改全局确定性或原容差",
+        "不以慢 CPU 回退推断设备优化上限",
+        "CANN 混合方案只作参考分析，不进入 Triton 候选"
+      ],
+      "source": "project/Ascend-Optimization-v1/tools/profiling/hgkda/skills/hgkda/references/性能指标/参考可信性与NPU分解.md",
+      "source_sha256": "100fd8a3ccf13c73bc24b7fcaba08f0feda48e5b96910110cd9820f3ee0d0d0c"
+    }
+  ]
+}

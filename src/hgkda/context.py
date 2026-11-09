@@ -20,10 +20,20 @@ def knowledge(operator, hypotheses=()):
     if hypotheses:
         names.append("rules.md")
     library = json.loads(root.joinpath("mechanisms.json").read_text(encoding="utf8"))
-    selected = [r for r in library["records"] if operator in r["operators"]]
+    selected = []
+    for record in library["records"]:
+        exact = operator in record.get("operators", [])
+        transferable = record.get("transferable_by_type") is True and kind in record.get("types", [])
+        if exact or transferable:
+            selected.append(dict(record, match="operator" if exact else "explicit_type_transfer",
+                application="已观察到的方法；新源码、形状和编译版本仍需独立验证"))
     return {"operator_type": kind, "mechanisms": selected, "source_checkpoint": library["source_checkpoint"], "documents": [
         {"id": name, "sha256": hashlib.sha256(root.joinpath(name).read_bytes()).hexdigest(),
          "text": root.joinpath(name).read_text(encoding="utf8")} for name in names],
+        "retrieval": {"exact": sum(r["match"] == "operator" for r in selected),
+                      "type_transfer": sum(r["match"] == "explicit_type_transfer" for r in selected),
+                      "empty": not selected,
+                      "policy": "精确算子记录优先；仅显式标记可迁移的记录按类型补充，保留原适用约束"},
         "update_policy": "新记录先作待验证假设；绑定源码、合同和完整结果后，经审查按条件去重更新"}
 
 

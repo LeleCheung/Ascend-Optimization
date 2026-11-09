@@ -44,6 +44,17 @@ def verify(index, repository):
             for measured in mixed.get('measurements', {}).values():
                 if measured and measured.get('verified_source_binding'):
                     assert measured['binding']['frozen_source_sha256'] == mixed['source']['sha256']
+            latest=versions['independent_entry_verified']
+            generated=([latest['generated_experiment']] if latest.get('generated_experiment') else [])
+            for experiment in generated+latest.get('generated_history',[]):
+                result=json.loads((repository/experiment['formal_result']['path']).read_bytes())
+                review=json.loads((repository/experiment['review']['path']).read_bytes())
+                audit=json.loads((repository/experiment['audit']['path']).read_bytes())
+                matches=[r for r in audit['rows'] if r['source_sha256']==experiment['source']['sha256']]
+                assert audit['evidence_verified'] and len(matches)==1
+                assert review['source_sha256']==experiment['source']['sha256']
+                assert result['geo_mean']==matches[0]['geo_mean']==experiment['cann_score']
+                assert matches[0]['accepted']==experiment['accepted']
         walk(row)
     walk(index['artifacts'])
     return dict(status='passed', operators=39, original_contract_accepted=26,

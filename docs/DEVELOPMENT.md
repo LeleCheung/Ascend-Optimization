@@ -37,6 +37,7 @@
 | [hotspots.py](../src/hgkda/hotspots.py)、[regions.py](../src/hgkda/regions.py) | 筛选候选内核指令，聚合源码区域；有时间轴时计算区间活动、等待和空闲 |
 | [roofline.py](../src/hgkda/roofline.py) | 根据 GEMM 工作量、同次采集及经验参考计算数值模型 |
 | [context.py](../src/hgkda/context.py) | 核对源码身份，将对照、已提供的实际 IR、Roofline、热点及知识组织为模型上下文 |
+| [feedback.py](../src/hgkda/feedback.py) | 核对完整性能与case清单，按几何平均损失和输入规模选择后续诊断对象，返回继续优化或达标决策 |
 | [data/knowledge/](../src/hgkda/data/knowledge/) | 方法约束、算子类别、指标规则与历史机制经验，随 Python 包安装 |
 | [curation.py](../src/hgkda/curation.py) | 知识证据核验、同作用域去重、历史保留与限长检索 |
 | [gate.py](../src/hgkda/gate.py)、[validation.py](../src/hgkda/validation.py) | 静态筛查、源码审查绑定与算子补充检查结果判定 |
@@ -111,6 +112,10 @@ Windows 与 910B 的实际目录及已安装环境见 [目录与运行环境](di
 流程为：固定 FlagGems／FlagTree 版本、CANN 参考与测试合同 → 宿主 Agent 读取 skill → 成对采集与指标比较 → 按需读取源码、实际 IR、Roofline 与热点证据 → 生成严格 Triton 候选 → 路径审查、完整 KGS 评测及补充检查 → 保留有效候选与更新经验。复用现有工具，按实际执行中发现的缺口补齐调度；模型、采集和每次修改均保留轨迹。
 
 从固定的起始实现开展优化，不直接把历史最佳源码作为生成成果。允许使用已有分类知识，但须记录输入的知识版本及人工干预。已经完成的固定候选回归和本轮 Codex 分析后修改的版本分别保留，不能表述为独立 skill 从起点自动生成的结果。
+
+启动路径与性能反馈的恢复方法见 [SELU独立skill性能恢复](selu-skill-recovery-20261109.md)。包内经验检索现在显式返回精确／类型迁移数量；性能失败通过 `feedback` 回传。服务器工具的模型上下文须绑定当前源码，不能复用旧SHA的采集；独立启动诊断与完整KGS计时分别保存。
+
+本轮新生成版已由0.210037×提升至0.887010× CANN，正式36/36、双方各42/42和专项33/33通过。历史独立回归1.039292×继续作为交付；总达标数仍为26/30。新生成候选及全部中间失败单独保存，包含明确的Codex方法指导。
 
 本轮完成证据核验及 GitHub 同步后，更新语雀 [FlagGems Table](https://bosc.yuque.com/up3wk0/twwy86/vcqrbcy2hp7gds4g)。保留原算子范围、来源分组与顺序，表格仍以表格为主体，不加入实验过程长文。三类记录如下：
 

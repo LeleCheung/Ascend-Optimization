@@ -24,3 +24,9 @@ curate --records <records.json> --root <evidence-root> 按算子类型、动作�
 retrieve --index <index.json> --operator-type <type> --scope <scope.json> --max-chars 6000 重新校验证据后按作用域检索，不截断单条记录。它是确定性整理规则；模型提出的新经验不会未经验证自动成为成功规律。
 
 gate --source <candidate.py> 只执行已知路径静态筛查；--review 可绑定已有审查记录。KGS evaluate 还需冻结请求、审查与新的输出目录。后端详细用法见仓库 docs/backends.md。
+
+## 性能反馈
+
+`feedback --operator <name> --source <candidate.py> --result <result.json> --audit <audit.json> --timing-cases <timing.jsonl> --output <new.json>` 校验源码、正式审计及计时case身份，重建几何平均，按性能损失选择代表case，并覆盖各dtype的最大输入。
+
+返回 `continue_optimization` 时把逐case反馈交回模型继续修改；只有超过阈值（默认0.8×）且正式审计所需补测通过才返回 `target_met`。偏移、stream等任务专项检查另行绑定，不由这个分数决策替代。该命令不调用模型、不执行设备测试，也不代替宿主的调度和审查。

@@ -33,6 +33,12 @@ def main():
     config=read(args.config)
     run=Path(config['run_directory']);repo=Path(config['repository']);workspace=run/'workspace'
     if args.action=='context':
+        if config.get('goal_kind')=='performance_recovery_with_formal_feedback':
+            from recovery_context import build
+            brief=build(config)
+            print(json.dumps(dict(status='completed',source_sha256=brief['source_sha256'],
+                output=str(workspace/'context-brief.json'),retrieval=brief['knowledge_retrieval']),ensure_ascii=False))
+            return
         comparison=workspace/'comparison.json';context=workspace/'context.json'
         if not comparison.exists():
             subprocess.run([sys.executable,'-m','hgkda','compare','--directory',config['paired_directory'],

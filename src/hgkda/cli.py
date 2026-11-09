@@ -45,6 +45,14 @@ def parser():
     p.add_argument("--source", type=Path, required=True)
     p.add_argument("--review", type=Path)
     p.add_argument("--output", type=Path)
+    p = commands.add_parser("feedback")
+    p.add_argument("--result", type=Path, required=True)
+    p.add_argument("--timing-cases", type=Path, required=True)
+    p.add_argument("--audit", type=Path, required=True)
+    p.add_argument("--source", type=Path, required=True)
+    p.add_argument("--operator", required=True)
+    p.add_argument("--threshold", type=float, default=.8)
+    p.add_argument("--output", type=Path)
     p = commands.add_parser("kgs")
     p.add_argument("action", choices=["status", "upload", "evaluate", "operation"])
     p.add_argument("--server", required=True)
@@ -130,6 +138,22 @@ def dispatch(args):
         text = args.source.read_bytes().decode("utf8")
         result = admit(text, read_json(args.review)) if args.review else inspect_text(text)
         return result, [identity(args.source)] + ([identity(args.review)] if args.review else [])
+    if cmd == "feedback":
+        from .feedback import performance_feedback
+        source = identity(args.source)
+        audit = read_json(args.audit)
+        rows = [r for r in audit.get('rows', []) if r.get('operator') == args.operator]
+        if not audit.get('evidence_verified') or len(rows) != 1 or rows[0]['source_sha256'] != source['sha256']:
+            raise ValueError('正式审计与候选源码身份不同或未通过')
+        result = read_json(args.result)
+        if result.get('geo_mean') != rows[0].get('geo_mean'):
+            raise ValueError('正式结果与审计性能不同')
+        cases = [json.loads(line) for line in args.timing_cases.read_text(encoding='utf8').splitlines() if line.strip()]
+        checks = rows[0].get('checks', {})
+        checked = len(checks) >= 2 and all(r.get('status') == 'passed' for r in checks.values())
+        feedback = performance_feedback(result, cases, threshold=args.threshold, checks_passed=checked)
+        feedback.update(source_sha256=source['sha256'], operator=args.operator)
+        return feedback, [source,identity(args.result),identity(args.audit),identity(args.timing_cases)]
     if cmd == "kgs":
         from .adapters.kgs import call, evaluate, upload_bundle
         if args.action == "status":

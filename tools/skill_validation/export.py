@@ -25,7 +25,8 @@ def main():
     secrets = [str(value).encode() for key, value in settings.get('env', {}).items()
                if any(word in key.upper() for word in ['TOKEN', 'API_KEY', 'PASSWORD']) and len(str(value)) > 8]
     files = [p for p in run.rglob('*') if p.is_file() and not p.is_symlink()
-             and not (set(p.relative_to(run).parts) & EXCLUDE)]
+             and not (set(p.relative_to(run).parts) & EXCLUDE)
+             and not any(part.endswith('-cache') for part in p.relative_to(run).parts)]
     assert files
     records = []
     for path in sorted(files):
