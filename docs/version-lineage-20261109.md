@@ -55,3 +55,9 @@ python tools/lineage/build.py --previous-table benchmarks/lineage/20261109/input
 生成候选的普通输入调用约80–85微秒，对应 CANN 约13微秒；大输入约84／152微秒。现有完整调用结果提示需要补查宿主调度与设备执行，尚不能证明某项开销的独立占比。模型将逐核均值用于全任务 Roofline、将 program 载荷当作指令粒度、将零值解释为采样分辨率的推断未获证实；原诊断保留，审查反馈另存，不把这些推断纳入已验证知识。
 
 控制工具位于 [tools/skill_validation/](../tools/skill_validation/)。`prepare_and_run.py` 用于新的独立试验，`agent_runner.py` 可恢复模型阶段而不重新采集，`agent_tools.py` 暴露上下文和默认最多三份设备预检，`evaluate.py` 在外部逐路径审查后对每份新源码提交一次正式评测；本轮因公共入口兼容修复明确增加第四份预检。这些工具是显式的服务器集成验证器，运行时路径由参数／配置传入，不加入 Python 核心依赖。
+
+## 表格发布与同步
+
+语雀 [FlagGems Table](https://bosc.yuque.com/up3wk0/twwy86/vcqrbcy2hp7gds4g) 已按三类版本更新并回读确认，保留39项及原顺序、三张分表和固定依赖版本。页面仍以表格为主体；[发布正文](../benchmarks/lineage/20261109/published-table.md)与[更新回执](../benchmarks/lineage/20261109/yuque-update.json)保存实际发布内容。
+
+GitHub证据提交为 `d878910bc48c75105c1dfe787325efd8c4c4644d`。910B 的常规 LFS 下载超时后，使用项目SSH传输54个已逐一校验摘要的内容寻址对象，再执行本地 LFS checkout。服务器已完成296个版本文件及599份实验原件核验；没有以指针替代实验实体。运行时缓存和服务器专用日志继续保留在仓库外。

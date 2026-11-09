@@ -13,7 +13,8 @@ def table(headers, rows):
     def row(values, tag):
         return '<tr>'+''.join('<'+tag+'>'+html.escape(str(v)).replace('\n', '<br/>')+'</'+tag+'>'
                               for v in values)+'</tr>'
-    return '<table><thead>'+row(headers, 'th')+'</thead><tbody>'+''.join(row(r, 'td') for r in rows)+'</tbody></table>'
+    # 语雀YMD的HTML表格要求table直接包含tr，不接受thead/tbody。
+    return '<table>'+row(headers, 'td')+''.join(row(r, 'td') for r in rows)+'</table>'
 
 
 def render(index, previous_tables, fixed_version):
