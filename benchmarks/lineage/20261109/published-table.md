@@ -45,7 +45,7 @@
 </tr>
 <tr>
 <td>
-<p>selu_</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/selu_/candidate.py">selu_</a></p>
 </td>
 <td>
 <p>精度失败</p>
@@ -57,10 +57,10 @@
 <p>无已核验记录</p>
 </td>
 <td>
-<p>CANN 0.982×<br />PyTorch 0.922×</p>
+<p>CANN 0.982×<br />PyTorch 0.922×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/selu_/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 1.039×<br />既有源码回归<br />Skill新生成：CANN 0.210×（未达标）</p>
+<p>CANN 1.039×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/selu_/candidate.py">源码</a><br />Skill新生成：CANN 0.210×（未达标）<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/skill-validation/20261109-selu/formal-3cec1212c3b7/operators/selu_/candidate.py">新生成源码</a></p>
 </td>
 <td>
 <p>36/36；双方补测通过<br />原合同达标</p>
@@ -74,7 +74,7 @@
 </tr>
 <tr>
 <td>
-<p>rad2deg_</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/rad2deg_/candidate.py">rad2deg_</a></p>
 </td>
 <td>
 <p>精度失败</p>
@@ -83,13 +83,13 @@
 <p>正确性失败，33/36</p>
 </td>
 <td>
-<p>CANN 1.297×<br />不计严格 Triton</p>
+<p>CANN 1.297×<br />不计严格 Triton<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/rad2deg_/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.922×<br />PyTorch 1.119×</p>
+<p>CANN 0.922×<br />PyTorch 1.119×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/rad2deg_/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.834×<br />既有源码回归</p>
+<p>CANN 0.834×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/rad2deg_/candidate.py">源码</a></p>
 </td>
 <td>
 <p>36/36；双方补测通过<br />原合同达标</p>
@@ -103,7 +103,7 @@
 </tr>
 <tr>
 <td>
-<p>log10_</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/log10_/candidate.py">log10_</a></p>
 </td>
 <td>
 <p>精度失败</p>
@@ -112,13 +112,13 @@
 <p>正确性失败，33/36</p>
 </td>
 <td>
-<p>CANN 1.306×<br />不计严格 Triton</p>
+<p>CANN 1.306×<br />不计严格 Triton<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/log10_/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.843×<br />PyTorch 0.806×</p>
+<p>CANN 0.843×<br />PyTorch 0.806×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/log10_/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.941×<br />既有源码回归</p>
+<p>CANN 0.941×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/log10_/candidate.py">源码</a></p>
 </td>
 <td>
 <p>36/36；双方补测通过<br />原合同达标</p>
@@ -132,7 +132,7 @@
 </tr>
 <tr>
 <td>
-<p>cumulative_trapezoid</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/cumulative_trapezoid/candidate.py">cumulative_trapezoid</a></p>
 </td>
 <td>
 <p>精度失败</p>
@@ -141,13 +141,13 @@
 <p>历史0.363×；默认扩展正确性未通过</p>
 </td>
 <td>
-<p>源码已归档；成绩待绑定<br />不计严格 Triton</p>
+<p>源码已归档；成绩待绑定<br />不计严格 Triton<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/cumulative_trapezoid/candidate.py">源码</a></p>
 </td>
 <td>
-<p>PyTorch 0.845×</p>
+<p>PyTorch 0.845×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/cumulative_trapezoid/candidate.py">源码</a></p>
 </td>
 <td>
-<p>原合同未闭环<br />数学合同 CANN 1.012×（单列）</p>
+<p>原合同未闭环<br />数学合同 CANN 1.012×（单列）<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/cumulative_trapezoid/candidate.py">候选源码（未验收）</a></p>
 </td>
 <td>
 <p>原合同语义／正确性未闭环；独立数学合同通过</p>
@@ -161,7 +161,7 @@
 </tr>
 <tr>
 <td>
-<p>uniform</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/regressions/20261109/uniform-native-reference/operators/uniform/candidate.py">uniform</a></p>
 </td>
 <td>
 <p>精度通过，无有效加速比</p>
@@ -173,10 +173,10 @@
 <p>无已核验记录</p>
 </td>
 <td>
-<p>PyTorch 1.628×</p>
+<p>PyTorch 1.628×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/uniform/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 2.399×<br />既有源码回归</p>
+<p>CANN 2.399×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/regressions/20261109/uniform-native-reference/operators/uniform/candidate.py">源码</a></p>
 </td>
 <td>
 <p>18/18；双方补测通过<br />原合同达标</p>
@@ -190,7 +190,7 @@
 </tr>
 <tr>
 <td>
-<p>value_selecting_reduction_backward</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/value_selecting_reduction_backward/candidate.py">value_selecting_reduction_backward</a></p>
 </td>
 <td>
 <p>0.4935×</p>
@@ -202,10 +202,10 @@
 <p>无已核验记录</p>
 </td>
 <td>
-<p>CANN 1.470×<br />PyTorch 1.676×</p>
+<p>CANN 1.470×<br />PyTorch 1.676×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/value_selecting_reduction_backward/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 1.349×<br />既有源码回归</p>
+<p>CANN 1.349×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/value_selecting_reduction_backward/candidate.py">源码</a></p>
 </td>
 <td>
 <p>96/96；双方补测通过<br />原合同达标</p>
@@ -219,7 +219,7 @@
 </tr>
 <tr>
 <td>
-<p>scatter_add</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/scatter_add/candidate.py">scatter_add</a></p>
 </td>
 <td>
 <p>精度失败</p>
@@ -231,10 +231,10 @@
 <p>无已核验记录</p>
 </td>
 <td>
-<p>CANN 1.886×<br />PyTorch 1.880×</p>
+<p>CANN 1.886×<br />PyTorch 1.880×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/scatter_add/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 1.892×<br />既有源码回归</p>
+<p>CANN 1.892×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/scatter_add/candidate.py">源码</a></p>
 </td>
 <td>
 <p>18/18；双方补测通过<br />原合同达标</p>
@@ -248,7 +248,7 @@
 </tr>
 <tr>
 <td>
-<p>upsample_bilinear2d</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/upsample_bilinear2d/candidate.py">upsample_bilinear2d</a></p>
 </td>
 <td>
 <p>精度失败</p>
@@ -260,10 +260,10 @@
 <p>无已核验记录</p>
 </td>
 <td>
-<p>CANN 1.147×<br />PyTorch 0.945×</p>
+<p>CANN 1.147×<br />PyTorch 0.945×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/upsample_bilinear2d/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 1.142×<br />既有源码回归</p>
+<p>CANN 1.142×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/upsample_bilinear2d/candidate.py">源码</a></p>
 </td>
 <td>
 <p>24/24；双方补测通过<br />原合同达标</p>
@@ -277,7 +277,7 @@
 </tr>
 <tr>
 <td>
-<p>fractional_max_pool3d</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/fractional_max_pool3d/candidate.py">fractional_max_pool3d</a></p>
 </td>
 <td>
 <p>0.0266×</p>
@@ -286,13 +286,13 @@
 <p>正式9/9，扩展16/27；参考CPU回退</p>
 </td>
 <td>
-<p>源码已归档；成绩待绑定<br />不计严格 Triton</p>
+<p>源码已归档；成绩待绑定<br />不计严格 Triton<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/fractional_max_pool3d/candidate.py">源码</a></p>
 </td>
 <td>
-<p>PyTorch 33.002×（参考含CPU回退）</p>
+<p>PyTorch 33.002×（参考含CPU回退）<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/fractional_max_pool3d/candidate.py">源码</a></p>
 </td>
 <td>
-<p>原合同未闭环</p>
+<p>原合同未闭环<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/fractional_max_pool3d/candidate.py">候选源码（未验收）</a></p>
 </td>
 <td>
 <p>缺合格的同语义CANN参考；不计达标</p>
@@ -306,7 +306,7 @@
 </tr>
 <tr>
 <td>
-<p>_conj_physical</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/_conj_physical/candidate.py">_conj_physical</a></p>
 </td>
 <td>
 <p>精度失败</p>
@@ -318,10 +318,10 @@
 <p>无已核验记录</p>
 </td>
 <td>
-<p>CANN 1.153×<br />PyTorch 45.279×（参考含CPU回退）</p>
+<p>CANN 1.153×<br />PyTorch 45.279×（参考含CPU回退）<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/_conj_physical/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 1.234×<br />既有源码回归</p>
+<p>CANN 1.234×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/_conj_physical/candidate.py">源码</a></p>
 </td>
 <td>
 <p>14/14；双方补测通过<br />原合同达标</p>
@@ -380,7 +380,7 @@
 </tr>
 <tr>
 <td>
-<p>negative_</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/regressions/20261109/negative-complete-block/operators/negative_/candidate.py">negative_</a></p>
 </td>
 <td>
 <p>未录入</p>
@@ -389,13 +389,13 @@
 <p>正确性失败 27/30</p>
 </td>
 <td>
-<p>CANN 1.251×<br />不计严格 Triton</p>
+<p>CANN 1.251×<br />不计严格 Triton<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/negative_/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.814×<br />PyTorch 0.560×</p>
+<p>CANN 0.814×<br />PyTorch 0.560×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/negative_/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.806×<br />本轮修复候选</p>
+<p>CANN 0.806×<br />本轮修复候选<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/regressions/20261109/negative-complete-block/operators/negative_/candidate.py">源码</a></p>
 </td>
 <td>
 <p>30/30；双方补测通过<br />原合同达标</p>
@@ -409,7 +409,7 @@
 </tr>
 <tr>
 <td>
-<p>xlogy_scalar_tensor</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/xlogy_scalar_tensor/candidate.py">xlogy_scalar_tensor</a></p>
 </td>
 <td>
 <p>未录入</p>
@@ -421,10 +421,10 @@
 <p>无已核验记录</p>
 </td>
 <td>
-<p>CANN 1.579×<br />PyTorch 1.234×</p>
+<p>CANN 1.579×<br />PyTorch 1.234×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/xlogy_scalar_tensor/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 1.536×<br />既有源码回归</p>
+<p>CANN 1.536×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/xlogy_scalar_tensor/candidate.py">源码</a></p>
 </td>
 <td>
 <p>30/30；双方补测通过<br />原合同达标</p>
@@ -438,7 +438,7 @@
 </tr>
 <tr>
 <td>
-<p>nan_to_num_</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/nan_to_num_/candidate.py">nan_to_num_</a></p>
 </td>
 <td>
 <p>未录入</p>
@@ -450,10 +450,10 @@
 <p>无已核验记录</p>
 </td>
 <td>
-<p>CANN 1.100×<br />PyTorch 0.876×</p>
+<p>CANN 1.100×<br />PyTorch 0.876×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/nan_to_num_/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.863×<br />既有源码回归</p>
+<p>CANN 0.863×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/nan_to_num_/candidate.py">源码</a></p>
 </td>
 <td>
 <p>30/30；双方补测通过<br />原合同达标</p>
@@ -467,7 +467,7 @@
 </tr>
 <tr>
 <td>
-<p>cross_out</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/cross_out/candidate.py">cross_out</a></p>
 </td>
 <td>
 <p>未录入</p>
@@ -476,13 +476,13 @@
 <p>0.136×</p>
 </td>
 <td>
-<p>CANN 4.057×<br />不计严格 Triton</p>
+<p>CANN 4.057×<br />不计严格 Triton<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/cross_out/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 4.090×<br />PyTorch 3.757×</p>
+<p>CANN 4.090×<br />PyTorch 3.757×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/cross_out/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 3.868×<br />既有源码回归</p>
+<p>CANN 3.868×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/cross_out/candidate.py">源码</a></p>
 </td>
 <td>
 <p>21/21；双方补测通过<br />原合同达标</p>
@@ -496,7 +496,7 @@
 </tr>
 <tr>
 <td>
-<p>expm1_</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/expm1_/candidate.py">expm1_</a></p>
 </td>
 <td>
 <p>未录入</p>
@@ -505,13 +505,13 @@
 <p>正确性失败 27/30</p>
 </td>
 <td>
-<p>源码已归档；成绩待绑定<br />不计严格 Triton</p>
+<p>源码已归档；成绩待绑定<br />不计严格 Triton<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/expm1_/candidate.py">源码</a></p>
 </td>
 <td>
-<p>PyTorch 0.647×</p>
+<p>PyTorch 0.647×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/expm1_/candidate.py">源码</a></p>
 </td>
 <td>
-<p>原合同未闭环</p>
+<p>原合同未闭环<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/expm1_/candidate.py">候选源码（未验收）</a></p>
 </td>
 <td>
 <p>缺合格的同语义CANN参考；不计达标</p>
@@ -525,7 +525,7 @@
 </tr>
 <tr>
 <td>
-<p>hardshrink_backward</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/hardshrink_backward/candidate.py">hardshrink_backward</a></p>
 </td>
 <td>
 <p>未录入</p>
@@ -534,13 +534,13 @@
 <p>0.154×</p>
 </td>
 <td>
-<p>CANN 0.894×<br />不计严格 Triton</p>
+<p>CANN 0.894×<br />不计严格 Triton<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/hardshrink_backward/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 1.042×<br />PyTorch 1.037×</p>
+<p>CANN 1.042×<br />PyTorch 1.037×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/hardshrink_backward/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.999×<br />既有源码回归</p>
+<p>CANN 0.999×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/hardshrink_backward/candidate.py">源码</a></p>
 </td>
 <td>
 <p>30/30；双方补测通过<br />原合同达标</p>
@@ -554,7 +554,7 @@
 </tr>
 <tr>
 <td>
-<p>subtract_</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/subtract_/candidate.py">subtract_</a></p>
 </td>
 <td>
 <p>未录入</p>
@@ -566,10 +566,10 @@
 <p>无已核验记录</p>
 </td>
 <td>
-<p>CANN 1.556×<br />PyTorch 1.131×</p>
+<p>CANN 1.556×<br />PyTorch 1.131×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/subtract_/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 1.659×<br />既有源码回归</p>
+<p>CANN 1.659×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/subtract_/candidate.py">源码</a></p>
 </td>
 <td>
 <p>30/30；双方补测通过<br />原合同达标</p>
@@ -583,7 +583,7 @@
 </tr>
 <tr>
 <td>
-<p>native_group_norm</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/native_group_norm/candidate.py">native_group_norm</a></p>
 </td>
 <td>
 <p>未录入</p>
@@ -592,13 +592,13 @@
 <p>正确性失败 21/27</p>
 </td>
 <td>
-<p>CANN 1.024×<br />不计严格 Triton</p>
+<p>CANN 1.024×<br />不计严格 Triton<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/native_group_norm/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.987×<br />PyTorch 0.783×</p>
+<p>CANN 0.987×<br />PyTorch 0.783×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/native_group_norm/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 1.004×<br />既有源码回归</p>
+<p>CANN 1.004×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/native_group_norm/candidate.py">源码</a></p>
 </td>
 <td>
 <p>27/27；双方补测通过<br />原合同达标</p>
@@ -612,7 +612,7 @@
 </tr>
 <tr>
 <td>
-<p>log2_</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/log2_/candidate.py">log2_</a></p>
 </td>
 <td>
 <p>未录入</p>
@@ -621,13 +621,13 @@
 <p>正确性失败 27/30</p>
 </td>
 <td>
-<p>CANN 1.055×<br />不计严格 Triton</p>
+<p>CANN 1.055×<br />不计严格 Triton<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/log2_/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.846×<br />PyTorch 0.634×</p>
+<p>CANN 0.846×<br />PyTorch 0.634×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/log2_/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.880×<br />既有源码回归</p>
+<p>CANN 0.880×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/log2_/candidate.py">源码</a></p>
 </td>
 <td>
 <p>30/30；双方补测通过<br />原合同达标</p>
@@ -641,7 +641,7 @@
 </tr>
 <tr>
 <td>
-<p>transform_bias_rescale_qkv</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/transform_bias_rescale_qkv/candidate.py">transform_bias_rescale_qkv</a></p>
 </td>
 <td>
 <p>未录入</p>
@@ -653,10 +653,10 @@
 <p>无已核验记录</p>
 </td>
 <td>
-<p>CANN 0.931×<br />PyTorch 1.043×</p>
+<p>CANN 0.931×<br />PyTorch 1.043×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/transform_bias_rescale_qkv/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.941×<br />既有源码回归</p>
+<p>CANN 0.941×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/transform_bias_rescale_qkv/candidate.py">源码</a></p>
 </td>
 <td>
 <p>21/21；双方补测通过<br />原合同达标</p>
@@ -670,7 +670,7 @@
 </tr>
 <tr>
 <td>
-<p>fix</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/fix/candidate.py">fix</a></p>
 </td>
 <td>
 <p>未录入</p>
@@ -679,13 +679,13 @@
 <p>运行失败 0/30</p>
 </td>
 <td>
-<p>CANN 1.197×<br />不计严格 Triton</p>
+<p>CANN 1.197×<br />不计严格 Triton<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/fix/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 1.014×<br />PyTorch 0.735×</p>
+<p>CANN 1.014×<br />PyTorch 0.735×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/fix/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.969×<br />既有源码回归</p>
+<p>CANN 0.969×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/fix/candidate.py">源码</a></p>
 </td>
 <td>
 <p>30/30；双方补测通过<br />原合同达标</p>
@@ -699,7 +699,7 @@
 </tr>
 <tr>
 <td>
-<p>round_out</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/round_out/candidate.py">round_out</a></p>
 </td>
 <td>
 <p>未录入</p>
@@ -708,13 +708,13 @@
 <p>正确性失败 24/30</p>
 </td>
 <td>
-<p>CANN 1.430×<br />不计严格 Triton</p>
+<p>CANN 1.430×<br />不计严格 Triton<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/round_out/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.829×<br />PyTorch 0.942×</p>
+<p>CANN 0.829×<br />PyTorch 0.942×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/round_out/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.916×<br />既有源码回归</p>
+<p>CANN 0.916×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/round_out/candidate.py">源码</a></p>
 </td>
 <td>
 <p>30/30；双方补测通过<br />原合同达标</p>
@@ -728,7 +728,7 @@
 </tr>
 <tr>
 <td>
-<p>hardswish_out</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/regressions/20261109/hardswish-native-low-precision/operators/hardswish_out/candidate.py">hardswish_out</a></p>
 </td>
 <td>
 <p>未录入</p>
@@ -737,13 +737,13 @@
 <p>0.177×</p>
 </td>
 <td>
-<p>CANN 1.395×<br />不计严格 Triton</p>
+<p>CANN 1.395×<br />不计严格 Triton<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/hardswish_out/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.862×<br />PyTorch 1.050×</p>
+<p>CANN 0.862×<br />PyTorch 1.050×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/hardswish_out/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.867×<br />本轮修复候选</p>
+<p>CANN 0.867×<br />本轮修复候选<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/regressions/20261109/hardswish-native-low-precision/operators/hardswish_out/candidate.py">源码</a></p>
 </td>
 <td>
 <p>30/30；双方补测通过<br />原合同达标</p>
@@ -757,7 +757,7 @@
 </tr>
 <tr>
 <td>
-<p>fake_quantize_per_tensor_affine_cachemask_out</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/fake_quantize_per_tensor_affine_cachemask_out/candidate.py">fake_quantize_per_tensor_affine_cachemask_out</a></p>
 </td>
 <td>
 <p>未录入</p>
@@ -766,13 +766,13 @@
 <p>8.651×</p>
 </td>
 <td>
-<p>CANN 6.975×<br />不计严格 Triton</p>
+<p>CANN 6.975×<br />不计严格 Triton<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/fake_quantize_per_tensor_affine_cachemask_out/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 7.060×<br />PyTorch 9.623×</p>
+<p>CANN 7.060×<br />PyTorch 9.623×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/fake_quantize_per_tensor_affine_cachemask_out/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 8.155×<br />既有源码回归</p>
+<p>CANN 8.155×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/fake_quantize_per_tensor_affine_cachemask_out/candidate.py">源码</a></p>
 </td>
 <td>
 <p>30/30；双方补测通过<br />原合同达标</p>
@@ -786,7 +786,7 @@
 </tr>
 <tr>
 <td>
-<p>special_round_out</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/special_round_out/candidate.py">special_round_out</a></p>
 </td>
 <td>
 <p>未录入</p>
@@ -795,13 +795,13 @@
 <p>运行失败 0/30</p>
 </td>
 <td>
-<p>CANN 1.261×<br />不计严格 Triton</p>
+<p>CANN 1.261×<br />不计严格 Triton<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/special_round_out/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.946×<br />PyTorch 0.967×</p>
+<p>CANN 0.946×<br />PyTorch 0.967×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/special_round_out/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 1.000×<br />既有源码回归</p>
+<p>CANN 1.000×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/special_round_out/candidate.py">源码</a></p>
 </td>
 <td>
 <p>30/30；双方补测通过<br />原合同达标</p>
@@ -815,7 +815,7 @@
 </tr>
 <tr>
 <td>
-<p>special_xlogy_</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/special_xlogy_/candidate.py">special_xlogy_</a></p>
 </td>
 <td>
 <p>未录入</p>
@@ -827,10 +827,10 @@
 <p>无已核验记录</p>
 </td>
 <td>
-<p>CANN 1.004×<br />PyTorch 0.846×</p>
+<p>CANN 1.004×<br />PyTorch 0.846×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/special_xlogy_/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 1.071×<br />既有源码回归</p>
+<p>CANN 1.071×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/special_xlogy_/candidate.py">源码</a></p>
 </td>
 <td>
 <p>30/30；双方补测通过<br />原合同达标</p>
@@ -844,7 +844,7 @@
 </tr>
 <tr>
 <td>
-<p>hardswish</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/hardswish/candidate.py">hardswish</a></p>
 </td>
 <td>
 <p>未录入</p>
@@ -853,13 +853,13 @@
 <p>0.148×</p>
 </td>
 <td>
-<p>CANN 1.061×<br />不计严格 Triton</p>
+<p>CANN 1.061×<br />不计严格 Triton<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/hardswish/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.882×<br />PyTorch 0.731×</p>
+<p>CANN 0.882×<br />PyTorch 0.731×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/hardswish/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.849×<br />既有源码回归</p>
+<p>CANN 0.849×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/hardswish/candidate.py">源码</a></p>
 </td>
 <td>
 <p>30/30；双方补测通过<br />原合同达标</p>
@@ -873,7 +873,7 @@
 </tr>
 <tr>
 <td>
-<p>fmod_tensor_</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/fmod_tensor_/candidate.py">fmod_tensor_</a></p>
 </td>
 <td>
 <p>未录入</p>
@@ -882,13 +882,13 @@
 <p>运行失败 0/30</p>
 </td>
 <td>
-<p>CANN 1.422×<br />不计严格 Triton</p>
+<p>CANN 1.422×<br />不计严格 Triton<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/fmod_tensor_/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.818×<br />PyTorch 0.729×</p>
+<p>CANN 0.818×<br />PyTorch 0.729×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/fmod_tensor_/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 0.841×<br />既有源码回归</p>
+<p>CANN 0.841×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/fmod_tensor_/candidate.py">源码</a></p>
 </td>
 <td>
 <p>30/30；双方补测通过<br />原合同达标</p>
@@ -902,7 +902,7 @@
 </tr>
 <tr>
 <td>
-<p>linalg_inv_ex</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/linalg_inv_ex/candidate.py">linalg_inv_ex</a></p>
 </td>
 <td>
 <p>未录入</p>
@@ -911,13 +911,13 @@
 <p>正确性失败 5/7</p>
 </td>
 <td>
-<p>源码已归档；成绩待绑定<br />不计严格 Triton</p>
+<p>源码已归档；成绩待绑定<br />不计严格 Triton<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/linalg_inv_ex/candidate.py">源码</a></p>
 </td>
 <td>
-<p>PyTorch 77.743×（参考含CPU回退）</p>
+<p>PyTorch 77.743×（参考含CPU回退）<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/linalg_inv_ex/candidate.py">源码</a></p>
 </td>
 <td>
-<p>原合同未闭环</p>
+<p>原合同未闭环<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/linalg_inv_ex/candidate.py">候选源码（未验收）</a></p>
 </td>
 <td>
 <p>缺合格的同语义CANN参考；不计达标</p>
@@ -931,7 +931,7 @@
 </tr>
 <tr>
 <td>
-<p>batch_norm_with_update_functional</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/batch_norm_with_update_functional/candidate.py">batch_norm_with_update_functional</a></p>
 </td>
 <td>
 <p>未录入</p>
@@ -940,13 +940,13 @@
 <p>100.912×</p>
 </td>
 <td>
-<p>CANN 1.783×<br />不计严格 Triton</p>
+<p>CANN 1.783×<br />不计严格 Triton<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/batch_norm_with_update_functional/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 1.748×<br />PyTorch 23.563×</p>
+<p>CANN 1.748×<br />PyTorch 23.563×<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/batch_norm_with_update_functional/candidate.py">源码</a></p>
 </td>
 <td>
-<p>CANN 1.774×<br />既有源码回归</p>
+<p>CANN 1.774×<br />既有源码回归<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/operators/batch_norm_with_update_functional/candidate.py">源码</a></p>
 </td>
 <td>
 <p>27/27；双方补测通过<br />原合同达标</p>
@@ -1013,7 +1013,7 @@
 </tr>
 <tr>
 <td>
-<p>mse_loss_backward</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/f63e6c30a0d8583ba092844e57ab90c0f6d0349f/project/Ascend-Optimization-v1/archive/comparisons/flaggems-comparison-20261009/measurements/mse_loss_backward/candidate.py">mse_loss_backward</a></p>
 </td>
 <td>
 <p>1.1688×</p>
@@ -1048,7 +1048,7 @@
 </tr>
 <tr>
 <td>
-<p>t_copy</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/f63e6c30a0d8583ba092844e57ab90c0f6d0349f/project/Ascend-Optimization-v1/archive/comparisons/flaggems-comparison-20261009/measurements/t_copy/candidate.py">t_copy</a></p>
 </td>
 <td>
 <p>3.0894×</p>
@@ -1083,7 +1083,7 @@
 </tr>
 <tr>
 <td>
-<p>prelu_kernel_backward</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/f63e6c30a0d8583ba092844e57ab90c0f6d0349f/project/Ascend-Optimization-v1/archive/comparisons/flaggems-repaired-comparison-20261009/validated-v5/measurements/_prelu_kernel_backward/candidate.py">prelu_kernel_backward</a></p>
 </td>
 <td>
 <p>1.8152×</p>
@@ -1118,7 +1118,7 @@
 </tr>
 <tr>
 <td>
-<p>batch_norm_backward</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/f63e6c30a0d8583ba092844e57ab90c0f6d0349f/project/Ascend-Optimization-v1/archive/comparisons/flaggems-repaired-comparison-20261009/validated-v5/measurements/batch_norm_backward/candidate.py">batch_norm_backward</a></p>
 </td>
 <td>
 <p>4.3885×</p>
@@ -1153,7 +1153,7 @@
 </tr>
 <tr>
 <td>
-<p>smooth_l1_loss_backward</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/f63e6c30a0d8583ba092844e57ab90c0f6d0349f/project/Ascend-Optimization-v1/archive/comparisons/flaggems-repaired-comparison-20261009/validated-v5/measurements/smooth_l1_loss_backward/candidate.py">smooth_l1_loss_backward</a></p>
 </td>
 <td>
 <p>2.2139×</p>
@@ -1188,7 +1188,7 @@
 </tr>
 <tr>
 <td>
-<p>logaddexp2</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/tree/f63e6c30a0d8583ba092844e57ab90c0f6d0349f/project/Ascend-Optimization-v1/operators/logaddexp2">logaddexp2</a></p>
 </td>
 <td>
 <p>0.3218×</p>
@@ -1223,7 +1223,7 @@
 </tr>
 <tr>
 <td>
-<p>amin</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/tree/f63e6c30a0d8583ba092844e57ab90c0f6d0349f/project/Ascend-Optimization-v1/operators/amin">amin</a></p>
 </td>
 <td>
 <p>0.5536×</p>
@@ -1258,7 +1258,7 @@
 </tr>
 <tr>
 <td>
-<p>matmul_bias_activation</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/tree/f63e6c30a0d8583ba092844e57ab90c0f6d0349f/project/Ascend-Optimization-v1/operators/matmul_bias_activation">matmul_bias_activation</a></p>
 </td>
 <td>
 <p>0.5408×</p>
@@ -1293,7 +1293,7 @@
 </tr>
 <tr>
 <td>
-<p>narrow_copy</p>
+<p><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/narrow_copy/candidate.py">narrow_copy</a></p>
 </td>
 <td>
 <p>0.0138×</p>
@@ -1308,7 +1308,7 @@
 <p>—</p>
 </td>
 <td>
-<p>含CANN DMA；不计严格Triton</p>
+<p>含CANN DMA；不计严格Triton<br /><a href="https://github.com/LeleCheung/Ascend-Optimization/blob/0d275193ed87b247b20c6f1400bbe52725a6e3fd/benchmarks/lineage/20261109/historical_nonconforming/narrow_copy/candidate.py">源码</a></p>
 </td>
 <td>
 <p>未按当前约束复核</p>
