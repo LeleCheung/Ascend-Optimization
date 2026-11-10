@@ -72,12 +72,8 @@ def main():
     assert request['source_sha256']==digest and request['case']==spec['case']
     assert request['trace_time_unit']==a.trace_unit and request['soc']==a.soc and request['core_id']==a.core_id
     execution=read(out/'execution.json');assert execution['returncode']==0 and not any(execution['child_exit_codes'])
-    # KGS解析器仅用于可选采集适配层；标准库分析核心不导入KG或KGS。
-    sys.path.insert(0,str(Path(c['repository'])/'sources/kernelgen_server'))
-    from kernelgen_server.profiling.ascend.ascend_instruction import build_instruction_report
-    sources={str(source):source.read_text(encoding='utf8')}
-    listing,warnings=build_instruction_report(out/'raw',[kernel],a.soc,sources)
-    listing.update(source_sha256=digest,case=spec['case'])
+    from hgkda.simulator import parse
+    listing=parse(out/'raw/kernel-000',kernel,source,digest,spec['case'])
     assert listing['kernels'] and all(k['name']==kernel for k in listing['kernels'])
     save(out/'listing.json',listing)
     from hgkda.regions import analyze
@@ -105,8 +101,8 @@ def main():
     save(Path(c['run_directory'])/'workspace/paired-context-pointer.json',
          dict(source_sha256=digest,context=str(context),sha256=sha(context)))
     save(out/'summary.json',dict(status='completed',source_sha256=digest,case=spec['case'],
-         kernel=kernel,cores=reports,selected_core=selected['core'],context=str(context),warnings=warnings,
-         parser='KGS ascend_instruction optional adapter',
+         kernel=kernel,cores=reports,selected_core=selected['core'],context=str(context),
+         parser=listing['parser'],
          raw_files=[dict(path=str(p.relative_to(out)),sha256=sha(p)) for p in (out/'raw').rglob('*') if p.is_file()]))
     print(json.dumps(dict(status='completed',context=str(context),cores=len(reports))))
 

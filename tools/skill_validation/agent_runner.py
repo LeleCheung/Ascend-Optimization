@@ -95,7 +95,9 @@ def main():
          candidate_file='candidate.py',device_probe='工具桥仅预检候选实现，不执行任意测试脚本；不要提交starter.py或probe脚本',
          current_best_source_read_allowed=False,phase=config.get('phase','development'),
          method_manifest_sha256=(hashlib.sha256(Path(config['method_manifest']).read_bytes()).hexdigest() if config.get('method_manifest') else None),
-         target='同CANN参考完整调用争取超过0.8，至少相对固定起点产生有效优化'))
+         experiment_goal=config.get('experiment_goal'),
+         starter_provenance=read(workspace/'starter-provenance.json') if (workspace/'starter-provenance.json').exists() else None,
+         target=config.get('generation_target','同CANN参考完整调用争取超过0.8，至少相对固定起点产生有效优化')))
     prompt = '''加载并遵循 skills/hgkda/SKILL.md，任务见 task.json。只在当前工作目录读取和写入，不读取历史最佳源码或其他实验目录，不使用其他agent。
 宿主已按当前源码与本次固定方法刷新上下文，先读取context-brief.json、contract.json和knowledge.json，并核对源码身份。工具桥context可重新整理证据；用法已在task.json完整给出，不浏览工具实现、help或workspace外的方法清单，这些由宿主校验。已有候选时直接围绕失败反馈修改，不重复探索环境。按task.json中的算子和合同，从starter.py或当前candidate.py生成并优化candidate.py，公共入口run(A)，其余辅助函数单下划线命名。
 所有设备计算、布局处理和回退严格Triton，CANN仅为参考。原始starter可能含非Triton后端，必须由你自行改写，不得保留。Codex不直接修补候选，你负责全部候选实现及编译/语义修复。

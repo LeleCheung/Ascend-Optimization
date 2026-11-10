@@ -88,6 +88,12 @@ def build(config):
             scope='保留变化最大的32项指标及完整搬运粒度；实际IR另列，不重复嵌入源码和历史知识')
         # 完整上下文中的深入取证必须真正进入模型输入，不能仅生成文件而不传递。
         deep=full['facts']
+        for index,item in enumerate(deep.get('compiled_ir',[])):
+            path=Path(item['path']);assert sha(path)==item['sha256']
+            folder=workspace/'actual-ir'/digest[:12];folder.mkdir(parents=True,exist_ok=True)
+            target=folder/('paired-'+str(index)+'-'+path.name);shutil.copyfile(path,target)
+            if not any(row['sha256']==item['sha256'] for row in artifacts):
+                artifacts.append(dict(path=str(target.relative_to(workspace)),sha256=item['sha256'],origin='current_paired_capture'))
         paired['instruction_hotspots']=deep.get('instruction_hotspots')
         region_data=deep.get('regions')
         paired['regions']=None if not region_data else dict(
