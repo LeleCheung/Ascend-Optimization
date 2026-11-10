@@ -69,8 +69,11 @@ def main():
             assert summary.get('cann_score') is None and summary.get('accepted') is False
             assert summary.get('failure_reason'),'失败归档必须说明终止原因'
         provenance=read(root/'workspace/starter-provenance.json')
-        assert provenance['starter_sha256']==provenance['upstream_sha256']
-        assert hashlib.sha256((root/'workspace/starter.py').read_bytes()).hexdigest()==provenance['starter_sha256']
+        digest=hashlib.sha256((root/'workspace/starter.py').read_bytes()).hexdigest()
+        if provenance.get('kind')=='existing_generated_candidate':
+            assert digest==provenance['source_sha256'] and provenance['prior_best_source_provided'] is True
+            assert summary['prior_best_source_provided'] is True
+        else:assert digest==provenance['starter_sha256']==provenance['upstream_sha256']
         assert summary['codex_direct_candidate_edits']==0
         method=read(root/'method-manifest.json')
         for item in method['files']:

@@ -19,16 +19,23 @@ def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def relocate_job(job, original_run, local_run):
+def relocate_job(job, original_run, local_run, dependency_roots=None):
     """只在内存映射归档位置，保留原始请求、合同及身份文件的字节。"""
     root = PurePosixPath(original_run)
     assert root.is_absolute() and '..' not in root.parts
+    roots=[(root,local_run)]
+    for original,target in (dependency_roots or {}).items():
+        prefix=PurePosixPath(original)
+        assert prefix.is_absolute() and '..' not in prefix.parts
+        roots.append((prefix,Path(target)))
+    roots.sort(key=lambda pair:len(pair[0].parts),reverse=True)
 
     def local(value):
         path = PurePosixPath(value)
         assert path.is_absolute() and '..' not in path.parts, '原件路径不规范'
-        relative = path.relative_to(root)
-        return str(local_run.joinpath(*relative.parts))
+        for prefix,target in roots:
+            if path.is_relative_to(prefix):return str(target.joinpath(*path.relative_to(prefix).parts))
+        raise ValueError('未声明的归档依赖：'+value)
 
     mapped = copy.deepcopy(job)
     for name in ['source', 'review', 'archive', 'request']:
@@ -42,7 +49,9 @@ def relocate_job(job, original_run, local_run):
 def inspect_transfer_manifest(run):
     """核验传输清单的全部原件，包含不直接参与分数重算的二进制与编译产物。"""
     path = run/'transfer-manifest.json'
-    manifest = read(path if path.exists() else run/'pull-manifest.json')
+    if not path.exists():path=run/'pull-manifest.json'
+    manifest=read(path if path.exists() else run/'export-manifest.json')
+    if isinstance(manifest,dict):manifest=manifest['files']
     names = set()
     for item in manifest:
         relative = PurePosixPath(item['path'])
@@ -133,6 +142,7 @@ def main():
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--original-run-directory',help='异机归档中的原始Linux运行目录；只在内存映射路径')
     parser.add_argument('--verify-transfer',action='store_true',help='同时核验transfer/pull-manifest.json中的全部原件')
+    parser.add_argument('--dependency-map',type=Path,help='显式原始Linux依赖根到本机归档根的JSON映射；不修改原件')
     args = parser.parse_args()
     if args.output.exists():
         raise FileExistsError(args.output)
@@ -140,13 +150,14 @@ def main():
     plan = read(run/'plan.json')
     state = read(run/'state.json')
     transfer_files = inspect_transfer_manifest(run) if args.verify_transfer else None
+    dependencies={key:(args.dependency_map.parent/value).resolve() for key,value in read(args.dependency_map).items()} if args.dependency_map else None
     assert not plan['errors'] and len(plan['jobs']) == plan['expected']
     assert state['status'] == 'completed', '队列仍在运行，不能生成最终核验'
     rows = []
     errors = []
     for job in plan['jobs']:
         try:
-            mapped = relocate_job(job,args.original_run_directory,run) if args.original_run_directory else job
+            mapped = relocate_job(job,args.original_run_directory,run,dependencies) if args.original_run_directory else job
             row = inspect_job(mapped,run)
             assert state['operators'][job['operator']]['accepted'] == row['accepted'], '控制器验收与原件重算不一致'
             rows.append(row)

@@ -64,6 +64,17 @@ class RegressionAuditTests(unittest.TestCase):
                 with self.assertRaises((AssertionError,ValueError)):
                     audit['relocate_job'](invalid,original,root)
 
+    def test_external_catalog_requires_explicit_dependency_mapping(self):
+        original='/data/project/runs/new';dependency='/data/project/runs/fixed'
+        job={key:original+'/'+key for key in ['source','review','archive','request']}
+        job['checks']=dict(supplementary=dict(leaf=dependency+'/catalog',checker=dependency+'/checker.py'))
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            with self.assertRaises(ValueError):audit['relocate_job'](job,original,root)
+            mapped=audit['relocate_job'](job,original,root,{dependency:root/'frozen'})
+            self.assertEqual(Path(mapped['checks']['supplementary']['checker']),root/'frozen/checker.py')
+            self.assertEqual(job['checks']['supplementary']['checker'],dependency+'/checker.py')
+
 
 if __name__ == '__main__':
     unittest.main()
