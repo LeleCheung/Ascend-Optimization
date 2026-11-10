@@ -11,6 +11,18 @@ def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 def read(path):return json.loads(Path(path).read_bytes())
 
 
+def starter_identity(workspace):
+    """区分上游原字节起点与已生成候选，不能把后者表述为从零重生成。"""
+    provenance=read(workspace/'starter-provenance.json')
+    kind=provenance.get('kind','upstream')
+    expected=(provenance['source_sha256'] if kind=='existing_generated_candidate' else provenance['upstream_sha256'])
+    digest=sha(workspace/'starter.py')
+    assert digest==expected
+    if 'starter_sha256' in provenance:assert digest==provenance['starter_sha256']
+    if kind=='existing_generated_candidate':assert provenance['prior_best_source_provided'] is True
+    return dict(provenance,starter_sha256=digest,kind=kind)
+
+
 def initial_context_identity(call):
     """核对调用前实际提供的知识、源码和方法身份，避免仅核对配置声明。"""
     path=call/'initial-context.json'
@@ -100,8 +112,7 @@ def audit(run):
         assert sha(package/item['path'])==item['sha256'],item['path']
         if item['path'].startswith('skills/hgkda/'):
             assert sha(workspace/item['path'])==item['sha256'],'运行中的skill被修改'
-    starter=read(workspace/'starter-provenance.json')
-    assert sha(workspace/'starter.py')==starter['starter_sha256']==starter['upstream_sha256']
+    starter=starter_identity(workspace)
     calls=[];writes=[];outside_reads=[]
     for call in sorted((run/'agent-calls').iterdir()):
         invocation=read(call/'host-invocation.json')
@@ -152,6 +163,7 @@ def audit(run):
         assert len(list(run.glob('attempts/*/preflight.json')))<=frozen_budget['maximum_preflight_sources']
     return dict(status='passed',operator=config['operator'],phase=config['phase'],
         method_manifest_sha256=sha(run/'method-manifest.json'),starter_sha256=starter['starter_sha256'],
+        starter_kind=starter['kind'],prior_best_source_provided=starter.get('prior_best_source_provided',False),
         method_files=len(method['files']),model_calls=calls,model_write_actions=writes,
         outside_read_attempts=outside_reads,frozen_budget_verified=frozen_budget,
         scope='核对原件及已记录的Read/Write/Edit/Bash调用；不将调用日志视作文件系统隔离证明')

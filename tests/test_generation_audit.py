@@ -12,6 +12,18 @@ module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 
 
 class GenerationAuditTests(unittest.TestCase):
+    def test_existing_candidate_is_explicit_and_wrong_origin_hash_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace=Path(tmp);(workspace/'starter.py').write_bytes(b'existing generated source')
+            digest=module.sha(workspace/'starter.py')
+            p=workspace/'starter-provenance.json'
+            record=dict(kind='existing_generated_candidate',source_sha256=digest,prior_best_source_provided=True)
+            p.write_text(json.dumps(record))
+            result=module.starter_identity(workspace)
+            self.assertTrue(result['prior_best_source_provided'])
+            p.write_text(json.dumps(dict(record,source_sha256='different')))
+            with self.assertRaises(AssertionError):module.starter_identity(workspace)
+
     def test_legacy_shell_replay_is_static_and_rejects_other_code(self):
         command="python - <<'EOF'\nimport re\ns=open('candidate.py').read()\ns=s.replace('old','new')\nopen('candidate.py','w').write(s)\nEOF\ngrep -n old candidate.py"
         self.assertEqual(module.legacy_shell_replacement(command,'old old'),'new new')

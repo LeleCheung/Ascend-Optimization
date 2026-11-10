@@ -44,7 +44,12 @@ def main():
     if a.outcome=='accepted':assert accepted
     else:assert a.failure_reason and not accepted
     package=Path(config['package'])
-    copy_verified_tree(package,run/'method-snapshot')
+    snapshot=run/'method-snapshot'
+    for item in read(run/'method-manifest.json')['files']:
+        source=package/item['path'];assert sha(source)==item['sha256']
+        target=snapshot/item['path'];target.parent.mkdir(parents=True,exist_ok=True)
+        if target.exists():assert sha(target)==item['sha256']
+        else:shutil.copyfile(source,target)
     if a.method_history_root:
         assert config['phase']=='development'
         target=run/'method-history/packages';target.mkdir(parents=True,exist_ok=True)
@@ -64,7 +69,9 @@ def main():
         supplementary_each=config['job']['checks']['supplementary']['previous_total'],
         formal_requests=len(records),formal_history=records,
         preflight_sources=len(list(run.glob('attempts/*/preflight.json'))),model_calls=len(calls),
-        prior_best_source_provided=False,codex_direct_candidate_edits=0,
+        starter_kind=generation['starter_kind'],
+        prior_best_source_provided=generation['prior_best_source_provided'],codex_direct_candidate_edits=0,
+        experiment_goal=config.get('experiment_goal'),
         method_manifest_sha256=sha(run/'method-manifest.json'),generation_audit_sha256=sha(run/'generation-audit.json'),
         retained_existing_delivery_cann_score=a.retained_delivery_score,
         current_original_contract_accepted=current['accepted'],target_total=current['total'],
