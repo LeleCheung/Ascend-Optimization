@@ -19,7 +19,7 @@ class KnowledgeTests(unittest.TestCase):
             values={'result.json':dict(status='PASSED',num_passed=1,num_workloads=1,geo_mean=.75),
                 'request.json':dict(implementation=dict(sources=[dict(content=source)])),
                 'review.json':dict(source_sha256=digest,status='reviewed_strict_triton',all_branches_reviewed=True,dependencies_reviewed=True),
-                'feedback.json':dict(result=dict(source_sha256=digest,geo_mean=.75,threshold=.8,decision='continue_optimization',accepted=False))}
+                'feedback.json':dict(schema_version='hgkda.result/v1',status='completed',result=dict(source_sha256=digest,geo_mean=.75,threshold=.8,decision='continue_optimization',accepted=False))}
             for name,value in values.items():(root/name).write_text(json.dumps(value))
             sha=lambda name:hashlib.sha256((root/name).read_bytes()).hexdigest()
             record=dict(id='failed',operator_type='pointwise',action_id='prefetch',
