@@ -53,7 +53,7 @@ def main():
         shell+='\n'.join('export '+k+'='+shlex.quote(v) for k,v in environment.items())+'\n'
         shell+='exec '+shlex.join(list(map(str,arguments)))
         with (a.output/(label+'.log')).open('xb') as log:
-            result=subprocess.run(['docker','exec',c['container'],'bash','-c',shell],stdout=log,stderr=subprocess.STDOUT,timeout=1200)
+            result=subprocess.run(['docker','exec','-w',str(a.output),c['container'],'bash','-c',shell],stdout=log,stderr=subprocess.STDOUT,timeout=1200)
         assert result.returncode==0,label+': '+(a.output/(label+'.log')).read_text(errors='replace')[-1800:]
     with Path(c['lock']).open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)

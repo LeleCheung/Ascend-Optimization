@@ -70,7 +70,7 @@ def main():
         with Path(c['lock']).open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
             with (out/'collector.log').open('xb') as log:
-                result=subprocess.run(['docker','exec',c['container'],'bash','-c',shell],
+                result=subprocess.run(['docker','exec','-w',str(out),c['container'],'bash','-c',shell],
                                       stdout=log,stderr=subprocess.STDOUT,timeout=60*a.timeout_minutes+120)
         log=(out/'collector.log').read_text(errors='replace')
         codes=[int(code) for code in re.findall(r'Child process exited with status (\d+)',log)]
