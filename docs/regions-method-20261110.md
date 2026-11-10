@@ -77,4 +77,6 @@ flowchart LR
 
 原件位于[本轮证据](../benchmarks/skill-validation/20261110-regions/README.md)，包括方法快照、真实模型输入输出、审查、完整KGS、成对采集和模拟器原件。Windows核验57份复验文件及2750份方法实验文件；三份时间轴逐区间精确复算，区域累计值按跨Python版本1e-12浮点容差核验。性能失败记录已通过`curate/retrieve`实测，并作为有作用域的反例纳入包内知识；这次知识更新发生在生成结束后，不声称模型已使用更新后的反例条目。
 
+安装验证采用同一`hgkda-0.1.0-py3-none-any.whl`，SHA-256为`a07cd123490e73f424054851e5e7ce519be328c90bec6c5c16de30b608d236ac`，源码版本为`9928d881f`。Windows与910B从已安装包运行CLI及skill入口，不设置`PYTHONPATH`；核心无KG/KGS依赖。安装回执与测试结果在本轮`verification/`目录中保存。
+
 服务器运行目录为`runs/overnight-regions-20261110-v1/`。外层取证、只读审查和调度仍由Codex承担。

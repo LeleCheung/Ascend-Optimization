@@ -11,6 +11,7 @@
 | [时间轴复算](verification/regions-replay.json) | 三份时间轴与区域重算、单位核验 |
 | [失败知识检索](verification/knowledge-replay.json) | 基于同源码完整成绩的失败反例准入与检索 |
 | [26项既有交付核验](verification/current-26.json) | 四批1159条传输记录、28条正式记录汇成26项交付；历史关联文件另存回执 |
+| [Windows安装回执](verification/installation-windows.json)、[910B安装回执](verification/installation-910b.json) | 同一wheel及独立环境中的CLI入口验证；源码版本9928d881f |
 
 原始Linux绝对路径保留，核验时使用`dependency-map.json`显式映射已有固定回归依赖；不修改原件。
 
