@@ -2,6 +2,7 @@
 import csv
 import json
 import math
+import re
 from pathlib import Path
 from statistics import median
 
@@ -18,6 +19,9 @@ def validate_time_unit(trace, instructions, unit):
     ratios=[]
     for row in instructions:
         reference=row.get('cycles' if unit=='cycles' else 'running_time_us')
+        # CSV仅保留0.01us精度；BAR/SET_FLAG的CSV等待口径也不同于trace中的标记时长。
+        if re.fullmatch(r'BAR|SET_FLAG',row.get('instruction',''),re.I):continue
+        if unit!='cycles' and (not reference or reference<.1):continue
         if reference and row['pc'] in durations:ratios.append(durations[row['pc']]/reference)
     expected=1000 if unit=='ns' else 1
     matching=sum(abs(value/expected-1)<.05 for value in ratios)
@@ -25,7 +29,8 @@ def validate_time_unit(trace, instructions, unit):
         raise ValueError('trace单位无法由同PC的CSV核验：'+str(dict(unit=unit,compared=len(ratios),
             median_ratio=median(ratios) if ratios else None,expected_ratio=expected)))
     return dict(status='verified',unit=unit,compared_pcs=len(ratios),matching_pcs=matching,
-                median_ratio=median(ratios),expected_ratio=expected,method='同PC的trace正时长总和对照CSV累计时间或cycles')
+                median_ratio=median(ratios),expected_ratio=expected,
+                method='同PC的trace正时长总和对照CSV；排除BAR/SET_FLAG标记口径及不足0.1us的舍入项')
 
 
 def pc(value):
