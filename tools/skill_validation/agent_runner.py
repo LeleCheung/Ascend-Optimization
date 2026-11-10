@@ -113,6 +113,11 @@ diagnosis.json已重置为本轮短空模板，旧诊断由宿主保存，不要
 工具桥命令：'''+tool_command
     if args.prompt_file:
         prompt = args.prompt_file.read_text(encoding='utf8')+'\n工具桥命令：'+tool_command
+    if config.get('experiment_goal'):
+        prompt=prompt.replace('若绑定当前源码的正式结果已达任务阈值且全部所需补测通过，保留candidate.py原字节，仅在diagnosis.json记录结论并结束；不为追求更高分无条件再改源码。',
+            '本轮是task.json中experiment_goal明确指定的针对性方法实验：已有达标状态不替代一次新修改及预测验证。只改变该问题对应的一个机制，保留其他已验证路径；完成后交接只读审查和正式评测。')
+        prompt=prompt.replace('初始candidate.py仅是固定FlagGems起点的原字节副本，入口及实现仍由你改写；后续调用则继续当前生成候选。',
+            '本轮起点来源见task.json的starter_provenance；已有正确候选时从其原字节继续小范围修改，不冒充从上游重新生成。')
     (workspace/'prompt.md').write_text(prompt, encoding='utf8')
     (call/'prompt.md').write_text(prompt, encoding='utf8')
     configuration = read(args.model_settings)
