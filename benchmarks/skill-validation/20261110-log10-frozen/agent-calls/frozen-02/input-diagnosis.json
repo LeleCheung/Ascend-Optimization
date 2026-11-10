@@ -1,0 +1,31 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "round": 1,
+  "source_sha256": "726ae0ca492b6a8a7251f2a0fa169a6a0edccac251206583a0e92163a74b4649",
+  "evidence": [
+    "起点 candidate.py/starter.py 同为 2a003996（FlagGems 原字节）：x.device.type != 'cuda' 走 torch.log10_ 回退，非连续路径用 x.contiguous() + copy_ 回写，即目标设备上设备计算与布局处理均非 Triton，不合规。",
+    "起点分块固定 BLOCK_SIZE=1024、grid=cdiv(n,1024)，无规模分流，无启动器/计划缓存；显式 x.to(float32) 计算 log 再转回输入 dtype。",
+    "知识（log10-layout-and-streaming，已观察）：同一布局/分块/启动路径下仅去掉显式 FP32 提升（FP16/BF16 的 log 与换底乘法保持输入 dtype），正式成绩由 0.761426 升至 0.851055 倍 CANN；36 项正式、双方各 66 项与 15 项边界补测通过。",
+    "知识（历史源码结构观察）：中等连续输入总 tile 上限 32768 元素；最大输入 40 个 program、相邻成对流式。属绑定历史源码的事实，非当前候选收益证明。",
+    "本轮无可用的 formal_feedback / preflight_feedback / actual_ir / paired 采集；设备与 IR 事实保留未知。"
+  ],
+  "hypothesis": "当前候选未落实任何历史已验证机制。假设合规化并按规模分流（中等输入单块大载荷、最大输入有限网格满块无掩码循环 + 独立掩码尾块）、且数学保持输入 dtype，可在不损失精度的前提下减少循环轮次、任务管理开销与掩码开销，并消除 PyTorch 回退与 contiguous 拷贝。",
+  "change": [
+    "移除 torch.log10_ 回退与 contiguous/copy_；非连续输入按真实 shape/stride 原地寻址（严格 Triton）。",
+    "新增 4 个 Triton 核：_log10_flat（平坦，EVEN 编译期特化去掩码）、_log10_stream（有限网格满块无掩码循环 + 唯一 program 处理掩码尾块）、_log10_stride1（单维统一步长）、_log10_nd（≤4 维动态除法寻址，缺失维 size=1/stride=0）。",
+    "数学改为 tl.log(x) * 0.4342944819032518 保持输入 dtype，不再显式 FP32 提升；换底常数用函数内字面量，避免模块标量被 JIT 捕获。",
+    "宿主角：_collapse_dims 仅合并元数据（保留最内 stride，size==1 跳过）；_flat_plan 按 (numel, element_size) 缓存计划，tile 预算 131072 字节（fp16/bf16 32768、fp32 16384 元素），numel≤1M 单块直取、>1M 走 8192×40 流式；numel>4 维时按最外层逐片（仅视图）调用。",
+    "公共入口 run(A)，其余全部下划线命名。"
+  ],
+  "expected": "预计各 dtype 大输入（1048576、4096×4096）减少每 program 循环轮次与任务数；小输入（1024）因单块单 program 且 EVEN 去掩码降低固定开销；非连续用例不再有 contiguous 全量拷贝。相对起点应有整体系数提升，是否超过 0.8 阈值由正式评测判定。",
+  "validation": [
+    "本轮仅调用工具桥 preflight，返回 awaiting_source_review（726ae0ca），按合同保持源码不变，等待外部只读路径与地址边界审查。",
+    "下一步需正式 KGS 36 项（layouts False/True）与双方各 66 项补测，重点覆盖负输入、正负零、NaN、Inf、接近 1、极小正数、offset 0/1/3/0 对齐序列与转置视图。"
+  ],
+  "unknown": [
+    "无实际 IR/TTIR 与成对 profiling，无法确认 FP16/BF16 的 log 是否已在当前编译产物中保持输入 dtype，也无法区分算术、搬运与宿主开销。",
+    "131072 字节 tile 预算来源为推算（UB 192KB 减去索引/临时量余量），实际 UB 占用与是否编译通过未知。",
+    "8192×40 有限网格在 16777216 元素上的轮次与收益未经当前源码验证；双块预读未实现，是否值得下一步加入待性能反馈决定。",
+    "numel>4 维按最外层逐片调用可能增加启动次数，测试是否覆盖该情形未知。"
+  ]
+}

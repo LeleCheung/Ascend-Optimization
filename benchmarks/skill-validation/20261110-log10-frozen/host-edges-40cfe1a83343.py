@@ -1,0 +1,5 @@
+import fcntl,subprocess
+from pathlib import Path
+with Path('/data/hanle/ascend-optimization/runs/physical-card-7-campaign.lock').open("a") as lock:
+ fcntl.flock(lock,fcntl.LOCK_EX)
+ subprocess.run(['docker', 'exec', 'tle_yy', 'bash', '-c', 'source /usr/local/Ascend/cann-9.0.0/set_env.sh\nexport ASCEND_RT_VISIBLE_DEVICES=7\nexport OMP_NUM_THREADS=1\nexport PYTHONDONTWRITEBYTECODE=1\nexport TRITON_CACHE_DIR=/data/hanle/ascend-optimization/runs/log10-method-transfer-20261110-frozen-v1/attempts/40cfe1a8334335ae9e06633be10f9b661e9e1c23806f5753c625cd977b5d1eb0/triton-cache\nexec /usr/local/python3.11.15/bin/python3.11 /data/hanle/ascend-optimization/runs/.queued/log10-method-transfer-20261110/package-v42/tools/skill_validation/unary_edges.py --source /data/hanle/ascend-optimization/runs/log10-method-transfer-20261110-frozen-v1/attempts/40cfe1a8334335ae9e06633be10f9b661e9e1c23806f5753c625cd977b5d1eb0/candidate.py --leaf /data/hanle/ascend-optimization/runs/independent-regression-20261109-v3/operators/log10_/supplementary-catalog --output /data/hanle/ascend-optimization/runs/log10-method-transfer-20261110-frozen-v1/edge-checks-40cfe1a83343.json'],check=True)

@@ -1,0 +1,23 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "round": "frozen-r1-layout-fix",
+  "source_identity": {
+    "reviewed_sha256": "5ac2254b6040ac4615ce440b7d74fa461149b76417e896cb100687f2da85c6f8",
+    "current_candidate_sha256_before_edit": "5ac2254b6040ac4615ce440b7d74fa461149b76417e896cb100687f2da85c6f8",
+    "note": "context-brief 与 latest-preflight/review 的 source_sha256 一致，确认本次只读反例绑定当前候选字节；本轮未改动数学、分块与启动路径。"
+  },
+  "evidence": [
+    "预检 source_review_requires_revision（绑定 5ac2254b）只给出一个正确性反例：高维分支按 merged[0][0] 循环，却对原始 x[i] 切片。",
+    "源码核对属实：merged 中 size==1 的维被跳过、相邻可连续维被折叠，merged 的下标与原始 shape 下标不再一一对应；反例 shape=(1,2,2,2,2,2)、stride=(1024,256,64,16,4,1) 合并后为 5 维，merged[0][0]=2 而 x.shape[0]=1，x[1] 越界。",
+    "本轮 formal_feedback 为空，设备性能成绩未更新；previous 知识记录的低精度数学（log 与换底乘法保持输入 dtype）与 8192/40 流式几何在当前候选源码中已落实，未改动。"
+  ],
+  "hypothesis": "该分支的循环上界取自合并维身份，而切片作用在原始第 0 维，两者语义不一致导致越界；只需让切片轴与循环上界同源即可恢复正确性，且不涉及任何性能机制。",
+  "change": "仅修改 candidate.py 中 len(merged)>4 的分支：改为挑选第一个原始长度 >1 的轴，用 x.select(axis, i) 做纯元数据切片后递归 _launch；无可选轴时直接返回。沿该轴每次调用 numel 严格减小，递归必然收敛；切片后的视图仍按真实 stride/offset 进入已有 _log10_nd 或 stride1 路径。数学路径、载荷/网格几何、plan 缓存与启动方式均未变。",
+  "expected": "反例路径合并维降到 4，进入既有 4 维寻址核（dims=(2,2,2,2)、strides=(64,16,4,1)），不再越界且不写坏邻接存储；所有计时用例（1D/2D 连续布局）仍走 flat/stream 路径，本轮预期不改变其性能。",
+  "validation": "工具桥 preflight（只读路径与边界审查）；正式 36 项与补测结论待宿主完整 KGS 评测反馈。",
+  "unknown": [
+    "本轮未获得新的设备性能反馈，不能断言任何性能变化。",
+    "合并维远超 4 的高维输入会退化为多次元数据切片发射，其宿主发射次数带来的开销未测，且不属于当前计时用例。",
+    "反例仅覆盖正向 stride 视图；负 stride 视图（如 flip）仍走 stride1/nd 寻址，未在本轮获得独立证据。"
+  ]
+}

@@ -1,0 +1,12 @@
+import hashlib,json,os,shutil,subprocess
+from pathlib import Path
+r=Path('/data/hanle/ascend-optimization/runs/log10-method-transfer-20261110-frozen-v1');formal=Path('/data/hanle/ascend-optimization/runs/log10-method-transfer-20261110-frozen-v1/formal-40cfe1a83343');root=formal/"operators/log10_";digest='40cfe1a8334335ae9e06633be10f9b661e9e1c23806f5753c625cd977b5d1eb0'
+env=dict(os.environ,PYTHONPATH='/data/hanle/ascend-optimization/runs/.queued/log10-method-transfer-20261110/package-v42/src',PYTHONDONTWRITEBYTECODE="1")
+with (formal/"controller-recovery.log").open("xb") as log:
+ subprocess.run(['/data/hanle/ascend-optimization/runtime/hgkda-release-venv/bin/python', '/data/hanle/ascend-optimization/Ascend-Optimization/tools/regression/run.py', '--plan', '/data/hanle/ascend-optimization/runs/log10-method-transfer-20261110-frozen-v1/formal-40cfe1a83343/plan.json', '--container', 'tle_yy', '--device', '7', '--port', '19696', '--lock', '/data/hanle/ascend-optimization/runs/physical-card-7-campaign.lock', '--device-python', '/usr/local/python3.11.15/bin/python3.11', '--cann-environment', '/usr/local/Ascend/cann-9.0.0/set_env.sh'],env=env,stdout=log,stderr=subprocess.STDOUT,check=True,timeout=3600)
+for name in ["audit","summarize"]:
+ subprocess.run(['/data/hanle/ascend-optimization/runtime/hgkda-release-venv/bin/python','/data/hanle/ascend-optimization/Ascend-Optimization/tools/regression'+"/"+name+".py","--run-directory",str(formal),"--output",str(formal/(name+"-final.json"))],env=env,check=True)
+subprocess.run(['/data/hanle/ascend-optimization/runtime/hgkda-release-venv/bin/python',"-m","hgkda","feedback","--result",str(root/"evaluation/result.json"),"--audit",str(formal/"audit-final.json"),"--source",str(root/"candidate.py"),"--operator","log10_","--timing-cases",'/data/hanle/ascend-optimization/runs/independent-regression-20261109-v3/operators/log10_/cann_supplementary-catalog/timing.jsonl',"--threshold","0.8","--output",str(formal/"performance-feedback.json")],env=env,check=True)
+(r/"formal-result-pointer.json").write_text(json.dumps(dict(run_directory=str(formal),source_sha256=digest,result=json.loads((root/"evaluation/result.json").read_bytes())["geo_mean"],audit=json.loads((formal/"audit-final.json").read_bytes()))))
+shutil.copyfile(formal/"performance-feedback.json",r/"workspace/performance-feedback.json")
+(r/("host-evaluate-"+digest[:12]+"-completed.json")).write_text(json.dumps(dict(status="completed",source_sha256=digest,recovered_before_first_request=True)))

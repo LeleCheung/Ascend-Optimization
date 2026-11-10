@@ -94,3 +94,11 @@ GitHub证据提交为 `d878910bc48c75105c1dfe787325efd8c4c4644d`。910B 的常�
 恢复证据与代码提交为 `29a5d742539f44380a625f1d4518c760607ba054`。语雀已更新`selu_`新生成版0.887010×，同时保留既有源码回归1.039292×；39项、三张分表、原顺序及120个源码链接均回读核对通过。当前[发布正文](../benchmarks/lineage/20261109/published-table-recovery.md)、[语雀回读正文](../benchmarks/lineage/20261109/published-table-recovery-readback.md)和[回执](../benchmarks/lineage/20261109/yuque-update-recovery.json)分别保存，首轮发布原件保持不变。
 
 本轮离线复核覆盖1175份实验原件和313个版本文件。910B同步使用项目SSH传送摘要校验的缺失LFS对象，再执行checkout及相同离线核验；最终Git提交、安装包、测试和实体文件核验记录保存在仓库外的本轮运行目录。
+
+## log10_ 方法迁移与冻结验证（2026-11-10）
+
+开发新生成版0.851055× CANN，固定方法与预算的新会话重生成版0.846792×；两版均正式36/36、双方各66/66及附加15/15检查通过。历史源码经独立入口回归的0.940911×继续保留；原目标总数仍为26/30。
+
+Codex仅维护方法、知识与工具，并承担取证、只读审查及外层调度；CC／DeepSeek完成全部候选实现修改。冻结阶段7次模型调用、4份正式新源码，未提供历史或开发最佳源码、未增加临时性能优化提示。尚未实现外层完全自主调度。
+
+原件见[开发归档](../benchmarks/skill-validation/20261110-log10-development/summary.json)、[冻结归档](../benchmarks/skill-validation/20261110-log10-frozen/summary.json)及[失败首轮](../benchmarks/skill-validation/20261110-log10-development-failed/summary.json)，方法、耗时及复现入口见[迁移报告](log10-method-transfer-20261110.md)。Windows核验共6967份实验原件及384个版本文件，三类版本及原39项顺序保留。发布正文与语雀回执在收尾提交中保存。

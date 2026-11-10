@@ -1,0 +1,18 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "evidence": [
+    "正式反馈（源码 40cfe1a8）：12 个计时用例几何平均 0.2534；候选 65.7–72.6 微秒，参考 15.5–25.8 微秒，且 1024 元素与 16777216 元素耗时几乎相同（67.6 与 71.6 微秒），最大输入仅比最小输入多约 6 微秒。",
+    "该平台不随规模变化，说明计时损失主要来自每次调用的宿主发射，而非设备算术或搬运；同一源码预检 66/66 补测全部通过，布局与数学路径本身正确。",
+    "launch-probe（同 SHA）显示热调用仍每次都走 triton JIT 路径（jit_calls 记录到 _log10_flat/_log10_stream），JIT 缓存已命中而时间不变；HookChain 回调数为 0。",
+    "runtime-api 摘录：JITFunction.run 返回本次使用的 CompiledKernel，其启动为 kernel.run(grid0,grid1,grid2,stream,function,packed_metadata,launch_metadata,enter_hook,exit_hook,*bound_args)；C 侧 getPointer 对整数地址直接解析指针，对 Tensor 才逐次调用 aclrtPointerGetAttributes。"
+  ],
+  "hypothesis": "历史 selu 记录的可迁移机制在当前候选存在明显缺项：当前只保留普通 JIT 调度。热路径每次重复绑定参数、计算特化键、查询后端策略与指针属性，构成约 50 微秒的固定平台；缓存编译启动器、函数句柄与 packed metadata，并直接以当前整数地址和当前 raw stream 调用原生 launch，可去掉这层重复宿主开销。",
+  "change": "新增单下划线辅助函数 _idle_hooks/_fast_key/_register_fast/_fast_flat：连续平坦路径首次 JIT 调用（该次已完成一次原地计算）后登记实际返回的 CompiledKernel 及原生 launch、function、packed_metadata、网格、BLOCK、EVEN，键含设备、dtype、numel 与实际 16 字节对齐类；热调用只做连续性判定、当前 stream 与当前 data_ptr，再原生发射。登记时排除 compile_only、张量注册、调试隐藏参数产物；运行时 HookChain 非空或形态不明即退回普通 JIT。非连续 stride1／多维路径与流式路径保持不变，仍走普通 JIT 与同一 Triton 核。",
+  "expected": "设备计算仍是同一 Triton 产物，正确性与特殊值语义不变；每次调用省去参数绑定、特化键计算与后端策略分发，候选耗时从约 68 微秒下降到接近参考的十余微秒量级，12 个计时用例几何平均明显高于 0.2534，争取超过 0.8。",
+  "validation": "先预检（66 项补测：特殊值、别名、布局、stream、同 shape 对齐序列），确认快速路径未改变原地语义、冷调用只算一次、未对齐与非连续输入仍正确；再由宿主一次完整 KGS 正式评测核对 12 个计时用例的候选微秒与几何平均。",
+  "unknown": [
+    "快速路径在当前后端真实节省的宿主时间未知，需正式计时确认。",
+    "核内设备时间占比未知（最大输入比小输入仅多约 6 微秒，但缺成对 profiling 证据）。",
+    "若热调用仍偏慢，剩余开销可能在 stream 查询、张量属性读取或 C 侧任务下发，需宿主采样后再定下一机制。"
+  ]
+}

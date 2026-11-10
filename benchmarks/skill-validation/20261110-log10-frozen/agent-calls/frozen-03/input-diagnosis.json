@@ -1,0 +1,19 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "evidence": [
+    "源码身份：上一轮候选 SHA 726ae0ca… 与 context-brief.source_sha256 一致；本轮修改后为 5ac2254b…。",
+    "预检回执 source_review_requires_revision 指出唯一确定缺陷：_collapse_dims 合并后保留了外层 stride，反例 shape=(2,3)、stride=(3,1) 返回 [[6,3]]，stride1 路径会按 0,3,6,9,12,15 越界。",
+    "知识机制 log10-layout-and-streaming 明确记载该约束：合并维度必须保留最内侧 stride。",
+    "当前无本轮实际 IR、成对 profiling 或正式 36 项性能反馈（formal_feedback=null），设备耗时保持未知。"
+  ],
+  "hypothesis": "若合并后的连续块步长取自最内层维度，则 (2,3)/(3,1) 之类的可合并布局会被识别为单一连续维度 [[6,1]] 并走平坦寻址，既消除越界写，又避免退化为散布访问；此前“非连续路径慢/错”的成因之一是这条元数据错误，而非 Triton 数学本身。",
+  "change": "仅一处最小修正（Edit）：_collapse_dims 在满足 outer[1]==st*size 时同时把合并后步长置为最内层 st，并加中文注释说明反例。数学路径（tl.log(x)*换底常数、保持输入 dtype）、规模分流（中等输入大块平坦、最大输入 40 program 有限网格流式）、stride1/多维寻址与启动路径本轮均未改动，未引入新优化机制。",
+  "expected": "合并维度反例 shape=(2,3)/stride=(3,1) 及 offset 视图返回 [[6,1]] 并走平坦路径；正确性缺陷消除，越界写风险清零。性能预期不设定量增益：该修复只把错误寻址改为正确寻址，路径几何不变。",
+  "validation": "工具桥 preflight 返回 awaiting_source_review、source_sha256=5ac2254b…，保持候选不变等待外部只读路径与地址边界审查；正式 36 项与双方各 66 项补测及阈值 0.8 需宿主 KGS 反馈确认，预检通过不代表达标。",
+  "unknown": [
+    "本轮无 candidate 实际 TTIR/bcmlir 与成对 profiling，无法判断大输入是访存、标量循环还是搬运组织受限。",
+    "历史“保持输入 dtype 提升到 0.851055 倍 CANN”绑定旧 SHA 8600ce07…，当前源码尚未在正式合同复现该收益。",
+    "最大输入 (1<<20 以上) 走 40 program / 8192 连续载荷的实际轮次开销、UB 占用与尾块表现，待正式性能反馈。",
+    "小输入（1024 元素）宿主发射固定延迟占比重，当前普通 JIT 调度未做缓存启动器优化，是否需按 selu 迁移记录补启动路径未验证。"
+  ]
+}
