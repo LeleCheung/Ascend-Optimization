@@ -72,7 +72,7 @@ def main():
     assert request['source_sha256']==digest and request['case']==spec['case']
     assert request['trace_time_unit']==a.trace_unit and request['soc']==a.soc and request['core_id']==a.core_id
     execution=read(out/'execution.json');assert execution['returncode']==0 and not any(execution['child_exit_codes'])
-    from hgkda.simulator import parse
+    from hgkda.simulator import parse, validate_time_unit
     listing=parse(out/'raw/kernel-000',kernel,source,digest,spec['case'])
     assert listing['kernels'] and all(k['name']==kernel for k in listing['kernels'])
     save(out/'listing.json',listing)
@@ -82,9 +82,11 @@ def main():
         traces=list((out/'raw/kernel-000').glob('OPPROF_*/simulator/'+core['name']+'/trace.json'))
         assert len(traces)==1,'时间轴原件不唯一'
         raw=read(traces[0]);trace=dict(raw) if isinstance(raw,dict) else dict(traceEvents=raw)
+        unit_validation=validate_time_unit(raw,core['instructions'],a.trace_unit)
         trace['hgkda_binding']=dict(source_sha256=digest,case=spec['case'],kernel=kernel,
             core=core['name'],time_unit=a.trace_unit,raw_trace_sha256=sha(traces[0]),
-            raw_trace=str(traces[0]),scope='单次模拟器采集的单kernel、单硬件核文件；不是整卡trace')
+            raw_trace=str(traces[0]),unit_validation=unit_validation,
+            scope='单次模拟器采集的单kernel、单硬件核文件；不是整卡trace')
         target=out/(core['name']+'-bound-trace.json');save(target,trace)
         result=analyze(listing,trace,kernel=kernel,core=core['name'],trace_unit=a.trace_unit,
                        sources={str(source):dict(text=source.read_text(encoding='utf8'),sha256=digest)})

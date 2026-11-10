@@ -27,6 +27,7 @@ python -m tools.skill_validation pair --config /path/to/run/config.json --case l
 | 准备与执行 | `prepare_operator.py`、`host_action.py`、`agent_runner.py`、`agent_tools.py` | 固定起点、单项调度、模型调用及有限工具桥 |
 | 当前上下文 | `transfer_context.py` | 按配置绑定源码、合同、知识、IR、采集和正式反馈 |
 | 成对采集 | `collect_pair.py`、`paired_driver.py`、`discover_kernel.py` | 发现实际kernel并按同输入采集候选和参考 |
+| 单核模拟器 | `collect_simulator.py` | 采集当前候选的逐核指令／时间轴，使用独立`hgkda.simulator`解析器，生成热点区域并更新模型上下文 |
 | 编译与宿主诊断 | `runtime_api.py`、`compare_compiled.py`、`host_profile.py` | 实际接口、IR比较及合同驱动的函数栈采样 |
 | 启动诊断 | `probe_launch.py`、`launch_probe.py` | 前者检查提交／同步及可选任务轨迹；后者检查冷／热缓存与调用钩子，二者不能互相替代 |
 | 算子专项 | `tools/operators/selu_/`、`tools/operators/log10_/` | 专项检查按算子集中维护，统一动作仍由本入口调用 |

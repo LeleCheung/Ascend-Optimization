@@ -3,6 +3,29 @@ import csv
 import json
 import math
 from pathlib import Path
+from statistics import median
+
+
+def validate_time_unit(trace, instructions, unit):
+    """用同核、同PC的CSV累计时间／cycles交叉核验trace单位，不读取显示单位。"""
+    events=trace.get('traceEvents',[]) if isinstance(trace,dict) else trace
+    names={e.get('pid'):e.get('args',{}).get('name') for e in events if e.get('ph')=='M' and e.get('name')=='process_name'}
+    durations={}
+    for event in events:
+        args=event.get('args',{});duration=number(event.get('dur'))
+        if event.get('ph')!='X' or 'pc_addr' not in args or not duration or names.get(event.get('pid'))=='CACHEMISS':continue
+        key=pc(args['pc_addr']);durations[key]=durations.get(key,0)+duration
+    ratios=[]
+    for row in instructions:
+        reference=row.get('cycles' if unit=='cycles' else 'running_time_us')
+        if reference and row['pc'] in durations:ratios.append(durations[row['pc']]/reference)
+    expected=1000 if unit=='ns' else 1
+    matching=sum(abs(value/expected-1)<.05 for value in ratios)
+    if len(ratios)<3 or matching/len(ratios)<.8:
+        raise ValueError('trace单位无法由同PC的CSV核验：'+str(dict(unit=unit,compared=len(ratios),
+            median_ratio=median(ratios) if ratios else None,expected_ratio=expected)))
+    return dict(status='verified',unit=unit,compared_pcs=len(ratios),matching_pcs=matching,
+                median_ratio=median(ratios),expected_ratio=expected,method='同PC的trace正时长总和对照CSV累计时间或cycles')
 
 
 def pc(value):

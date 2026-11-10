@@ -126,7 +126,7 @@ def analyze(listing, trace=None, *, core=None, kernel=None, width=8, top=12, tra
                 row=dict(id=identifier,kernel=k['name'],core=c['name'],kind=kind,file=file,start=start,end=end,
                          instructions=len(members),pipelines=sorted({str(m.get('pipeline','unknown')) for m in members}),
                          instruction_time_sum_us=sum(times),largest_instruction_us=max(times,default=0),
-                         wait_instruction_time_sum_us=sum(m.get('running_time_us',0) for m in members if re.search(r'WAIT|BAR',m.get('instruction','')) and finite(m.get('running_time_us',0))),
+                         wait_instruction_time_sum_us=sum(m.get('running_time_us',0) for m in members if re.search(r'WAIT|BAR',m.get('instruction',''),re.I) and finite(m.get('running_time_us',0))),
                          pcs=[m.get('pc') for m in members],source_lines=sorted({(m.get('source') or {}).get('line',0) for m in members}),
                          contains_function_entry=any((m.get('source') or {}).get('code','').lstrip().startswith('def ') for m in members),
                          interpretation=('SHA核验源码的静态AST范围；编译器调试位置决定归属，不重建动态循环次数或硬件关键路径。' if kind in {'source_loop','source_conditional','source_function'} else '源码邻域/PC邻域。')+'累计指令时间仅作关注度排序，各流水可重叠，非真实区域耗时或已证实因果')
@@ -153,7 +153,7 @@ def analyze(listing, trace=None, *, core=None, kernel=None, width=8, top=12, tra
                 if b<=a:outside+=1;continue
                 pipe=names.get(e.get('pid'),str(e.get('pid')))
                 by_pipeline[pipe].append((a,b))
-                if re.search(r'WAIT|BAR',e.get('name','')):waits[pipe].append((a,b))
+                if re.search(r'WAIT|BAR',e.get('name',''),re.I):waits[pipe].append((a,b))
                 else:productive[pipe].append((a,b))
                 pc=pc_key(e.get('args',{}).get('pc_addr'))
                 if pc in lookup and pipe in HARDWARE_PIPELINES:by_region[lookup[pc]].append((a,b))

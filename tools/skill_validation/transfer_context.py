@@ -20,6 +20,23 @@ def profile_frames(rows,iterations):
                  inclusive_us_per_op=row['cumulative_seconds']*1e6/iterations) for row in rows]
 
 
+def compact_regions(data):
+    """保留判断所需的区域和区间统计；PC及空闲区间原件按需读取。"""
+    if not data:return None
+    timeline=dict(data['timeline'])
+    if 'pipelines' in timeline:
+        timeline['pipelines']=[dict(row,idle_intervals=row.get('idle_intervals',[])[:8]) for row in timeline['pipelines']]
+    rows=[]
+    for row in data['regions'][:8]:
+        item={k:v for k,v in row.items() if k not in {'pcs','source_lines'}}
+        item.update(pcs=row.get('pcs',[])[:8],pc_count=len(row.get('pcs',[])),
+                    source_lines=row.get('source_lines',[])[:16])
+        rows.append(item)
+    return dict(source_sha256=data.get('source_sha256'),case=data.get('case'),regions=rows,
+        total_regions=data['total_regions'],timeline=timeline,limitations=data['limitations'],
+        compact_policy='最多8区域，每区域8个PC；每流水最多8个空闲区间，完整原件见绑定context')
+
+
 def retire_previous(workspace,digest):
     """保留上一源码的反馈原件，避免把它冒充当前源码的采集或成绩。"""
     for name in ['paired-context-pointer.json','performance-feedback.json','next-performance-feedback.json','latest-preflight.json','launch-probe.json','host-profile.json','compiler-comparison.json']:
@@ -96,10 +113,7 @@ def build(config):
                 artifacts.append(dict(path=str(target.relative_to(workspace)),sha256=item['sha256'],origin='current_paired_capture'))
         paired['instruction_hotspots']=deep.get('instruction_hotspots')
         region_data=deep.get('regions')
-        paired['regions']=None if not region_data else dict(
-            source_sha256=region_data.get('source_sha256'),case=region_data.get('case'),
-            regions=region_data['regions'][:8],total_regions=region_data['total_regions'],
-            timeline=region_data['timeline'],limitations=region_data['limitations'])
+        paired['regions']=compact_regions(region_data)
         paired['roofline']=deep.get('roofline')
     methods=read(Path(config['method_manifest']))
     for item in methods['files']:
