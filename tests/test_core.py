@@ -77,6 +77,21 @@ class EvidenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             analyze(listing, events)
 
+    def test_bound_timeline_rejects_wrong_case_core_and_unit(self):
+        listing=dict(source_sha256='source',case=dict(name='case-a'),kernels=[
+            dict(name='k',cores=[dict(name='c',instructions=[])])])
+        binding=dict(source_sha256='source',case=dict(name='case-a'),kernel='k',core='c',time_unit='us')
+        trace=dict(hgkda_binding=binding,traceEvents=[
+            dict(ph='M',name='process_name',pid=1,args=dict(name='MTE2')),
+            dict(ph='X',name='LOAD',pid=1,ts=0,dur=2),
+            dict(ph='X',name='WAIT',pid=1,ts=3,dur=1)])
+        result=analyze(listing,trace,kernel='k',core='c',capture=(0,6))
+        row=result['timeline']['pipelines'][0]
+        self.assertEqual([row[k] for k in ['productive_union','wait_only_union','idle_union']],[2,1,3])
+        for field,value in [('case',dict(name='case-b')),('core','other'),('time_unit','ns'),('source_sha256','other')]:
+            invalid=dict(trace,hgkda_binding=dict(binding,**{field:value}))
+            with self.assertRaises(ValueError):analyze(listing,invalid,kernel='k',core='c')
+
 
 if __name__ == '__main__':
     unittest.main()

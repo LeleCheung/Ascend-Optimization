@@ -86,6 +86,15 @@ def build(config):
             hypotheses=full['hypotheses'],limitations=facts['limitations'],
             full_context_sha256=item['sha256'],
             scope='保留变化最大的32项指标及完整搬运粒度；实际IR另列，不重复嵌入源码和历史知识')
+        # 完整上下文中的深入取证必须真正进入模型输入，不能仅生成文件而不传递。
+        deep=full['facts']
+        paired['instruction_hotspots']=deep.get('instruction_hotspots')
+        region_data=deep.get('regions')
+        paired['regions']=None if not region_data else dict(
+            source_sha256=region_data.get('source_sha256'),case=region_data.get('case'),
+            regions=region_data['regions'][:8],total_regions=region_data['total_regions'],
+            timeline=region_data['timeline'],limitations=region_data['limitations'])
+        paired['roofline']=deep.get('roofline')
     methods=read(Path(config['method_manifest']))
     for item in methods['files']:
         assert sha(Path(config['package'])/item['path'])==item['sha256'],item['path']
@@ -136,7 +145,9 @@ def build(config):
         runtime_api=dict(path=runtime_text.name,sha256=sha(runtime_text),raw_json=runtime.name,raw_sha256=sha(runtime)) if runtime_text else None,
         method_manifest_sha256=sha(Path(config['method_manifest'])),
         interpretation_rules=[
-          '知识是方法及条件，不提供历史最佳源码；候选全部修改由CC／DeepSeek完成。',
+          '起点来源见starter-provenance.json；从已有候选改进与从上游重新生成分别报告，候选全部修改由CC／DeepSeek完成。',
+          '区域累计指令时间只用于排序；同核同窗口的productive、wait_only、idle互斥，空闲不自动等于因果停顿。',
+          '不以单条最慢指令直接选修改；结合周围搬入、计算、写回及实际IR，提出可测量的区域机制假设。',
           '原始FlagGems起点可能含目标设备不合规回退，初次采集缺失不代表已验证其Triton路径。',
           '正式性能只采用KGS完整合同；profiling或设备任务时间与完整调用分别记录。',
           '缺少实际IR、Roofline或组件指标时保留未知，不根据源码虚构测量。',

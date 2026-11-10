@@ -107,6 +107,12 @@ def analyze(listing, trace=None, *, core=None, kernel=None, width=8, top=12, tra
     kernels=[k for k in listing.get('kernels',[]) if kernel is None or k['name']==kernel]
     if not kernels:raise ValueError('没有匹配kernel')
     if trace is not None and (len(kernels)!=1 or core is None):raise ValueError('trace必须绑定唯一kernel和具体硬件核')
+    if trace is not None and isinstance(trace,dict) and 'hgkda_binding' in trace:
+        binding=trace['hgkda_binding']
+        expected=dict(source_sha256=listing.get('source_sha256'),case=listing.get('case'),
+                      kernel=kernels[0]['name'],core=core,time_unit=trace_unit)
+        if any(binding.get(key)!=value for key,value in expected.items()):
+            raise ValueError('时间轴与指令清单的源码、case、kernel、core或单位不同')
     regions=[];lookup={};scopes=source_scopes(sources)
     for k in kernels:
         for c in k.get('cores',[]):
@@ -170,7 +176,9 @@ def analyze(listing, trace=None, *, core=None, kernel=None, width=8, top=12, tra
                           pipelines=rows,outside_events=outside,
                           interpretation='productive排除WAIT/BAR；wait_only排除与有效指令重叠的等待；productive+wait_only+idle=窗口。idle不是因果停顿，不重建关键路径；辅助trace泳道另标。Chrome ts/dur通常为微秒，displayTimeUnit仅显示单位，输入单位由调用者确认。')
     regions.sort(key=lambda r:(r.get('trace_interval_union',0),r['instruction_time_sum_us']),reverse=True)
-    return dict(schema='hgkda-regions-v1',status='completed' if regions else 'empty',regions=regions[:top],total_regions=len(regions),timeline=timeline,
+    return dict(schema='hgkda-regions-v1',status='completed' if regions else 'empty',
+                source_sha256=listing.get('source_sha256'),case=listing.get('case'),
+                regions=regions[:top],total_regions=len(regions),timeline=timeline,
                 grouping=dict(source_line_window=width,pc_bytes=64,top=top,verified_source_files={file:entry['sha256'] for file,entry in (sources or {}).items()},
                     policy='精确文件匹配时优先静态源码循环，其次条件/函数范围；无核验源码时保留邻域聚合'),
                 limitations=['静态源码范围不等同编译后基本块或动态关键路径；源码邻域回退仍需结合实际IR解释', '不同区域的区间也可能重叠，不累加为总耗时', '函数入口调试行号可能覆盖多段指令，已显式标记'])

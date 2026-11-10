@@ -41,6 +41,7 @@ def parser():
             p.add_argument("--listing", type=Path)
             p.add_argument("--ir-manifest", type=Path)
             p.add_argument("--roofline", type=Path)
+            p.add_argument("--regions", type=Path)
     p = commands.add_parser("gate")
     p.add_argument("--source", type=Path, required=True)
     p.add_argument("--review", type=Path)
@@ -116,6 +117,8 @@ def dispatch(args):
                 inputs.append(entry_id)
         if args.trace:
             inputs.append(identity(args.trace))
+            if not read_json(args.trace).get('hgkda_binding'):
+                raise ValueError('导入时间轴须声明hgkda_binding，明确源码、case、kernel、core和时间单位')
         return analyze(read_json(args.listing), read_json(args.trace) if args.trace else None,
                        kernel=args.kernel, core=args.core, top=args.top,
                        sources=sources, trace_unit=args.trace_unit), inputs
@@ -128,7 +131,7 @@ def dispatch(args):
     if cmd == "context":
         from .context import build_context
         result = build_context(args.operator, args.source, args.comparison, listing=args.listing,
-                               ir_manifest=args.ir_manifest, roofline=args.roofline)
+                               ir_manifest=args.ir_manifest, roofline=args.roofline, regions=args.regions)
         return result, result.pop("inputs")
     if cmd == "knowledge":
         from .context import knowledge

@@ -13,6 +13,7 @@ COMMANDS = {
     'preflight': ('host_action.py', ('preflight',), '审查后执行候选预检'),
     'evaluate': ('host_action.py', ('evaluate',), '审查后执行正式KGS评测并反馈'),
     'pair': ('host_action.py', ('pair',), '采集指定case的候选与参考'),
+    'simulate': ('collect_simulator.py', (), '单核模拟器采集、区域时间轴和上下文绑定'),
     'profile-host': ('host_profile.py', (), '按合同采样候选宿主函数栈'),
     'probe-timing': ('probe_launch.py', (), '诊断提交、同步和可选真机任务轨迹'),
     'probe-cache': ('launch_probe.py', (), '诊断冷／热调用缓存与运行钩子'),

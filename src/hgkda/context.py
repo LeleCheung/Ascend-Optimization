@@ -37,7 +37,7 @@ def knowledge(operator, hypotheses=()):
         "update_policy": "新记录先作待验证假设；绑定源码、合同和完整结果后，经审查按条件去重更新"}
 
 
-def build_context(operator, source, comparison, *, listing=None, ir_manifest=None, roofline=None):
+def build_context(operator, source, comparison, *, listing=None, ir_manifest=None, roofline=None, regions=None):
     source = Path(source)
     source_id = identity(source, kind="candidate_source")
     compared = unwrap(read_json(comparison))
@@ -54,7 +54,7 @@ def build_context(operator, source, comparison, *, listing=None, ir_manifest=Non
             groups[name] = diagnose_case({"operator": operator, "case_id": spec.get("case", {}).get("name"),
                                          "metrics": metrics}, levels=("metrics", "instruction"))
     hypotheses = [dict(item, group=group) for group, result in groups.items() for item in result["hypotheses"]]
-    instruction, regions, ir, roof = None, None, [], None
+    instruction, region_result, ir, roof = None, None, [], None
     if listing:
         content = read_json(listing)
         declared = content.get("source_sha256")
@@ -64,8 +64,18 @@ def build_context(operator, source, comparison, *, listing=None, ir_manifest=Non
         names = {k["kernel"] for k in instruction["kernels"]}
         filtered = dict(content, kernels=[k for k in content.get("kernels", []) if k["name"] in names])
         if names:
-            regions = analyze_regions(filtered)
+            region_result = analyze_regions(filtered)
         inputs.append(identity(listing, kind="instruction_listing"))
+    if regions:
+        region_result = unwrap(read_json(regions))
+        if region_result.get('source_sha256') != source_id['sha256'] or region_result.get('case') != spec.get('case'):
+            raise ValueError('热点区域必须绑定相同源码与用例')
+        timeline = region_result.get('timeline', {})
+        if timeline.get('status') == 'completed':
+            names = {row['kernel'] for row in (instruction or {}).get('kernels', [])}
+            if timeline.get('kernel') not in names or not timeline.get('core'):
+                raise ValueError('时间轴必须绑定已匹配的候选kernel和具体核')
+        inputs.append(identity(regions, kind='instruction_regions'))
     if ir_manifest:
         manifest_path = Path(ir_manifest)
         manifest = read_json(manifest_path)
@@ -87,7 +97,7 @@ def build_context(operator, source, comparison, *, listing=None, ir_manifest=Non
     return {"operator": operator, "source": dict(source_id, text=source.read_text(encoding="utf8")),
             "case": spec.get("case"), "reference_kind": spec.get("reference_kind", "unspecified"),
             "facts": {"paired": compared, "compiled_ir": ir, "instruction_hotspots": instruction,
-                      "regions": regions, "roofline": roof},
+                      "regions": region_result, "roofline": roof},
             "hypotheses": hypotheses, "diagnostic_groups": groups,
             "knowledge": knowledge(operator, hypotheses), "inputs": inputs,
             "agent_task": {"output_fields": ["evidence", "mechanism_hypothesis", "proposed_change",

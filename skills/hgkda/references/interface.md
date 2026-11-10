@@ -15,6 +15,10 @@ hgkda.result/v1 封装含 operation、status、inputs 和 result。每个输入�
 
 context 的 facts 保存对照、源码/IR、Roofline、热点和区域；hypotheses 单独保存经验规则结果；knowledge 给出版本化参考。它不自动调用任何模型，也不宣称模型已按建议完成优化。
 
+`regions --listing <listing.json> --trace <bound-trace.json> --kernel <symbol> --core <core> --trace-unit us`接受单kernel、单硬件核的逐指令时间轴。时间轴须携带`hgkda_binding`，声明`source_sha256`、`case`、`kernel`、`core`、`time_unit`，并与指令清单匹配；采集适配层负责核对原始文件和范围。单位须由采集格式确认，不能从`displayTimeUnit`猜测。逐流水使用区间并集计算`productive_union`、`wait_only_union`与`idle_union`，三者相加等于相同观察窗口；流水之间可重叠，不可相加为总耗时。
+
+将结果通过`context --listing <listing.json> --regions <regions.json>`与相同源码、case的成对对照及实际IR一起交给模型。`idle`表示窗口内未观察到该流水执行，不等同已证实的阻塞原因或关键路径；模型须提出具体机制和验证预期。
+
 roofline --input <json> 接受已核验的 GEMM 工作量、同次采集指标和同环境经验参考：facts、shape（M,N,K）、dtype、empirical，并保留 source_sha256 与 case。缺少工作量合同时使用成对 profiling，不用估计值填补未知字段。
 
 ## 知识整理
