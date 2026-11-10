@@ -2,7 +2,9 @@
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
+from .artifacts import unwrap
 from .validation import supplement_status
 from .gate import admit
 
@@ -60,8 +62,22 @@ def organize(records, *, root=Path('.')):
                         if not supplement_status(operator, d, ev['source_sha256']) == 'passed':
                             raise ValueError('补测未满足当前算子门禁')
                 if expect_failure:
+                    if ev.get('performance_feedback'):
+                        item=ev['performance_feedback'];path=root/item['path']
+                        if digest(path)!=item['sha256']:raise ValueError('性能反馈身份改变')
+                        feedback=unwrap(json.loads(path.read_bytes()))
+                        threshold=row['scope'].get('performance_threshold')
+                        if not (isinstance(threshold,(int,float)) and math.isfinite(threshold) and threshold>0
+                            and feedback.get('source_sha256')==ev['source_sha256']
+                            and feedback.get('geo_mean')==result.get('geo_mean')
+                            and feedback.get('threshold')==threshold
+                            and feedback.get('decision')=='continue_optimization'
+                            and feedback.get('accepted') is False
+                            and 0<result['geo_mean']<=threshold):
+                            raise ValueError('性能失败须绑定同源码、完整成绩及明确作用域阈值')
+                        failures+=1
                     if not failures > 0:
-                        raise ValueError('失败约束没有可核验失败结果')
+                        raise ValueError('失败约束没有可核验的补测或性能失败结果')
             except (KeyError, AssertionError, OSError, ValueError) as error:
                 row['status'] = 'draft'
                 row['validation_error'] = type(error).__name__ + ': ' + str(error)

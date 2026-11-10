@@ -1,5 +1,7 @@
 """验证知识准入与去重，不将缺失证据升级为成功结论。"""
 import copy
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +11,30 @@ from hgkda.context import knowledge
 
 
 class KnowledgeTests(unittest.TestCase):
+    def test_performance_failure_requires_matching_score_source_and_scope(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);source='import triton\n@triton.jit\ndef k():\n    pass\n'
+            digest=hashlib.sha256(source.encode()).hexdigest()
+            (root/'candidate.py').write_bytes(source.encode())
+            values={'result.json':dict(status='PASSED',num_passed=1,num_workloads=1,geo_mean=.75),
+                'request.json':dict(implementation=dict(sources=[dict(content=source)])),
+                'review.json':dict(source_sha256=digest,status='reviewed_strict_triton',all_branches_reviewed=True,dependencies_reviewed=True),
+                'feedback.json':dict(result=dict(source_sha256=digest,geo_mean=.75,threshold=.8,decision='continue_optimization',accepted=False))}
+            for name,value in values.items():(root/name).write_text(json.dumps(value))
+            sha=lambda name:hashlib.sha256((root/name).read_bytes()).hexdigest()
+            record=dict(id='failed',operator_type='pointwise',action_id='prefetch',
+                scope=dict(operator='log10_',performance_threshold=.8),summary='正确性通过但性能未过线',status='observed_failure',
+                evidence=dict(source='candidate.py',source_sha256=digest,formal_result='result.json',formal_result_sha256=sha('result.json'),
+                    formal_request='request.json',backend_review='review.json',backend_review_sha256=sha('review.json'),
+                    performance_feedback=dict(path='feedback.json',sha256=sha('feedback.json'))))
+            self.assertEqual(organize([record],root=root)['active'][0]['status'],'observed_failure')
+            invalid=copy.deepcopy(record);invalid['scope']['performance_threshold']=.9
+            self.assertEqual(organize([invalid],root=root)['active'][0]['status'],'draft')
+            values['feedback.json']['result']['source_sha256']='wrong'
+            (root/'feedback.json').write_text(json.dumps(values['feedback.json']))
+            record['evidence']['performance_feedback']['sha256']=sha('feedback.json')
+            self.assertEqual(organize([record],root=root)['active'][0]['status'],'draft')
+
     def test_missing_evidence_downgrades_validation(self):
         record={'id':'sample','operator_type':'pointwise','action_id':'tile',
                 'scope':{'operator':'expm1_'},'summary':'待核验分块修改',
