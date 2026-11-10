@@ -6,10 +6,17 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from hgkda.simulator import parse
+from hgkda.simulator import parse, validate_time_unit
 
 
 class SimulatorTests(unittest.TestCase):
+    def test_display_unit_cannot_override_csv_verified_timestamp_unit(self):
+        trace=dict(displayTimeUnit='ns',traceEvents=[
+            dict(ph='X',ts=i,dur=1000*(i+1),args=dict(pc_addr=hex(i))) for i in range(3)])
+        instructions=[dict(pc=hex(i),running_time_us=i+1,cycles=1650*(i+1)) for i in range(3)]
+        self.assertEqual(validate_time_unit(trace,instructions,'ns')['status'],'verified')
+        with self.assertRaises(ValueError):validate_time_unit(trace,instructions,'us')
+
     def test_same_pc_on_different_cores_is_not_merged_and_source_is_exact(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);source=root/'candidate.py';source.write_text('def k():\n    pass\n')

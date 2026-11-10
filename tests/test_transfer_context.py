@@ -12,6 +12,18 @@ module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 
 
 class TransferContextTests(unittest.TestCase):
+    def test_compact_regions_preserve_wait_accounting_and_source_identity(self):
+        data=dict(source_sha256='current',case=dict(name='case'),total_regions=1,limitations=['overlap'],
+            regions=[dict(id='region',pcs=list(range(100)),source_lines=list(range(100)))],
+            timeline=dict(status='completed',capture_duration=10,pipelines=[
+                dict(productive_union=4,wait_only_union=3,idle_union=3,idle_intervals=[[i,i+1] for i in range(20)])]))
+        result=module.compact_regions(data)
+        self.assertEqual(result['source_sha256'],'current')
+        self.assertEqual(result['regions'][0]['pc_count'],100)
+        self.assertEqual(len(result['regions'][0]['pcs']),8)
+        row=result['timeline']['pipelines'][0]
+        self.assertEqual(row['productive_union']+row['wait_only_union']+row['idle_union'],10)
+
     def test_host_profile_units_use_operator_iterations(self):
         rows=[dict(function='key',self_seconds=.0002,cumulative_seconds=.0003,total_calls=100)]
         result=module.profile_frames(rows,50)[0]
