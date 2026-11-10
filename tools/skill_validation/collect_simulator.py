@@ -46,14 +46,17 @@ def main():
     admit(source.read_text(encoding='utf8'),read(Path(c['run_directory'])/'source-reviews'/(digest+'.json')))
     if not a.parse_only:
         out.mkdir(parents=True,exist_ok=False)
+        # 真机和模拟器的编译产物可能不同；保留相同源码和case，分别写入独立目录。
+        capture_spec=out/'spec.json'
+        save(capture_spec,dict(spec,ir_directory=str(out/'actual-ir')))
         app=shlex.join([c['device_python'],str(Path(c['package'])/'tools/skill_validation/paired_driver.py'),
-                       '--spec',str(pair/'spec.json'),'--side','candidate'])
+                       '--spec',str(capture_spec),'--side','candidate'])
         command=['msprof','op','simulator','--application='+app,'--kernel-name='+kernel,
                  '--soc-version='+a.soc,'--core-id='+str(a.core_id),'--launch-count=1',
                  '--dump=on','--timeout='+str(a.timeout_minutes),'--output='+str(out/'raw/kernel-000')]
         save(out/'request.json',dict(source_sha256=digest,case=spec['case'],kernel=kernel,
              core_id=a.core_id,soc=a.soc,trace_time_unit=a.trace_unit,command=command,
-             paired_spec_sha256=sha(pair/'spec.json'),collector_sha256=sha(__file__)))
+             paired_spec_sha256=sha(pair/'spec.json'),capture_spec_sha256=sha(capture_spec),collector_sha256=sha(__file__)))
         environment=dict(ASCEND_RT_VISIBLE_DEVICES=str(c['device']),OMP_NUM_THREADS='1',
             PYTHONDONTWRITEBYTECODE='1',TRITON_DISABLE_LINE_INFO='false',
             TRITON_CACHE_DIR=str(out/'compiler-cache'),
