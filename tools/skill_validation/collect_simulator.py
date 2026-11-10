@@ -34,6 +34,8 @@ def main():
     p.add_argument('--trace-unit',choices=['us','ns','cycles'],required=True,
                    help='原始trace ts/dur单位，须依据工具格式确认，displayTimeUnit不是换算依据')
     p.add_argument('--parse-only',action='store_true',help='仅解析该目录已完成的采集，不重新运行模拟器')
+    p.add_argument('--allow-postcapture-exit',action='store_true',
+                   help='仅允许目标同步及IR清单落盘之后的139退出；不接受超时或Python异常')
     a=p.parse_args()
     if a.timeout_minutes<1:p.error('timeout-minutes必须为正数')
     c=read(a.config);pair=a.paired_directory.resolve();out=a.output.resolve()
@@ -73,11 +75,27 @@ def main():
         log=(out/'collector.log').read_text(errors='replace')
         codes=[int(code) for code in re.findall(r'Child process exited with status (\d+)',log)]
         save(out/'execution.json',dict(returncode=result.returncode,child_exit_codes=codes))
-        assert result.returncode==0 and not any(codes),'模拟器或被采集进程失败：'+log[-1800:]
     request=read(out/'request.json')
     assert request['source_sha256']==digest and request['case']==spec['case']
     assert request['trace_time_unit']==a.trace_unit and request['soc']==a.soc and request['core_id']==a.core_id
-    execution=read(out/'execution.json');assert execution['returncode']==0 and not any(execution['child_exit_codes'])
+    execution=read(out/'execution.json')
+    qualification=dict(process_clean_exit=execution['returncode']==0 and not any(execution['child_exit_codes']))
+    if not qualification['process_clean_exit']:
+        assert a.allow_postcapture_exit and execution['returncode']==0
+        assert execution['child_exit_codes'] and set(execution['child_exit_codes'])=={139}
+        assert 'Traceback (most recent call last)' not in (out/'collector.log').read_text(errors='replace')
+        capture_spec=read(out/'spec.json');assert sha(out/'spec.json')==request['capture_spec_sha256']
+        assert capture_spec['case']==spec['case'] and capture_spec['source_sha256']==digest
+        assert Path(capture_spec['ir_directory'])==out/'actual-ir'
+        manifest=out/'actual-ir/manifest.json';compiled=read(manifest)
+        assert compiled['source_sha256']==digest and compiled['files']
+        for item in compiled['files']:assert sha(manifest.parent/item['path'])==item['sha256']
+        qualification.update(kernel_completed=True,completion_manifest_sha256=sha(manifest),
+            basis='独立空目录的IR清单在候选调用和torch.npu.synchronize成功返回后写入；当前驱动源码规定该顺序',
+            driver_sha256=sha(Path(c['package'])/'tools/skill_validation/paired_driver.py'),
+            limitation='目标kernel已同步完成，但应用随后以139退出；保留退出异常，不表述为干净进程运行')
+        save(out/'postcapture-exit-qualification.json',qualification)
+    else:qualification['kernel_completed']=True
     from hgkda.simulator import parse, validate_time_unit
     listing=parse(out/'raw/kernel-000',kernel,source,digest,spec['case'])
     assert listing['kernels'] and all(k['name']==kernel for k in listing['kernels'])
@@ -96,6 +114,8 @@ def main():
         target=out/(core['name']+'-bound-trace.json');save(target,trace)
         result=analyze(listing,trace,kernel=kernel,core=core['name'],trace_unit=a.trace_unit,
                        sources={str(source):dict(text=source.read_text(encoding='utf8'),sha256=digest)})
+        result['collection_qualification']=qualification
+        if not qualification['process_clean_exit']:result['limitations'].append(qualification['limitation'])
         save(out/(core['name']+'-regions.json'),result)
         reports.append(dict(core=core['name'],regions=str(out/(core['name']+'-regions.json')),
                            trace_sha256=sha(target),timeline_status=result['timeline']['status']))
@@ -108,7 +128,8 @@ def main():
         '--output',str(context)],check=True)
     save(Path(c['run_directory'])/'workspace/paired-context-pointer.json',
          dict(source_sha256=digest,context=str(context),sha256=sha(context)))
-    save(out/'summary.json',dict(status='completed',source_sha256=digest,case=spec['case'],
+    save(out/'summary.json',dict(status='completed' if qualification['process_clean_exit'] else 'completed_with_postcapture_exit',
+         collection_qualification=qualification,source_sha256=digest,case=spec['case'],
          kernel=kernel,cores=reports,selected_core=selected['core'],context=str(context),
          parser=listing['parser'],
          raw_files=[dict(path=str(p.relative_to(out)),sha256=sha(p)) for p in (out/'raw').rglob('*') if p.is_file()]))

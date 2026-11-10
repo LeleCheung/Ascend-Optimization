@@ -25,6 +25,7 @@ def main():
     secrets = [str(value).encode() for key, value in settings.get('env', {}).items()
                if any(word in key.upper() for word in ['TOKEN', 'API_KEY', 'PASSWORD']) and len(str(value)) > 8]
     files = [p for p in run.rglob('*') if p.is_file() and not p.is_symlink()
+             and p.resolve()!=args.credential_settings.resolve()
              and not (set(p.relative_to(run).parts) & EXCLUDE)
              and not any(part.endswith('-cache') for part in p.relative_to(run).parts)]
     assert files
@@ -37,7 +38,8 @@ def main():
     # 参考profile链接由导出程序保存为相对链接，解压后仍在本次原件内。
     manifest = dict(files=records, file_count=len(records), total_bytes=sum(r['bytes'] for r in records),
                     credential_scan='passed_exact_values_not_recorded',
-                    source_run=str(run), excluded=sorted(EXCLUDE))
+                    source_run=str(run), excluded=sorted(EXCLUDE),
+                    credential_settings_excluded=True)
     manifest_path = run/'export-manifest.json'
     assert not manifest_path.exists()
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2)+'\n', encoding='utf8')
