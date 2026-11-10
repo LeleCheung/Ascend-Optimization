@@ -16,6 +16,8 @@
 
 可复用的远程Python执行工具已收敛到`tools/maintenance/remote_python.py`，显式指定`--host`和`--python`；不在外层持续新增按算子／日期命名的控制脚本。该工具不会自动选择实验、审查候选或启动模型。
 
+从PowerShell传输含中文脚本时，优先传UTF-8文件路径，避免默认管道编码将中文变成问号。固定方法快照不可随工具更新而改写；解析修正及重新解析日志另存。本轮证据集中在`benchmarks/skill-validation/20261110-regions/`，日常调用仍使用上面的统一入口。
+
 ## 仓库内
 
     Ascend-Optimization/

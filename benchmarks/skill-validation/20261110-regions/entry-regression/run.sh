@@ -1,0 +1,3 @@
+cd /data/hanle/ascend-optimization/Ascend-Optimization
+export PYTHONDONTWRITEBYTECODE=1
+/data/hanle/ascend-optimization/runtime/hgkda-release-venv/bin/python -u -m tools.regression.run --plan /data/hanle/ascend-optimization/runs/overnight-regions-20261110-v1/entry-regression/plan.json --container tle_yy --device 7 --port 19697 --lock /data/hanle/ascend-optimization/runs/physical-card-7-campaign.lock --device-python /usr/local/python3.11.15/bin/python3.11 --cann-environment /usr/local/Ascend/cann-9.0.0/set_env.sh > /data/hanle/ascend-optimization/runs/overnight-regions-20261110-v1/entry-regression/controller.log 2>&1

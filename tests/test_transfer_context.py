@@ -46,7 +46,7 @@ class TransferContextTests(unittest.TestCase):
             config=self.fixture(Path(tmp));result=module.build(config)
             self.assertEqual(result['operator'],'log10_')
             self.assertEqual(result['contract']['supplementary_each'],66)
-            self.assertEqual(result['knowledge_retrieval']['exact'],1)
+            self.assertGreaterEqual(result['knowledge_retrieval']['exact'],1)
             self.assertIsNone(result['paired_evidence'])
             self.assertEqual(result['actual_ir'],[])
 

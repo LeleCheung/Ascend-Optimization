@@ -1,0 +1,19 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "evidence": [
+    "paired capture 的 bcmlir（paired-1-_log10_stream.bcmlir，origin=current_paired_capture）显示：流式主循环是 scf.for，循环体内先后 memref.alloc 两个 8192xf16 缓冲并 GM→UB memref.copy，随后 math.log/mulf 与写回同一缓冲的 materialize_in_destination；循环不携带任何可轮换缓冲，写回目标与下一轮搬入目标为同一 UB 缓冲。",
+    "同一次采集的指令热点：WAIT_FLAG PIPE:MTE3,TRIGGERPIPE:MTE2,FLAGID:0 挂在源码 line 56 的 tl.load 上，running_time 44.67us（窗口 49.45us），即 MTE2 每轮都要等上一轮 MTE3 写回完成；与 MTE2 wait_only 由 0 升到 0.768 一致，说明循环内是单缓冲串行（WAR），而非成对预取带来的重叠。",
+    "starter（_log10_flat，512 program，单块 32768 元素）逐块均值：MTE2 5.76 + MTE3 11.6 + VECTOR 14.7 ≈ 32us，接近其 34.8us 采集窗口，说明基线同为单缓冲串行，其 0.495 的速度比来自 512 program 且尾波浪费仅约 1.6%；当前 64 program 在 40 个物理 Vector 核上产生 1.25 倍尾波浪费，且平均 MTE2 粒度由 16.48KB 降到 5.41KB（aiv_mte2_instructions 6207 对 2036）。",
+    "因此设备任务时间 39.26→49.64us 不能只归因于搬运计数或空闲比例：MTE3/Vector 空闲下降只是并发块被压到更少 program 后的分布变化，真正的损失是循环内缓冲复用导致的搬入-写回串行，加上 program 数不整除物理核数。"
+  ],
+  "hypothesis": "若把流式循环改为「循环携带的单块轮换」软件流水（第 0 块先搬入，之后每轮先发出第 i 块的 GM→UB 搬入，再写回第 i-1 块），则相邻两轮使用不同 UB 缓冲，写回与下一轮搬入不再共用缓冲，MTE2 不必等待上一轮 MTE3 的 flag；此时每核内可形成「搬入(i+1) ∥ 计算/写回(i)」的稳态，任务时间趋近各流水最大分量（MTE3/VECTOR）而不是三者相加。",
+  "change": "仅重写 _log10_stream 的设备侧循环结构：以 tl.arange 在循环外构造 8192 元素索引，循环外搬入首块，循环内先发出下一块 tl.load 再对当前块做 tl.log*0.4342944819032518 的原地写回并以循环携带值轮换当前块，循环结束后写回尾块。BLOCK=8192、ITERS、grid=64、_STREAM_THRESHOLD、数学公式、dtype 精度、平坦/stride1/ND 路径、_FAST 启动器与 stream/指针读取全部保持不变；不改动小输入路径与任何布局分支。",
+  "expected": "目标 FP16 [4096,4096]：设备任务时间由 49.6us 降到约 30–36us，正式 speedup 由 0.364 升到约 0.55–0.68（应不低于 starter 的 0.495）；MTE2 wait_only 由 0.768 降到 0.4 以下、MTE2 productive 由 0.22 上升、Vector/MTE3 wait_only 下降；aiv_mte2_instructions 与 5.41KB 平均粒度预计基本不变（本次不针对搬运粒度）。BF16/FP32 4096×4096 同走该循环，应按相近比例回收；其余 case 走未改动的平坦路径，延迟下限约 15.5–16.7us 不变。",
+  "validation": "以 task.json 的 preflight 命令提交候选，随后由宿主执行一次完整 KGS 评测（36 项正式 + 双方各 66 项补测），逐项核对：目标 case3 速度比、case7/case11 是否同向改善、以及全部 ≤1M 元素 case 是否回到 starter 水平；严格性检查覆盖负数、正负零、NaN/Inf、布局 False/True、原位别名与 stream。",
+  "unknown": [
+    "Ascend 侧 bufferization 是否会把循环内 alloc 提升为两份轮换缓冲；若仍合并为同一 UB 缓冲，则 WAR 依旧，本次改动不产生收益，需回退到 starter 路径。",
+    "硬件 flag 调度是否允许第 i+1 块 MTE2 与第 i 块 MTE3 真正并行；源码层轮换只是结构性去依赖，不能据此断言已实现重叠。",
+    "grid=64 在 40 个物理 Vector 核上的 1.25 倍尾波浪费仍存在，会限制本次收益上限；是否调整几何留待下一轮独立验证。",
+    "模拟器区间与逐块均值是模型观测，不是物理延迟，最终判断只看完整 KGS 正式成绩。"
+  ]
+}

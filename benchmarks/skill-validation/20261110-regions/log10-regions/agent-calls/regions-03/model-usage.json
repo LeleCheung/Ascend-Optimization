@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 18,
+    "duration_ms": 113748,
+    "usage": {
+      "input_tokens": 56968,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 622464,
+      "output_tokens": 17444,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 56968,
+        "outputTokens": 17444,
+        "cacheReadInputTokens": 622464,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.0321719999999999,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 0,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.0321719999999999,
+    "result": "Preflight 返回 `awaiting_source_review`，候选已保留、冻结为 SHA `cbb329b7…`。\n\n## 本轮诊断与改动摘要\n\n**机制（非“空闲变多/搬运变小”解释）**\n- `paired-1-_log10_stream.bcmlir`（origin=`current_paired_capture`）显示流式主循环是 `scf.for`，循环体内 `memref.alloc` 两块 8192×f16 后 `memref.copy`(GM→UB)→`math.log`/`mulf`→写回**同一块**缓冲；循环不携带任何轮换缓冲，故相邻两轮共用同一 UB 缓冲。\n- 同次采集热点：`WAIT_FLAG PIPE:MTE3,TRIGGERPIPE:MTE2,FLAGID:0` 挂在 line 56 的 `tl.load` 上（44.67us / 49.45us 窗口），即 MTE2 每轮等上一轮 MTE3 写回 —— 单缓冲 WAR 串行，对应 MTE2 wait_only 0→0.768。\n- starter 逐块均值 MTE2 5.76 + MTE3 11.6 + VECTOR 14.7 ≈ 32us ≈ 其 34.8us 窗口，说明基线同样串行；其相对更优来自 512 program 的尾波浪费仅约 1.6%（64 program 在 40 个物理 Vector 核上为 1.25 倍）。\n- 因此 39.26→49.64us 的主因是循环内缓冲复用（搬入与写回互相阻塞）+ 网格与物理核数不整除，而不是搬运计数或空闲比例本身。\n\n**唯一的改动**：只重写 `_log10_stream` 的设备侧循环为「循环携带单块轮换」软件流水（循环外搬入首块；每轮先发第 i 块搬入，再写回第 i-1 块，`pos`/`x` 作为循环携带值轮换；尾块循环外写回）。`BLOCK=8192`、`ITERS`、`grid=64`、阈值、数学公式与精度、平坦/stride1/ND 路径、`_FAST` 启动器与 stream/指针读取全部未动 —— 为保持实验单变量，本轮不调整几何、不缩小载荷、不减 program 数。\n\n**预测指标**：case3 设备任务时间 49.6→30–36us，speedup 0.364→0.55–0.68（应不低于 starter 0.495）；MTE2 wait_only 降到 0.4 以下、MTE2 productive 上升；`aiv_mte2_instructions` 与 5.41KB 平均粒度预计基本不变；≤1M 元素 case 走未改路径，延迟下限不变。\n\n**未决**：Ascend bufferization 是否真把循环内 alloc 提升为两份轮换缓冲；硬件 flag 调度是否允许 i+1 搬入与 i 写回并行；grid=64 相对 40 核的 1.25 倍尾波仍是收益上限约束；模拟器区间仅为模型观测，最终以完整 KGS 成绩判定。"
+  }
+}
