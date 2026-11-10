@@ -66,7 +66,7 @@ python tools/lineage/build.py --previous-table benchmarks/lineage/20261109/input
 
 优先修复专项经验检索、按性能损失选择大小输入及正式结果驱动的继续优化，再核验启动路径；无需先增加算子数量或更换候选语言。
 
-控制工具位于 [tools/skill_validation/](../tools/skill_validation/)。`prepare_and_run.py` 用于新的独立试验，`agent_runner.py` 可恢复模型阶段而不重新采集，`agent_tools.py` 暴露上下文和默认最多三份设备预检，`evaluate.py` 在外部逐路径审查后对每份新源码提交一次正式评测；本轮因公共入口兼容修复明确增加第四份预检。这些工具是显式的服务器集成验证器，运行时路径由参数／配置传入，不加入 Python 核心依赖。
+上述首轮试验当时使用`prepare_and_run.py`准备，`agent_runner.py`恢复模型阶段，`agent_tools.py`暴露上下文和默认最多三份设备预检，`evaluate.py`在外部逐路径审查后对每份新源码提交一次正式评测；该轮因公共入口兼容修复明确增加第四份预检。2026-11-10目录整理后，新实验改用`python -m tools.skill_validation prepare`，旧入口保留在Git历史和对应方法快照。当前分工见[验证工具说明](../tools/skill_validation/README.md)，不将历史操作步骤作为当前入口。
 
 ## 启动路径与性能反馈恢复（当前结果）
 

@@ -117,12 +117,12 @@ def main():
                 built=read(prior_build/'build.json')
                 assert sha(built['binary'])==built['binary_sha256']
                 assert sha(built['reference'])==built['reference_sha256']
-                assert sha(args.repository/'tools/backends/cann_uniform_range.cpp')==built['source_sha256']
+                assert sha(args.repository/'tools/operators/uniform/cann_uniform_range.cpp')==built['source_sha256']
                 build.mkdir()
                 for path in [Path(built['binary']),Path(built['reference']),Path(built['source']),prior_build/'build.json']:
                     shutil.copyfile(path,build/path.name)
             else:
-                device('build-native',[args.repository/'tools/backends/build_uniform_range.py',
+                device('build-native',[args.repository/'tools/operators/uniform/build_uniform_range.py',
                                       '--sdk',args.sdk,'--output',build])
                 built=read(build/'build.json')
             state['status']='qualifying_reference';save(state_path,state)

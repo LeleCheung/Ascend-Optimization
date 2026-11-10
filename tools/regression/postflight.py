@@ -70,7 +70,7 @@ def main():
             catalog.mkdir()
             original = (args.catalog/'correctness.jsonl').read_bytes()
             (catalog/'correctness.jsonl').write_bytes(original)
-            probe = repository/'tools/backends/probe_cann_expm1.py'
+            probe = repository/'tools/operators/expm1_/probe_cann.py'
             snapshot = args.probe_directory/probe.name
             snapshot.write_bytes(probe.read_bytes())
             save(args.probe_directory/'identity.json',dict(

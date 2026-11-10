@@ -1,4 +1,4 @@
-"""核验启动缓存的当前stream、当前指针和未对齐尾块；不改变正式合同。"""
+"""SELU专项：核验当前stream、当前指针和未对齐尾块，不改变正式合同。"""
 import argparse
 import hashlib
 import importlib.util

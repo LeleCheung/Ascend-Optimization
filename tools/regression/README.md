@@ -66,20 +66,12 @@ python tools/regression/audit.py \
 
 输出路径须不存在且父目录已建立。使用普通克隆时先执行 `git lfs pull`，确保核验的是原始合同包及设备二进制，而非 LFS 指针。
 
-## 回归后的修复实验
+## 专项与历史修复实验
 
-`unary_host_cache.cpp` 与 `build_unary_host.py` 用于验证 `negative_` 的启动开销假设。构建器保留父版本的全部 Triton 核和回退，追加只读取张量元数据并调用 Triton 启动器的 C++ 宿主缓存。缓存按元素数、类型和设备区分；每次取得当前地址和 stream，不保存输入张量或计算结果。
+通用回归工具不直接生成或改写候选。当前专项正确性／执行路径检查集中在[tools/operators/](../operators/README.md)，例如`negative_/verify_unary_host.py`；参考构建与资格检查也按算子维护。
 
-该构建器依赖冻结 `negative_` 的启动计划格式。生成内容属于独立新候选，须绑定宿主源码、二进制和父源码身份，经过逐路径审查、语义补测、实际 Triton 路径核验及一次完整 KGS 评测；它不改变原 25 项固定候选回归的结果。
+2026-11-09的negative、hardswish_out及累计积分修复包含直接拼接或替换候选的历史控制逻辑，已退出当前运行入口，原字节保留于[tools/archive/20261109/](../archive/README.md)。已有成绩和失败原件不改写，详见[回归报告](../../docs/regression-20261109.md)。后续候选及启动封装均由CC／DeepSeek修改。
 
-`run_negative_repair.py` 等待固定回归、参考探测及随机参考检查结束，串行完成构建、准入、路径核验及正式评测。`verify_unary_host.py` 检查冷／热启动、新地址、新 stream、非连续和未对齐输入，捕获四类实际 Triton 编译核，检查宿主缓存是否命中。
+`capture_compiled.py`仍用于只读核验候选路径：拒绝候选调用范围内非元数据ATen操作，从实际Triton编译对象保存TTIR和设备二进制，与完整语义测试及审查共同使用。
 
-`capture_compiled.py` 用于其他新候选的路径核验：在候选调用范围内拒绝非元数据 ATen 操作，并从实际返回的 Triton 编译对象保存 TTIR 和设备二进制。它与完整语义测试、依赖审查共同使用。
-
-`compare_previous.py` 在相同源码和性能用例下分别计算候选耗时、CANN 耗时的新旧比值，输出逐项 JSON 和 CSV。历史索引含多次有效测量的汇总时，索引分数与所附单次原件分数分别保留；本轮仍每项只做一次正式测量。`run_tile_variant.py` 则独立核验 `hardswish_out` 的较大分块候选，所有结果与固定回归分开。
-
-较大分块先检查实际编译路径。910B 的 UB 预算为 192 KiB；本轮 `hardswish_out` 的双循环版本在 8192 分块下仍然溢出，关闭自动多缓冲也未解决。`--complete-block-loop` 改为由静态整除条件选择单一循环，非整除保留掩码，避免完整块和尾块同时占用缓冲。数学表达式、非连续布局及输出类型回退不变。
-
-最终组合还使用 `--affine-gate --native-low-precision --half-only-large-tiles`：归一化门控采用 `clamp(x/6+1/2,0,1)`，输入或输出为 FP32 时保留 FP32，其余采用输入精度。较大分块仅用于 FP16 输入和输出，BF16 内部扩展及 FP32 路径保留 4096。所有改动先核验实际编译产物及完整冻结补测，再进入一次正式请求；不放宽原容差。该组合为 0.866788×，30/30 及两侧各 42/42 通过。
-
-`run_negative_repair.py --stream-variant` 继承经过核验的宿主缓存及 Triton 回退，仅将完整块改为无掩码固定长度搬运；尾块保留掩码。验证器的 `--include-stream-tail` 包含大输入非整除检查。编译异常后数值正确也不等于新路径生效，必须确认实际捕获目标流式核，之后才提交正式请求。
+`compare_previous.py`按相同源码和性能case分别比较候选与CANN的新旧耗时。它不以两个汇总加速比分数之比替代实际性能变化，不通过重复测量挑高分。

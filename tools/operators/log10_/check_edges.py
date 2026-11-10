@@ -1,4 +1,4 @@
-"""额外验证对数极小值、归约边界与大输入尾块；不修改正式合同或候选。"""
+"""log10专项：验证极小值、特殊值、数学边界与尾块，不修改正式合同或候选。"""
 import argparse
 import hashlib
 import importlib.util

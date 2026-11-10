@@ -1,4 +1,4 @@
-"""检查原地SELU在带偏移视图上的结果与周边存储；仅作为额外正确性证据。"""
+"""SELU专项：检查原地偏移视图及周边存储，不替代正式合同。"""
 import argparse
 import hashlib
 import importlib.util

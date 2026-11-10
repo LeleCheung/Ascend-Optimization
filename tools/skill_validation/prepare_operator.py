@@ -53,7 +53,7 @@ def main():
     shutil.copytree(package/'skills/hgkda',workspace/'skills/hgkda')
     (workspace/'.claude/skills').mkdir(parents=True)
     (workspace/'.claude/skills/hgkda').symlink_to(workspace/'skills/hgkda',target_is_directory=True)
-    method_files=[p for folder in ['src/hgkda','skills/hgkda','tools/skill_validation']
+    method_files=[p for folder in ['src/hgkda','skills/hgkda','tools/skill_validation','tools/operators']
                   for p in (package/folder).rglob('*') if p.is_file() and '__pycache__' not in p.parts]
     method_manifest=run/'method-manifest.json'
     save(method_manifest,dict(phase=args.phase,files=[dict(path=p.relative_to(package).as_posix(),sha256=sha(p))

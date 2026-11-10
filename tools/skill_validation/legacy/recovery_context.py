@@ -1,9 +1,11 @@
-"""将当前源码的启动诊断及完整性能反馈提供给模型，拒绝借用其他源码的采集。"""
+"""兼容早期SELU恢复合同；新实验使用transfer_context，不扩展此分支。"""
 import hashlib
 import json
 from pathlib import Path
 import shutil
 import statistics
+import subprocess
+import sys
 
 from hgkda.artifacts import unwrap
 from hgkda.context import knowledge
@@ -15,6 +17,40 @@ def read(path):
 
 def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def build_initial(config):
+    """仅重放早期SELU上下文格式；不准备新候选或扩展到其他算子。"""
+    assert config['job']['operator']=='selu_', '旧上下文仅适用于SELU；新实验使用operator_transfer配置'
+    run=Path(config['run_directory']);workspace=run/'workspace'
+    comparison=workspace/'comparison.json';context=workspace/'context.json'
+    if not comparison.exists():
+        subprocess.run([sys.executable,'-m','hgkda','compare','--directory',config['paired_directory'],
+                        '--output',str(comparison)],check=True,stdout=subprocess.DEVNULL)
+    if not context.exists():
+        subprocess.run([sys.executable,'-m','hgkda','context','--operator','selu_',
+            '--source',str(workspace/'starter.py'),'--comparison',str(comparison),
+            '--ir-manifest',str(run/'baseline-ir/manifest.json'),'--output',str(context)],
+            check=True,stdout=subprocess.DEVNULL)
+    data=unwrap(read(context));paired=data['facts']['paired']
+    local_ir=workspace/'actual-ir';local_ir.mkdir(exist_ok=True)
+    for item in data['facts']['compiled_ir']:
+        shutil.copyfile(item['path'],local_ir/Path(item['path']).name)
+    selected=[row for row in paired['differences'] if any(k in row['metric'] for k in
+                ['ratio','time','instructions','datas'])]
+    selected.sort(key=lambda row:abs((row.get('candidate_over_reference') or 1)-1),reverse=True)
+    brief=dict(source_sha256=data['source']['sha256'],case=data['case'],reference_kind=data['reference_kind'],
+        differences=selected[:12],transfer_granularity=paired['derived_differences'],hypotheses=data['hypotheses'],
+        mechanisms=data['knowledge']['mechanisms'],full_context=str(context),
+        measurement_limits=paired['limitations'],
+        interpretation_rules=['采集为零不自动等于低于分辨率或没有开销；保留未知原因。',
+            '分块payload不等于实际每条搬运指令粒度，须从编译产物或计数核验。',
+            '不得以全任务字节数除以逐block平均时间建立Roofline或声称达到带宽上限。',
+            '实际类型精度是否改变须检查新候选IR；Python源码表达式不能替代编译证据。'],
+        actual_ir=[str(local_ir/Path(row['path']).name) for row in data['facts']['compiled_ir']],
+        reference='CANN原生；正式性能只由KGS完整评测确定')
+    (workspace/'context-brief.json').write_text(json.dumps(brief,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
+    return brief
 
 
 def build(config):

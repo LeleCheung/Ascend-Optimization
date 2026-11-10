@@ -30,3 +30,7 @@ gate --source <candidate.py> 只执行已知路径静态筛查；--review 可绑
 `feedback --operator <name> --source <candidate.py> --result <result.json> --audit <audit.json> --timing-cases <timing.jsonl> --output <new.json>` 校验源码、正式审计及计时case身份，重建几何平均，按性能损失选择代表case，并覆盖各dtype的最大输入。
 
 返回 `continue_optimization` 时把逐case反馈交回模型继续修改；只有超过阈值（默认0.8×）且正式审计所需补测通过才返回 `target_met`。偏移、stream等任务专项检查另行绑定，不由这个分数决策替代。该命令不调用模型、不执行设备测试，也不代替宿主的调度和审查。
+
+## 源码仓库中的服务器验证
+
+使用完整源码仓库开展模型生成与设备验证时，从仓库根目录执行`python -m tools.skill_validation --help`，分别选择`prepare`、`generate`、`context`、`preflight`、`evaluate`或`pair`。这些是Linux服务器集成工具，不随核心包安装；模型与设备配置通过实验配置传入。调用宿主仍负责只读路径审查、多轮编排及停止条件，不将该入口表述为全自动Agent。仅使用已安装skill与核心包时，继续使用上述`hgkda`接口。

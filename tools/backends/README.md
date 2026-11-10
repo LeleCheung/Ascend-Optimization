@@ -5,12 +5,10 @@
 | 工具 | 用途 |
 | --- | --- |
 | `build_cann_reference.py` | 重建示例中已固定的 CANN 参考宿主桥 |
-| `probe_cann_expm1.py` | 独立进程探测官方旧图 Expm1 的默认／高精度模式，核验小值及零符号 |
-| `cann_uniform_range.cpp` | 绑定原生 Uniform＋Clamp，适配原随机合同的半开区间语义 |
-| `build_uniform_range.py` | 单线程编译随机参考桥，核验宿主标量边界并生成带二进制 SHA 的参考包装 |
-| `run_uniform_reference.py` | 等待指定回归结束，核验参考资格，再经独立 CLI 执行一次正式 KGS 请求 |
-| `cann_trapezoid.cpp`、`build_trapezoid.py` | 构建原生 Add＋Muls＋FP32 Cumsum＋Cast 参考及独立 Triton 扫描候选 |
-| `run_trapezoid_reference.py` | 单独核验数学参考合同，保留原输入、容差和补测；通过后提交一次 KGS 正式请求 |
+| `../operators/expm1_/probe_cann.py` | 独立进程探测官方旧图Expm1的默认／高精度模式 |
+| `../operators/uniform/` | Uniform＋Clamp参考构建、资格核验及单次正式评测 |
+
+专项参考按算子集中在[tools/operators/](../operators/README.md)。累计积分的旧构建器同时改写候选，已与旧调度器一起移到[历史工具](../archive/README.md)，不用于新实验。
 
 参考实现的设备计算通过厂商接口执行。C++ 宿主桥负责张量描述符、分配、标量参数、生成器状态和 stream；候选的设备计算与搬运遵循严格 Triton 约束。
 

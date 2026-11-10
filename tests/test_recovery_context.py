@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 
-spec=importlib.util.spec_from_file_location('recovery_context',Path(__file__).resolve().parents[1]/'tools/skill_validation/recovery_context.py')
+spec=importlib.util.spec_from_file_location('recovery_context',Path(__file__).resolve().parents[1]/'tools/skill_validation/legacy/recovery_context.py')
 module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 
 
