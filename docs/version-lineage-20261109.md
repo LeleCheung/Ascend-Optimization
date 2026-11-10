@@ -101,4 +101,6 @@ GitHub证据提交为 `d878910bc48c75105c1dfe787325efd8c4c4644d`。910B 的常�
 
 Codex仅维护方法、知识与工具，并承担取证、只读审查及外层调度；CC／DeepSeek完成全部候选实现修改。冻结阶段7次模型调用、4份正式新源码，未提供历史或开发最佳源码、未增加临时性能优化提示。尚未实现外层完全自主调度。
 
-原件见[开发归档](../benchmarks/skill-validation/20261110-log10-development/summary.json)、[冻结归档](../benchmarks/skill-validation/20261110-log10-frozen/summary.json)及[失败首轮](../benchmarks/skill-validation/20261110-log10-development-failed/summary.json)，方法、耗时及复现入口见[迁移报告](log10-method-transfer-20261110.md)。Windows核验共6967份实验原件及384个版本文件，三类版本及原39项顺序保留。发布正文与语雀回执在收尾提交中保存。
+原件见[开发归档](../benchmarks/skill-validation/20261110-log10-development/summary.json)、[冻结归档](../benchmarks/skill-validation/20261110-log10-frozen/summary.json)及[失败首轮](../benchmarks/skill-validation/20261110-log10-development-failed/summary.json)，方法、耗时及复现入口见[迁移报告](log10-method-transfer-20261110.md)。Windows核验共6967份实验原件及384个版本文件，三类版本及原39项顺序保留。
+
+证据提交为`324577e17cb15b3176421b6f53b8562e43c0bc61`。语雀只追加`log10_`冻结新生成0.847×，旧源码回归0.941×保留；回读核对39项、3张分表、121个GitHub链接及其余38项内容不变。[发布正文](../benchmarks/lineage/20261109/published-table-log10.md)、[回读正文](../benchmarks/lineage/20261109/published-table-log10-readback.md)及[回执](../benchmarks/lineage/20261109/yuque-update-log10.json)保存字节摘要，三端安装与LFS实体核验记录按迁移报告所列位置保存。
