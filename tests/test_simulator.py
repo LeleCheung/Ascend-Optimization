@@ -36,6 +36,16 @@ class SimulatorTests(unittest.TestCase):
             (root/'OPPROF_two/simulator').mkdir(parents=True)
             with self.assertRaises(ValueError):parse(root,'k',source,digest,dict(name='case'))
 
+    def test_sync_queue_wait_is_not_a_timestamp_calibration_reference(self):
+        trace=dict(traceEvents=[dict(ph='X',dur=1,args=dict(pc_addr=hex(i))) for i in range(6)])
+        instructions=[dict(pc=hex(i),instruction='LOAD' if i<3 else 'WAIT_FLAG',
+                           running_time_us=1 if i<3 else 3) for i in range(6)]
+        result=validate_time_unit(trace,instructions,'us')
+        self.assertEqual(result['compared_pcs'],3)
+        self.assertEqual(len(result['excluded_sync_pcs']),3)
+        with self.assertRaises(ValueError):validate_time_unit(trace,instructions,'ns')
+        with self.assertRaises(ValueError):validate_time_unit(trace,instructions[3:],'us')
+
 
 if __name__=='__main__':
     unittest.main()

@@ -25,6 +25,8 @@ roofline --input <json> 接受已核验的 GEMM 工作量、同次采集指标�
 
 curate --records <records.json> --root <evidence-root> 按算子类型、动作和作用域去重。只有源码、完整请求/结果、候选后端审查及所需补测身份均匹配，才保留 validated 状态；缺失证据降为 draft，旧条目保留在 superseded。
 
+`observed_failure`可保存补测失败，或正确性通过但性能未达标的反例。后者须绑定同源码的完整成绩、性能反馈文件及`scope.performance_threshold`；不能仅凭文字判断失败。同步指令的CSV累计等待与trace区间口径分开；时间单位仅用非同步指令交叉核验，等待指令仍参与区域及时间轴统计。
+
 retrieve --index <index.json> --operator-type <type> --scope <scope.json> --max-chars 6000 重新校验证据后按作用域检索，不截断单条记录。它是确定性整理规则；模型提出的新经验不会未经验证自动成为成功规律。
 
 gate --source <candidate.py> 只执行已知路径静态筛查；--review 可绑定已有审查记录。KGS evaluate 还需冻结请求、审查与新的输出目录。后端详细用法见仓库 docs/backends.md。

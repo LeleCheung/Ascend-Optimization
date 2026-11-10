@@ -95,7 +95,7 @@ def organize(records, *, root=Path('.')):
         for row in rows[1:]:
             row['superseded_by'] = chosen.get('id', chosen['dedup_key'])
             history.append(row)
-    return dict(schema='hgkda-knowledge-v1', active=active, superseded=history, rejected=rejected, evidence_root=str(root.resolve()), policy='相同类型/动作/作用域去重；源码/请求/结果核验后标validated或observed_failure；失败约束必须有匹配的失败补测；旧原件保留')
+    return dict(schema='hgkda-knowledge-v1', active=active, superseded=history, rejected=rejected, evidence_root=str(root.resolve()), policy='相同类型/动作/作用域去重；源码/请求/结果核验后标validated或observed_failure；失败约束须有匹配的失败补测或绑定完整成绩及作用域阈值的性能反馈；旧原件保留')
 
 def retrieve(index, operator_type, scope, max_chars=6000):
     selected = []
