@@ -12,6 +12,20 @@ module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
 
 
 class GenerationAuditTests(unittest.TestCase):
+    def test_only_frozen_method_tools_are_accepted_as_development_external_reads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package=Path(tmp);tool=package/'tools/skill_validation/tool.py';tool.parent.mkdir(parents=True)
+            tool.write_bytes(b'method tool')
+            config=dict(phase='development',package=str(package))
+            method=dict(files=[dict(path='tools/skill_validation/tool.py',sha256=module.sha(tool))])
+            self.assertEqual(module.verify_development_method_read(tool,config,method)['status'],'verified_method_tool')
+            self.assertIsNone(module.verify_development_method_read(tool,dict(config,phase='frozen'),method))
+            tool.write_bytes(b'changed')
+            self.assertIsNone(module.verify_development_method_read(tool,config,method))
+            candidate=package/'candidate.py';candidate.write_bytes(b'candidate')
+            method['files'].append(dict(path='candidate.py',sha256=module.sha(candidate)))
+            self.assertIsNone(module.verify_development_method_read(candidate,config,method))
+
     def test_existing_candidate_is_explicit_and_wrong_origin_hash_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace=Path(tmp);(workspace/'starter.py').write_bytes(b'existing generated source')

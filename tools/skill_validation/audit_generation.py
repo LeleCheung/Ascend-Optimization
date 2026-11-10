@@ -35,6 +35,18 @@ def initial_context_identity(call):
                 method_manifest_sha256=context['method_manifest_sha256'],knowledge_sha256=sha(call/'initial-knowledge.json'))
 
 
+def verify_development_method_read(path, config, method):
+    """开发实验可读取已冻结方法工具；不允许外部候选或冻结重生成越界读取。"""
+    if config['phase']!='development':return None
+    package=Path(config['package']).resolve();target=Path(path).resolve()
+    if not target.is_relative_to(package):return None
+    relative=target.relative_to(package).as_posix()
+    if not relative.startswith('tools/skill_validation/'):return None
+    item=next((row for row in method['files'] if row['path']==relative),None)
+    if not item or sha(target)!=item['sha256']:return None
+    return dict(status='verified_method_tool',method_path=relative,sha256=item['sha256'])
+
+
 def frozen_source_continuity(ordered,starter_sha,workspace):
     """允许原字节起点文件初始化，拒绝任何未由模型轨迹解释的源码迁移。"""
     previous=None
@@ -136,12 +148,13 @@ def audit(run):
             if tool['name']=='Read' and path:
                 target=Path(path);target=target if target.is_absolute() else workspace/target
                 if not target.resolve().is_relative_to(workspace.resolve()):
-                    outside_reads.append(dict(invocation=call.name,path=path,success=success))
+                    verified=verify_development_method_read(target,config,method) if success else None
+                    outside_reads.append(dict(invocation=call.name,path=path,success=success,method_tool_identity=verified))
         calls.append(dict(invocation=call.name,model=invocation.get('model'),started_at=invocation.get('started_at'),prompt_sha256=invocation['prompt_sha256'],
             runner_sha256=invocation['runner_sha256'],tool_bridge_sha256=invocation['tool_bridge_sha256'],tools=len(tools),
             candidate_replay=replay_candidate(call,workspace,tools,results,allow_legacy_shell=config['phase']=='development'),
             initial_context=initial_context_identity(call)))
-    assert not any(row['success'] for row in outside_reads),'模型成功读取了workspace外文件，须审查信息来源'
+    assert not any(row['success'] and not row['method_tool_identity'] for row in outside_reads),'模型成功读取了未核验的workspace外文件，须审查信息来源'
     frozen_budget=None
     if config['phase']=='frozen':
         frozen_budget=read(run/'frozen-budget.json')

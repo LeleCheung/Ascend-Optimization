@@ -19,9 +19,11 @@ class KnowledgeTests(unittest.TestCase):
             values={'result.json':dict(status='PASSED',num_passed=1,num_workloads=1,geo_mean=.75),
                 'request.json':dict(implementation=dict(sources=[dict(content=source)])),
                 'review.json':dict(source_sha256=digest,status='reviewed_strict_triton',all_branches_reviewed=True,dependencies_reviewed=True),
-                'feedback.json':dict(schema_version='hgkda.result/v1',status='completed',result=dict(source_sha256=digest,geo_mean=.75,threshold=.8,decision='continue_optimization',accepted=False))}
+                'feedback.json':dict(schema_version='hgkda.result/v1',status='completed',result=dict(geo_mean=.75,threshold=.8,decision='continue_optimization',accepted=False))}
             for name,value in values.items():(root/name).write_text(json.dumps(value))
             sha=lambda name:hashlib.sha256((root/name).read_bytes()).hexdigest()
+            values['feedback.json']['inputs']=[dict(sha256=digest),dict(sha256=sha('result.json'))]
+            (root/'feedback.json').write_text(json.dumps(values['feedback.json']))
             record=dict(id='failed',operator_type='pointwise',action_id='prefetch',
                 scope=dict(operator='log10_',performance_threshold=.8),summary='正确性通过但性能未过线',status='observed_failure',
                 evidence=dict(source='candidate.py',source_sha256=digest,formal_result='result.json',formal_result_sha256=sha('result.json'),
@@ -30,7 +32,7 @@ class KnowledgeTests(unittest.TestCase):
             self.assertEqual(organize([record],root=root)['active'][0]['status'],'observed_failure')
             invalid=copy.deepcopy(record);invalid['scope']['performance_threshold']=.9
             self.assertEqual(organize([invalid],root=root)['active'][0]['status'],'draft')
-            values['feedback.json']['result']['source_sha256']='wrong'
+            values['feedback.json']['inputs'][0]['sha256']='wrong'
             (root/'feedback.json').write_text(json.dumps(values['feedback.json']))
             record['evidence']['performance_feedback']['sha256']=sha('feedback.json')
             self.assertEqual(organize([record],root=root)['active'][0]['status'],'draft')

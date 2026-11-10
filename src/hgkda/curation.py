@@ -65,10 +65,11 @@ def organize(records, *, root=Path('.')):
                     if ev.get('performance_feedback'):
                         item=ev['performance_feedback'];path=root/item['path']
                         if digest(path)!=item['sha256']:raise ValueError('性能反馈身份改变')
-                        feedback=unwrap(json.loads(path.read_bytes()))
+                        document=json.loads(path.read_bytes());feedback=unwrap(document)
+                        bound={value.get('sha256') for value in document.get('inputs',[])}
                         threshold=row['scope'].get('performance_threshold')
                         if not (isinstance(threshold,(int,float)) and math.isfinite(threshold) and threshold>0
-                            and feedback.get('source_sha256')==ev['source_sha256']
+                            and ev['source_sha256'] in bound and ev['formal_result_sha256'] in bound
                             and feedback.get('geo_mean')==result.get('geo_mean')
                             and feedback.get('threshold')==threshold
                             and feedback.get('decision')=='continue_optimization'
