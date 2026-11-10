@@ -30,10 +30,13 @@ def main():
     p.add_argument('--soc',required=True)
     p.add_argument('--simulator-library',type=Path,required=True)
     p.add_argument('--core-id',type=int,default=0)
+    p.add_argument('--timeout-minutes',type=int,default=5)
     p.add_argument('--trace-unit',choices=['us','ns','cycles'],required=True,
                    help='原始trace ts/dur单位，须依据工具格式确认，displayTimeUnit不是换算依据')
     p.add_argument('--parse-only',action='store_true',help='仅解析该目录已完成的采集，不重新运行模拟器')
-    a=p.parse_args();c=read(a.config);pair=a.paired_directory.resolve();out=a.output.resolve()
+    a=p.parse_args()
+    if a.timeout_minutes<1:p.error('timeout-minutes必须为正数')
+    c=read(a.config);pair=a.paired_directory.resolve();out=a.output.resolve()
     spec=read(pair/'spec.json');source=Path(spec['source']);digest=sha(source)
     assert digest==spec['source_sha256']
     assert digest==sha(Path(c['run_directory'])/'workspace/candidate.py'),'只采当前候选'
@@ -47,7 +50,7 @@ def main():
                        '--spec',str(pair/'spec.json'),'--side','candidate'])
         command=['msprof','op','simulator','--application='+app,'--kernel-name='+kernel,
                  '--soc-version='+a.soc,'--core-id='+str(a.core_id),'--launch-count=1',
-                 '--dump=on','--timeout=5','--output='+str(out/'raw/kernel-000')]
+                 '--dump=on','--timeout='+str(a.timeout_minutes),'--output='+str(out/'raw/kernel-000')]
         save(out/'request.json',dict(source_sha256=digest,case=spec['case'],kernel=kernel,
              core_id=a.core_id,soc=a.soc,trace_time_unit=a.trace_unit,command=command,
              paired_spec_sha256=sha(pair/'spec.json'),collector_sha256=sha(__file__)))
@@ -63,7 +66,7 @@ def main():
             fcntl.flock(lock,fcntl.LOCK_EX)
             with (out/'collector.log').open('xb') as log:
                 result=subprocess.run(['docker','exec',c['container'],'bash','-c',shell],
-                                      stdout=log,stderr=subprocess.STDOUT,timeout=420)
+                                      stdout=log,stderr=subprocess.STDOUT,timeout=60*a.timeout_minutes+120)
         log=(out/'collector.log').read_text(errors='replace')
         codes=[int(code) for code in re.findall(r'Child process exited with status (\d+)',log)]
         save(out/'execution.json',dict(returncode=result.returncode,child_exit_codes=codes))
