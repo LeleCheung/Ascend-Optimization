@@ -54,8 +54,33 @@ def main():
                 for name in ['leaf', 'checker']:
                     spec[name] = local(spec[name])
             formal.append(audit['inspect_job'](mapped, path.parent))
+    transfer=config.get('context_kind')=='operator_transfer'
     recovery=config.get('goal_kind')=='performance_recovery_with_formal_feedback'
-    if recovery:
+    if transfer:
+        summary=read(root/'summary.json')
+        assert len(formal)==summary['formal_requests']
+        if summary.get('outcome','accepted')=='accepted':
+            assert formal,'成功实验必须有完整正式结果'
+            selected=next(row for row in formal if row['source_sha256']==summary['source_sha256'])
+            assert selected['full_passed'] and selected['accepted']
+            assert selected['geo_mean']==summary['cann_score']
+        else:
+            assert summary['outcome']=='failed'
+            assert summary.get('cann_score') is None and summary.get('accepted') is False
+            assert summary.get('failure_reason'),'失败归档必须说明终止原因'
+        provenance=read(root/'workspace/starter-provenance.json')
+        assert provenance['starter_sha256']==provenance['upstream_sha256']
+        assert hashlib.sha256((root/'workspace/starter.py').read_bytes()).hexdigest()==provenance['starter_sha256']
+        assert summary['codex_direct_candidate_edits']==0
+        method=read(root/'method-manifest.json')
+        for item in method['files']:
+            assert hashlib.sha256((root/'method-snapshot'/item['path']).read_bytes()).hexdigest()==item['sha256']
+            if item['path'].startswith('skills/hgkda/'):
+                assert hashlib.sha256((root/'workspace'/item['path']).read_bytes()).hexdigest()==item['sha256']
+        assert summary['method_manifest_sha256']==hashlib.sha256((root/'method-manifest.json').read_bytes()).hexdigest()
+        assert summary['phase']==config['phase']
+        if config['phase']=='frozen':assert summary['temporary_codex_optimization_prompts']==0
+    elif recovery:
         summary=read(root/'summary.json')
         assert len(formal)==summary['formal_requests']
         selected=next(row for row in formal if row['source_sha256']==summary['source_sha256'])
@@ -72,7 +97,9 @@ def main():
         assert read(root/'offset-check-final.json')['passed'] == 9
         assert read(root/'entry-equivalence.json')['device_kernels_unchanged']
     value = dict(status='passed', files_verified=len(manifest['files']), formal=formal,
-                 scope=('启动路径恢复实验的原件、完整结果与专项补测' if recovery else
+                 experiment_outcome=summary.get('outcome','accepted') if transfer else None,
+                 scope=('多算子方法迁移：原件、方法身份、起点、完整合同与贡献记录' if transfer else
+                        '启动路径恢复实验的原件、完整结果与专项补测' if recovery else
                         '原件身份及两次不同源码的完整请求；不重复设备评测，不将入口失败作为性能样本'))
     args.output.write_text(json.dumps(value, ensure_ascii=False, indent=2)+'\n', encoding='utf8')
     print(json.dumps(dict(status=value['status'], files_verified=value['files_verified'],

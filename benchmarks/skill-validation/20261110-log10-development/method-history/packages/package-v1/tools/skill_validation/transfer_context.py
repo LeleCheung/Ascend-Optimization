@@ -1,0 +1,61 @@
+"""为多算子方法迁移整理当前源码、分类知识、合同与已绑定的实际采集。"""
+import hashlib
+import json
+from pathlib import Path
+import shutil
+
+from hgkda.artifacts import unwrap
+from hgkda.context import knowledge
+
+
+def read(path):return json.loads(Path(path).read_bytes())
+def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def build(config):
+    run=Path(config['run_directory']);workspace=run/'workspace'
+    source=workspace/config.get('active_source','starter.py');digest=sha(source)
+    operator=config['job']['operator'];library=knowledge(operator,hypotheses=True)
+    for name in ['knowledge.json','contract.json','reference-qualification.json']:
+        target=workspace/name
+        if name=='knowledge.json':
+            target.write_text(json.dumps(library,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
+    compiled=run/'attempts'/digest/'compiled/verification.json'
+    artifacts=[]
+    if compiled.exists():
+        record=read(compiled);assert record['source_sha256']==digest
+        target_root=workspace/'actual-ir'/digest[:12];target_root.mkdir(parents=True,exist_ok=True)
+        for index,entry in enumerate(record['entries']):
+            for item in entry['artifacts']:
+                if item['kind'] not in ['ttir','bcmlir']:continue
+                path=Path(item['path']);assert sha(path)==item['sha256']
+                target=target_root/(str(index)+'-'+path.name);shutil.copyfile(path,target)
+                artifacts.append(dict(path=str(target.relative_to(workspace)),sha256=item['sha256'],kernel=entry['symbol']))
+    feedback=None
+    for name in ['next-performance-feedback.json','performance-feedback.json']:
+        if (workspace/name).exists():
+            feedback=unwrap(read(workspace/name));assert feedback['source_sha256']==digest
+            break
+    paired=None
+    pointer=workspace/'paired-context-pointer.json'
+    if pointer.exists():
+        item=read(pointer)
+        assert item['source_sha256']==digest,'成对采集不属于当前源码'
+        context=Path(item['context']);assert sha(context)==item['sha256']
+        paired=unwrap(read(context))
+    methods=read(Path(config['method_manifest']))
+    for item in methods['files']:
+        assert sha(Path(config['package'])/item['path'])==item['sha256'],item['path']
+    value=dict(operator=operator,phase=config['phase'],source_sha256=digest,active_source=source.name,
+        contract=read(workspace/'contract.json'),knowledge_retrieval=library['retrieval'],
+        mechanisms=library['mechanisms'],formal_feedback=feedback,actual_ir=artifacts,
+        paired_evidence=paired,method_manifest_sha256=sha(Path(config['method_manifest'])),
+        interpretation_rules=[
+          '知识是方法及条件，不提供历史最佳源码；候选全部修改由CC／DeepSeek完成。',
+          '原始FlagGems起点可能含目标设备不合规回退，初次采集缺失不代表已验证其Triton路径。',
+          '正式性能只采用KGS完整合同；profiling或设备任务时间与完整调用分别记录。',
+          '缺少实际IR、Roofline或组件指标时保留未知，不根据源码虚构测量。',
+          '不得把全任务工作量除以逐核平均时间；计数与时间的聚合范围必须一致。',
+          '预检通过是交接审查的边界，正式性能未达标须依据反馈继续生成候选。'])
+    (workspace/'context-brief.json').write_text(json.dumps(value,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
+    return value

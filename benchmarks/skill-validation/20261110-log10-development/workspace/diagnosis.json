@@ -1,0 +1,19 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "evidence": [
+    "源码身份：candidate.py sha256=8600ce07031842c6bed467ea5ebe1f0a66d265e864b171e4176c1f0b6b318324，与context-brief.active_source、performance-feedback.source_sha256、latest-preflight.source_sha256一致；starter.py 为 2a003996…，本候选非其原字节。",
+    "预检：latest-preflight 状态 passed，补充检查 66/66，failed_cases 为空，绑定同一 SHA。",
+    "正式性能：36项合同全量评测 decision=target_met、accepted=true，几何平均 0.851055>阈值0.8。逐case最弱点集中在3个 4096×4096（16777216元素）最大输入：fp16 0.4457、bf16 0.6337、fp32 0.6862；65536 与 1048576 各dtype约0.93–1.01，极小1024输入约0.957–0.992。",
+    "IR证据：actual-ir/8600ce070318 下存在 _log10_tile_kernel、_log10_pair_kernel、_log10_uniform_kernel 三类符号的 TTIR/bcmlir，说明规模分流与成对循环确实进入编译产物；编译器对照显示相对69699663主要为数学dtype变化。",
+    "启动诊断：暖调用 jit_calls 为空，_PLANS 命中，AOT风格启动缓存已生效（该证据不含正式性能，仅说明JIT未重复编译）。"
+  ],
+  "hypothesis": "历史方法可迁移：(1) 移除目标设备PyTorch回退，全部路径用Triton；(2) 数学保持输入dtype（tl.log 后乘换底常数，不做显式FP32升降）以减少宽度转换；(3) 连续平坦路径按规模分流——<=16384单块无循环无掩码直处理，更大输入以8192相邻成对子块、40个program有限网格长循环推进，循环轮数与步长为constexpr，尾块单独掩码；(4) 宿主侧缓存发射计划避免重复元数据构造。最大输入与CANN的差距仍主要落在访存/循环组织而非宿主发射。",
+  "change": "本轮不修改源码：candidate.py 已完整落实上述机制（_TILE_MAX=16384、_PAIR_BLOCK=8192、_PROGRAMS=40、rounds=full//(2*grid) 的满块主循环加掩码尾块、_log10_math 保持输入dtype），且绑定该SHA的正式结果已超阈值，按停止规则保留原字节。",
+  "expected": "保持当前字节即保持已验证的0.851055几何平均；任何进一步改动（如按dtype进一步区分成对载荷或减少最大输入循环轮次）都需重新走预检与完整36项评测，不能凭IR推断增益。",
+  "validation": "已有证据：预检66/66通过；完整36项正式评测几何平均0.851055、accepted=true；launch-probe确认暖路径JIT零调用。本轮未改源码，不复测同源码以免重复消耗。",
+  "unknown": [
+    "最大输入fp16 0.4457的损失中，访存、超越函数吞吐与任务调度各占多少尚未独立取证；无成对profiling。",
+    "16777216元素下块数2048、40 program、每轮2块，满块轮次为25轮，其后残余块由各program的两块尾段掩码覆盖；进一步增大载荷或轮次是否获益未验证。",
+    "更细的每dtype载荷选择（fp16可与fp32同字节宽度取更大元素块）未做单变量实验，不能仅凭不同dtype耗时相近断言标量化瓶颈。"
+  ]
+}

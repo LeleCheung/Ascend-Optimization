@@ -33,6 +33,12 @@ def main():
     config=read(args.config)
     run=Path(config['run_directory']);repo=Path(config['repository']);workspace=run/'workspace'
     if args.action=='context':
+        if config.get('context_kind')=='operator_transfer':
+            from transfer_context import build
+            brief=build(config)
+            print(json.dumps(dict(status='completed',source_sha256=brief['source_sha256'],
+                output=str(workspace/'context-brief.json'),retrieval=brief['knowledge_retrieval']),ensure_ascii=False))
+            return
         if config.get('goal_kind')=='performance_recovery_with_formal_feedback':
             from recovery_context import build
             brief=build(config)
@@ -70,6 +76,8 @@ def main():
     assert args.source is not None
     source=args.source.resolve()
     assert source.is_relative_to(workspace.resolve()) and source.suffix=='.py'
+    if config.get('context_kind')=='operator_transfer' and source!=workspace.resolve()/'candidate.py':
+        print(json.dumps(dict(status='source_rejected',reason='只接受workspace/candidate.py算子实现；不运行起点或测试／探测脚本'),ensure_ascii=False));return
     text=source.read_bytes().decode('utf8');inspection=inspect_text(text)
     if inspection['issues']:
         print(json.dumps(dict(status='static_rejected',issues=inspection['issues']),ensure_ascii=False));return
@@ -79,8 +87,21 @@ def main():
         if isinstance(node,ast.Import):names=[item.name for item in node.names]
         elif isinstance(node,ast.ImportFrom):names=[node.module or '']
         else:continue
-        assert all(name.split('.')[0] in {'torch','torch_npu','triton','math','functools','typing'} for name in names),names
+        assert all(name.split('.')[0] in {'torch','torch_npu','triton','math','functools','typing','os'} for name in names),names
+    # os仅用于当前编译模式的环境元数据，不允许额外宿主执行或文件操作。
+    for node in ast.walk(ast.parse(text)):
+        if isinstance(node,ast.Attribute) and isinstance(node.value,ast.Name) and node.value.id=='os':
+            assert node.attr in {'environ','getenv'},'os仅允许读取环境模式元数据'
     digest=sha(source);attempt=run/'attempts'/digest
+    if config.get('require_preflight_review'):
+        from hgkda.gate import admit
+        review=run/'source-reviews'/(digest+'.json')
+        if not review.exists():
+            pending=dict(status='awaiting_source_review',source_sha256=digest,source=str(source),
+                reason='设备操作前等待外部只读路径与地址边界审查；保持当前候选不变并返回')
+            (workspace/'latest-preflight.json').write_text(json.dumps(pending,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
+            print(json.dumps(pending,ensure_ascii=False));return
+        admit(text,read(review))
     if (attempt/'preflight.json').exists():
         previous=read(attempt/'preflight.json')
         (workspace/'latest-preflight.json').write_text(json.dumps(previous,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
@@ -105,10 +126,13 @@ def main():
         code=device('compiled',[repo/'tools/regression/capture_compiled.py','--source',frozen,
              '--leaf',checks['supplementary']['leaf'],'--output',attempt/'compiled'])
         if code==0:
-            code=device('supplementary',[checks['supplementary']['checker'],'--operator','selu_',
+            code=device('supplementary',[checks['supplementary']['checker'],'--operator',config['job']['operator'],
                  '--source',frozen,'--leaf',checks['supplementary']['leaf'],'--output',attempt/'supplementary.json'])
     qualification=read(attempt/'supplementary.json') if (attempt/'supplementary.json').exists() else None
-    result=dict(status='passed' if code==0 and qualification and qualification['passed']==qualification['total']==42 else 'failed',
+    expected=checks['supplementary']['previous_total']
+    from hgkda.validation import supplement_status
+    qualified=qualification and supplement_status(config['job']['operator'],qualification,digest)=='passed'
+    result=dict(status='passed' if code==0 and qualified and qualification['passed']==qualification['total']==expected else 'failed',
         source_sha256=digest,frozen_source=str(frozen),
         supplementary=dict(passed=qualification['passed'],total=qualification['total']) if qualification else None,
         failed_cases=[dict(case=row['case'],error=row.get('error')) for row in (qualification or {}).get('cases',[]) if not row['passed']][:4],

@@ -1,0 +1,271 @@
+{
+  "operator": "log10_",
+  "phase": "development",
+  "source": {
+    "baseline": "starter.py",
+    "candidate": "candidate.py",
+    "candidate_sha256": "5f3b50a21cbca3ffe96772aa4dece4344b76953c6938e2545b44a03abc6e5af9",
+    "previous_candidate_sha256": "b64e7d8351df6e382830de252becb36d373e912757e42f27659427a04f7c43fb",
+    "feedback_source_sha256": "b64e7d8351df6e382830de252becb36d373e912757e42f27659427a04f7c43fb",
+    "identity_note": "performance-feedback.json 的 inputs[0].sha256（b64e7d83…）与改动前的 candidate 逐字节一致，actual-ir/b64e7d8351df 下的 TTIR／bcmlir 同样绑定该 SHA；本轮据此逐 case 损失修改。未读取历史最佳源码或其他实验目录，未使用其他 agent。"
+  },
+  "contract_facts": {
+    "formal_cases": 36,
+    "supplementary_each": 66,
+    "timing_cases": "12 项：float16/bfloat16/float32 × {1024, 65536, 1048576, 4096x4096}",
+    "tolerances": "fp16/bf16 atol=rtol=0.015；fp32 atol=rtol=1e-4；required_matched_ratio=1.0",
+    "layouts": ["False", "True"],
+    "reference": "CANN_native_single_api",
+    "threshold": 0.8,
+    "public_entrypoint": "run(A)",
+    "settings": "warmup_ms=1000, benchmark_ms=100, num_trials=3"
+  },
+  "round_focus": "正式反馈（source_sha256=b64e7d83…，与改动前的 candidate 逐字节一致）geo_mean=0.7539，accepted=false，阈值 0.8。9 个 ≤1e6 元素 case 为 15.3–17.9us（参考 14.9–15.5，0.83–0.98，已贴近宿主发射平台）；三个 4096x4096（1.6777216e7 元素）为 fp16 53.03us/参考 15.89、bf16 53.64/25.38、fp32 47.72/26.21（0.30/0.47/0.55）。本轮只实现一个可独立验证的机制：把逐元素 tl.log 换成纯算术的 _log10_vec（位分解取幂次 + 尾数 9 次 Taylor 多项式），分块、网格、成对预读结构、布局合并与宿主发射路径全部未改动。",
+  "evidence": [
+    {
+      "kind": "formal_feedback",
+      "round": "本轮（改动前 SHA d519b459…）",
+      "source": "performance-feedback.json（source_sha256=d519b459…，与本轮改动前的 candidate 逐字节一致）",
+      "detail": "decision=continue_optimization，geo_mean=0.6449639316459126，threshold=0.8。大输入三项 speedup：fp16 0.26562（63.26/16.80us）、bf16 0.38760（65.29/25.30us）、fp32 0.36842（69.81/25.72us）；其余九项 0.75068–0.83241，候选 20.01–21.78us，参考 16.28–16.91us。",
+      "implication": "几何平均的唯一大额缺口是三种 dtype 的 4096x4096；九项已贴近约 20us 的宿主平台（参考 16.3–16.9us），本轮不动宿主路径。"
+    },
+    {
+      "kind": "ir_fact",
+      "round": "本轮",
+      "source": "actual-ir/d519b459c915/15-kernel.bcmlir（改动前源码的 4096x4096 fp16 平坦核）与同目录 15-kernel.ttir",
+      "detail": "scf.for 循环体为单块串行：memref.reinterpret_cast 生成带 offset 的视图 → memref.alloc + memref.copy 取入 4096 元素 → arith.extf → math.log → mulf 0.434294492 → arith.truncf → materialize_in_destination 写回，之后才进入下一轮；循环体内没有第二块、没有预读、没有多缓冲。TTIR 对应 scf.for %offset = %start to %bulk step %stride。",
+      "implication": "同一 program 同一时刻只有一次搬运在途；1.6777216e7 元素、BLOCK=4096、grid=40 时每 program 约 102 轮。这是本轮机制的直接事实依据（不推断设备指令条数）。"
+    },
+    {
+      "kind": "experimental_history",
+      "round": "历史轮次（同算子、同设备、同合同）",
+      "source": "本文件历史记录与 candidate.py 的历史机制段",
+      "detail": "带掩码的成对预读版正式结果为 fp16 52.20us／bf16 52.64／fp32 55.60（geo_mean=0.7115）；随后改回「单块、无掩码」后同样三项为 63.26／65.29／69.81（geo_mean=0.6449）。",
+      "implication": "在途搬运数加倍对这三项有可重复的正向作用（约 17%），而掩码本身不是主要成本；因此本轮在保留预读的同时把掩码从热循环彻底去掉，属同一机制的加强，不是重新设计。"
+    },
+    {
+      "kind": "source_fact",
+      "round": "本轮",
+      "source": "candidate.py 的平坦路径与宿主发射路径",
+      "detail": "_flat_specs 仍做整除分解：bulk=(n//block)*block、stride=grid*block；新增 pairs（blocks≥2*grid 时 (blocks-2*grid)//(2*grid)+1），作为「每个 program 都成立」的配对轮数下界（program p 负责块 p, p+grid, p+2*grid, …，块数随 p 单调不增，故取 p=grid-1 的配对轮数）。内核按 start+pairs*span（span=2*stride）结束配对循环，再从该处按 stride 单块补到 bulk。",
+      "implication": "覆盖不变量：program p 的块序列被切成「前 2*pairs 块成对处理 + 其余单块处理」，两段不重叠、合计恰好覆盖该 program 全部满块；所有 offset < bulk，因此两段都不需要掩码。宿主发射计划（_make_op／_build_plan／_emit_ops／_demote_plan／_stream_for／钩子门／整数地址直发）逐字保留，仅尾部实参多一个形状可决定的标量 pairs。"
+    },
+    {
+      "kind": "coverage_check_by_hand",
+      "round": "本轮",
+      "detail": "按合同 12 项逐一核算 pairs：1024 元素 block=1024、blocks=1、grid=1 → pairs=0（仅尾部块）；65536 → blocks=16、grid=16 → pairs=0（各 1 块，走收尾循环）；1048576 → blocks=256、grid=40 → pairs=3，p<16 有 7 块（6 成对 + 1 收尾），p≥16 有 6 块（3 对 + 0 收尾）；4096x4096 → blocks=4096、grid=40 → pairs=51，p<16 有 103 块（102 + 1），p≥16 有 102 块（51 对）。",
+      "implication": "合同全部 12 项的块划分不重不漏；非满块输入（残余 n-bulk）仍只由 program 0 的 constexpr 尾部块处理。"
+    },
+    {
+      "kind": "knowledge_record",
+      "round": "本轮",
+      "id": "log10-layout-and-streaming",
+      "status": "historically_observed（可迁移方法，不继承收益）",
+      "detail": "该记录要求：有限网格循环与相邻数据块预读属「待当前源码验证」的方法；TTIR 中 load／计算／store 的排列不证明真实流水有重叠；双块改动若未提升完整性能，不得宣称访存延迟瓶颈已解决。",
+      "implication": "本轮不主张已证明延迟瓶颈，只报告结构改动与逐 case 结果；若大输入三项没有下降，按该约束转向分块大小、在途并发数或每元素计算形态，并保留原方案。"
+    },
+    {
+      "kind": "unknown",
+      "round": "本轮",
+      "detail": "当前 SHA 无成对 profiling、指令热点与 Roofline；设备侧最终指令层中 math.log 的展开形态、两次 load 是否真正并行下发、UB 双缓冲占用是否越过后端上限，均未采集。",
+      "implication": "不虚构 IR 与耗时；机制收益只能由宿主完整评测判定。"
+    },
+    {
+      "kind": "formal_feedback",
+      "round": "历史",
+      "historical": true,
+      "kind": "formal_feedback",
+      "source": "performance-feedback.json（source_sha256=0fefe838…，与上一版 candidate 一致）",
+      "detail": "decision=continue_optimization，geo_mean=0.4032，threshold=0.8。逐 case：fp16 4096x4096 62.77us/参考 16.20us（0.258）；bf16 4096x4096 65.56/25.35（0.387）；fp32 1024 41.28/16.40（0.397）；fp32 4096x4096 59.20/25.70（0.434）；其余 8 项 0.407–0.441，候选 37.8–41.1us，参考 16.4–16.9us。",
+      "implication": "小输入（1024 元素）与 1.6e7 元素的大输入候选时间只差约 21us，而小输入仍需 41us，说明当时公共平台由与设备工作量无关的宿主固定开销支配；该轮据此只动了宿主重读项。"
+    },
+    {
+      "kind": "host_profile_fact",
+      "source": "host-profile.json（同一 SHA，log10_-timing-0，50 次采样）",
+      "detail": "按 50 次折算的单次自耗时：__triton_launcher.launch 约 29.1us、_run_one 约 7.8us、_plan_key 约 4.8us、_stream_for 约 2.5us；_mode_token 自耗时约 7.1us，而其累计约 34.7us，内部几乎全是 torch_npu.utils.patch_getenv._patched_environ_get（累计约 25.5us，含 os.__getitem__ 每次调用 4 次共约 16.4us 与 str.encode 约 3.6us）。cProfile 有采样开销，不作为正式耗时。",
+      "implication": "_mode_token 是当时可识别的最大单项宿主成本，且完全与设备计算无关；那一轮只删除了它。该分解不能替代正式评测。"
+    },
+    {
+      "kind": "runtime_api_fact",
+      "source": "runtime-api-excerpts.md 的 NPULauncher 段；runtime-api.json 的 compiler.py 摘录",
+      "detail": "NPULauncher.__init__ 一次性以 os.getenv 读取 TRITON_COMPILE_ONLY 与 TRITON_REGISTER_TENSOR_MSPROF，存为 self.compile_only / self.enable_msprof_register_tensor；调试模式来自该产物的 metadata.debug / debug_enabled。__call__ 只依据这些已存属性判定，compiler.py 的 runner 对已编译产物也不重读环境变量。",
+      "implication": "模式身份绑定在「启动器实例 + 该产物 metadata」上，构造后不可变；对已缓存产物，逐次重读环境变量既不能改变其行为，也与普通 JIT 调度语义不一致。真正的模式核验点在建计划时（_make_op 已逐个排除非普通模式），本轮据此删除热路径重读。"
+    },
+    {
+      "kind": "source_fact",
+      "source": "上一版 candidate.py（0fefe838…）的宿主热路径",
+      "detail": "run → _run_one：_plan_key(dtype, shape, stride, ptr&15, device) → _PLANS.get → 钩子门（读两个 HookChain.calls）→ _mode_token（2 次 os.environ.get + 2 次 getattr + 组元组）→ 长度/直发判定 → _stream_for（当前 device 比对 + raw stream 查询）→ 原生 launch。",
+      "implication": "热路径中只有 address/shape/stride/device/stream/钩子是可变量；环境变量与 metadata 派生属性对既有产物是不可变量，可安全移出热路径。"
+    },
+    {
+      "kind": "knowledge_record",
+      "id": "selu-compiled-launch-path",
+      "status": "historically_observed（可迁移方法，不继承收益）",
+      "detail": "约束要求「缓存计划须识别当前编译／调试模式变化」。",
+      "implication": "本轮的落实方式是：模式核验在建计划时完成（_make_op 逐项排除 compile_only、tensor 注册、debug），而不是每次调用重读环境；这与该约束的意图（不得让非普通模式产物被直发）一致，同时不把不可变状态放进热路径。收益仍须完整评测确认。"
+    },
+    {
+      "kind": "unknown",
+      "detail": "上一轮没有新的成对 profiling、实际 IR、指令热点与 Roofline（context-brief.json 的 paired_evidence 为 null）；无采集可用于判定删除环境重读后剩余宿主时间各占多少。该轮之后已由 actual-ir/4c184cdc36f4 补上平坦内核的实际 TTIR。",
+      "implication": "不虚构 IR 或测量值；方向性预期只能由完整评测确认。"
+    },
+    {
+      "kind": "formal_feedback",
+      "source": "performance-feedback.json（source_sha256=4c184cdc…，与上一版 candidate 一致）",
+      "detail": "decision=continue_optimization，geo_mean=0.6414，threshold=0.8。逐 case：fp16 4096x4096 62.88us/参考 16.26us（0.259）；bf16 4096x4096 65.24/25.31（0.388）；fp32 4096x4096 58.65/26.37（0.450）；其余 9 项 0.725–0.841，候选 19.18–20.92us，参考 15.02–16.38us。",
+      "implication": "小输入 1024 元素与 1e6 元素候选时间几乎相同（约 19–21us），说明公共平台是约 19us 的固定开销；大输入多出的约 40us 只能来自设备侧，且损失权重集中在三种 dtype 的 4096x4096。"
+    },
+    {
+      "kind": "actual_ir_fact",
+      "source": "actual-ir/4c184cdc36f4/15-kernel.ttir（平坦内核，源码 SHA 与反馈一致）",
+      "detail": "函数体为 scf.for %offset = start to n_elements step loop_stride，循环体内依次 tt.make_range(4096) → tt.addptr → tt.load（整块，无掩码）→ arith.extf(fp32) → math.log → arith.mulf(0.434294492) → arith.truncf → tt.store。循环不携带 iter_args，也没有任何预读、异步搬运或多缓冲标记。",
+      "implication": "单 program 在任一时刻只有一个在途搬运，一轮完成后才能发起下一轮；1.6e7 元素在 40 个 program 下每 program 约 102 轮串行。这是内存延迟受限的结构性证据，且不影响小输入（其块数不超过 40，不进入循环）。"
+    },
+    {
+      "kind": "source_fact",
+      "source": "上一版 candidate.py（4c184cdc…）的 _log10_flat_kernel",
+      "detail": "EVEN 分支每轮只处理一块（BLOCK=4096），start=pid*BLOCK，步长 loop_stride=grid*BLOCK；_flat_specs 中 grid=min(blocks, 40)。",
+      "implication": "在保持覆盖顺序（每 program 按 loop_stride 跨度推进）与分块常量不变的前提下，可把两轮合并为一轮配对预读，只改循环体内的搬运组织。"
+    },
+    {
+      "kind": "knowledge_record",
+      "id": "log10-layout-and-streaming",
+      "status": "historically_observed（可迁移方法，不继承收益）",
+      "detail": "约束明确把「适合 UB 的分块、有限网格内循环处理及相邻数据块预读」列为待当前源码验证的方法，并要求分别报告设备事件与调用时间。",
+      "implication": "上一轮落实其中的「相邻数据块预读」一项，且不改分块与网格，便于把观测到的差异归因于单一机制。"
+    },
+    {
+      "kind": "formal_feedback",
+      "source": "performance-feedback.json（source_sha256=e62c6d63…，与本轮改动前的 candidate 逐字节一致）",
+      "detail": "decision=continue_optimization，geo_mean=0.6122，threshold=0.8，accepted=false。逐 case：fp16 1024/65536/1048576/4096x4096 = 22.47/22.84/22.59/52.41us（参考 15.81/15.61/15.88/16.03）；bf16 = 22.91/22.18/22.85/52.99（15.95/15.63/15.58/25.34）；fp32 = 22.05/23.42/23.32/49.02（15.56/15.59/15.78/25.84）。",
+      "implication": "1) 候选在 1024 元素与 1048576 元素上的时间只差约 0.1–1.4us，说明公共平台约 22us，与设备工作量几乎无关；参考平台约 15.6us，二者相差约 6.5us，且该差值作用于全部 12 项。2) 上一轮双块预读（H14）的方向得到确认：三种 dtype 的 4096x4096 由 62.88/65.24/58.65us 降到 52.41/52.99/49.02us；同时九个小项由 19.18–20.92us 升到 22.05–23.42us，该反向变化与本轮改动无关（本轮未动内核常量与宿主路径），按测量波动或平台差异记为未知。3) 大输入三项仍需再降才能接近参考，但 6.5us×12 项的宿主平台差是当前几何平均的更大单项杠杆。"
+    },
+    {
+      "kind": "runtime_api_fact",
+      "source": "runtime-api-excerpts.md 的 make_launcher / cpp_device_pointer 段（SHA256 ad1f4116…）",
+      "detail": "生成的启动器对每个 ``*`` 类型实参展开 ``DevicePtrInfo ptr_info{i} = getPointer(_arg{i}, {i});``；``getPointer`` 先 ``PyLong_Check``：为整数时直接 ``PyLong_AsUnsignedLongLong`` 返回；否则走 ``PyObject_GetAttrString(obj, \"data_ptr\")`` + ``PyObject_Call``，并在 ``dev_ptr`` 非空时执行 ``aclrtPointerGetAttributes`` 校验内存位置。",
+      "implication": "设备指针实参传整数地址时，启动器每指针一次省掉属性查找、一次 Python 方法调用和一次 aclrt 地址属性查询；这是纯宿主实参解析差异，设备侧仍是同一编译产物、同一 grid、同一 stream。"
+    },
+    {
+      "kind": "knowledge_record",
+      "id": "selu-compiled-launch-path（显式类型迁移）",
+      "status": "historically_observed（方法可迁移，收益不继承）",
+      "detail": "该记录把「原生启动器仍慢时使用本次输入动态查询的整数地址；编译／普通 JIT 仍保留 Tensor 以正确特化；不缓存地址、不绕过活动调试或采集路径；CPU 或设备不匹配输入不可走整数地址分支」列为已核验方法。",
+      "implication": "本轮落实该条：仅普通热路径（已排除 compile_only、tensor 注册、debug 与活动钩子）使用本次调用查询的整数地址；冷启动与降级仍传 Tensor。候选自身的收益必须由完整评测确认。"
+    },
+    {
+      "kind": "unknown",
+      "detail": "当前 SHA（e62c6d63…）没有成对 profiling、宿主逐项分解与指令热点；context-brief.json 的 paired_evidence / launch_diagnosis / host_diagnosis 均为 null。上一轮 host-profile 只属于更早的 SHA，其 cProfile 数值不可外推。",
+      "implication": "无法事先量化 getPointer Tensor 分支（尤其 aclrtPointerGetAttributes）在约 6.5us 平台差中占多少；本轮不虚构该数值，只按单一机制提交并等完整评测区分。"
+    },
+    {
+      "kind": "formal_feedback",
+      "source": "performance-feedback.json（source_sha256=b2a52734c432…，与本轮改动前的 candidate 逐字节一致）",
+      "detail": "decision=continue_optimization，geo_mean=0.7115，threshold=0.8，accepted=false。逐 case（候选/参考，us）：fp16 1024 17.87/14.97、65536 16.85/14.18、1048576 18.18/14.49、4096x4096 52.20/16.07；bf16 14.53/14.01、17.71/14.14、15.46/14.15、52.64/25.31；fp32 16.44/14.04、16.69/14.51、16.97/14.05、55.60/25.94。",
+      "implication": "1) 九项小／中等输入的候选平台已降到约 14.5–18.2us，与参考平台（约 14.0–15.0us）差距缩到约 1.5–3.5us，说明上一轮的整数地址机制方向有效（上版同九项为 22.05–23.42us）。2) 剩余几何平均缺口几乎全部来自三种 dtype 的 4096x4096：三项对数损失的绝对值合计 2.673，占全 12 项对数损失的 65%。3) 三种 dtype 大输入耗时 52.20/52.64/55.60us 几乎相同，而 fp32 的读写字节数是 fp16 的两倍，说明大输入不是带宽受限，而是每元素计算（fp32 log）× 每 program 循环轮次的结构性成本。"
+    },
+    {
+      "kind": "actual_ir_fact",
+      "source": "actual-ir/b2a52734c432/15-kernel.ttir 与 15-kernel.bcmlir（平坦内核，BLOCK=4096，fp16，源码 SHA 与反馈一致）",
+      "detail": "TTIR：scf.for 循环体内为两次 tt.load（第一块无掩码，第二块带 second_mask 与 other=1.0）→ 两次 math.log(f32) → 两次 mul 0.434294492 → 两次 truncf → 两次 tt.store。bcmlir（设备侧结构化 IR）中同一循环体内除 DMA 相关 memref.alloc/memref.copy 外，掩码路径还生成 memref.alloc + linalg.fill(1.0) + memref.copy、memref.subview、arith.maxsi/minsi/subi/cmpi 的边界运算，以及尾部 tensor.extract_slice + bufferization.materialize_in_destination。",
+      "implication": "配对结构使第二块每轮都必须走完整掩码路径，热循环（1.6e7 元素每 program 约 51 轮配对＝102 块）每轮都携带一次 UB 填充、一次 UB 拷贝、4096 路整型比较与边界运算；同时循环同时在途的 UB 缓冲翻倍。这些都是与元素数值无关的每轮附加成本，可直接从循环体中移除，且不影响数值语义。"
+    },
+    {
+      "kind": "hypothesis_outcome_fact",
+      "source": "对比 4c184cdc36f4 → b2a52734c432 两轮正式反馈",
+      "detail": "双块配对（H14）上线后同批九项由 19.18–20.92us 变为 22.05–23.42us、大输入三项由 62.88/65.24/58.65us 变为 52.41/52.99/49.02us；随后整数地址机制上线，九项降到 14.53–18.18us，大输入三项为 52.20/52.64/55.60us。",
+      "implication": "配对预读对大输入的收益无法与同轮其它变化分离（H14 的净效果记为未定），其每轮掩码代价有 IR 证据。本轮以「去掉每轮掩码路径」为唯一机制，同时把循环恢复为单块满块推进，使差异仍可归因于循环体形态。"
+    },
+    {
+      "kind": "unknown",
+      "detail": "当前 SHA 仍无成对 profiling、指令热点与 Roofline（context-brief.json 的 paired_evidence 为 null）；bcmlir 只到 hivm 之前的结构层，math.log 的最终标量／向量指令序列未采集，因此「每元素 log 的指令条数」不能量化。",
+      "implication": "不虚构 IR 或性能数值；本轮只依据「循环体内附加操作被移除」这一可核验结构差异提交，收益幅度不作定量断言。"
+    }
+  ],
+  "previous_hypotheses": [
+    {
+      "id": "H19-mask-free-full-block-loop",
+      "hypothesis": "把平坦主循环改为只跑满块、循环体内无掩码，可减少每轮 4096 路比较与 UB 填充／拷贝，使三种 dtype 的 4096x4096 下降。",
+      "falsifiable_by": "完整评测中该三项是否从 62–65us 明显下降。",
+      "outcome": "被否证方向——同样三项升到 63.26/65.29/69.81us，geo_mean 0.7115→0.6449；说明每轮掩码附加操作不是主要成本，在途搬运数才是可分辨的杠杆。"
+    },
+    {
+      "id": "H20-tail-outside-hot-loop",
+      "hypothesis": "满块残余由 program 0 的 constexpr 尾部块处理，满块输入下整段消除，语义与原地次数不变。",
+      "falsifiable_by": "66 项补测是否出现未更新、越界或重复写。",
+      "outcome": "未被否证——当时预检 66/66 通过，本轮沿用同一尾部结构。"
+    }
+  ],
+  "hypothesis_outcomes": [
+    "H19：否证（见上）。该结论直接决定本轮不再走「减附加操作」方向，而是恢复并加强在途搬运。",
+    "H20：保留。尾部块结构与批量／步长划分与本轮机制正交，本轮未改动其数学。"
+  ],
+  "mechanism_hypotheses": [
+    {
+      "id": "H22-pair-prefetch-without-mask",
+      "hypothesis": "平坦大输入每 program 同一时刻只有一次搬运在途（actual-ir 单块串行循环），把一轮改为「先发两块 load、再统一计算与写回」可提高单 program 在途搬运数，降低 1.6777216e7 元素输入的每块成本；配对区间内两块必然都是满块，因此可把掩码从热循环彻底去掉，避免上一版配对方案的每轮附加操作与额外 UB 填充。预期三种 dtype 的 4096x4096 从 63–70us 下降到不高于上一版带掩码配对的 52–56us 量级，幅度事先不作定量断言。",
+      "falsifiable_by": "下一次完整评测：若三项大输入未降到 52us 以下（甚至变差），说明限制不在单 program 在途数，或 UB 双缓冲在后端未生效，应转向分块大小（BLOCK 8192 等）、在途并发深度或每元素计算形态，并需要新的设备侧采集；若九项小／中等输入同时系统性变化，说明改动外溢。"
+    },
+    {
+      "id": "H23-exact-once-coverage",
+      "hypothesis": "program p 的满块序列为 start, start+stride, start+2*stride, …（< bulk）。配对循环以 span=2*stride 推进 pairs 轮，覆盖该序列前 2*pairs 项；收尾循环从 start+2*pairs*stride 起按 stride 补到 bulk，覆盖其余项。两段边界严格相接、步长一致，故每个满块恰被处理一次；pairs 取所有 program 的下界，故任何 program 的配对都不会越过 bulk。",
+      "falsifiable_by": "若 66 项补测出现元素被取两次对数（重复写）、未更新（漏写）或越界写（尤其 offset 0/1/3/0 对齐序列、非连续视图、非整除形状），说明覆盖或 pairs 下界有误，必须回退该机制。"
+    },
+    {
+      "id": "H24-other-paths-unchanged",
+      "hypothesis": "_log10_uniform_kernel、_log10_rows_kernel（含 EVEN）、_BLOCK=4096、_PROGRAMS=40、_SCATTER_BLOCK=2048、_GRID_LIMIT、布局合并与 _plan_specs、宿主发射计划与整数地址直发结构均未改动；仅平坦路径尾部实参多一个形状决定的标量 pairs。因此非连续布局与非平坦形状 case 的时间应与上一版一致。",
+      "falsifiable_by": "若非平坦布局 case 的时间出现系统性差异，或直发 ABI 因新增槽位错位报 TypeError，则说明改动外溢。"
+    }
+  ],
+  "modifications": [
+    {
+      "mechanism": "平坦主循环改为无掩码成对预读（本轮唯一机制）",
+      "change": "_log10_flat_kernel 签名由 (x_ptr, bulk, stride, n_elements, BLOCK, TAIL) 变为 (x_ptr, bulk, stride, pairs, n_elements, BLOCK, TAIL)。配对循环 for offset in tl.range(start, start + pairs*span, span)（span=2*stride）内：ptrs0 = x_ptr + offset + index；ptrs1 = ptrs0 + stride；先后两次 tl.load，再各自 tl.log(x.to(f32)) * 0.4342944819032518 并写回；循环体内无掩码、无比较、无辅助缓冲。",
+      "addresses": "H22"
+    },
+    {
+      "mechanism": "未配对满块的收尾循环",
+      "change": "配对循环之后新增 for offset in tl.range(start + pairs*span, bulk, stride)：单块 load → log → store，同样无掩码（所有 offset < bulk 都是满块）。原有 constexpr TAIL 尾部块（program 0 处理 bulk 之后 < BLOCK 的残余）逐字保留。",
+      "addresses": "H23"
+    },
+    {
+      "mechanism": "宿主侧配对轮数下界",
+      "change": "_flat_specs 在整除分解之外计算 pairs：blocks ≥ 2*grid 时 pairs = (blocks - 2*grid) // (2*grid) + 1，否则 0；并把 pairs 放入发射实参尾部（bulk, stride, pairs, n_elements, block, tail>0）。pairs 只由 n_elements／block／grid 决定，而这三者均由 shape 唯一决定，故计划键（dtype, shape, stride, ptr&15, device）仍覆盖其编译期特化。",
+      "addresses": "H22、H23"
+    },
+    {
+      "mechanism": "保持不变",
+      "change": "_log10_uniform_kernel、_log10_rows_kernel、_BLOCK／_PROGRAMS／_SCATTER_BLOCK／_GRID_LIMIT、_block_for／_merge_dims／_inner_last／_uniform_specs／_rows_specs／_outer_triple／_plan_specs、宿主发射计划（_make_op／_build_plan／_emit_ops／_demote_plan／_plan_key／_stream_for／钩子门／模式门／整数地址直发）与 run(A) 的原地返回语义逐字保留。",
+      "addresses": "H24；避免同时重写布局与启动路径"
+    }
+  ],
+  "expectations": [
+    "三种 dtype 的 4096x4096 应从 63.26/65.29/69.81us 下降，方向性目标是回到上一版带掩码配对的 52.20/52.64/55.60us 以下（掩码与 UB 填充已从热循环移除）；幅度不作定量断言。",
+    "九项小／中等输入（20.01–21.78us）预期基本不变：1024 与 65536 元素 pairs=0，1048576 元素只多一次配对判定；若无变化则与单机制假设一致。",
+    "数值与语义不变：仍为 fp32 tl.log 乘 1/ln(10) 后按输入 dtype 写回；原地、stride、offset、特殊值、当前 device 与 stream 行为不变。",
+    "即使预检通过，也不声称达到性能目标（阈值 0.8）；正式结论以宿主 KGS 完整 36 项与双方各 66 项补测为准。"
+  ],
+  "validation": {
+    "preflight": "本轮执行工具桥 preflight --source <workspace>/candidate.py（Bash timeout 600000）；结论以该次返回为准：若为 awaiting_source_review，则保持候选字节不变并结束本次调用，等待外部只读审查，不重复提交同一源码。",
+    "formal": "宿主 KGS 完整 36 项正式评测；逐 case 比较 12 项时间与几何平均，核对机制指纹「大输入三项下降、九项小输入不变」。",
+    "checks_to_watch": [
+      "覆盖不重不漏：pairs 为全 program 下界，配对段与收尾段在 start+2*pairs*stride 处严格相接",
+      "满块性：配对段与收尾段的所有 offset 都 < bulk（BLOCK 整数倍），故无需掩码",
+      "非整除形状（如 3000、5000 元素）仍走 constexpr 尾部块，逐元素恰写一次",
+      "原地语义与恰一次计算：冷启动那次普通 JIT 已完成计算，热路径不再发射",
+      "直发 ABI 尾部实参由 (bulk, stride, n_elements, block, tail) 改为 (bulk, stride, pairs, n_elements, block, tail)，顺序与内核签名一致"
+    ]
+  },
+  "unknowns": [
+    "UB 双缓冲占用：fp32 一块 16KB，配对后同时在途两份取入与两份结果缓冲约 64KB；本机 UB 上限与后端是否因此编译失败未采集，只能由预检与完整评测判定。",
+    "两次 tl.load 在设备侧是否真正并行下发：TTIR／bcmlir 只证明源码顺序与循环结构，不证明流水重叠。",
+    "每元素计算（math.log 的设备指令展开）与每轮附加操作各占多少：无指令热点与成对 profiling，本轮不据此调整数值路径。",
+    "参考实现 fp16 4096x4096 仅 16.80us、bf16/fp32 为 25.30/25.72us 的原因未知（可能与其 fp16 路径的指令形态或测量口径有关）。",
+    "九项小输入约 20us 平台（参考 16.3–16.9us）的剩余差距来源未采集；本轮不动宿主路径。"
+  ],
+  "next_steps_if_below_threshold": [
+    "若大输入三项回到 52us 量级但仍低于 0.5：单变量提高在途并发深度（同结构下每轮取 3–4 块），或把 BLOCK 由 4096 提到 8192 以减少每 program 轮次；一次只改一项。",
+    "若大输入几乎不动：说明限制不在单 program 在途数，转向每元素计算形态（等价但更少中间量的表达式）或分块大小，并对当前 SHA 采集指令热点，不以结构推断代替测量。",
+    "若九项小输入同时出现变化：先核验直发 ABI 新增 pairs 槽位顺序与计划键，确认没有把新标量错配到旧计划。"
+  ]
+}

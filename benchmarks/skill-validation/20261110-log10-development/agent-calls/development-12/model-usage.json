@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 31,
+    "duration_ms": 163569,
+    "usage": {
+      "input_tokens": 60893,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1292032,
+      "output_tokens": 22427,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 60893,
+        "outputTokens": 22427,
+        "cacheReadInputTokens": 1292032,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.511156,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 0,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.511156,
+    "result": "本轮已完成单一机制修改并交接预检（`awaiting_source_review`，源码 SHA `4c184cdc…`），保持候选不变，等待外部只读审查。\n\n## 本轮做了什么\n\n**依据**：`performance-feedback.json` 的 `source_sha256` 与上一版候选（`0fefe838…`）一致，geo_mean = 0.4032（阈值 0.8），12 个 timing case 全在 0.258–0.441；小输入 1024 元素仍要 41.3us（参考 16.4us），而 1.6e7 元素大输入只比它多约 21us，说明公共平台由宿主固定开销支配。\n\n**host-profile 定位到的最大单项**：热路径 `_mode_token` 单次采样累计约 34.7us（占该 case 采样总量约四成），内部几乎全是经 `torch_npu.utils.patch_getenv` 包装的 `os.environ.get`（含 4 次 `os.__getitem__`、2 次 `str.encode`）。\n\n**运行接口事实**（runtime-api 摘录）：`NPULauncher.__init__` 一次性用 `os.getenv` 固定 `compile_only` / `enable_msprof_register_tensor`，`debug` 来自该产物 `metadata`；`__call__` 只依据这些已存属性判定，`compiler.py` 的 runner 对已编译产物也不重读环境。即模式身份绑定「启动器实例 + 该产物 metadata」，构造后不可变。\n\n**唯一改动**：去掉 `_run_one` 热路径的 `_mode_token()` 判定，删除该函数与仅它使用的 `import os`，`_PLANS` 计划元组 6→5 元素（`_demote_plan` 同步）。模式核验仍在建计划时由 `_make_op` 逐项排除非普通模式；钩子门（`HookChain.calls`）逐次读取保留。内核体、分块、网格、布局合并、`_stream_for` 的当前 device/stream 动态查询、原生 launch 的 9+ 实参 ABI、`run(A)` 原地语义逐字未动。\n\n**预期**：小/中 9 个 case 下降约 10–17us 量级，大输入获近似同量绝对下降；几何平均应上升，但单凭这一个宿主机制不预期达到 0.8。**这不是性能结论**，正式结果以后续完整 KGS 评测为准；`diagnosis.json` 已记录证据、H11–H13 假设、修改、预期、验证项与未知项（未虚构 IR 或测量）。下一轮若仍不足，首选机制是把原生 launch 的指针实参改为本次动态查询的整数地址以绕过 `getPointer` 的 `aclrtPointerGetAttributes`。"
+  }
+}

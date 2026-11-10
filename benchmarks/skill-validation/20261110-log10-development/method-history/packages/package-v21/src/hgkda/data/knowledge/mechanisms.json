@@ -1,0 +1,247 @@
+{
+  "schema_version": "hgkda.knowledge/v1",
+  "source_checkpoint": "f63e6c30a0d8583ba092844e57ab90c0f6d0349f",
+  "records": [
+    {
+      "id": "log10-layout-and-streaming",
+      "operators": ["log10_"],
+      "types": ["pointwise"],
+      "status": "historically_observed",
+      "signal": "固定FlagGems起点在非CUDA设备回退到PyTorch，非连续路径使用contiguous/copy_；历史严格Triton版通过完整36项与双方各66项补测",
+      "mechanism": "log10可在FP32计算自然对数后乘换底常数；小输入关注宿主发射，大输入关注并发program数、单块UB占用和连续搬运组织，非连续输入必须按真实stride原地读写",
+      "action": "由生成模型移除目标设备的PyTorch回退；分别设计连续、统一步长和通用多维寻址路径。测试适合UB的分块、有限网格内循环处理及相邻数据块预读；采用共享的启动器缓存方法并验证当前stream与每次指针对齐",
+      "constraints": [
+        "候选全部计算、复制与布局处理严格Triton，不能依靠contiguous、copy_或CANN完成非连续路径",
+        "保留负输入、正负零、NaN、Inf及FP16/BF16/FP32语义，不能以普通正数正确替代特殊值验证",
+        "指针对齐是当前输入属性，不可仅按shape缓存；相同shape依次offset 0/1/3/0必须通过且不写坏邻接存储",
+        "非连续布局采用实际shape和stride；可合并连续维度，避免不必要的逐元素动态除法，不能假定全部视图都有统一stride",
+        "维度合并后必须保留最内侧stride。例如shape[2,3]、stride[3,1]合并后应为shape[6]、stride[1]；错误保留外侧stride会越界。连续输入优先使用直接平坦寻址，不能因错误的合并元数据转入散布访问",
+        "UB溢出也可能来自错误步长导致的散布缓冲膨胀，先核验地址映射再盲目缩小分块；设备预检前对当前SHA进行只读路径与边界审查",
+        "有限网格循环与双块预读是待当前源码验证的方法，不继承历史收益；分块过大可能造成UB编译失败",
+        "正式性能反馈同时覆盖小输入及各dtype最大输入；设备profiling时间不能代替完整KGS调用成绩"
+      ],
+      "source": "benchmarks/operators/log10_/candidate.py",
+      "source_sha256": "d5ba772425b156c2f9377b8c07ceb338c5045024f81169042d76690645c5f049",
+      "evidence_checkpoint": "8c26d796ad1beaf099216d527e2a17045537c83c",
+      "evidence": [
+        "benchmarks/operators/log10_/review.json",
+        "benchmarks/operators/log10_/evidence/cann.json",
+        "benchmarks/operators/log10_/evidence/supplementary.json",
+        "benchmarks/operators/log10_/evidence/cann_supplementary.json",
+        "benchmarks/regressions/20261109/fixed-25/operators/log10_/evaluation/result.json"
+      ],
+      "attribution": "Codex从历史诊断、源码与完整结果提炼方法；后续候选实现仅由CC／DeepSeek生成和修改"
+    },
+    {
+      "id": "selu-compiled-launch-path",
+      "operators": [
+        "selu_"
+      ],
+      "types": [
+        "pointwise",
+        "fused_pointwise",
+        "indexed_pointwise"
+      ],
+      "transferable_by_type": true,
+      "status": "historically_observed",
+      "signal": "多个小输入完整调用均约80–85微秒，CANN约13微秒；大输入与小输入的性能损失不同",
+      "mechanism": "历史实现缓存编译启动器、函数句柄、packed metadata与元数据，并按当前指针和stream直接启动Triton产物；新生成版采用普通JIT调度，未保留该路径。两份完整实现的对照尚非单变量因果证明",
+      "action": "按几何平均损失覆盖小输入与最大输入；核验当前启动器ABI及constexpr槽位，缓存编译句柄和宿主元数据。按本机后端合同查询当前raw stream并对齐异步任务队列；缓存命中直接发射，保留条件不满足时的普通Triton回退",
+      "constraints": [
+        "每次读取当前stream并核对设备、dtype、numel、stride、指针对齐；不能缓存张量结果或旧stream",
+        "首调用仅执行一次原地计算；未对齐、非连续、尾块与profiling模式需正确处理",
+        "启动器ABI以当前生成产物为准；Python或C++宿主桥不得执行目标设备计算",
+        "历史相对CANN1.039292与普通调度0.210037仅为两份实现观察，新候选需完整评测，不能继承历史加速比",
+        "普通调用时间、设备事件跨度和真机任务耗时分别报告；不将事件跨度直接视作设备本体时间",
+        "查询函数对象可以缓存，当前device、stream和输入指针的动态返回值不能缓存",
+        "快速表只接纳已排除compile-only、debug和采集专用模式的编译产物；改变编译模式时重新建立启动器与缓存",
+        "不共享可变发射参数数组；不在设备发射异常后回退重发原地计算",
+        "NoWait的适用性依据当前Triton后端的队列合同与stream测试，不从接口名称推断正确性",
+        "编译产物缓存键必须包含设备身份。当前stream和当前指针动态查询，不能将第一张设备的编译句柄无条件用于另一张设备",
+        "冷调用时缓存容器可能尚未存在；不能只比较旧字典的键差集来识别新产物。按当前JIT调用返回值和编译产物接口登记实际使用的对象，并在诊断中核对缓存能否真正命中",
+        "调试与采集钩子的模块位置必须依据当前API事实核验。接口导入失败导致永久普通调度时应显式报告，不得仅凭源码存在缓存结构就声称快路径已经生效",
+        "直接调用编译启动器必须保留当前生成器定义的完整参数槽位；constexpr虽不进入设备侧实参，仍可能在Python启动ABI中保留PyObject占位。不能仅按动态参数列表拼接ABI，也不能把TypeError后永远普通调度误认为快路径有效",
+          "调试钩子可能是始终存在的HookChain容器；对象非None不等于存在活动回调。按当前类的空链语义区分空容器和真实采集钩子，存在真实钩子时仍须尊重回调。可用冷热调用的JIT计数和缓存大小核验快路径，不以缓存结构存在替代实际命中证据",
+          "JIT计数已为零但完整调用仍慢时，先采样候选的热调用宿主栈，检查布局合并、特化字符串、后端策略注册器和Python启动包装。cProfile累计时间包含子函数且有采样开销，不能相加或作为正式性能；以固定KGS合同确认实际收益",
+          "连续输入的常见路径可先检查连续性，再查询不可变布局／网格／完整ABI元数据缓存，避免每次合并所有维度和重新构造字符串。缓存键覆盖dtype、设备、numel、实际对齐与编译特化类别；不缓存张量、指针或stream的动态值。非连续与未对齐输入保留正确通用路径",
+          "核验当前NPULauncher的__call__与其原生launch入口；只有已排除compile-only、张量注册、调试隐藏参数及活动钩子的普通产物才能使用轻量入口。查询函数对象和不变元数据可缓存，当前设备、指针及raw stream须动态读取；减少后端策略分发层不等于省略stream正确性",
+          "原地算子的冷启动若通过普通JIT调用登记编译产物，该调用已执行计算，返回后不能再次执行计划。暖启动与冷启动分别验证恰好一次目标计算；活动钩子分支必须真实进入普通JIT，不能仅调用名为慢速的函数却仍然直发原生入口",
+          "缓存计划须识别当前编译／调试模式变化。已建立的普通模式计划不能跨模式复用；每次调用核验相应门，活动回调或状态未知时尊重普通Triton路径，不绕过调试隐藏参数。多操作原地计划不能在部分发射后把整个计划重发"
+      ],
+      "source": "benchmarks/operators/selu_/candidate.py",
+      "source_sha256": "8764018cfb2cab9444a34caf7a171f7eac7395656631698ce491e676557462f0",
+      "evidence_checkpoint": "d33cd2b55dd51d8bab732025409f52f916976370",
+      "evidence": [
+        "benchmarks/regressions/20261109/fixed-25/operators/selu_/evaluation/result.json",
+        "benchmarks/skill-validation/20261109-selu/formal-3cec1212c3b7/operators/selu_/evaluation/result.json",
+        "benchmarks/skill-validation/20261109-selu-recovery/formal-5e9e4d482620/operators/selu_/evaluation/result.json",
+        "benchmarks/skill-validation/20261109-selu-recovery/formal-5e9e4d482620/audit-final.json"
+      ],
+      "current_validation": {
+        "date": "2026-11-09",
+        "source": {
+          "path": "benchmarks/skill-validation/20261109-selu-recovery/formal-5e9e4d482620/operators/selu_/candidate.py",
+          "sha256": "5e9e4d4826207ea03e70d01e871c71220e40f9097ad0a0f87da977f793573115"
+        },
+        "formal_result": {
+          "path": "benchmarks/skill-validation/20261109-selu-recovery/formal-5e9e4d482620/operators/selu_/evaluation/result.json",
+          "sha256": "e3a00612be5e3ef603875444734eeeb5ad45c29e908b474c23a1b2ba635e91f2"
+        },
+        "audit": {
+          "path": "benchmarks/skill-validation/20261109-selu-recovery/formal-5e9e4d482620/audit-final.json",
+          "sha256": "68e93d77e1b29ddf618870704889a0fb49f3aa86a6bfce79366affc5009c0eb2"
+        },
+        "summary": {
+          "path": "benchmarks/skill-validation/20261109-selu-recovery/summary.json",
+          "sha256": "b5a7cfca07a34210ec005a290937f2ffcfd41f44e088fd83c4b264a776c6d96a"
+        },
+        "cann_score": 0.8870103232338551,
+        "formal_cases": 36,
+        "supplementary_each": 42,
+        "offset_checks": 9,
+        "runtime_checks": 24,
+        "accepted": true,
+        "historical_best_retained": true,
+        "findings": [
+          "大输入分块调整后约45.5/83.2/82.5微秒；小输入由普通调度约80微秒恢复至约13–15微秒",
+          "高层stream对象构造、同步型查询与重复宿主检查分别需要排查；空队列查询微基准不代表交替发射成本"
+        ],
+        "diagnostics": [
+          {
+            "path": "benchmarks/skill-validation/20261109-selu-recovery/host-probe-c625.json",
+            "sha256": "c0cb790c2e28ca019107c0b1587501565b32979b06ce4a54a4dba780ea784756"
+          },
+          {
+            "path": "benchmarks/skill-validation/20261109-selu-recovery/host-probe-0fed8d43398d.json",
+            "sha256": "f65c9c1962044da7a4299ab824420e12cd74fa0f2e51d0ca7bf15901aac3c5ed"
+          },
+          {
+            "path": "benchmarks/skill-validation/20261109-selu-recovery/runtime-abi-provenance.json",
+            "sha256": "f9c484a629437d9b8c95fd529101274863e5f9b90dcded058c8ad262654198d8"
+          }
+        ],
+        "attribution": "CC/DeepSeek生成源码，Codex提供历史方法、诊断和实现指导，并完成审查及正式评测"
+      }
+    },
+    {
+      "id": "pointwise-signed-zero",
+      "operators": [
+        "negative_"
+      ],
+      "types": [
+        "pointwise"
+      ],
+      "status": "historically_observed",
+      "signal": "普通数正确但零符号不符",
+      "mechanism": "历史 Triton 负号降低为 0-x，可能不保留目标负零语义",
+      "action": "核对实际 TTIR；可测试浮点符号位翻转，并重新验证零、NaN/Inf、全部 dtype 与布局",
+      "constraints": [
+        "不能从普通数测试推断特殊值正确",
+        "更大分块需重新检查 UB"
+      ],
+      "source": "project/Ascend-Optimization-v1/tools/profiling/hgkda/skills/hgkda/references/算子类型/逐元素与原地.md",
+      "source_sha256": "63881dea0fd3354eff97b1afc51b6a0c58ddf041157aef2f6d93f5b981a496ed"
+    },
+    {
+      "id": "expm1-precision-buffer",
+      "operators": [
+        "expm1_"
+      ],
+      "types": [
+        "pointwise"
+      ],
+      "status": "historically_observed",
+      "signal": "总读写量相同而 Vector/搬运指令与候选时间较高",
+      "mechanism": "稳定数学公式、类型扩展与缓冲存活共同影响性能",
+      "action": "按 dtype 检查小值公式、实际 IR、tile 和每轮块数；用完整调用验证",
+      "constraints": [
+        "减少 IR 转换不保证更快",
+        "FP16 域通过不能代替 BF16 域检查",
+        "近零误差、负零和首次调用语义须保持"
+      ],
+      "source": "project/Ascend-Optimization-v1/tools/profiling/hgkda/skills/hgkda/references/性能指标/expm1精度与流式分块.md",
+      "source_sha256": "370f1784885e383ab400e6aeed1c94ba1912c7eca1ece347864295cfc4672214"
+    },
+    {
+      "id": "gemm-reuse-direction",
+      "operators": [
+        "matmul_bias_activation"
+      ],
+      "types": [
+        "gemm"
+      ],
+      "status": "historically_observed",
+      "signal": "GM/L1 总量近似不变，UB 流量与 MTE 指令变化",
+      "mechanism": "相邻输出块的复用方向改变内部数据组织，收益不必来自 HBM 流量减少",
+      "action": "比较共享 A/B、K 分块及交错组织，结合实际 bcmlir、搬运粒度与完整评测",
+      "constraints": [
+        "静态 copy 数量不是动态搬运次数",
+        "热点源码映射不等于该 Python 表达式独占时间"
+      ],
+      "source": "project/Ascend-Optimization-v1/tools/profiling/hgkda/skills/hgkda/references/性能指标/成对证据到优化动作的闭环.md",
+      "source_sha256": "63a1eca1a23edb2f184e4bed2f7c6e3c2035d4b8c3e4fae3fb66f643a0fc868e"
+    },
+    {
+      "id": "scatter-scalarized-lowering",
+      "operators": [
+        "scatter_add"
+      ],
+      "types": [
+        "scatter"
+      ],
+      "status": "historically_observed",
+      "signal": "无冲突写仍慢，TTIR 到后续 IR 出现逐元素循环",
+      "mechanism": "具体 FP16 编译实例将向量原子写降低为逐 lane 存储",
+      "action": "检查候选本身的 IR 与索引表达，再测试分组或输出块归约",
+      "constraints": [
+        "不能推广到全部 dtype/形状",
+        "预处理、暂存和转换必须计入完整调用",
+        "原子累加精度独立验证"
+      ],
+      "source": "project/Ascend-Optimization-v1/tools/profiling/hgkda/skills/hgkda/references/算子类型/索引与采样.md",
+      "source_sha256": "4ad9c5ae6b3306ab3d2673d016c95fb680b36e7f07b8e1688f933d2fd880e8b7"
+    },
+    {
+      "id": "qkv-layout-precision",
+      "operators": [
+        "transform_bias_rescale_qkv"
+      ],
+      "types": [
+        "fused_pointwise"
+      ],
+      "status": "historically_observed",
+      "signal": "扁平索引产生离散读写循环与大量写回指令",
+      "mechanism": "显式序列×head_dim 二维分块改善编译后的搬运组织",
+      "action": "比较实际 ttadapter 的离散访存标记、设备写回及延迟；Q 与 bias 在相加前使用足够精度",
+      "constraints": [
+        "布局与数值问题分开验证",
+        "旧候选采集不能作为新候选实测"
+      ],
+      "source": "project/Ascend-Optimization-v1/tools/profiling/hgkda/skills/hgkda/references/算子类型/融合与执行路径.md",
+      "source_sha256": "d7f3cb7051eed4a0511d01782418c1447abf641874e8268a4f6d586146be9e26"
+    },
+    {
+      "id": "reference-stability",
+      "operators": [
+        "cumulative_trapezoid",
+        "_conj_physical",
+        "fractional_max_pool3d"
+      ],
+      "types": [
+        "scan",
+        "sampling"
+      ],
+      "status": "historically_observed",
+      "signal": "参考重复结果不自洽或 trace 出现 CPU 回退",
+      "mechanism": "参考路径、精度顺序或运行条件影响可比性",
+      "action": "固定输入检查参考允许区间、实际叶子算子及任务路径，单列不同确定性条件",
+      "constraints": [
+        "不偷偷修改全局确定性或原容差",
+        "不以慢 CPU 回退推断设备优化上限",
+        "CANN 混合方案只作参考分析，不进入 Triton 候选"
+      ],
+      "source": "project/Ascend-Optimization-v1/tools/profiling/hgkda/skills/hgkda/references/性能指标/参考可信性与NPU分解.md",
+      "source_sha256": "100fd8a3ccf13c73bc24b7fcaba08f0feda48e5b96910110cd9820f3ee0d0d0c"
+    }
+  ]
+}

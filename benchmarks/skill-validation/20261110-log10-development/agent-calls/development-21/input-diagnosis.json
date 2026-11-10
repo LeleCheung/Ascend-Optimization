@@ -1,0 +1,19 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "evidence": [
+    "上一轮预检（sha 43eecc…）在 _log10_vec 编译期抛 NameError：Cannot access global variable _DENORM_LIMIT from within @jit'ed function；同一内核先前还在 _NAN 处报 Global variable … conflicting value nan。",
+    "正式反馈（上一版）：geo_mean=0.7539；9 个 ≤1e6 元素 case 为 15.3–17.9us（参考 14.9–15.5us），三个 4096x4096（1.6e7 元素）为 0.30/0.47/0.55。",
+    "逐 case 时间对元素数近似线性（1e6 约 2.0ns/元素，1.6e7 约 2.45ns/元素），fp16/bf16/fp32 在同一元素数下几乎相同，而 fp32 字节数是 fp16 两倍。",
+    "actual-ir 历史观察（非本轮采集）：平坦路径格内为单块 memref.copy → 计算 → 写回，40 program 下 1.6e7 元素每 program 约 102 轮。"
+  ],
+  "hypothesis": "限制项是逐元素的超越函数开销而非带宽或网格几何：通用 math.log 在本后端按逐元素高代价展开。故只替换内核数学为纯加乘/位运算（位分解取幂次 + 尾数 9 次 Taylor），预期 1.6e7 元素三个 case 明显受益、小输入基本不变。编译阻塞来自本后端 JIT 仅允许内核访问 tl.constexpr 全局，普通模块级 int/float 常量被拒，浮点 NaN 常量还会触发嵌套 JIT 的全局值冲突。",
+  "change": "唯一改动：内核算术常量全部改为内核内字面量（0x00800000 次正规阈值、2^24 归一化、0x3F2AAAAB 归约、指数域掩码、0x7FC00000/0xFF800000 位模式、log10(2) 与 24*log10(2)），删除对应模块级常量；分块、网格、成对预读循环、布局合并与宿主直发/回退路径均未改动。特殊值语义不变：±0→-inf，负有限值与 -inf→NaN，±inf/NaN 由输入传播，次正规数归一化后减 24*log10(2)。",
+  "expected": "消除 NameError 编译阻塞；fp32 多项式截断误差按 |t|<=1/3 上界约 7.3e-7（合同 1e-4），fp16/bf16 余量更大。若逐元素超越函数假设成立，三个 1.6e7 元素 case 由 0.30/0.47/0.55 上移；小输入受宿主发射平台限制，预计不变。",
+  "validation": "本轮已提交预检，返回 awaiting_source_review（sha 81e71eae…），保持候选不变等待只读审查；随后由宿主执行完整 36 项正式评测与双方各 66 项补测，按逐 case 损失判断假设。",
+  "unknown": [
+    "无本轮设备级 IR／profiling，math.log 是否逐元素展开仍为假设，仅由逐 case 时间与 dtype 无关性推断。",
+    "多项式精度只按截断上界估算，未取得设备实测误差；1e-4 容差下 match_ratio 待完整评测确认。",
+    "预检仅到源码审查边界，是否还有其它编译失败（int32 字面量宽度、tl.range 动态界）未验证。",
+    "大输入收益是否真由数学替换带来、还是仍受其它逐元素调度开销限制，未知。"
+  ]
+}

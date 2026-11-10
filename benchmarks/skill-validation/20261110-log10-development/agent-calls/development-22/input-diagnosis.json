@@ -1,0 +1,32 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "de6eed610ab31e68843d5bb4d53204af9684ab65a8d39b28721a1d495a8856c3",
+  "evidence": [
+    "绑定源码 81e71eae 预检为编译失败：布局路径要求 4194560 bits UB，实际 1572864 bits，全部 case 未进入正式评测；该版数学是位分解 + 9 次 Taylor 多项式。",
+    "原生 tl.log 版正式反馈：geo_mean=0.7539；三个 4096x4096（1.6e7 元素）case 为 fp16 0.30、bf16 0.47、fp32 0.55；9 个 ≤1e6 元素 case 为 0.83–0.98。",
+    "旧平坦路径每 program 每轮仅 4096 元素、40 个 program，1.6e7 元素按覆盖计算约 102 轮；知识记录的历史结构为中等输入单块上限 32768 元素、最大输入 40 program × 相邻两块 8192 元素、循环长度与子块为 constexpr。",
+    "本轮无新的设备 IR 或 profiling 采集，actual_ir 为空，设备侧结论均未测量。"
+  ],
+  "hypothesis": [
+    "编译失败源于数学近似的中间量放大 UB，而非分块本身；撤回该数学即恢复可编译性。",
+    "大输入每 program 的循环轮次与任务管理次数是待验证限制项：每轮载荷 4096 → 2×8192、轮数降到约 26 可减少循环与搬运组织开销；不同 dtype 耗时近不足以证明通用数学标量化，故轮次只作假设。"
+  ],
+  "change": [
+    "删除 _log10_vec（Taylor 近似），恢复 _log10_math = tl.log(x_fp32) * 0.4342944819032518，该数学此前已完整通过 36 项与双方各 66 项补测。",
+    "新增 _log10_tile_kernel：n ≤ 16384 时单 program、BLOCK=next_pow2(n)、EVEN 为 constexpr，无循环无掩码。",
+    "新增 _log10_pair_kernel 取代 _log10_flat_kernel：40 个 program，每轮相邻两块 BLOCK=8192，ROUNDS/BLOCKS/GRID/BLOCK 全为 constexpr，残余块（<2*GRID）用合并掩码处理，主循环体无掩码。",
+    "布局合并、统一/行式路径分块（2048）、宿主直发表与 stream/地址逐次核验路径未改动。"
+  ],
+  "expected": [
+    "恢复可编译并通过原完整检查器（特殊值、别名、非连续布局、offset 0/1/3/0、stream）。",
+    "1.6e7 元素三个 case 因轮数下降明显回升；≤1e6 元素 case 保持或略好。收益真伪只由宿主完整 KGS 评测判定。"
+  ],
+  "validation": [
+    "已调用工具桥 preflight，返回 awaiting_source_review（源码 de6eed61 冻结），未执行设备测试；正式性能待宿主完整评测。"
+  ],
+  "unknown": [
+    "无当前候选的实际 IR／profiling：tl.log 是否按向量宽度展开、8192 级分块相对 4096 级的 UB 余量均未测量；16384 单块在 fp32 下的 UB 峰值仅按载荷 64KB 估算。",
+    "轮次减少是否对应真实收益，以及 65536／1048576 等中间规模下网格与残余掩码的代价未验证。",
+    "非连续路径本次只做数学替换，性能与直发表命中情况未采集。"
+  ]
+}

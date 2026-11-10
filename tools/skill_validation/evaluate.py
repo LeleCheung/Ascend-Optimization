@@ -32,13 +32,16 @@ def main():
     config = read(args.config)
     repo = Path(config['repository'])
     parent = Path(config['run_directory'])
+    formal_sources=sum(path.is_dir() for path in parent.glob('formal-*'))
+    assert formal_sources < config.get('maximum_formal_sources',16),'达到当前阶段正式新源码数量限制，保留结果并由控制器记录后续计划'
     digest = sha(args.source)
     admit(args.source.read_bytes().decode('utf8'), read(args.review))
     preflight = read(parent/'attempts'/digest/'preflight.json')
     assert preflight['status'] == 'passed' and preflight['source_sha256'] == digest
     run = parent/('formal-'+digest[:12])
     run.mkdir(exist_ok=False)
-    root = run/'operators/selu_'
+    operator=config['job']['operator']
+    root = run/'operators'/operator
     root.mkdir(parents=True)
     source = root/'candidate.py'
     source.write_bytes(args.source.read_bytes())
@@ -73,7 +76,7 @@ def main():
          result=read(root/'evaluation/result.json')['geo_mean'], audit=read(run/'audit-final.json')))
     # 每次新源码正式评测后自动形成可回传的性能决策，正确性通过不代表优化结束。
     subprocess.run([sys.executable,'-m','hgkda','feedback','--result',str(root/'evaluation/result.json'),
-        '--audit',str(run/'audit-final.json'),'--source',str(source),'--operator','selu_',
+        '--audit',str(run/'audit-final.json'),'--source',str(source),'--operator',operator,
         '--timing-cases',str(Path(job['checks']['cann_supplementary']['leaf'])/'timing.jsonl'),
         '--threshold',str(config.get('threshold',.8)),'--output',str(run/'performance-feedback.json')],check=True)
 

@@ -44,7 +44,7 @@ def main():
         return compiled
     JITFunction.run=capture
     try:
-        candidate.run(**inputs);torch.npu.synchronize()
+        getattr(candidate,spec.get('entrypoint','run'))(**inputs);torch.npu.synchronize()
     finally:JITFunction.run=original
     value=dict(source_sha256=spec['source_sha256'],files=artifacts)
     (Path(spec['ir_directory'])/'manifest.json').write_text(json.dumps(value,indent=2)+'\n')

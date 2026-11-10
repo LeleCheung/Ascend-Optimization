@@ -1,0 +1,22 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256_before": "5f3b50a21cbca3ffe96772aa4dece4344b76953c6938e2545b44a03abc6e5af9",
+  "source_sha256_after": "43eeccea09a1533d8b08820ab11b7730d09cd2e4dbb5add08f5594fcab722c5a",
+  "evidence": [
+    "预检日志（绑定 5f3b50…）：编译 _log10_flat_kernel 时 RuntimeError: Global variable _NAN has value nan，但内层 _log10_vec 首次编译时该值为 conflicting value nan，堆栈落在 ast 依赖核验的 _update_hash。",
+    "该异常发生在 Python 侧依赖哈希比较，设备代码尚未下发，所以它只说明常量捕获方式不合规，不提供精度或性能信息。",
+    "源码事实：模块级 _NAN=float('nan')、_NEG_INF=float('-inf') 被 _log10_vec 引用；其余被捕获的模块全局量都是整数或自等浮点常数。",
+    "上一轮候选正式反馈（记在模块注释）geo_mean=0.7539：≤1e6 元素 9 个 case 为 0.83–0.98；三个 4096x4096 为 0.30/0.47/0.55，且三 dtype 在 1.6e7 元素下耗时接近，与字节数无关。",
+    "本轮无绑定当前 SHA 的实际 IR 与成对 profiling：设备流水、搬运计数与指令热度均为未知。"
+  ],
+  "hypothesis": "嵌套 JIT 按值比较被捕获的模块全局常量，NaN 不等于自身，使同一 _NAN 在父核与内层 @triton.jit 间被判冲突。冲突只来自常量表示，与位分解数学、分块几何和布局路径无关，换一种设备侧构造特殊值的方式即可恢复编译且不牺牲语义。性能侧机制假设不变：大输入受逐元素超越函数限制而非带宽，纯加乘多项式应把限制项移到向量运算与带宽上。",
+  "change": "1) 删除模块级浮点 _NAN/_NEG_INF，改为 int32 位模式 _NAN_BITS=0x7FC00000、_NEG_INF_BITS=0xFF800000；2) _log10_vec 内用 zeros = xi & 0 取同形状零张量，按位加常量后 bitcast 成 float32，分别替换 x<0 的 NaN 分支与 |x|==0 的 -inf 分支；3) 模块注释记录该编译阻塞与修法。设备计算仍是同一 Triton 内核，分块、网格、成对预读循环、布局合并与宿主发射路径均未改动。",
+  "expected": "预检应能通过嵌套 JIT 依赖核验并完成编译；正确性检查将覆盖 ±0→-inf、负有限值与 -inf→NaN、±inf/NaN 传播、次正规数，以及 fp16/bf16/float32 三种容差。若多项式机制成立，三个 4096x4096 case 应从 0.30/0.47/0.55 明显回升；≤1e6 元素 case 受宿主发射平台限制，预期基本不变。",
+  "validation": "只调用工具桥 preflight 验证编译与正确性；正式分数以宿主 KGS 完整 36 项与双方各 66 项补测为准，不以预检通过代替性能达标，也不以局部观测推断硬件瓶颈。",
+  "unknown": [
+    "多项式与 tl.log 在本设备向量单元上的真实耗时对比：缺当前 SHA 的 IR 与 profiling。",
+    "预检 failed_cases 为空，说明失败发生在首个编译用例，无法据此定位其他 dtype／布局路径。",
+    "指针对齐序列（offset 0/1/3/0）与非连续视图在本次修改后是否触发新的特化或宿主 ABI 分支。",
+    "次正规数与极端指数处多项式误差只有解析估计（约 8e-7），尚无设备数值结果。"
+  ]
+}

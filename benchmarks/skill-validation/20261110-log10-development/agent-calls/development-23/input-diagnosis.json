@@ -1,0 +1,17 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "evidence": [
+    "预检（source_sha256=de6eed61…）为 source_review_requires_revision，唯一失败项 paired-unmasked-boundary：_flat_specs 用 blocks=ceil(N/BLOCK) 计算 rounds=blocks//(2*grid)；N=65535、BLOCK=8192 时 blocks=8、grid=4、rounds=1，主循环无掩码覆盖块0..7，pid3 第二块含 offset 65535（有效上限 65534），确定越界。",
+    "该失败为纯静态边界审查结论，本 SHA 尚未设备预检或正式评测，因此当前无 IR、无 profiling、无完整性能。",
+    "知识记录 log10-layout-and-streaming 给出同一约束：无掩码成对主循环轮数必须按真正满块数计算，ceil 总块数可能含不满尾块。"
+  ],
+  "hypothesis": "越界根因是轮数口径：主循环只能覆盖完整满块，不满尾块必须留给掩码分支；用 ceil 块数排无掩码轮次会把不满尾块当满块。按满块数修正后两段互斥且合计完整，且不改动已验证数学（tl.log 后乘换底常数）与宿主发射路径。",
+  "change": "仅在 _flat_specs 把 rounds 改为 full//(2*grid)，full=n_elements//BLOCK；内核 ABI、constexpr 槽位与网格不变，另同步修正说明文字。覆盖性：残余起始块 2*grid*rounds，剩余块数 blocks-2*grid*rounds ≤ 2*grid，每 program 两块恰覆盖；主循环块下标 < full，最大偏移 (2*grid*rounds)*BLOCK-1 ≤ full*BLOCK-1 < n_elements。",
+  "expected": "65535 这类不满块规模由掩码尾部正确覆盖、不再写出界；满块规模（65536、1048576、4096x4096）轮数与残余块数不变，上一轮载荷/循环几何收益不受影响；≤16384 的单块路径未改动。",
+  "validation": "工具桥 preflight 已受理修订版（source_sha256=69699663…）并返回 awaiting_source_review，按约定保持本候选字节不变等待外部只读路径与地址边界审查；通过后再凭正式 KGS 36 项及双方各 66 项补测给出逐 case 损失，重点看三个 4096x4096 case 是否较 0.7539 基线回升，以及 layout=True、特殊值、别名与 stream 检查。此前步骤：正式 KGS 36 项及双方各 66 项补测给出逐 case 损失，重点看三个 4096x4096 case 是否较 0.7539 基线回升，以及 layout=True、特殊值、别名与 stream 检查。",
+  "unknown": [
+    "尚无当前 SHA 的实际 IR 与成对 profiling：每 program 循环轮次是限制项仍是由元素数与耗时匹配得到的假设，不是实测标量瓶颈。",
+    "4096x4096 三个 dtype case 的历史损失（0.30/0.47/0.55）能否由载荷几何改善，待完整评测确认。",
+    "散布类路径仍为 _SCATTER_BLOCK=2048，其分块与轮次未做本机核验。"
+  ]
+}

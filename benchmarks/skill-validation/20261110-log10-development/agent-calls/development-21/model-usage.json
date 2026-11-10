@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 28,
+    "duration_ms": 118721,
+    "usage": {
+      "input_tokens": 41149,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 775296,
+      "output_tokens": 17265,
+      "output_tokens_details": {
+        "thinking_tokens": 0
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 41149,
+        "outputTokens": 17265,
+        "cacheReadInputTokens": 775296,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.0250180000000002,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 0,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.0250180000000002,
+    "result": "本轮已完成，候选保持在预检返回时的状态。\n\n## 本轮结论\n\n**起点问题（已发生的事实）**：当前绑定源码 `81e71eae` 是上一轮的 Taylor 近似版，预检编译失败——布局路径要求 4194560 bits UB、实际仅 1572864 bits，全部 case 未进入正式评测。按知识记录，这属于「数学近似放大 UB」而非分块问题。\n\n**本轮两步（先后次序遵循「先最小修复，再一个性能机制」）**：\n\n1. **最小编译修复**：删除 `_log10_vec`（位分解 + 9 次 Taylor），恢复此前已完整通过 36 项正式用例与双方各 66 项补测的 `_log10_math = tl.log(x_fp32) * 0.4342944819032518`，换底常数写成内核内字面量（规避本后端禁止 JIT 读普通模块全局、以及 NaN 全局值哈希冲突）。\n2. **唯一性能机制：连续路径的载荷与循环几何**（针对正式反馈 0.7539 中三个 4096×4096 case 的 0.30/0.47/0.55）：\n   - `n ≤ 16384`：单 program 单块直处理，`BLOCK=next_pow2(n)`、`EVEN` 为 constexpr，无循环无掩码；\n   - 更大输入：40 个 program，每 program 每轮**相邻两块 8192 元素**配对预读，`ROUNDS = BLOCKS // (2*GRID)`、`GRID`、`BLOCK`、`BLOCKS` 全部 constexpr，1.6e7 元素由约 102 轮降到约 26 轮；残余块（不足 2·GRID 块）用一块合并掩码处理，主循环体内无掩码、无比较。\n   - 布局合并、散布/统一/行式路径分块（2048）、宿主直发表与 stream/地址逐次核验路径均未改动，避免多机制混淆。\n\n**交接状态**：工具桥 `preflight --source candidate.py` 返回 `awaiting_source_review`，源码 `de6eed610ab31e68843d5bb4d53204af9684ab65a8d39b28721a1d495a8856c3` 已冻结，候选字节保持不变，等待外部只读路径与地址边界审查后由宿主执行完整 KGS 评测。\n\n**明确未测**：无当前候选的实际 IR／profiling，`tl.log` 是否按向量宽度展开、8192 级分块相对 4096 级的 UB 余量、16384 单块在 fp32 下的 UB 峰值（仅按 64KB 载荷估算）均为未知；「轮次是限制项」仍是假设，性能达标与否只能由完整评测确认，预检通过不等于达到 0.8 阈值。诊断已按本轮短模板写入 `diagnosis.json`。"
+  }
+}
