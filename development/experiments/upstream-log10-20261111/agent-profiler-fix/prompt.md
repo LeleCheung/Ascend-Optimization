@@ -1,0 +1,4 @@
+先读method.md、failure.txt、runtime-excerpt.txt，并读取log10.py一次。本轮修复上游profiler benchmark启动兼容，不改变kernel数学、分块或测试。
+现象：log10_原生正确性18项通过。原生benchmark在torch_npu.profiler激活后，直接launcher调用报int对象没有size属性。厂商driver中有对Tensor执行size()的代码。请核对快速启动参数是否丢失Tensor元数据；选择能兼容profiling且尽量保留正常启动性能的最小改动。可以考虑保留真实Tensor参数或必要时采用受支持的Triton启动路径，由你决定具体实现。
+只修改本目录已有log10.py和diagnosis.json，用Read/Edit。全部计算保持严格Triton。不得关闭profiler、改计时方法、增加原生计算回退、修改kernel数学或放宽测试。必须保留上游log10_(A)和已有run(A)接口、动态地址和当前stream语义。Codex不直接修改候选代码，所有候选修改由你完成。
+不要访问工作区外或猜测其他文件，不运行设备测试，不找其他agent。记录证据、改法和需要验证的普通调用/profiler/布局路径；宿主负责审查和执行测试。完成修改后简短返回。

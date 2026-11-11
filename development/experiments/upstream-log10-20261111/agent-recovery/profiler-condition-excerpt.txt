@@ -1,0 +1,289 @@
+534:             "uint32_t": "I",
+535:             "uint64_t": "K",
+536:         }[ty_to_cpp(ty)]
+537: 
+538:     def _format_of_msprof_task_type_ratio(bs_task_type, mix_mode):
+539:         # Default fallback based on mix_mode
+540:         default_task_type = "MSPROF_GE_TASK_TYPE_AIV" if mix_mode == "aiv" else "MSPROF_GE_TASK_TYPE_AI_CORE"
+541: 
+542:         if not bs_task_type:
+543:             return default_task_type, 0
+544: 
+545:         task_type_num, mix_block_dim_ratio = divmod(int(bs_task_type), 10)
+546:         task_type_map = {
+547:             1: "MSPROF_GE_TASK_TYPE_AIV",
+548:             2: "MSPROF_GE_TASK_TYPE_AI_CORE",
+549:             3: "MSPROF_GE_TASK_TYPE_MIX_AIC",
+550:             4: "MSPROF_GE_TASK_TYPE_MIX_AIV",
+551:         }
+552: 
+553:         task_type = task_type_map.get(task_type_num, default_task_type)
+554:         return task_type, mix_block_dim_ratio
+555: 
+556:     """
+557:     args:
+602:     if enable_auto_map_parallel_blocks is None:
+603:         enable_auto_map_parallel_blocks = _is_auto_map_parallel_blocks_enabled()
+604:     npu_utils = NPUUtils()
+605:     num_physical_blocks = npu_utils.get_aivector_core_num() if mix_mode == "aiv" else npu_utils.get_aicore_num()
+606:     task_type, mix_block_dim_ratio = _format_of_msprof_task_type_ratio(bs_task_type, mix_mode)
+607:     is_mix_task_type = "true" if ("MIX" in task_type) else "false"
+608:     LINE_CHANGE_CHAR = chr(10)  # it is \n
+609:     alloc_success_code = 'return 1;'
+610:     sync_lock_fail_code = 'fprintf(stderr, "Error: syncBlockLock allocation failed\\n"); return;'
+611:     workspace_fail_code = 'fprintf(stderr, "Error: workspace allocation failed\\n"); return;'
+612: 
+613:     cpp_device_pointer = """
+671:   return ptr_info;
+672: }
+673: """
+674: 
+675:     cpp_msprof_extern = """
+676: extern "C" {
+677:   typedef int (* callback)(unsigned int type, void* data, unsigned int len);
+678:   extern int MsprofReportApi(unsigned int  agingFlag, const MsprofApi *api);
+679:   extern unsigned long int  MsprofSysCycleTime();
+680:   extern int MsprofRegisterCallback(unsigned int moduleId, callback handle);
+681:   static unsigned int __MsprofFlagL0  = 0;
+682:   static unsigned int __MsprofFlagL1  = 0;
+683: 
+684:   int ProfCtrlHandle(unsigned int CtrlType, void* CtrlData, unsigned int DataLen) {
+685:     if ((CtrlData == nullptr) || (DataLen == 0U)) {
+686:       return 1;
+687:     }
+688: 
+689:     if (CtrlType == 1) {
+690:       MsprofCommandHandle* handle = (MsprofCommandHandle *)(CtrlData);
+691:       if (handle->type >= 6)  // 6 is not used here
+692:         return 1;
+693:       if (handle->type == 1) {  // init - 0  , start - 1
+694:         __MsprofFlagL0 = ((0x00000800ULL & handle->profSwitch) == 0x00000800ULL) ? 1 : 0;
+695:         __MsprofFlagL1 = ((0x00000002ULL & handle->profSwitch) == 0x00000002ULL) ? 1 : 0;
+696:       }
+697:     }
+698:     return 0;
+699:   }
+700: }
+701: """
+702: 
+703:     cpp_msprof_callback = """
+704:   MsprofRegisterCallback(8, ProfCtrlHandle);      // 8 - CCE defined in msprof headerfile slog.h
+705: """
+706: 
+707:     cpp_msprof_call_before_launch = """
+708:     unsigned long int beginTime = 0;
+709:     unsigned long int endTime = 0;
+710:     unsigned long int opNameHashID = 0;
+711:     unsigned int threadId = 0;
+712:     char* _kernelName = const_cast<char*>(name.c_str());
+713:     size_t length = name.length();
+714:     if (__MsprofFlagL0 || __MsprofFlagL1)
+715:     {
+716:       beginTime = MsprofSysCycleTime();
+717:     }
+718: """
+719: 
+720:     cpp_msprof_call_after_launch = f"""
+721:     if (__MsprofFlagL0 || __MsprofFlagL1)
+722:     {{
+723:       endTime = MsprofSysCycleTime();
+724:       opNameHashID = MsprofGetHashId(_kernelName, length);
+725:       threadId = (unsigned int)(syscall(SYS_gettid));
+726:       MsprofApi info;
+727:       info.level = MSPROF_REPORT_NODE_LEVEL;
+728:       info.magicNumber = 0x5a5a;      //MSPROF_REPORT_DATA_MAGIC_NUM
+729:       info.type = MSPROF_REPORT_NODE_LAUNCH_TYPE;
+730:       info.threadId = threadId;
+731:       info.reserve = 0;
+732:       info.beginTime = beginTime;
+733:       info.endTime = endTime;
+734:       info.itemId = opNameHashID;
+735:       MsprofReportApi(false, &info);
+736:     }}
+737:     if (__MsprofFlagL1)
+738:     {{
+739:       MsprofCompactInfo nodeBasicInfo;
+740:       nodeBasicInfo.level = MSPROF_REPORT_NODE_LEVEL;
+741:       nodeBasicInfo.magicNumber = 0x5a5a;      //MSPROF_REPORT_DATA_MAGIC_NUM
+742:       nodeBasicInfo.type = MSPROF_REPORT_NODE_BASIC_INFO_TYPE;
+743:       nodeBasicInfo.threadId = threadId;
+744:       nodeBasicInfo.timeStamp = endTime;
+745:       nodeBasicInfo.data.nodeBasicInfo.opName = opNameHashID;
+746:       nodeBasicInfo.data.nodeBasicInfo.opType = opNameHashID;
+747:       nodeBasicInfo.data.nodeBasicInfo.taskType = {task_type};
+748:       nodeBasicInfo.data.nodeBasicInfo.blockDim = nodeBasicBlockDim;
+749:       MsprofReportCompactInfo(0, static_cast<void *>(&nodeBasicInfo), sizeof(MsprofCompactInfo));
+750: 
+751:       // 'mix' kernel need to report the ctxID
+752:       if ({is_mix_task_type} > 0) {{
+753:         MsprofAdditionalInfo info;
+754:         info.level = MSPROF_REPORT_NODE_LEVEL;
+755:         info.type = MSPROF_REPORT_NODE_CONTEXT_ID_INFO_TYPE;
+756:         info.threadId = threadId;
+757:         info.timeStamp = endTime;
+758:         MsprofContextIdInfo ctxId;
+759:         ctxId.opName = opNameHashID;
+760:         ctxId.ctxIdNum = 1;
+761:         for (uint32_t i = 0; i < ctxId.ctxIdNum; i++) {{
+762:           ctxId.ctxIds[i] = i;
+763:         }}
+764:         size_t copyLen = sizeof(MsprofContextIdInfo);
+765:         if (copyLen > MSPROF_ADDTIONAL_INFO_DATA_LENGTH) {{
+766:           copyLen = MSPROF_ADDTIONAL_INFO_DATA_LENGTH;
+767:         }}
+768:         memcpy(info.data, &ctxId, copyLen);
+769:         MsprofReportAdditionalInfo(false, static_cast<void *>(&info), sizeof(MsprofAdditionalInfo));
+770:       }}
+771: 
+772:       // Report tensor info
+773:       int max_tensors_num = tensorShapes.size() < MSPROF_GE_TENSOR_DATA_NUM ? tensorShapes.size() : MSPROF_GE_TENSOR_DATA_NUM;
+774:       MsprofAdditionalInfo tensorInfo;
+775:       tensorInfo.level = MSPROF_REPORT_NODE_LEVEL;
+776:       tensorInfo.type = MSPROF_REPORT_NODE_TENSOR_INFO_TYPE;
+777:       tensorInfo.threadId = threadId;
+778:       tensorInfo.timeStamp = endTime;
+779:       auto profTensorData = reinterpret_cast<MsprofTensorInfo *>(tensorInfo.data);
+780:       profTensorData->opName = opNameHashID;
+781:       int tensorCount = 0;
+782:       int dataTypes[MSPROF_GE_TENSOR_DATA_NUM];
+783:       if (tensorShapes.size() > 0) {{
+784:         {LINE_CHANGE_CHAR.join(
+785:           f'dataTypes[{i}] = {convert_sigtype_to_int(ty[1:])};'
+786:           for i, ty in signature.items()
+787:           if ty.startswith("*") and i < 5
+788:         )}
+789:       }}
+790:       for (int i = 0; i < tensorShapes.size() && tensorCount < MSPROF_GE_TENSOR_DATA_NUM; i++) {{
+791:         auto fillTensorData = [&](int index, int tensorType) {{
+792:           profTensorData->tensorData[index].tensorType = tensorType;
+793:           profTensorData->tensorData[index].format = 2; // GeDataFormat: ND = 2
+794:           profTensorData->tensorData[index].dataType = dataTypes[i];
+795:           int nDim = tensorShapes[i].size();
+796:           nDim = nDim < MSPROF_GE_TENSOR_DATA_SHAPE_LEN ? nDim : MSPROF_GE_TENSOR_DATA_SHAPE_LEN;
+797:           for (int j = 0; j < nDim; j++) {{
+798:             profTensorData->tensorData[index].shape[j] = tensorShapes[i][j];
+799:           }}
+800:           for (int j = nDim; j < MSPROF_GE_TENSOR_DATA_SHAPE_LEN; j++) {{
+801:             profTensorData->tensorData[index].shape[j] = 0;
+802:           }}
+803:         }};
+804:         int tensorType = (i < tensorKinds.size()) ? tensorKinds[i] : 0;  // DeFault tensor type is input
+805:         if (tensorType == TENSOR_KIND_INPUT || tensorType == TENSOR_KIND_INPUT_OUTPUT) {{
+806:           fillTensorData(tensorCount, MSPROF_GE_TENSOR_TYPE_INPUT);
+807:           tensorCount++;
+808:         }}
+809:         if ((tensorType == TENSOR_KIND_OUTPUT || tensorType == TENSOR_KIND_INPUT_OUTPUT) && tensorCount < MSPROF_GE_TENSOR_DATA_NUM){{
+810:           fillTensorData(tensorCount, MSPROF_GE_TENSOR_TYPE_OUTPUT);
+811:           tensorCount++;
+812:         }}
+813:       }}
+814:       profTensorData->tensorNum = tensorCount;
+815:       MsprofReportAdditionalInfo(false, static_cast<void *>(&tensorInfo), sizeof(MsprofAdditionalInfo));
+816:     }}
+817: """
+818: 
+819:     cpp_kernel_launch = f"""
+820:     ret = rtKernelLaunch(func, blockNum, static_cast<void*>(&args), sizeof(args), NULL, stream);
+821: """
+822:     if compile_on_910_95 and enable_simt:
+842: #define TENSOR_KIND_INPUT 0
+843: #define TENSOR_KIND_OUTPUT 1
+844: #define TENSOR_KIND_INPUT_OUTPUT 2
+845: 
+846: {cpp_msprof_extern}
+847: 
+848: {cpp_device_pointer}
+849: 
+850: // FlagPrism: append the optional debugger pointer to the generated launch ABI.
+851: static void _launch(const char* kernelName, const void* func, rtStream_t stream, int gridX, int gridY, int gridZ, std::vector<std::vector<int64_t>> &tensorShapes, std::vector<int> &tensorKinds{', ' + arg_decls if len(signature) > 0 else ''}{debug_abi.launch_declaration}) {{
+852:   // only 1D parallelization is supported for NPU
+853:   // Pointer type becomes flattend 1-D Memref tuple: base_ptr, data_ptr, offset, shape, stride
+854:   // base_ptr offset shape and stride are not used, arbitrarily set for now
+855:   std::string name = "";
+856:   name.append(kernelName);
+857:   void *workspace_addr_ptr = NULL;
+858:   uint32_t blockNum4Workspace = gridX * gridY * gridZ;
+872:         warned = true;
+873:     }}
+874:     #endif
+875:     {'blockNum = std::min(blockNum, (uint32_t)' + str(num_physical_blocks) + ');' if enable_auto_map_parallel_blocks else ''}
+876:     // set mixBlockNumRation for nodeBasicBlockDim for msprof report
+877:     uint32_t mixBlockNumRation = {mix_block_dim_ratio};
+878:     uint32_t nodeBasicBlockDim = (mixBlockNumRation << 16) + blockNum;
+879: 
+880:     {'cce::internal::DebugTunnelData *DTData = cce::internal::DebugTunnel::Open(blockNum);' if enable_device_print else ''}
+881:     rtError_t ret = RT_ERROR_NONE;
+882:     {'void *ffts_addr = NULL; uint32_t ffts_len; ret = rtGetC2cCtrlAddr((uint64_t*)&ffts_addr, &ffts_len);' if target_support_ffts else ''}
+883:     {'if (ret != RT_ERROR_NONE) return ret;' if (target_support_ffts and enable_taskqueue) else 'if (ret != RT_ERROR_NONE) return;' if (target_support_ffts and (not enable_taskqueue)) else ''}
+920:       {debug_abi.struct_value}  // FlagPrism
+921:       {', '.join(f'static_cast<{ty_to_cpp(ty)}>(grid{mark})' for mark, ty in grid_info.items())}
+922:       {', static_cast<void*>(DTData)' if enable_device_print else ''}
+923:     }};
+924:     {cpp_msprof_call_before_launch}
+925:     {cpp_kernel_launch}
+926:     {'void *&stream_ref = const_cast<void*&>(stream);' if enable_device_print else ''}
+927:     {'cce::internal::DebugTunnel::Close(DTData, stream_ref);' if enable_device_print else ''}
+928:     {cpp_msprof_call_after_launch}
+929:     {'return ret;' if enable_taskqueue else 'ret = rtStreamSynchronize(stream);'}
+930:    }};
+931:    {f'''{get_backend_func("async_launch", "launch_call") if enable_taskqueue else ''}'''}
+932:   return;
+933: }}
+934: 
+935: // Extract tensor shape from PyObject
+936: static std::vector<int64_t> _get_tensor_shape(PyObject *tensor) {{
+937:   std::vector<int64_t> shape;
+938: 
+939:   // Early return if tensor is None or null
+940:   if (!tensor || tensor == Py_None) {{
+941:     return shape;
+942:   }}
+943: 
+970:   PyObject *packedMetadata = NULL;
+971:   PyObject *launch_metadata = NULL;
+972:   PyObject *launch_enter_hook = NULL;
+973:   PyObject *launch_exit_hook = NULL;
+974:   std::vector<std::vector<int64_t>> tensorShapes;
+975: 
+976:   // FlagPrism: decode the optional hidden argument after user arguments.
+977:   {debug_abi.extracted_declaration}
+978:   {newline.join([f"{_extracted_type(ty)} _arg{i};" for i, ty in signature.items()])}
+979:   if(!PyArg_ParseTuple(
+980:       args, \"{format}\",
+981:       &gridX, &gridY, &gridZ, &stream, &function,
+982:       &packedMetadata, &launch_metadata,
+983:       &launch_enter_hook, &launch_exit_hook{args_list})) {{
+984:     return NULL;
+985:   }}
+986:   if (__MsprofFlagL1)
+987:   {{
+988:     {
+989:       LINE_CHANGE_CHAR.join(
+990:         f"{{ auto tmp = _get_tensor_shape(_arg{i}); if (!tmp.empty()) tensorShapes.push_back(tmp); }}"
+991:         for i, ty in signature.items() if ty[0] == "*"
+992:       )
+993:     }
+994:   }}
+995: 
+996:   if (launch_enter_hook != Py_None){{
+997:     PyObject* args = Py_BuildValue("(O)", launch_metadata);
+1017: 
+1018:   // raise exception asap
+1019:   {newline.join(ptr_decls)}
+1020:   // FlagPrism: forward the optional pointer after all user arguments.
+1021:   _launch(kernelName, function, stream, gridX, gridY, gridZ, tensorShapes, tensorKinds{', ' + ', '.join(internal_args_list) if len(internal_args_list) > 0 else ''}{debug_abi.call_argument});
+1022:   if (PyErr_Occurred()) {{
+1023:     return NULL;
+1024:   }}
+1025:   if(launch_exit_hook != Py_None){{
+1026:     PyObject* args = Py_BuildValue("(O)", launch_metadata);
+1027:     PyObject* ret = PyObject_CallObject(launch_exit_hook, args);
+1028:     Py_DECREF(args);
+1050:   if(m == NULL) {{
+1051:     return NULL;
+1052:   }}
+1053:   PyModule_AddFunctions(m, ModuleMethods);
+1054:   {cpp_msprof_callback}
+1055:   return m;
+1056: }}
+1057: """

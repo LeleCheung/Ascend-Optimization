@@ -7,7 +7,8 @@ FORBIDDEN_METHODS = {'contiguous', 'clone', 'copy_', 'fill_', 'zero_', 'flatten'
 TORCH_METADATA = {'empty', 'empty_like', 'empty_strided', 'device', 'dtype', 'is_tensor',
                   'Tensor', 'Size', 'finfo', 'iinfo', 'numel', 'get_default_dtype',
                   'broadcast_shapes', 'view_as_real', 'view_as_complex', '_C._is_alias_of',
-                  'npu.device_count', 'npu.get_device_properties'}
+                  'npu.device_count', 'npu.get_device_properties',
+                  'autograd._profiler_enabled'}
 
 
 def inspect_text(text):

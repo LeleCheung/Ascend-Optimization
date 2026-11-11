@@ -1,0 +1,17 @@
+{
+  "evidence": [
+    "failure.txt: test_log10_inplace profiler benchmark (do_bench_npu_profiler) fails at log10.py _triton_run line 297-298 with AttributeError: 'int' object has no attribute 'size'; input A is a real npu tensor (float16) and the traceback shows the kwarg/positional arg contract of the direct launcher call.",
+    "runtime-excerpt.txt: triton/backends/ascend/driver.py NPULauncher.__call__ computes get_backend_func('get_tensor_params_shape', *args) and driver.py embeds C code calling PyObject_CallMethod(tensor, 'size', NULL) per tensor parameter; the raw integer data_ptr passed by the fast launch path has no size().",
+    "runtime-excerpt.txt: NPULauncher arguments are positional: args[5] is packed metadata, args[6] launch metadata, args[9:] are kernel args; _triton_run builds the same positional prefix (grid dims, stream, function, packed_metadata, None, None, None) then the kernel args.",
+    "Correctness 18/18 passes; the failure is host-side launch/collection interface only (int address instead of tensor metadata), not device math: normal correctness and non-inplace paths launch through the supported Triton JIT entry and were unaffected.",
+    "log10.py _build_entry already refuses the fast launcher whenever compile_only / enable_msprof_register_tensor / debug flags are set at build time, which is why these env-gated paths never saw the int address; the profiler-time tensor query happens inside the compiled launcher instead."
+  ],
+  "hypothesis": "The fast launch path replaced the tensor parameter with A.data_ptr() (int). The compiled Ascend launcher only loads tensor.size() when profiling registers tensors, so the normal benchmark and 18 correctness cases pass while profiler timing fails. Passing the real tensor restores metadata without otherwise changing the launch contract.",
+  "change": "log10.py _triton_run: the direct compiled-launcher call now passes the tensor A instead of the integer `pointer` for the data-pointer parameter (comment added). The integer `pointer` is still used for the alignment decision, so the strided/unaligned routing is untouched. No kernel math, tiling, entry cache, stream getter, fallback JIT path, log10_(A)/run(A) signatures, dynamic addressing or current-stream semantics changed. Both the flat/masked/pair fast path and the large-input streaming entry (which share this code path) now carry tensor metadata.",
+  "validation": [
+    "Profiler path: rerun upstream benchmark/test_log10.py::test_log10_inplace (and out-of-place) under torch_npu.profiler do_bench_npu_profiler; expect no 'int' object has no attribute 'size' and valid per-case latency for float16/float32/float64.",
+    "Normal path: rerun native benchmark without profiler and confirm latencies remain valid and speedups are not regressed by the tensor-vs-int argument (same compiled launcher, tensor just resolves data_ptr in C).",
+    "Layout paths: verify unaligned (data_ptr & 15) tensor, non-contiguous strided view, 1D/ND views, empty tensor and the large-input streaming path (numel >= 8*40*32768) both under normal timing and profiler timing.",
+    "Semantics: confirm log10_ still returns the same tensor object with in-place values, and that entries cached from a warmup call remain usable when a profiler session starts afterwards (no per-entry recompilation expected)."
+  ]
+}

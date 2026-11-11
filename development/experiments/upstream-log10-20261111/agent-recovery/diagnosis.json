@@ -1,0 +1,51 @@
+{
+  "evidence": [
+    "ordinary-launch-regression.json: the retained candidate is slower than the previous launch form on the host-dominated small cases. log10_-timing-0..2,4..6,8..10 have new_ms 0.01707..0.02112 versus old_ms 0.01226..0.01455, and new_speedup 0.777..0.921 versus old_speedup 1.046..1.189. Cases 3, 7 and 11 are effectively unchanged (old/new ratios near 1.0), consistent with a fixed per-launch host cost that is irrelevant once device work dominates.",
+    "Candidate status: upstream correctness 18/18, upstream profiler benchmark 9 points, KGS 36/36, dual reference checks 66+66, edges 15. The only failing metric is KGS versus CANN = 0.750834 (< 0.8).",
+    "A previous retained direct-launch candidate that supplied the integer address to the same compiled launcher measured KGS versus CANN 0.899286, above the 0.8 threshold. This isolates the host-side tensor-object argument as the source of the ordinary-launch regression.",
+    "profiler-state-probe.txt: before profiling {autograd_profiler_enabled: false, syscnt_enabled: true, profile_path_present: false}; inside profiling {true, true, true}; after stop {false, true, true}. Stop therefore does not clear the retained profiler path, and the active-only flag returns to false.",
+    "profiler warning in profiler-state-probe.txt: 'Stop profiler while current state is RECORD'. The observed state transition still leaves the retained path populated, so the latch-like path state is a usable post-stop signal.",
+    "Stated driver evidence: profiler start latches flags and stop does not clear shown flags; an unrelated profile can run without this candidate and the next candidate call still requires shape metadata. Hence testing only torch.autograd._profiler_enabled() is insufficient."
+  ],
+  "change": "log10.py now selects the pointer representation per launch from retained profiler state. Ordinary launches pass the integer address that _triton_run already computes for the alignment check; the tensor object is passed only when (a) the compiled launcher or its metadata sets enable_msprof_register_tensor, (b) torch.autograd._profiler_enabled() is true, (c) ProfPathCreator().get_prof_dir() returns a non-empty retained path, or (d) a state source cannot be evaluated. The decision to use the tensor form is monotonic (_METADATA_LATCH): once any profiler evidence has been seen, later launches keep the metadata-bearing form because stop does not clear driver state. The profiler-path query is resolved once through supported torch_npu modules; result files and test names are not consulted. Triton kernels, log10 mathematics, tile/layout branches, stream getter, compile-only/debug guards, fallback JIT paths and the run/log10_ double binding are unchanged.",
+  "reasoning": [
+    "The regression is host-side, not kernel-side: small-shape cases lose 4-8 microseconds while large cases are unchanged, and the earlier integer-address candidate reached KGS 0.899286. Passing the tensor makes the Ascend launcher resolve tensor attributes for profiling metadata on every launch; passing the integer address avoids that resolution entirely.",
+    "The tensor form is still mandatory while tensor registration is active because the launcher may query size()/dtype on pointer parameters, and an int raises AttributeError. Extra tuple/unpacking or proxy objects would still incur Python attribute dispatch and could violate the launcher's expected C argument type, so state/history checking is the cheaper correct representation choice.",
+    "Active-only detection is unsound on this driver: after stop, _profiler_enabled() is false but the retained profiler path remains non-empty and the next launch must still carry shape metadata. The implementation combines the launcher's latched enable_msprof_register_tensor flag with the retained profiler path and makes the result monotonic.",
+    "An unrelated profile with no candidate call in between is covered because the path remains populated after that profile stops; the next candidate call observes it before choosing the integer form. Unknown state falls back to the tensor form, preserving correctness over speed."
+  ],
+  "limitations": [
+    "No device execution or test suite was run in this recovery; all conclusions are from the supplied measurements and state probe.",
+    "The retained-path signal is environment-specific. On a torch_npu version where ProfPathCreator cannot be resolved, the implementation conservatively latches the tensor form, which preserves correctness but does not recover ordinary host performance there.",
+    "The per-call state probes (active-profiler query, retained-path query, launcher flag reads) add a small constant host cost until the latch is set in a process that never profiles; this should be far below the removed tensor-metadata resolution but must be measured.",
+    "If a future driver cleared all profiler flags at stop and produced no retained path, later launches would use the integer form. That state is unknown today and is intentionally not guessed; the launcher flag check is the remaining defense.",
+    "The change does not attempt to recover fast direct launch for entries that were compiled under profiling and therefore intentionally fall back through the existing compile-only/msprof guard."
+  ],
+  "validation": [
+    {
+      "scenario": "ordinary fresh process, no profiler ever created",
+      "dtypes": ["float32", "float16", "bfloat16"],
+      "checks": "Run upstream correctness and KGS for the candidate in a fresh process; verify outputs for contiguous, non-contiguous, empty, aligned and unaligned inputs; confirm KGS versus CANN recovers near the prior integer-address result (0.899286) and is >= 0.8; confirm host latency on the small log10_-timing cases returns to the old_ms range."
+    },
+    {
+      "scenario": "unrelated profiling before the candidate",
+      "dtypes": ["float32", "float16", "bfloat16"],
+      "checks": "Start and stop a profiler on another operation without calling log10_; after stop, call both run and log10_ including a cached entry and a new shape. Expect no AttributeError about int.size(), exact mathematics against the reference, and the metadata-bearing launch form actually used after stop."
+    },
+    {
+      "scenario": "during profiling",
+      "dtypes": ["float32", "float16", "bfloat16"],
+      "checks": "Profile the candidate itself from a fresh process for all three dtypes and for the streaming/large path, plus non-contiguous and masked-tail shapes. Expect tensor registration to succeed, upstream profiler benchmark to retain 9 points, and correctness to remain 18/18."
+    },
+    {
+      "scenario": "after profiler stop",
+      "dtypes": ["float32", "float16", "bfloat16"],
+      "checks": "Stop the profiler while the retained path is still populated, then call both run and log10_ for all three dtypes with both previously built entries and newly built entries. Expect no launch error, correct in-place results, and continued metadata-bearing arguments due to the monotonic latch; also confirm no retry-after-launch behavior is introduced."
+    },
+    {
+      "scenario": "guard and binding regression checks",
+      "dtypes": ["float32", "float16", "bfloat16"],
+      "checks": "Confirm run is log10_ (same object), debug/compile-only entries still take the fallback path, stream semantics still follow the current stream, and dynamic addresses remain correct when the same cached entry is used with different tensor addresses."
+    }
+  ]
+}

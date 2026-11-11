@@ -1,0 +1,3 @@
+这是接口兼容的最小修复。先读failure.txt和loader-excerpt.txt，再看log10.py末尾导出部分（约280行后）。当前源码已通过FlagGems目标文件原生正确性18项及9个profiler性能点，KGS的双参考补测各66项及特殊值15项也通过，但KGS加载器拒收：run与log10_不是同一函数对象。
+请仅调整本模块的公共入口绑定，使run(A)与log10_(A)均可调用且符合加载器的同一函数对象要求。避免别名或包装造成递归。保留Tensor参数传给直接launcher的profiler修复，保持所有Triton kernel、宿主计算、缓存、动态地址、当前stream及输出语义；不要进行性能优化，不修改测试或KGS。
+只可用Read/Edit修改本目录log10.py、diagnosis.json，不读取外部文件，不运行设备。不要反复读完整文件，不找其他agent。新增注释和诊断用专业中文。修改由你完成，宿主负责审查和完整复验，结束时简短说明。

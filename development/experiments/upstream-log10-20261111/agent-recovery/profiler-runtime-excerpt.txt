@@ -1,0 +1,222 @@
+backends/ascend/testing.py
+backends/ascend/driver.py
+126: 
+127: class NPULauncher(object):
+128: 
+129:     def __init__(self, src, metadata):
+130:         self.compile_only = os.getenv("TRITON_COMPILE_ONLY", 'false').lower() in ('true', '1')
+131:         self.enable_msprof_register_tensor = os.getenv("TRITON_REGISTER_TENSOR_MSPROF",
+132:                                                        'false').lower() in ('true', '1')
+133:         debug_mode = metadata.debug
+134:         header_src = generate_npu_header_src()
+135:         constants = src.constants if hasattr(src, "constants") else dict()
+136:         cst_key = lambda i: src.fn.arg_names.index(i) if isinstance(i, str) else i
+137:         constants = {cst_key(key): value for key, value in constants.items()}
+138:         signature = {cst_key(key): value for key, value in src.signature.items()}
+139:         wrapper_src = make_launcher(constants, signature, metadata)
+140:         so_launcher_path = make_npu_launcher_stub(header_src, wrapper_src, metadata.debug)
+153:     def __call__(self, *args, **kwargs):
+154:         if self.compile_only:
+155:             cache_manager = get_cache_manager(args[5]['hash'])
+156:             print("[INFO]: skip running kernel")
+157:             print(f"[INFO]: The compiled kernel cache is in {cache_manager.cache_dir}")
+158:         if self.enable_msprof_register_tensor:
+159:             tensor_params_shape = get_backend_func("get_tensor_params_shape", *args)
+160:             # args[5] must be the packed metadata.
+161:             # Check the launch wrapper in which PyArg_ParseTuple specifies the ordering of args
+162:             args[5]['tensor_params_shape'] = tensor_params_shape
+163:         else:
+164:             if self.compile_only:
+165:                 return
+166:             debug_enabled = bool(getattr(self.metadata, "debug_enabled", False))
+167:             if debug_enabled:
+spec/ascend/runtime/jit.py
+backends/ascend/driver.py
+127: class NPULauncher(object):
+128: 
+129:     def __init__(self, src, metadata):
+130:         self.compile_only = os.getenv("TRITON_COMPILE_ONLY", 'false').lower() in ('true', '1')
+131:         self.enable_msprof_register_tensor = os.getenv("TRITON_REGISTER_TENSOR_MSPROF",
+132:                                                        'false').lower() in ('true', '1')
+133:         debug_mode = metadata.debug
+134:         header_src = generate_npu_header_src()
+135:         constants = src.constants if hasattr(src, "constants") else dict()
+136:         cst_key = lambda i: src.fn.arg_names.index(i) if isinstance(i, str) else i
+137:         constants = {cst_key(key): value for key, value in constants.items()}
+138:         signature = {cst_key(key): value for key, value in src.signature.items()}
+139:         wrapper_src = make_launcher(constants, signature, metadata)
+140:         so_launcher_path = make_npu_launcher_stub(header_src, wrapper_src, metadata.debug)
+141:         self.metadata = metadata  # FlagPrism
+142:         # setup for remote run
+143:         # TODO: use a var to pack all vars required to run on a remote machine
+144:         self.mix_mode = metadata.mix_mode
+145:         self.shared = metadata.shared
+146:         # initialize launcher
+147:         import importlib.util
+148:         spec = importlib.util.spec_from_file_location("__triton_launcher", so_launcher_path)
+149:         mod = importlib.util.module_from_spec(spec)
+150:         spec.loader.exec_module(mod)
+151:         self.launch = getattr(mod, "launch")
+152: 
+153:     def __call__(self, *args, **kwargs):
+154:         if self.compile_only:
+155:             cache_manager = get_cache_manager(args[5]['hash'])
+156:             print("[INFO]: skip running kernel")
+157:             print(f"[INFO]: The compiled kernel cache is in {cache_manager.cache_dir}")
+158:         if self.enable_msprof_register_tensor:
+159:             tensor_params_shape = get_backend_func("get_tensor_params_shape", *args)
+160:             # args[5] must be the packed metadata.
+161:             # Check the launch wrapper in which PyArg_ParseTuple specifies the ordering of args
+162:             args[5]['tensor_params_shape'] = tensor_params_shape
+163:         else:
+164:             if self.compile_only:
+165:                 return
+166:             debug_enabled = bool(getattr(self.metadata, "debug_enabled", False))
+167:             if debug_enabled:
+168:                 # FlagPrism: use the backend-neutral launch gateway; this
+169:                 # backend only supplies its name and launch state.
+170:                 with _flagprism.debugger_launch_context(
+171:                         "ascend",
+172:                         self.metadata,
+173:                         args[:3],
+174:                         args[3],
+175:                         args[6],
+176:                         args[9:],
+177:                 ) as hidden_args:
+178:                     profiler_registered = self.launch(*args, *hidden_args, **kwargs)
+179:             else:
+180:                 profiler_registered = self.launch(*args, **kwargs)
+181:             import triton
+182:             triton.backends.ascend.utils.TRITON_PROFILER_REGISTERED = True if profiler_registered == 1 else False
+183: 
+184: 
+185: class NPUDriver(DriverBase):
+186: 
+187:     def __init__(self):
+188:         self.utils = NPUUtils()
+189:         self.launcher_cls = NPULauncher
+190:         super().__init__()
+191: 
+192:     @classmethod
+193:     def is_active(cls):
+194: 
+195:         def test_npucompiler():
+196:             from triton.backends.ascend.utils import _get_bisheng_path
+197:             npucompiler = _get_bisheng_path()
+198:             targets = subprocess.check_output([npucompiler, "-print-targets"]).decode().strip().split()
+199:             return "hiipu64" in targets
+200: 
+201:         try:
+202:             return test_npucompiler()
+203:         except Exception as e_npucompiler:
+204:             import warnings
+205:             red = "\x1b[31;20m"
+backends/ascend/testing.py
+45: def do_bench_npu_profiler(
+46:     funcs,
+47:     warmup=5,
+48:     active=30,
+49:     clear_l2_cache=False,
+50:     prof_dir=None,
+51:     keep_res=False,
+52:     target_kernel_name: Optional[str] = None,
+53: ):
+54:     if not isinstance(funcs, list):
+55:         funcs = [funcs]
+56: 
+57:     # warmup kernel
+58:     for fn in funcs:
+59:         fn()
+60:         torch.npu.synchronize()
+61: 
+62:     experimental_config = torch_npu.profiler._ExperimentalConfig(
+63:         aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+64:         profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+65:         l2_cache=False,
+66:         data_simplification=False,
+67:     )
+68: 
+69:     if prof_dir is not None:
+70:         torch_path = prof_dir
+71:     else:
+72:         process = multiprocessing.current_process()
+73:         pid = process.pid
+74:         process_name = process.name
+75:         timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+76:         base_path = cache.get_triton_dir("profile_results")
+77:         torch_path = os.path.join(base_path, f"prof_{timestamp}_{process_name}-{pid}")
+78: 
+79:     if clear_l2_cache:
+80:         buffer = runtime.driver.active.get_empty_cache_for_benchmark()
+81:         buffer = buffer.float()  # to avoid type cast
+82:         buffer.sum()
+83:         torch.npu.synchronize()  # shake out of any npu error
+84: 
+85:     total = warmup + active
+86:     with torch_npu.profiler.profile(
+87:             activities=[torch_npu.profiler.ProfilerActivity.NPU],
+88:             on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(torch_path),
+89:             record_shapes=False,
+90:             profile_memory=False,
+91:             with_stack=False,
+92:             with_flops=False,
+93:             with_modules=False,
+94:             experimental_config=experimental_config,
+95:     ) as prof:
+96:         for fn in funcs:
+97:             for _ in builtins.range(total):
+98:                 if clear_l2_cache:
+99:                     buffer.sum()  # use buffer read to clear l2 cache
+100:                     torch.npu.synchronize()
+101:                 fn()
+102:                 torch.npu.synchronize()
+103:     if clear_l2_cache:
+104:         del buffer
+105: 
+106:     try:
+107:         return _collect_prof_result(
+108:             torch_path,
+109:             funcs,
+110:             warmup,
+111:             active,
+112:             target_kernel_name=target_kernel_name,
+113:             clear_l2_cache=clear_l2_cache,
+114:         )
+115:     finally:
+116:         _rm_dic(keep_res, torch_path)
+117: 
+118: 
+119: def _rm_dic(keep_res, torch_path):
+120:     if keep_res:
+121:         return
+122:     import shutil
+123: 
+124:     if os.path.exists(torch_path):
+125:         shutil.rmtree(torch_path)
+126: 
+127: 
+128: def _collect_prof_result(
+129:     base_dir: str,
+130:     funcs,
+131:     num_warmup: int,
+132:     num_active: int,
+133:     target_kernel_name: Optional[str] = None,
+134:     clear_l2_cache: bool = False,
+135: ):
+/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/driver.py
+937:   std::vector<int64_t> shape;
+938: 
+939:   // Early return if tensor is None or null
+940:   if (!tensor || tensor == Py_None) {{
+941:     return shape;
+942:   }}
+943: 
+944:   // Calling tensor.size()
+945:   PyObject* size_result = PyObject_CallMethod(tensor, "size", NULL);
+946:   if (!size_result) {{
+947:     return shape;
+948:   }}
+949:   // Using PySequence_Fast to improve access efficiency
+950:   PyObject* seq = PySequence_Fast(size_result, "Expected a sequence from tensor.size()");
+951:   if (seq) {{
+952:     Py_ssize_t len = PySequence_Fast_GET_SIZE(seq);

@@ -27,7 +27,7 @@ class PublicDistributionTests(unittest.TestCase):
                 p=subprocess.run([sys.executable,'-X','utf8',*args],cwd=root,env=env,capture_output=True,text=True,encoding='utf8')
                 self.assertEqual(p.returncode,0,p.stderr);return p.stdout
             invoke('-m','hgkda','doctor')
-            for action in ['prepare','context','generate','preflight','pair','simulate','evaluate']:
+            for action in ['prepare','context','generate','preflight','pair','simulate','evaluate','upstream-test']:
                 invoke('-m','hgkda.runtime',action,'--help')
             run=root/'run'
             invoke('-m','hgkda.runtime','prepare','--operator-directory',str(root/'operators/log10_'),

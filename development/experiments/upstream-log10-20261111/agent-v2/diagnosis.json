@@ -1,0 +1,47 @@
+{
+  "task": "upstream_interface_integration",
+  "operator": "log10_",
+  "upstream_commit": "d6a8eec473517a3d68157b208eb9c057eb1d4c50",
+  "scope": "仅完成 Ascend 后端接口接入，不进行性能调优、不重写实现",
+  "changes": [
+    {
+      "file": "log10.py",
+      "host_path": "src/flag_gems/runtime/backend/_ascend/ops/log10.py",
+      "kind": "module_bootstrap",
+      "detail": "在既有候选交付原件（与 candidate.py 逐字节一致）基础上，补充 Apache-2.0 许可证声明、模块级 logger，以及公共接口 log10_(A)。log10_(A) 仅调用既有 run/_triton_run 并以 A 原地返回，未引入任何新的计算路径。"
+    },
+    {
+      "file": "log10.py",
+      "kind": "kernel_and_launch_code_unchanged",
+      "detail": "除文件头许可证/说明、import logging、logger 定义与末尾 log10_ 包装函数外，其余内容（kernel 源码、常量、缓存表、入口构建、跨步路径、stream 解析、run 别名及原有空行与注释）均未改动。"
+    },
+    {
+      "file": "backend_init.py",
+      "host_path": "src/flag_gems/runtime/backend/_ascend/ops/__init__.py",
+      "kind": "export",
+      "detail": "新增 `from .log10 import log10_`（按字典序置于 log_ 之前），并在 __all__ 中新增 \"log10_\"，使后端 ops 包对外暴露 log10_。"
+    }
+  ],
+  "unchanged": [
+    "Triton kernel 集合与源码：_log10_flat、_log10_flat_masked、_log10_pair、_log10_scaled、_log10_nd、_log10_streaming，包括 tl.log(x) * 0.4342944819032518 的原地数学与 float32 中间精度。",
+    "数据布局处理：连续快路径、16 字节对齐检查、_launch_strided 的维度归并/SCALE 缩放/最多 8 维展开、以及超过 8 维时按最外层切分。",
+    "分块策略：_TILE_MAX/_TILE_MIN/_HOIST_MIN/_BLOCK_STRIDED 常量、_pick_tile、pair 双半块 hoist、以及 n >= 8*40*_TILE_MAX 时的 bounded-grid 流式入口。",
+    "编译与启动缓存：_ENTRIES 以 (dtype, n, device) 为键，_build_entry/_make_streaming_entry 直接复用编译产物 launcher；条件不满足时保留原 fallback 调用路径。",
+    "当前 stream 查询：_resolve_stream 的一次性解析 + 每次调用重新求值（_STREAM_GETTERS），优先 torch_npu._C._npu_getCurrentRawStreamNoWait，其次 triton driver，最后 torch.npu.current_stream()。",
+    "空张量（n == 0）直接返回、原地语义（返回同一张量对象、不替换 view）、dtype 由 x_ptr.dtype.element_ty 写回。",
+    "通用上游 log10 / log10_out：未新增或修改后端同名的 log10、log10_out 导出，故 flag_gems.log10 与 flag_gems.log10_out 仍走通用点乘实现（upstream_generic_log10.py）。"
+  ],
+  "unknown": [
+    "本次未在设备上执行任何测试或计时；flag_gems.log10_ 实际解析到昇腾后端实现须由宿主在真实环境中确认（例如检查 flag_gems.log10_.__module__）。",
+    "既有候选源码在固定 commit 上的原生 tests/benchmark 结论尚未由本轮生成；不能继承旧源码的 KGS 通过结论。",
+    "整数等非浮点 dtype 的原地行为（float32 计算后按元素 dtype 截断写回）沿用既有实现，未在接入中增加 dtype 校验，需宿主按上游 log10_ 语义确认是否需要额外报错处理。"
+  ],
+  "host_validation_required": [
+    "导入来源校验：确认 src/flag_gems/runtime/backend/_ascend/ops/__init__.py 可正常导入，且 log10_ 出现在其 __all__ 与模块命名空间。",
+    "分派校验：在 Ascend 环境启用 FlagGems 后，确认 flag_gems.log10_ 指向 _ascend/ops/log10.py 中的实现，同时 flag_gems.log10 与 flag_gems.log10_out 仍为通用上游实现。",
+    "原生正确性测试：固定 commit d6a8eec473517a3d68157b208eb9c057eb1d4c50 上以 --ops 精确选择 log10 相关用例运行，覆盖 int/float16/bfloat16/float32、连续与非连续（含非对齐 storage_offset）、0 元素、单元素、非 2 的幂尺寸、以及 >= 8*40*32768 的流式大输入；确认返回对象与输入同一张量、原 view 不被替换。",
+    "原生 benchmark：使用目标仓库 core benchmark 口径记录 log10 系列逐 dtype/shape 结果与派生几何平均，作为 FlagGems 原生成绩单独保存，不覆盖 KGS/CANN 结果。",
+    "多 stream 场景：在同一进程内切换 torch.npu.Stream 后连续调用 log10_，确认 _resolve_stream 每次求值确实落到当前 stream。",
+    "特殊值：0、负数、inf、nan 的原地结果与 torch.log10_ 语义一致（-inf / nan 传播）。"
+  ]
+}

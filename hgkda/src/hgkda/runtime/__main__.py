@@ -4,6 +4,7 @@ import subprocess
 import sys
 
 ACTIONS={
+ 'upstream-test':('upstream_test',[]),
  'prepare':('prepare',[]),
  'generate':('host_action',['generate']), 'context':('agent_tools',['context']),
  'preflight':('host_action',['preflight']), 'evaluate':('host_action',['evaluate']),

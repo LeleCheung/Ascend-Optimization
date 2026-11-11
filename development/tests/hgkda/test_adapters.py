@@ -38,6 +38,12 @@ class AdapterTests(unittest.TestCase):
         self.assertFalse(inspect_text(source.replace('t.view_as_real(x)', 't.real(x).clone()'))['static_passed'])
         self.assertFalse(inspect_text(source.replace('t.npu.device_count()', 't.npu.synchronize()'))['static_passed'])
 
+    def test_profiler_state_is_metadata_but_control_is_not_allowed(self):
+        source = 'import torch as t\ndef run(x):\n return t.autograd._profiler_enabled()\n'
+        self.assertTrue(inspect_text(source)['static_passed'])
+        for name in ['_disable_profiler', '_enable_profiler', 'profiler.profile']:
+            self.assertFalse(inspect_text(source.replace('_profiler_enabled', name))['static_passed'])
+
     def test_gate_preserves_crlf_source_identity(self):
         source = b'def run(x):\r\n    return x\r\n'
         review = dict(source_sha256=hashlib.sha256(source).hexdigest(),

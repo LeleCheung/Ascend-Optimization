@@ -29,6 +29,8 @@ description: 诊断与优化昇腾算子的性能；对同输入候选和参考�
 
 ## 硬约束
 
+准备向FlagGems提交算子时，按[上游验收](references/upstream-validation.md)调用外部仓库的原生正确性测试与benchmark。使用python -m hgkda.runtime upstream-test；上游验收与KGS、HG-KDA补测分别报告。
+
 候选的所有设备计算与搬运严格使用 Triton，包含快路径、慢路径和回退。CANN/Ascend C 仅作参考，禁止原生 DMA 或 PyTorch 目标算子替代候选。保留 stride、offset、dtype、原地/out 别名、特殊值、当前设备和 stream；不缓存张量结果或旧 stream。
 
 活跃阈值是排查优先级，不是瓶颈证明。经验 microbenchmark 包络不是物理峰值。流水时间可能重叠；模拟器指令时间不可相加为正式耗时。默认一次完整正式评测，不以局部测试替代完整调用。
