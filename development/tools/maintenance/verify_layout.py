@@ -4,6 +4,7 @@ import ast
 import hashlib
 import json
 import os
+import subprocess
 from pathlib import Path
 
 def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
@@ -12,7 +13,10 @@ def main():
  r=a.repository.resolve()
  if os.name=='nt':r=Path(chr(92)*2+'?'+chr(92)+str(r))
  mapping=json.loads((r/'development/manifests/three-part-migration-20261111.json').read_bytes())
- for item in mapping['immutable_files']:assert sha(r/item['new'])==item['sha256'],item['new']
+ tracked=set(subprocess.check_output(['git','-C',str(a.repository.resolve()),'ls-files','-z']).decode('utf8').split(chr(0)))
+ for item in mapping['immutable_files']:
+  assert item['new'] in tracked,'frozen file is not tracked: '+item['new']
+  assert sha(r/item['new'])==item['sha256'],item['new']
  index=json.loads((r/'operators/index.json').read_bytes());assert index['accepted']==26
  count=0;missing=[]
  def check(v):
