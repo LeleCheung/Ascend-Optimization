@@ -1,0 +1,25 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems_cudnn_batch_norm_backward",
+  "description": "cudnn_batch_norm_backward: batch-norm backward. Reference is the vendor aten.native_batch_norm_backward oracle with upcast inputs (mirrors the FlagGems correctness test); save_mean/save_var are the biased channel statistics of the input.",
+  "inputs": [
+    "input",
+    "grad_output",
+    "weight",
+    "running_mean",
+    "running_var",
+    "save_mean",
+    "save_var",
+    "eps",
+    "reserve_space"
+  ],
+  "outputs": [
+    "in_grad",
+    "weight_grad",
+    "bias_grad"
+  ],
+  "reference": "import torch\n\n_STR2DTYPE = {\n    \"float16\": torch.float16,\n    \"float32\": torch.float32,\n    \"bfloat16\": torch.bfloat16,\n}\n\n\ndef gen_inputs(ctx, device):\n    shape = tuple(ctx[\"input__shape\"])\n    dtype = _STR2DTYPE[ctx[\"input__dtype\"]]\n    C = shape[1]\n    inp = torch.randn(shape, dtype=dtype, device=device)\n    weight = torch.ones((C,), dtype=dtype, device=device)\n    inp_f32 = inp.to(torch.float32)\n    dims = [0] + list(range(2, inp.ndim))\n    save_mean = inp_f32.mean(dim=dims).to(dtype)\n    save_var = inp_f32.var(dim=dims, unbiased=False).to(dtype)\n    grad_output = torch.ones_like(inp)\n    reserve_space = torch.empty(0, dtype=dtype, device=device)\n    return {\n        \"input\": inp,\n        \"grad_output\": grad_output,\n        \"weight\": weight,\n        \"save_mean\": save_mean,\n        \"save_var\": save_var,\n        \"reserve_space\": reserve_space,\n    }\n\n\ndef run(input, grad_output, weight, running_mean, running_var, save_mean, save_var, eps, reserve_space):\n    return torch.ops.aten.cudnn_batch_norm_backward(\n        input,\n        grad_output,\n        weight,\n        running_mean,\n        running_var,\n        save_mean,\n        save_var,\n        eps,\n        reserve_space,\n    )\n\n\ndef run_correctness(input, grad_output, weight, running_mean, running_var, save_mean, save_var, eps, reserve_space):\n    ref_save_invstd = torch.rsqrt(save_var.float() + eps)\n    in_grad, weight_grad, bias_grad = torch.ops.aten.native_batch_norm_backward(\n        grad_output.float(),\n        input.float(),\n        weight.float() if weight is not None else None,\n        None,\n        None,\n        save_mean.float(),\n        ref_save_invstd,\n        True,\n        eps,\n        [True, True, True],\n    )\n    return (\n        in_grad.to(input.dtype),\n        weight_grad.to(weight.dtype),\n        bias_grad.to(grad_output.dtype),\n    )\n",
+  "reference_device": "target",
+  "custom_inputs_entrypoint": "gen_inputs",
+  "correctness_reference_entrypoint": "run_correctness"
+}

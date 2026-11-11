@@ -1,0 +1,18 @@
+{
+  "api_version": "v5.1",
+  "name": "abl_t2_add_rmsnorm_quant",
+  "description": "AKG Bench Lite t2/add_rmsnorm_quant",
+  "inputs": [
+    "x",
+    "residual",
+    "gamma",
+    "scale",
+    "zero_point"
+  ],
+  "outputs": [
+    "output"
+  ],
+  "reference": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\n\nclass Model(nn.Module):\n    \"\"\"\n    Model that performs Add + RMS Normalization + Quantization fused operation.\n    This operation adds a residual connection to the input, applies RMS normalization,\n    and then quantizes the result. This fusion is commonly used in quantized neural networks\n    to reduce memory usage while maintaining numerical stability through normalization.\n    \"\"\"\n\n    def __init__(self, epsilon=1e-6):\n        super(Model, self).__init__()\n        self.epsilon = epsilon\n\n    def forward(self, x, residual, gamma, scale, zero_point):\n        \"\"\"\n        Perform Add + RMS Normalization + Quantization fused operation.\n        \"\"\"\n        # Add residual connection\n        x_added = x + residual\n\n        # Compute reciprocal RMS and normalize\n        rstd = torch.rsqrt(x_added.pow(2).mean(dim=-1, keepdim=True) + self.epsilon)\n        output = (x_added * rstd) * gamma\n\n        # Quantize to int8\n        output_quantized = torch.round(output / scale + zero_point).clamp(-128, 127).to(torch.int8)\n        return output_quantized\n\n\ndef get_inputs():\n    \"\"\"\n    Generate random input tensors for testing with large model shapes.\n    \"\"\"\n    # Batch size: 32\n    # Sequence length: 1024\n    # Hidden size: 4096\n    batch_size, seq_len, hidden_size = 32, 1024, 4096\n\n    # Generate input and residual tensors\n    x = torch.randn(batch_size, seq_len, hidden_size, dtype=torch.float32)\n    residual = torch.randn(batch_size, seq_len, hidden_size, dtype=torch.float32)\n\n    # Generate scale parameter\n    gamma = torch.randn(hidden_size, dtype=torch.float32)\n\n    # Generate quantization parameters\n    scale = torch.randn(1, dtype=torch.float32) * 0.1 + 0.01  # Small positive scale\n    zero_point = torch.randn(1, dtype=torch.float32) * 10  # Zero point around 0\n\n    return [x, residual, gamma, scale, zero_point]\n\n\ndef get_init_inputs():\n    \"\"\"\n    Return initialization parameters for the model.\n    \"\"\"\n    # Return parameters as a list\n    epsilon = 1e-6\n    return [epsilon]\n\n\ndef run(x, residual, gamma, scale, zero_point):\n    model = Model(1e-06)\n    device = x.device\n    model = model.to(device)\n    model.eval()\n    with torch.no_grad():\n        result = model(x, residual, gamma, scale, zero_point)\n    return result\n\n\ndef _legacy_gen_inputs(axes, device):\n    inputs = get_inputs()\n    result = {}\n    result['x'] = inputs[0].to(device) if hasattr(inputs[0], 'to') else inputs[0]\n    result['residual'] = inputs[1].to(device) if hasattr(inputs[1], 'to') else inputs[1]\n    result['gamma'] = inputs[2].to(device) if hasattr(inputs[2], 'to') else inputs[2]\n    result['scale'] = inputs[3].to(device) if hasattr(inputs[3], 'to') else inputs[3]\n    result['zero_point'] = inputs[4].to(device) if hasattr(inputs[4], 'to') else inputs[4]\n    return result\n\ndef gen_inputs(ctx, device):\n    del ctx\n    return _legacy_gen_inputs({'batch_size': 32, 'sequence_length': 1024, 'hidden_size': 4096}, device)\n",
+  "reference_device": "target",
+  "custom_inputs_entrypoint": "gen_inputs"
+}

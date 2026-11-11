@@ -1,0 +1,596 @@
+schema_version: '1.0'
+name: kernelswift-v5-operator-retrieval-v1
+description: Golden Concept retrieval for all ten KernelSwift v5 Definitions across five optimization stages, plus bilingual Source retrieval regressions.
+max_results: 4
+minimum_recall_at_4: 0.9
+target:
+  backend: ascend
+  vendor: Huawei
+  architecture: DAV_2201
+  device: Ascend910B2
+  software:
+    language: triton
+    language_version: 3.2.0
+    compiler: triton-ascend
+  source: fixture
+operators:
+  ks_grouped_topk_softmax_e8_k8_g8_tg4:
+    family: moe_routing
+    motifs: [softmax, reduction, topk, sort, masking, renormalization]
+    dataflow: [grouped_router_topk]
+    dtypes: [float16, float32]
+    layouts: [contiguous]
+  ks_fused_moe_e8_k2_h128_i64:
+    family: moe_ffn
+    motifs: [softmax, reduction, topk, sort, renormalization, expert_dispatch, matrix_multiply, activation, weighted_reduction]
+    dataflow: [router_expert_combine]
+    dtypes: [float16, float32]
+    layouts: [contiguous]
+  ks_causal_sdpa_t83_h8_d64:
+    family: attention
+    motifs: [matrix_multiply, masking, softmax, reduction, layout_transform]
+    dataflow: [causal_qk_softmax_pv]
+    dtypes: [float16]
+    layouts: [contiguous]
+  ks_mm_encoder_attention_h8_d64_kv8:
+    family: attention
+    motifs: [matrix_multiply, softmax, reduction, layout_transform]
+    dataflow: [qk_softmax_pv]
+    dtypes: [float16]
+    layouts: [contiguous]
+  ks_splade_pool_max:
+    family: sparse_retrieval
+    motifs: [matrix_multiply, activation, layer_norm, segment_reduction, reduction]
+    dataflow: [projection_sparse_pool]
+    dtypes: [float32, int32]
+    layouts: [contiguous]
+  ks_music_flamingo_rope_d64_s256:
+    family: rotary_position_encoding
+    motifs: [broadcast, elementwise, sincos]
+    dataflow: [rotary_phase_generation]
+    dtypes: [float32]
+    layouts: [contiguous]
+  ks_mhc_post:
+    family: head_mixing
+    motifs: [einsum, broadcast, elementwise, layout_transform, type_conversion]
+    dataflow: [residual_head_mix]
+    dtypes: [bfloat16, float32]
+    layouts: [contiguous]
+  ks_hc_split_sinkhorn_hc4_iter20:
+    family: head_mixing
+    motifs: [activation, reduction, iterative_normalization, layout_transform]
+    dataflow: [head_split_sinkhorn]
+    dtypes: [float32]
+    layouts: [contiguous]
+  ks_centre_random_augmentation_s4:
+    family: geometric_augmentation
+    motifs: [reduction, masking, broadcast, random_sampling, geometric_transform]
+    dataflow: [center_rotate_translate]
+    dtypes: [float32]
+    layouts: [contiguous]
+  ks_head_compute_mix_bwd_m4:
+    family: head_mixing
+    motifs: [activation, elementwise, gradient_reduction, reduction, broadcast]
+    dataflow: [affine_sigmoid_backward]
+    dtypes: [float32]
+    layouts: [contiguous]
+cases:
+  - id: grouped_topk.initial
+    definition_id: ks_grouped_topk_softmax_e8_k8_g8_tg4
+    scenario: initial
+    phase: initial
+    task: implementation
+    question: How should grouped TopK sort tiles and merge bounded temporary buffers without globally sorting the full row?
+    expected_any: [kg:method:cannbot-topk-tile-sort-merge]
+    expected_first: kg:method:cannbot-topk-tile-sort-merge
+    forbidden_direct: [kg:method:triton-ascend-layernorm-fp32-statistics]
+  - id: grouped_topk.constraint
+    definition_id: ks_grouped_topk_softmax_e8_k8_g8_tg4
+    scenario: constraint
+    phase: initial
+    task: constraint_check
+    question: What last-axis, largest-only and power-of-two K constraints apply to Triton Ascend TopK?
+    expected_any: [kg:reference:triton-ascend-topk-contract]
+  - id: grouped_topk.post_error
+    definition_id: ks_grouped_topk_softmax_e8_k8_g8_tg4
+    scenario: post_error
+    phase: post_error
+    task: diagnosis
+    question: TopK tile sorting failed because all values, indices and merge buffers exceeded UB; how should the live set be reduced?
+    errors: [UB overflow while allocating TopK value, index, and merge buffers]
+    expected_any: [kg:diagnostic:triton-ascend-ub-overflow, kg:diagnostic:cannbot-ub-live-set-accounting]
+  - id: grouped_topk.post_profile
+    definition_id: ks_grouped_topk_softmax_e8_k8_g8_tg4
+    scenario: post_profile
+    phase: post_profile
+    task: diagnosis
+    question: Profiling shows uneven expert-group traffic; how can routing imbalance be separated from TopK kernel cost?
+    findings:
+      - category: routing
+        label: moe_load_imbalance
+        confidence: high
+    expected_any: [kg:diagnostic:kernelwiki-moe-load-imbalance]
+  - id: grouped_topk.plateau
+    definition_id: ks_grouped_topk_softmax_e8_k8_g8_tg4
+    scenario: plateau
+    phase: plateau
+    task: next_experiment
+    question: Performance plateaued after tile sorting; should TopK value-index candidates remain contiguous and be merged in one temporary buffer?
+    expected_any: [kg:method:cannbot-topk-temp-buffer-merge, kg:method:cannbot-topk-ub-aware-multirow]
+
+  - id: fused_moe.initial
+    definition_id: ks_fused_moe_e8_k2_h128_i64
+    scenario: initial
+    phase: initial
+    task: implementation
+    question: How should routed expert matmul, activation and weighted combine be fused to avoid intermediate global-memory round trips?
+    expected_any:
+      - kg:method:kernelwiki-epilogue-fusion
+      - kg:method:kernelwiki-kernel-fusion
+      - kg:method:triton-ascend-matmul-k-loop-epilogue
+      - kg:method:cannbot-topk-tile-sort-merge
+    forbidden_direct: [kg:method:triton-ascend-layernorm-fp32-statistics]
+  - id: fused_moe.constraint
+    definition_id: ks_fused_moe_e8_k2_h128_i64
+    scenario: constraint
+    phase: initial
+    task: constraint_check
+    question: Which Triton Ascend TopK width and last-axis constraints must the MoE router preserve before expert dispatch?
+    expected_any: [kg:reference:triton-ascend-topk-contract]
+  - id: fused_moe.post_error
+    definition_id: ks_fused_moe_e8_k2_h128_i64
+    scenario: post_error
+    phase: post_error
+    task: diagnosis
+    question: The fused expert kernel overflows UB when router weights, expert tiles and activation intermediates are live together; what should be diagnosed first?
+    errors: [UB overflow in fused router expert combine kernel]
+    expected_any: [kg:diagnostic:cannbot-ub-live-set-accounting, kg:diagnostic:triton-ascend-ub-overflow]
+  - id: fused_moe.post_profile
+    definition_id: ks_fused_moe_e8_k2_h128_i64
+    scenario: post_profile
+    phase: post_profile
+    task: diagnosis
+    question: Cube utilization is low despite expensive expert matmuls; how should compute underutilization be separated from memory stalls?
+    findings:
+      - category: compute
+        label: compute_underutilization
+        confidence: high
+    expected_any: [kg:diagnostic:kernelwiki-compute-underutilization, kg:diagnostic:triton-ascend-profile-bottleneck-routing]
+  - id: fused_moe.plateau
+    definition_id: ks_fused_moe_e8_k2_h128_i64
+    scenario: plateau
+    phase: plateau
+    task: next_experiment
+    question: The routed expert pipeline has plateaued; which producer-consumer fusion should remove one more global tensor round trip?
+    expected_any:
+      - kg:method:kernelwiki-kernel-fusion
+      - kg:method:kernelwiki-epilogue-fusion
+      - kg:method:cannbot-topk-temp-buffer-merge
+      - kg:method:cannbot-topk-tile-sort-merge
+
+  - id: causal_sdpa.initial
+    definition_id: ks_causal_sdpa_t83_h8_d64
+    scenario: initial
+    phase: initial
+    task: implementation
+    question: How should causal QK tiles update the running maximum, denominator and PV accumulator with online softmax?
+    expected_any: [kg:method:triton-ascend-online-attention-softmax, kg:method:cannbot-attention-online-softmax]
+    forbidden_direct: [kg:method:cannbot-topk-tile-sort-merge]
+  - id: causal_sdpa.constraint
+    definition_id: ks_causal_sdpa_t83_h8_d64
+    scenario: constraint
+    phase: initial
+    task: constraint_check
+    question: Which mask and boundary mechanism should causal attention loads use without mixing block-pointer boundary_check with mask and other?
+    expected_any: [kg:reference:triton-ascend-load-boundary-contract, kg:reference:agent-triton-load-store-mask-responsibility]
+  - id: causal_sdpa.post_error
+    definition_id: ks_causal_sdpa_t83_h8_d64
+    scenario: post_error
+    phase: post_error
+    task: diagnosis
+    question: A causal attention kernel fails around a data-dependent store mask after tiled softmax; how should the discrete store failure be diagnosed?
+    errors: [Triton Ascend lowering failed for a discrete store mask]
+    expected_any: [kg:diagnostic:triton-ascend-discrete-store-mask]
+  - id: causal_sdpa.post_profile
+    definition_id: ks_causal_sdpa_t83_h8_d64
+    scenario: post_profile
+    phase: post_profile
+    task: diagnosis
+    question: Profiling causal attention shows mixed Cube, Vector and MTE stalls; how should the measured engine bottleneck route the next optimization?
+    findings:
+      - category: pipeline
+        label: mixed_engine_stalls
+        confidence: high
+    expected_any: [kg:diagnostic:triton-ascend-profile-bottleneck-routing]
+  - id: causal_sdpa.plateau
+    definition_id: ks_causal_sdpa_t83_h8_d64
+    scenario: plateau
+    phase: plateau
+    task: next_experiment
+    question: Attention plateaued with repeated score-tile passes; should running max, sum and output be updated together per tile?
+    expected_any: [kg:method:cannbot-attention-online-softmax, kg:method:triton-ascend-online-attention-softmax]
+
+  - id: encoder_attention.initial
+    definition_id: ks_mm_encoder_attention_h8_d64_kv8
+    scenario: initial
+    phase: initial
+    task: implementation
+    question: How should encoder QK-softmax-PV use online softmax state while iterating over key-value tiles?
+    expected_any: [kg:method:triton-ascend-online-attention-softmax, kg:method:cannbot-attention-online-softmax]
+    forbidden_direct: [kg:method:cannbot-topk-tile-sort-merge]
+  - id: encoder_attention.constraint
+    definition_id: ks_mm_encoder_attention_h8_d64_kv8
+    scenario: constraint
+    phase: initial
+    task: constraint_check
+    question: Which Cube transfer alignment and layout constraints should guide fp16 attention matmul tile selection?
+    expected_any: [kg:method:cannbot-matmul-ascend-tile-alignment]
+  - id: encoder_attention.post_error
+    definition_id: ks_mm_encoder_attention_h8_d64_kv8
+    scenario: post_error
+    phase: post_error
+    task: diagnosis
+    question: Encoder attention passes compilation but fails fp16 tolerance after QK softmax and PV; how should the precision error be isolated?
+    errors: [Output mismatch after QK softmax and PV contraction]
+    expected_any: [kg:diagnostic:triton-ascend-precision-comparison]
+  - id: encoder_attention.post_profile
+    definition_id: ks_mm_encoder_attention_h8_d64_kv8
+    scenario: post_profile
+    phase: post_profile
+    task: diagnosis
+    question: Profiling shows many undersized tl.dot tiles and dot issue latency; should outer-loop dot tiles be merged?
+    findings:
+      - category: compute
+        label: latency_bound_dot
+        confidence: high
+    expected_any: [kg:method:cannbot-latency-bound-dot-tile-merge]
+  - id: encoder_attention.plateau
+    definition_id: ks_mm_encoder_attention_h8_d64_kv8
+    scenario: plateau
+    phase: plateau
+    task: next_experiment
+    question: Encoder attention plateaued after tiling; can lightweight output post-processing be fused into the tiled producer epilogue?
+    expected_any: [kg:method:kernelwiki-epilogue-fusion, kg:method:triton-ascend-matmul-k-loop-epilogue]
+
+  - id: splade.initial
+    definition_id: ks_splade_pool_max
+    scenario: initial
+    phase: initial
+    task: implementation
+    question: How should SPLADE LayerNorm compute FP32 mean and variance statistics before sparse projection and max pooling?
+    expected_any: [kg:method:triton-ascend-layernorm-fp32-statistics]
+    expected_first: kg:method:triton-ascend-layernorm-fp32-statistics
+    forbidden_direct: [kg:method:triton-ascend-online-attention-softmax]
+  - id: splade.constraint
+    definition_id: ks_splade_pool_max
+    scenario: constraint
+    phase: initial
+    task: constraint_check
+    question: What fp32 activation dtype support applies before SPLADE log1p ReLU projection and segment max pooling?
+    expected_any: [kg:reference:triton-ascend-exp-sigmoid-dtype-support]
+  - id: splade.post_error
+    definition_id: ks_splade_pool_max
+    scenario: post_error
+    phase: post_error
+    task: diagnosis
+    question: SPLADE projection, LayerNorm temporaries and vocabulary reduction exceed UB in one program; how should the overflow be reduced?
+    errors: [UB overflow in SPLADE projection and segment max kernel]
+    expected_any: [kg:diagnostic:triton-ascend-ub-overflow, kg:diagnostic:cannbot-ub-live-set-accounting]
+  - id: splade.post_profile
+    definition_id: ks_splade_pool_max
+    scenario: post_profile
+    phase: post_profile
+    task: next_experiment
+    question: Profiling shows repeated passes over the same SPLADE rows for mean, variance and max; which compatible reduction passes can be merged?
+    findings:
+      - category: memory
+        label: repeated_reduction_passes
+        confidence: high
+    expected_any: [kg:method:cannbot-reduction-pass-merge]
+  - id: splade.plateau
+    definition_id: ks_splade_pool_max
+    scenario: plateau
+    phase: plateau
+    task: next_experiment
+    question: SPLADE plateaued on intermediate tensors between projection, activation, LayerNorm and pooling; which kernel fusion removes global round trips?
+    expected_any: [kg:method:kernelwiki-kernel-fusion, kg:method:cannbot-reduction-pass-merge]
+
+  - id: rope.initial
+    definition_id: ks_music_flamingo_rope_d64_s256
+    scenario: initial
+    phase: initial
+    task: implementation
+    question: How should contiguous RoPE phase, sine and cosine values be vectorized along the stride-one axis?
+    expected_any: [kg:method:kernelwiki-vectorized-loads, kg:method:triton-ascend-contiguous-axis-vectorization]
+    forbidden_direct: [kg:method:cannbot-matmul-ascend-tile-alignment]
+  - id: rope.constraint
+    definition_id: ks_music_flamingo_rope_d64_s256
+    scenario: constraint
+    phase: initial
+    task: constraint_check
+    question: Which runtime stride precondition must hold before RoPE uses linear contiguous offsets?
+    expected_any: [kg:reference:agent-contiguous-input-precondition]
+  - id: rope.post_error
+    definition_id: ks_music_flamingo_rope_d64_s256
+    scenario: post_error
+    phase: post_error
+    task: diagnosis
+    question: RoPE compilation fails because tl.arange and reshape dimensions are not constexpr; how should the shape parameter be fixed?
+    errors: [Shape operation requires a constexpr parameter]
+    expected_any: [kg:diagnostic:agent-constexpr-shape-parameter]
+  - id: rope.post_profile
+    definition_id: ks_music_flamingo_rope_d64_s256
+    scenario: post_profile
+    phase: post_profile
+    task: implementation
+    question: Profiling shows scalar element loops for independent sine and cosine lanes; how should they become tl.arange tensor lanes?
+    findings:
+      - category: pipeline
+        label: scalar_element_loops
+        confidence: high
+    expected_any: [kg:method:triton-ascend-vectorize-independent-work]
+  - id: rope.plateau
+    definition_id: ks_music_flamingo_rope_d64_s256
+    scenario: plateau
+    phase: plateau
+    task: next_experiment
+    question: RoPE performance differs across sequence lengths after vectorization; should kernels be split only by materially different shape families?
+    expected_any: [kg:method:cannbot-shape-family-kernel-specialization]
+
+  - id: mhc_post.initial
+    definition_id: ks_mhc_post
+    scenario: initial
+    phase: initial
+    task: architecture_selection
+    question: How should contiguous dimensions around einsum head mixing and layout conversion be merged before tiling?
+    expected_any: [kg:method:triton-ascend-contiguous-dimension-merge]
+    forbidden_direct: [kg:method:triton-ascend-online-attention-softmax]
+  - id: mhc_post.constraint
+    definition_id: ks_mhc_post
+    scenario: constraint
+    phase: initial
+    task: constraint_check
+    question: Which tensor stride checks are required before the head-mixing kernel assumes contiguous linear loads?
+    expected_any: [kg:reference:agent-contiguous-input-precondition]
+  - id: mhc_post.post_error
+    definition_id: ks_mhc_post
+    scenario: post_error
+    phase: post_error
+    task: diagnosis
+    question: The bfloat16-to-float conversion path introduces a numerical mismatch after head recombination; how should the failing operation be isolated?
+    errors: [Precision mismatch after type conversion and head recombination]
+    expected_any: [kg:diagnostic:triton-ascend-precision-operation-isolation]
+  - id: mhc_post.post_profile
+    definition_id: ks_mhc_post
+    scenario: post_profile
+    phase: post_profile
+    task: implementation
+    question: Profiling shows scalar loops over independent head-mixing outputs; how should elementwise work be vectorized?
+    findings:
+      - category: pipeline
+        label: scalar_element_loops
+        confidence: high
+    expected_any: [kg:method:triton-ascend-vectorize-independent-work]
+  - id: mhc_post.plateau
+    definition_id: ks_mhc_post
+    scenario: plateau
+    phase: plateau
+    task: next_experiment
+    question: Head mixing plateaued on intermediate layout and cast tensors; which producer-consumer kernel fusion should remove them?
+    expected_any: [kg:method:kernelwiki-kernel-fusion]
+
+  - id: sinkhorn.initial
+    definition_id: ks_hc_split_sinkhorn_hc4_iter20
+    scenario: initial
+    phase: initial
+    task: architecture_selection
+    question: How should contiguous head and normalization dimensions be merged before tiling iterative Sinkhorn reductions?
+    expected_any: [kg:method:triton-ascend-contiguous-dimension-merge]
+    forbidden_direct: [kg:method:cannbot-topk-tile-sort-merge]
+  - id: sinkhorn.constraint
+    definition_id: ks_hc_split_sinkhorn_hc4_iter20
+    scenario: constraint
+    phase: initial
+    task: constraint_check
+    question: How must Triton 3.2 control reduction accumulation when tl.sum has no dtype parameter?
+    expected_any: [kg:reference:triton-ascend-sum-dtype-contract]
+  - id: sinkhorn.post_error
+    definition_id: ks_hc_split_sinkhorn_hc4_iter20
+    scenario: post_error
+    phase: post_error
+    task: diagnosis
+    question: Twenty Sinkhorn iterations keep normalization intermediates live and overflow UB; how should the logical tile be split?
+    errors: [UB overflow in iterative Sinkhorn normalization]
+    expected_any: [kg:diagnostic:triton-ascend-ub-overflow, kg:method:agent-ascend-ub-subblock-split]
+  - id: sinkhorn.post_profile
+    definition_id: ks_hc_split_sinkhorn_hc4_iter20
+    scenario: post_profile
+    phase: post_profile
+    task: next_experiment
+    question: Profiling shows multiple compatible normalization reductions rereading the same row; which reduction passes should be merged?
+    findings:
+      - category: memory
+        label: repeated_reduction_passes
+        confidence: high
+    expected_any: [kg:method:cannbot-reduction-pass-merge]
+  - id: sinkhorn.plateau
+    definition_id: ks_hc_split_sinkhorn_hc4_iter20
+    scenario: plateau
+    phase: plateau
+    task: next_experiment
+    question: Sinkhorn plateaued after tiling; can an adaptive row loop be eliminated when one UB-safe tile covers a complete normalization row?
+    expected_any: [kg:method:cannbot-adaptive-loop-elimination]
+
+  - id: centre_augmentation.initial
+    definition_id: ks_centre_random_augmentation_s4
+    scenario: initial
+    phase: initial
+    task: implementation
+    question: How should contiguous point coordinates be loaded and vectorized for centering, rotation and translation?
+    expected_any: [kg:method:kernelwiki-vectorized-loads, kg:method:triton-ascend-contiguous-axis-vectorization]
+    forbidden_direct: [kg:method:triton-ascend-online-attention-softmax]
+  - id: centre_augmentation.constraint
+    definition_id: ks_centre_random_augmentation_s4
+    scenario: constraint
+    phase: initial
+    task: constraint_check
+    question: Which separate input-validity and output-ownership masks must geometric augmentation use for padded points?
+    expected_any: [kg:reference:agent-triton-load-store-mask-responsibility]
+  - id: centre_augmentation.post_error
+    definition_id: ks_centre_random_augmentation_s4
+    scenario: post_error
+    phase: post_error
+    task: diagnosis
+    question: Random augmentation fails when a data-dependent valid-point predicate is used as a discrete store mask; how should it be diagnosed?
+    errors: [Discrete store mask lowering failure for valid random samples]
+    expected_any: [kg:diagnostic:triton-ascend-discrete-store-mask]
+  - id: centre_augmentation.post_profile
+    definition_id: ks_centre_random_augmentation_s4
+    scenario: post_profile
+    phase: post_profile
+    task: diagnosis
+    question: Profiling shows coordinate loads dominate rotation arithmetic; how should a bandwidth-bound dataflow be recognized before compute tuning?
+    findings:
+      - category: memory
+        label: memory_bandwidth
+        confidence: high
+    expected_any: [kg:diagnostic:kernelwiki-memory-bound-routing, kg:diagnostic:triton-ascend-profile-bottleneck-routing]
+  - id: centre_augmentation.plateau
+    definition_id: ks_centre_random_augmentation_s4
+    scenario: plateau
+    phase: plateau
+    task: next_experiment
+    question: Augmentation performance differs by point count after vectorization; should only materially different shape families receive specialized kernels?
+    expected_any: [kg:method:cannbot-shape-family-kernel-specialization]
+
+  - id: head_mix_backward.initial
+    definition_id: ks_head_compute_mix_bwd_m4
+    scenario: initial
+    phase: initial
+    task: architecture_selection
+    question: Which fp32 sigmoid activation support applies to affine head-mixing backward computation?
+    expected_any: [kg:reference:triton-ascend-exp-sigmoid-dtype-support]
+    forbidden_direct: [kg:method:cannbot-topk-tile-sort-merge]
+  - id: head_mix_backward.constraint
+    definition_id: ks_head_compute_mix_bwd_m4
+    scenario: constraint
+    phase: initial
+    task: constraint_check
+    question: How must gradient reduction control accumulation when Triton 3.2 tl.sum exposes no dtype argument?
+    expected_any: [kg:reference:triton-ascend-sum-dtype-contract]
+  - id: head_mix_backward.post_error
+    definition_id: ks_head_compute_mix_bwd_m4
+    scenario: post_error
+    phase: post_error
+    task: diagnosis
+    question: Head-mixing gradients fail numerical tolerance after sigmoid derivative and parameter reduction; how should dtype-specific comparison diagnose the mismatch?
+    errors: [Gradient output mismatch after sigmoid derivative reduction]
+    expected_any: [kg:diagnostic:triton-ascend-precision-comparison]
+  - id: head_mix_backward.post_profile
+    definition_id: ks_head_compute_mix_bwd_m4
+    scenario: post_profile
+    phase: post_profile
+    task: next_experiment
+    question: Profiling shows elementwise sigmoid-gradient work and parameter reduction traverse the same data separately; how should they be fused?
+    findings:
+      - category: memory
+        label: repeated_elementwise_reduction_passes
+        confidence: high
+    expected_any: [kg:method:cannbot-reduction-elementwise-fusion]
+  - id: head_mix_backward.plateau
+    definition_id: ks_head_compute_mix_bwd_m4
+    scenario: plateau
+    phase: plateau
+    task: next_experiment
+    question: Backward performance plateaued with separate gradient statistics; which compatible reduction passes can be merged?
+    expected_any: [kg:method:cannbot-reduction-pass-merge]
+source_cases:
+  - id: triton_ascend.chinese_matmul
+    query: 昇腾 Triton 矩阵乘法 tl.dot 分块 K 循环 epilogue 优化
+    package_ids: [source:triton-ascend]
+    expected_any_paths:
+      - docs/zh/examples/05_matrix_multiplication_example.md
+      - docs/zh/triton_api/Linear_Algebra_Ops/dot.md
+    expected_first_path: docs/zh/examples/05_matrix_multiplication_example.md
+    required_hit: true
+    forbidden_paths:
+      - python/triton/language/standard.py
+  - id: musa.reviewed_s5000_occupancy
+    query: MUSA S5000 occupancy register shared memory resource tradeoff
+    package_ids: [source:musa-sdk-5.2.0]
+    expected_any_paths: [reviewed/performance-tuning.md]
+    expected_first_path: reviewed/performance-tuning.md
+    required_hit: true
+  - id: musa.raw_compute_optimization
+    query: MUSA 计算优化 占用率 线程束分化
+    package_ids: [source:musa-sdk-5.2.0]
+    include_source_only: true
+    expected_any_paths: [raw/compute_optimization.html]
+    expected_first_path: raw/compute_optimization.html
+    required_hit: true
+  - id: musa.raw_flash_attention
+    query: MUSA FlashAttention 优化 在线 Softmax
+    package_ids: [source:musa-sdk-5.2.0]
+    include_source_only: true
+    expected_any_paths: [raw/flash_attention_optimization.html]
+    expected_first_path: raw/flash_attention_optimization.html
+    required_hit: true
+  - id: musa.raw_gemm_gemv
+    query: MUSA GEMM GEMV 优化 共享内存
+    package_ids: [source:musa-sdk-5.2.0]
+    include_source_only: true
+    expected_any_paths: [raw/gemm_gemv_optimization.html]
+    expected_first_path: raw/gemm_gemv_optimization.html
+    required_hit: true
+  - id: musa.raw_memory_optimization
+    query: MUSA 内存优化 全局内存合并访问 向量化
+    package_ids: [source:musa-sdk-5.2.0]
+    include_source_only: true
+    expected_any_paths: [raw/memory_optimization.html]
+    expected_first_path: raw/memory_optimization.html
+    required_hit: true
+  - id: musa.raw_reduction_optimization
+    query: MUSA 归约算法原理 两阶段归约 分治 线程束洗牌
+    package_ids: [source:musa-sdk-5.2.0]
+    include_source_only: true
+    expected_any_paths: [raw/reduction_optimization.html]
+    expected_first_path: raw/reduction_optimization.html
+    required_hit: true
+  - id: asight.reviewed_metric_scope
+    query: Asight Compute acu section metric kernel replay warp stall
+    package_ids: [source:t-head-ppu-docs]
+    expected_any_paths: [reviewed/asight-compute.md]
+    expected_first_path: reviewed/asight-compute.md
+    required_hit: true
+  - id: asight.raw_chapter
+    query: Asight Compute ACU metric section kernel replay
+    package_ids: [source:t-head-ppu-docs]
+    include_source_only: true
+    expected_any_paths: [raw/chapter-166-content.json]
+    required_hit: true
+  - id: triton_ascend.multi_intent_reduction_quantization
+    query: Ascend triton tl.sum reduction over axis and round half to even quantization
+    expected_any_paths:
+      - plugins-official/triton-op-generator/template/quantization.md
+    required_hit: true
+  - id: triton_ascend.atomic_add_api
+    query: Ascend Triton tl.atomic_add atomic add optimization
+    package_ids: [source:triton-ascend]
+    expected_any_paths: [docs/zh/triton_api/Atomic_Ops/atomic_add.md]
+    required_hit: true
+  - id: triton_ascend.profiling_guide
+    query: Triton Ascend profiling guide msprof trace kernel performance analysis
+    package_ids: [source:triton-ascend]
+    expected_any_paths:
+      - docs/en/debug_guide/profiling.md
+      - docs/zh/debug_guide/profiling.md
+    expected_first_path: docs/en/debug_guide/profiling.md
+    required_hit: true
+  - id: triton_ascend.dot_lowering_cpp
+    query: Ascend Triton dot matmul lowering to linalg cube MAC
+    package_ids: [source:triton-ascend]
+    path_globs: ["**/*.cpp"]
+    expected_any_paths:
+      - third_party/ascend/lib/TritonToLinalg/TritonOpConverter.cpp
+    expected_first_path: third_party/ascend/lib/TritonToLinalg/TritonOpConverter.cpp
+    required_hit: true

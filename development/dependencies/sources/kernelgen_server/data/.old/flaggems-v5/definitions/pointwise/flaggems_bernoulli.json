@@ -1,0 +1,15 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems_bernoulli",
+  "description": "Extracted from FlagGems bernoulli. Draws binary (0/1) samples from a Bernoulli distribution with per-element probabilities given by the input tensor (values in [0,1)). Output is stochastic.",
+  "inputs": [
+    "input"
+  ],
+  "outputs": [
+    "output"
+  ],
+  "reference": "import torch\n\n_DTYPES = {\n    \"float16\": torch.float16,\n    \"float32\": torch.float32,\n    \"float64\": torch.float64,\n    \"bfloat16\": torch.bfloat16,\n}\n\n\ndef _to_dtype(name):\n    if isinstance(name, torch.dtype):\n        return name\n    return _DTYPES.get(str(name), torch.float32)\n\n\ndef gen_inputs(ctx, device):\n    # Reproduce the pytest/benchmark input distribution exactly:\n    # torch.rand(shape, dtype) -> uniform [0,1) probabilities for bernoulli.\n    shape = ctx[\"input__shape\"]\n    dtype = _to_dtype(ctx[\"input__dtype\"])\n    return {\"input\": torch.rand(shape, dtype=dtype, device=device)}\n\n\ndef valid(ref_outputs, sol_outputs, inputs, ctx):\n    # Stochastic op: cannot compare elementwise. Mirror the pytest checks:\n    # (1) all outputs are 0 or 1; (2) output mean approximates input-probability mean.\n    sol = sol_outputs[0].detach().to(\"cpu\").float()\n    is01 = bool(((sol == 0) | (sol == 1)).all().item())\n    if not is01:\n        return {\"passed\": False, \"message\": \"output contains values other than 0 or 1\", \"metrics\": {}}\n    inp = inputs[0].detach().to(\"cpu\").float()\n    expected_mean = inp.mean().item()\n    actual_mean = sol.mean().item()\n    ok = abs(actual_mean - expected_mean) < 0.1\n    return {\n        \"passed\": bool(ok),\n        \"message\": \"\" if ok else f\"mean {actual_mean} vs expected {expected_mean}\",\n        \"metrics\": {\"expected_mean\": expected_mean, \"actual_mean\": actual_mean},\n    }\n\n\ndef run(input):\n    return torch.bernoulli(input)\n",
+  "reference_device": "target",
+  "custom_inputs_entrypoint": "gen_inputs",
+  "custom_valid_entrypoint": "valid"
+}

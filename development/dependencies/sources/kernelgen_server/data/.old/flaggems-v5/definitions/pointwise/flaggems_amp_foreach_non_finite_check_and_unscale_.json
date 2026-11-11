@@ -1,0 +1,18 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems_amp_foreach_non_finite_check_and_unscale_",
+  "description": "Extracted from FlagGems _amp_foreach_non_finite_check_and_unscale_. In-place: each tensor in the list is multiplied by inv_scale; found_inf is set to 1.0 if any tensor contains a non-finite value. inv_scale and found_inf are float32 scalar tensors.",
+  "inputs": [
+    "tensors",
+    "found_inf",
+    "inv_scale"
+  ],
+  "outputs": [
+    "tensors",
+    "found_inf"
+  ],
+  "reference": "import torch\n\n\ndef run(tensors, found_inf, inv_scale):\n    torch._amp_foreach_non_finite_check_and_unscale_(tensors, found_inf, inv_scale)\n    return tensors, found_inf\n\n\ndef gen_inputs(ctx, device):\n    import torch\n\n    t_shapes = ctx[\"tensors__shape\"]\n    t_dtype = getattr(torch, ctx[\"tensors__dtype\"])\n    special = all(len(s) == 1 for s in t_shapes)\n    tensors = []\n    if special:\n        # first tensor carries an inf, second carries a nan\n        tensors.append(\n            torch.tensor([1.0, 2.0, float(\"inf\"), 4.0], device=device, dtype=t_dtype)\n        )\n        tensors.append(\n            torch.tensor([5.0, 6.0, float(\"nan\"), 8.0], device=device, dtype=t_dtype)\n        )\n    else:\n        for s in t_shapes:\n            tensors.append(torch.randn(tuple(s), device=device, dtype=t_dtype))\n    found_inf = torch.tensor(0.0, device=device, dtype=torch.float32)\n    inv_scale = torch.tensor(2.0, device=device, dtype=torch.float32)\n    return {\"tensors\": tensors, \"found_inf\": found_inf, \"inv_scale\": inv_scale}\n\n\n\ndef _flatten(value):\n    if isinstance(value, (list, tuple)):\n        leaves = []\n        for item in value:\n            leaves.extend(_flatten(item))\n        return leaves\n    return [value]\n\n\ndef valid(ref_outputs, sol_outputs, inputs, ctx):\n    import torch\n\n    ref_leaves = _flatten(ref_outputs)\n    sol_leaves = _flatten(sol_outputs)\n    if len(ref_leaves) != len(sol_leaves):\n        return {\"passed\": False, \"message\": \"leaf count mismatch\", \"metrics\": {}}\n    for r, s in zip(ref_leaves, sol_leaves):\n        r = r.detach().to(\"cpu\").to(torch.float64)\n        s = s.detach().to(\"cpu\").to(torch.float64)\n        if r.shape != s.shape:\n            return {\n                \"passed\": False,\n                \"message\": f\"shape {s.shape} vs {r.shape}\",\n                \"metrics\": {},\n            }\n        both_nan = torch.isnan(r) & torch.isnan(s)\n        both_posinf = torch.isposinf(r) & torch.isposinf(s)\n        both_neginf = torch.isneginf(r) & torch.isneginf(s)\n        finite = torch.isfinite(r) & torch.isfinite(s)\n        close = torch.zeros_like(r, dtype=torch.bool)\n        close[finite] = (\n            (r[finite] - s[finite]).abs() <= 1e-2 + 1e-2 * r[finite].abs()\n        )\n        if not (close | both_nan | both_posinf | both_neginf).all().item():\n            return {\"passed\": False, \"message\": \"value mismatch\", \"metrics\": {}}\n    return {\"passed\": True, \"message\": \"\", \"metrics\": {}}\n",
+  "reference_device": "target",
+  "custom_inputs_entrypoint": "gen_inputs",
+  "custom_valid_entrypoint": "valid"
+}

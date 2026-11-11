@@ -1,0 +1,23 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems_scaled_dot_product_attention_backward",
+  "description": "Faithfully extracted from tests/test_scaled_dot_product_attention.py::test_scaled_dot_product_attention_legacy_backward. Q/K/V use make_input's uniform(-0.05, 0.05), and the reference obtains dQ/dK/dV through the same PyTorch SDPA forward/autograd data flow. No source benchmark exists.",
+  "inputs": [
+    "grad_output",
+    "query",
+    "key",
+    "value",
+    "scale",
+    "is_causal",
+    "enable_gqa"
+  ],
+  "outputs": [
+    "grad_query",
+    "grad_key",
+    "grad_value"
+  ],
+  "reference": "import torch\nimport torch.nn.functional as F\n\n\ndef gen_inputs(ctx, device):\n    torch.manual_seed(1234567890)\n    result = {}\n    for name in (\"query\", \"key\", \"value\"):\n        shape = tuple(ctx[f\"{name}__shape\"])\n        dtype = getattr(torch, ctx[f\"{name}__dtype\"])\n        result[name] = torch.empty(shape, dtype=dtype, device=device).uniform_(-0.05, 0.05).requires_grad_()\n    grad_shape = tuple(ctx[\"grad_output__shape\"])\n    grad_dtype = getattr(torch, ctx[\"grad_output__dtype\"])\n    result[\"grad_output\"] = torch.randn(grad_shape, dtype=grad_dtype, device=device)\n    return result\n\n\ndef run(grad_output, query, key, value, scale, is_causal, enable_gqa):\n    q = query.detach().requires_grad_(True)\n    k = key.detach().requires_grad_(True)\n    v = value.detach().requires_grad_(True)\n    output = F.scaled_dot_product_attention(\n        q,\n        k,\n        v,\n        attn_mask=None,\n        dropout_p=0.0,\n        is_causal=is_causal,\n        scale=scale,\n        enable_gqa=enable_gqa,\n    )\n    return torch.autograd.grad(output, (q, k, v), grad_outputs=grad_output)\n\n\ndef _assert_close_equal_nan(actual, expected, rtol, atol):\n    try:\n        torch.testing.assert_close(\n            actual,\n            expected.to(actual.dtype),\n            rtol=rtol,\n            atol=atol,\n            equal_nan=True,\n        )\n        return \"\"\n    except AssertionError as exc:\n        return str(exc)\n\n\ndef valid(ref_outputs, sol_outputs, inputs, ctx):\n    if len(ref_outputs) != 3 or len(sol_outputs) != 3:\n        return {\"passed\": False, \"message\": \"expected dQ, dK, dV\", \"metrics\": {}}\n    dtype_name = ctx[\"query__dtype\"]\n    rtol = {\n        \"float16\": 1e-3,\n        \"bfloat16\": 0.016,\n        \"float32\": 1.3e-6,\n        \"float64\": 1e-7,\n    }.get(dtype_name, 1.3e-6)\n    for index, label in ((0, \"dQ\"), (1, \"dK\")):\n        message = _assert_close_equal_nan(sol_outputs[index], ref_outputs[index], rtol, 1e-4)\n        if message:\n            return {\"passed\": False, \"message\": f\"{label}: {message}\", \"metrics\": {}}\n    is_gqa = bool(ctx[\"enable_gqa\"]) and inputs[1].shape[1] != inputs[2].shape[1]\n    if is_gqa:\n        v_atol = 2e-2 if dtype_name == \"bfloat16\" else 4e-3 if dtype_name == \"float16\" else 5e-4\n    else:\n        v_atol = 5e-3 if dtype_name == \"bfloat16\" else 2e-3 if dtype_name == \"float16\" else 3e-4\n    message = _assert_close_equal_nan(sol_outputs[2], ref_outputs[2], rtol, v_atol)\n    if message:\n        return {\"passed\": False, \"message\": f\"dV: {message}\", \"metrics\": {}}\n    return {\"passed\": True, \"message\": \"\", \"metrics\": {}}\n",
+  "reference_device": "target",
+  "custom_inputs_entrypoint": "gen_inputs",
+  "custom_valid_entrypoint": "valid"
+}

@@ -1,0 +1,19 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems_weight_int4pack_mm_with_scales_and_zeros",
+  "description": "Groupwise int4 asymmetric weight-only quantized GEMM (XPU _weight_int4pack_mm_with_scales_and_zeros semantics): out[m,n] = sum_k self[m,k] * qScale[k/gs,n] * (w_int4[k,n] - qZeros[k/gs,n]) where mat2 is the int32-packed int4 weight of shape [N, K/8] and qScale/qZeros have shape [K/gs, N].",
+  "inputs": [
+    "self",
+    "mat2",
+    "qGroupSize",
+    "qScale",
+    "qZeros"
+  ],
+  "outputs": [
+    "output"
+  ],
+  "reference": "import torch\n\ndef gen_inputs(ctx, device):\n    m, k = ctx['self__shape']\n    n, kpack = ctx['mat2__shape']\n    gs = ctx['qGroupSize']\n    self_dtype = getattr(torch, ctx['self__dtype'])\n    scale_dtype = getattr(torch, ctx['qScale__dtype'])\n    # random uint4 weight values 0..15\n    w = torch.randint(0, 16, (n, k), device=device)\n    # pack 2 consecutive k-values per byte, then 4 bytes per int32 (little-endian)\n    packed = (w[:, 1::2] << 4 | w[:, ::2]).to(torch.uint8)\n    mat2 = packed.view(torch.int32)\n    act = torch.randn(m, k, dtype=self_dtype, device=device) * 0.5\n    ngroups = k // gs\n    # realistic positive groupwise scales in [0.01, 0.03]\n    scale = torch.rand(ngroups, n, dtype=scale_dtype, device=device) * 0.02 + 0.01\n    zeros = torch.randint(0, 16, (ngroups, n), dtype=torch.int8, device=device)\n    return {'self': act, 'mat2': mat2, 'qScale': scale, 'qZeros': zeros}\n\ndef run(self, mat2, qGroupSize, qScale, qZeros):\n    n = mat2.shape[0]\n    k = self.shape[1]\n    gs = qGroupSize\n    shifts = torch.arange(4, dtype=torch.int64, device=mat2.device) * 8\n    bytes_ = (mat2[..., None].to(torch.int64) >> shifts) & 0xFF\n    w_even = bytes_ & 0xF\n    w_odd = (bytes_ >> 4) & 0xF\n    w = torch.stack((w_even, w_odd), dim=-1).reshape(n, k).float()\n    scale = qScale.repeat_interleave(gs, dim=0).float()\n    zero = qZeros.repeat_interleave(gs, dim=0).float()\n    dequant = (w - zero.t()) * scale.t()\n    out = torch.matmul(self.float(), dequant.t())\n    return out.to(self.dtype)\n\ndef run_correctness(self, mat2, qGroupSize, qScale, qZeros):\n    n = mat2.shape[0]\n    k = self.shape[1]\n    gs = qGroupSize\n    shifts = torch.arange(4, dtype=torch.int64, device=mat2.device) * 8\n    bytes_ = (mat2[..., None].to(torch.int64) >> shifts) & 0xFF\n    w_even = bytes_ & 0xF\n    w_odd = (bytes_ >> 4) & 0xF\n    w = torch.stack((w_even, w_odd), dim=-1).reshape(n, k).to(torch.float64)\n    scale = qScale.to(torch.float64).repeat_interleave(gs, dim=0)\n    zero = qZeros.to(torch.float64).repeat_interleave(gs, dim=0)\n    dequant = (w - zero.t()) * scale.t()\n    out = torch.matmul(self.to(torch.float64), dequant.t())\n    return out.to(self.dtype)\n",
+  "reference_device": "target",
+  "correctness_reference_entrypoint": "run_correctness",
+  "custom_inputs_entrypoint": "gen_inputs"
+}

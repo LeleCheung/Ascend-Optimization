@@ -1,0 +1,17 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems_softmax",
+  "description": "torch.nn.functional.softmax along a given dim. Extracted from FlagGems tests/test_softmax.py (test_softmax) with reference-only float64 upcast (to_reference(..., upcast=True)) and NaN/Inf-tolerant comparison (equal_nan=True). The neg_inf source variant replaces negative inputs with -inf, which can make softmax produce NaN, so a custom NaN/Inf-tolerant validator mirrors gems_assert_close(..., equal_nan=True).",
+  "inputs": [
+    "x",
+    "dim"
+  ],
+  "outputs": [
+    "output"
+  ],
+  "reference": "import torch\n\n\ndef run_correctness(x, dim):\n    output = torch.nn.functional.softmax(x.float(), dim=dim)\n    return output.to(x.dtype)\n\n\ndef run(x, dim):\n    return torch.nn.functional.softmax(x, dim=dim)\n\n\ndef gen_inputs(ctx, device):\n    dtype = getattr(torch, ctx[\"x__dtype\"])\n    shape = tuple(ctx[\"x__shape\"])\n    x = torch.randn(shape, dtype=dtype, device=device)\n    x = torch.where(x < 0.0, float(\"-inf\"), x)\n    return {\"x\": x}\n\n\ndef valid(ref_outputs, sol_outputs, inputs, ctx):\n    ref = ref_outputs[0].detach().to(\"cpu\").to(torch.float64)\n    sol = sol_outputs[0].detach().to(\"cpu\").to(torch.float64)\n    if ref.shape != sol.shape:\n        return {\"passed\": False, \"message\": f\"shape {tuple(sol.shape)} vs {tuple(ref.shape)}\"}\n    sol_dtype = sol_outputs[0].dtype\n    rtol_map = {torch.float16: 1e-3, torch.float32: 1.3e-6, torch.bfloat16: 1e-2}\n    rtol = rtol_map.get(sol_dtype, 1e-3)\n    atol = 1e-4\n    both_nan = torch.isnan(ref) & torch.isnan(sol)\n    both_posinf = torch.isposinf(ref) & torch.isposinf(sol)\n    both_neginf = torch.isneginf(ref) & torch.isneginf(sol)\n    finite = torch.isfinite(ref) & torch.isfinite(sol)\n    close = torch.zeros_like(ref, dtype=torch.bool)\n    if finite.any():\n        close[finite] = (ref[finite] - sol[finite]).abs() <= atol + rtol * ref[finite].abs()\n    ok = (close | both_nan | both_posinf | both_neginf).all().item()\n    return {\"passed\": bool(ok), \"message\": \"\", \"metrics\": {}}\n",
+  "reference_device": "target",
+  "custom_inputs_entrypoint": "gen_inputs",
+  "custom_valid_entrypoint": "valid",
+  "correctness_reference_entrypoint": "run_correctness"
+}

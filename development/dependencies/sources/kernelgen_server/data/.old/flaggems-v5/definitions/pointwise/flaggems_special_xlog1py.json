@@ -1,0 +1,17 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems_special_xlog1py",
+  "description": "Extracted from FlagGems special_xlog1py (aten.special_xlog1py = x * log1p(y)). Binary pointwise. Reference upcasts inputs to float64 (to_reference(..., upcast=True)). Main test draws randn inputs with the second operand clamped to min=-1+1e-6 to stay in domain; boundary tests cover x==0 (=>0) and y==NaN (=>NaN).",
+  "inputs": [
+    "x",
+    "y"
+  ],
+  "outputs": [
+    "output"
+  ],
+  "reference": "import torch\n\n\ndef run_correctness(x, y):\n    output = torch.ops.aten.special_xlog1py(x.float(), y.float())\n    return output.to(x.dtype)\n\n\ndef run(x, y):\n    return torch.ops.aten.special_xlog1py(x, y)\n\n\ndef gen_inputs(ctx, device):\n    import torch\n\n    def _to_dtype(s):\n        s = str(s).replace(\"torch.\", \"\")\n        return getattr(torch, s)\n\n    shape = list(ctx[\"x__shape\"])\n    dtype = _to_dtype(ctx[\"x__dtype\"])\n    if shape == [10]:\n        # test_special_xlog1py_x_zero: x == 0, y = linspace(-0.5, 2.0, 10)\n        x = torch.zeros(shape, dtype=dtype, device=device)\n        y = torch.linspace(-0.5, 2.0, 10, dtype=dtype, device=device)\n    elif shape == [13]:\n        # test_special_xlog1py_y_nan: y is NaN => result is NaN\n        x = torch.randn(shape, dtype=dtype, device=device)\n        y = torch.full(shape, float(\"nan\"), dtype=dtype, device=device)\n    else:\n        # test_special_xlog1py: randn inputs, second operand clamped into domain\n        x = torch.randn(shape, dtype=dtype, device=device)\n        y = torch.randn(shape, dtype=dtype, device=device).clamp(min=-1.0 + 1e-6)\n    return {\"x\": x, \"y\": y}\n\n\ndef valid(ref_outputs, sol_outputs, inputs, ctx):\n    import torch\n\n    ref = ref_outputs[0].detach().to(\"cpu\").to(torch.float64)\n    sol = sol_outputs[0].detach().to(\"cpu\").to(torch.float64)\n    if ref.shape != sol.shape:\n        return {\"passed\": False, \"message\": f\"shape {sol.shape} vs {ref.shape}\", \"metrics\": {}}\n    dtype = str(ctx.get(\"x__dtype\", \"float32\")).replace(\"torch.\", \"\")\n    rtol_map = {\"float16\": 1e-3, \"bfloat16\": 1.6e-2, \"float32\": 1.3e-6, \"float64\": 1e-7}\n    rtol = rtol_map.get(dtype, 1e-3)\n    atol = 1e-4\n    both_nan = torch.isnan(ref) & torch.isnan(sol)\n    both_posinf = torch.isposinf(ref) & torch.isposinf(sol)\n    both_neginf = torch.isneginf(ref) & torch.isneginf(sol)\n    finite = torch.isfinite(ref) & torch.isfinite(sol)\n    close = torch.zeros_like(ref, dtype=torch.bool)\n    close[finite] = (ref[finite] - sol[finite]).abs() <= atol + rtol * ref[finite].abs()\n    ok = (close | both_nan | both_posinf | both_neginf).all().item()\n    return {\"passed\": bool(ok), \"message\": \"\", \"metrics\": {}}\n",
+  "reference_device": "target",
+  "custom_inputs_entrypoint": "gen_inputs",
+  "custom_valid_entrypoint": "valid",
+  "correctness_reference_entrypoint": "run_correctness"
+}

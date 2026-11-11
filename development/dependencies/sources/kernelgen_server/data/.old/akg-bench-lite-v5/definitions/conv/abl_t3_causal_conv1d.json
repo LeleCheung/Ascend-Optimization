@@ -1,0 +1,18 @@
+{
+  "api_version": "v5.1",
+  "name": "abl_t3_causal_conv1d",
+  "description": "AKG Bench Lite t3/causal_conv1d",
+  "inputs": [
+    "x",
+    "conv_state",
+    "weight",
+    "bias",
+    "conv_state_indices"
+  ],
+  "outputs": [
+    "output"
+  ],
+  "reference": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\n\n\n\nclass Model(nn.Module):\n    \"\"\"\n    Causal Conv1D for Mamba architecture (PyTorch Reference Implementation).\n    \n    Performs causal 1D convolution with optional SiLU activation.\n    Used in Mamba SSM (State Space Model) for efficient sequence modeling.\n    \n    Formula:\n        x_padded = concat(conv_state, x)\n        out = conv1d(x_padded, weight, bias) + (optional: silu activation)\n        conv_state = x_padded[:, :, -(width-1):]  # update state\n    \"\"\"\n\n    def __init__(self, activation=\"silu\"):\n        super(Model, self).__init__()\n        self.activation = activation\n\n    def forward(self, x, conv_state, weight, bias, conv_state_indices):\n        \"\"\"\n        Args:\n            x: (batch, dim) - input tensor\n            conv_state: (batch, dim, width-1) - convolution state buffer\n            weight: (dim, width) - convolution weights\n            bias: (dim,) - convolution bias\n            conv_state_indices: (batch,) - indices for state selection (ignored in ref)\n        \n        Returns:\n            out: (batch, dim) - output after causal conv1d + activation\n        \"\"\"\n        batch, dim = x.shape\n        width = weight.shape[1]\n        \n        # Expand to 3D: (batch, dim, 1)\n        x_3d = x.unsqueeze(-1)\n        \n        # Concatenate conv_state and x\n        x_padded = torch.cat([conv_state, x_3d], dim=-1).to(weight.dtype)\n        \n        # Grouped convolution\n        out = F.conv1d(x_padded, weight.unsqueeze(1), bias, padding=0, groups=dim)\n        out = out.squeeze(-1)\n        \n        # SiLU activation\n        if self.activation == \"silu\":\n            out = F.silu(out)\n        \n        # Update conv_state (in-place)\n        conv_state.copy_(x_padded[:, :, -(width-1):])\n        \n        return out.to(x.dtype)\n\n\ndef get_inputs():\n    batch = 32\n    dim = 2048\n    width = 4\n    \n    x = torch.randn(batch, dim, dtype=torch.float16)\n    conv_state = torch.randn(batch, dim, width - 1, dtype=torch.float16)\n    weight = torch.randn(dim, width, dtype=torch.float16)\n    bias = torch.randn(dim, dtype=torch.float16)\n    conv_state_indices = torch.arange(batch, dtype=torch.int32)\n    \n    return [x, conv_state, weight, bias, conv_state_indices]\n\n\ndef get_init_inputs():\n    return [\"silu\"]\n\n\ndef run(x, conv_state, weight, bias, conv_state_indices):\n    model = Model('silu')\n    device = x.device\n    model = model.to(device)\n    model.eval()\n    with torch.no_grad():\n        result = model(x, conv_state, weight, bias, conv_state_indices)\n    return result\n\n\ndef _legacy_gen_inputs(axes, device):\n    inputs = get_inputs()\n    result = {}\n    result['x'] = inputs[0].to(device) if hasattr(inputs[0], 'to') else inputs[0]\n    result['conv_state'] = inputs[1].to(device) if hasattr(inputs[1], 'to') else inputs[1]\n    result['weight'] = inputs[2].to(device) if hasattr(inputs[2], 'to') else inputs[2]\n    result['bias'] = inputs[3].to(device) if hasattr(inputs[3], 'to') else inputs[3]\n    result['conv_state_indices'] = inputs[4].to(device) if hasattr(inputs[4], 'to') else inputs[4]\n    return result\n\ndef gen_inputs(ctx, device):\n    del ctx\n    return _legacy_gen_inputs({'batch_size': 32, 'channels': 2048, 'state_length': 3, 'kernel_width': 4}, device)\n",
+  "reference_device": "target",
+  "custom_inputs_entrypoint": "gen_inputs"
+}

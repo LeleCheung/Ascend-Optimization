@@ -1,0 +1,15 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems_nested_tensor_from_tensor_list",
+  "description": "Construct a nested tensor from a list of tensors that share the same shape in all dimensions except the first (ragged) dimension, whose sizes may differ across tensors. The output stores the concatenated element buffer (values) together with per-tensor ragged sizes.",
+  "inputs": [
+    "list"
+  ],
+  "outputs": [
+    "output"
+  ],
+  "reference": "import torch\n\ndef gen_inputs(ctx, device):\n    shape = ctx['list__shape']\n    dtype = getattr(torch, ctx['list__dtype'])\n    n = shape[0]\n    rest = shape[1:]\n    if len(rest) == 0:\n        rest = [1]\n    span = max(1, rest[0] // 4)\n    dim0s = torch.randint(-span, span + 1, (n,), device=device).tolist()\n    tensors = []\n    for j in range(n):\n        s = tuple([max(1, rest[0] + dim0s[j])] + list(rest[1:]))\n        tensors.append(torch.randn(s, dtype=dtype, device=device))\n    return {'list': tensors}\n\ndef run(list):\n    return torch.ops.aten._nested_tensor_from_tensor_list(list)\n\ndef validate(reference_outputs, candidate_outputs, candidate_args, ctx):\n    ref = reference_outputs[0]\n    cand = candidate_outputs[0]\n    if not (isinstance(ref, torch.Tensor) and isinstance(cand, torch.Tensor)):\n        return {\"passed\": False, \"message\": \"outputs are not tensors\"}\n    if getattr(ref, 'is_nested', False) != getattr(cand, 'is_nested', False):\n        return {\"passed\": False, \"message\": \"nested flag differs\"}\n    if ref.dtype != cand.dtype:\n        return {\"passed\": False, \"message\": \"dtype differs\"}\n    if ref.layout != cand.layout:\n        return {\"passed\": False, \"message\": \"layout differs\"}\n    ref_vals = ref.values()\n    cand_vals = cand.values()\n    if ref_vals.shape != cand_vals.shape:\n        return {\"passed\": False, \"message\": \"values shape differs\"}\n    if torch.equal(ref_vals, cand_vals):\n        return {\"passed\": True, \"message\": \"\", \"metrics\": {\"matched_ratio\": 1.0}}\n    ok = bool(torch.allclose(ref_vals.float(), cand_vals.float(), rtol=1e-5, atol=1e-5))\n    return {\n        \"passed\": ok,\n        \"message\": \"\" if ok else \"nested tensor values differ\",\n        \"metrics\": {\"matched_ratio\": 1.0 if ok else 0.0},\n    }\n",
+  "reference_device": "target",
+  "custom_inputs_entrypoint": "gen_inputs",
+  "custom_valid_entrypoint": "validate"
+}

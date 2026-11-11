@@ -1,0 +1,7 @@
+# KernelGen Server client distribution
+
+`kernelgen-server-client` is the local KG dependency. It contains only hardware-neutral code: `protocol/` owns wire schemas and Protocol version; `http.py` owns HTTP requests and cancellation; `catalog.py` validates a caller-supplied Catalog; `operator_bundles.py` owns deterministic packing and Bundle wire models; `flaggems_discovery.py` inventories source suites without executing pytest; `debug/models.py` and `profiling/models.py` own request/result types. `process_utils.py` and `device_visibility.py` are pure primitives shared with the target Server. Importing the client must not import `kernelgen_server`, Torch, Triton, FastAPI, scheduler or profiler implementations.
+
+The target-only `kernelgen_server` distribution keeps Bundle storage, debug process execution, pytest evaluation, profiling backends, device scheduling and HTTP API. Its legacy model import paths re-export the same client classes so an in-process installation cannot create two incompatible Pydantic types. Built-in Catalog locations remain server-owned; the client only parses an explicit Catalog path.
+
+From an exact KGS checkout, install `python3 -m pip install -e ./client` before `python3 -m pip install -e '.[server]'`. KG may install the client subproject directly from the exact KGS commit in its lock without retaining a local Server checkout. `kernelgen-server-client` package version describes the Python distribution; Protocol compatibility still comes from `/status.api_version` and features from `/status.capabilities`.

@@ -1,0 +1,20 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems_smooth_l1_loss_backward",
+  "description": "Gradient of aten.smooth_l1_loss w.r.t. input, extracted from FlagGems tests/test_smooth_l1_loss.py. Reference upcasts to float32 and casts back to the input dtype; comparison is NaN/Inf tolerant (equal_nan=True, atol=2e-2) mirroring gems_assert_close.",
+  "inputs": [
+    "grad_output",
+    "input",
+    "target",
+    "reduction",
+    "beta"
+  ],
+  "outputs": [
+    "grad_input"
+  ],
+  "reference": "import torch\n\n\ndef run(grad_output, input, target, reduction, beta):\n    return torch.ops.aten.smooth_l1_loss_backward(\n        grad_output, input, target, reduction, beta\n    )\n\n\ndef run_correctness(grad_output, input, target, reduction, beta):\n    output = torch.ops.aten.smooth_l1_loss_backward(\n        grad_output.float(),\n        input.float(),\n        target.float(),\n        reduction,\n        beta,\n    )\n    return output.to(input.dtype)\n\n\ndef gen_inputs(ctx, device):\n    import torch\n\n    go_dtype = getattr(torch, ctx[\"grad_output__dtype\"])\n    in_dtype = getattr(torch, ctx[\"input__dtype\"])\n    tg_dtype = getattr(torch, ctx[\"target__dtype\"])\n    go_shape = tuple(ctx[\"grad_output__shape\"])\n    in_shape = tuple(ctx[\"input__shape\"])\n    tg_shape = tuple(ctx[\"target__shape\"])\n    # test_smooth_l1_loss_backward_beta_zero_equal_inputs_cuda_behavior:\n    # equal inputs with beta=0 yield NaN gradients on CUDA.\n    return {\n        \"grad_output\": torch.ones(go_shape, dtype=go_dtype, device=device),\n        \"input\": torch.zeros(in_shape, dtype=in_dtype, device=device),\n        \"target\": torch.zeros(tg_shape, dtype=tg_dtype, device=device),\n    }\n\n\ndef valid(ref_outputs, sol_outputs, inputs, ctx):\n    import torch\n\n    ref = ref_outputs[0].detach().to(\"cpu\").to(torch.float64)\n    sol = sol_outputs[0].detach().to(\"cpu\").to(torch.float64)\n    if ref.shape != sol.shape:\n        return {\"passed\": False, \"message\": f\"shape {sol.shape} vs {ref.shape}\"}\n    both_nan = torch.isnan(ref) & torch.isnan(sol)\n    both_posinf = torch.isposinf(ref) & torch.isposinf(sol)\n    both_neginf = torch.isneginf(ref) & torch.isneginf(sol)\n    finite = torch.isfinite(ref) & torch.isfinite(sol)\n    close = torch.zeros_like(ref, dtype=torch.bool)\n    close[finite] = (ref[finite] - sol[finite]).abs() <= 2e-2 + 2e-2 * ref[finite].abs()\n    ok = (close | both_nan | both_posinf | both_neginf).all().item()\n    return {\"passed\": bool(ok), \"message\": \"\", \"metrics\": {}}\n",
+  "reference_device": "target",
+  "custom_inputs_entrypoint": "gen_inputs",
+  "custom_valid_entrypoint": "valid",
+  "correctness_reference_entrypoint": "run_correctness"
+}

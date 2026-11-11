@@ -1,1 +1,0 @@
-"""SimpleOpt launcher package."""

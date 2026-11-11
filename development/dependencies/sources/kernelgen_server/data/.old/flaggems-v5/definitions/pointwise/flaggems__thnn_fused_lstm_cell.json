@@ -1,0 +1,20 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems__thnn_fused_lstm_cell",
+  "description": "严格复刻 FlagGems fused LSTM cell forward：使用 LSTM_SHAPES，覆盖无 bias 与双 bias；返回 (hy, cy, workspace)，但按 pytest 只校验 hy/cy。",
+  "inputs": [
+    "input_gates",
+    "hidden_gates",
+    "cx",
+    "input_bias",
+    "hidden_bias"
+  ],
+  "outputs": [
+    "hy",
+    "cy",
+    "workspace"
+  ],
+  "reference": "import torch\n\n\ndef run(input_gates, hidden_gates, cx, input_bias, hidden_bias):\n    gates = input_gates + hidden_gates\n    if input_bias is not None:\n        gates = gates + input_bias\n    if hidden_bias is not None:\n        gates = gates + hidden_bias\n    i, f, g, o = gates.chunk(4, dim=-1)\n    i = torch.sigmoid(i)\n    f = torch.sigmoid(f)\n    g = torch.tanh(g)\n    o = torch.sigmoid(o)\n    cy = f * cx + i * g\n    hy = o * torch.tanh(cy)\n    return hy, cy, gates\n\n\ndef valid(ref_outputs, sol_outputs, inputs, ctx):\n    import torch\n    if len(ref_outputs) < 2 or len(sol_outputs) < 2:\n        return {\"passed\": False, \"message\": \"expected hy and cy\", \"metrics\": {}}\n    dtype = sol_outputs[0].dtype\n    rtol = {\n        torch.float16: 1e-3,\n        torch.bfloat16: 1.6e-2,\n        torch.float32: 1.3e-6,\n    }.get(dtype, 1e-6)\n    atol = 1e-2 if dtype == torch.bfloat16 else (1.5e-3 if dtype == torch.float16 else 1e-4)\n    for name, ref, sol in zip((\"hy\", \"cy\"), ref_outputs[:2], sol_outputs[:2]):\n        if ref.shape != sol.shape or not torch.allclose(ref, sol, rtol=rtol, atol=atol):\n            return {\"passed\": False, \"message\": f\"{name} mismatch\", \"metrics\": {}}\n    return {\"passed\": True, \"message\": \"\", \"metrics\": {}}\n",
+  "reference_device": "target",
+  "custom_valid_entrypoint": "valid"
+}

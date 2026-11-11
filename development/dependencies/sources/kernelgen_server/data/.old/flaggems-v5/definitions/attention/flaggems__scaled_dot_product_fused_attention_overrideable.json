@@ -1,0 +1,30 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems__scaled_dot_product_fused_attention_overrideable",
+  "description": "Faithfully extracted from FlagGems test_scaled_dot_product_fused_attention_overrideable.py and its benchmark. Source cases use uniform(-0.1, 0.1) Q/K/V for correctness and torch.randn Q/K/V for timing; only the main output values and the pytest's selected metadata are validated.",
+  "inputs": [
+    "query",
+    "key",
+    "value",
+    "attn_bias",
+    "dropout_p",
+    "is_causal",
+    "return_debug_mask",
+    "scale"
+  ],
+  "outputs": [
+    "output",
+    "logsumexp",
+    "cum_seq_q",
+    "cum_seq_k",
+    "max_q",
+    "max_k",
+    "philox_seed",
+    "philox_offset",
+    "debug_attn_mask"
+  ],
+  "reference": "import torch\nimport torch.nn.functional as F\n\n\ndef gen_inputs(ctx, device):\n    result = {}\n    for name in (\"query\", \"key\", \"value\"):\n        shape = tuple(ctx[f\"{name}__shape\"])\n        dtype = getattr(torch, ctx[f\"{name}__dtype\"])\n        result[name] = torch.randn(shape, dtype=dtype, device=device).uniform_(-0.1, 0.1)\n    return result\n\n\ndef run(query, key, value, attn_bias, dropout_p, is_causal, return_debug_mask, scale):\n    output = F.scaled_dot_product_attention(\n        query,\n        key,\n        value,\n        attn_mask=attn_bias,\n        dropout_p=dropout_p,\n        is_causal=is_causal,\n        scale=scale,\n    )\n    batch = query.shape[0]\n    seq_len_q = query.shape[2]\n    seq_len_k = key.shape[2]\n    logsumexp = torch.empty(\n        (batch, query.shape[1], seq_len_q), dtype=torch.float32, device=query.device\n    )\n    cum_seq_q = torch.tensor(\n        [0, seq_len_q] * batch, dtype=torch.int32, device=query.device\n    ).reshape(batch, 2)\n    cum_seq_k = torch.tensor(\n        [0, seq_len_k] * batch, dtype=torch.int32, device=key.device\n    ).reshape(batch, 2)\n    philox_seed = torch.zeros(1, dtype=torch.int64, device=query.device)\n    philox_offset = torch.zeros(1, dtype=torch.int64, device=query.device)\n    debug_attn_mask = torch.empty(0, dtype=query.dtype, device=query.device)\n    return (\n        output,\n        logsumexp,\n        cum_seq_q,\n        cum_seq_k,\n        seq_len_q,\n        seq_len_k,\n        philox_seed,\n        philox_offset,\n        debug_attn_mask,\n    )\n\n\ndef valid(ref_outputs, sol_outputs, inputs, ctx):\n    if len(sol_outputs) != 9:\n        return {\"passed\": False, \"message\": \"expected 9 outputs\", \"metrics\": {}}\n    query, key = inputs[0], inputs[1]\n    dtype = query.dtype\n    ref = ref_outputs[0].to(dtype)\n    sol = sol_outputs[0]\n    rtol = {\n        torch.float16: 1e-3,\n        torch.bfloat16: 0.016,\n        torch.float32: 1.3e-6,\n        torch.float64: 1e-7,\n    }.get(dtype, 1.3e-6)\n    try:\n        torch.testing.assert_close(sol, ref, rtol=rtol, atol=1e-4)\n    except AssertionError as exc:\n        return {\"passed\": False, \"message\": str(exc), \"metrics\": {}}\n    batch = query.shape[0]\n    if tuple(sol_outputs[2].shape) != (batch, 2):\n        return {\"passed\": False, \"message\": \"cum_seq_q shape mismatch\", \"metrics\": {}}\n    if tuple(sol_outputs[3].shape) != (batch, 2):\n        return {\"passed\": False, \"message\": \"cum_seq_k shape mismatch\", \"metrics\": {}}\n    if sol_outputs[4] != query.shape[2] or sol_outputs[5] != key.shape[2]:\n        return {\"passed\": False, \"message\": \"max sequence length mismatch\", \"metrics\": {}}\n    if tuple(sol_outputs[6].shape) != (1,) or tuple(sol_outputs[7].shape) != (1,):\n        return {\"passed\": False, \"message\": \"philox state shape mismatch\", \"metrics\": {}}\n    return {\"passed\": True, \"message\": \"\", \"metrics\": {}}\n",
+  "reference_device": "target",
+  "custom_inputs_entrypoint": "gen_inputs",
+  "custom_valid_entrypoint": "valid"
+}

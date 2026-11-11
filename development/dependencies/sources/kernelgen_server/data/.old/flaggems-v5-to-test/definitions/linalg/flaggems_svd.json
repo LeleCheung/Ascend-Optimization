@@ -1,0 +1,18 @@
+{
+  "api_version": "v5.1",
+  "name": "flaggems_svd",
+  "description": "Singular value decomposition via torch.svd, extracted from FlagGems test_svd. Validation follows the pytest: match singular values, reconstruct input from U/S/V, and check orthonormality of U and V (U/V are not directly comparable due to sign/basis non-uniqueness).",
+  "inputs": [
+    "x",
+    "some",
+    "compute_uv"
+  ],
+  "outputs": [
+    "U",
+    "S",
+    "V"
+  ],
+  "reference": "import torch\n\n\ndef run(x, some, compute_uv):\n    return torch.svd(x, some=some, compute_uv=compute_uv)\n\n\ndef valid(ref_outputs, sol_outputs, inputs, ctx):\n    import torch\n\n    x = inputs[0]\n    compute_uv = bool(inputs[2]) if len(inputs) > 2 else True\n\n    ref_u, ref_s, ref_v = ref_outputs[0], ref_outputs[1], ref_outputs[2]\n    sol_u, sol_s, sol_v = sol_outputs[0], sol_outputs[1], sol_outputs[2]\n\n    def to64(t):\n        t = t.detach().to(\"cpu\")\n        return t.to(torch.complex128) if t.is_complex() else t.to(torch.float64)\n\n    for a, b, name in ((sol_u, ref_u, \"U\"), (sol_s, ref_s, \"S\"), (sol_v, ref_v, \"V\")):\n        if tuple(a.shape) != tuple(b.shape):\n            return {\"passed\": False, \"message\": f\"{name} shape {tuple(a.shape)} vs {tuple(b.shape)}\", \"metrics\": {}}\n\n    is_complex = x.is_complex()\n    rs = to64(ref_s)\n    ss = to64(sol_s)\n    atol_s = 5e-4 if not compute_uv else (2e-2 if is_complex else 2e-3)\n    if not torch.allclose(ss, rs, rtol=1e-3, atol=atol_s):\n        diff = (ss - rs).abs().max().item()\n        return {\"passed\": False, \"message\": f\"S mismatch max_abs_diff={diff}\", \"metrics\": {}}\n\n    if compute_uv:\n        u = to64(sol_u)\n        s = to64(sol_s)\n        v = to64(sol_v)\n        k = s.shape[-1]\n        recon = u[..., :, :k] @ torch.diag_embed(s).to(u.dtype) @ v[..., :, :k].mH\n        xx = to64(x)\n        atol_r = 2e-2 if is_complex else 2e-3\n        if recon.numel() > 0 and not torch.allclose(recon, xx, rtol=1e-3, atol=atol_r):\n            diff = (recon - xx).abs().max().item()\n            return {\"passed\": False, \"message\": f\"reconstruction mismatch max_abs_diff={diff}\", \"metrics\": {}}\n        for actual, name in ((u, \"U\"), (v, \"V\")):\n            if actual.numel() == 0:\n                continue\n            kk = actual.shape[-1]\n            eye = torch.eye(kk, dtype=actual.dtype, device=actual.device)\n            gram = actual.mH @ actual\n            eye = eye.expand_as(gram)\n            if not torch.allclose(gram, eye, rtol=1e-3, atol=2e-2):\n                diff = (gram - eye).abs().max().item()\n                return {\"passed\": False, \"message\": f\"{name} not orthonormal max_abs_diff={diff}\", \"metrics\": {}}\n\n    return {\"passed\": True, \"message\": \"\", \"metrics\": {}}\n",
+  "reference_device": "target",
+  "custom_valid_entrypoint": "valid"
+}

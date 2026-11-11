@@ -1,0 +1,47 @@
+REFERENCE_DEVICE = 'target'
+
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that performs a matrix multiplication, applies Swish activation, sums with a bias term, and normalizes with GroupNorm.
+    """
+    def __init__(self, in_features, out_features, num_groups, bias_shape):
+        super(Model, self).__init__()
+        self.matmul = nn.Linear(in_features, out_features)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        x = self.matmul(x)
+        x = torch.sigmoid(x) * x  # Swish activation
+        x = x + self.bias
+        x = self.group_norm(x)
+        return x
+
+batch_size = 32768
+in_features = 1024
+out_features = 4096
+num_groups = 64
+bias_shape = (out_features,)
+
+
+_reference_model = None
+
+
+def run(x):
+    global _reference_model
+    if _reference_model is None:
+        torch.manual_seed(42)
+        _reference_model = Model(*([in_features, out_features, num_groups, bias_shape])).to(
+            device=x.device, dtype=torch.float32
+        )
+    with torch.no_grad():
+        return _reference_model(x)

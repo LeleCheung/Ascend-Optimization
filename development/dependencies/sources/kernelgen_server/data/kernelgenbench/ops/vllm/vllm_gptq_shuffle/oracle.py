@@ -1,0 +1,42 @@
+REFERENCE_DEVICE = 'target'
+
+import torch
+try:
+    from vllm import _custom_ops
+except ModuleNotFoundError:
+    _custom_ops = None
+
+
+def _legacy_gen_inputs(ctx, device):
+    qw_shape = tuple(ctx["q_weight__shape"])
+    cols = tuple(ctx["q_perm__shape"])[0]
+    q_weight = torch.randint(0, 2**31 - 1, qw_shape, device=device, dtype=torch.int32)
+    q_perm = torch.randperm(cols, device=device).to(torch.int32)
+    return {"q_weight": q_weight, "q_perm": q_perm}
+
+
+def run(q_weight, q_perm, bit):
+    q = q_weight.clone()
+    _custom_ops.gptq_shuffle(q, q_perm, bit)
+    return q
+
+
+def _legacy_context(ctx):
+    result = {}
+    for name, spec in ctx["inputs"].items():
+        kind = spec.get("type") if isinstance(spec, dict) else None
+        if kind in {"random", "custom"}:
+            result[f"{name}__shape"] = spec["shape"]
+            result[f"{name}__dtype"] = spec["dtype"]
+            for key, value in spec.items():
+                if key not in {"type", "shape", "dtype"}:
+                    result[f"{name}__{key}"] = value
+        elif kind in {"scalar", "literal"}:
+            result[name] = spec["value"]
+        else:
+            raise ValueError(f"unsupported legacy input recipe: {name}")
+    return result
+
+
+def gen_inputs(ctx, device):
+    return _legacy_gen_inputs(_legacy_context(ctx), device)
