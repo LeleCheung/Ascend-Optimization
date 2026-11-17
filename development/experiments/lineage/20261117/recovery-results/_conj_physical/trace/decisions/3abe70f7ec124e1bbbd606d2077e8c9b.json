@@ -1,0 +1,62 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "3abe70f7ec124e1bbbd606d2077e8c9b",
+  "recorded_at": "2026-11-17T06:45:36.928858+00:00",
+  "round_id": "performance-01",
+  "input_source": {
+    "path": "trace/sources/64d85d5b54b60b9e85ec804c28eb0a08e42211e0bbdba7824b997744359d1057.py",
+    "sha256": "64d85d5b54b60b9e85ec804c28eb0a08e42211e0bbdba7824b997744359d1057"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/436ae8f61abdb9a299243a22728d7a761ffd5388c4990498e4262e55cddfa255.json",
+        "sha256": "436ae8f61abdb9a299243a22728d7a761ffd5388c4990498e4262e55cddfa255"
+      },
+      "original": {
+        "path": "workspace/performance-feedback.json",
+        "sha256": "436ae8f61abdb9a299243a22728d7a761ffd5388c4990498e4262e55cddfa255"
+      },
+      "category": "roofline",
+      "role": "trigger",
+      "finding": "Full-contract per-case timings: candidate is 31.99/33.38/32.79 us for float32 1K/64K/1M and 32.53/32.93/32.41 us for complex64 1K/64K/1M. Candidate wall time is essentially flat (~32 us) across a 1024x size range and across dtypes, while the CANN reference is 13.0/13.4/14.0 us for the real cases. A fixed host-side dispatch floor, not device copy bandwidth, dominates the real cases (0.40-0.43x).",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/64d85d5b54b60b9e85ec804c28eb0a08e42211e0bbdba7824b997744359d1057.py",
+        "sha256": "64d85d5b54b60b9e85ec804c28eb0a08e42211e0bbdba7824b997744359d1057"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "64d85d5b54b60b9e85ec804c28eb0a08e42211e0bbdba7824b997744359d1057"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Hot contiguous path: run() calls numel/is_conj/is_contiguous, allocates an independent torch.empty output, then _cur_stream() which invokes torch.npu.current_device() plus _raw_stream(device) on every call, then reads src.data_ptr() and out.data_ptr(), then a dict launch lookup. The cached launch-plan key omits device identity, and the constant per-call torch.npu.current_device() ACL query is redundant because the input tensor already carries its device index. No native return-input aliasing is present; output is a fresh torch.empty tensor.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/4c7c51b9b2af0a711cc953401a80fa97fb455a98ca8b0d621aab890a3972ce8b.json",
+        "sha256": "4c7c51b9b2af0a711cc953401a80fa97fb455a98ca8b0d621aab890a3972ce8b"
+      },
+      "original": {
+        "path": "workspace/knowledge.json",
+        "sha256": "4c7c51b9b2af0a711cc953401a80fa97fb455a98ca8b0d621aab890a3972ce8b"
+      },
+      "category": "knowledge",
+      "role": "background",
+      "finding": "Prior transferable observations: reduce hot-path Python/metadata queries for the contiguous flat path; cache compiled launcher/function/packed metadata but never cache dynamic current stream, pointers, or tensors; the launch-plan cache key must include device identity; in this environment Tensor.data_ptr triggers aclrtPointerGetAttributes per call, so the integer-address launch branch already used here is preferred; gains must be confirmed by the full KGS contract, not by host claims.",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "The ~19 us gap versus CANN on real inputs is dominated by repeated host-side queries on every call, chiefly the per-call torch.npu.current_device() ACL query used only to resolve the raw stream, plus a launch-plan lookup keyed without device identity. Deriving the device from the already-available input tensor (a cheap attribute read) and caching the resolved stream function per device should remove one ACL round-trip from every hot call while preserving dynamic current-stream semantics and independent output allocation.",
+  "change": "Refactor the stream helper to _stream_for(device_index) that resolves/reuses the raw-stream getter per device from input.device.index (falling back to torch.npu.current_device() only when the index is None), and include the device index in both launch-plan cache keys. Replace every hot-path _cur_stream() call with _stream_for(dev). No change to kernel bodies, grid/block selection, strides/offset handling, tail masking, or output allocation: every call still allocates a fresh torch.empty output (independent storage for real inputs) and complex inputs still negate via NEG while reading plain storage.",
+  "expected": "Lower candidate_us on the host-bound small/real cases (targeting the fixed floor), neutral on the large complex case where device copy dominates; complex correctness and independent-output semantics unchanged. Overall geomean should improve if the removed ACL query is a meaningful fraction of the ~19 us host gap.",
+  "validation": "Tool-bridge preflight on the edited candidate.py, then hand off for source review; full 14-case KGS timing is the evaluation evidence and the causal host claim remains a hypothesis until that full run confirms it. Per-case before/after us compared against performance-feedback.json.",
+  "alternatives": [],
+  "discriminating_observation": "",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

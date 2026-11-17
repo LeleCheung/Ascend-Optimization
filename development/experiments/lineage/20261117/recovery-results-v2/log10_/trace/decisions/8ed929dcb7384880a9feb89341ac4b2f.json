@@ -1,0 +1,90 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "8ed929dcb7384880a9feb89341ac4b2f",
+  "recorded_at": "2026-11-17T06:10:38.807067+00:00",
+  "round_id": "performance-03",
+  "input_source": {
+    "path": "trace/sources/ea5c99dcb04be5f84f52d8e16797ed993218ecd31db4e4ce98bed54a62b11777.py",
+    "sha256": "ea5c99dcb04be5f84f52d8e16797ed993218ecd31db4e4ce98bed54a62b11777"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/f3ce424e5726ce7b7bbfb71a4bdd1e1ad68fe0f523aa6f0e238ec916fdc7bb05.json",
+        "sha256": "f3ce424e5726ce7b7bbfb71a4bdd1e1ad68fe0f523aa6f0e238ec916fdc7bb05"
+      },
+      "original": {
+        "path": "workspace/current-compile-failure.json",
+        "sha256": "f3ce424e5726ce7b7bbfb71a4bdd1e1ad68fe0f523aa6f0e238ec916fdc7bb05"
+      },
+      "category": "source_ir",
+      "role": "trigger",
+      "finding": "当前候选(ea5c99dc)62/66失败：timing-7/-3/-11 的 fresh-stream 用例编译期报 ub overflow, requires 2621440 bits while 1572864 bits available。触发点即 _make_streaming_entry 的 dtype 分支 sub=16384(2字节dtype)。编译器实际UB占用含FP32中间量，输入dtype字节数不是安全上界。",
+      "source_sha256": "ea5c99dcb04be5f84f52d8e16797ed993218ecd31db4e4ce98bed54a62b11777"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/ec8a53e7f5530cb247bb2f95175e44cfd0c95fec62f741b9186768ac0bc8d28c.json",
+        "sha256": "ec8a53e7f5530cb247bb2f95175e44cfd0c95fec62f741b9186768ac0bc8d28c"
+      },
+      "original": {
+        "path": "workspace/tile-failure.json",
+        "sha256": "ec8a53e7f5530cb247bb2f95175e44cfd0c95fec62f741b9186768ac0bc8d28c"
+      },
+      "category": "other",
+      "role": "background",
+      "finding": "更早的统一大tile尝试(f574e5e)60/66，同样UB溢出需2097152 bits；两次tile放大均失败，说明沿提高单次搬运位宽的方向不可行。",
+      "source_sha256": "f574e5e5922c54e2aac118cb39ee43443d921fa6cd0c6d697fdff310c6427e9e"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/ef7dac101e14fcd525bbfbf757003af9f25eeccd797e0e329b788f45b160626d.json",
+        "sha256": "ef7dac101e14fcd525bbfbf757003af9f25eeccd797e0e329b788f45b160626d"
+      },
+      "original": {
+        "path": "workspace/current-timing.json",
+        "sha256": "ef7dac101e14fcd525bbfbf757003af9f25eeccd797e0e329b788f45b160626d"
+      },
+      "category": "paired_profiling",
+      "role": "mechanism",
+      "finding": "仅作背景：大输入(命中流式路径) timing-3 0.406、timing-7 0.588、timing-11 0.589，中小输入约0.87-1.01。差距集中在有限网格的流式调度，而非数学或小输入宿主。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/ea5c99dcb04be5f84f52d8e16797ed993218ecd31db4e4ce98bed54a62b11777.py",
+        "sha256": "ea5c99dcb04be5f84f52d8e16797ed993218ecd31db4e4ce98bed54a62b11777"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "ea5c99dcb04be5f84f52d8e16797ed993218ecd31db4e4ce98bed54a62b11777"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "第130-149行 _log10_streaming 为轮转调度：start=pid*2*SUB，step=num_programs*2*SUB，每个program各轮地址相距 grid*2*SUB，轮间不连续；UB占用只由 SUB 决定，与调度方式无关。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/47abd9b28aa446ca87c336a0c30cf75529cb6b3f9f6f38e28d72150b5452b133.json",
+        "sha256": "47abd9b28aa446ca87c336a0c30cf75529cb6b3f9f6f38e28d72150b5452b133"
+      },
+      "original": {
+        "path": "workspace/knowledge.json",
+        "sha256": "47abd9b28aa446ca87c336a0c30cf75529cb6b3f9f6f38e28d72150b5452b133"
+      },
+      "category": "knowledge",
+      "role": "background",
+      "finding": "记录显示相邻双块预取曾使FP16大输入由39.26us升至49.64us(0.915->0.751)，故不盲目增加预取深度；大输入瓶颈候选为每program循环轮次与搬运组织，收益须由完整性能确认。",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "在UB占用不变的前提下改善流式访存连续性：把每个program覆盖的元素从跨步轮转改为一段连续区间，使相邻轮次地址连续递增，便于MTE2组织连续搬运；每轮载荷仍为 2*8192、数学不变，不会再次触发UB溢出。",
+  "change": "1) 回退 _make_streaming_entry 的 dtype 分支，sub 统一为 8192（恢复已知安全取值）。2) 单一机制：_log10_streaming 改为连续分区调度，每个program处理 [pid*CHUNK, min((pid+1)*CHUNK, N))，CHUNK 由 Python 侧按 grid<=40 计算并以 constexpr 传入；保留原有全块无掩码/尾块带掩码的编译期分支，不新增预取深度。ABI 尾部参数变为 (n, sub, chunk)。",
+  "expected": "编译期UB占用与已知安全的 sub=8192 方案等同，66项应全部通过；大输入 timing-3/7/11 因逐轮地址连续，期望速度比不低于当前 0.406/0.588/0.589；中小输入仍走 flat/pair 路径不受影响。此为假设，须完整计时确认，不能由源码结构推断收益。",
+  "validation": "先工具桥 preflight 对当前SHA做静态/编译预检；随后完整复核66项（含 fresh-stream、非连续、特殊值、对齐序列）；计时比较 timing-3/7/11 及全部12项是否回退。若编译仍失败即回退到已知安全字节并保留记录。",
+  "alternatives": [],
+  "discriminating_observation": "",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

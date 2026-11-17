@@ -56,10 +56,11 @@ def main():
     diagnosis=workspace/'diagnosis.json'
     if diagnosis.exists():(call/'input-diagnosis.json').write_bytes(diagnosis.read_bytes())
     # 旧诊断保存为原件；给每轮提供短空模板，避免模型不断编辑膨胀的历史文档。
-    save(diagnosis,dict(schema_version='hgkda.diagnosis/v1',evidence=[],hypothesis='',
+    save(diagnosis,dict(schema_version='hgkda.diagnosis/v1',source_sha256=hashlib.sha256(active_input.read_bytes()).hexdigest(),evidence=[],hypothesis='',
                         change='',expected='',validation='',unknown=[]))
     if config.get('method_manifest'):(call/'method-manifest.json').write_bytes(Path(config['method_manifest']).read_bytes())
     call_config=dict(config)
+    call_config['trace_round_id']=args.invocation
     if config.get('method_manifest'):call_config['method_manifest']=str(call/'method-manifest.json')
     save(call/'config.json',call_config)
     # 模型阶段固定本次方法身份；开发控制器后续切换run/config不会改变活动调用。
@@ -125,6 +126,11 @@ diagnosis.json已重置为本轮短空模板，旧诊断由宿主保存，不要
         prompt=prompt.replace('初始candidate.py仅是固定FlagGems起点的原字节副本，入口及实现仍由你改写；后续调用则继续当前生成候选。',
                               '初始candidate.py来自明确提供的既有交付版本；保留来源，不将修改表述为从上游从零生成。')
     prompt=prompt.replace('公共入口run(A)，','公共入口及参数遵循contract.json，')
+    prompt += '''\n开始一个具体修改前，先把当前源码SHA、引用证据、假设、改法、预期变化及验证方式写入diagnosis.json，
+再调用工具桥decision --record diagnosis.json，保存修改前决策。证据项包含path、category、role、finding；
+category取paired_profiling/simulator/source_ir/roofline/knowledge/probe/other，role取trigger/disambiguation/mechanism/background。
+没有使用模拟器就不填模拟器；读过多个工具不自动声明因果贡献。编译失败、退步及保持源码不变也保留记录。
+每个机制可对应多次小编辑，不要求每次文本替换都重新写长分析；正式结果后更新诊断中的观测与未决问题。\n'''
     (workspace/'prompt.md').write_text(prompt, encoding='utf8')
     (call/'prompt.md').write_text(prompt, encoding='utf8')
     configuration = read(args.model_settings)
@@ -211,4 +217,5 @@ diagnosis.json已重置为本轮短空模板，旧诊断由宿主保存，不要
 
 
 if __name__ == '__main__':
-    main()
+    from hgkda.runtime.trace import traced_main
+    traced_main(main, 'generate')

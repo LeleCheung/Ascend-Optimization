@@ -1,0 +1,746 @@
+{
+  "operator": "selu_",
+  "kind": "saved_ledger_attempt_order",
+  "selected_source": {
+    "path": "/data/hanle/ascend-optimization/runs/endurance-20261022/kg-runs/selu_-endurance-20261022-attempt-2/stages/optimize/work/.ledger.json",
+    "sha256": "c3e781a71f127085c795c6bfe57104b14e9c003ec19a663467115f803d32096d"
+  },
+  "points": [
+    {
+      "id": "selu_:round-1",
+      "score": 0.7526967977178296,
+      "source_sha256": "49bdbb789d497b6423f893f3433167f3fd4bc61197676236bd62a9ec79c7dd91",
+      "method": "本批起点",
+      "raw": {
+        "ledger_sha256": "c3e781a71f127085c795c6bfe57104b14e9c003ec19a663467115f803d32096d",
+        "round": 1,
+        "source_sha256": "49bdbb789d497b6423f893f3433167f3fd4bc61197676236bd62a9ec79c7dd91",
+        "evaluation": {
+          "evaluated_at": "2026-10-22T15:40:45.011081Z",
+          "status": "PASSED",
+          "geo_mean": 0.7526967977178296,
+          "num_workloads": 36,
+          "num_passed": 36
+        },
+        "plan": {
+          "kind": "baseline",
+          "strategy": "Establish the authoritative baseline for the unmodified best-so-far SELU in-place seed",
+          "code_changes": "None; seed copied byte-identically from the provided best-so-far source",
+          "hypothesis": "The seed's per-dtype UB block sizing (16384 fp16 / 8192 else), direct-launch fast path and full-stride generic kernel reproduce the parent measurements; per-workload latencies reveal whether large cases are vector-bound (exp) or launch-bound",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "establish_baseline",
+            "mechanism": "No change; records per-workload latency and speedup decomposition for all 12 timing cases"
+          },
+          "source": {
+            "origin": "baseline",
+            "parent_round_num": null
+          },
+          "key_params": {},
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "pending",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 1,
+          "expectation_status": "baseline",
+          "root_cause": "Baseline decomposition: 9 of 12 timing workloads are host-launch-bound (18.2-19.1us vs reference 12.6-14.1us, speedups 0.71-0.74); the three large ones are device-bound with 1.246x (fp16 16M), 0.709x (bf16 16M) and 0.596x (fp32 16M).",
+          "perf_gap_analysis": "No previous measurement to compare. Measured means on device (bounded debug probes, same session): full call 14.0us for 1024 elements of which the compiled launcher's C call is ~9.4-10.2us and Python work ~3.5us (stream get 0.62, address wrapper 0.57, numel/data_ptr/dict/contiguity ~1.0, call frames ~1.5), while torch.selu_ is 7.4-9.0us. On the 16M cases the device body is ~70us (fp32), of which a pure copy is already ~64us at ~2 TB/s; a persistent grid-stride copy reached 46us, so per-program tile overhead (not arithmetic) is the large-case limiter.",
+          "next_suggestion": "Keep the kernel math identical and cut host work per call: cache the compiled launcher primitives keyed by data pointer, verify dtype/numel/contiguity, and invoke the generated launcher directly with the current bare integer address (confirmed accepted and numerically correct on target) and current stream, dropping the int-subclass address wrapper and one Python frame.",
+          "optimization_level": "host_side_special",
+          "debug_lesson": "Measuring through the standard Triton entry (53us) hides device time; only the direct launcher path gives a usable device-time comparison. Also grid must be a tuple, and driver.active.get_current_stream returns a raw int on this build, so the candidate's own _resolve_stream accessor must be used for stream reads.",
+          "strategy_evolution": "Baseline established with per-workload latency decomposition; conclusions drawn from bounded target probes rather than from aggregate ratios.",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "selu_:round-2",
+      "score": 0.8632226350837635,
+      "source_sha256": "8764018cfb2cab9444a34caf7a171f7eac7395656631698ce491e676557462f0",
+      "method": "直接启动精简宿主路径",
+      "raw": {
+        "ledger_sha256": "c3e781a71f127085c795c6bfe57104b14e9c003ec19a663467115f803d32096d",
+        "round": 2,
+        "source_sha256": "8764018cfb2cab9444a34caf7a171f7eac7395656631698ce491e676557462f0",
+        "evaluation": {
+          "evaluated_at": "2026-10-22T15:54:38.671691Z",
+          "status": "PASSED",
+          "geo_mean": 0.8632226350837635,
+          "num_workloads": 36,
+          "num_passed": 36
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Cut per-call host overhead by invoking the compiled launcher directly with a bare integer address from a single fast-path frame",
+          "code_changes": "Cache (dtype, numel, masked, launcher.launch, grid, function, packed_metadata, stream_getter) keyed by data_ptr; fast path verifies contiguity/dtype/numel then calls the generated launcher inline with the current bare integer address and current stream. The int-subclass address wrapper and the inner launch closure frame are gone; masked/strided/unaligned/debug paths unchanged.",
+          "hypothesis": "The nine small timing workloads are host-launch-bound at ~18.5us, of which ~3.5us is Python-side work measured directly on target (address wrapper 0.57us, stream 0.62us, numel/data_ptr/dict/contiguity 1.0us, extra frame); eliminating the wrapper object and the inner closure frame will raise every small-case speedup from ~0.73 to ~0.83",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Removes ~2.3us of per-call Python from the measured path (address object 0.57us, wrapper frame ~1.5us, tuple key) while keeping the same 9.4us compiled launcher, so the nine launch-bound workloads should move from ~18.5us toward ~16us"
+          },
+          "source": {
+            "origin": "coder",
+            "parent_round_num": null
+          },
+          "key_params": {
+            "address": "bare int",
+            "cache_key": "data_ptr"
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "pending",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 2,
+          "expectation_status": "met",
+          "root_cause": "Per-call Python work dominated the nine small workloads; eliminating the int-subclass address construction and the intermediate launch closure frame brought the measured full call from ~18.5us to ~13.4us while the device body stayed identical.",
+          "perf_gap_analysis": "Predicted ~2.3us of removable Python per call; observed 18.5 -> 13.4us (about 5.1us) on all nine small cases, so the expectation was exceeded. Aggregate 0.7527 -> 0.8632. Per workload: small cases 0.7395/0.7137/0.7214/0.7371/0.7409/0.7416/0.7298/0.7426/0.7514 -> 0.8695/0.8832/0.9017/0.8926/0.8922/0.8930/0.8977/0.8582/0.8499; timing-3 unchanged 1.246 -> 1.250; timing-7 unchanged 0.709 -> 0.710; timing-11 unchanged 0.596 -> 0.598, i.e. the device body was untouched as intended. Remaining gap on small cases is the compiled launcher call itself (~9.4us, confirmed by direct measurement) against a reference at ~11.7us.",
+          "next_suggestion": "The nine launch-bound cases are now within ~1.7us of the reference and the remaining host work is the compiled launcher itself (~9.4us) plus irreducible metadata reads, so switch to the large cases: give the three 16M contiguous workloads a persistent grid-stride SELU kernel (grid = num_vectorcore, current dtype block, num_stages=1 so the tile still fits UB) to cut per-program tile overhead.",
+          "optimization_level": "host_side_special",
+          "debug_lesson": "The direct-launcher path is only cheap if the surrounding Python is cheap too: removing the int-subclass address object and the inner closure frame cut much more (5.1us) than the isolated probe costs suggested, because the closed-over stream/address/defaults were re-evaluated down two Python frames per call.",
+          "strategy_evolution": "Baseline identified host launch overhead as the dominant aggregate lever; the host fast-path rewrite realized it, so the remaining budget goes to the three device-bound large cases.",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "selu_:round-3",
+      "score": 0.8870867172659556,
+      "source_sha256": "0e782a69158783eb900458c93ca3531737ecaa2579739621ffcc9b3415ac7622",
+      "method": "固定网格流式循环",
+      "raw": {
+        "ledger_sha256": "c3e781a71f127085c795c6bfe57104b14e9c003ec19a663467115f803d32096d",
+        "round": 3,
+        "source_sha256": "0e782a69158783eb900458c93ca3531737ecaa2579739621ffcc9b3415ac7622",
+        "evaluation": {
+          "evaluated_at": "2026-10-22T15:58:25.626329Z",
+          "status": "PASSED",
+          "geo_mean": 0.8870867172659556,
+          "num_workloads": 36,
+          "num_passed": 36
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Persistent grid-stride kernel for long contiguous tensors to cut per-program overhead on the three large timing workloads",
+          "code_changes": "Added _selu_persist(X, TILES, G, BLOCK) grid-stride kernel; for contiguous inputs with n % block == 0 and tiles >= 4 * num_vectorcore the entry binds this kernel with grid=num_vectorcore and num_stages=1 (falls back to the plain tile grid if that compile fails). Host fast path, masked, strided and fallback paths unchanged.",
+          "hypothesis": "On the 16M cases the device body is limited by per-program tile cost rather than arithmetic (a pure copy at the same tile size costs 78us vs 83us for the full SELU), and a persistent grid-stride kernel measured 73.9us vs 83.0us for f32 and 75.5us vs 83.8us for bf16 with grid=num_vectorcore",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Replaces ~1024-2048 short-lived programs with one program per vector core looping over the same dtype-sized tiles, removing the per-program setup cost that dominates the 16M cases"
+          },
+          "source": {
+            "origin": "coder",
+            "parent_round_num": null
+          },
+          "key_params": {
+            "BLOCK": "16384 f16 / 8192 else",
+            "grid": "num_vectorcore (queried)",
+            "num_stages": 1,
+            "tiles_per_core_min": 4
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "failed",
+          "analysis_path": ".kernelgen/profile-analysis/round-0003.json",
+          "summary": "failed: msprof base collection exited successfully without profile completion marker (4/4 workloads: selu_-timing-11, selu_-timing-7, selu_-timing-3, selu_-timing-0). The service declared capabilities performance_counters, pipeline_utilization, kernel_profile and instruction_listing, but every result returned an empty capability set, an empty artifact list and no metrics, so no artifact could be cited as evidence."
+        },
+        "conclusion": {
+          "round_num": 3,
+          "expectation_status": "met",
+          "root_cause": "The 16M workloads were limited by per-program tile overhead rather than arithmetic; one persistent program per vector core looping over the same dtype-sized tiles removed 8-10us of device time while keeping the tile inside the UB budget via num_stages=1.",
+          "perf_gap_analysis": "Predicted ~+2.7% aggregate from ~10% device gains on the three large cases; observed 0.8632 -> 0.8871 (+2.8%). Per workload: timing-3 1.250 -> 1.359 (45.6 -> 41.9us), timing-7 0.710 -> 0.783 (83.3 -> 75.5us), timing-11 0.598 -> 0.677 (82.7 -> 72.9us); the nine launch-bound cases stayed in the same 11.6-13.1us band (0.82-0.94, reference timing itself drifted down to 9.6-11.8us). The gains match the probe prediction almost exactly (probe: f32 83.0 -> 73.9us, bf16 83.8 -> 75.5us, f16 46.4 -> 42.3us). Remaining gap: fp32 16M is still 1.48x off the reference and a measured persistent copy floor of ~60us for the same traffic bounds further pure-kernel improvement to ~13us.",
+          "next_suggestion": "The persistent path is bound at one program per vector core (G = num_vectorcore, num_stages=1). The next experiment should test 2 programs per vector core (grid = 2 * num_vectorcore, which needs no extra UB) and, independently, routing the 1M-element workloads through the persistent path, since bf16 16M still trails the reference at 0.783 and the fp32 16M copy floor (~60us measured) leaves ~13us of headroom.",
+          "optimization_level": "L1_architecture",
+          "debug_lesson": "Per-program tile cost, not arithmetic, dominated the 16M cases: an identical-tile pure copy cost 78us of 83us, so the winning change was program granularity (one program per vector core with an in-program loop over the same tiles) rather than reducing vector ops; exp2 and fp16-negative-branch variants were measured and were slower or UB-infeasible.",
+          "strategy_evolution": "Host overhead was the first lever (round 2, +14.7% aggregate); after it was exhausted, the large-case device structure became the limiter and program granularity delivered the remaining measured gain.",
+          "knowledge_assessments": []
+        }
+      }
+    }
+  ],
+  "view": {
+    "id": "mainline",
+    "session": "selu_",
+    "title": "selu_ 优化轨迹",
+    "subtitle": "历史 KGS 参考 · 本批 3 次正式评测",
+    "ylim": [
+      0,
+      1.1
+    ],
+    "annotations": [
+      {
+        "point": 2,
+        "method": "直接启动精简宿主路径",
+        "color": "probe",
+        "position": [
+          220,
+          285
+        ],
+        "arrow": [
+          540,
+          325
+        ]
+      },
+      {
+        "point": 3,
+        "method": "固定网格流式循环",
+        "color": "probe",
+        "position": [
+          930,
+          285
+        ],
+        "arrow": [
+          1210,
+          325
+        ]
+      }
+    ],
+    "legend": [
+      "paired",
+      "sim",
+      "knowledge",
+      "probe",
+      "ir"
+    ],
+    "gap": null,
+    "x_label": "本批正式评测顺序",
+    "plot_bottom": 745,
+    "nodes": [
+      {
+        "point": 1,
+        "location": "mixed"
+      },
+      {
+        "point": 2,
+        "location": "host"
+      },
+      {
+        "point": 3,
+        "location": "device"
+      }
+    ],
+    "delivery": {
+      "score": 1.0392916039566351,
+      "source": "operators/selu_/versions/independent_strict/retained/kernel.py",
+      "source_sha256": "8764018cfb2cab9444a34caf7a171f7eac7395656631698ce491e676557462f0",
+      "passed": 36,
+      "total": 36,
+      "result": "operators/selu_/evidence/retained/evaluation/result.json",
+      "result_sha256": "34d6285c927de59c8d73f6d0c9b8d29831a8c09c3908e4dead34bf38b3336c31",
+      "endpoint_same_source": false
+    },
+    "result_only": false,
+    "line_status": "下图：历史优化片段"
+  },
+  "history": [
+    {
+      "ledger_sha256": "57b12acfbcfb527b230259af82555b54671f27c75568f3244114b69efe2bcf5f",
+      "round": 1,
+      "source_sha256": "cec7c0259644289a130f84587b6ec1a605979ddb10a4acf4fd710b7c79fe44b0",
+      "evaluation": {
+        "evaluated_at": "2026-10-21T17:33:09.558325Z",
+        "status": "PASSED",
+        "geo_mean": 0.1303704995714201,
+        "num_workloads": 36,
+        "num_passed": 36
+      },
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Establish measured baseline with the FlagGems-derived elementwise selu_ kernel: one contiguous 1D in-place kernel plus a generic 4D strided kernel replacing the forbidden aten fallback",
+        "code_changes": "Seed code kept for the contiguous fast path (BLOCK_SIZE=1024, one program per block); the forbidden torch.ops.aten.selu_ fallback for non-contiguous or unsupported-dtype inputs was replaced by a self-authored strided kernel that decomposes the linear index into up to 4 padded dims and applies shape/stride offsets",
+        "hypothesis": "The single-block-per-program elementwise kernel is correct for all workloads, but small (1024 element) workloads are dominated by host launch overhead and large workloads by memory bandwidth",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "First measurement of the workspace; no comparison target"
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {},
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "completed",
+        "analysis_path": ".kernelgen/profile-analysis/round-0001.json",
+        "summary": "mixed: per-call host launch gap dominates every workload up to 1M elements, 4096x4096 case is scalar/issue bound, not MTE bandwidth bound"
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "Baseline is dominated by host-side launch overhead, not device work: msprof shows the 1024-element kernel runs 1.3 us while the eval walltime floor is 75 us at 1K, 64K and 1M elements alike, so ~63 us per call is spent in the Python/triton dispatch path (logger.debug + kwargs dispatch + lambda grid + torch_device_fn.device guard + JITFunction.run) versus 11.6 us for the reference. The 4096x4096 case (0.60 ms) is scalar/issue-bound, not memory-bound: aiv_scalar 0.627 of a 599 us kernel with mte2 0.118 and mte3 0.127, because a 16384-program grid of 1024-element blocks costs ~150 scalar/flag instructions per program.",
+        "perf_gap_analysis": "Baseline round: geo_mean 0.1304 with min_speedup 0.0819 (selu_-timing-11, 4096x4096 fp32). Every workload is slower than the reference; the profile attributes the small/medium floor entirely to host dispatch and the large cases to per-program scalar issue overhead. No prior measurement existed to compare against.",
+        "next_suggestion": "Reduce per-call host dispatch cost first (biggest lever: 4 of 12 timing workloads sit at the 75 us floor and 4 more are only ~14 us of kernel): bypass JITFunction.run with a cached compiled launcher (flag_gems libentry or a direct compiled-kernel handle), replace the lambda grid with a precomputed tuple, and drop the device-guard context and logger.debug from the hot path, keeping BLOCK_SIZE=1024 and the arithmetic identical so the effect is isolated.",
+        "optimization_level": "L1_architecture",
+        "debug_lesson": "Candidate admission rejects any torch.ops.aten fallback even for non-contiguous inputs, so general stride support must live in the candidate kernel (4D padded shape/stride decomposition).",
+        "strategy_evolution": "Established that the forbidden aten fallback in the seed must be replaced by an in-candidate strided kernel (preflight rejected torch.ops.aten.selu_), and that the next optimization must target host dispatch before tiling.",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "57b12acfbcfb527b230259af82555b54671f27c75568f3244114b69efe2bcf5f",
+      "round": 2,
+      "source_sha256": "13a6a1583c9cbf1f202f112e468f7d820366d0d22984fedd159287c402383034",
+      "evaluation": {
+        "evaluated_at": "2026-10-21T17:55:23.091798Z",
+        "status": "PASSED",
+        "geo_mean": 0.1296484231817655,
+        "num_workloads": 36,
+        "num_passed": 36
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Cut per-call host launch overhead while keeping the kernel, BLOCK_SIZE and arithmetic identical, so the effect is isolated to the dispatch path",
+        "code_changes": "Added _fast_launch(): it reuses triton's own device_caches/binder/compute_cache_key so the exact same specialization key (dtype, pointer alignment, divisibility) still selects the same compiled binary, then calls the cached CompiledKernel.run directly (grid, stream, function, packed_metadata, bound args) instead of JITFunction.run. On the first call for a specialization it returns False so the caller performs the stock literal kernel[grid](...) launch (single execution, compiles and caches); any exception permanently falls back to the stock path. Kernels, BLOCK_SIZE=1024, math and the strided path are unchanged.",
+        "hypothesis": "The dominant cost is host dispatch, not device work: measured per-call host submission is ~55 us for the triton JIT path versus ~30 us for a cached compiled-kernel launch and 7.5 us for torch.selu_. Bypassing JITFunction.run while keeping triton's specialization key should cut ~30 us from every workload whose kernel is only a few microseconds, leaving the 4096x4096 workloads (device bound) unchanged.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Removing triton's per-call option/hook/binding re-work drops host submission from ~55 us to ~30 us, which is the entire floor of the 1024/65536-element workloads and most of the 1048576-element ones"
+        },
+        "source": {
+          "origin": "analyzer",
+          "parent_round_num": 1
+        },
+        "key_params": {
+          "BLOCK_SIZE": 1024,
+          "launch_path": "cached CompiledKernel.run with triton specialization key"
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": false,
+        "status": "not_required",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "not_met",
+        "root_cause": "The intended launch-path bypass never took effect. JITFunction.run sets kwargs['debug'] and calls _flagprism.apply_compile_options(kwargs) before binder(), so the options that feed compute_cache_key differ from the ones obtained by my bare binder(x, n, BLOCK_SIZE=1024) call; the recomputed key therefore missed on every invocation. _fast_launch returned False each time and the caller executed the stock literal kernel[grid](...) launch, so round 2 was functionally identical to round 1 (same 66-69 us host floor, exact numerics).",
+        "perf_gap_analysis": "Expected ~30 us lower per-call floor on the 9 launch-bound workloads; observed only 75.0 -> 67.2 us (timing-0), 79.4 -> 65.8 (timing-2), 86.0 -> 66.4 (timing-10) and essentially unchanged 4096x4096 cases (0.604/0.601/0.604 ms), giving geo_mean 0.13037 -> 0.12965, i.e. no gain. The gap is fully explained by the fast path never launching: the in-process probe shows _SLOW remained False, the recomputed key's kernel_cache.get() returned None (compiled_type NoneType), so every call still ran the stock JIT launch at ~69 us/call in batch mode, matching the observed eval floor. Reference latencies also moved between rounds (11.6 -> 8.2-10.4 us on the small workloads), so the small delta is within environment noise rather than a real effect.",
+        "next_suggestion": "Key the cached launch on triton's own `specialization` list returned by binder (which is independent of the injected options) plus BLOCK_SIZE, and capture the compiled handle by diffing kernel_cache keys before/after the stock launch instead of recomputing the option-dependent cache key. Also use x.device.index instead of get_current_device. Re-verify on the target that the fast path actually launches (compiled handle found) and that one call performs exactly one kernel execution.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "A cached compiled-kernel fast path must be validated in-process: assert that the lookup actually hits (here kernel_cache.get(key) was None on every call) instead of inferring engagement from the measured latency alone. Recomputing triton's cache key from binder() alone is invalid because run() injects FlagPrism compile options and debug into the options before binding.",
+        "strategy_evolution": "Round 1 showed host dispatch dominates 9 of 12 timing workloads; round 2 attempted a cached compiled-kernel launch but silently fell back to the JIT path due to a cache-key mismatch. Next round must fix the key derivation and prove engagement on the target before evaluating.",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "9d18c0d1e8f6a7584cbf415687222a1736f1e61c92f3f8aa4512f7997340af48",
+      "round": 1,
+      "source_sha256": "c212a8f40def1789e16b94c67aff067ba44c138ebc9bbe9852283067de6458c0",
+      "evaluation": {
+        "evaluated_at": "2026-10-22T04:57:56.381159Z",
+        "status": "PASSED",
+        "geo_mean": 0.7301211496336593,
+        "num_workloads": 36,
+        "num_passed": 36
+      },
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Measure the provided best-so-far selu_ candidate unchanged to establish the authoritative baseline",
+        "code_changes": "None; seed written verbatim (buffered Triton elementwise kernels + cached raw Ascend launcher path + constexpr-stride generic kernel for non-contiguous inputs)",
+        "hypothesis": "The seed's cached raw launcher minimizes host overhead; its 8192-element tile caps vector-core occupancy, so large shapes leave bandwidth and small shapes leave launch latency on the table",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "No change; records reference candidate latency for all 12 timing workloads"
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {},
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "failed",
+        "analysis_path": ".kernelgen/profile-analysis/round-0001.json",
+        "summary": "failed: msprof base collection exited successfully without profile completion marker. Deterministic on 2 attempts (5 workloads, then selu_-timing-11 alone). No device counters, pipeline utilization, UB usage, sync stalls or kernel durations exist for round 1: every manifest records status=failed with capabilities=[] and artifacts=[]. Because the artifact list is empty, this analysis carries no evidence-backed findings; the quantitative reasoning below is derived from the authoritative round-1 ev"
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "Baseline recorded. Two independent cost centers, both measured: (1) 9 of 12 timing workloads are host-launch bound and flat at ~16.1-17.5us regardless of numel (fp32: 16.110us at numel=1024 vs 16.112us at numel=1048576). Debug measurement on the target splits this into a 12.25us raw Ascend launcher call plus ~2.1us of avoidable Python dispatch in run() (numel/is_contiguous/data_ptr/tuple/dict), on top of which the harness adds ~1.4us; the framework reference launches in 8.65us. (2) The 3 4096x4096 workloads are device-bound at ~82-83us and the device cost is a fixed ~1.5us per TILE, not a bandwidth or vector-throughput limit: fp16 (67MB) and fp32 (134MB) take the same 82-83us, a pure copy kernel costs the same as the SELU kernel at the same tile size, and cost scales with tile COUNT (selu fp16 at BLOCK 1024/2048/4096/8192 = 607/300/160/82us). A 16384 tile halves the tile count and halves device time (pure copy 78us -> 40us), but the 192KB UB budget with auto multi-buffering blocks a 16384 tile for fp32 and bf16.",
+        "perf_gap_analysis": "",
+        "next_suggestion": "Two evidence-backed levers, in expected-value order. First the host path, which governs 9 of 12 workloads: replace the per-call Python dispatch with an object-identity fast path so a repeated tensor skips numel/is_contiguous/data_ptr/tuple/dict (~2.1us measured), and keep the raw launcher (graph replay was measured slower at 46us and numerically incorrect, so it is discarded). Second the device path: give fp16 a 16384-element tile with native-precision math (verified max_abs 0.0039 vs the 0.015 atol), which measured 46.5us vs 82us for the 4096x4096 case; bf16 and fp32 must stay at 8192 because every 16384 formulation and every num_stages=2 pipelined loop overflows UB, and num_stages>2 is rejected by the compiler.",
+        "optimization_level": "L1_architecture",
+        "debug_lesson": "Pipelined-loop timing at 40+ iterations cannot resolve device cost; measuring through the cheap raw launcher with a known host floor, plus dtype and tile-size sweeps, isolated a per-TILE latency model (~1.5us/tile/40 vector cores) that predicted the pure-copy result exactly. Per-call torch.npu.synchronize() adds a ~50us constant and must not be used for absolute latency.",
+        "strategy_evolution": "",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "9d18c0d1e8f6a7584cbf415687222a1736f1e61c92f3f8aa4512f7997340af48",
+      "round": 2,
+      "source_sha256": "8d098b024ee2abdc1b331d3ec962285133c3737c8995cb7ef34e9e848f5b9a75",
+      "evaluation": {
+        "evaluated_at": "2026-10-22T05:16:53.686503Z",
+        "status": "PASSED",
+        "geo_mean": 1.001556545566768,
+        "num_workloads": 36,
+        "num_passed": 36
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Collapse the per-call host dispatch to a single object-identity test plus a fully pre-bound raw launch",
+        "code_changes": "run() now keeps a (tensor-object, zero-argument launch) pair: when the same tensor object is passed again it dispatches straight through the pre-bound launch behind one identity test. The per-specialization launch also bakes the integer data pointer (the raw launcher accepts an int for a tensor parameter), so the cache key becomes (dtype, numel, aligned, ptr) and no per-call argument is rebuilt. Kernels, tiles and math are byte-identical to round 1, and non-contiguous/misaligned calls keep ordinary Triton launches.",
+        "hypothesis": "Nine of twelve timing workloads are purely host-launch bound and flat in numel, so cutting the ~2.1us of measured Python dispatch per call raises only those nine and leaves the three 4096x4096 device-bound workloads unchanged",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Target debug timing showed run()'s per-call Python dispatch (dtype/numel/data_ptr tuple, dict lookup, closure arguments) cost ~2.1us on top of the 12.25us raw launcher, so removing it should drop the nine launch-bound workloads from ~16.1us toward ~13-14us"
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": null
+        },
+        "key_params": {
+          "BLOCK_MAX": 8192,
+          "fast_path": "object-identity"
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "failed",
+        "analysis_path": ".kernelgen/profile-analysis/round-0002.json",
+        "summary": "failed: msprof base collection exited successfully without profile completion marker (reproduced on 5 attempts across metrics and instruction levels; zero artifacts returned for selu_-timing-11, selu_-timing-3, selu_-timing-7 and selu_-timing-6)"
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "met",
+        "root_cause": "The nine launch-bound workloads were paying per-call Python dispatch (dtype/numel/data_ptr tuple construction, dict lookup, and argument marshalling into the launcher) on top of the raw launch. Binding the data pointer into the specialization and short-circuiting a repeated tensor behind one identity test removed it. The three 4096x4096 workloads are untouched because they are device-bound by per-TILE latency, not host-bound: 2048 tiles of 8192 elements at ~1.5us each over 40 vector cores.",
+        "perf_gap_analysis": "Predicted the nine launch-bound workloads would fall from ~16.1-17.5us toward ~13-14us; they fell further, to 9.0-10.4us, so the gap vs prediction is favourable (about 4us better than forecast) and every one of the nine now exceeds the reference (speedups 1.03-1.23 vs 0.72-0.84). The per-call Python dispatch removed was larger in the real harness than the 2.1us measured in isolation, which is consistent with the harness's own per-call wrapper being charged once per iteration rather than once per debug loop. The three 4096x4096 workloads are unchanged within noise (81.6/83.2/82.7us vs 81.9/83.2/82.7us baseline, speedups 0.696/0.710/0.597 vs 0.694/0.710/0.598), exactly as predicted for a purely host-side change, and they are now the whole remaining deficit: 2.4us of it is the host launch floor and ~77us is the device term of 2048 tiles x ~1.5us / 40 vector cores.",
+        "next_suggestion": "Take the device side next, which is now the only remaining gap (timing-3/7/11 at 0.696/0.710/0.597 while all nine host-bound workloads already exceed parity). Give fp16 a 16384-element tile with native-precision math: it halves the tile count, measured 46.5us vs 82us pre-regression on the same shape, and its accuracy was verified at max_abs 0.0039 against a 0.015 atol. In the same probe series, test whether passing the destination as a second pointer parameter removes a conservative aliasing serialization that could be the source of the ~1.5us per-tile latency, which is the only route left to help bf16 and fp32 at their UB-capped 8192 tile.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "",
+        "strategy_evolution": "",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "728c02f5d5ef13da5a17926c91b5c4552a9c9035614eef8bed1843f353d0a645",
+      "round": 1,
+      "source_sha256": "49bdbb789d497b6423f893f3433167f3fd4bc61197676236bd62a9ec79c7dd91",
+      "evaluation": {
+        "evaluated_at": "2026-10-22T07:56:02.756086Z",
+        "status": "PASSED",
+        "geo_mean": 0.8251829725485884,
+        "num_workloads": 36,
+        "num_passed": 36
+      },
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Establish the measured baseline for the injected best-so-far seed (aligned-address direct launcher, dtype-capped UB block, stride-correct in-place writes).",
+        "code_changes": "None; seed written verbatim to tmp/main.py.",
+        "hypothesis": "The seed is correct on all 36 workloads and gives the starting latency for the 12 timing cases.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "Reference point for later experiments."
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {},
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "completed",
+        "analysis_path": ".kernelgen/profile-analysis/round-0001.json",
+        "summary": "mixed: Small cases are host/launch-bound: the device task is 12.6% of the evaluated walltime, At identical element count and identical logical bytes, the non-fp16 fp32-math path costs 2.08x the fp16 vector time, Scalar prologue cost is purely per-program; the 8192 block cap doubles it on bf16/fp32 without evidence of internal sub-tiling"
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "Baseline established: 36/36 PASS, geo_mean 0.825. Two independent bottlenecks identified. (1) Nine of the twelve timing workloads are host-launch bound: profiled device task duration for selu_-timing-0 (fp16 [1024]) is 1.65 us against a 13.16 us walltime, and a target-side host-cost probe measured the candidate's per-call host path at 12.17 us versus 11.5 us for the PyTorch reference wrapper shape and 9.2 us for the bare compiled-launcher floor. (2) The three large workloads are device bound and dominated by the number of MTE transfers rather than by bytes or program count: the candidate runs fp16 [4096,4096] at 45.6 us (vector 27.2 us), bf16 at 83.2 us (vector 56.7 us) and fp32 at 82.6 us (vector 46.3 us); a target probe shows a pure copy kernel at BLOCK 16384 costs 40.2 us versus 78.1 us at BLOCK 8192 for the same bytes, and 2 tiles per program at BLOCK 8192 costs 77.3 us, so device time tracks transfer count, and the fp32-domain math needs three full-width UB tiles live, which caps BLOCK at 8192 for bf16/fp32 (every BLOCK 16384 variant fails to compile with ub overflow, including enable_ubuf_saving and a tightened fma form).",
+        "perf_gap_analysis": "No previous measurement to compare against; this round fixes the reference point. Gap decomposition for the next experiments: on the nine host-bound workloads the candidate is 5.8% above its own achievable host floor (12.17 us measured vs 11.50 us for a prebound-method, numel-keyed, single-frame launch path) and 1.4x above the reference (10.47 us at timing-0); on the large workloads the transfer-count model predicts bf16 can move from 83.8 us to about 64.5 us if the fp32-domain math is replaced by fp16-width math so that BLOCK can double to 16384 (probed: 64.45 us, max abs error 0.0175 with 0 of 16777216 elements outside the bf16 tolerance), while fp32 has no compilable BLOCK 16384 form and stays transfer-bound.",
+        "next_suggestion": "Target the host-bound majority first: replace the per-call dispatch with the probed faster launch path (bound Tensor methods hoisted to module scope, dictionary keyed by numel instead of a (numel, align) tuple, launcher closures taking only the pointer, all inside a single Python frame) while still reading this call's address, dtype, contiguity and current stream, which the target probe measured at 11.50 us versus 12.17 us for the current path.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "The three tensor-metadata reads, the dict key and the address-subclass construction each cost ~0.25-0.35 us in isolation but ~2.2 us in total under a saturated launch queue, so per-call Python work has to be judged under real queue pressure, not in a microbenchmark; and UB overflow is a compile-time error, so tile-width feasibility for each dtype can be enumerated cheaply before any measurement.",
+        "strategy_evolution": "Round 1 is the injected best-so-far seed measured unchanged; profile plus target-side probes replaced guessing about which of the two regimes (host launch vs device transfer count) to attack, and they show the two require different changes, so the loop proceeds host-path first and tile/math-width second.",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "728c02f5d5ef13da5a17926c91b5c4552a9c9035614eef8bed1843f353d0a645",
+      "round": 2,
+      "source_sha256": "9ac565b2a89fc4f4da3c38bfd231cf2da46e57705344d596d51ac27a34c27aa8",
+      "evaluation": {
+        "evaluated_at": "2026-10-22T08:29:33.659624Z",
+        "status": "PASSED",
+        "geo_mean": 0.8839117631467809,
+        "num_workloads": 36,
+        "num_passed": 36
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Shrink the per-call host launch path while keeping this call's address, dtype, contiguity and current stream reads intact.",
+        "code_changes": "run() now reads only this call's address, numel, dtype, contiguity and (inside the launcher) the current stream; Tensor methods are module-level bound functions; the dispatch table is keyed by numel instead of a (numel, align) tuple; launcher closures take only (tensor, address); the lookup, dtype/contiguity validation and the launcher call happen in one Python frame. Kernels, BLOCK selection, masked/strided paths and the profiler gate are unchanged.",
+        "hypothesis": "Nine of twelve timing workloads are host-launch bound (profiled device task 1.65 us against a 13.16 us walltime for selu_-timing-0), so removing per-call Python dispatch work, not device work, is what moves the headline metric; a target-side interleaved A/B measured the shipped form at 11.50 us versus 12.17 us for the current path.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Host-side per-call work drops by the ~0.7 us measured on target (12.17 -> 11.50 us per call), and the nine host-bound timing workloads carry only 1.65 us of device task, so their walltime latency should fall almost one-for-one."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": 1
+        },
+        "key_params": {
+          "BLOCK_fp16": 16384,
+          "BLOCK_other": 8192,
+          "table_key": "numel"
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "completed",
+        "analysis_path": ".kernelgen/profile-analysis/round-0002.json",
+        "summary": "mixed: Small workloads: >=87% of eval walltime is outside the profiled device kernel, Large bf16: vector pipe is 2.08x the fp16 control at identical byte volume; the fp32 upcast branch is the mechanism, Large fp32: device task is 1.57x the reference-side device time and is vector-dominated, not transfer-dominated"
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "met",
+        "root_cause": "Confirmed the round-1 root cause for the host-bound majority: with only 1.65 us of device task per call, the per-call Python dispatch and launcher arguments were the whole cost, and removing the tuple key, the per-call method lookups and the extra closure frame cut 0.3-1.8 us per call. The remaining host floor is the compiled Triton launcher itself (~9.2 us per call, versus ~5.5-7.2 us for the full torch reference op), which is not reducible from the wrapper, so those workloads now sit at roughly the achievable limit (0.87-0.92 except where reference drift dominates).",
+        "perf_gap_analysis": "Predicted a ~0.7 us per-call host saving on the nine host-bound workloads (measured 12.17 -> 11.50 us on target) and observed exactly that direction: timing-0 13.164 -> 12.848 us, timing-2 12.777 -> 12.410, timing-5 14.371 -> 12.543, timing-6 13.804 -> 12.531, timing-10 12.349 -> 12.440, while timing-8/9 moved the other way by 0.6-1.0 us (12.786 -> 13.387, 12.359 -> 13.324). Aggregate geo_mean rose 0.8252 -> 0.8839 (+7.1%), larger than the 5.5% host-path delta because the reference latencies for those workloads were also measured higher this round (timing-1 reference 10.712 -> 13.804 us, giving that workload 0.825 -> 1.090), so part of the aggregate gain is reference-side drift rather than candidate improvement. The three large workloads were unchanged by design (same kernels, BLOCK and grid): timing-3 45.588 -> 45.603 us (1.249 -> 1.248) and timing-7 83.246 -> 83.310 us (0.710) reproduce round 1, while timing-11 measured 82.649 -> 92.166 us (0.596 -> 0.572) even though its device path is byte-identical, and its reference moved 49.301 -> 52.681 us in the same direction, so that entry is device-level drift on a shared card, not a regression from this change; a target probe measured the same fp32 config at 83.8 and 98.4 us in two consecutive runs, bounding that noise at roughly +/-15%.",
+        "next_suggestion": "Attack the bf16 large case with the already-probed narrowing: bf16 currently runs fp32-domain math, which needs three full-width UB tiles and caps BLOCK at 8192 (2048 MTE transfers, 83.3 us); doing the math at fp16 width compiles at BLOCK 16384 (1024 transfers) and was probed at 64.45 us with 0 of 16777216 elements outside the bf16 tolerance, so expect selu_-timing-7 to move from 0.71 toward 0.9.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "On the walltime-timed small workloads the reference latency itself moves 10-30% between rounds (timing-1 reference 10.71 us in round 1 vs 13.80 us in round 2), so a single round's per-workload speedup at the ~12 us scale is not by itself evidence about a code change; only changes large enough to clear that noise, or device-task-duration evidence, should drive the next experiment.",
+        "strategy_evolution": "Round 1 established two separate regimes; round 2 spent the whole round on the host-launch regime because it covers nine of twelve timing workloads. That lever is now largely exhausted, so the next round moves to the device regime for bf16 (transfer count via tile width), and fp32 remains the open problem because no BLOCK 16384 form compiles for fp32-domain math.",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "728c02f5d5ef13da5a17926c91b5c4552a9c9035614eef8bed1843f353d0a645",
+      "round": 3,
+      "source_sha256": "eda640d7c9c779606d02b45f4b64a09475f397779b379486ca8c0ecef7d09f85",
+      "evaluation": {
+        "evaluated_at": "2026-10-22T08:33:02.941853Z",
+        "status": "PASSED",
+        "geo_mean": 0.8669973390795919,
+        "num_workloads": 36,
+        "num_passed": 36
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Narrow the bf16 math width so the bf16 tile can double, halving its MTE transfer count.",
+        "code_changes": "_selu_nomask/_selu_masked gain an explicit bfloat16 branch that casts the loaded tile to float16, runs the same fp16-width expression, and rounds the result back to bfloat16; _pick_block now caps BLOCK at 8192 only for float32 (16384 for fp16 and bf16). fp32 path, strided kernel, host dispatch and profiler gate unchanged.",
+        "hypothesis": "bf16 runs fp32-domain math, whose three live full-width UB tiles cap BLOCK at 8192 and therefore double the MTE transfer count; doing the math at fp16 width fits BLOCK 16384. Target probe at n=16777216: 83.82 us for the current bf16 form versus 64.45 us for the fp16-width form, with 0 of 16777216 elements outside the bf16 tolerance (max abs error 0.0175).",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Halving the bf16 program count halves the MTE transfers (2048 -> 1024 for 16.7M elements), which is the cost driver measured on this target."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": 2
+        },
+        "key_params": {
+          "BLOCK_bf16": 16384,
+          "BLOCK_fp16": 16384,
+          "BLOCK_fp32": 8192
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": false,
+        "status": "not_required",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 3,
+        "expectation_status": "partially_met",
+        "root_cause": "The bf16 root cause is confirmed and was fixed as predicted: bf16 was running fp32-domain math, which needs three live full-width UB tiles and therefore caps BLOCK at 8192, doubling the MTE transfer count relative to fp16 at BLOCK 16384; the fp16-width bf16 branch compiles at 16384 and delivers the predicted 63.5 us. The aggregate regression has a different, unrelated cause: bilateral machine-level drift of about 12% on the host-bound small workloads between the round-2 and round-3 measurements, which the retest quantified and which no code change in this round could have produced.",
+        "perf_gap_analysis": "The frozen expectation was that halving the bf16 transfer count would move selu_-timing-7 from 0.71 toward 0.90, and the workload-level evidence matched exactly: 83.310 -> 63.477 us, speedup 0.710 -> 0.932, versus the 64.45 us that the pre-round target probe predicted, with correctness unchanged (0 bad elements; bf16 correctness cases still 1.0 matched ratio, max rel err 0.044). The aggregate nevertheless fell from 0.8839 to 0.8670 because the nine small workloads, whose kernels and host path are byte-identical to round 2 and which this change cannot affect, all moved +1.5 to +2.0 us together with their own reference latencies. A full-suite retest confirmed the drift was bilateral and not the candidate: reference latencies returned to 10.46-11.75 us (from 11.94-13.30) and candidate latencies to 11.64-13.66 us, giving a remeasured geo_mean of 0.8727 with timing-7 (63.472 us) and timing-11 (82.682 us) unchanged within 0.1%. So the device change delivered its predicted 31% on timing-7, while the headline metric moved the opposite way purely through measurement drift on the host-bound majority; the round is not an improvement on the ledger even though its kernel is strictly better on the one workload it targets.",
+        "next_suggestion": "Re-establish the verified bf16 narrowing (it is a real 83.3 -> 63.5 us device win on selu_-timing-7 and has no effect on any other dtype, since the bf16 branch is compile-time eliminated elsewhere) and, in the same submission, recover the remaining host-side slack measured on target by dropping the extra Python frame and the unused tensor argument on the launcher call, then verify the combined form under the retest path if the two sides drift again.",
+        "optimization_level": "L2_memory",
+        "debug_lesson": "A geo_mean comparison across rounds on this shared card is only meaningful if both sides moved together: here the reference latencies for the nine small workloads swung 11.7 -> 12.5 -> 11.2 us mean across three measurements of the same code, which is larger than any host-path change made so far. Round-to-round comparisons therefore need the retest path or a per-workload device-task measurement before concluding that a candidate regressed.",
+        "strategy_evolution": "Round 2 exhausted the host-launch lever; round 3 moved to the device/transfer-count regime and its mechanism was verified per workload, but the ledger decision is dominated by drift on the other twelve-twelfths of the suite. Strategy changes accordingly: subsequent rounds must pair a verified device win with same-state verification (retest) rather than trusting a single cross-round aggregate.",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "c3e781a71f127085c795c6bfe57104b14e9c003ec19a663467115f803d32096d",
+      "round": 1,
+      "source_sha256": "49bdbb789d497b6423f893f3433167f3fd4bc61197676236bd62a9ec79c7dd91",
+      "evaluation": {
+        "evaluated_at": "2026-10-22T15:40:45.011081Z",
+        "status": "PASSED",
+        "geo_mean": 0.7526967977178296,
+        "num_workloads": 36,
+        "num_passed": 36
+      },
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Establish the authoritative baseline for the unmodified best-so-far SELU in-place seed",
+        "code_changes": "None; seed copied byte-identically from the provided best-so-far source",
+        "hypothesis": "The seed's per-dtype UB block sizing (16384 fp16 / 8192 else), direct-launch fast path and full-stride generic kernel reproduce the parent measurements; per-workload latencies reveal whether large cases are vector-bound (exp) or launch-bound",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "No change; records per-workload latency and speedup decomposition for all 12 timing cases"
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {},
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "Baseline decomposition: 9 of 12 timing workloads are host-launch-bound (18.2-19.1us vs reference 12.6-14.1us, speedups 0.71-0.74); the three large ones are device-bound with 1.246x (fp16 16M), 0.709x (bf16 16M) and 0.596x (fp32 16M).",
+        "perf_gap_analysis": "No previous measurement to compare. Measured means on device (bounded debug probes, same session): full call 14.0us for 1024 elements of which the compiled launcher's C call is ~9.4-10.2us and Python work ~3.5us (stream get 0.62, address wrapper 0.57, numel/data_ptr/dict/contiguity ~1.0, call frames ~1.5), while torch.selu_ is 7.4-9.0us. On the 16M cases the device body is ~70us (fp32), of which a pure copy is already ~64us at ~2 TB/s; a persistent grid-stride copy reached 46us, so per-program tile overhead (not arithmetic) is the large-case limiter.",
+        "next_suggestion": "Keep the kernel math identical and cut host work per call: cache the compiled launcher primitives keyed by data pointer, verify dtype/numel/contiguity, and invoke the generated launcher directly with the current bare integer address (confirmed accepted and numerically correct on target) and current stream, dropping the int-subclass address wrapper and one Python frame.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "Measuring through the standard Triton entry (53us) hides device time; only the direct launcher path gives a usable device-time comparison. Also grid must be a tuple, and driver.active.get_current_stream returns a raw int on this build, so the candidate's own _resolve_stream accessor must be used for stream reads.",
+        "strategy_evolution": "Baseline established with per-workload latency decomposition; conclusions drawn from bounded target probes rather than from aggregate ratios.",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "c3e781a71f127085c795c6bfe57104b14e9c003ec19a663467115f803d32096d",
+      "round": 2,
+      "source_sha256": "8764018cfb2cab9444a34caf7a171f7eac7395656631698ce491e676557462f0",
+      "evaluation": {
+        "evaluated_at": "2026-10-22T15:54:38.671691Z",
+        "status": "PASSED",
+        "geo_mean": 0.8632226350837635,
+        "num_workloads": 36,
+        "num_passed": 36
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Cut per-call host overhead by invoking the compiled launcher directly with a bare integer address from a single fast-path frame",
+        "code_changes": "Cache (dtype, numel, masked, launcher.launch, grid, function, packed_metadata, stream_getter) keyed by data_ptr; fast path verifies contiguity/dtype/numel then calls the generated launcher inline with the current bare integer address and current stream. The int-subclass address wrapper and the inner launch closure frame are gone; masked/strided/unaligned/debug paths unchanged.",
+        "hypothesis": "The nine small timing workloads are host-launch-bound at ~18.5us, of which ~3.5us is Python-side work measured directly on target (address wrapper 0.57us, stream 0.62us, numel/data_ptr/dict/contiguity 1.0us, extra frame); eliminating the wrapper object and the inner closure frame will raise every small-case speedup from ~0.73 to ~0.83",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Removes ~2.3us of per-call Python from the measured path (address object 0.57us, wrapper frame ~1.5us, tuple key) while keeping the same 9.4us compiled launcher, so the nine launch-bound workloads should move from ~18.5us toward ~16us"
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": null
+        },
+        "key_params": {
+          "address": "bare int",
+          "cache_key": "data_ptr"
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "met",
+        "root_cause": "Per-call Python work dominated the nine small workloads; eliminating the int-subclass address construction and the intermediate launch closure frame brought the measured full call from ~18.5us to ~13.4us while the device body stayed identical.",
+        "perf_gap_analysis": "Predicted ~2.3us of removable Python per call; observed 18.5 -> 13.4us (about 5.1us) on all nine small cases, so the expectation was exceeded. Aggregate 0.7527 -> 0.8632. Per workload: small cases 0.7395/0.7137/0.7214/0.7371/0.7409/0.7416/0.7298/0.7426/0.7514 -> 0.8695/0.8832/0.9017/0.8926/0.8922/0.8930/0.8977/0.8582/0.8499; timing-3 unchanged 1.246 -> 1.250; timing-7 unchanged 0.709 -> 0.710; timing-11 unchanged 0.596 -> 0.598, i.e. the device body was untouched as intended. Remaining gap on small cases is the compiled launcher call itself (~9.4us, confirmed by direct measurement) against a reference at ~11.7us.",
+        "next_suggestion": "The nine launch-bound cases are now within ~1.7us of the reference and the remaining host work is the compiled launcher itself (~9.4us) plus irreducible metadata reads, so switch to the large cases: give the three 16M contiguous workloads a persistent grid-stride SELU kernel (grid = num_vectorcore, current dtype block, num_stages=1 so the tile still fits UB) to cut per-program tile overhead.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "The direct-launcher path is only cheap if the surrounding Python is cheap too: removing the int-subclass address object and the inner closure frame cut much more (5.1us) than the isolated probe costs suggested, because the closed-over stream/address/defaults were re-evaluated down two Python frames per call.",
+        "strategy_evolution": "Baseline identified host launch overhead as the dominant aggregate lever; the host fast-path rewrite realized it, so the remaining budget goes to the three device-bound large cases.",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "c3e781a71f127085c795c6bfe57104b14e9c003ec19a663467115f803d32096d",
+      "round": 3,
+      "source_sha256": "0e782a69158783eb900458c93ca3531737ecaa2579739621ffcc9b3415ac7622",
+      "evaluation": {
+        "evaluated_at": "2026-10-22T15:58:25.626329Z",
+        "status": "PASSED",
+        "geo_mean": 0.8870867172659556,
+        "num_workloads": 36,
+        "num_passed": 36
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Persistent grid-stride kernel for long contiguous tensors to cut per-program overhead on the three large timing workloads",
+        "code_changes": "Added _selu_persist(X, TILES, G, BLOCK) grid-stride kernel; for contiguous inputs with n % block == 0 and tiles >= 4 * num_vectorcore the entry binds this kernel with grid=num_vectorcore and num_stages=1 (falls back to the plain tile grid if that compile fails). Host fast path, masked, strided and fallback paths unchanged.",
+        "hypothesis": "On the 16M cases the device body is limited by per-program tile cost rather than arithmetic (a pure copy at the same tile size costs 78us vs 83us for the full SELU), and a persistent grid-stride kernel measured 73.9us vs 83.0us for f32 and 75.5us vs 83.8us for bf16 with grid=num_vectorcore",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Replaces ~1024-2048 short-lived programs with one program per vector core looping over the same dtype-sized tiles, removing the per-program setup cost that dominates the 16M cases"
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": null
+        },
+        "key_params": {
+          "BLOCK": "16384 f16 / 8192 else",
+          "grid": "num_vectorcore (queried)",
+          "num_stages": 1,
+          "tiles_per_core_min": 4
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "failed",
+        "analysis_path": ".kernelgen/profile-analysis/round-0003.json",
+        "summary": "failed: msprof base collection exited successfully without profile completion marker (4/4 workloads: selu_-timing-11, selu_-timing-7, selu_-timing-3, selu_-timing-0). The service declared capabilities performance_counters, pipeline_utilization, kernel_profile and instruction_listing, but every result returned an empty capability set, an empty artifact list and no metrics, so no artifact could be cited as evidence."
+      },
+      "conclusion": {
+        "round_num": 3,
+        "expectation_status": "met",
+        "root_cause": "The 16M workloads were limited by per-program tile overhead rather than arithmetic; one persistent program per vector core looping over the same dtype-sized tiles removed 8-10us of device time while keeping the tile inside the UB budget via num_stages=1.",
+        "perf_gap_analysis": "Predicted ~+2.7% aggregate from ~10% device gains on the three large cases; observed 0.8632 -> 0.8871 (+2.8%). Per workload: timing-3 1.250 -> 1.359 (45.6 -> 41.9us), timing-7 0.710 -> 0.783 (83.3 -> 75.5us), timing-11 0.598 -> 0.677 (82.7 -> 72.9us); the nine launch-bound cases stayed in the same 11.6-13.1us band (0.82-0.94, reference timing itself drifted down to 9.6-11.8us). The gains match the probe prediction almost exactly (probe: f32 83.0 -> 73.9us, bf16 83.8 -> 75.5us, f16 46.4 -> 42.3us). Remaining gap: fp32 16M is still 1.48x off the reference and a measured persistent copy floor of ~60us for the same traffic bounds further pure-kernel improvement to ~13us.",
+        "next_suggestion": "The persistent path is bound at one program per vector core (G = num_vectorcore, num_stages=1). The next experiment should test 2 programs per vector core (grid = 2 * num_vectorcore, which needs no extra UB) and, independently, routing the 1M-element workloads through the persistent path, since bf16 16M still trails the reference at 0.783 and the fp32 16M copy floor (~60us measured) leaves ~13us of headroom.",
+        "optimization_level": "L1_architecture",
+        "debug_lesson": "Per-program tile cost, not arithmetic, dominated the 16M cases: an identical-tile pure copy cost 78us of 83us, so the winning change was program granularity (one program per vector core with an in-program loop over the same tiles) rather than reducing vector ops; exp2 and fp16-negative-branch variants were measured and were slower or UB-infeasible.",
+        "strategy_evolution": "Host overhead was the first lever (round 2, +14.7% aggregate); after it was exhausted, the large-case device structure became the limiter and program granularity delivered the remaining measured gain.",
+        "knowledge_assessments": []
+      }
+    }
+  ],
+  "gap": null,
+  "relation_note": "按同一原始账本正式轮次展示；未逐编辑恢复的关系不声称直接源码继承。",
+  "delivery": {
+    "score": 1.0392916039566351,
+    "source": "operators/selu_/versions/independent_strict/retained/kernel.py",
+    "source_sha256": "8764018cfb2cab9444a34caf7a171f7eac7395656631698ce491e676557462f0",
+    "passed": 36,
+    "total": 36,
+    "result": "operators/selu_/evidence/retained/evaluation/result.json",
+    "result_sha256": "34d6285c927de59c8d73f6d0c9b8d29831a8c09c3908e4dead34bf38b3336c31",
+    "endpoint_same_source": false
+  },
+  "current_cann_score": 1.0392916039566351,
+  "historical_simulator_files": 4
+}

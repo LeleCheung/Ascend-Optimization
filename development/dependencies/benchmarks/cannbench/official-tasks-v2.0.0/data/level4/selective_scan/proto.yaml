@@ -1,0 +1,80 @@
+attrs: []
+category: FusedComposite
+description: Mamba S6 选择性状态空间扫描算子，融合离散化、时间维递归扫描、输出投影、跳跃连接与 SiLU 门控
+difficulty: L4
+formula: 'dA[b,l,d,n] = exp(delta[b,l,d] * A[d,n])                    # 离散化状态转移: einsum(''bld,dn->bldn'')
+
+  dBu[b,l,d,n] = delta[b,l,d] * B_mat[b,l,n] * u[b,l,d]       # 离散化输入注入
+
+  h_t = dA_t ⊙ h_{t-1} + dBu_t                                # 时间维递归扫描 (h_0 = 0)
+
+  y[b,l,d] = Σ_n C_mat[b,l,n] * h[b,l,d,n] + D_skip[d] * u[b,l,d]  # 输出投影 + 跳跃连接
+
+  y = y ⊙ SiLU(z)                                             # SiLU 门控: SiLU(z) =
+  z * sigmoid(z)
+
+  '
+inputs:
+- description: 输入序列特征
+  dtype:
+  - bfloat16
+  - float16
+  - float32
+  name: u
+  shape: '[B, L, D]'
+- description: 输入依赖的离散化步长 Δ，要求严格为正（评测用例 value_range [0.001, 0.1]），保证离散化数值稳定
+  dtype:
+  - bfloat16
+  - float16
+  - float32
+  name: delta
+  shape: '[B, L, D]'
+- description: 连续域状态转移矩阵，要求严格为负（评测用例 value_range [-1, -0.01]），保证 dA = exp(delta*A)
+    ∈ (0, 1)、递归收缩稳定
+  dtype:
+  - bfloat16
+  - float16
+  - float32
+  name: A
+  shape: '[D, N]'
+- description: 输入依赖的输入投影矩阵 B（选择性机制）
+  dtype:
+  - bfloat16
+  - float16
+  - float32
+  name: B_mat
+  shape: '[B, L, N]'
+- description: 输入依赖的输出投影矩阵 C（选择性机制）
+  dtype:
+  - bfloat16
+  - float16
+  - float32
+  name: C_mat
+  shape: '[B, L, N]'
+- description: 跳跃连接（skip connection）缩放系数
+  dtype:
+  - bfloat16
+  - float16
+  - float32
+  name: D_skip
+  shape: '[D]'
+- description: SiLU 门控分支输入
+  dtype:
+  - bfloat16
+  - float16
+  - float32
+  name: z
+  shape: '[B, L, D]'
+name: SelectiveScan
+outputs:
+- description: 选择性扫描输出序列，dtype 与输入一致
+  dtype:
+  - bfloat16
+  - float16
+  - float32
+  name: y
+  shape: '[B, L, D]'
+schema: selective_scan(Tensor u, Tensor delta, Tensor A, Tensor B_mat, Tensor C_mat,
+  Tensor D_skip, Tensor z) -> Tensor y
+shape_support: u/delta/z [B, L, D]，A [D, N]，B_mat/C_mat [B, L, N]，D_skip [D]，输出 y
+  [B, L, D]

@@ -24,27 +24,39 @@ def execute(command,log,*,cwd,timeout=1500):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',type=Path,required=True)
-    parser.add_argument('action',choices=['context','preflight'])
+    parser.add_argument('action',choices=['context','preflight','decision'])
     parser.add_argument('--source',type=Path)
+    parser.add_argument('--record',type=Path)
     args=parser.parse_args()
     config=read(args.config)
     run=Path(config['run_directory']);repo=Path(config.get('repository', config['run_directory']));workspace=run/'workspace'
+    def report(value):
+        from hgkda.runtime.trace import emit
+        emit(config,'tool_result',action=args.action,outcome=value)
+        print(json.dumps(value,ensure_ascii=False))
+    if args.action=='decision':
+        from hgkda.runtime.trace import record_decision
+        path=args.record or workspace/'diagnosis.json'
+        # 相对路径由模型工作区解释，文件不能来自其他实验目录。
+        path=((workspace/args.record) if args.record and not args.record.is_absolute() else path).resolve()
+        assert path.is_relative_to(workspace.resolve()),'decision must be inside current workspace'
+        report(record_decision(config,read(path)));return
     if args.action=='context':
         if config.get('context_kind')=='operator_transfer':
             from hgkda.runtime.transfer_context import build
             brief=build(config)
-            print(json.dumps(dict(status='completed',source_sha256=brief['source_sha256'],
-                output=str(workspace/'context-brief.json'),retrieval=brief['knowledge_retrieval']),ensure_ascii=False))
+            report(dict(status='completed',source_sha256=brief['source_sha256'],
+                output=str(workspace/'context-brief.json'),retrieval=brief['knowledge_retrieval']))
             return
         raise ValueError('Public runtime requires context_kind=operator_transfer')
     assert args.source is not None
     source=args.source.resolve()
     assert source.is_relative_to(workspace.resolve()) and source.suffix=='.py'
     if config.get('context_kind')=='operator_transfer' and source!=workspace.resolve()/'candidate.py':
-        print(json.dumps(dict(status='source_rejected',reason='只接受workspace/candidate.py算子实现；不运行起点或测试／探测脚本'),ensure_ascii=False));return
+        report(dict(status='source_rejected',reason='只接受workspace/candidate.py算子实现；不运行起点或测试／探测脚本'));return
     text=source.read_bytes().decode('utf8');inspection=inspect_text(text)
     if inspection['issues']:
-        print(json.dumps(dict(status='static_rejected',issues=inspection['issues']),ensure_ascii=False));return
+        report(dict(status='static_rejected',issues=inspection['issues']));return
     # 本试验不接受未提供源码的二进制或动态外部执行依赖。
     import ast
     for node in ast.walk(ast.parse(text)):
@@ -64,12 +76,12 @@ def main():
             pending=dict(status='awaiting_source_review',source_sha256=digest,source=str(source),
                 reason='设备操作前等待外部只读路径与地址边界审查；保持当前候选不变并返回')
             (workspace/'latest-preflight.json').write_text(json.dumps(pending,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
-            print(json.dumps(pending,ensure_ascii=False));return
+            report(pending);return
         admit(text,read(review))
     if (attempt/'preflight.json').exists():
         previous=read(attempt/'preflight.json')
         (workspace/'latest-preflight.json').write_text(json.dumps(previous,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
-        print(json.dumps(previous,ensure_ascii=False));return
+        report(previous);return
     limit=config.get('maximum_preflight_sources',3)
     assert len(list((run/'attempts').glob('*/preflight.json'))) < limit, '已达到本轮显式配置的设备预检数量限制'
     attempt.mkdir(parents=True,exist_ok=False)
@@ -105,7 +117,9 @@ def main():
         formal_evaluation='待宿主模型完成逐路径源码审查后执行一次KGS完整评测')
     (attempt/'preflight.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
     (workspace/'latest-preflight.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
-    print(json.dumps(result,ensure_ascii=False))
+    report(result)
 
 
-if __name__=='__main__':main()
+if __name__=='__main__':
+    from hgkda.runtime.trace import traced_main
+    traced_main(main, next((name for name in ('context','preflight','decision') if name in sys.argv), 'model-tool'))

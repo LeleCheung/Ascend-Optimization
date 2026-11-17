@@ -1,0 +1,489 @@
+{
+  "operator": "value_selecting_reduction_backward",
+  "kind": "saved_ledger_attempt_order",
+  "selected_source": {
+    "path": "/data/hanle/ascend-optimization/runs/night-20261021-v3/kg-runs/value_selecting_reduction_backward-night-20261021-v3-kg-no-profile/stages/optimize/work/.ledger.json",
+    "sha256": "d9428dd9e0fda1838177ed905bcb4ed9d3203626861277e6850dcc5cf7c0515c"
+  },
+  "points": [
+    {
+      "id": "value_selecting_reduction_backward:round-1",
+      "score": 0.30103327010127967,
+      "source_sha256": "7e602e186917f44cecb17b098e1986c1cc70ddcdaadaec2ea038d0085326f1fa",
+      "method": "本批起点",
+      "raw": {
+        "ledger_sha256": "d9428dd9e0fda1838177ed905bcb4ed9d3203626861277e6850dcc5cf7c0515c",
+        "round": 1,
+        "source_sha256": "7e602e186917f44cecb17b098e1986c1cc70ddcdaadaec2ea038d0085326f1fa",
+        "evaluation": {
+          "evaluated_at": "2026-10-21T13:40:02.803448Z",
+          "status": "PASSED",
+          "geo_mean": 0.30103327010127967,
+          "num_workloads": 96,
+          "num_passed": 96
+        },
+        "plan": {
+          "kind": "baseline",
+          "strategy": "Establish a single-kernel Triton baseline that writes the whole output: out[o,r,i] = grad[o,i] if idx[o,i]==r else 0, using the injective property of value-selecting scatter to fuse zero-fill and scatter into one pass.",
+          "code_changes": "First candidate in a fresh workspace (the provided flag_gems seed was rejected by candidate admission: no @triton.jit kernel / launch). New self-contained module with two @triton.jit kernels: a fast (outer,red,inner==1) path with a persistent 1D grid (capped at 65535 programs, striding by tl.num_programs(0)) and a general strided path for inner>1. Output allocated with torch.empty and fully written by the kernel.",
+          "hypothesis": "A fused single kernel replaces the reference's two passes (zeros fill + scatter), so the wall time should be at or below the reference on every workload and clearly better where launch overhead dominates the small tensors.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "establish_baseline",
+            "mechanism": "One kernel writes the entire output instead of a full-tensor zero-fill followed by a separate scatter launch."
+          },
+          "source": {
+            "origin": "baseline",
+            "parent_round_num": null
+          },
+          "key_params": {
+            "BLOCK_R_max": 2048,
+            "max_programs": 65535,
+            "general_BLOCK": 256
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": false,
+          "status": "not_required",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 1,
+          "expectation_status": "baseline",
+          "root_cause": "Baseline established. Correctness is exact on all 78 workloads (abs_err 0, matched_ratio 1.0), confirming the injective-selection formulation out[o,r,i] = grad[o,i] if idx[o,i]==r else 0 is exactly equivalent to zeros+scatter. Performance is poor (geo_mean 0.301): measured latency scales with the number of launched programs (~70 ns/program) rather than with bytes written, so the large timing shapes (timing-1,2,4,5,7,8,10,11,13,14,16,17) run 4-15x slower than the reference while the small ones (timing-0,3,6,9,12,15) are already at or above reference speed (1.01-1.19x).",
+          "perf_gap_analysis": "Expected the fused single kernel to be at least at parity everywhere. Observed: parity on the 6 smallest timing shapes (speedup 1.007-1.188, all near the ~0.13-0.15 ms per-invocation floor), but 0.25x on 4096^2, 0.11x on 8192^2 f16, 0.27x on 8192^2 f32 and 0.064-0.066x on the 128x256x512 shapes. Grouping by program count shows time ~= 0.128 ms + 60-70 ns per program (8192 programs -> 0.60 ms, 32768 programs -> 2.40 ms) independent of BLOCK_R (1 KB vs 4 KB per program give the same 2.40 ms), so per-program fixed cost, not store bandwidth, dominates. Only 1 tile per program is executed, so the persistent loop never engages and the scalar idx/grad loads plus the per-element int64 compare are paid once per program.",
+          "next_suggestion": "Measure on-target with a bounded Debug Job microbenchmark: pure-fill Triton kernels sweeping program count (32..4096 with a real persistent loop) and BLOCK, the fused kernel with the index cast to int32 before the compare, and out.zero_()/aten reference as bandwidth ceilings, to identify whether the per-program cost is dispatch overhead (fix: far fewer programs, larger loops) or the int64 compare/scalar load.",
+          "optimization_level": "L1_architecture",
+          "debug_lesson": "",
+          "strategy_evolution": "",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "value_selecting_reduction_backward:round-2",
+      "score": 1.6020742636251846,
+      "source_sha256": "cc149ba4e1548d6211763c0920d4778c94dd00f5c573042b6b8827cd034c1372",
+      "method": "固定网格流式回填梯度",
+      "raw": {
+        "ledger_sha256": "d9428dd9e0fda1838177ed905bcb4ed9d3203626861277e6850dcc5cf7c0515c",
+        "round": 2,
+        "source_sha256": "cc149ba4e1548d6211763c0920d4778c94dd00f5c573042b6b8827cd034c1372",
+        "evaluation": {
+          "evaluated_at": "2026-10-21T13:55:35.232326Z",
+          "status": "PASSED",
+          "geo_mean": 1.6020742636251846,
+          "num_workloads": 96,
+          "num_passed": 96
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Stream large contiguous output tiles from a small persistent grid instead of one program per tile, and shrink the launch signature to three pointers with compile-time geometry.",
+          "code_changes": "Replaced the per-tile launch grid (one program per tile, which hit the 65535 coreDim limit and cost ~70 ns/program) with a persistent 1D grid of at most 512 task-derived programs that stride by tl.num_programs(0). Each tile is now a contiguous 8192-element region of consecutive output rows (BLOCK_R = next_pow2(red) capped at 8192, BLOCK_O = 8192/BLOCK_R, capped by next_pow2(outer)). Scalar geometry (outer, red, strides, nb, nt, block shape, even flags) moved from runtime args to constexpr, leaving a 3-pointer launch signature. Empty outputs return without launching.",
+          "hypothesis": "The measured 4-15x deficit on the large timing shapes is pure per-program dispatch cost (time scaled with program count, not bytes: 32768 programs took 2.4 ms regardless of block size). Cutting to <=512 programs that each stream contiguous 8192-element tiles should reach the measured fill roofline, and making the geometry compile-time constants should cut the host launch binder cost that dominates every small shape.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Eliminating per-program dispatch cost and reading the index/gradient scalars once per 8192-element contiguous tile lifts the large shapes to the measured fill roofline (0.095-0.20 ms instead of 0.6-2.4 ms); the 3-argument constexpr launch trims ~6 us of host binder cost on every shape, which is the entire cost of the small shapes."
+          },
+          "source": {
+            "origin": "coder",
+            "parent_round_num": 1
+          },
+          "key_params": {
+            "TILE_ELEMS": 8192,
+            "MAX_PROGRAMS": 512,
+            "GENERAL_BLOCK": 256
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": false,
+          "status": "not_required",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 2,
+          "expectation_status": "met",
+          "root_cause": "Persistent small grid with contiguous 8192-element tiles plus a 3-pointer constexpr launch removed the per-program dispatch cost that dominated round 1, so the remaining time is host-side: ~0.055-0.064 ms Triton launch, ~0.03 ms of allocation/free interaction, ~0.006 ms Python geometry.",
+          "perf_gap_analysis": "Predicted the large shapes would fall to the fill roofline and that a 3-argument constexpr launch would shave host binder cost; both held. Observed geo_mean 1.602 (0.301 -> 5.3x better), min_speedup 1.383 (was 0.064). The 8192^2 shapes improved 26x/26x/3.4x in latency terms (2.40 -> 0.111 ms f16, 2.40 -> 0.111 ms bf16, 2.40 -> 0.188 ms f32) confirming per-program dispatch was the whole deficit there. However 15 of the 18 timing shapes now cluster at 0.104-0.112 ms, i.e. almost exactly the measured alloc+launch floor (0.097-0.103 ms in the diagnostic), so their speedups (1.38-1.45x) are capped by host overhead rather than by anything the kernel does; device time on those shapes is negligible. Only timing-14 (f32 8192^2, 268 MB, exceeds the 176 MB L2) still carries ~0.083 ms of real device time.",
+          "next_suggestion": "Attack the remaining ~0.105 ms host floor, which now dominates 15 of 18 timing shapes: measure torch.empty vs grad.new_empty vs empty-with-device-object allocation cost, whether the alloc+launch interaction (~0.03 ms above launch-only) is a free path cost, and how much Python geometry math can be removed, then keep only the variant that reproduces the floor reduction.",
+          "optimization_level": "L1_architecture",
+          "debug_lesson": "",
+          "strategy_evolution": "",
+          "knowledge_assessments": []
+        }
+      }
+    }
+  ],
+  "view": {
+    "id": "mainline",
+    "session": "value_selecting_reduction_backward",
+    "title": "value_selecting_reduction_backward 优化轨迹",
+    "subtitle": "历史 KGS 参考 · 本批 2 次正式评测",
+    "ylim": [
+      0,
+      1.9
+    ],
+    "annotations": [
+      {
+        "point": 2,
+        "method": "固定网格流式回填梯度",
+        "color": "unknown",
+        "position": [
+          550,
+          285
+        ],
+        "arrow": [
+          950,
+          325
+        ]
+      }
+    ],
+    "legend": [
+      "paired",
+      "sim",
+      "knowledge",
+      "probe",
+      "unknown"
+    ],
+    "gap": null,
+    "x_label": "本批正式评测顺序",
+    "plot_bottom": 745,
+    "nodes": [
+      {
+        "point": 1,
+        "location": "mixed"
+      },
+      {
+        "point": 2,
+        "location": "mixed"
+      }
+    ],
+    "delivery": {
+      "score": 1.3492307218562967,
+      "source": "operators/value_selecting_reduction_backward/versions/independent_strict/retained/kernel.py",
+      "source_sha256": "aaf74e7b4c22ef3941480023b67c16a52ec81f9b5071151832cc492d985d532e",
+      "passed": 96,
+      "total": 96,
+      "result": "operators/value_selecting_reduction_backward/evidence/retained/evaluation/result.json",
+      "result_sha256": "78a50644649d105909ae38992d33f657d786edc3f56629b5b4bc0301a8f0e917",
+      "endpoint_same_source": false
+    },
+    "result_only": false,
+    "line_status": "下图：历史优化片段"
+  },
+  "history": [
+    {
+      "ledger_sha256": "d9428dd9e0fda1838177ed905bcb4ed9d3203626861277e6850dcc5cf7c0515c",
+      "round": 1,
+      "source_sha256": "7e602e186917f44cecb17b098e1986c1cc70ddcdaadaec2ea038d0085326f1fa",
+      "evaluation": {
+        "evaluated_at": "2026-10-21T13:40:02.803448Z",
+        "status": "PASSED",
+        "geo_mean": 0.30103327010127967,
+        "num_workloads": 96,
+        "num_passed": 96
+      },
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Establish a single-kernel Triton baseline that writes the whole output: out[o,r,i] = grad[o,i] if idx[o,i]==r else 0, using the injective property of value-selecting scatter to fuse zero-fill and scatter into one pass.",
+        "code_changes": "First candidate in a fresh workspace (the provided flag_gems seed was rejected by candidate admission: no @triton.jit kernel / launch). New self-contained module with two @triton.jit kernels: a fast (outer,red,inner==1) path with a persistent 1D grid (capped at 65535 programs, striding by tl.num_programs(0)) and a general strided path for inner>1. Output allocated with torch.empty and fully written by the kernel.",
+        "hypothesis": "A fused single kernel replaces the reference's two passes (zeros fill + scatter), so the wall time should be at or below the reference on every workload and clearly better where launch overhead dominates the small tensors.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "One kernel writes the entire output instead of a full-tensor zero-fill followed by a separate scatter launch."
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {
+          "BLOCK_R_max": 2048,
+          "max_programs": 65535,
+          "general_BLOCK": 256
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": false,
+        "status": "not_required",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "Baseline established. Correctness is exact on all 78 workloads (abs_err 0, matched_ratio 1.0), confirming the injective-selection formulation out[o,r,i] = grad[o,i] if idx[o,i]==r else 0 is exactly equivalent to zeros+scatter. Performance is poor (geo_mean 0.301): measured latency scales with the number of launched programs (~70 ns/program) rather than with bytes written, so the large timing shapes (timing-1,2,4,5,7,8,10,11,13,14,16,17) run 4-15x slower than the reference while the small ones (timing-0,3,6,9,12,15) are already at or above reference speed (1.01-1.19x).",
+        "perf_gap_analysis": "Expected the fused single kernel to be at least at parity everywhere. Observed: parity on the 6 smallest timing shapes (speedup 1.007-1.188, all near the ~0.13-0.15 ms per-invocation floor), but 0.25x on 4096^2, 0.11x on 8192^2 f16, 0.27x on 8192^2 f32 and 0.064-0.066x on the 128x256x512 shapes. Grouping by program count shows time ~= 0.128 ms + 60-70 ns per program (8192 programs -> 0.60 ms, 32768 programs -> 2.40 ms) independent of BLOCK_R (1 KB vs 4 KB per program give the same 2.40 ms), so per-program fixed cost, not store bandwidth, dominates. Only 1 tile per program is executed, so the persistent loop never engages and the scalar idx/grad loads plus the per-element int64 compare are paid once per program.",
+        "next_suggestion": "Measure on-target with a bounded Debug Job microbenchmark: pure-fill Triton kernels sweeping program count (32..4096 with a real persistent loop) and BLOCK, the fused kernel with the index cast to int32 before the compare, and out.zero_()/aten reference as bandwidth ceilings, to identify whether the per-program cost is dispatch overhead (fix: far fewer programs, larger loops) or the int64 compare/scalar load.",
+        "optimization_level": "L1_architecture",
+        "debug_lesson": "",
+        "strategy_evolution": "",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "d9428dd9e0fda1838177ed905bcb4ed9d3203626861277e6850dcc5cf7c0515c",
+      "round": 2,
+      "source_sha256": "cc149ba4e1548d6211763c0920d4778c94dd00f5c573042b6b8827cd034c1372",
+      "evaluation": {
+        "evaluated_at": "2026-10-21T13:55:35.232326Z",
+        "status": "PASSED",
+        "geo_mean": 1.6020742636251846,
+        "num_workloads": 96,
+        "num_passed": 96
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Stream large contiguous output tiles from a small persistent grid instead of one program per tile, and shrink the launch signature to three pointers with compile-time geometry.",
+        "code_changes": "Replaced the per-tile launch grid (one program per tile, which hit the 65535 coreDim limit and cost ~70 ns/program) with a persistent 1D grid of at most 512 task-derived programs that stride by tl.num_programs(0). Each tile is now a contiguous 8192-element region of consecutive output rows (BLOCK_R = next_pow2(red) capped at 8192, BLOCK_O = 8192/BLOCK_R, capped by next_pow2(outer)). Scalar geometry (outer, red, strides, nb, nt, block shape, even flags) moved from runtime args to constexpr, leaving a 3-pointer launch signature. Empty outputs return without launching.",
+        "hypothesis": "The measured 4-15x deficit on the large timing shapes is pure per-program dispatch cost (time scaled with program count, not bytes: 32768 programs took 2.4 ms regardless of block size). Cutting to <=512 programs that each stream contiguous 8192-element tiles should reach the measured fill roofline, and making the geometry compile-time constants should cut the host launch binder cost that dominates every small shape.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Eliminating per-program dispatch cost and reading the index/gradient scalars once per 8192-element contiguous tile lifts the large shapes to the measured fill roofline (0.095-0.20 ms instead of 0.6-2.4 ms); the 3-argument constexpr launch trims ~6 us of host binder cost on every shape, which is the entire cost of the small shapes."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": 1
+        },
+        "key_params": {
+          "TILE_ELEMS": 8192,
+          "MAX_PROGRAMS": 512,
+          "GENERAL_BLOCK": 256
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": false,
+        "status": "not_required",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "met",
+        "root_cause": "Persistent small grid with contiguous 8192-element tiles plus a 3-pointer constexpr launch removed the per-program dispatch cost that dominated round 1, so the remaining time is host-side: ~0.055-0.064 ms Triton launch, ~0.03 ms of allocation/free interaction, ~0.006 ms Python geometry.",
+        "perf_gap_analysis": "Predicted the large shapes would fall to the fill roofline and that a 3-argument constexpr launch would shave host binder cost; both held. Observed geo_mean 1.602 (0.301 -> 5.3x better), min_speedup 1.383 (was 0.064). The 8192^2 shapes improved 26x/26x/3.4x in latency terms (2.40 -> 0.111 ms f16, 2.40 -> 0.111 ms bf16, 2.40 -> 0.188 ms f32) confirming per-program dispatch was the whole deficit there. However 15 of the 18 timing shapes now cluster at 0.104-0.112 ms, i.e. almost exactly the measured alloc+launch floor (0.097-0.103 ms in the diagnostic), so their speedups (1.38-1.45x) are capped by host overhead rather than by anything the kernel does; device time on those shapes is negligible. Only timing-14 (f32 8192^2, 268 MB, exceeds the 176 MB L2) still carries ~0.083 ms of real device time.",
+        "next_suggestion": "Attack the remaining ~0.105 ms host floor, which now dominates 15 of 18 timing shapes: measure torch.empty vs grad.new_empty vs empty-with-device-object allocation cost, whether the alloc+launch interaction (~0.03 ms above launch-only) is a free path cost, and how much Python geometry math can be removed, then keep only the variant that reproduces the floor reduction.",
+        "optimization_level": "L1_architecture",
+        "debug_lesson": "",
+        "strategy_evolution": "",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "fb39e839ce5f496a532f5f585c3f554e67df5f6ea71f9e7d18f26ae23883d0d1",
+      "round": 1,
+      "source_sha256": "5fd31f53a80e95810c8d99af296e78b9dc0b7ca452b64015ec63c4b9e1b4a7f7",
+      "evaluation": {
+        "evaluated_at": "2026-10-21T14:17:39.995447Z",
+        "status": "PASSED",
+        "geo_mean": 0.6850980730945315,
+        "num_workloads": 96,
+        "num_passed": 96
+      },
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Establish a measured baseline with a single fused Triton kernel that zero-fills the output and writes the selected grad cells in one pass (no separate memset + scatter launches).",
+        "code_changes": "New tmp/main.py: wrapper computes (outer, red, inner) view of sizes, allocates torch.empty output, dispatches an inner==1 fast-path kernel (one contiguous row of `red` outputs per program, value selected by comparing lane offset with the row index) or a general (outer, inner-block) kernel that loops over the reduced axis.",
+        "hypothesis": "Because the target cell of every source element is uniquely determined, the scatter is conflict free, so a single zero-fill + selected-write kernel removes one kernel launch versus reference zeros+scatter_ and should at least match reference bandwidth on the large memsets.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "First measurement of the fused single-launch architecture against the aten/flag_gems zeros+scatter_ reference."
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {},
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "completed",
+        "analysis_path": ".kernelgen/profile-analysis/round-0001.json",
+        "summary": "launch: Runtime is set by program (Block) count at ~0.5-0.7 us of scalar-pipe time per program, invariant to the work inside the program, Identical program count and element count at 2x bytes gives identical 0.61 ms - the bound is per-program, not per-byte, Masked-store element-wise predication is NOT the bottleneck (hypothesis b contradicted)"
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "Baseline architecture (single fused zero-fill + selected-write launch, one program per contiguous `red` row for the inner==1 fast path, masked store) is numerically exact on all 96 workloads (abs_err=0 on every correctness case), confirming the conflict-free scatter analysis and the flat-element stride addressing. Performance is program-count bound rather than bandwidth bound: profile evidence on round 1 shows a flat ~0.62 us scalar-pipe cost per program (aiv_scalar_ratio 0.68-0.88, aiv_vec_ratio only 0.043-0.099) while work per program spans 128-4096 elements, so kernel time ~= BlockNum * 0.62us / 20 cores. The worst workloads launch 32768 programs of only 1KB each (timing-5/11/17 at 0.13x), and fp16 vs fp32 8192^2 take identical time despite 2x the bytes, which rules out a per-byte store bound.",
+        "perf_gap_analysis": "Baseline geo_mean 0.6851 with min_speedup 0.1277 (worst: timing-5, 128x256x512 dim2, 32768 programs). Small shapes already beat the reference (timing-0/3/6/9/12/15 at 1.48-1.58x) because one launch replaces the reference zeros+scatter_ pair; large-outer shapes lose 2-8x because the per-program cost dominates. Comparing the two competing explanations from the profile: masked-store predication is contradicted (vector share is flat at 4-10% for every BLOCK and per-program scalar cost is flat-to-falling as BLOCK grows 32x), UB pressure is contradicted (tiles are 0.25-8KB against 192KB UB, no spills), so the gap is explained by too many tiny programs. Element-per-program must rise by roughly 8-32x, with all timing shapes having a power-of-two `red` so an unmasked store is available.",
+        "next_suggestion": "Replace the one-row-per-program fast path with a 2D [ROWS, COLS] tile kernel that owns ROWS consecutive outer rows: val = where(cols[None,:] == idx[:,None], g[:,None], 0), grid = ceil(outer/ROWS), ROWS = pow2(TILE//red) capped at 64 with TILE=8192, using the unmasked store when COLS==red and ROWS divides outer. That cuts timing-5 from 32768 to 2048 programs and should move the large-outer workloads toward the ~400GB/s store bound while keeping all correctness cases exact.",
+        "optimization_level": "L1_architecture",
+        "debug_lesson": "Per-workload latency that tracks element count instead of byte count is the signature of a launch/program-count bound on Ascend, not a bandwidth bound; verify with per-program cost and vector-ratio counters before changing tile bytes.",
+        "strategy_evolution": "",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "fb39e839ce5f496a532f5f585c3f554e67df5f6ea71f9e7d18f26ae23883d0d1",
+      "round": 2,
+      "source_sha256": "6aeec9d48ca503024ec2ecce06dc9c5558c3ab039d662cf2a18a5cd347bb6951",
+      "evaluation": {
+        "evaluated_at": "2026-10-21T14:49:17.911024Z",
+        "status": "PARTIAL_PASS",
+        "geo_mean": null,
+        "num_workloads": 96,
+        "num_passed": 90
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Amortize the flat per-program launch/dispatch cost by giving each program ROWS consecutive outer rows (multi-row 2D tile with one contiguous store per program).",
+        "code_changes": "Replaced the one-row-per-program inner==1 fast path with a 2D [ROWS, COLS] tile kernel: grid = ceil(outer/ROWS), each program owns ROWS consecutive contiguous output rows, loads ROWS contiguous grad/indices values, builds val = where(cols[None,:] == idx[:,None], g[:,None], 0) and stores a contiguous ROWS*COLS block. ROWS = pow2(8192//red) capped at 64 and at outer; the store is unmasked when COLS==red and ROWS divides outer. inner>1 path unchanged.",
+        "hypothesis": "Round-1 profile showed a flat per-program cost of ~0.5-0.7us with aiv_scalar_ratio 0.68-0.88 and aiv_vec_ratio only 0.04-0.10, so kernel time is proportional to program count rather than bytes (fp16 and fp32 8192^2 both take ~0.62ms). Packing ROWS rows into one program with one contiguous store per program should cut the program count 2-16x and lift geo_mean above 1.0.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Fewer, larger programs amortize the flat ~0.62us per-program scalar cost: timing-5/11/17 fall from 32768 to 2048 programs, timing-4/10/16 to 256, timing-2/8/14 from 16384 to 8192, so large-outer shapes approach the store-bandwidth bound while staying above the 20-core parallelism floor."
+        },
+        "source": {
+          "origin": "profile_next_experiment",
+          "parent_round_num": 1
+        },
+        "key_params": {
+          "COLS": "pow2(red) capped 8192",
+          "ROWS": "pow2(8192//red) capped 64",
+          "TILE": 8192
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": false,
+        "status": "not_required",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "partially_met",
+        "root_cause": "The multi-row tile kernel achieved its program-count goal (32768->2048 programs on timing-5, large-outer shapes now 1.02-1.42x) but the wrapper computed COLS with a round-down power-of-two helper, so any non-power-of-two `red` (only the [2,3,5] correctness cases, red=5) dropped the last columns and produced 6 INCORRECT_NUMERICAL results; the 8192^2 shapes remain element-rate limited independent of program count.",
+        "perf_gap_analysis": "Predicted program-count reduction was observed on the large-outer shapes: timing-5 1.227->0.152ms (0.13x->1.02x, 32768->2048 programs), timing-4 0.309->0.114ms (0.51x->1.36x), timing-16 0.302->0.106ms, timing-10 0.309->0.114ms, timing-11 1.222->0.152ms; small shapes stayed 1.34-1.42x and timing-1/7/13 ~1.0x. Two deviations from the expectation: (1) 6 of 78 correctness cases FAILED (fp16/bf16/fp32 sizes [2,3,5] dim=2 keepdim both) because COLS was computed as the largest power of two <= red, so red=5 produced COLS=4 and the tail column was never written - matched_ratio 0.83-0.93 with the missing cells left at zero; (2) timing-2/8 (8192^2 fp16/bf16) only moved 0.624->0.603ms despite halving 16384->8192 programs, showing that shape is not program-count bound: it and fp32 8192^2 both sit at ~111 Melem/s (212 GB/s fp16 vs 424 GB/s fp32), an element-rate limit distinct from the reference's byte-rate memset, so the tile kernel's per-element select/store path is the next bottleneck.",
+        "next_suggestion": "Repair COLS to next_pow2(red) (8 for red=5) and ROWS from TILE//COLS, then attack the remaining element-rate limit: 8192^2 fp16 (0.603ms, 0.51x) and fp32 (0.603ms) both run at ~111 Melem/s regardless of dtype, i.e. an element-rate bound rather than the reference's ~420 GB/s byte-rate memset. Test a two-store program (wide contiguous constant zero store + patch scatter of the ROWS selected cells) in a bounded target debug microbenchmark before spending an eval round on it.",
+        "optimization_level": "L1_architecture",
+        "debug_lesson": "A power-of-two tile extent must be the NEXT power of two >= the logical extent; reusing a block-size helper that rounds down silently drops the tail columns and only fails on non-power-of-two extents (red=5 here).",
+        "strategy_evolution": "",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "9193e2a61a9cf92bd4b2269cc26cb7ecb1528f6034765b6b938b40ae53ce70e2",
+      "round": 1,
+      "source_sha256": "e14bf9b71e9e9eff1c077c33d6ee921738894dc28429f72bdc0519ee289df520",
+      "evaluation": {
+        "evaluated_at": "2026-10-21T15:14:10.274530Z",
+        "status": "PASSED",
+        "geo_mean": 0.5905213084173733,
+        "num_workloads": 96,
+        "num_passed": 96
+      },
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Establish a measured baseline with the simplest correct Triton architecture: a zero-fill kernel over the whole output followed by a general non-reducing scatter kernel (mirrors aten zeros+scatter_).",
+        "code_changes": "New self-contained Triton implementation in tmp/main.py: _zero_kernel fills the output, _scatter_general computes each source element's destination offset from (outer, K, inner) decomposition with affine collapsed stride groups for the possibly non-contiguous grad/indices.",
+        "hypothesis": "Because the output tensor (up to 8192x8192 fp32 = 268 MB) must be materialized, walltime is dominated by the zero-fill write; a 2-kernel Triton implementation should land close to the eager reference and give a reference point for a fused single-kernel design.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "One zero-fill pass plus a small scatter pass; establishes the measured reference point."
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {
+          "_ZERO_BLOCK": 4096,
+          "_SCATTER_BLOCK": 1024
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "Baseline establishes the reference point: 2 Triton kernels (masked zero-fill + masked scatter) score geo_mean 0.5905. All 96 workloads are numerically exact (abs_err 0). Per-workload evidence shows two independent losses: (1) all small/medium workloads sit ~0.21 ms against a ~0.135 ms reference floor, i.e. two Triton launches each cost ~35 us of host walltime beyond the reference's aten calls; (2) the two largest workloads are element-rate rather than bandwidth bound - fp16 8192x8192 (134 MB) and fp32 8192x8192 (268 MB) both take ~0.739 ms (~90 Gelem/s), while the reference sustains ~417 GB/s on both (0.324/0.640 ms), so the fully masked store is not vectorized and costs a fixed per-element rate regardless of dtype.",
+        "perf_gap_analysis": "No prior measurement (baseline round). Absolute position: worst workload timing-2 at 0.4386x, best timing-14 at 0.865x. Reference latency is flat at ~0.135-0.15 ms for the 12 small/medium workloads (floor bound), so the recoverable loss there is host-launch overhead only; on the 6 large workloads the dtype-insensitive 0.739 ms is recoverable store-bandwidth.",
+        "next_suggestion": "Fuse zero-fill and scatter into one launch whose stores are unmasked and contiguous: constexpr K so offsets are stride-1 along the reduced axis, row mask omitted when M % R == 0 and column mask omitted when K is a power of two, so the vectorizer can emit wide stores.",
+        "optimization_level": "L1_architecture",
+        "debug_lesson": "",
+        "strategy_evolution": "Move from a zeros+scatter pair mirroring aten to a single fused gather-formulation kernel with unmasked contiguous stores.",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "9193e2a61a9cf92bd4b2269cc26cb7ecb1528f6034765b6b938b40ae53ce70e2",
+      "round": 2,
+      "source_sha256": "e893186748573e4908a2d4df050d6147322c95979344f714a50bccf93b0f2bb3",
+      "evaluation": {
+        "evaluated_at": "2026-10-21T15:20:41.329816Z",
+        "status": "PASSED",
+        "geo_mean": 1.5501846118103537,
+        "num_workloads": 96,
+        "num_passed": 96
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Fuse zero-fill and scatter into a single launch over the output, with mask-free contiguous stores enabled by constexpr K.",
+        "code_changes": "Replaced the separate zero-fill + scatter launches with one _fused_lastdim kernel for the (dim == last, contiguous) case: out[row,col] = where(col == indices[row], grad[row], 0), computed on an (R x BK) tile of a contiguous row-major output. K and BK are constexpr so offsets are stride-1 along the reduced axis; the row mask is dropped when M % R == 0 (EVEN) and the column mask is dropped when K is a power of two (FULLK), leaving a fully unmasked contiguous store. The zero+scatter pair remains only for the non-last-dim / non-contiguous general path.",
+        "hypothesis": "The baseline lost for two separable reasons: two launches (host floor) and masked stores (element-rate). Fusing removes the second launch and the constexpr-K unmasked tile restores store vectorization, so fp16 large cases should approach the fp32 case's byte rate and all 12 floor-bound workloads should approach a 1.0x speedup.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "One launch removes ~35 us of host overhead on the floor-bound small workloads, and unmasked contiguous stores restore wide vectorized writes so large workloads become bandwidth bound (~417 GB/s) instead of element-rate bound (~90 Gelem/s)."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": 1
+        },
+        "key_params": {
+          "_MAX_BK": 8192,
+          "_TARGET_BYTES": 32768
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "completed",
+        "analysis_path": ".kernelgen/profile-analysis/round-0002.json",
+        "summary": "mixed: 15 of 18 timing workloads are pinned by a ~100 us per-call host floor, not by kernel time, fp16/bf16 large case is dominated by the per-element compare/select, not by store bandwidth, fp32 large case: no pipe is saturated (MTE2/MTE3 <80% when active, vector compute usage <20%) while effective write rate is 845 GB/s"
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "met",
+        "root_cause": "The 0.59 baseline lost on two independent axes; fusing removed both the second launch and the masked-store element-rate wall, taking geo_mean to 1.5502 with 96/96 exact. Remaining loss is now localized: a per-call host cost of ~98-105 us that dominates 15 of 18 timing workloads, a ~845 GB/s DRAM write wall on the largest fp32 case (at it), and dtype-independent select compute (int32 compare + where) that holds fp16/bf16 8192^2 at 730 GB/s instead of ~845 GB/s.",
+        "perf_gap_analysis": "geo_mean 0.5905 -> 1.5502 (+162%), min_speedup 0.4386 -> 1.4462, all 96 workloads still exact. The fusion half of the hypothesis is fully confirmed: every floor-bound workload moved from ~0.21 ms to 0.098-0.108 ms, i.e. exactly max(H, T) with a single per-call host cost H ~= 98-105 us, and the two-launch penalty disappeared. The 'unmasked stores make large workloads bandwidth bound' half is only partially confirmed: timing-14 (fp32 8192^2, 268 MB) reached 845 GB/s and is at the practical HBM write wall for this single-die part (~2x the reference's 417 GB/s), but timing-2/timing-8 (fp16/bf16, 134 MB) reach only 730 GB/s because the [R,BK] int32 compare + tl.where costs 127.6 us of the 183.9 us kernel (MTE3 only 17% active), so those two remain select-compute bound. Profiler kernel times: timing-0 5.5 us, timing-16 11.4 us, timing-13 81.5 us, timing-2 183.9 us, timing-14 317.9 us - so 15 of 18 timing workloads are host-floor bound and cannot be moved by kernel changes.",
+        "next_suggestion": "Diagnose the ~98 us per-call host cost first (allocation vs Triton launch vs harness sync) because it gates 15 of 18 timing workloads; then try replacing the full-tile where-select with a zero-tile store plus a one-element scatter store to cut fp16/bf16 select compute.",
+        "optimization_level": "L1_architecture",
+        "debug_lesson": "Per-element select cost is dtype-independent (fp32 vec 141.5 us vs fp16 127.6 us for the same 67.1 M elements) while duration tracks bytes, so element-rate work and byte-rate work must be optimized separately.",
+        "strategy_evolution": "From a two-launch zeros+scatter mirror of aten to a single fused gather-formulation kernel with constexpr-K unmasked contiguous stores; next, attack the host per-call floor and the per-element select independently since they are the only two remaining limits.",
+        "knowledge_assessments": []
+      }
+    }
+  ],
+  "gap": null,
+  "relation_note": "按同一原始账本正式轮次展示；未逐编辑恢复的关系不声称直接源码继承。",
+  "delivery": {
+    "score": 1.3492307218562967,
+    "source": "operators/value_selecting_reduction_backward/versions/independent_strict/retained/kernel.py",
+    "source_sha256": "aaf74e7b4c22ef3941480023b67c16a52ec81f9b5071151832cc492d985d532e",
+    "passed": 96,
+    "total": 96,
+    "result": "operators/value_selecting_reduction_backward/evidence/retained/evaluation/result.json",
+    "result_sha256": "78a50644649d105909ae38992d33f657d786edc3f56629b5b4bc0301a8f0e917",
+    "endpoint_same_source": false
+  },
+  "current_cann_score": 1.3492307218562967,
+  "historical_simulator_files": 0
+}

@@ -1,0 +1,289 @@
+{
+  "operator": "subtract_",
+  "kind": "saved_ledger_attempt_order",
+  "selected_source": {
+    "path": "/data/hanle/ascend-optimization/runs/next25-20261029-v2/kg-runs/subtract_-next25-20261029-v2-attempt-1/stages/optimize/work/.ledger.json",
+    "sha256": "dcd20c82a44970c85498961b415ff912729b5bb51fd9dd33eb33f5faa4845662"
+  },
+  "points": [
+    {
+      "id": "subtract_:round-1",
+      "score": 0.39507788892111945,
+      "source_sha256": "ea988d4a76b4bf4980eccf8ef109d253d4ad556466190953fccc7af46716c7fa",
+      "method": "本批起点",
+      "raw": {
+        "ledger_sha256": "dcd20c82a44970c85498961b415ff912729b5bb51fd9dd33eb33f5faa4845662",
+        "round": 1,
+        "source_sha256": "ea988d4a76b4bf4980eccf8ef109d253d4ad556466190953fccc7af46716c7fa",
+        "evaluation": {
+          "evaluated_at": "2026-10-29T19:04:57.843582Z",
+          "status": "PASSED",
+          "geo_mean": 0.39507788892111945,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "baseline",
+          "strategy": "Replace the FlagGems seed with a self-contained Triton in-place subtract kernel: flat unit-stride kernel for contiguous operands plus a constexpr (shape, strideA, strideB) index kernel for strided views and broadcasting.",
+          "code_changes": "New tmp/main.py: _sub_flat (fp32 compute, mask on n), _sub_flat_native for integral dtypes, _sub_strided with collapsed constexpr dim/stride tuples; run(A, B, *, alpha=1) mutates A in place and returns A; plain kernel[grid](...) launches with BLOCK=4096 (512 for the strided path).",
+          "hypothesis": "Correct IEEE arithmetic in the kernel preserves +-inf/NaN from the special-value inputs (fixing the three non-finite mismatches of the FlagGems seed) and gives a fully passing baseline whose large-case speeds are set by HBM traffic.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "establish_baseline",
+            "mechanism": "First measured round: establishes a correct Triton baseline with plain JIT launches so the host-dispatch overhead and the device throughput can be separated in later rounds."
+          },
+          "source": {
+            "origin": "baseline",
+            "parent_round_num": null
+          },
+          "key_params": {},
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "pending",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 1,
+          "expectation_status": "baseline",
+          "root_cause": "Baseline established: the self-contained Triton in-place kernel reproduces A.sub_(B, alpha=0.5) semantics bit-exactly enough for all 30 frozen workloads (18/18 correctness incl. the three 2D-strided special-value cases that the FlagGems seed failed). Performance is bimodal: the three 4096x4096 workloads run at device bandwidth (2.50x and 2.45x versus the fp16/bf16 reference, 0.86x versus the fp32 reference at 172.6 us), while all nine remaining timing workloads sit at a fixed ~62 us regardless of element count (1024 or 1048576 elements), i.e. they are pure Triton JIT host-dispatch cost, not device time.",
+          "perf_gap_analysis": "No prior measured round, so this is the reference point for later rounds. Absolute evidence: 9 workloads at 61.5-64.1 us candidate versus 12.4-16.8 us reference (speedup 0.20-0.27) with latency independent of numel -> per-call host overhead; a bounded debug probe measured plain JIT kernel[grid](...) dispatch at 59.2 us and the flag/torch reference at 14.7 us for the same 1024-element call, confirming the gap is host-side. Large cases: fp16 4096^2 152.1 us (2.50x), bf16 4096^2 152.0 us (2.45x), fp32 4096^2 172.6 us (0.86x, 1.17 TB/s logical) so the fp32 tile/grid organisation still leaves device-side headroom versus the 148.4 us reference. geo_mean 0.395 is therefore dominated by the nine host-bound workloads.",
+          "next_suggestion": "Keep the device kernel; replace the per-call JIT dispatch with the backend's low-level compiled launcher (CompiledKernel.run.launch with int grid, cached function/packed_metadata, freshly read stream and pointers) for the contiguous path, which is expected to cut the ~62 us host cost toward the reference's ~14 us on the nine small/medium workloads.",
+          "optimization_level": "host_side_special",
+          "debug_lesson": "",
+          "strategy_evolution": "Round 1 establishes a correct Triton baseline that already fixes the seed's three non-finite correctness failures; the measured evidence splits the remaining problem into host dispatch (9 workloads) and fp32/bf16 device tiling (3 workloads).",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "subtract_:round-2",
+      "score": 1.1299787721942687,
+      "source_sha256": "190310ac54d7d2564bd0b4d889d5e9d4bb47b2fddaee8f8e43464ff303f8ad3f",
+      "method": "直接启动已编译 kernel",
+      "raw": {
+        "ledger_sha256": "dcd20c82a44970c85498961b415ff912729b5bb51fd9dd33eb33f5faa4845662",
+        "round": 2,
+        "source_sha256": "190310ac54d7d2564bd0b4d889d5e9d4bb47b2fddaee8f8e43464ff303f8ad3f",
+        "evaluation": {
+          "evaluated_at": "2026-10-29T19:12:46.891102Z",
+          "status": "PASSED",
+          "geo_mean": 1.1299787721942687,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Keep the round-1 device kernel and replace only the host dispatch: launch the pre-compiled kernel through the backend's low-level launcher instead of the Triton JIT entry, after verifying on the target that the direct path is numerically identical and re-reads pointers/alpha/stream per call.",
+          "code_changes": "Added _ENTRIES cache keyed by (dtype, numel, device) holding the compiled artifact resolved through _sub_flat.warmup(); run() now launches that entry via compiled.run.launch(gridX, 1, 1, stream, function, packed_metadata, None, None, None, a_ptr, b_ptr, alpha, n, BLOCK) guarded by 16B pointer alignment and the launcher debug flags, with a plain kernel[grid](...) fallback for unaligned pointers, non-contiguous views and integral dtypes. Kernel bodies, block size and grid shape are unchanged from round 1; pointers, alpha and the current stream are read on every call. The low-level launch entry was chosen from the batch's injected historical note that compiled.run.launch is this backend's low-level launch path; the method was verified on the target (numerics identical for fresh pointers/alpha and for a larger grid) before adoption.",
+          "hypothesis": "The nine small/medium timing workloads are dominated by Triton JIT dispatch, not device work, so launching the already-compiled artifact through the backend launcher with only fresh pointers/scalars/stream will cut their per-call cost to roughly the reference's 12-17 us and raise geo_mean well above 0.395 without changing the large-case results.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Removes Triton's per-call argument binding / cache-key / dispatch work (~59 us measured for the same 1024-element launch) on the nine host-bound timing workloads; they were 61.5-64.1 us and should approach the ~9-12 us launch cost, while the three bandwidth-bound 4096x4096 workloads stay at their round-1 device time."
+          },
+          "source": {
+            "origin": "coder",
+            "parent_round_num": 1
+          },
+          "key_params": {
+            "BLOCK": 4096,
+            "cache_key": "(dtype, numel, device)",
+            "grid": "ceil(n/BLOCK)",
+            "launcher": "CompiledKernel.run.launch"
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "pending",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 2,
+          "expectation_status": "met",
+          "root_cause": "Confirmed: the nine small/medium workloads were bound by Triton's JIT dispatch (59.4 us measured, versus 8.5 us for the backend launcher and 13.7 us for the reference), not by device work. Replacing only the host dispatch cut them to 15.5-17.4 us and left the three large workloads unchanged, so the device kernels were already correct and unchanged.",
+          "perf_gap_analysis": "Predicted: the nine host-bound workloads drop from ~62 us toward the reference's 12-17 us; observed: all nine fell to 15.5-17.4 us (fp16/bf16 0.80-1.08x, fp32 0.80-0.82x), i.e. slightly above the 8.5 us bare-launch/host floor measured on the target because our call also pays ~2.8 us of wrapper prelude (numel, contiguity, shape compare, data_ptr, dict key, stream query). The three bandwidth-bound workloads were untouched as planned: fp16 4096^2 151.9 us, bf16 151.9 us, fp32 177.7 us, so the aggregate geo_mean rose from 0.395 to 1.130 (2.86x) with the per-workload ordering preserved. Remaining gap: nine workloads still ~0.8-1.08x because their latency is host dominated, and the fp32 4096^2 tile (4096 elements = 16 KiB per operand) is below the 32 KiB per-operand tile that target probes showed to be ~2.4x faster (653 -> 1558 GB/s) for 2-byte dtypes.",
+          "next_suggestion": "Next bottleneck: the three 4096x4096 workloads are now device-bound and the fp16/bf16 tiles are too small (BLOCK=4096 gives 653 GB/s while 16384 gives ~1560-1660 GB/s in target probes, and 32768 overflows the 192 KiB unified buffer); size the flat tile to ~32 KiB per operand and use the unmasked kernel when numel is a multiple of it, keeping the nine host-bound workloads on their current path.",
+          "optimization_level": "host_side_special",
+          "debug_lesson": "",
+          "strategy_evolution": "Round 1 isolated the problem into host dispatch (9 workloads) and device tiling (3 workloads). Round 2 fixed the host side; the device side is now the next target, with the tile policy already screened on the target.",
+          "knowledge_assessments": []
+        }
+      }
+    }
+  ],
+  "view": {
+    "id": "mainline",
+    "session": "subtract_",
+    "title": "subtract_ 优化轨迹",
+    "subtitle": "历史 KGS 参考 · 本批 2 次正式评测",
+    "ylim": [
+      0,
+      1.4
+    ],
+    "annotations": [
+      {
+        "point": 2,
+        "method": "直接启动已编译 kernel",
+        "color": "probe",
+        "position": [
+          550,
+          285
+        ],
+        "arrow": [
+          950,
+          325
+        ]
+      }
+    ],
+    "legend": [
+      "paired",
+      "sim",
+      "knowledge",
+      "probe",
+      "ir"
+    ],
+    "gap": null,
+    "x_label": "本批正式评测顺序",
+    "plot_bottom": 745,
+    "nodes": [
+      {
+        "point": 1,
+        "location": "mixed"
+      },
+      {
+        "point": 2,
+        "location": "host"
+      }
+    ],
+    "delivery": {
+      "score": 1.6585932548729845,
+      "source": "operators/subtract_/versions/independent_strict/retained/kernel.py",
+      "source_sha256": "462e3f429976dea2cfa95582d0c3df3d153388dff1a25a285659992de5a835d1",
+      "passed": 30,
+      "total": 30,
+      "result": "operators/subtract_/evidence/retained/evaluation/result.json",
+      "result_sha256": "ea70b44f6aad1271de564dab1bb2e54a48feb8d928bff4e900eb8fe48959d508",
+      "endpoint_same_source": false
+    },
+    "result_only": false,
+    "line_status": "下图：历史优化片段"
+  },
+  "history": [
+    {
+      "ledger_sha256": "dcd20c82a44970c85498961b415ff912729b5bb51fd9dd33eb33f5faa4845662",
+      "round": 1,
+      "source_sha256": "ea988d4a76b4bf4980eccf8ef109d253d4ad556466190953fccc7af46716c7fa",
+      "evaluation": {
+        "evaluated_at": "2026-10-29T19:04:57.843582Z",
+        "status": "PASSED",
+        "geo_mean": 0.39507788892111945,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Replace the FlagGems seed with a self-contained Triton in-place subtract kernel: flat unit-stride kernel for contiguous operands plus a constexpr (shape, strideA, strideB) index kernel for strided views and broadcasting.",
+        "code_changes": "New tmp/main.py: _sub_flat (fp32 compute, mask on n), _sub_flat_native for integral dtypes, _sub_strided with collapsed constexpr dim/stride tuples; run(A, B, *, alpha=1) mutates A in place and returns A; plain kernel[grid](...) launches with BLOCK=4096 (512 for the strided path).",
+        "hypothesis": "Correct IEEE arithmetic in the kernel preserves +-inf/NaN from the special-value inputs (fixing the three non-finite mismatches of the FlagGems seed) and gives a fully passing baseline whose large-case speeds are set by HBM traffic.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "First measured round: establishes a correct Triton baseline with plain JIT launches so the host-dispatch overhead and the device throughput can be separated in later rounds."
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {},
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "Baseline established: the self-contained Triton in-place kernel reproduces A.sub_(B, alpha=0.5) semantics bit-exactly enough for all 30 frozen workloads (18/18 correctness incl. the three 2D-strided special-value cases that the FlagGems seed failed). Performance is bimodal: the three 4096x4096 workloads run at device bandwidth (2.50x and 2.45x versus the fp16/bf16 reference, 0.86x versus the fp32 reference at 172.6 us), while all nine remaining timing workloads sit at a fixed ~62 us regardless of element count (1024 or 1048576 elements), i.e. they are pure Triton JIT host-dispatch cost, not device time.",
+        "perf_gap_analysis": "No prior measured round, so this is the reference point for later rounds. Absolute evidence: 9 workloads at 61.5-64.1 us candidate versus 12.4-16.8 us reference (speedup 0.20-0.27) with latency independent of numel -> per-call host overhead; a bounded debug probe measured plain JIT kernel[grid](...) dispatch at 59.2 us and the flag/torch reference at 14.7 us for the same 1024-element call, confirming the gap is host-side. Large cases: fp16 4096^2 152.1 us (2.50x), bf16 4096^2 152.0 us (2.45x), fp32 4096^2 172.6 us (0.86x, 1.17 TB/s logical) so the fp32 tile/grid organisation still leaves device-side headroom versus the 148.4 us reference. geo_mean 0.395 is therefore dominated by the nine host-bound workloads.",
+        "next_suggestion": "Keep the device kernel; replace the per-call JIT dispatch with the backend's low-level compiled launcher (CompiledKernel.run.launch with int grid, cached function/packed_metadata, freshly read stream and pointers) for the contiguous path, which is expected to cut the ~62 us host cost toward the reference's ~14 us on the nine small/medium workloads.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "",
+        "strategy_evolution": "Round 1 establishes a correct Triton baseline that already fixes the seed's three non-finite correctness failures; the measured evidence splits the remaining problem into host dispatch (9 workloads) and fp32/bf16 device tiling (3 workloads).",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "dcd20c82a44970c85498961b415ff912729b5bb51fd9dd33eb33f5faa4845662",
+      "round": 2,
+      "source_sha256": "190310ac54d7d2564bd0b4d889d5e9d4bb47b2fddaee8f8e43464ff303f8ad3f",
+      "evaluation": {
+        "evaluated_at": "2026-10-29T19:12:46.891102Z",
+        "status": "PASSED",
+        "geo_mean": 1.1299787721942687,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Keep the round-1 device kernel and replace only the host dispatch: launch the pre-compiled kernel through the backend's low-level launcher instead of the Triton JIT entry, after verifying on the target that the direct path is numerically identical and re-reads pointers/alpha/stream per call.",
+        "code_changes": "Added _ENTRIES cache keyed by (dtype, numel, device) holding the compiled artifact resolved through _sub_flat.warmup(); run() now launches that entry via compiled.run.launch(gridX, 1, 1, stream, function, packed_metadata, None, None, None, a_ptr, b_ptr, alpha, n, BLOCK) guarded by 16B pointer alignment and the launcher debug flags, with a plain kernel[grid](...) fallback for unaligned pointers, non-contiguous views and integral dtypes. Kernel bodies, block size and grid shape are unchanged from round 1; pointers, alpha and the current stream are read on every call. The low-level launch entry was chosen from the batch's injected historical note that compiled.run.launch is this backend's low-level launch path; the method was verified on the target (numerics identical for fresh pointers/alpha and for a larger grid) before adoption.",
+        "hypothesis": "The nine small/medium timing workloads are dominated by Triton JIT dispatch, not device work, so launching the already-compiled artifact through the backend launcher with only fresh pointers/scalars/stream will cut their per-call cost to roughly the reference's 12-17 us and raise geo_mean well above 0.395 without changing the large-case results.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Removes Triton's per-call argument binding / cache-key / dispatch work (~59 us measured for the same 1024-element launch) on the nine host-bound timing workloads; they were 61.5-64.1 us and should approach the ~9-12 us launch cost, while the three bandwidth-bound 4096x4096 workloads stay at their round-1 device time."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": 1
+        },
+        "key_params": {
+          "BLOCK": 4096,
+          "cache_key": "(dtype, numel, device)",
+          "grid": "ceil(n/BLOCK)",
+          "launcher": "CompiledKernel.run.launch"
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "met",
+        "root_cause": "Confirmed: the nine small/medium workloads were bound by Triton's JIT dispatch (59.4 us measured, versus 8.5 us for the backend launcher and 13.7 us for the reference), not by device work. Replacing only the host dispatch cut them to 15.5-17.4 us and left the three large workloads unchanged, so the device kernels were already correct and unchanged.",
+        "perf_gap_analysis": "Predicted: the nine host-bound workloads drop from ~62 us toward the reference's 12-17 us; observed: all nine fell to 15.5-17.4 us (fp16/bf16 0.80-1.08x, fp32 0.80-0.82x), i.e. slightly above the 8.5 us bare-launch/host floor measured on the target because our call also pays ~2.8 us of wrapper prelude (numel, contiguity, shape compare, data_ptr, dict key, stream query). The three bandwidth-bound workloads were untouched as planned: fp16 4096^2 151.9 us, bf16 151.9 us, fp32 177.7 us, so the aggregate geo_mean rose from 0.395 to 1.130 (2.86x) with the per-workload ordering preserved. Remaining gap: nine workloads still ~0.8-1.08x because their latency is host dominated, and the fp32 4096^2 tile (4096 elements = 16 KiB per operand) is below the 32 KiB per-operand tile that target probes showed to be ~2.4x faster (653 -> 1558 GB/s) for 2-byte dtypes.",
+        "next_suggestion": "Next bottleneck: the three 4096x4096 workloads are now device-bound and the fp16/bf16 tiles are too small (BLOCK=4096 gives 653 GB/s while 16384 gives ~1560-1660 GB/s in target probes, and 32768 overflows the 192 KiB unified buffer); size the flat tile to ~32 KiB per operand and use the unmasked kernel when numel is a multiple of it, keeping the nine host-bound workloads on their current path.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "",
+        "strategy_evolution": "Round 1 isolated the problem into host dispatch (9 workloads) and device tiling (3 workloads). Round 2 fixed the host side; the device side is now the next target, with the tile policy already screened on the target.",
+        "knowledge_assessments": []
+      }
+    }
+  ],
+  "gap": null,
+  "relation_note": "按同一原始账本正式轮次展示；未逐编辑恢复的关系不声称直接源码继承。",
+  "delivery": {
+    "score": 1.6585932548729845,
+    "source": "operators/subtract_/versions/independent_strict/retained/kernel.py",
+    "source_sha256": "462e3f429976dea2cfa95582d0c3df3d153388dff1a25a285659992de5a835d1",
+    "passed": 30,
+    "total": 30,
+    "result": "operators/subtract_/evidence/retained/evaluation/result.json",
+    "result_sha256": "ea70b44f6aad1271de564dab1bb2e54a48feb8d928bff4e900eb8fe48959d508",
+    "endpoint_same_source": false
+  },
+  "current_cann_score": 1.6585932548729845,
+  "historical_simulator_files": 0
+}

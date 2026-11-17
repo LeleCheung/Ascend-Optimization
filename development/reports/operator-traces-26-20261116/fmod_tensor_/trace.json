@@ -1,0 +1,351 @@
+{
+  "operator": "fmod_tensor_",
+  "kind": "saved_ledger_attempt_order",
+  "selected_source": {
+    "path": "/data/hanle/ascend-optimization/runs/next25-20261029-v2/kg-runs/fmod_tensor_-next25-20261029-v2-attempt-1/stages/optimize/work/.ledger.json",
+    "sha256": "aca31fa8c42ec93864874585a186f68684820be05f436a4bfb823b5913725a42"
+  },
+  "points": [
+    {
+      "id": "fmod_tensor_:round-1",
+      "score": 0.6565483503943638,
+      "source_sha256": "ec1a8d87f05098e0d384ac609e68784748c84d982b261b3de8fc5feaae07c955",
+      "method": "本批起点",
+      "raw": {
+        "ledger_sha256": "aca31fa8c42ec93864874585a186f68684820be05f436a4bfb823b5913725a42",
+        "round": 1,
+        "source_sha256": "ec1a8d87f05098e0d384ac609e68784748c84d982b261b3de8fc5feaae07c955",
+        "evaluation": {
+          "evaluated_at": "2026-10-29T23:55:45.012682Z",
+          "status": "PASSED",
+          "geo_mean": 0.6565483503943638,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "baseline",
+          "strategy": "Establish the measured baseline with the inherited seed: quotient -> truncate-toward-zero -> multiply -> subtract (no FMA fusion), flat fast path plus strided generic path, cached low-level launch for the contiguous case",
+          "code_changes": "Unmodified seed written to tmp/main.py",
+          "hypothesis": "The seed reproduces the fixed NPU fmod reference contract and establishes an authoritative latency baseline per workload",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "establish_baseline",
+            "mechanism": "No change; measurement of the inherited candidate"
+          },
+          "source": {
+            "origin": "baseline",
+            "parent_round_num": null
+          },
+          "key_params": {
+            "BLOCK": 4096,
+            "GENERIC_BLOCK": 256
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "failed",
+          "analysis_path": ".kernelgen/profile-analysis/round-0001.json",
+          "summary": "failed: msprof base collection exited successfully without profile completion marker (identical error on all 5 requests: timing-3, timing-11, timing-8, timing-0 at level=metrics, plus timing-11 retried alone). Every result returned status=failed, capabilities=[], metrics={}, artifacts=[]. No device kernel duration, AIV/MTE counters, or instruction listing was obtainable, so the requested host-vs-device split, pipeline utilization, per-program distribution and fp16-widening evidence could not be "
+        },
+        "conclusion": {
+          "round_num": 1,
+          "expectation_status": "baseline",
+          "root_cause": "Baseline establishes that the seed's quotient->truncate->multiply->subtract arithmetic reproduces the fixed NPU fmod reference exactly (all 18 correctness cases PASSED with abs_err/rel_err 0, matched_ratio 1.0) and that two independent gaps limit throughput: (1) 9 of 12 timing workloads sit on a per-call floor of 15.9-18.7 us versus 10.1-11.6 us for the reference, and a target microbenchmark shows this floor is host/launch bound (n=1024 fp16: full run 15.1 us, the same cached raw launch with the Python body bypassed 10.6 us, reference fmod_ 6.3 us, standard Triton JIT launch 50 us), so the Python bookkeeping above the launch costs ~4.4 us per call; (2) the large 16-bit cases are arithmetic bound, not bandwidth bound (fp16 4096x4096 moves 100.7 MB in 162.7 us = 0.62 TB/s while fp32 moves 201.3 MB in 190.4 us = 1.06 TB/s, i.e. equal per-element cost, and an fp16/bf16-native arithmetic variant measured 164 us versus 163 us for the fp32-widened one, so narrowing the arithmetic domain gives no speedup).",
+          "perf_gap_analysis": "Baseline only; no prior measurement to compare. Observed geo_mean 0.6565 with min_speedup 0.508 on fmod_tensor_-timing-3. Host-bound small workloads score 0.58-0.72 and the large fp32 case is already at parity (0.9477, 1.058 TB/s achieved), so the aggregated gap decomposes into a fixable host-path excess of ~4.4 us per call plus an instruction-bound deficit on 16-bit large tensors where the reference reaches 1.21 TB/s and the candidate 0.62 TB/s.",
+          "next_suggestion": "Shrink only the host path (pre-bind the launch tuple with its grid, resolve the raw-stream getter once but still query the live stream per call, single dict hit, A.get_device() instead of a device object) and keep the kernel byte-identical, targeting the nine host-bound workloads; attack the 16-bit large-tensor instruction count in a later round.",
+          "optimization_level": "host_side_special",
+          "debug_lesson": "On this target the standard Triton JIT launch costs ~50 us per call, so the cached raw-launch path is mandatory; the reference's whole fmod_ call is 6.3 us, so small-tensor speedup is decided by host bookkeeping. msprof profile collection fails server-side on this backend right now (no OpProf marker), so per-call host/device splits must be obtained with event-vs-loop timing instead.",
+          "strategy_evolution": "Start from a validated-correctness seed, quantify the host floor with a target microbenchmark, then optimize the dominant term first instead of guessing at the device kernel.",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "fmod_tensor_:round-2",
+      "score": 0.6961232360037043,
+      "source_sha256": "aa91395e63ce510f5f47f4199b5717d588ac140992c60a809c7f302ee105af51",
+      "method": "精简宿主元数据处理",
+      "raw": {
+        "ledger_sha256": "aca31fa8c42ec93864874585a186f68684820be05f436a4bfb823b5913725a42",
+        "round": 2,
+        "source_sha256": "aa91395e63ce510f5f47f4199b5717d588ac140992c60a809c7f302ee105af51",
+        "evaluation": {
+          "evaluated_at": "2026-10-30T00:08:40.248528Z",
+          "status": "PASSED",
+          "geo_mean": 0.6961232360037043,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Keep the arithmetic and launch mechanism identical and strip the per-call Python bookkeeping that dominates small-tensor latency",
+          "code_changes": "Kernels untouched. Host path: _RAW_STREAM resolved once at import (still invoked per call with the live device index); _entry returns a 4-tuple (raw_launch, function, packed_metadata, grid) with the grid precomputed; cache key shrunk to (A.dtype, A.get_device(), n) with a single dict .get; A.get_device() replaces A.device.index; numel computed once; the fast path is entered directly when the cached entry exists.",
+          "hypothesis": "The nine timing workloads at 15.9-18.7 us are bound by per-call host cost, not device work: on target, calling the identical cached raw launch with the Python body bypassed measured 10.6 us while the full run() measured 15.1 us, so ~4.4 us is Python bookkeeping above the launch. Shrinking that bookkeeping should drop those workloads to roughly 12-13 us and lift geo_mean from 0.6565 toward ~0.80.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Removing ~2.5-3 us of per-call Python bookkeeping (device-object construction, repeated numel/grid arithmetic, tuple key of 4 with device object, extra function-call layer in _stream) lifts the nine host-bound workloads whose latency is set by per-call cost rather than by device work"
+          },
+          "source": {
+            "origin": "profile_next_experiment",
+            "parent_round_num": 1
+          },
+          "key_params": {
+            "BLOCK": 4096,
+            "cache_key": "(dtype, get_device(), n)",
+            "prebound_grid": true
+          },
+          "knowledge_uses": [
+            {
+              "concept_ref": "",
+              "source_ref": {
+                "resource": "retrieved_knowledge.records[xlogy-runtime-scalar-v1]",
+                "revision": "dedup_key:571a2c1d70e8ce3a9ddda757699e334629383e775dc5535da5bfc8a951df15f5",
+                "locator": "records/xlogy-runtime-scalar-v1 (cached-launch-runtime-arguments), summary and evidence.source"
+              },
+              "query_event_id": "query:cached-launch-runtime-arguments",
+              "role": "implementation",
+              "disposition": "adopted",
+              "application_note": "Reused the documented low-level launch form compiled.run.launch(function, packed_metadata, hooks, *kernel args) with the packed metadata object, but per the record's constraint kept passing the live current stream and the current tensor pointers on every invocation instead of caching them.",
+              "affected_parts": [
+                "_entry",
+                "run fast path",
+                "_raw_stream"
+              ]
+            }
+          ]
+        },
+        "profile": {
+          "required": true,
+          "status": "pending",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 2,
+          "expectation_status": "partially_met",
+          "root_cause": "The per-call host cost was reduced as intended (nine host-bound workloads 15.9-18.7 -> 14.1-15.8 us, speedups 0.63-0.71 -> 0.72-0.78) but less than predicted, because the largest remaining components are inside the raw launch and driver path rather than in Python bookkeeping. The dominant remaining deficit is the instruction-bound arithmetic on the two large 16-bit workloads (0.508/0.515), where the candidate reaches 0.62 TB/s while the reference reaches 1.21 TB/s at the same element count and the per-element cost is nearly identical to the fp32 case, so memory traffic is not the limiter.",
+          "perf_gap_analysis": "Predicted ~12-13 us for the nine host-bound workloads; observed 14.1-15.8 us, i.e. only ~1.2-1.5 us recovered instead of the ~3 us predicted. The bypass measurement overstated what was recoverable because the 10.6 us 'prebound launch only' figure came from a lambda that cannot stand in for the mandatory contiguity/shape/alignment validation, and the raw launch itself (9.9 us) plus the per-call stream query (0.7 us) remain unavoidable from Python. Aggregate: geo_mean 0.6565 -> 0.6961 with min_speedup unchanged at 0.508 (timing-3); the two large 16-bit workloads are unchanged at 0.508/0.515 exactly as expected since the kernel was untouched. The fp32 large workload read 0.842 this round versus 0.948 before while its candidate latency was flat (0.190351 -> 0.190860 ms) and only its reference latency moved (0.180398 -> 0.160677 ms), so that shift is reference-side variation, not a regression of this change.",
+          "next_suggestion": "Turn to the instruction-bound large 16-bit workloads (timing-3/timing-7 at 0.508/0.515): measure the memory roofline, the cost of the fp32 divide, and mask-free/compiled-tile variants of the same exact arithmetic to find out how much of the 2x gap is division versus the rest of the chain.",
+          "optimization_level": "host_side_special",
+          "debug_lesson": "The Python body above the cached raw launch was only worth ~1.2 us, not the ~4.4 us the bypass measurement suggested: most of the remaining per-call cost is inside the raw launch + driver path (measured floor 9.9 us launch + 0.7 us stream query) and cannot be removed from Python. Small-tensor latency is now close to its achievable host floor.",
+          "strategy_evolution": "Host-path tuning is nearly exhausted; shift to the device arithmetic formulation for the large 16-bit cases, which now dominate the aggregate gap.",
+          "knowledge_assessments": [
+            {
+              "concept_ref": "",
+              "source_ref": {
+                "resource": "retrieved_knowledge.records[xlogy-runtime-scalar-v1]",
+                "revision": "dedup_key:571a2c1d70e8ce3a9ddda757699e334629383e775dc5535da5bfc8a951df15f5",
+                "locator": "records/xlogy-runtime-scalar-v1 (cached-launch-runtime-arguments), summary and evidence.source"
+              },
+              "assessment": "confirmed",
+              "rationale": "Round 2 rebuilt the host path around the recorded cached-launch pattern (pre-bound compiled.run.launch with packed_metadata, grid precomputed) while still querying the live stream and current data_ptr on every invocation; all 30 workloads passed with abs_err/rel_err 0, including the strided views and the 1-element specialization, so the record's constraint was respected and caused no failure. The failure mode the record warns about (stale cached runtime state across parameter switches) was not isolated by a dedicated sweep, so the assessment rests on the passing suite plus the implementation matching the documented form."
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "view": {
+    "id": "mainline",
+    "session": "fmod_tensor_",
+    "title": "fmod_tensor_ 优化轨迹",
+    "subtitle": "历史 KGS 参考 · 本批 2 次正式评测",
+    "ylim": [
+      0,
+      0.9
+    ],
+    "annotations": [
+      {
+        "point": 2,
+        "method": "精简宿主元数据处理",
+        "color": "probe",
+        "position": [
+          550,
+          285
+        ],
+        "arrow": [
+          950,
+          325
+        ]
+      }
+    ],
+    "legend": [
+      "paired",
+      "sim",
+      "knowledge",
+      "probe",
+      "ir"
+    ],
+    "gap": null,
+    "x_label": "本批正式评测顺序",
+    "plot_bottom": 745,
+    "nodes": [
+      {
+        "point": 1,
+        "location": "mixed"
+      },
+      {
+        "point": 2,
+        "location": "host"
+      }
+    ],
+    "delivery": {
+      "score": 0.840686089752437,
+      "source": "operators/fmod_tensor_/versions/independent_strict/retained/kernel.py",
+      "source_sha256": "0f7bf1e0427e099f7820bc3bf89c7988a2f263d0d21842d9bd5e11cdc8ba3b43",
+      "passed": 30,
+      "total": 30,
+      "result": "operators/fmod_tensor_/evidence/retained/evaluation/result.json",
+      "result_sha256": "9bcbc28b1c55f35a6820e3f542fb3c710a02cd4a9af0717dfd5ee0567462a187",
+      "endpoint_same_source": false
+    },
+    "result_only": false,
+    "line_status": "下图：历史优化片段"
+  },
+  "history": [
+    {
+      "ledger_sha256": "aca31fa8c42ec93864874585a186f68684820be05f436a4bfb823b5913725a42",
+      "round": 1,
+      "source_sha256": "ec1a8d87f05098e0d384ac609e68784748c84d982b261b3de8fc5feaae07c955",
+      "evaluation": {
+        "evaluated_at": "2026-10-29T23:55:45.012682Z",
+        "status": "PASSED",
+        "geo_mean": 0.6565483503943638,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Establish the measured baseline with the inherited seed: quotient -> truncate-toward-zero -> multiply -> subtract (no FMA fusion), flat fast path plus strided generic path, cached low-level launch for the contiguous case",
+        "code_changes": "Unmodified seed written to tmp/main.py",
+        "hypothesis": "The seed reproduces the fixed NPU fmod reference contract and establishes an authoritative latency baseline per workload",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "No change; measurement of the inherited candidate"
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {
+          "BLOCK": 4096,
+          "GENERIC_BLOCK": 256
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "failed",
+        "analysis_path": ".kernelgen/profile-analysis/round-0001.json",
+        "summary": "failed: msprof base collection exited successfully without profile completion marker (identical error on all 5 requests: timing-3, timing-11, timing-8, timing-0 at level=metrics, plus timing-11 retried alone). Every result returned status=failed, capabilities=[], metrics={}, artifacts=[]. No device kernel duration, AIV/MTE counters, or instruction listing was obtainable, so the requested host-vs-device split, pipeline utilization, per-program distribution and fp16-widening evidence could not be "
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "Baseline establishes that the seed's quotient->truncate->multiply->subtract arithmetic reproduces the fixed NPU fmod reference exactly (all 18 correctness cases PASSED with abs_err/rel_err 0, matched_ratio 1.0) and that two independent gaps limit throughput: (1) 9 of 12 timing workloads sit on a per-call floor of 15.9-18.7 us versus 10.1-11.6 us for the reference, and a target microbenchmark shows this floor is host/launch bound (n=1024 fp16: full run 15.1 us, the same cached raw launch with the Python body bypassed 10.6 us, reference fmod_ 6.3 us, standard Triton JIT launch 50 us), so the Python bookkeeping above the launch costs ~4.4 us per call; (2) the large 16-bit cases are arithmetic bound, not bandwidth bound (fp16 4096x4096 moves 100.7 MB in 162.7 us = 0.62 TB/s while fp32 moves 201.3 MB in 190.4 us = 1.06 TB/s, i.e. equal per-element cost, and an fp16/bf16-native arithmetic variant measured 164 us versus 163 us for the fp32-widened one, so narrowing the arithmetic domain gives no speedup).",
+        "perf_gap_analysis": "Baseline only; no prior measurement to compare. Observed geo_mean 0.6565 with min_speedup 0.508 on fmod_tensor_-timing-3. Host-bound small workloads score 0.58-0.72 and the large fp32 case is already at parity (0.9477, 1.058 TB/s achieved), so the aggregated gap decomposes into a fixable host-path excess of ~4.4 us per call plus an instruction-bound deficit on 16-bit large tensors where the reference reaches 1.21 TB/s and the candidate 0.62 TB/s.",
+        "next_suggestion": "Shrink only the host path (pre-bind the launch tuple with its grid, resolve the raw-stream getter once but still query the live stream per call, single dict hit, A.get_device() instead of a device object) and keep the kernel byte-identical, targeting the nine host-bound workloads; attack the 16-bit large-tensor instruction count in a later round.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "On this target the standard Triton JIT launch costs ~50 us per call, so the cached raw-launch path is mandatory; the reference's whole fmod_ call is 6.3 us, so small-tensor speedup is decided by host bookkeeping. msprof profile collection fails server-side on this backend right now (no OpProf marker), so per-call host/device splits must be obtained with event-vs-loop timing instead.",
+        "strategy_evolution": "Start from a validated-correctness seed, quantify the host floor with a target microbenchmark, then optimize the dominant term first instead of guessing at the device kernel.",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "aca31fa8c42ec93864874585a186f68684820be05f436a4bfb823b5913725a42",
+      "round": 2,
+      "source_sha256": "aa91395e63ce510f5f47f4199b5717d588ac140992c60a809c7f302ee105af51",
+      "evaluation": {
+        "evaluated_at": "2026-10-30T00:08:40.248528Z",
+        "status": "PASSED",
+        "geo_mean": 0.6961232360037043,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Keep the arithmetic and launch mechanism identical and strip the per-call Python bookkeeping that dominates small-tensor latency",
+        "code_changes": "Kernels untouched. Host path: _RAW_STREAM resolved once at import (still invoked per call with the live device index); _entry returns a 4-tuple (raw_launch, function, packed_metadata, grid) with the grid precomputed; cache key shrunk to (A.dtype, A.get_device(), n) with a single dict .get; A.get_device() replaces A.device.index; numel computed once; the fast path is entered directly when the cached entry exists.",
+        "hypothesis": "The nine timing workloads at 15.9-18.7 us are bound by per-call host cost, not device work: on target, calling the identical cached raw launch with the Python body bypassed measured 10.6 us while the full run() measured 15.1 us, so ~4.4 us is Python bookkeeping above the launch. Shrinking that bookkeeping should drop those workloads to roughly 12-13 us and lift geo_mean from 0.6565 toward ~0.80.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Removing ~2.5-3 us of per-call Python bookkeeping (device-object construction, repeated numel/grid arithmetic, tuple key of 4 with device object, extra function-call layer in _stream) lifts the nine host-bound workloads whose latency is set by per-call cost rather than by device work"
+        },
+        "source": {
+          "origin": "profile_next_experiment",
+          "parent_round_num": 1
+        },
+        "key_params": {
+          "BLOCK": 4096,
+          "cache_key": "(dtype, get_device(), n)",
+          "prebound_grid": true
+        },
+        "knowledge_uses": [
+          {
+            "concept_ref": "",
+            "source_ref": {
+              "resource": "retrieved_knowledge.records[xlogy-runtime-scalar-v1]",
+              "revision": "dedup_key:571a2c1d70e8ce3a9ddda757699e334629383e775dc5535da5bfc8a951df15f5",
+              "locator": "records/xlogy-runtime-scalar-v1 (cached-launch-runtime-arguments), summary and evidence.source"
+            },
+            "query_event_id": "query:cached-launch-runtime-arguments",
+            "role": "implementation",
+            "disposition": "adopted",
+            "application_note": "Reused the documented low-level launch form compiled.run.launch(function, packed_metadata, hooks, *kernel args) with the packed metadata object, but per the record's constraint kept passing the live current stream and the current tensor pointers on every invocation instead of caching them.",
+            "affected_parts": [
+              "_entry",
+              "run fast path",
+              "_raw_stream"
+            ]
+          }
+        ]
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "partially_met",
+        "root_cause": "The per-call host cost was reduced as intended (nine host-bound workloads 15.9-18.7 -> 14.1-15.8 us, speedups 0.63-0.71 -> 0.72-0.78) but less than predicted, because the largest remaining components are inside the raw launch and driver path rather than in Python bookkeeping. The dominant remaining deficit is the instruction-bound arithmetic on the two large 16-bit workloads (0.508/0.515), where the candidate reaches 0.62 TB/s while the reference reaches 1.21 TB/s at the same element count and the per-element cost is nearly identical to the fp32 case, so memory traffic is not the limiter.",
+        "perf_gap_analysis": "Predicted ~12-13 us for the nine host-bound workloads; observed 14.1-15.8 us, i.e. only ~1.2-1.5 us recovered instead of the ~3 us predicted. The bypass measurement overstated what was recoverable because the 10.6 us 'prebound launch only' figure came from a lambda that cannot stand in for the mandatory contiguity/shape/alignment validation, and the raw launch itself (9.9 us) plus the per-call stream query (0.7 us) remain unavoidable from Python. Aggregate: geo_mean 0.6565 -> 0.6961 with min_speedup unchanged at 0.508 (timing-3); the two large 16-bit workloads are unchanged at 0.508/0.515 exactly as expected since the kernel was untouched. The fp32 large workload read 0.842 this round versus 0.948 before while its candidate latency was flat (0.190351 -> 0.190860 ms) and only its reference latency moved (0.180398 -> 0.160677 ms), so that shift is reference-side variation, not a regression of this change.",
+        "next_suggestion": "Turn to the instruction-bound large 16-bit workloads (timing-3/timing-7 at 0.508/0.515): measure the memory roofline, the cost of the fp32 divide, and mask-free/compiled-tile variants of the same exact arithmetic to find out how much of the 2x gap is division versus the rest of the chain.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "The Python body above the cached raw launch was only worth ~1.2 us, not the ~4.4 us the bypass measurement suggested: most of the remaining per-call cost is inside the raw launch + driver path (measured floor 9.9 us launch + 0.7 us stream query) and cannot be removed from Python. Small-tensor latency is now close to its achievable host floor.",
+        "strategy_evolution": "Host-path tuning is nearly exhausted; shift to the device arithmetic formulation for the large 16-bit cases, which now dominate the aggregate gap.",
+        "knowledge_assessments": [
+          {
+            "concept_ref": "",
+            "source_ref": {
+              "resource": "retrieved_knowledge.records[xlogy-runtime-scalar-v1]",
+              "revision": "dedup_key:571a2c1d70e8ce3a9ddda757699e334629383e775dc5535da5bfc8a951df15f5",
+              "locator": "records/xlogy-runtime-scalar-v1 (cached-launch-runtime-arguments), summary and evidence.source"
+            },
+            "assessment": "confirmed",
+            "rationale": "Round 2 rebuilt the host path around the recorded cached-launch pattern (pre-bound compiled.run.launch with packed_metadata, grid precomputed) while still querying the live stream and current data_ptr on every invocation; all 30 workloads passed with abs_err/rel_err 0, including the strided views and the 1-element specialization, so the record's constraint was respected and caused no failure. The failure mode the record warns about (stale cached runtime state across parameter switches) was not isolated by a dedicated sweep, so the assessment rests on the passing suite plus the implementation matching the documented form."
+          }
+        ]
+      }
+    }
+  ],
+  "gap": null,
+  "relation_note": "按同一原始账本正式轮次展示；未逐编辑恢复的关系不声称直接源码继承。",
+  "delivery": {
+    "score": 0.840686089752437,
+    "source": "operators/fmod_tensor_/versions/independent_strict/retained/kernel.py",
+    "source_sha256": "0f7bf1e0427e099f7820bc3bf89c7988a2f263d0d21842d9bd5e11cdc8ba3b43",
+    "passed": 30,
+    "total": 30,
+    "result": "operators/fmod_tensor_/evidence/retained/evaluation/result.json",
+    "result_sha256": "9bcbc28b1c55f35a6820e3f542fb3c710a02cd4a9af0717dfd5ee0567462a187",
+    "endpoint_same_source": false
+  },
+  "current_cann_score": 0.840686089752437,
+  "historical_simulator_files": 0
+}

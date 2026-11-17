@@ -1,0 +1,59 @@
+attrs:
+- description: 哈希表容量（必选），须等于table_keys.shape[0]与table_values.shape[0]
+  name: bucket_size
+  required: true
+  type: int
+- description: value的维度（必选），须等于table_values.shape[1]
+  name: embedding_dim
+  required: true
+  type: int
+- default: 'false'
+  description: 启用filter_key功能
+  name: filter_key_flag
+  required: false
+  type: bool
+- default: '-1'
+  description: 被过滤的key（仅filter_key_flag=True时生效）；被过滤查询输出全0行且不探查不插入
+  name: filter_key
+  required: false
+  type: int
+category: HashTable
+description: 直接映射哈希表查找/插入算子（表状态为显式输入）；命中返回已存向量，未命中按first-insert-wins插入key派生的确定性初始化向量，输出附带每查询状态flags
+difficulty: L3
+formula: "slot = key mod bucket_size\nvalues[i] = 0                        if filtered\n\
+  \          = table_values[slot]       if table_keys[slot] >= 0\n          = init_vector(key[winner])\
+  \ otherwise (first-insert-wins, winner = min flattened index)\ninit_vector(k)[j]\
+  \ = float32((lo32(k*2654435761) XOR lo32(j*2654435769)) & 0x7FF) * 2^-10 - 1.0\n"
+inputs:
+- description: slot占用标记，>=0为占用、<0为空，shape为[bucket_size]
+  dtype:
+  - int64
+  name: table_keys
+  shape: '[bucket_size]'
+- description: 各slot已存的embedding，shape为[bucket_size, embedding_dim]
+  dtype:
+  - float32
+  name: table_values
+  shape: '[bucket_size, embedding_dim]'
+- description: 要查找/插入的key序列（非负），按C序展平
+  dtype:
+  - int64
+  name: keys
+  shape: 任意形状
+name: EmbeddingHashTableLookupOrInsert
+outputs:
+- description: 命中值/插入的初始化向量/过滤全0行，shape为(N, embedding_dim)
+  dtype:
+  - float32
+  name: values
+  shape: (N, embedding_dim)
+- description: 每查询状态，0=被过滤，1=本查询执行插入，2=命中
+  dtype:
+  - int32
+  name: flags
+  shape: (N)
+schema: embedding_hash_table_lookup_or_insert(Tensor table_keys, Tensor table_values,
+  Tensor keys, int bucket_size, int embedding_dim, bool filter_key_flag=False, int
+  filter_key=-1) -> (Tensor values, Tensor flags)
+shape_support: 'table_keys: [bucket_size]; table_values: [bucket_size, embedding_dim];
+  keys: 任意形状(非负int64); values: (N, embedding_dim); flags: (N)'

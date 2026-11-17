@@ -1,0 +1,76 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "f28618b00ab6435a905a4e280249e6e2",
+  "recorded_at": "2026-11-17T07:30:17.632983+00:00",
+  "round_id": "performance-03",
+  "input_source": {
+    "path": "trace/sources/4c85a61f6b548c434784b48db23d4bea612595f6b05897ff101b87be903742f0.py",
+    "sha256": "4c85a61f6b548c434784b48db23d4bea612595f6b05897ff101b87be903742f0"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/a8169185e744c5e772947f3859c58d70174a7817b56225a9d5645f30fffc857d.json",
+        "sha256": "a8169185e744c5e772947f3859c58d70174a7817b56225a9d5645f30fffc857d"
+      },
+      "original": {
+        "path": "workspace/performance-feedback.json",
+        "sha256": "a8169185e744c5e772947f3859c58d70174a7817b56225a9d5645f30fffc857d"
+      },
+      "category": "other",
+      "role": "background",
+      "finding": "Full formal timing evidence for source 4c85: geo_mean 1.3859 (<1.4), float32 cases candidate_us ~28.9-29.9us vs reference ~14.3-14.5us; prompt records candidate-only improvement 1.11959x and remaining old comparable high ~2.7% faster, not guaranteed reproducible. This is complete-package timing, not paired profiling.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/4c85a61f6b548c434784b48db23d4bea612595f6b05897ff101b87be903742f0.py",
+        "sha256": "4c85a61f6b548c434784b48db23d4bea612595f6b05897ff101b87be903742f0"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "4c85a61f6b548c434784b48db23d4bea612595f6b05897ff101b87be903742f0"
+      },
+      "category": "other",
+      "role": "mechanism",
+      "finding": "Dense hot branch is entered only when input.is_contiguous() and not input.is_conj(). It allocates a fresh destination solely as the Triton flat-copy target; both the copy kernel and the conjugate kernel address the output by flat element offset from out.data_ptr(), so only contiguousness (not a particular stride spelling) affects correctness.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/4c85a61f6b548c434784b48db23d4bea612595f6b05897ff101b87be903742f0.py",
+        "sha256": "4c85a61f6b548c434784b48db23d4bea612595f6b05897ff101b87be903742f0"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "4c85a61f6b548c434784b48db23d4bea612595f6b05897ff101b87be903742f0"
+      },
+      "category": "other",
+      "role": "trigger",
+      "finding": "The dense branch passes memory_format=torch.contiguous_format to torch.empty_like. For an already-contiguous, dense, non-overlapping input, torch.empty_like default memory_format=preserve_format yields a tensor with the input's strides, i.e. the same contiguous layout; the keyword is therefore redundant here. Default still allocates independent storage.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/4c7c51b9b2af0a711cc953401a80fa97fb455a98ca8b0d621aab890a3972ce8b.json",
+        "sha256": "4c7c51b9b2af0a711cc953401a80fa97fb455a98ca8b0d621aab890a3972ce8b"
+      },
+      "original": {
+        "path": "workspace/knowledge.json",
+        "sha256": "4c7c51b9b2af0a711cc953401a80fa97fb455a98ca8b0d621aab890a3972ce8b"
+      },
+      "category": "knowledge",
+      "role": "disambiguation",
+      "finding": "preserve_format is documented to copy input strides when the input is non-overlapping and dense; a standard contiguous tensor is non-overlapping and dense, so default empty_like output is contiguous. Removing the explicit contiguous_format keyword does not change contiguity, independent allocation, or the real Triton copy.",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "In the exactly-contiguous, no-conjugate-bit branch, torch.empty_like(input) (default preserve_format) produces the same contiguous layout as torch.empty_like(input, memory_format=torch.contiguous_format), so the explicit keyword is a redundant host argument. Dropping it trims a small amount of hot-path Python/dispatcher argument handling without changing semantics.",
+  "change": "Edit only the dense branch allocation: torch.empty_like(input, memory_format=torch.contiguous_format) -> torch.empty_like(input). Keep independent storage, the Triton flat copy, device cache identity (dev in cache key), and per-call stream read unchanged.",
+  "expected": "Semantically identical output (fresh contiguous tensor filled by the same Triton kernel). Very small host-side reduction; gain likely within timing noise, so no guaranteed improvement. If no reproducible gain, retain the fastest valid candidate and stop.",
+  "validation": "Run preflight on the edited candidate; confirm it returns awaiting_source_review with new source sha. Then formal evaluation via the bridge compares full-package timing against 4c85; accept only if correct and not slower. Semantics unchanged because all math/allocation paths are untouched.",
+  "alternatives": [],
+  "discriminating_observation": "",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

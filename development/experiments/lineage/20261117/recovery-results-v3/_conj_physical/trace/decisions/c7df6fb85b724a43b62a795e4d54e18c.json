@@ -1,0 +1,90 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "c7df6fb85b724a43b62a795e4d54e18c",
+  "recorded_at": "2026-11-17T07:09:34.561417+00:00",
+  "round_id": "performance-02",
+  "input_source": {
+    "path": "trace/sources/577f382ee5d0b658c4a0637bda6a12a5cdec6d488ed10c16e3f98f553bd221b7.py",
+    "sha256": "577f382ee5d0b658c4a0637bda6a12a5cdec6d488ed10c16e3f98f553bd221b7"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/577f382ee5d0b658c4a0637bda6a12a5cdec6d488ed10c16e3f98f553bd221b7.py",
+        "sha256": "577f382ee5d0b658c4a0637bda6a12a5cdec6d488ed10c16e3f98f553bd221b7"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "577f382ee5d0b658c4a0637bda6a12a5cdec6d488ed10c16e3f98f553bd221b7"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Around lines 276-278, _strict_empty_like expands x.shape into a tuple and dispatches torch.empty(tuple, device, dtype). The hot contiguous non-conj-bit output allocation goes through this general-shape helper.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/577f382ee5d0b658c4a0637bda6a12a5cdec6d488ed10c16e3f98f553bd221b7.py",
+        "sha256": "577f382ee5d0b658c4a0637bda6a12a5cdec6d488ed10c16e3f98f553bd221b7"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "577f382ee5d0b658c4a0637bda6a12a5cdec6d488ed10c16e3f98f553bd221b7"
+      },
+      "category": "source_ir",
+      "role": "trigger",
+      "finding": "Around lines 205-206, the contiguous non-conj-bit fast path is the only path that calls _strict_empty_like; the conj-bit and strided paths already call torch.empty(input.shape, ...) directly. Only this branch needs to change.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/0b6150939e54d5c7bb4ee6de7e1087add0f2ee97006e299d02bb4a03f01fd42e.json",
+        "sha256": "0b6150939e54d5c7bb4ee6de7e1087add0f2ee97006e299d02bb4a03f01fd42e"
+      },
+      "original": {
+        "path": "workspace/diagnosis.json",
+        "sha256": "0b6150939e54d5c7bb4ee6de7e1087add0f2ee97006e299d02bb4a03f01fd42e"
+      },
+      "category": "other",
+      "role": "trigger",
+      "finding": "Current candidate feedback: full checks pass, candidate-only geometric speed is 0.99405 (no improvement), and all six timing cases remain 32-33us, so the prior device-lookup-removal hypothesis is not confirmed; host allocation overhead on the hot path remains an untested explanation. This is task feedback, not paired profiling.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/fd62b3b597fff8bb79aa3fe248cd1a34306f7553bc1a887670fb94c09fe8b736.json",
+        "sha256": "fd62b3b597fff8bb79aa3fe248cd1a34306f7553bc1a887670fb94c09fe8b736"
+      },
+      "original": {
+        "path": "workspace/agent-config.json",
+        "sha256": "fd62b3b597fff8bb79aa3fe248cd1a34306f7553bc1a887670fb94c09fe8b736"
+      },
+      "category": "knowledge",
+      "role": "background",
+      "finding": "Strict Triton storage policy allows allocation-only torch.empty_like, so the hot allocation can be expressed directly without a tuple-shape torch.empty dispatch and without bypassing the Triton copy kernel.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/fd62b3b597fff8bb79aa3fe248cd1a34306f7553bc1a887670fb94c09fe8b736.json",
+        "sha256": "fd62b3b597fff8bb79aa3fe248cd1a34306f7553bc1a887670fb94c09fe8b736"
+      },
+      "original": {
+        "path": "workspace/agent-config.json",
+        "sha256": "fd62b3b597fff8bb79aa3fe248cd1a34306f7553bc1a887670fb94c09fe8b736"
+      },
+      "category": "other",
+      "role": "background",
+      "finding": "Full KGS is evaluation evidence from the old package use, not paired host profiling; it does not by itself establish the allocation mechanism.",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "On the dense contiguous non-conj-bit path, _strict_empty_like expands the shape into a tuple and calls torch.empty, adding host-side shape/dispatch allocation overhead. Replacing only that call with a direct independent contiguous torch.empty_like(input, memory_format=torch.contiguous_format) may lower per-call host cost and improve the 32-33us timing cases. This is inferred from the code diff, not from measured host profiling.",
+  "change": "In run(), for the existing contig and not has_bit branch, replace out = _strict_empty_like(input) with out = torch.empty_like(input, memory_format=torch.contiguous_format). Keep the Triton copy kernel call and all other paths (conj-bit, strided, zero-numel) unchanged; still return a fresh independent contiguous tensor and never alias the input.",
+  "expected": "If host allocation overhead is material, the six timing cases should drop below 32-33us and candidate-only geometric speed should exceed 1.0. If the device copy dominates, timings and geometric speed should stay flat. Fresh-allocation and non-aliasing semantics must remain identical.",
+  "validation": "Run preflight on the edited candidate, then evaluate with the standard full checks/timing suite. Compare the six timing cases and candidate-only geometric speed against the current 32-33us / 0.99405 baseline, and confirm copy correctness (independent contiguous output, no input aliasing) across contiguity and conj-bit cases.",
+  "alternatives": [],
+  "discriminating_observation": "",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

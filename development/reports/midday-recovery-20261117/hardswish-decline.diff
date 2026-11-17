@@ -1,0 +1,108 @@
+--- development\experiments\lineage\20261117\source-evidence\sources\e1bb9d02f196ca1ad7e73ecbf5ef004f44e72d7479bb96e5842742818d962d98.py
++++ operators\hardswish\evidence\independent_strict\581ad44a1694-candidate.py
+@@ -16,49 +16,26 @@
+ _STREAM = {}
+ _PLANS = {}
+ _EMPTY_LIKE = torch.empty_like
+-# dtype, n, device, launch, grid, block, opts, fn, packed, getter, has_launch, h16
+-_FAST = [None, -1, -1, None, 1, 4096, {}, None, None, None, False, False]
+-
+-@triton.jit
+-def _hardswish_stream(X, Y, N: tl.constexpr, BLOCK: tl.constexpr,
+-                      H16: tl.constexpr):
++# dtype, n, device, launch, grid, block, opts, fn, packed, getter, has_launch
++_FAST = [None, -1, -1, None, 1, 4096, {}, None, None, None, False]
++
++@triton.jit
++def _hardswish_stream(X, Y, N: tl.constexpr, BLOCK: tl.constexpr):
+     pid = tl.program_id(0)
+     lane = tl.arange(0, BLOCK)
+     step = tl.num_programs(0) * BLOCK
+     # Hot loop: every tile here is fully in range, so the transfers stay
+     # unmasked contiguous bursts.  Only the trailing region needs a predicate.
+-    #
+-    # H16 keeps a narrow dtype's arithmetic narrow: the fp32 emulation of a
+-    # 16-bit operand costs a cast in and out plus full-rate fp32 vector work,
+-    # which the target measures at 1.48x the cost of native narrow math.
+     full = (N // step) * step
+     for start in range(pid * BLOCK, full, step):
+-        x = tl.load(X + start + lane)
+-        if H16:
+-            three = tl.full((1,), 3.0, x.dtype)
+-            zero = tl.full((1,), 0.0, x.dtype)
+-            six = tl.full((1,), 6.0, x.dtype)
+-            sixth = tl.full((1,), 1.0 / 6.0, x.dtype)
+-            inner = tl.minimum(tl.maximum(x + three, zero), six)
+-            tl.store(Y + start + lane, x * inner * sixth)
+-        else:
+-            v = x.to(tl.float32)
+-            inner = tl.minimum(tl.maximum(v + 3.0, 0.0), 6.0)
+-            tl.store(Y + start + lane, v * inner * (1.0 / 6.0))
++        x = tl.load(X + start + lane).to(tl.float32)
++        inner = tl.minimum(tl.maximum(x + 3.0, 0.0), 6.0)
++        tl.store(Y + start + lane, x * inner * (1.0 / 6.0))
+     offset = full + pid * BLOCK + lane
+     tail = offset < N
+-    x = tl.load(X + offset, tail, other=0)
+-    if H16:
+-        three = tl.full((1,), 3.0, x.dtype)
+-        zero = tl.full((1,), 0.0, x.dtype)
+-        six = tl.full((1,), 6.0, x.dtype)
+-        sixth = tl.full((1,), 1.0 / 6.0, x.dtype)
+-        inner = tl.minimum(tl.maximum(x + three, zero), six)
+-        tl.store(Y + offset, x * inner * sixth, tail)
+-    else:
+-        v = x.to(tl.float32)
+-        inner = tl.minimum(tl.maximum(v + 3.0, 0.0), 6.0)
+-        tl.store(Y + offset, v * inner * (1.0 / 6.0), tail)
++    x = tl.load(X + offset, tail, other=0).to(tl.float32)
++    inner = tl.minimum(tl.maximum(x + 3.0, 0.0), 6.0)
++    tl.store(Y + offset, x * inner * (1.0 / 6.0), tail)
+ 
+ def _stream_getter(device):
+     getter = _STREAM.get(device)
+@@ -106,10 +83,9 @@
+ def _build(y, out, n, device):
+     """Compile this specialization once and return its launch plan."""
+     block, grid = _geometry(n, device)
+-    h16 = y.dtype is torch.float16
+     launch = fn = packed = stream = None
+     try:
+-        compiled = _hardswish_stream.warmup(y, out, n, block, h16, grid=(1,))
++        compiled = _hardswish_stream.warmup(y, out, n, block, grid=(1,))
+         launcher = compiled.run
+         if not (getattr(launcher, 'compile_only', False) or getattr(launcher, 'enable_msprof_register_tensor', False) or getattr(launcher.metadata, 'debug_enabled', False) or getattr(launcher.metadata, 'debug', False)):
+             launch = launcher.launch
+@@ -119,7 +95,7 @@
+     except Exception:
+         launch = None
+     return [y.dtype, n, device, launch, grid, block, {}, fn, packed, stream,
+-            launch is not None, h16]
++            launch is not None]
+ 
+ def _slow(y, out, n):
+     if not n:
+@@ -135,9 +111,9 @@
+     yp = out.data_ptr()
+     if plan[10] and not ((xp | yp) & 15):
+         plan[3](plan[4], 1, 1, plan[9](), plan[7], plan[8], None, None, None,
+-                xp, yp, n, plan[5], plan[11])
++                xp, yp, n, plan[5])
+     elif n:
+-        _hardswish_stream[plan[4],](y, out, n, plan[5], plan[11])
++        _hardswish_stream[plan[4],](y, out, n, plan[5])
+ 
+ def run(x):
+     if not x.is_contiguous():
+@@ -150,9 +126,9 @@
+         yp = out.data_ptr()
+         if f[10] and not ((xp | yp) & 15):
+             f[3](f[4], 1, 1, f[9](), f[7], f[8], None, None, None,
+-                 xp, yp, n, f[5], f[11])
++                 xp, yp, n, f[5])
+         elif n:
+-            _hardswish_stream[f[4],](x, out, n, f[5], f[11])
++            _hardswish_stream[f[4],](x, out, n, f[5])
+         return out
+     _slow(x, out, n)
+     return out

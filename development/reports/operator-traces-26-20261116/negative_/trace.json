@@ -1,0 +1,394 @@
+{
+  "operator": "negative_",
+  "kind": "saved_ledger_attempt_order",
+  "selected_source": {
+    "path": "/data/hanle/ascend-optimization/runs/next25-20261029-v2/kg-runs/negative_-next25-20261029-v2-attempt-2/stages/optimize/work/.ledger.json",
+    "sha256": "033b6af41f9abe6fff6bf0a47f8feccb55afc008f68c51584a5acae24412a4f1"
+  },
+  "points": [
+    {
+      "id": "negative_:round-1",
+      "score": 0.15974547587110685,
+      "source_sha256": "99976c0c4a66cd4daf2f6586d42e77b70eb3625564c077002099dc72de4ef2f1",
+      "method": "本批起点",
+      "raw": {
+        "ledger_sha256": "033b6af41f9abe6fff6bf0a47f8feccb55afc008f68c51584a5acae24412a4f1",
+        "round": 1,
+        "source_sha256": "99976c0c4a66cd4daf2f6586d42e77b70eb3625564c077002099dc72de4ef2f1",
+        "evaluation": {
+          "evaluated_at": "2026-10-29T13:44:51.548335Z",
+          "status": "PASSED",
+          "geo_mean": 0.15974547587110685,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "baseline",
+          "strategy": "Establish the authoritative baseline of the supplied seed implementation (contiguous 1-D negation kernel + collapsed-stride gather kernel) in this workspace",
+          "code_changes": "None: the seed file is evaluated unmodified",
+          "hypothesis": "The seed already passes all 30 workloads (a prior formal run of this exact file passed 30/30 with geo_mean 0.167); its cost is dominated by a ~55 us Triton launch path for small tensors and a 152 us BLOCK=4096 kernel for 4096x4096 tensors",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "establish_baseline",
+            "mechanism": "Records the starting point for later launch-overhead and tiling experiments"
+          },
+          "source": {
+            "origin": "baseline",
+            "parent_round_num": null
+          },
+          "key_params": {},
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "pending",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 1,
+          "expectation_status": "baseline",
+          "root_cause": "Seed cost structure established: 9 of 12 timing workloads are host-launch-bound (55-62 us measured against a 40-55 us Triton launch floor, with per-launch marginal cost measured at ~54 us) and 3 are device-bound (151.6 us for 4096x4096 with BLOCK=4096/grid=4096, i.e. ~0.9 TB/s effective on a 176 MB L2-resident working set where the aten reference reaches 23 us).",
+          "perf_gap_analysis": "Baseline geo_mean 0.1597, min_speedup 0.0830 (timing-3). All 30 workloads pass, confirming the earlier 27/30 flaggems baseline failure was not reproducible for this exact seed. Gap decomposition from paired target measurements: (a) launch path - an empty 1-tensor Triton launch costs 51.3 us while the same kernel through the compiled-kernel raw launcher costs 17.1 us and torch's in-place elementwise op costs 6-10 us, so ~35-45 us per call is pure Triton host overhead that dominates every small workload; (b) device tiling - the seed's BLOCK=4096 grid=4096 config measures 152 us on 4096x4096 fp32/fp16 whereas BLOCK=16384 grid=1024 measures 59.2/59.9 us (already at the then-host-bound floor), a 2.6x device-side gain.",
+          "next_suggestion": "Cut the per-call host cost by launching the precompiled Triton kernel directly (warmup once, then call the compiled runner with the tensor plus constexpr-specialized n), and retile large tensors to BLOCK=16384 so the device work drops under the new launch floor.",
+          "optimization_level": "host_side_special",
+          "debug_lesson": "Bit-exact re-simulation of the frozen reference inputs showed the 3 reported non-finite mismatches do not reproduce; the only deviation was -0.0 vs +0.0 at index 0, which compare() accepts (|diff|=0 <= atol). A prior formal run of the identical file passed 30/30.",
+          "strategy_evolution": "From prompt-only analysis (suspected strided-gather numerics bug) to paired target evidence: numerics are exact, the real cost is a ~55 us Triton host launch path plus an undersized device tile.",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "negative_:round-2",
+      "score": 0.2831461945786261,
+      "source_sha256": "a1b1a49e7021d3b263f788790691316d3545f991820d0b2d041c9ae364ce1e18",
+      "method": "直接启动已编译 kernel",
+      "raw": {
+        "ledger_sha256": "033b6af41f9abe6fff6bf0a47f8feccb55afc008f68c51584a5acae24412a4f1",
+        "round": 2,
+        "source_sha256": "a1b1a49e7021d3b263f788790691316d3545f991820d0b2d041c9ae364ce1e18",
+        "evaluation": {
+          "evaluated_at": "2026-10-29T13:51:29.033058Z",
+          "status": "PASSED",
+          "geo_mean": 0.2831461945786261,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Remove Triton's per-call host launch overhead by launching the precompiled kernel through Triton's own compiled-kernel entry point, keeping identical device kernels and tiling",
+          "code_changes": "Split the seed kernel into _neg_exact (no mask) and _neg_tail (masked, other=0.0); keep a per-specialisation CompiledKernel handle (kernel.warmup) and launch it through the compiled-kernel entry point with (gridX,1,1, current stream, function, packed_metadata, t, constexprs), skipping the per-call JITFunction binding/cache lookup. Kernel bodies, tiling (BLOCK=4096 above 4096 elements, next_pow2 single tile below) and the strided gather kernel are unchanged, and the standard kernel[grid](...) call remains the fallback.",
+          "hypothesis": "If the ~55 us per-call cost of the 9 small workloads is Triton host-side launch overhead rather than device work, then launching the already compiled kernel directly (17.1 us measured for the same launch in probe2 vs 51.3 us through kernel[grid]) should cut those workloads to roughly 25-30 us and raise geo_mean from 0.16 to about 0.30, while the three 4096x4096 workloads stay device-bound at ~152 us because their tiling is unchanged.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Removes ~27 us of per-call Python argument binding/cache bookkeeping from the 9 host-bound workloads (n<=1048576), where device work is only a few microseconds"
+          },
+          "source": {
+            "origin": "coder",
+            "parent_round_num": null
+          },
+          "key_params": {},
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "pending",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 2,
+          "expectation_status": "met",
+          "root_cause": "The 9 host-bound workloads were paying Triton's per-call Python launch overhead (measured 54.5 us marginal per empty launch, 51.3 us for a 1-tensor launch) on top of only a few microseconds of device work; replacing the JITFunction.run binding/cache path with the compiled-kernel entry point removed ~21-27 us per call.",
+          "perf_gap_analysis": "Predicted: 9 host-bound workloads fall from ~55-62 us to ~25-30 us (speedup ~0.30) and geo_mean ~0.30, with the three 4096x4096 workloads unchanged at ~152 us. Observed: geo_mean 0.2831 (+77% vs baseline 0.1597); the nine n<=1048576 workloads measured 31.1-34.5 us (speedup 0.336-0.448, previously 0.170-0.188) and the three 4096x4096 workloads stayed at 151.5/151.8/152.0 us (0.085/0.126/0.150), exactly as predicted. Residual gap versus the prediction: the isolated probe measured 27.4-28.9 us per call (best of 3 trials) whereas the harness records 31.1-34.5 us (median of 3 trials after a 25 ms warmup budget), i.e. ~4-6 us of additional per-call cost in the harness path, and the harness reference timings for the small workloads (11.0-12.9 us) are slower than my probe's (8.8-9.2 us), which raises the reference side and lowers speedup relative to my estimate. min_speedup is unchanged at 0.085 because timing-3 was deliberately left on the old tiling.",
+          "next_suggestion": "Retile the device kernel for large tensors: BLOCK=16384 (exact, mask-free) instead of BLOCK=4096/grid=4096, which probe2 measured at 59 us vs 152 us on 4096x4096, so the three still-device-bound workloads (currently 0.085/0.126/0.150 speedup) drop toward the new host floor.",
+          "optimization_level": "host_side_special",
+          "debug_lesson": "Per-launch marginal cost measured 54.5 us for an empty Triton launch on this stack; the compiled-kernel entry point costs 17.1 us for the same launch, so on this operator the host path, not the elementwise math, is the primary optimization target for n<=1048576.",
+          "strategy_evolution": "Layer 1 (host launch path) is now largely done; the remaining cost splits into ~31 us residual host path for small tensors and ~152 us device time for the three 4096x4096 tensors, which is where the worst speedup now lives.",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "negative_:round-3",
+      "score": 0.4128810206452792,
+      "source_sha256": "6dd8338ba1b49783cc0f274f7e494b3d25878cb9363e9dd014efcee4b470c97a",
+      "method": "每个 program 处理64KB",
+      "raw": {
+        "ledger_sha256": "033b6af41f9abe6fff6bf0a47f8feccb55afc008f68c51584a5acae24412a4f1",
+        "round": 3,
+        "source_sha256": "6dd8338ba1b49783cc0f274f7e494b3d25878cb9363e9dd014efcee4b470c97a",
+        "evaluation": {
+          "evaluated_at": "2026-10-29T13:57:37.250514Z",
+          "status": "PASSED",
+          "geo_mean": 0.4128810206452792,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Retile the device kernel to one 64 KiB tile per program for large tensors, keeping the direct launch path",
+          "code_changes": "run() now picks block = 65536 // A.element_size() (16384 elements for fp32, 32768 for fp16/bf16 = one 64 KiB tile) when n > 4096, keeping next_pow2(n) single-tile for n <= 4096, with the same exact/masked kernel split and unchanged host launch path and strided kernel.",
+          "hypothesis": "If the 4096x4096 workloads are device-bound because a 16 KiB tile per program (BLOCK=4096, grid=4096) under-uses the vector core DMA, then a 64 KiB tile (BLOCK=16384 fp32 / 32768 fp16, grid=1024/512) should cut their latency from 152 us to roughly 34-42 us while the nine host-bound workloads stay at their current ~31-36 us, lifting geo_mean from 0.283 to about 0.42.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Larger per-program DMA bursts and 4x fewer programs raise the device-side effective bandwidth of the 4096x4096 workloads from ~0.9 TB/s toward the aten reference's ~5 TB/s, dropping them from 152 us toward the ~33 us host floor"
+          },
+          "source": {
+            "origin": "coder",
+            "parent_round_num": null
+          },
+          "key_params": {},
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "completed",
+          "analysis_path": ".kernelgen/profile-analysis/round-0003.json",
+          "summary": "mixed: Nine of twelve timed workloads are dispatch-bound: device task time is 1.5-5.2 us while eval latency is 30.3-31.5 us, 4096x4096 fp32 is device-bound with fully serialized AIV pipes (MTE2+MTE3+VEC+scalar sum equals aiv_time), 64 KiB tiles already sustain ~5.9 TB/s aggregate MTE2 read rate (L2-resident); per-program DMA width is not the residual limit"
+        },
+        "conclusion": {
+          "round_num": 3,
+          "expectation_status": "met",
+          "root_cause": "The 4096x4096 workloads were device-bound because a BLOCK=4096 tile moves only 16 KiB per program, so 4096 programs per kernel spend most of their time on per-program DMA setup rather than on payload; a 64 KiB tile (16384 fp32 / 32768 fp16 elements) reaches the DMA efficiency needed to fall back under the host launch floor.",
+          "perf_gap_analysis": "Predicted: 4096x4096 workloads drop from 152 us to roughly 34-42 us, the nine host-bound workloads keep ~31-36 us, geo_mean ~0.42. Observed: geo_mean 0.4129 (+46% vs 0.2831); the three 4096x4096 workloads fell from 151.5/151.8/152.0 us to 30.4/34.0/41.4 us (speedup 0.085/0.126/0.150 -> 0.412/0.563/0.548) and the nine others stayed at 29.8-31.5 us, matching the prediction within measurement noise. min_speedup improved from 0.084 to 0.366 and the worst workload is now a small host-bound one (timing-9) rather than a large device-bound one, i.e. the device-tiling bottleneck is gone and the residual gap is the host launch floor plus fp32 4096x4096 device time (41.4 us vs the 30 us floor).",
+          "next_suggestion": "With 11 of 12 workloads now inside a few microseconds of the ~30 us host launch floor, attack the remaining host cost: probe6 showed the same launch costs 12.3 us when the pointer is passed as an integer address and the stream handle is resolved through a pre-resolved torch_npu._C entry point, versus 22.8 us with a tensor argument and the driver registry lookup per call.",
+          "optimization_level": "L2_memory",
+          "debug_lesson": "On this stack a 64 KiB tile per program is the largest element-wise tile that stays inside the vector core UB: fp32 tiles of 32768 elements and static_range loops of 4-8 tiles did not merely fail to compile, they poisoned the device (vector core exception) while still returning plausible timings, so UB sizing must be validated explicitly rather than inferred from a fast measurement.",
+          "strategy_evolution": "Device tiling is now resolved (64 KiB tiles); the binding constraint has moved back to the per-call host cost, which now sets the latency of 11 of 12 workloads, with fp32 4096x4096 still ~10 us above that floor.",
+          "knowledge_assessments": []
+        }
+      }
+    }
+  ],
+  "view": {
+    "id": "mainline",
+    "session": "negative_",
+    "title": "negative_ 优化轨迹",
+    "subtitle": "历史 KGS 参考 · 本批 3 次正式评测",
+    "ylim": [
+      0,
+      0.5
+    ],
+    "annotations": [
+      {
+        "point": 2,
+        "method": "直接启动已编译 kernel",
+        "color": "probe",
+        "position": [
+          220,
+          285
+        ],
+        "arrow": [
+          540,
+          325
+        ]
+      },
+      {
+        "point": 3,
+        "method": "每个 program 处理64KB",
+        "color": "paired",
+        "position": [
+          930,
+          285
+        ],
+        "arrow": [
+          1210,
+          325
+        ]
+      }
+    ],
+    "legend": [
+      "paired",
+      "sim",
+      "knowledge",
+      "probe",
+      "ir"
+    ],
+    "gap": null,
+    "x_label": "本批正式评测顺序",
+    "plot_bottom": 745,
+    "nodes": [
+      {
+        "point": 1,
+        "location": "mixed"
+      },
+      {
+        "point": 2,
+        "location": "host"
+      },
+      {
+        "point": 3,
+        "location": "device"
+      }
+    ],
+    "delivery": {
+      "score": 0.8056990223175148,
+      "source": "operators/negative_/versions/independent_strict/retained/kernel.py",
+      "source_sha256": "a3c2c0641053bd2da97f548b8124d5e550a0a418dae3fa3512e14cc18007a0ad",
+      "passed": 30,
+      "total": 30,
+      "result": "operators/negative_/evidence/retained/evaluation/result.json",
+      "result_sha256": "607b123f14f2ff24b73d40aad7d708f9a648fe3713c1bf7d8d3b341702daf935",
+      "endpoint_same_source": false
+    },
+    "result_only": false,
+    "line_status": "下图：历史优化片段"
+  },
+  "history": [
+    {
+      "ledger_sha256": "033b6af41f9abe6fff6bf0a47f8feccb55afc008f68c51584a5acae24412a4f1",
+      "round": 1,
+      "source_sha256": "99976c0c4a66cd4daf2f6586d42e77b70eb3625564c077002099dc72de4ef2f1",
+      "evaluation": {
+        "evaluated_at": "2026-10-29T13:44:51.548335Z",
+        "status": "PASSED",
+        "geo_mean": 0.15974547587110685,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Establish the authoritative baseline of the supplied seed implementation (contiguous 1-D negation kernel + collapsed-stride gather kernel) in this workspace",
+        "code_changes": "None: the seed file is evaluated unmodified",
+        "hypothesis": "The seed already passes all 30 workloads (a prior formal run of this exact file passed 30/30 with geo_mean 0.167); its cost is dominated by a ~55 us Triton launch path for small tensors and a 152 us BLOCK=4096 kernel for 4096x4096 tensors",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "Records the starting point for later launch-overhead and tiling experiments"
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {},
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "Seed cost structure established: 9 of 12 timing workloads are host-launch-bound (55-62 us measured against a 40-55 us Triton launch floor, with per-launch marginal cost measured at ~54 us) and 3 are device-bound (151.6 us for 4096x4096 with BLOCK=4096/grid=4096, i.e. ~0.9 TB/s effective on a 176 MB L2-resident working set where the aten reference reaches 23 us).",
+        "perf_gap_analysis": "Baseline geo_mean 0.1597, min_speedup 0.0830 (timing-3). All 30 workloads pass, confirming the earlier 27/30 flaggems baseline failure was not reproducible for this exact seed. Gap decomposition from paired target measurements: (a) launch path - an empty 1-tensor Triton launch costs 51.3 us while the same kernel through the compiled-kernel raw launcher costs 17.1 us and torch's in-place elementwise op costs 6-10 us, so ~35-45 us per call is pure Triton host overhead that dominates every small workload; (b) device tiling - the seed's BLOCK=4096 grid=4096 config measures 152 us on 4096x4096 fp32/fp16 whereas BLOCK=16384 grid=1024 measures 59.2/59.9 us (already at the then-host-bound floor), a 2.6x device-side gain.",
+        "next_suggestion": "Cut the per-call host cost by launching the precompiled Triton kernel directly (warmup once, then call the compiled runner with the tensor plus constexpr-specialized n), and retile large tensors to BLOCK=16384 so the device work drops under the new launch floor.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "Bit-exact re-simulation of the frozen reference inputs showed the 3 reported non-finite mismatches do not reproduce; the only deviation was -0.0 vs +0.0 at index 0, which compare() accepts (|diff|=0 <= atol). A prior formal run of the identical file passed 30/30.",
+        "strategy_evolution": "From prompt-only analysis (suspected strided-gather numerics bug) to paired target evidence: numerics are exact, the real cost is a ~55 us Triton host launch path plus an undersized device tile.",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "033b6af41f9abe6fff6bf0a47f8feccb55afc008f68c51584a5acae24412a4f1",
+      "round": 2,
+      "source_sha256": "a1b1a49e7021d3b263f788790691316d3545f991820d0b2d041c9ae364ce1e18",
+      "evaluation": {
+        "evaluated_at": "2026-10-29T13:51:29.033058Z",
+        "status": "PASSED",
+        "geo_mean": 0.2831461945786261,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Remove Triton's per-call host launch overhead by launching the precompiled kernel through Triton's own compiled-kernel entry point, keeping identical device kernels and tiling",
+        "code_changes": "Split the seed kernel into _neg_exact (no mask) and _neg_tail (masked, other=0.0); keep a per-specialisation CompiledKernel handle (kernel.warmup) and launch it through the compiled-kernel entry point with (gridX,1,1, current stream, function, packed_metadata, t, constexprs), skipping the per-call JITFunction binding/cache lookup. Kernel bodies, tiling (BLOCK=4096 above 4096 elements, next_pow2 single tile below) and the strided gather kernel are unchanged, and the standard kernel[grid](...) call remains the fallback.",
+        "hypothesis": "If the ~55 us per-call cost of the 9 small workloads is Triton host-side launch overhead rather than device work, then launching the already compiled kernel directly (17.1 us measured for the same launch in probe2 vs 51.3 us through kernel[grid]) should cut those workloads to roughly 25-30 us and raise geo_mean from 0.16 to about 0.30, while the three 4096x4096 workloads stay device-bound at ~152 us because their tiling is unchanged.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Removes ~27 us of per-call Python argument binding/cache bookkeeping from the 9 host-bound workloads (n<=1048576), where device work is only a few microseconds"
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": null
+        },
+        "key_params": {},
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "met",
+        "root_cause": "The 9 host-bound workloads were paying Triton's per-call Python launch overhead (measured 54.5 us marginal per empty launch, 51.3 us for a 1-tensor launch) on top of only a few microseconds of device work; replacing the JITFunction.run binding/cache path with the compiled-kernel entry point removed ~21-27 us per call.",
+        "perf_gap_analysis": "Predicted: 9 host-bound workloads fall from ~55-62 us to ~25-30 us (speedup ~0.30) and geo_mean ~0.30, with the three 4096x4096 workloads unchanged at ~152 us. Observed: geo_mean 0.2831 (+77% vs baseline 0.1597); the nine n<=1048576 workloads measured 31.1-34.5 us (speedup 0.336-0.448, previously 0.170-0.188) and the three 4096x4096 workloads stayed at 151.5/151.8/152.0 us (0.085/0.126/0.150), exactly as predicted. Residual gap versus the prediction: the isolated probe measured 27.4-28.9 us per call (best of 3 trials) whereas the harness records 31.1-34.5 us (median of 3 trials after a 25 ms warmup budget), i.e. ~4-6 us of additional per-call cost in the harness path, and the harness reference timings for the small workloads (11.0-12.9 us) are slower than my probe's (8.8-9.2 us), which raises the reference side and lowers speedup relative to my estimate. min_speedup is unchanged at 0.085 because timing-3 was deliberately left on the old tiling.",
+        "next_suggestion": "Retile the device kernel for large tensors: BLOCK=16384 (exact, mask-free) instead of BLOCK=4096/grid=4096, which probe2 measured at 59 us vs 152 us on 4096x4096, so the three still-device-bound workloads (currently 0.085/0.126/0.150 speedup) drop toward the new host floor.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "Per-launch marginal cost measured 54.5 us for an empty Triton launch on this stack; the compiled-kernel entry point costs 17.1 us for the same launch, so on this operator the host path, not the elementwise math, is the primary optimization target for n<=1048576.",
+        "strategy_evolution": "Layer 1 (host launch path) is now largely done; the remaining cost splits into ~31 us residual host path for small tensors and ~152 us device time for the three 4096x4096 tensors, which is where the worst speedup now lives.",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "033b6af41f9abe6fff6bf0a47f8feccb55afc008f68c51584a5acae24412a4f1",
+      "round": 3,
+      "source_sha256": "6dd8338ba1b49783cc0f274f7e494b3d25878cb9363e9dd014efcee4b470c97a",
+      "evaluation": {
+        "evaluated_at": "2026-10-29T13:57:37.250514Z",
+        "status": "PASSED",
+        "geo_mean": 0.4128810206452792,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Retile the device kernel to one 64 KiB tile per program for large tensors, keeping the direct launch path",
+        "code_changes": "run() now picks block = 65536 // A.element_size() (16384 elements for fp32, 32768 for fp16/bf16 = one 64 KiB tile) when n > 4096, keeping next_pow2(n) single-tile for n <= 4096, with the same exact/masked kernel split and unchanged host launch path and strided kernel.",
+        "hypothesis": "If the 4096x4096 workloads are device-bound because a 16 KiB tile per program (BLOCK=4096, grid=4096) under-uses the vector core DMA, then a 64 KiB tile (BLOCK=16384 fp32 / 32768 fp16, grid=1024/512) should cut their latency from 152 us to roughly 34-42 us while the nine host-bound workloads stay at their current ~31-36 us, lifting geo_mean from 0.283 to about 0.42.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Larger per-program DMA bursts and 4x fewer programs raise the device-side effective bandwidth of the 4096x4096 workloads from ~0.9 TB/s toward the aten reference's ~5 TB/s, dropping them from 152 us toward the ~33 us host floor"
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": null
+        },
+        "key_params": {},
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "completed",
+        "analysis_path": ".kernelgen/profile-analysis/round-0003.json",
+        "summary": "mixed: Nine of twelve timed workloads are dispatch-bound: device task time is 1.5-5.2 us while eval latency is 30.3-31.5 us, 4096x4096 fp32 is device-bound with fully serialized AIV pipes (MTE2+MTE3+VEC+scalar sum equals aiv_time), 64 KiB tiles already sustain ~5.9 TB/s aggregate MTE2 read rate (L2-resident); per-program DMA width is not the residual limit"
+      },
+      "conclusion": {
+        "round_num": 3,
+        "expectation_status": "met",
+        "root_cause": "The 4096x4096 workloads were device-bound because a BLOCK=4096 tile moves only 16 KiB per program, so 4096 programs per kernel spend most of their time on per-program DMA setup rather than on payload; a 64 KiB tile (16384 fp32 / 32768 fp16 elements) reaches the DMA efficiency needed to fall back under the host launch floor.",
+        "perf_gap_analysis": "Predicted: 4096x4096 workloads drop from 152 us to roughly 34-42 us, the nine host-bound workloads keep ~31-36 us, geo_mean ~0.42. Observed: geo_mean 0.4129 (+46% vs 0.2831); the three 4096x4096 workloads fell from 151.5/151.8/152.0 us to 30.4/34.0/41.4 us (speedup 0.085/0.126/0.150 -> 0.412/0.563/0.548) and the nine others stayed at 29.8-31.5 us, matching the prediction within measurement noise. min_speedup improved from 0.084 to 0.366 and the worst workload is now a small host-bound one (timing-9) rather than a large device-bound one, i.e. the device-tiling bottleneck is gone and the residual gap is the host launch floor plus fp32 4096x4096 device time (41.4 us vs the 30 us floor).",
+        "next_suggestion": "With 11 of 12 workloads now inside a few microseconds of the ~30 us host launch floor, attack the remaining host cost: probe6 showed the same launch costs 12.3 us when the pointer is passed as an integer address and the stream handle is resolved through a pre-resolved torch_npu._C entry point, versus 22.8 us with a tensor argument and the driver registry lookup per call.",
+        "optimization_level": "L2_memory",
+        "debug_lesson": "On this stack a 64 KiB tile per program is the largest element-wise tile that stays inside the vector core UB: fp32 tiles of 32768 elements and static_range loops of 4-8 tiles did not merely fail to compile, they poisoned the device (vector core exception) while still returning plausible timings, so UB sizing must be validated explicitly rather than inferred from a fast measurement.",
+        "strategy_evolution": "Device tiling is now resolved (64 KiB tiles); the binding constraint has moved back to the per-call host cost, which now sets the latency of 11 of 12 workloads, with fp32 4096x4096 still ~10 us above that floor.",
+        "knowledge_assessments": []
+      }
+    }
+  ],
+  "gap": null,
+  "relation_note": "按同一原始账本正式轮次展示；未逐编辑恢复的关系不声称直接源码继承。",
+  "delivery": {
+    "score": 0.8056990223175148,
+    "source": "operators/negative_/versions/independent_strict/retained/kernel.py",
+    "source_sha256": "a3c2c0641053bd2da97f548b8124d5e550a0a418dae3fa3512e14cc18007a0ad",
+    "passed": 30,
+    "total": 30,
+    "result": "operators/negative_/evidence/retained/evaluation/result.json",
+    "result_sha256": "607b123f14f2ff24b73d40aad7d708f9a648fe3713c1bf7d8d3b341702daf935",
+    "endpoint_same_source": false
+  },
+  "current_cann_score": 0.8056990223175148,
+  "historical_simulator_files": 6
+}

@@ -1,0 +1,623 @@
+{
+  "operator": "hardswish",
+  "kind": "saved_ledger_attempt_order",
+  "selected_source": {
+    "path": "/data/hanle/ascend-optimization/runs/strict-night-20261102/kg-runs/hardswish-strict-night-20261102-attempt-1/stages/optimize/work/.ledger.json",
+    "sha256": "1c30713dd746c18200bc7356b3c29aff8a8c9b8cf9971c40c9d49b90fd542adb"
+  },
+  "points": [
+    {
+      "id": "hardswish:round-1",
+      "score": 0.7263107110394426,
+      "source_sha256": "492997f7aae410f9e0ccded09f4d90ad184344e9d841a173bb1fb5a9ed625e80",
+      "method": "本批起点",
+      "raw": {
+        "ledger_sha256": "1c30713dd746c18200bc7356b3c29aff8a8c9b8cf9971c40c9d49b90fd542adb",
+        "round": 1,
+        "source_sha256": "492997f7aae410f9e0ccded09f4d90ad184344e9d841a173bb1fb5a9ed625e80",
+        "evaluation": {
+          "evaluated_at": "2026-11-02T11:47:26.228907Z",
+          "status": "PASSED",
+          "geo_mean": 0.7263107110394426,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "baseline",
+          "strategy": "Establish the measured baseline with the provided seed implementation unchanged",
+          "code_changes": "None; tmp/main.py is byte-identical to the seed (streaming masked tiles, BLOCK=4096 clamped by next_pow2 work, grid capped at vector cores for n>=131072, cached compiled-kernel launch path).",
+          "hypothesis": "The seed should pass correctness on all 30 workloads and reveal where the end-to-end vs CANN gap lives (small-input launch overhead vs large-input bandwidth).",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "establish_baseline",
+            "mechanism": "Unmodified seed measured against the fixed CANN reference."
+          },
+          "source": {
+            "origin": "baseline",
+            "parent_round_num": null
+          },
+          "key_params": {},
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "failed",
+          "analysis_path": ".kernelgen/profile-analysis/round-0001.json",
+          "summary": "failed: msprof base collection exited successfully without profile completion marker: all 5 collection attempts over 4 workloads (hardswish-timing-3 twice, timing-7, timing-11, timing-0 twice) returned status failed with capabilities [], empty metrics, empty artifacts and no downloaded reports; profile ids cfcf835f9f7a45949c82bf8f032ff930, f364675861f44b9ea09bcad4f742eb4b, 0f8b51e6a81c4f1ba3109dc9686174f2, 4f6be59d9759492aa1d3330d65b8a40c, 039cfc710ada40ac843617c3c0d3330c, 54c38e28bc8f4728a50586"
+        },
+        "conclusion": {
+          "round_num": 1,
+          "expectation_status": "baseline",
+          "root_cause": "Baseline characterization of the seed: one persistent streaming kernel with BLOCK=4096, grid capped at num_vectorcore for n>=131072, cached compiled-kernel integer-address launch. All 30 workloads pass but geo_mean is 0.7263. Two distinct deficits: (1) every small/medium workload (n=1024 up to 1M) sits at a flat ~0.79-0.82 speedup with latency ~0.033-0.035 ms vs reference ~0.026-0.028 ms, a constant ~6.5 us per-call cost that does not scale with n; (2) the two 4096x4096 16-bit workloads (timing-3 fp16, timing-7 bf16) are at 0.428/0.438, 0.0984/0.1010 ms vs 0.0422/0.0443 ms.",
+          "perf_gap_analysis": "No previous measurement, so this round only establishes the reference point. Diagnostic arithmetic from the authoritative latencies: at n=16777216 the fp16 case moves 67.1 MB in 0.0984 ms (~681 GB/s) while fp32 moves 134.2 MB in 0.1194 ms (~1.12 TB/s); doubling the bytes costs only +0.021 ms, so byte volume is nearly free and the ~0.098 ms is dominated by a fixed cost of ~0.95 us per serialized tile round trip over ~103 tiles per program. That points at exposed per-iteration latency in the dynamic streaming loop (runtime stride tl.num_programs(0)*BLOCK, so the trip count is not statically known) with only one program per vector core to hide it, rather than at DMA granularity or cast cost (bf16 tracks fp16 exactly, and fp32 sitting at 0.822 contradicts a 16-bit-cast explanation).",
+          "next_suggestion": "Raise the per-iteration tile only in the large-input regime: BLOCK=16384 for 16-bit dtypes and 8192 for fp32 when n>=131072, leaving the n<131072 path, the num_vectorcore grid cap, the tl.num_programs(0) stride loop, the masked tail, fp32 compute and the cached integer-address launch byte-identical. This cuts serialized round trips per program at n=16.7M from ~103 to ~26 (16-bit) and ~52 (fp32) with identical bytes and program count. If timings barely move, the exposed-latency hypothesis is falsified and the next round should target unrollability of the loop instead.",
+          "optimization_level": "L2_memory",
+          "debug_lesson": "msprof profile collection is currently unavailable on this server: 5 attempts across 4 workloads all failed with 'msprof base collection exited successfully without profile completion marker', empty capabilities and empty artifacts, independent of tensor size, with scheduler broken=0. No device-side counters (kernel-only time, MTE2/MTE3 utilization, achieved bandwidth, instruction listing) exist for this round, so all bottleneck reasoning is arithmetic on authoritative eval latencies plus source reading.",
+          "strategy_evolution": "Seed as-is establishes the baseline; the measured shape of the gap splits the problem into a large-input per-iteration-latency problem and a fixed per-call overhead problem, to be attacked separately.",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "hardswish:round-2",
+      "score": 0.7418745845232044,
+      "source_sha256": "7ad08150b03d80c9a2eb17b48e613401d62c311ccdf1b9b139aea5937c9dc301",
+      "method": "连续块去除掩码",
+      "raw": {
+        "ledger_sha256": "1c30713dd746c18200bc7356b3c29aff8a8c9b8cf9971c40c9d49b90fd542adb",
+        "round": 2,
+        "source_sha256": "7ad08150b03d80c9a2eb17b48e613401d62c311ccdf1b9b139aea5937c9dc301",
+        "evaluation": {
+          "evaluated_at": "2026-11-02T11:56:29.339175Z",
+          "status": "PASSED",
+          "geo_mean": 0.7418745845232044,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Make the traversal's transfers unmasked",
+          "code_changes": "Kernel _hardswish_stream only: split the single masked streaming loop into (1) a hot loop over the statically-truncated range [pid*BLOCK, full) where full=(N//step)*step, using unmasked tl.load/tl.store on contiguous bursts, and (2) exactly one trailing masked tile at offset = full + pid*BLOCK + lane with predicate offset<N. Host geometry, BLOCK=4096, the num_vectorcore cap, fp32 compute and the cached integer-address launch are byte-identical.",
+          "hypothesis": "The large-input deficit comes from per-element masking in the streaming loop, which prevents the load/store from lowering to full unmasked contiguous DMA bursts, rather than from tile size (tile size is UB-capped: 8192 fp32 elements needs 256 KB against 192 KB available with multi-buffering). Removing the predicate from all full tiles should cut the ~0.75 us per-iteration exposed cost and raise timing-3/7 from 0.098/0.101 ms toward the 1.0 speedup band; small workloads keep grid=1..few so they should move only marginally.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Every hot-loop transfer becomes a full unmasked contiguous DMA burst instead of a predicated one, removing per-element predicate handling and the possible non-contiguous fallback that exposes ~0.75 us of serialized latency per 4096-element tile."
+          },
+          "source": {
+            "origin": "profile_next_experiment",
+            "parent_round_num": 1
+          },
+          "key_params": {
+            "BLOCK": 4096,
+            "masked_hot_loop": false
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "pending",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 2,
+          "expectation_status": "not_met",
+          "root_cause": "Masking in the streaming loop was not the large-input bottleneck. The unmasked hot loop left timing-3/7 unchanged at 0.0980/0.1001 ms, confirming from the target sweep that the cost is the 103 sequential 4096-element tiles each of the 40 vector cores must walk, with per-tile latency dominating over byte volume; the mask removal only helped the small/medium workloads, which are dominated by fixed per-call cost.",
+          "perf_gap_analysis": "Frozen expectation was that removing per-element predicates from all full tiles would cut the ~0.75 us exposed per-iteration cost and lift timing-3/7 from ~0.098/0.101 ms toward the 1.0 speedup band. Observed: timing-3 0.0980 ms (0.4296, was 0.4283) and timing-7 0.1001 ms (0.4421, was 0.4383) - effectively unchanged, so the hypothesis is falsified for the large regime. The change did help the small/medium workloads: timing-0 0.0337->0.0302 ms (0.808->0.852), timing-1 0.0343->0.0315 (0.810->0.883), timing-2 0.0341->0.0321 (0.805->0.826), timing-4 0.0347->0.0303 (0.804->0.828), timing-5 0.0348->0.0342, timing-6 0.0347->0.0342, timing-8 0.0326->0.0334, timing-9 0.0341->0.0307, timing-10 0.0347->0.0316, and geo_mean rose 0.7263->0.7419. timing-11's ratio fell 0.822->0.726 but our latency was unchanged (0.1194->0.1188 ms) while its CANN reference moved 0.0981->0.0863 ms, i.e. reference jitter rather than a regression. Net: +2.2% geo_mean, expectation not met because the dominant large-input cost is tile count per core, not masking.",
+          "next_suggestion": "Attack the tile-count cap instead of the mask: shorten the multi-buffer pipeline with num_stages=2 only in the n>=131072 regime and raise BLOCK to 16384 (16-bit, 32 KB per transfer) / 8192 (fp32, 32 KB per transfer), keeping grid capped at num_vectorcore, the unmasked hot loop, the single masked tail tile and the cached integer-address launch. This cuts sequential tiles per core from ~103 to ~26 for 16-bit and ~52 for fp32 while keeping UB inside 192 KB. Verify compilation by preflight (8192 elements alone overflows UB; only a reduced stage count makes it fit), and if num_stages does not shrink the footprint, fall back to the best measured tile and pivot to cutting the fixed ~6.5 us per-call host cost, which affects 9 of the 12 timing workloads.",
+          "optimization_level": "L2_memory",
+          "debug_lesson": "A target-side debug sweep (n=16.7M) showed: num_vectorcore=40, num_aicore=20; torch.ops.aten.hardswish.out reaches 0.0430 ms (1561 GB/s) on fp16 and 0.0881 ms (1524 GB/s) on fp32, while our kernel gets 676/1167 GB/s. fp16 and fp32 take nearly the same time (0.0993 vs 0.1151) while moving 2x different bytes, and byte volume costs only 0.0158 ms for 67 MB (≈4.2 TB/s marginal, i.e. L2-resident), so the kernel is bound by the number of sequential tiles each vector core walks (N/(40*4096)=103), not by bytes. BLOCK is capped at 4096 elements by UB (8192 elements demands 262176 B against 196608 B available, ~32 B/element); grid=80/160 does not help because only one block is resident per core, and one-shot grid=4096 is far worse (0.170 ms). Raising the tile therefore requires shortening the compiler's multi-buffer pipeline.",
+          "strategy_evolution": "Mask removal improved the many small/medium workloads (+3-4% each) and is kept as the new best, but the large-input regime needs fewer/larger tiles rather than better-shaped transfers; since UB caps a tile at 4096 elements per stage chain, the next lever is the multi-buffer depth (num_stages) rather than BLOCK alone.",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "hardswish:round-3",
+      "score": 0.911505346974438,
+      "source_sha256": "581ad44a1694f4311efaa907e84874a5b33e9df5e8a751cd2859513a72ac1101",
+      "method": "缩减小输入启动开销",
+      "raw": {
+        "ledger_sha256": "1c30713dd746c18200bc7356b3c29aff8a8c9b8cf9971c40c9d49b90fd542adb",
+        "round": 3,
+        "source_sha256": "581ad44a1694f4311efaa907e84874a5b33e9df5e8a751cd2859513a72ac1101",
+        "evaluation": {
+          "evaluated_at": "2026-11-02T12:07:10.258101Z",
+          "status": "PASSED",
+          "geo_mean": 0.911505346974438,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Cut per-call host overhead in the small-workload regime",
+          "code_changes": "Device kernel unchanged. Host path flattened to a single frame: the _strict_empty_like/torch.empty(tuple(shape), device, dtype) call becomes a module-level torch.empty_like alias, _strict_contiguous inlined to an is_contiguous test plus _strict_clone, the plan closure removed and replaced by a module-level flat plan list (_FAST) holding dtype/n/device/launcher/grid/block/fn/packed/stream-getter, and _build now returns that plan instead of a closure so run() calls the C launcher directly with no intermediate Python frame. Stream is still re-read every call.",
+          "hypothesis": "The small/medium workloads (10 of 12 timing cases, all at ~0.030-0.034 ms regardless of n from 1024 to 1M) are bound by per-call host cost, not device time, so trimming Python work and switching to torch.empty_like should reduce each call by ~1-3 us and lift those speedups from ~0.84 toward ~0.90, while the 4096x4096 cases are unaffected (they are tile-count bound on device and their host cost is already overlapped).",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Removing one Python frame, a tuple(x.shape)/device/dtype reconstruction on every call and the closure indirection cuts the CPU-side cost of each invocation, which is the entire cost of the small-workload regime where the device kernel is only a few microseconds."
+          },
+          "source": {
+            "origin": "coder",
+            "parent_round_num": null
+          },
+          "key_params": {
+            "host_frames": 1,
+            "alloc": "torch.empty_like"
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "failed",
+          "analysis_path": ".kernelgen/profile-analysis/round-0003.json",
+          "summary": "failed: msprof base collection exited successfully without profile completion marker — all 5 round-3 collection attempts failed with status=failed, capabilities=[], artifacts=[] and zero downloaded reports. Attempts: hardswish-timing-3 twice (profile ids bf53fe3d943745c1bc35394d8949fec3, 275df43bf3074bb191c737eb708c2531; manifests .kernelgen/profiles/round-0003/hardswish-timing-3/0d72ddc720b94fec9c8b1af4771ba0e7/manifest.json and .../c8638025489348f189c6adcadba3eabd/manifest.json), hardswish-tim"
+        },
+        "conclusion": {
+          "round_num": 3,
+          "expectation_status": "partially_met",
+          "root_cause": "Per-call host cost was the dominant term for every workload with n <= 1M: each call paid a _strict_empty_like wrapper that rebuilt tuple(shape)/device/dtype, a _strict_contiguous frame, and a plan-closure indirection before the C launcher. Replacing them with a module-level torch.empty_like alias, an inlined contiguity test and a flat plan list holding the launcher, grid, block, fn, packed metadata and stream getter removed ~8 us per call, which is why ten of twelve timing workloads went from ~0.84 to above 1.0 while the three large workloads, whose cost is device-side, stayed fixed.",
+          "perf_gap_analysis": "Frozen expectation was a ~1-3 us per-call reduction lifting the small-workload speedups from ~0.84 toward ~0.90. Observed a much larger effect: latency fell from ~0.030-0.034 ms to 0.0218-0.0238 ms, and the ten small/medium workloads moved from 0.786-0.883 to 1.030-1.130 (timing-0 0.852->1.130, timing-1 0.883->1.030, timing-2 0.826->1.050, timing-4 0.828->1.094, timing-5 0.841->1.106, timing-6 0.840->1.096, timing-8 0.817->1.110, timing-9 0.824->1.128, timing-10 0.824->1.123), so the prediction's direction was right but its magnitude was understated. The three 4096x4096 workloads were unaffected as predicted (timing-3 0.0980->0.0980, timing-7 0.1001->0.1001, timing-11 0.1188->0.1183), confirming their cost is entirely device-side. geo_mean 0.7419->0.9115.",
+          "next_suggestion": "Keep the flattened host path and switch the 16-bit arithmetic: add a constexpr flag selecting element-dtype arithmetic (tl.full((1,), c, x.dtype) constants, no .to(tl.float32)) when the tensor is float16, leaving fp32 and bfloat16 on the exact fp32 path. Target sweep measured fp16 n=16.7M at 0.0670 ms versus 0.0994 ms for the fp32 path (copy floor 0.0603 ms), with max relative error 0.0016 against F.hardswish - well inside the 0.015 tolerance. Expected timing-3 0.098 -> ~0.067 ms (0.43 -> ~0.63). Afterwards consider bfloat16 encoded through fp16 arithmetic (bfloat16 dtype math showed no gain: 0.1018 vs 0.1014 ms, suggesting the backend emulates bfloat16 in fp32), and do not chase the 4096-element tile cap further: num_stages does not shrink the ~32 B/element buffer footprint, and grid=80/160, one-shot grids and BLOCK=2048/8192 are all measured worse or uncompilable.",
+          "optimization_level": "host_side_special",
+          "debug_lesson": "Benchmarking the *full* candidate call path is what separated the two cost regimes: with the flattened host path the 10 small/medium workloads dropped from ~0.030 ms to ~0.022 ms and became faster than the CANN reference (1.03-1.13), while the 4096x4096 cases did not move at all. Per-call Python frames and tuple(shape)/device/dtype reconstruction were worth ~8 us - far more than the 1-3 us estimated from the earlier micro-benchmarks, because those micro-benchmarks measured a tight allocation loop rather than the whole run() invocation. On the device side, a fixed-geometry arithmetic ladder (copy 0.0603, copy+cast 0.0570, x*2 0.0598, fp32-math hardswish 0.0994, element-dtype hardswish 0.0670 ms) shows the large 16-bit case is vector-arithmetic bound rather than memory bound.",
+          "strategy_evolution": "The bottleneck split cleanly into a host-cost regime (n <= 1M, fixed by flattening the call path) and a device-cost regime (4096x4096). With the host regime now faster than the reference, all remaining headroom is in the large 16-bit cases, where the target arithmetic ladder shows element-dtype vector math is worth 1.48x.",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "hardswish:round-4",
+      "score": 0.8836362997271318,
+      "source_sha256": "e1bb9d02f196ca1ad7e73ecbf5ef004f44e72d7479bb96e5842742818d962d98",
+      "method": "原精度向量运算：退步",
+      "raw": {
+        "ledger_sha256": "1c30713dd746c18200bc7356b3c29aff8a8c9b8cf9971c40c9d49b90fd542adb",
+        "round": 4,
+        "source_sha256": "e1bb9d02f196ca1ad7e73ecbf5ef004f44e72d7479bb96e5842742818d962d98",
+        "evaluation": {
+          "evaluated_at": "2026-11-02T12:13:27.287034Z",
+          "status": "PASSED",
+          "geo_mean": 0.8836362997271318,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Native narrow-dtype vector arithmetic for the fp16 path",
+          "code_changes": "Added a constexpr H16 argument to _hardswish_stream. When H16 is true (input dtype is float16) both the hot loop and the masked tail keep the arithmetic in the operand dtype: the tl.full((1,), 3.0/0.0/6.0/1/6, x.dtype) constants and no .to(tl.float32), so no cast in and no cast out. fp32 and bfloat16 inputs keep the exact H16=false fp32 path. The plan list grew one field (index 11) carried into both the integer-address C launch and the JIT fallback. Host path, grid, BLOCK, vector-core cap and masked tail are unchanged.",
+          "hypothesis": "The fp16 4096x4096 case is vector-arithmetic bound, not memory bound: at identical geometry the target sweep measured a pure copy at 0.0603 ms, one multiply at 0.0598 ms, fp32-emulated hardswish at 0.0994 ms and element-dtype hardswish at 0.0670 ms. Switching only the fp16 path to element-dtype math should take timing-3 from 0.098 to ~0.067 ms (speedup 0.431 -> ~0.63) and leave the ten already-faster small workloads and the bf16/fp32 large cases unchanged.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Narrow-dtype vector math runs at twice the fp32 lane rate and drops the two cast operations per tile that the fp32 emulation pays, removing the vector-arithmetic saturation that dominates the 16.7M-element fp16 case."
+          },
+          "source": {
+            "origin": "coder",
+            "parent_round_num": null
+          },
+          "key_params": {
+            "H16": "true for float16 only",
+            "vector_math": "element dtype"
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": false,
+          "status": "not_required",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 4,
+          "expectation_status": "partially_met",
+          "root_cause": "The fp16 4096x4096 workload was saturated on fp32 vector arithmetic: emulating a 16-bit operand through fp32 costs a cast in and a cast out plus full-rate fp32 vector work over five operations per element, which the target isolates at 0.0994 ms against a 0.0603 ms copy floor. Element-dtype constants remove both casts and double the vector lane rate, taking that workload to 0.0648 ms. The aggregate metric moved the other way only because the ten CPU-bound workloads, now essentially at parity with the CANN call (our 0.0237 ms vs reference 0.0221 ms in the retest), are dominated by host-state variance that swamped a genuine 1.5x device-side gain on one of twelve workloads.",
+          "perf_gap_analysis": "Frozen expectation: timing-3 0.098 -> ~0.067 ms (0.431 -> ~0.63) with the small workloads and the bf16/fp32 large cases unchanged. Observed on the target workload: timing-3 0.0980 -> 0.0648 ms, speedup 0.431 -> 0.649, i.e. the mechanism and magnitude were both correct and the retest reproduced it at 0.0674 ms. timing-7 (bfloat16) was unchanged as predicted (0.1001 -> 0.1001). However the aggregate fell: geo_mean 0.9115 -> 0.8836, and the independent retest measured 0.8499. The cause is measurement drift, not the code: the ten CPU-bound small/medium workloads regressed in relative terms (timing-0 1.130 -> 0.996, timing-8 1.110 -> 1.002) although they run the byte-identical fp32 path and unchanged host path, and their CANN reference latency moved 0.0247 -> 0.0265 ms in this round and 0.0221 ms in the retest (-17% from this round) while the three device-bound large cases stayed stable (timing-7 0.1001 -> 0.1007, timing-3 0.0648 -> 0.0674). Net effect of the change itself, holding drift aside, is about +3.5% on geo_mean; the recorded aggregate does not show it.",
+          "next_suggestion": "Re-apply the float16 element-dtype path (it is a genuine 1.5x on timing-3 and was confirmed twice: 0.0980 -> 0.0648 ms in this round and 0.0674 ms in the retest) and evaluate it again for a clean draw, because the aggregate comparison was decided by host-side measurement drift on the ten CPU-bound workloads rather than by the code. While doing so, test whether genuinely narrow arithmetic frees enough on-chip buffer for a doubled float16 tile: with no fp32 intermediate the ~32 B/element footprint may fall, letting BLOCK=8192 (16 KB transfers) compile for float16 where it previously overflowed UB, which would move the fp16 case from 0.067 toward the 0.044 CANN level. Check compilation by preflight first, since an 8192-element tile failed UB before the narrow-math change. Do not pursue bfloat16 narrow math: bfloat16 is emulated in fp32 and a bfloat16->float16 encoding would silently overflow finite values above 65504.",
+          "optimization_level": "L1_architecture",
+          "debug_lesson": "The 16.7M-element fp16 case is vector-arithmetic bound, not memory bound: at identical geometry (BLOCK=4096, grid=40) the target ladder gave copy 0.0603 ms, copy+fp32-cast 0.0570, x*2 0.0598, fp32-emulated hardswish 0.0994 and element-dtype hardswish 0.0670 ms. Two further facts from the same measurements: bfloat16 element-dtype math gives no gain at all (0.1018 vs 0.1014 ms), so the backend emulates bfloat16 through fp32 and only float16 gets the doubled vector lane rate; and the residual gap between 0.0670 and the 0.0603 copy floor is the tile-granularity ceiling, since the ~32 B/element buffer footprint pins BLOCK at 4096 elements and no grid shape or num_stages setting changes that.",
+          "strategy_evolution": "Element-dtype arithmetic is confirmed as the lever for float16 and confirmed useless for bfloat16. The remaining fp16 headroom is the 0.067 -> 0.060 copy floor, which requires a larger tile than the 4096-element UB cap currently allows; narrow arithmetic may itself lower that cap's binding, so the tile size becomes re-testable rather than settled.",
+          "knowledge_assessments": []
+        }
+      }
+    }
+  ],
+  "view": {
+    "id": "mainline",
+    "session": "hardswish",
+    "title": "hardswish 优化轨迹",
+    "subtitle": "历史 KGS 参考 · 本批 4 次正式评测",
+    "ylim": [
+      0,
+      1.1
+    ],
+    "annotations": [
+      {
+        "point": 2,
+        "method": "连续块去除掩码",
+        "color": "probe",
+        "position": [
+          220,
+          285
+        ],
+        "arrow": [
+          540,
+          325
+        ]
+      },
+      {
+        "point": 3,
+        "method": "缩减小输入启动开销",
+        "color": "paired",
+        "position": [
+          930,
+          285
+        ],
+        "arrow": [
+          1210,
+          325
+        ]
+      },
+      {
+        "point": 4,
+        "method": "原精度向量运算：退步",
+        "color": "ir",
+        "position": [
+          220,
+          775
+        ],
+        "arrow": [
+          540,
+          730
+        ]
+      }
+    ],
+    "legend": [
+      "paired",
+      "sim",
+      "knowledge",
+      "probe",
+      "ir"
+    ],
+    "gap": null,
+    "x_label": "本批正式评测顺序",
+    "plot_bottom": 650,
+    "nodes": [
+      {
+        "point": 1,
+        "location": "mixed"
+      },
+      {
+        "point": 2,
+        "location": "device"
+      },
+      {
+        "point": 3,
+        "location": "host"
+      },
+      {
+        "point": 4,
+        "location": "device"
+      }
+    ],
+    "delivery": {
+      "score": 0.8492181060338365,
+      "source": "operators/hardswish/versions/independent_strict/retained/kernel.py",
+      "source_sha256": "581ad44a1694f4311efaa907e84874a5b33e9df5e8a751cd2859513a72ac1101",
+      "passed": 30,
+      "total": 30,
+      "result": "operators/hardswish/evidence/retained/evaluation/result.json",
+      "result_sha256": "b64d023cfb99aea711c36239a1e6a9d265d23cd61111234fcaeeb437f4c8c7cb",
+      "endpoint_same_source": false
+    },
+    "result_only": false,
+    "line_status": "下图：历史优化片段"
+  },
+  "history": [
+    {
+      "ledger_sha256": "bae9b115baf5f706c134971fce484ee84b14bad5a75f2b173ad2170cc704cb20",
+      "round": 1,
+      "source_sha256": "49a714651cbb56a198fc8455e0e73034157e30fdf958bff744333f1d0cff2285",
+      "evaluation": {
+        "evaluated_at": "2026-10-29T23:30:45.103761Z",
+        "status": "PASSED",
+        "geo_mean": 0.6537451393634451,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Measure the provided best-so-far seed (streaming hardswish with cached compiled launch) unchanged to establish the authoritative baseline in this workspace",
+        "code_changes": "None; seed copied verbatim to tmp/main.py",
+        "hypothesis": "The seed passes all 30 workloads but its per-call host cost (~0.115 ms for tiny inputs vs ~0.019 ms reference) dominates, so geo_mean stays near the previously recorded 0.148",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "Record authoritative per-workload latencies for the seed so later host-path and device-side changes have a reference point"
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {},
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "failed",
+        "analysis_path": ".kernelgen/profile-analysis/round-0001.json",
+        "summary": "failed: msprof base collection exited successfully without profile completion marker"
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "Baseline established: the seed passes all 30 workloads at geo_mean 0.6537. Two independent limits are visible in the authoritative per-workload data. (a) Nine workloads with n <= 1048576 cost a flat 26.3-27.6 us against a 17.8-21.3 us reference, i.e. the gap is independent of dtype and of a 1024x range of n, so it is per-call host cost rather than traffic. (b) The three 4096x4096 workloads cost 97.4/99.5/115.7 us against 42.1/44.3/92.6 us, and their device time is nearly byte-insensitive (f16 67 MB in 97.4 us, f32 134 MB in 115.7 us), which points to a per-iteration cost in the 40-program, 102-iteration serial streaming loop rather than to HBM saturation.",
+        "perf_gap_analysis": "",
+        "next_suggestion": "Shrink the per-call host path: measured on the target, the compiled-launch floor is 8.3 us and allocation 5.6 us, while the Triton JIT binder costs 56 us and torch.npu.current_stream() 15.9 us, so replace the per-call key construction, dict lookups and wrapper calls with a cached closure launched by integer address, keeping the kernel and block/grid policy unchanged to isolate the host change.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "Target-side probes split the two limits cleanly: launch-only 8.3 us is insensitive to argument count, empty_like/new_empty cost 5.5 us while explicit torch.empty costs 7.0 us, and the reference full call is 15.4 us in the same probe. Host work is therefore the first lever, and the device kernel should be left untouched in the next round so the host effect is measurable.",
+        "strategy_evolution": "Baseline round only; no strategy applied yet.",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "bae9b115baf5f706c134971fce484ee84b14bad5a75f2b173ad2170cc704cb20",
+      "round": 2,
+      "source_sha256": "7d33bf4ffdce3fb6981b0f3c02233848611c1f6460fac9ecddcff9c588b4edc3",
+      "evaluation": {
+        "evaluated_at": "2026-10-29T23:46:06.238717Z",
+        "status": "PASSED",
+        "geo_mean": 0.7647050634195595,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Keep the device kernel and tiling identical and replace only the per-call host path with a cached integer-address launch closure",
+        "code_changes": "run() now caches the hottest specialization as [device, dtype, numel, closure] and the closure launches the compiled kernel by integer address; the per-call dict key construction, two dict lookups, x.device.index and wrapper indirections are gone. Kernel body, block choice and grid policy are unchanged; the grid cap now comes from the target's reported num_vectorcore instead of the literal 40, and unaligned pointers fall back to the bound JIT call.",
+        "hypothesis": "The nine workloads with n <= 1048576 sit a flat ~7.5-8.6 us above the reference independent of dtype and size, so that gap is per-call host cost rather than traffic; a cached closure driven by integer pointers removes most of it, so those workloads move from ~0.70x to near or above 1.0x while the three 4096x4096 workloads, which are device-bound, stay within a couple of percent.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Removing ~8 us of per-call Python (key tuple construction, dict lookups, device-index access, extra wrapper frames) from a path where the launch floor (8.3 us) and allocation (5.6 us) are already known, moving the nine host-bound workloads from ~26.7 us toward the 15.4-19.3 us reference"
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": 1
+        },
+        "key_params": {
+          "block_cap": 4096,
+          "grid_cap": "num_vectorcore",
+          "hot_path_ops": "contiguous, empty_like, numel, 3 compares, get_device, cached launch"
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "partially_met",
+        "root_cause": "The per-call host path was the binding constraint for every workload with n <= 1048576, as the size- and dtype-independent gap showed. Replacing key construction, two dict lookups, device-index access and wrapper frames with a cached integer-address launch closure removed roughly half of that gap; what remains is the irreducible allocation (5.5 us) plus compiled-launch (8.3 us) floor, which the reference pays too.",
+        "perf_gap_analysis": "Direction and mechanism were right, magnitude was not. All nine host-bound workloads fell from 26.3-27.6 us to 23.9-24.3 us and their speedups rose from 0.68-0.72 to 0.83-0.89, so the per-call host gap over the reference narrowed from ~7.5-8.6 us to ~3.9-4.6 us and geo_mean rose 0.6537 -> 0.7647. The frozen expectation was near or above 1.0x, so ~4 us remains unaccounted for: the probe measured allocation 5.5 us plus launch 8.3 us plus ~1.7 us of glue as our floor, and the same probe measured the reference full call at 15.4 us, i.e. the reference also pays allocation and dispatch, so the residual is small per-call work this round did not remove plus harness-side per-call cost that also applies to the reference. The three 4096x4096 workloads moved by less than 0.3 us (0.4319/0.4444/0.9061), exactly as predicted for device-bound cases; timing-11's reference latency itself drifted 92.6 -> 108.3 us between rounds, so its 0.800 -> 0.906 change is not attributable to this candidate.",
+        "next_suggestion": "Attack the device bound instead: fold the arithmetic so the UB footprint drops from the measured 28 B/element to ~16-20 B/element, which lets the capped streaming tile grow from BLOCK=4096 to 8192 and doubles bytes per DMA for the 4096x4096 workloads.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "The launch floor (8.3 us, arg-count independent), allocation (5.5-5.6 us) and raw-stream query (0.27 us) bound how far a host path can go; plain Triton JIT (56 us) and torch.npu.current_stream (15.9 us) must both be avoided. Direct measurement also showed the three 4096x4096 workloads equal their standalone device-kernel time to within 0.5 us, so they must be attacked in the kernel, not the wrapper.",
+        "strategy_evolution": "Round 1 measured the seed and separated a host-side limit (nine workloads) from a device-side limit (three workloads). Round 2 fixed the host side only, keeping the kernel byte-identical so the effect was attributable. The device limit is now the largest remaining term and becomes the next target.",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "1c30713dd746c18200bc7356b3c29aff8a8c9b8cf9971c40c9d49b90fd542adb",
+      "round": 1,
+      "source_sha256": "492997f7aae410f9e0ccded09f4d90ad184344e9d841a173bb1fb5a9ed625e80",
+      "evaluation": {
+        "evaluated_at": "2026-11-02T11:47:26.228907Z",
+        "status": "PASSED",
+        "geo_mean": 0.7263107110394426,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Establish the measured baseline with the provided seed implementation unchanged",
+        "code_changes": "None; tmp/main.py is byte-identical to the seed (streaming masked tiles, BLOCK=4096 clamped by next_pow2 work, grid capped at vector cores for n>=131072, cached compiled-kernel launch path).",
+        "hypothesis": "The seed should pass correctness on all 30 workloads and reveal where the end-to-end vs CANN gap lives (small-input launch overhead vs large-input bandwidth).",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "Unmodified seed measured against the fixed CANN reference."
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {},
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "failed",
+        "analysis_path": ".kernelgen/profile-analysis/round-0001.json",
+        "summary": "failed: msprof base collection exited successfully without profile completion marker: all 5 collection attempts over 4 workloads (hardswish-timing-3 twice, timing-7, timing-11, timing-0 twice) returned status failed with capabilities [], empty metrics, empty artifacts and no downloaded reports; profile ids cfcf835f9f7a45949c82bf8f032ff930, f364675861f44b9ea09bcad4f742eb4b, 0f8b51e6a81c4f1ba3109dc9686174f2, 4f6be59d9759492aa1d3330d65b8a40c, 039cfc710ada40ac843617c3c0d3330c, 54c38e28bc8f4728a50586"
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "Baseline characterization of the seed: one persistent streaming kernel with BLOCK=4096, grid capped at num_vectorcore for n>=131072, cached compiled-kernel integer-address launch. All 30 workloads pass but geo_mean is 0.7263. Two distinct deficits: (1) every small/medium workload (n=1024 up to 1M) sits at a flat ~0.79-0.82 speedup with latency ~0.033-0.035 ms vs reference ~0.026-0.028 ms, a constant ~6.5 us per-call cost that does not scale with n; (2) the two 4096x4096 16-bit workloads (timing-3 fp16, timing-7 bf16) are at 0.428/0.438, 0.0984/0.1010 ms vs 0.0422/0.0443 ms.",
+        "perf_gap_analysis": "No previous measurement, so this round only establishes the reference point. Diagnostic arithmetic from the authoritative latencies: at n=16777216 the fp16 case moves 67.1 MB in 0.0984 ms (~681 GB/s) while fp32 moves 134.2 MB in 0.1194 ms (~1.12 TB/s); doubling the bytes costs only +0.021 ms, so byte volume is nearly free and the ~0.098 ms is dominated by a fixed cost of ~0.95 us per serialized tile round trip over ~103 tiles per program. That points at exposed per-iteration latency in the dynamic streaming loop (runtime stride tl.num_programs(0)*BLOCK, so the trip count is not statically known) with only one program per vector core to hide it, rather than at DMA granularity or cast cost (bf16 tracks fp16 exactly, and fp32 sitting at 0.822 contradicts a 16-bit-cast explanation).",
+        "next_suggestion": "Raise the per-iteration tile only in the large-input regime: BLOCK=16384 for 16-bit dtypes and 8192 for fp32 when n>=131072, leaving the n<131072 path, the num_vectorcore grid cap, the tl.num_programs(0) stride loop, the masked tail, fp32 compute and the cached integer-address launch byte-identical. This cuts serialized round trips per program at n=16.7M from ~103 to ~26 (16-bit) and ~52 (fp32) with identical bytes and program count. If timings barely move, the exposed-latency hypothesis is falsified and the next round should target unrollability of the loop instead.",
+        "optimization_level": "L2_memory",
+        "debug_lesson": "msprof profile collection is currently unavailable on this server: 5 attempts across 4 workloads all failed with 'msprof base collection exited successfully without profile completion marker', empty capabilities and empty artifacts, independent of tensor size, with scheduler broken=0. No device-side counters (kernel-only time, MTE2/MTE3 utilization, achieved bandwidth, instruction listing) exist for this round, so all bottleneck reasoning is arithmetic on authoritative eval latencies plus source reading.",
+        "strategy_evolution": "Seed as-is establishes the baseline; the measured shape of the gap splits the problem into a large-input per-iteration-latency problem and a fixed per-call overhead problem, to be attacked separately.",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "1c30713dd746c18200bc7356b3c29aff8a8c9b8cf9971c40c9d49b90fd542adb",
+      "round": 2,
+      "source_sha256": "7ad08150b03d80c9a2eb17b48e613401d62c311ccdf1b9b139aea5937c9dc301",
+      "evaluation": {
+        "evaluated_at": "2026-11-02T11:56:29.339175Z",
+        "status": "PASSED",
+        "geo_mean": 0.7418745845232044,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Make the traversal's transfers unmasked",
+        "code_changes": "Kernel _hardswish_stream only: split the single masked streaming loop into (1) a hot loop over the statically-truncated range [pid*BLOCK, full) where full=(N//step)*step, using unmasked tl.load/tl.store on contiguous bursts, and (2) exactly one trailing masked tile at offset = full + pid*BLOCK + lane with predicate offset<N. Host geometry, BLOCK=4096, the num_vectorcore cap, fp32 compute and the cached integer-address launch are byte-identical.",
+        "hypothesis": "The large-input deficit comes from per-element masking in the streaming loop, which prevents the load/store from lowering to full unmasked contiguous DMA bursts, rather than from tile size (tile size is UB-capped: 8192 fp32 elements needs 256 KB against 192 KB available with multi-buffering). Removing the predicate from all full tiles should cut the ~0.75 us per-iteration exposed cost and raise timing-3/7 from 0.098/0.101 ms toward the 1.0 speedup band; small workloads keep grid=1..few so they should move only marginally.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Every hot-loop transfer becomes a full unmasked contiguous DMA burst instead of a predicated one, removing per-element predicate handling and the possible non-contiguous fallback that exposes ~0.75 us of serialized latency per 4096-element tile."
+        },
+        "source": {
+          "origin": "profile_next_experiment",
+          "parent_round_num": 1
+        },
+        "key_params": {
+          "BLOCK": 4096,
+          "masked_hot_loop": false
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "not_met",
+        "root_cause": "Masking in the streaming loop was not the large-input bottleneck. The unmasked hot loop left timing-3/7 unchanged at 0.0980/0.1001 ms, confirming from the target sweep that the cost is the 103 sequential 4096-element tiles each of the 40 vector cores must walk, with per-tile latency dominating over byte volume; the mask removal only helped the small/medium workloads, which are dominated by fixed per-call cost.",
+        "perf_gap_analysis": "Frozen expectation was that removing per-element predicates from all full tiles would cut the ~0.75 us exposed per-iteration cost and lift timing-3/7 from ~0.098/0.101 ms toward the 1.0 speedup band. Observed: timing-3 0.0980 ms (0.4296, was 0.4283) and timing-7 0.1001 ms (0.4421, was 0.4383) - effectively unchanged, so the hypothesis is falsified for the large regime. The change did help the small/medium workloads: timing-0 0.0337->0.0302 ms (0.808->0.852), timing-1 0.0343->0.0315 (0.810->0.883), timing-2 0.0341->0.0321 (0.805->0.826), timing-4 0.0347->0.0303 (0.804->0.828), timing-5 0.0348->0.0342, timing-6 0.0347->0.0342, timing-8 0.0326->0.0334, timing-9 0.0341->0.0307, timing-10 0.0347->0.0316, and geo_mean rose 0.7263->0.7419. timing-11's ratio fell 0.822->0.726 but our latency was unchanged (0.1194->0.1188 ms) while its CANN reference moved 0.0981->0.0863 ms, i.e. reference jitter rather than a regression. Net: +2.2% geo_mean, expectation not met because the dominant large-input cost is tile count per core, not masking.",
+        "next_suggestion": "Attack the tile-count cap instead of the mask: shorten the multi-buffer pipeline with num_stages=2 only in the n>=131072 regime and raise BLOCK to 16384 (16-bit, 32 KB per transfer) / 8192 (fp32, 32 KB per transfer), keeping grid capped at num_vectorcore, the unmasked hot loop, the single masked tail tile and the cached integer-address launch. This cuts sequential tiles per core from ~103 to ~26 for 16-bit and ~52 for fp32 while keeping UB inside 192 KB. Verify compilation by preflight (8192 elements alone overflows UB; only a reduced stage count makes it fit), and if num_stages does not shrink the footprint, fall back to the best measured tile and pivot to cutting the fixed ~6.5 us per-call host cost, which affects 9 of the 12 timing workloads.",
+        "optimization_level": "L2_memory",
+        "debug_lesson": "A target-side debug sweep (n=16.7M) showed: num_vectorcore=40, num_aicore=20; torch.ops.aten.hardswish.out reaches 0.0430 ms (1561 GB/s) on fp16 and 0.0881 ms (1524 GB/s) on fp32, while our kernel gets 676/1167 GB/s. fp16 and fp32 take nearly the same time (0.0993 vs 0.1151) while moving 2x different bytes, and byte volume costs only 0.0158 ms for 67 MB (≈4.2 TB/s marginal, i.e. L2-resident), so the kernel is bound by the number of sequential tiles each vector core walks (N/(40*4096)=103), not by bytes. BLOCK is capped at 4096 elements by UB (8192 elements demands 262176 B against 196608 B available, ~32 B/element); grid=80/160 does not help because only one block is resident per core, and one-shot grid=4096 is far worse (0.170 ms). Raising the tile therefore requires shortening the compiler's multi-buffer pipeline.",
+        "strategy_evolution": "Mask removal improved the many small/medium workloads (+3-4% each) and is kept as the new best, but the large-input regime needs fewer/larger tiles rather than better-shaped transfers; since UB caps a tile at 4096 elements per stage chain, the next lever is the multi-buffer depth (num_stages) rather than BLOCK alone.",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "1c30713dd746c18200bc7356b3c29aff8a8c9b8cf9971c40c9d49b90fd542adb",
+      "round": 3,
+      "source_sha256": "581ad44a1694f4311efaa907e84874a5b33e9df5e8a751cd2859513a72ac1101",
+      "evaluation": {
+        "evaluated_at": "2026-11-02T12:07:10.258101Z",
+        "status": "PASSED",
+        "geo_mean": 0.911505346974438,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Cut per-call host overhead in the small-workload regime",
+        "code_changes": "Device kernel unchanged. Host path flattened to a single frame: the _strict_empty_like/torch.empty(tuple(shape), device, dtype) call becomes a module-level torch.empty_like alias, _strict_contiguous inlined to an is_contiguous test plus _strict_clone, the plan closure removed and replaced by a module-level flat plan list (_FAST) holding dtype/n/device/launcher/grid/block/fn/packed/stream-getter, and _build now returns that plan instead of a closure so run() calls the C launcher directly with no intermediate Python frame. Stream is still re-read every call.",
+        "hypothesis": "The small/medium workloads (10 of 12 timing cases, all at ~0.030-0.034 ms regardless of n from 1024 to 1M) are bound by per-call host cost, not device time, so trimming Python work and switching to torch.empty_like should reduce each call by ~1-3 us and lift those speedups from ~0.84 toward ~0.90, while the 4096x4096 cases are unaffected (they are tile-count bound on device and their host cost is already overlapped).",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Removing one Python frame, a tuple(x.shape)/device/dtype reconstruction on every call and the closure indirection cuts the CPU-side cost of each invocation, which is the entire cost of the small-workload regime where the device kernel is only a few microseconds."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": null
+        },
+        "key_params": {
+          "host_frames": 1,
+          "alloc": "torch.empty_like"
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "failed",
+        "analysis_path": ".kernelgen/profile-analysis/round-0003.json",
+        "summary": "failed: msprof base collection exited successfully without profile completion marker — all 5 round-3 collection attempts failed with status=failed, capabilities=[], artifacts=[] and zero downloaded reports. Attempts: hardswish-timing-3 twice (profile ids bf53fe3d943745c1bc35394d8949fec3, 275df43bf3074bb191c737eb708c2531; manifests .kernelgen/profiles/round-0003/hardswish-timing-3/0d72ddc720b94fec9c8b1af4771ba0e7/manifest.json and .../c8638025489348f189c6adcadba3eabd/manifest.json), hardswish-tim"
+      },
+      "conclusion": {
+        "round_num": 3,
+        "expectation_status": "partially_met",
+        "root_cause": "Per-call host cost was the dominant term for every workload with n <= 1M: each call paid a _strict_empty_like wrapper that rebuilt tuple(shape)/device/dtype, a _strict_contiguous frame, and a plan-closure indirection before the C launcher. Replacing them with a module-level torch.empty_like alias, an inlined contiguity test and a flat plan list holding the launcher, grid, block, fn, packed metadata and stream getter removed ~8 us per call, which is why ten of twelve timing workloads went from ~0.84 to above 1.0 while the three large workloads, whose cost is device-side, stayed fixed.",
+        "perf_gap_analysis": "Frozen expectation was a ~1-3 us per-call reduction lifting the small-workload speedups from ~0.84 toward ~0.90. Observed a much larger effect: latency fell from ~0.030-0.034 ms to 0.0218-0.0238 ms, and the ten small/medium workloads moved from 0.786-0.883 to 1.030-1.130 (timing-0 0.852->1.130, timing-1 0.883->1.030, timing-2 0.826->1.050, timing-4 0.828->1.094, timing-5 0.841->1.106, timing-6 0.840->1.096, timing-8 0.817->1.110, timing-9 0.824->1.128, timing-10 0.824->1.123), so the prediction's direction was right but its magnitude was understated. The three 4096x4096 workloads were unaffected as predicted (timing-3 0.0980->0.0980, timing-7 0.1001->0.1001, timing-11 0.1188->0.1183), confirming their cost is entirely device-side. geo_mean 0.7419->0.9115.",
+        "next_suggestion": "Keep the flattened host path and switch the 16-bit arithmetic: add a constexpr flag selecting element-dtype arithmetic (tl.full((1,), c, x.dtype) constants, no .to(tl.float32)) when the tensor is float16, leaving fp32 and bfloat16 on the exact fp32 path. Target sweep measured fp16 n=16.7M at 0.0670 ms versus 0.0994 ms for the fp32 path (copy floor 0.0603 ms), with max relative error 0.0016 against F.hardswish - well inside the 0.015 tolerance. Expected timing-3 0.098 -> ~0.067 ms (0.43 -> ~0.63). Afterwards consider bfloat16 encoded through fp16 arithmetic (bfloat16 dtype math showed no gain: 0.1018 vs 0.1014 ms, suggesting the backend emulates bfloat16 in fp32), and do not chase the 4096-element tile cap further: num_stages does not shrink the ~32 B/element buffer footprint, and grid=80/160, one-shot grids and BLOCK=2048/8192 are all measured worse or uncompilable.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "Benchmarking the *full* candidate call path is what separated the two cost regimes: with the flattened host path the 10 small/medium workloads dropped from ~0.030 ms to ~0.022 ms and became faster than the CANN reference (1.03-1.13), while the 4096x4096 cases did not move at all. Per-call Python frames and tuple(shape)/device/dtype reconstruction were worth ~8 us - far more than the 1-3 us estimated from the earlier micro-benchmarks, because those micro-benchmarks measured a tight allocation loop rather than the whole run() invocation. On the device side, a fixed-geometry arithmetic ladder (copy 0.0603, copy+cast 0.0570, x*2 0.0598, fp32-math hardswish 0.0994, element-dtype hardswish 0.0670 ms) shows the large 16-bit case is vector-arithmetic bound rather than memory bound.",
+        "strategy_evolution": "The bottleneck split cleanly into a host-cost regime (n <= 1M, fixed by flattening the call path) and a device-cost regime (4096x4096). With the host regime now faster than the reference, all remaining headroom is in the large 16-bit cases, where the target arithmetic ladder shows element-dtype vector math is worth 1.48x.",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "1c30713dd746c18200bc7356b3c29aff8a8c9b8cf9971c40c9d49b90fd542adb",
+      "round": 4,
+      "source_sha256": "e1bb9d02f196ca1ad7e73ecbf5ef004f44e72d7479bb96e5842742818d962d98",
+      "evaluation": {
+        "evaluated_at": "2026-11-02T12:13:27.287034Z",
+        "status": "PASSED",
+        "geo_mean": 0.8836362997271318,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Native narrow-dtype vector arithmetic for the fp16 path",
+        "code_changes": "Added a constexpr H16 argument to _hardswish_stream. When H16 is true (input dtype is float16) both the hot loop and the masked tail keep the arithmetic in the operand dtype: the tl.full((1,), 3.0/0.0/6.0/1/6, x.dtype) constants and no .to(tl.float32), so no cast in and no cast out. fp32 and bfloat16 inputs keep the exact H16=false fp32 path. The plan list grew one field (index 11) carried into both the integer-address C launch and the JIT fallback. Host path, grid, BLOCK, vector-core cap and masked tail are unchanged.",
+        "hypothesis": "The fp16 4096x4096 case is vector-arithmetic bound, not memory bound: at identical geometry the target sweep measured a pure copy at 0.0603 ms, one multiply at 0.0598 ms, fp32-emulated hardswish at 0.0994 ms and element-dtype hardswish at 0.0670 ms. Switching only the fp16 path to element-dtype math should take timing-3 from 0.098 to ~0.067 ms (speedup 0.431 -> ~0.63) and leave the ten already-faster small workloads and the bf16/fp32 large cases unchanged.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Narrow-dtype vector math runs at twice the fp32 lane rate and drops the two cast operations per tile that the fp32 emulation pays, removing the vector-arithmetic saturation that dominates the 16.7M-element fp16 case."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": null
+        },
+        "key_params": {
+          "H16": "true for float16 only",
+          "vector_math": "element dtype"
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": false,
+        "status": "not_required",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 4,
+        "expectation_status": "partially_met",
+        "root_cause": "The fp16 4096x4096 workload was saturated on fp32 vector arithmetic: emulating a 16-bit operand through fp32 costs a cast in and a cast out plus full-rate fp32 vector work over five operations per element, which the target isolates at 0.0994 ms against a 0.0603 ms copy floor. Element-dtype constants remove both casts and double the vector lane rate, taking that workload to 0.0648 ms. The aggregate metric moved the other way only because the ten CPU-bound workloads, now essentially at parity with the CANN call (our 0.0237 ms vs reference 0.0221 ms in the retest), are dominated by host-state variance that swamped a genuine 1.5x device-side gain on one of twelve workloads.",
+        "perf_gap_analysis": "Frozen expectation: timing-3 0.098 -> ~0.067 ms (0.431 -> ~0.63) with the small workloads and the bf16/fp32 large cases unchanged. Observed on the target workload: timing-3 0.0980 -> 0.0648 ms, speedup 0.431 -> 0.649, i.e. the mechanism and magnitude were both correct and the retest reproduced it at 0.0674 ms. timing-7 (bfloat16) was unchanged as predicted (0.1001 -> 0.1001). However the aggregate fell: geo_mean 0.9115 -> 0.8836, and the independent retest measured 0.8499. The cause is measurement drift, not the code: the ten CPU-bound small/medium workloads regressed in relative terms (timing-0 1.130 -> 0.996, timing-8 1.110 -> 1.002) although they run the byte-identical fp32 path and unchanged host path, and their CANN reference latency moved 0.0247 -> 0.0265 ms in this round and 0.0221 ms in the retest (-17% from this round) while the three device-bound large cases stayed stable (timing-7 0.1001 -> 0.1007, timing-3 0.0648 -> 0.0674). Net effect of the change itself, holding drift aside, is about +3.5% on geo_mean; the recorded aggregate does not show it.",
+        "next_suggestion": "Re-apply the float16 element-dtype path (it is a genuine 1.5x on timing-3 and was confirmed twice: 0.0980 -> 0.0648 ms in this round and 0.0674 ms in the retest) and evaluate it again for a clean draw, because the aggregate comparison was decided by host-side measurement drift on the ten CPU-bound workloads rather than by the code. While doing so, test whether genuinely narrow arithmetic frees enough on-chip buffer for a doubled float16 tile: with no fp32 intermediate the ~32 B/element footprint may fall, letting BLOCK=8192 (16 KB transfers) compile for float16 where it previously overflowed UB, which would move the fp16 case from 0.067 toward the 0.044 CANN level. Check compilation by preflight first, since an 8192-element tile failed UB before the narrow-math change. Do not pursue bfloat16 narrow math: bfloat16 is emulated in fp32 and a bfloat16->float16 encoding would silently overflow finite values above 65504.",
+        "optimization_level": "L1_architecture",
+        "debug_lesson": "The 16.7M-element fp16 case is vector-arithmetic bound, not memory bound: at identical geometry (BLOCK=4096, grid=40) the target ladder gave copy 0.0603 ms, copy+fp32-cast 0.0570, x*2 0.0598, fp32-emulated hardswish 0.0994 and element-dtype hardswish 0.0670 ms. Two further facts from the same measurements: bfloat16 element-dtype math gives no gain at all (0.1018 vs 0.1014 ms), so the backend emulates bfloat16 through fp32 and only float16 gets the doubled vector lane rate; and the residual gap between 0.0670 and the 0.0603 copy floor is the tile-granularity ceiling, since the ~32 B/element buffer footprint pins BLOCK at 4096 elements and no grid shape or num_stages setting changes that.",
+        "strategy_evolution": "Element-dtype arithmetic is confirmed as the lever for float16 and confirmed useless for bfloat16. The remaining fp16 headroom is the 0.067 -> 0.060 copy floor, which requires a larger tile than the 4096-element UB cap currently allows; narrow arithmetic may itself lower that cap's binding, so the tile size becomes re-testable rather than settled.",
+        "knowledge_assessments": []
+      }
+    }
+  ],
+  "gap": null,
+  "relation_note": "按同一原始账本正式轮次展示；未逐编辑恢复的关系不声称直接源码继承。",
+  "delivery": {
+    "score": 0.8492181060338365,
+    "source": "operators/hardswish/versions/independent_strict/retained/kernel.py",
+    "source_sha256": "581ad44a1694f4311efaa907e84874a5b33e9df5e8a751cd2859513a72ac1101",
+    "passed": 30,
+    "total": 30,
+    "result": "operators/hardswish/evidence/retained/evaluation/result.json",
+    "result_sha256": "b64d023cfb99aea711c36239a1e6a9d265d23cd61111234fcaeeb437f4c8c7cb",
+    "endpoint_same_source": false
+  },
+  "current_cann_score": 0.8492181060338365,
+  "historical_simulator_files": 0
+}

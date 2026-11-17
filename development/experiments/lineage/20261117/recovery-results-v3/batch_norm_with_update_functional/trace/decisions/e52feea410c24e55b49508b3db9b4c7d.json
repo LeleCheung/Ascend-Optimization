@@ -1,0 +1,65 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "e52feea410c24e55b49508b3db9b4c7d",
+  "recorded_at": "2026-11-17T06:52:53.162833+00:00",
+  "round_id": "performance-02",
+  "input_source": {
+    "path": "trace/sources/90d07324fad0b82b72d132c15f0eaad810b6e436f28158973f38f3407d634000.py",
+    "sha256": "90d07324fad0b82b72d132c15f0eaad810b6e436f28158973f38f3407d634000"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/afe7a18b5741c25ba07e956146882648e2c36e014ffac3a1d943826f56608746.json",
+        "sha256": "afe7a18b5741c25ba07e956146882648e2c36e014ffac3a1d943826f56608746"
+      },
+      "original": {
+        "path": "workspace/performance-feedback.json",
+        "sha256": "afe7a18b5741c25ba07e956146882648e2c36e014ffac3a1d943826f56608746"
+      },
+      "category": "other",
+      "role": "trigger",
+      "finding": "KGS 完整正式计时显示各 dtype 与各输入规模候选耗时都落在约 217–234us，规模从 131072 到 2097152 元素变化时耗时几乎不变；FP32 相对基线更差（speedup 1.22–1.38），几何速度 0.99309。此数值是完整调用 KGS 计时，不是 paired profiling，不能据此断言宿主或设备某一组件主导。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/90d07324fad0b82b72d132c15f0eaad810b6e436f28158973f38f3407d634000.py",
+        "sha256": "90d07324fad0b82b72d132c15f0eaad810b6e436f28158973f38f3407d634000"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "90d07324fad0b82b72d132c15f0eaad810b6e436f28158973f38f3407d634000"
+      },
+      "category": "other",
+      "role": "disambiguation",
+      "finding": "当前实现只有一个设备 kernel（batch_norm_with_update_kernel），每次调用都经 batch_norm_with_update_kernel[feat_dim,] 进入 JITFunction.run 的参数绑定、特化键计算、寄存器缓存查找与网格求值，并重建 torch_npu.npu.device 上下文；设备侧算法本身与 starter 相同。去除 autotune 未改变结果，说明剩余固定开销不来自配置选择。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/1916472afb2f79831700f61ef23b4a24c513b460234380822991921b04c8acc3.md",
+        "sha256": "1916472afb2f79831700f61ef23b4a24c513b460234380822991921b04c8acc3"
+      },
+      "original": {
+        "path": "workspace/skills/hgkda/references/launch-and-feedback.md",
+        "sha256": "1916472afb2f79831700f61ef23b4a24c513b460234380822991921b04c8acc3"
+      },
+      "category": "knowledge",
+      "role": "mechanism",
+      "finding": "文档允许缓存编译结果、packed metadata、函数句柄、网格与宿主参数模板并直接调用当前编译版本的启动器，设备计算仍由该 Triton 产物执行；每次调用须核对 dtype/shape/stride/alignment/device 与当前 stream，不得缓存输入、输出、张量结果或旧 stream；非对齐、尾块、非连续、调试与 profiling 模式保留普通 Triton 回退；首次调用不得重复执行原地计算；直接启动接口可能为每个显式 tl.constexpr 保留参数槽位，需按编译签名核对。",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "移除 autotune 后完整调用耗时仍近似恒定且与元素数弱相关，提示固定量的宿主发射开销可能占显著比例。缓存首次正常发射返回的 CompiledKernel 启动器（含 packed metadata 与网格），后续在相同 dtype/shape/stride/alignment/device 与动态标量下，用当前输入输出张量与当前 stream 直接发射，可跳过每次 JITFunction.run 的绑定与特化键计算，从而在设备计算不变时降低完整 walltime。这是待验证机制假设，未由 paired profiling 证明宿主开销主导。",
+  "change": "在 _batch_norm_with_update_functional 中增加保守的已编译启动器缓存：冷路径仍执行一次普通 batch_norm_with_update_kernel[feat_dim,] 发射并捕获其返回的 CompiledKernel；仅当运行时确认该对象具备 run 与 __getitem__ 启动器接口时，缓存 compiled[(feat_dim,1,1)]。缓存键包含设备索引、输入/输出 dtype、batch/spatial/feat 维度、输入输出 stride、momentum/eps、BLOCK_M/BLOCK_N 以及各张量 data_ptr()%16 对齐类别与 weight/bias 是否为空。命中时以当前张量地址、当前 stride 与动态标量、当前 stream 调用缓存的启动器；键不匹配、接口缺失、profiling 激活或缓存已满时走原有普通发射。输出与统计张量每次仍独立分配，不缓存张量或旧 stream。",
+  "expected": "设备 kernel、数值与输出布局不变；若固定宿主发射开销确有可观占比，则完整调用 per-call 耗时下降、几何速度相对当前候选上升，FP16/BF16/FP32 同路径受益；若宿主开销非主因，则耗时可测变化很小，且回退路径保证正确性不受影响。",
+  "validation": "先通过工具桥 preflight 静态筛查与外部只读路径、地址边界审查；随后执行完整 27 例正式性能与 PyTorch/CANN 两套 36 例补充正确性与计时，按同合同几何速度及逐 case 比较当前候选；核对键不匹配、profiling 与非对齐输入下均保持普通 Triton 发射，且首次调用仅执行一次原地计算。",
+  "alternatives": [
+    "设备 kernel 本体在固定小规模下也接近固定耗时（受启动/尾部同步影响），宿主发射优化不会带来可测收益；若如此，完整调用耗时应基本不变。",
+    "固定耗时来自 NPU 队列提交与同步方式而非 Python 绑定；此时直接启动器仍保留一次运行时提交，改善有限。"
+  ],
+  "discriminating_observation": "以同源码同 case 的 paired profiling 区分宿主发射时间与 kernel 设备时间；在缺少该采集时，用同合同下直接发射路径相对当前普通 JIT 路径的完整调用耗时变化作为区分观察，并保留不匹配即回退。",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

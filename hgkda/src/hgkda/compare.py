@@ -20,6 +20,7 @@ from pathlib import Path
 
 
 import statistics
+import re
 
 
 def number(value):
@@ -34,13 +35,50 @@ def read_side(directory, expected_spec_sha, side):
     meta = json.loads((directory/'collection.json').read_text(encoding='utf-8-sig'))
     if meta['status'] != 'completed' or meta['spec_sha256'] not in expected_spec_sha or meta['side'] != side:
         raise ValueError('采集身份或完成状态不符：'+str(directory))
+    if meta.get('kernels'):
+        children=[]
+        for item in meta['kernels']:
+            child_path=(directory/item['directory']).resolve()
+            if not child_path.is_relative_to(directory.resolve()):raise ValueError('kernel采集路径越界')
+            child=read_side(child_path,expected_spec_sha,side)
+            if child['basic']['Op Name']!=item['symbol']:raise ValueError('子kernel身份不同')
+            if not isinstance(item['occurrences'],int) or item['occurrences']<1:raise ValueError('非法kernel调用次数')
+            children.append((child,item['occurrences']))
+        devices={child['basic'].get('Device Id') for child,_ in children}
+        if len(devices)!=1 or None in devices:raise ValueError('多kernel设备不同')
+        tables={}
+        for child,count in children:
+            for key,group in child['tables'].items():
+                target=tables.setdefault(key,dict(rows=0,fields={}))
+                target['rows']+=group['rows']*count
+                for field,stats in group['fields'].items():
+                    value=target['fields'].setdefault(field,dict(valid=0,missing=0,min=None,max=None,_sum=0))
+                    value['valid']+=stats['valid']*count;value['missing']+=stats['missing']*count
+                    if stats['valid']:
+                        value['_sum']+=stats['mean']*stats['valid']*count
+                        value['min']=min(value['min'],stats['min']) if value['min'] is not None else stats['min']
+                        value['max']=max(value['max'],stats['max']) if value['max'] is not None else stats['max']
+        for group in tables.values():
+            for value in group['fields'].values():
+                total=value.pop('_sum');value['mean']=total/value['valid'] if value['valid'] else None
+                value['sum']=total if value['valid'] and not value['missing'] else None
+        derived={}
+        for key,group in tables.items():
+            if key.startswith('Memory.csv/'):
+                fields=group['fields'];size=fields.get('GM_to_UB_datas(KB)',{}).get('sum');n=fields.get('aiv_mte2_instructions',{}).get('sum')
+                derived[key+'/bytes_per_mte2']=size*1024/n if size is not None and n else None
+        return dict(basic={'Op Name':'multiple_kernels','Device Id':next(iter(devices)),'Task Duration(us)':None},
+            metadata=meta,tables=tables,derived=derived,
+            kernel_profiles=[dict(occurrences=n,**child) for child,n in children],
+            evidence={str(i)+'/'+name:ref for i,(child,_) in enumerate(children) for name,ref in child['evidence'].items()})
     tables, files = {}, {}
     for path in sorted((directory/'profile').rglob('*.csv')):
-        if path.name in tables:
-            raise ValueError('同侧存在重复CSV，不能混合采集：'+path.name)
+        name=re.sub(r'_\d{14,}\.csv$', '.csv', path.name)
+        if name in tables:
+            raise ValueError('同侧存在重复CSV，不能混合采集：'+name)
         with path.open(encoding='utf-8-sig', newline='') as stream:
-            tables[path.name] = list(csv.DictReader(stream))
-        files[path.name] = dict(path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+            tables[name] = list(csv.DictReader(stream))
+        files[name] = dict(path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest())
     basic = tables.pop('OpBasicInfo.csv', [])
     if len(basic) != 1 or basic[0].get('Op Name') != meta['expected_kernel']:
         raise ValueError('目标kernel不同或基本信息不唯一')

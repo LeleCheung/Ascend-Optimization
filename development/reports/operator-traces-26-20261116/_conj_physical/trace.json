@@ -1,0 +1,538 @@
+{
+  "operator": "_conj_physical",
+  "kind": "saved_ledger_attempt_order",
+  "selected_source": {
+    "path": "/data/hanle/ascend-optimization/runs/remaining-five-20261023-v2/kg-runs/_conj_physical-remaining-five-20261023-v2-attempt-1/stages/optimize/work/.ledger.json",
+    "sha256": "62faff9a3d36dc6c746146a9ff26384fb90da182f645093a53e3fb3568831875"
+  },
+  "points": [
+    {
+      "id": "_conj_physical:round-1",
+      "score": 15.304934839726046,
+      "source_sha256": "9164b1dde5699d174a796e86903e6702bf878140b82ee04364f0b84b5bd18103",
+      "method": "本批起点",
+      "raw": {
+        "ledger_sha256": "62faff9a3d36dc6c746146a9ff26384fb90da182f645093a53e3fb3568831875",
+        "round": 1,
+        "source_sha256": "9164b1dde5699d174a796e86903e6702bf878140b82ee04364f0b84b5bd18103",
+        "evaluation": {
+          "evaluated_at": "2026-10-23T11:50:09.956853Z",
+          "status": "PASSED",
+          "geo_mean": 15.304934839726046,
+          "num_workloads": 14,
+          "num_passed": 14
+        },
+        "plan": {
+          "kind": "baseline",
+          "strategy": "Establish a native Triton baseline: one flat vector kernel for contiguous storage (copy for real dtypes, alternating-sign conj over the interleaved real/imaginary float stream for complex) plus a rank-generic strided kernel that reads through the input's real strides into a contiguous output.",
+          "code_changes": "Self-contained tmp/main.py replacing the FlagGems copy_/launch_conj_physical seed (which redispatched to a CPU-only copy and produced wrong values for strided inputs). Turns the lazy conjugate bit into a NEG flag with a metadata-only view, allocates a contiguous output like the reference, and selects UB-safe tile sizes per kernel/dtype after a measured 16384-wide fp32 tile overflowed the unified buffer.",
+          "hypothesis": "The reference aten::_conj_physical has no NPU kernel and falls back to the CPU with per-call transfer/sync, so a single native Triton pass should already beat it; the remaining gap will be host launch cost on the small inputs.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "establish_baseline",
+            "mechanism": "Native device execution replaces a CPU-fallback reference that pays D2H/H2D plus synchronization per call."
+          },
+          "source": {
+            "origin": "baseline",
+            "parent_round_num": null
+          },
+          "key_params": {
+            "copy_block": "1024/8192/16384",
+            "conj_block": "1024/4096/8192",
+            "strided_block": "1024/2048/4096"
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "pending",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 1,
+          "expectation_status": "baseline",
+          "root_cause": "The reference aten::_conj_physical has no NPU kernel and falls back to the CPU (measured warning from aten::conj_physical.out plus per-call 0.13 ms for 1024 elements and 5.8-7.3 ms for 65k-1M elements), so a single native Triton pass already wins on every workload. The candidate's own latency is however nearly constant at 0.106-0.125 ms across 1024, 65536 and 1048576 elements, and its per-call device event span equals its walltime, so the remaining bottleneck is host launch submission (~0.10 ms/call, versus ~7 us for the output allocation), not kernel work or HBM traffic.",
+          "perf_gap_analysis": "Baseline round (no previous measurement). Observed: all 8 correctness workloads pass with abs_err/rel_err 0 and matched_ratio 1, including the lazy conjugate-bit and transposed complex cases, and the two small timing inputs are the limiting ones (1.247x for float32[1024], 1.056x for complex64[1024]) while the four larger inputs reach 49-69x. The size independence of the candidate latency shows the gap to the 0.8x bar is entirely launch-side, which the next round targets.",
+          "next_suggestion": "Add a pre-bound launch fast path for the two contiguous kernels: compile through the ordinary kernel[grid](...) call once per (kernel, dtype, tile, pointer-alignment) specialization, then invoke the generated launcher directly with this call's pointers, element count and current stream, keeping the ordinary JIT path as fallback for the strided kernel and for any binding failure.",
+          "optimization_level": "L1_architecture",
+          "debug_lesson": "Preflight PASSED a candidate whose complex64[1048576] specialization later failed to compile with a unified-buffer overflow (2097408 bits required vs 1572864 available at a 16384-wide fp32 tile); only the debug numeric run over the real timing inputs exposed it. Tile width must be budgeted from buffered bytes per kernel shape, not chosen by taste, and preflight is not a substitute for compiling every frozen timing specialization.",
+          "strategy_evolution": "Moved from replicating the FlagGems copy/conj decomposition to a self-contained flat-stream kernel: complex conjugate is applied as an alternating-lane sign flip over the interleaved real/imaginary floats, which keeps load and store contiguous, and the conjugate bit is converted into a constexpr instead of being materialized by a copy.",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "_conj_physical:round-2",
+      "score": 89.38029764192028,
+      "source_sha256": "38748dd722f0bbff0803d22ea2a7fc6e47f4bc2e2ccb9d51b90757d6dba56db2",
+      "method": "预绑定编译后启动器",
+      "raw": {
+        "ledger_sha256": "62faff9a3d36dc6c746146a9ff26384fb90da182f645093a53e3fb3568831875",
+        "round": 2,
+        "source_sha256": "38748dd722f0bbff0803d22ea2a7fc6e47f4bc2e2ccb9d51b90757d6dba56db2",
+        "evaluation": {
+          "evaluated_at": "2026-10-23T11:56:48.807069Z",
+          "status": "PASSED",
+          "geo_mean": 89.38029764192028,
+          "num_workloads": 14,
+          "num_passed": 14
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Cut host launch cost on the dense contiguous paths with a pre-bound compiled launcher, while keeping the ordinary Triton launch path for non-contiguous layouts and as a fallback.",
+          "code_changes": "Added _copy_cache/_conj_cache plus _bind_copy/_bind_conj: the first call for a (kernel, dtype, tile, src-alignment, dst-alignment) specialization compiles through the ordinary kernel[grid](...) path, then reuses compiled.run.launch with this call's raw pointers, element count and current stream from _npu_getCurrentRawStreamNoWait. The strided kernel and any binding failure keep the ordinary launch. Complex binding warms up on the interleaved real views because Triton has no complex dtype.",
+          "hypothesis": "Because candidate latency was nearly constant at 0.106-0.125 ms for 1024 through 1048576 elements, the cost is host launch submission rather than kernel work; bypassing JIT dispatch should cut latency toward the ~0.008 ms launcher plus ~0.007 ms output allocation floor and raise every workload, especially the two small inputs that cap the geometric mean.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Replacing Triton's per-call JIT dispatch with a direct launcher call removes roughly 30 us of host submission per invocation, which is the measured bottleneck at every input size."
+          },
+          "source": {
+            "origin": "coder",
+            "parent_round_num": 1
+          },
+          "key_params": {
+            "prebound_launch": "compiled.run.launch",
+            "stream": "_npu_getCurrentRawStreamNoWait",
+            "alignment_key": "ptr & 15"
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "pending",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 2,
+          "expectation_status": "met",
+          "root_cause": "Per-call cost is now host-side and size independent: every timing input takes 0.0316-0.0328 ms while its device work ranges from nothing to 16 MB of traffic, so the remaining gap is output allocation plus launcher invocation plus Python glue, not device execution.",
+          "perf_gap_analysis": "Expected a large gain from bypassing JIT dispatch and observed it: geo_mean 15.30x -> 89.38x, i.e. 5.8x better than round 1, with the same 14/14 pass and abs_err/rel_err 0. Per workload latency collapsed from 0.106-0.125 ms to 0.0316-0.0328 ms and is now flat across 1024, 65536 and 1048576 elements, confirming the hypothesis that host submission, not kernel work, set the cost. The large inputs gained the most (t1 53.8x -> 427x, t2 69.0x -> 399x, t4 49.4x -> 403x, t5 53.2x -> 436x) because their reference pays 12.7-14.1 ms of CPU-fallback transfer. The two small inputs improved least (t0 1.25x -> 3.99x, t3 1.06x -> 4.26x) because their reference is only ~0.13 ms, so they are now pinned by the residual per-call floor: allocation ~0.0075 ms plus launcher ~0.008 ms plus Python glue. min_speedup moved from 1.056 to 3.99 and the bottleneck is unchanged in kind, only smaller.",
+          "next_suggestion": "Attack the remaining ~0.032 ms per-call floor, which is now identical for 1024 and 1048576 elements: split it into output allocation, launcher call and Python glue with a preallocated-output probe, then remove whichever dominates (for example by trimming per-call device/stream lookups or by avoiding a masked tail kernel where the count divides evenly).",
+          "optimization_level": "host_side_special",
+          "debug_lesson": "The complex specialization never bound because JITFunction.warmup received complex tensors while the kernel's signature is a float stream; the failure was invisible because the bind is wrapped in try/except, and only a probe that printed the cache contents exposed that the fast path was dead (t3 stayed at 0.154 ms). Cache-population state is worth asserting in any host-side fast path.",
+          "strategy_evolution": "Kept the round 1 kernels untouched and changed only the launch layer, so the 5.8x aggregate gain is attributable to dispatch cost rather than arithmetic or tiling. The strided kernel and any binding failure still take the ordinary Triton path, and the pre-bound path still keys on pointer alignment, so unaligned views get their own specialization (verified: offset view with ptr%16==4 exact and equally fast).",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "_conj_physical:round-3",
+      "score": 112.14772442067374,
+      "source_sha256": "feccb337a7fc417432a66c6fefde42181665a258a6b7fdf82ce96c2799ecaef2",
+      "method": "简化输出分配路径",
+      "raw": {
+        "ledger_sha256": "62faff9a3d36dc6c746146a9ff26384fb90da182f645093a53e3fb3568831875",
+        "round": 3,
+        "source_sha256": "feccb337a7fc417432a66c6fefde42181665a258a6b7fdf82ce96c2799ecaef2",
+        "evaluation": {
+          "evaluated_at": "2026-10-23T12:01:54.951533Z",
+          "status": "PASSED",
+          "geo_mean": 112.14772442067374,
+          "num_workloads": 14,
+          "num_passed": 14
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Trim the dominant remaining host cost (output allocation) without touching the kernels, by selecting the cheaper allocator entry point on the path where it provably preserves the required contiguous, bit-free output.",
+          "code_changes": "run() now reads is_conj()/is_contiguous() once and, when the input is contiguous and carries no conjugate bit, allocates with torch.empty_like(input) instead of torch.empty(input.shape, dtype=..., device=...); every other case keeps the contiguous torch.empty allocation so the reference's contiguous output layout is preserved. The two flags are reused by both the complex and real branches instead of re-querying.",
+          "hypothesis": "The per-call floor is now output allocation (~0.0070 ms) plus launcher (~0.0070 ms) plus stream query (~0.0010 ms); torch.empty_like measured 0.0056 ms against 0.0071 ms for torch.empty(shape, ...), so taking it on the dense bit-free path should cut the floor by roughly 1.3 us, from ~0.0313 to ~0.0280 ms.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Removing 1.3 us of per-call allocation cost from a floor that is otherwise unchanged raises every workload by the same small factor, with the largest relative gain on the small inputs where the reference is fastest."
+          },
+          "source": {
+            "origin": "coder",
+            "parent_round_num": 2
+          },
+          "key_params": {
+            "alloc": "torch.empty_like on contiguous bit-free inputs",
+            "fallback_alloc": "torch.empty(shape, dtype, device)"
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "pending",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 3,
+          "expectation_status": "met",
+          "root_cause": "Adopted torch.empty_like on the contiguous bit-free path, the cheapest measured allocation entry point, cutting ~1.3 us from a per-call floor that is otherwise dominated by the ~0.007 ms direct launcher call. Confirmed: every timing workload still runs at 0.028-0.034 ms regardless of whether its device work is zero or 16 MB of traffic.",
+          "perf_gap_analysis": "Candidate-side latency fell as predicted: t0 0.03157 -> 0.02779 ms and t3 0.03205 -> 0.03021 ms, i.e. about 1.3-1.8 us per call, matching the 0.0056 vs 0.0071 ms allocation measurement that motivated the change. The headline geo_mean 89.38 -> 112.15 is larger than that change can explain and must not be attributed to it: the reference side moved as well (t1 reference 13.56 -> 27.16 ms, t4 13.23 -> 19.08 ms), which is the CPU-fallback path's own variance. Reads honestly: all six candidate latencies are within 0.0278-0.0335 ms and still size independent, so the floor remains host-bound; the two small inputs stay lowest (4.69x and 4.73x) because their reference is only ~0.13-0.14 ms, and they are now within ~2x of the level where device time would start to dominate.",
+          "next_suggestion": "Stop trimming host glue: the floor is now ~0.028 ms split between a ~0.0056 ms allocation and a ~0.007 ms launcher call, and the remaining Python glue is only a few microseconds. Any further gain would have to come from the launcher call itself, which is already the cheapest supported path (passing tensors instead of raw pointers measured slower at 0.0152 ms vs 0.0102 ms), so the next experiment should instead revisit whether device work begins to matter at the largest sizes, e.g. by comparing tile sizes at 1048576 elements with the host cost held fixed.",
+          "optimization_level": "host_side_special",
+          "debug_lesson": "",
+          "strategy_evolution": "Kept both kernels and the launch mechanism identical to round 2 and changed only the allocation entry point, so the candidate-side delta is attributable to that one host-side choice; the geo_mean movement beyond it is reference variance and is reported as such rather than as an optimization win.",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "_conj_physical:round-4",
+      "score": 68.75499098959077,
+      "source_sha256": "c5dd849d838b35f5b3f4d0df73c3bd84a877c9a83f8a8fdca43e0ba868b909a3",
+      "method": "增加安全回退：退步",
+      "raw": {
+        "ledger_sha256": "62faff9a3d36dc6c746146a9ff26384fb90da182f645093a53e3fb3568831875",
+        "round": 4,
+        "source_sha256": "c5dd849d838b35f5b3f4d0df73c3bd84a877c9a83f8a8fdca43e0ba868b909a3",
+        "evaluation": {
+          "evaluated_at": "2026-10-23T12:06:03.531044Z",
+          "status": "PASSED",
+          "geo_mean": 68.75499098959077,
+          "num_workloads": 14,
+          "num_passed": 14
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Make the host fast path fail safe: keep the pre-bound launcher as the default and add an exception-guarded fallback to the ordinary Triton dispatch, verifying the guard neither changes results nor costs measurable time.",
+          "code_changes": "Both pre-bound launch sites in run() are now wrapped in try/except; on any exception the code falls through to the ordinary kernel[grid](...) dispatch for the same kernel and tile, writing the same output. No kernel, tile, key or allocation logic changed.",
+          "hypothesis": "The direct launcher passes raw integer pointers, which a profiler-instrumented launch context is documented to reject by calling size() on pointer arguments; a guarded fallback should leave the 0.0278-0.0280 ms floor and all workload results unchanged while removing that failure mode.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "maintain",
+            "mechanism": "A passing try/except costs nothing on CPython 3.11, so the measured floor should be unchanged while a launch context that rejects raw integer pointers degrades to the slower JIT path instead of failing."
+          },
+          "source": {
+            "origin": "coder",
+            "parent_round_num": 3
+          },
+          "key_params": {
+            "fallback": "ordinary kernel[grid](...) launch",
+            "guard": "try/except around compiled.run.launch"
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": false,
+          "status": "not_required",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 4,
+          "expectation_status": "partially_met",
+          "root_cause": "Added an exception-guarded fallback around both pre-bound launch sites so a launch context that rejects raw integer pointers degrades to the ordinary JIT dispatch. The guard is free when unused, so the measured per-call floor and every workload result are unchanged; the lower geo_mean of this round comes from faster reference-side measurements, not from the candidate.",
+          "perf_gap_analysis": "Candidate side behaved exactly as predicted: every timing workload stayed within 0.0280-0.0286 ms versus round 3's 0.0278-0.0335 ms, all 14 workloads passed with abs_err/rel_err 0, and the guard was separately proven to produce exact output when the launcher raises, so the added try/except cost nothing measurable. The aggregate metric nevertheless fell from 112.15 to 68.75, which the candidate cannot explain: the reference side was remeasured 2-4x faster on the same workloads (t1 27.16 -> 5.85 ms, t2 13.13 -> 7.30 ms, t4 19.08 -> 6.77 ms, t5 11.62 -> 10.57 ms) while the two small inputs stayed flat (t0 0.1304 -> 0.1308 ms reference, 4.69x -> 4.67x speedup). That is the CPU-fallback reference's own variance, so the round is not a candidate regression; the honest reading is that geo_mean for this operator has moved between 15.3 and 112.1 across rounds largely with the reference, while the candidate's own cost has fallen and then held at ~0.028 ms.",
+          "next_suggestion": "Treat the candidate as settled at a ~0.028 ms per-call host floor and do not spend further rounds on host glue: the allocation, launcher and stream steps have each been measured and the only remaining lever is the ~0.007 ms direct launcher call, whose cheaper alternatives (tensor arguments) measured 50% worse. If more measurement is wanted, remeasure the existing best round instead of changing code, because the spread between rounds 3 and 4 is reference-side.",
+          "optimization_level": "host_side_special",
+          "debug_lesson": "A failing launcher can be simulated by replacing the cached (launch, function, metadata) tuple with a function that raises; that exercises the guard end to end and proved both the real and complex paths still return exact values, which a plain code review of try/except would not have established.",
+          "strategy_evolution": "This round deliberately optimized for robustness rather than speed, using the round-paired structure as a control: identical candidate latency with a very different aggregate score isolates the reference's variance and shows that further host micro-tuning is below the measurement noise of this contract.",
+          "knowledge_assessments": []
+        }
+      }
+    }
+  ],
+  "view": {
+    "id": "mainline",
+    "session": "_conj_physical",
+    "title": "_conj_physical 优化轨迹",
+    "subtitle": "历史参考可能含 CPU 回退 · 本批 4 次正式评测",
+    "ylim": [
+      0,
+      130.1
+    ],
+    "annotations": [
+      {
+        "point": 2,
+        "method": "预绑定编译后启动器",
+        "color": "probe",
+        "position": [
+          220,
+          285
+        ],
+        "arrow": [
+          540,
+          325
+        ]
+      },
+      {
+        "point": 3,
+        "method": "简化输出分配路径",
+        "color": "probe",
+        "position": [
+          930,
+          285
+        ],
+        "arrow": [
+          1210,
+          325
+        ]
+      },
+      {
+        "point": 4,
+        "method": "增加安全回退：退步",
+        "color": "unknown",
+        "position": [
+          220,
+          775
+        ],
+        "arrow": [
+          540,
+          730
+        ]
+      }
+    ],
+    "legend": [
+      "paired",
+      "sim",
+      "knowledge",
+      "probe",
+      "unknown"
+    ],
+    "gap": null,
+    "x_label": "本批正式评测顺序",
+    "plot_bottom": 650,
+    "nodes": [
+      {
+        "point": 1,
+        "location": "mixed"
+      },
+      {
+        "point": 2,
+        "location": "host"
+      },
+      {
+        "point": 3,
+        "location": "host"
+      },
+      {
+        "point": 4,
+        "location": "host"
+      }
+    ],
+    "delivery": {
+      "score": 1.2344229083397662,
+      "source": "operators/_conj_physical/versions/independent_strict/retained/kernel.py",
+      "source_sha256": "64d85d5b54b60b9e85ec804c28eb0a08e42211e0bbdba7824b997744359d1057",
+      "passed": 14,
+      "total": 14,
+      "result": "operators/_conj_physical/evidence/retained/evaluation/result.json",
+      "result_sha256": "4e95a87b2b2a8459f2abe7cdceb91282c14ce8fdffa36a87bba05f4ef47801f7",
+      "endpoint_same_source": false
+    },
+    "result_only": false,
+    "line_status": "下图：历史优化片段"
+  },
+  "history": [
+    {
+      "ledger_sha256": "62faff9a3d36dc6c746146a9ff26384fb90da182f645093a53e3fb3568831875",
+      "round": 1,
+      "source_sha256": "9164b1dde5699d174a796e86903e6702bf878140b82ee04364f0b84b5bd18103",
+      "evaluation": {
+        "evaluated_at": "2026-10-23T11:50:09.956853Z",
+        "status": "PASSED",
+        "geo_mean": 15.304934839726046,
+        "num_workloads": 14,
+        "num_passed": 14
+      },
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Establish a native Triton baseline: one flat vector kernel for contiguous storage (copy for real dtypes, alternating-sign conj over the interleaved real/imaginary float stream for complex) plus a rank-generic strided kernel that reads through the input's real strides into a contiguous output.",
+        "code_changes": "Self-contained tmp/main.py replacing the FlagGems copy_/launch_conj_physical seed (which redispatched to a CPU-only copy and produced wrong values for strided inputs). Turns the lazy conjugate bit into a NEG flag with a metadata-only view, allocates a contiguous output like the reference, and selects UB-safe tile sizes per kernel/dtype after a measured 16384-wide fp32 tile overflowed the unified buffer.",
+        "hypothesis": "The reference aten::_conj_physical has no NPU kernel and falls back to the CPU with per-call transfer/sync, so a single native Triton pass should already beat it; the remaining gap will be host launch cost on the small inputs.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "Native device execution replaces a CPU-fallback reference that pays D2H/H2D plus synchronization per call."
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {
+          "copy_block": "1024/8192/16384",
+          "conj_block": "1024/4096/8192",
+          "strided_block": "1024/2048/4096"
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "The reference aten::_conj_physical has no NPU kernel and falls back to the CPU (measured warning from aten::conj_physical.out plus per-call 0.13 ms for 1024 elements and 5.8-7.3 ms for 65k-1M elements), so a single native Triton pass already wins on every workload. The candidate's own latency is however nearly constant at 0.106-0.125 ms across 1024, 65536 and 1048576 elements, and its per-call device event span equals its walltime, so the remaining bottleneck is host launch submission (~0.10 ms/call, versus ~7 us for the output allocation), not kernel work or HBM traffic.",
+        "perf_gap_analysis": "Baseline round (no previous measurement). Observed: all 8 correctness workloads pass with abs_err/rel_err 0 and matched_ratio 1, including the lazy conjugate-bit and transposed complex cases, and the two small timing inputs are the limiting ones (1.247x for float32[1024], 1.056x for complex64[1024]) while the four larger inputs reach 49-69x. The size independence of the candidate latency shows the gap to the 0.8x bar is entirely launch-side, which the next round targets.",
+        "next_suggestion": "Add a pre-bound launch fast path for the two contiguous kernels: compile through the ordinary kernel[grid](...) call once per (kernel, dtype, tile, pointer-alignment) specialization, then invoke the generated launcher directly with this call's pointers, element count and current stream, keeping the ordinary JIT path as fallback for the strided kernel and for any binding failure.",
+        "optimization_level": "L1_architecture",
+        "debug_lesson": "Preflight PASSED a candidate whose complex64[1048576] specialization later failed to compile with a unified-buffer overflow (2097408 bits required vs 1572864 available at a 16384-wide fp32 tile); only the debug numeric run over the real timing inputs exposed it. Tile width must be budgeted from buffered bytes per kernel shape, not chosen by taste, and preflight is not a substitute for compiling every frozen timing specialization.",
+        "strategy_evolution": "Moved from replicating the FlagGems copy/conj decomposition to a self-contained flat-stream kernel: complex conjugate is applied as an alternating-lane sign flip over the interleaved real/imaginary floats, which keeps load and store contiguous, and the conjugate bit is converted into a constexpr instead of being materialized by a copy.",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "62faff9a3d36dc6c746146a9ff26384fb90da182f645093a53e3fb3568831875",
+      "round": 2,
+      "source_sha256": "38748dd722f0bbff0803d22ea2a7fc6e47f4bc2e2ccb9d51b90757d6dba56db2",
+      "evaluation": {
+        "evaluated_at": "2026-10-23T11:56:48.807069Z",
+        "status": "PASSED",
+        "geo_mean": 89.38029764192028,
+        "num_workloads": 14,
+        "num_passed": 14
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Cut host launch cost on the dense contiguous paths with a pre-bound compiled launcher, while keeping the ordinary Triton launch path for non-contiguous layouts and as a fallback.",
+        "code_changes": "Added _copy_cache/_conj_cache plus _bind_copy/_bind_conj: the first call for a (kernel, dtype, tile, src-alignment, dst-alignment) specialization compiles through the ordinary kernel[grid](...) path, then reuses compiled.run.launch with this call's raw pointers, element count and current stream from _npu_getCurrentRawStreamNoWait. The strided kernel and any binding failure keep the ordinary launch. Complex binding warms up on the interleaved real views because Triton has no complex dtype.",
+        "hypothesis": "Because candidate latency was nearly constant at 0.106-0.125 ms for 1024 through 1048576 elements, the cost is host launch submission rather than kernel work; bypassing JIT dispatch should cut latency toward the ~0.008 ms launcher plus ~0.007 ms output allocation floor and raise every workload, especially the two small inputs that cap the geometric mean.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Replacing Triton's per-call JIT dispatch with a direct launcher call removes roughly 30 us of host submission per invocation, which is the measured bottleneck at every input size."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": 1
+        },
+        "key_params": {
+          "prebound_launch": "compiled.run.launch",
+          "stream": "_npu_getCurrentRawStreamNoWait",
+          "alignment_key": "ptr & 15"
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "met",
+        "root_cause": "Per-call cost is now host-side and size independent: every timing input takes 0.0316-0.0328 ms while its device work ranges from nothing to 16 MB of traffic, so the remaining gap is output allocation plus launcher invocation plus Python glue, not device execution.",
+        "perf_gap_analysis": "Expected a large gain from bypassing JIT dispatch and observed it: geo_mean 15.30x -> 89.38x, i.e. 5.8x better than round 1, with the same 14/14 pass and abs_err/rel_err 0. Per workload latency collapsed from 0.106-0.125 ms to 0.0316-0.0328 ms and is now flat across 1024, 65536 and 1048576 elements, confirming the hypothesis that host submission, not kernel work, set the cost. The large inputs gained the most (t1 53.8x -> 427x, t2 69.0x -> 399x, t4 49.4x -> 403x, t5 53.2x -> 436x) because their reference pays 12.7-14.1 ms of CPU-fallback transfer. The two small inputs improved least (t0 1.25x -> 3.99x, t3 1.06x -> 4.26x) because their reference is only ~0.13 ms, so they are now pinned by the residual per-call floor: allocation ~0.0075 ms plus launcher ~0.008 ms plus Python glue. min_speedup moved from 1.056 to 3.99 and the bottleneck is unchanged in kind, only smaller.",
+        "next_suggestion": "Attack the remaining ~0.032 ms per-call floor, which is now identical for 1024 and 1048576 elements: split it into output allocation, launcher call and Python glue with a preallocated-output probe, then remove whichever dominates (for example by trimming per-call device/stream lookups or by avoiding a masked tail kernel where the count divides evenly).",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "The complex specialization never bound because JITFunction.warmup received complex tensors while the kernel's signature is a float stream; the failure was invisible because the bind is wrapped in try/except, and only a probe that printed the cache contents exposed that the fast path was dead (t3 stayed at 0.154 ms). Cache-population state is worth asserting in any host-side fast path.",
+        "strategy_evolution": "Kept the round 1 kernels untouched and changed only the launch layer, so the 5.8x aggregate gain is attributable to dispatch cost rather than arithmetic or tiling. The strided kernel and any binding failure still take the ordinary Triton path, and the pre-bound path still keys on pointer alignment, so unaligned views get their own specialization (verified: offset view with ptr%16==4 exact and equally fast).",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "62faff9a3d36dc6c746146a9ff26384fb90da182f645093a53e3fb3568831875",
+      "round": 3,
+      "source_sha256": "feccb337a7fc417432a66c6fefde42181665a258a6b7fdf82ce96c2799ecaef2",
+      "evaluation": {
+        "evaluated_at": "2026-10-23T12:01:54.951533Z",
+        "status": "PASSED",
+        "geo_mean": 112.14772442067374,
+        "num_workloads": 14,
+        "num_passed": 14
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Trim the dominant remaining host cost (output allocation) without touching the kernels, by selecting the cheaper allocator entry point on the path where it provably preserves the required contiguous, bit-free output.",
+        "code_changes": "run() now reads is_conj()/is_contiguous() once and, when the input is contiguous and carries no conjugate bit, allocates with torch.empty_like(input) instead of torch.empty(input.shape, dtype=..., device=...); every other case keeps the contiguous torch.empty allocation so the reference's contiguous output layout is preserved. The two flags are reused by both the complex and real branches instead of re-querying.",
+        "hypothesis": "The per-call floor is now output allocation (~0.0070 ms) plus launcher (~0.0070 ms) plus stream query (~0.0010 ms); torch.empty_like measured 0.0056 ms against 0.0071 ms for torch.empty(shape, ...), so taking it on the dense bit-free path should cut the floor by roughly 1.3 us, from ~0.0313 to ~0.0280 ms.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Removing 1.3 us of per-call allocation cost from a floor that is otherwise unchanged raises every workload by the same small factor, with the largest relative gain on the small inputs where the reference is fastest."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": 2
+        },
+        "key_params": {
+          "alloc": "torch.empty_like on contiguous bit-free inputs",
+          "fallback_alloc": "torch.empty(shape, dtype, device)"
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 3,
+        "expectation_status": "met",
+        "root_cause": "Adopted torch.empty_like on the contiguous bit-free path, the cheapest measured allocation entry point, cutting ~1.3 us from a per-call floor that is otherwise dominated by the ~0.007 ms direct launcher call. Confirmed: every timing workload still runs at 0.028-0.034 ms regardless of whether its device work is zero or 16 MB of traffic.",
+        "perf_gap_analysis": "Candidate-side latency fell as predicted: t0 0.03157 -> 0.02779 ms and t3 0.03205 -> 0.03021 ms, i.e. about 1.3-1.8 us per call, matching the 0.0056 vs 0.0071 ms allocation measurement that motivated the change. The headline geo_mean 89.38 -> 112.15 is larger than that change can explain and must not be attributed to it: the reference side moved as well (t1 reference 13.56 -> 27.16 ms, t4 13.23 -> 19.08 ms), which is the CPU-fallback path's own variance. Reads honestly: all six candidate latencies are within 0.0278-0.0335 ms and still size independent, so the floor remains host-bound; the two small inputs stay lowest (4.69x and 4.73x) because their reference is only ~0.13-0.14 ms, and they are now within ~2x of the level where device time would start to dominate.",
+        "next_suggestion": "Stop trimming host glue: the floor is now ~0.028 ms split between a ~0.0056 ms allocation and a ~0.007 ms launcher call, and the remaining Python glue is only a few microseconds. Any further gain would have to come from the launcher call itself, which is already the cheapest supported path (passing tensors instead of raw pointers measured slower at 0.0152 ms vs 0.0102 ms), so the next experiment should instead revisit whether device work begins to matter at the largest sizes, e.g. by comparing tile sizes at 1048576 elements with the host cost held fixed.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "",
+        "strategy_evolution": "Kept both kernels and the launch mechanism identical to round 2 and changed only the allocation entry point, so the candidate-side delta is attributable to that one host-side choice; the geo_mean movement beyond it is reference variance and is reported as such rather than as an optimization win.",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "62faff9a3d36dc6c746146a9ff26384fb90da182f645093a53e3fb3568831875",
+      "round": 4,
+      "source_sha256": "c5dd849d838b35f5b3f4d0df73c3bd84a877c9a83f8a8fdca43e0ba868b909a3",
+      "evaluation": {
+        "evaluated_at": "2026-10-23T12:06:03.531044Z",
+        "status": "PASSED",
+        "geo_mean": 68.75499098959077,
+        "num_workloads": 14,
+        "num_passed": 14
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Make the host fast path fail safe: keep the pre-bound launcher as the default and add an exception-guarded fallback to the ordinary Triton dispatch, verifying the guard neither changes results nor costs measurable time.",
+        "code_changes": "Both pre-bound launch sites in run() are now wrapped in try/except; on any exception the code falls through to the ordinary kernel[grid](...) dispatch for the same kernel and tile, writing the same output. No kernel, tile, key or allocation logic changed.",
+        "hypothesis": "The direct launcher passes raw integer pointers, which a profiler-instrumented launch context is documented to reject by calling size() on pointer arguments; a guarded fallback should leave the 0.0278-0.0280 ms floor and all workload results unchanged while removing that failure mode.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "maintain",
+          "mechanism": "A passing try/except costs nothing on CPython 3.11, so the measured floor should be unchanged while a launch context that rejects raw integer pointers degrades to the slower JIT path instead of failing."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": 3
+        },
+        "key_params": {
+          "fallback": "ordinary kernel[grid](...) launch",
+          "guard": "try/except around compiled.run.launch"
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": false,
+        "status": "not_required",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 4,
+        "expectation_status": "partially_met",
+        "root_cause": "Added an exception-guarded fallback around both pre-bound launch sites so a launch context that rejects raw integer pointers degrades to the ordinary JIT dispatch. The guard is free when unused, so the measured per-call floor and every workload result are unchanged; the lower geo_mean of this round comes from faster reference-side measurements, not from the candidate.",
+        "perf_gap_analysis": "Candidate side behaved exactly as predicted: every timing workload stayed within 0.0280-0.0286 ms versus round 3's 0.0278-0.0335 ms, all 14 workloads passed with abs_err/rel_err 0, and the guard was separately proven to produce exact output when the launcher raises, so the added try/except cost nothing measurable. The aggregate metric nevertheless fell from 112.15 to 68.75, which the candidate cannot explain: the reference side was remeasured 2-4x faster on the same workloads (t1 27.16 -> 5.85 ms, t2 13.13 -> 7.30 ms, t4 19.08 -> 6.77 ms, t5 11.62 -> 10.57 ms) while the two small inputs stayed flat (t0 0.1304 -> 0.1308 ms reference, 4.69x -> 4.67x speedup). That is the CPU-fallback reference's own variance, so the round is not a candidate regression; the honest reading is that geo_mean for this operator has moved between 15.3 and 112.1 across rounds largely with the reference, while the candidate's own cost has fallen and then held at ~0.028 ms.",
+        "next_suggestion": "Treat the candidate as settled at a ~0.028 ms per-call host floor and do not spend further rounds on host glue: the allocation, launcher and stream steps have each been measured and the only remaining lever is the ~0.007 ms direct launcher call, whose cheaper alternatives (tensor arguments) measured 50% worse. If more measurement is wanted, remeasure the existing best round instead of changing code, because the spread between rounds 3 and 4 is reference-side.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "A failing launcher can be simulated by replacing the cached (launch, function, metadata) tuple with a function that raises; that exercises the guard end to end and proved both the real and complex paths still return exact values, which a plain code review of try/except would not have established.",
+        "strategy_evolution": "This round deliberately optimized for robustness rather than speed, using the round-paired structure as a control: identical candidate latency with a very different aggregate score isolates the reference's variance and shows that further host micro-tuning is below the measurement noise of this contract.",
+        "knowledge_assessments": []
+      }
+    }
+  ],
+  "gap": null,
+  "relation_note": "按同一原始账本正式轮次展示；未逐编辑恢复的关系不声称直接源码继承。",
+  "delivery": {
+    "score": 1.2344229083397662,
+    "source": "operators/_conj_physical/versions/independent_strict/retained/kernel.py",
+    "source_sha256": "64d85d5b54b60b9e85ec804c28eb0a08e42211e0bbdba7824b997744359d1057",
+    "passed": 14,
+    "total": 14,
+    "result": "operators/_conj_physical/evidence/retained/evaluation/result.json",
+    "result_sha256": "4e95a87b2b2a8459f2abe7cdceb91282c14ce8fdffa36a87bba05f4ef47801f7",
+    "endpoint_same_source": false
+  },
+  "current_cann_score": 1.2344229083397662,
+  "historical_simulator_files": 0,
+  "reference_limitation": "历史参考路径可能包含CPU回退；该批巨大比值不代表相对原生CANN的加速，不能与当前CANN分数比较。"
+}

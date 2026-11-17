@@ -1,0 +1,143 @@
+--- development\experiments\lineage\20261117\source-evidence\sources\1b1834c2bbea117f896effac8b5312b650350000335307a30cd0f64896b3bcf0.py
++++ operators\rad2deg_\evidence\independent_strict\5e47796a38a4-candidate.py
+@@ -12,37 +12,9 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-"""In-place rad2deg (degrees = radians * 180/pi) as a self-contained Triton kernel.
+-
+-The op is a pure elementwise scaling that must be applied in place, so the same
+-buffer is both source and destination and the pointer arithmetic has to follow
+-the tensor's actual (possibly strided) layout.
+-
+-Dense inputs take a two-stage launch path:
+-
+-* the first call for a given (dtype, pointer-alignment) pair performs an
+-  ordinary ``kernel[grid](...)`` launch, which compiles and caches the kernel;
+-* later calls reuse that compiled kernel and invoke its generated NPU launcher
+-  directly, passing the pointer, the element count and the *current* stream of
+-  this call. Only the per-call launch bookkeeping is skipped -- nothing about
+-  the tensor (data, shape, layout, dtype, stream) is cached.
+-
+-Measured on the target: the ordinary JIT dispatch costs ~53us per call, the
+-pre-bound launcher ~8.9us, and the oracle's own C++ entry ~11.6us. The kernel
+-itself is a few microseconds for the small sizes, so the fixed per-call host
+-path is what the score is made of, and only the cheapest possible wrapper
+-around the launcher pays off:
+-
+-* one cache dict per tile size, keyed by ``(dtype, data_ptr & 15)`` with the
+-  tile size carried by the dict, so the hot path builds a 2-tuple key and never
+-  has to branch on the tile size beyond picking the dict;
+-* the raw stream getter is called directly instead of through a lambda, which
+-  saves one Python frame per call;
+-* the element count is read once and reused for the mask argument and the grid.
+-
+-A bounded probe on the target measured 8.93us for the launcher alone, 12.21us
+-for the whole call and 11.58us for the oracle, so the wrapper -- not the
+-launcher -- is the only part left to win.
++"""严格Triton原地弧度转角度。保留CC第三轮分块与精简启动；
++Codex将冷启动改为只编译后执行一次，隔离设备缓存并保留profiling回退。
++非连续输入仍按真实stride在Triton内读写；当前stream逐次查询。
+ """
+ 
+ import torch
+@@ -57,11 +29,6 @@
+ if _get_stream is None:  # pragma: no cover
+     def _get_stream(device):
+         return triton.runtime.driver.active.get_current_stream(device)
+-
+-try:
+-    _device = torch.npu.current_device()
+-except Exception:  # pragma: no cover
+-    _device = 0
+ 
+ # 180.0 / pi, matching the reference multiply constant.
+ _INV = 57.29577951308232
+@@ -74,7 +41,7 @@
+ _N_LARGE = 131072
+ _MAX_I32 = 0x7FFFFFFF
+ 
+-# (dtype, data_ptr & 15) -> (launch, function, packed_metadata)
++# 按设备、dtype、指针对齐和标量特化类别缓存编译产物；不缓存输入。
+ _cache_small = {}
+ _cache_large = {}
+ 
+@@ -139,18 +106,19 @@
+     tl.store(x_ptr + off, y, mask=mask)
+ 
+ 
+-def _install(a, n, ptr, cache, block):
+-    """Compile+bind the contiguous kernel for this dtype/alignment/tile."""
+-    global _device
+-    _device = torch.npu.current_device()
+-    grid = -(-n // block)
+-    # Ordinary launch first: compiles the specialization for this dtype and
+-    # proves the kernel runs; the compiled artifact is then reused.
+-    _rad2deg_contig_kernel[(grid,)](a, n, BLOCK=block)
+-    compiled = _rad2deg_contig_kernel.warmup(a, n, BLOCK=block, grid=(grid, 1, 1))
+-    cache[(a.dtype, ptr & 15)] = (compiled.run.launch,
+-                                  compiled.function,
+-                                  compiled.packed_metadata)
++def _install(a, n, cache, block, key):
++    # warmup只编译，不提交原地运算；失败后走一次普通Triton启动。
++    compiled = _rad2deg_contig_kernel.warmup(a, n, BLOCK=block, grid=(1,))
++    launcher = compiled.run
++    metadata = launcher.metadata
++    if (getattr(launcher, 'compile_only', False)
++            or getattr(launcher, 'enable_msprof_register_tensor', False)
++            or getattr(metadata, 'debug_enabled', False)
++            or getattr(metadata, 'debug', False)):
++        return None
++    entry = (launcher.launch, compiled.function, compiled.packed_metadata)
++    cache[key] = entry
++    return entry
+ 
+ 
+ def _launch_strided(a, n, block=_BLOCK_SMALL):
+@@ -171,8 +139,9 @@
+     # Rank above the kernel's unroll width: peel the leading axes with zero-copy
+     # views (never exercised by the contracted workloads, kept for generality).
+     while len(shape) > 8:
+-        for k in range(shape[0]):
+-            _launch_strided(a[k], n // shape[0], block)
++        for k in range(a.shape[0]):
++            sub = a[k]
++            _launch_strided(sub, sub.numel(), block)
+         return
+ 
+     rank = len(shape)
+@@ -210,19 +179,22 @@
+         cache = _cache_small
+         block = _BLOCK_SMALL
+ 
+-    ptr = A.data_ptr()
+-    entry = cache.get((A.dtype, ptr & 15))
+-    if entry is not None:
+-        entry[0](-(-n // block), 1, 1, _get_stream(_device),
+-                 entry[1], entry[2], None, None, None, ptr, n, block)
+-        return A
+-
+-    if n > _MAX_I32:  # pragma: no cover - out of scope for this operator
++    if n > _MAX_I32:
+         _rad2deg_contig_kernel[(-(-n // block),)](A, n, BLOCK=block)
+         return A
+-
+-    try:
+-        _install(A, n, ptr, cache, block)
+-    except Exception:  # pragma: no cover - keep working without the fast path
++    device = A.get_device()
++    ptr = A.data_ptr()
++    key = (device, A.dtype, ptr & 15, n == 1)
++    entry = cache.get(key)
++    if entry is None:
++        try:
++            entry = _install(A, n, cache, block, key)
++        except Exception:
++            entry = None
++    if entry is None:
+         _rad2deg_contig_kernel[(-(-n // block),)](A, n, BLOCK=block)
++    else:
++        # 每次查询输入设备的当前stream，不缓存stream或输入指针。
++        entry[0](-(-n // block), 1, 1, _get_stream(device),
++                 entry[1], entry[2], None, None, None, ptr, n, block)
+     return A

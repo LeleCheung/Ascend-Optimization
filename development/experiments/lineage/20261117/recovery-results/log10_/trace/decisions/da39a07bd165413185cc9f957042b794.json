@@ -1,0 +1,50 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "da39a07bd165413185cc9f957042b794",
+  "recorded_at": "2026-11-17T05:51:00.062331+00:00",
+  "round_id": "performance-02-retry",
+  "input_source": {
+    "path": "trace/sources/f574e5e5922c54e2aac118cb39ee43443d921fa6cd0c6d697fdff310c6427e9e.py",
+    "sha256": "f574e5e5922c54e2aac118cb39ee43443d921fa6cd0c6d697fdff310c6427e9e"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/ec8a53e7f5530cb247bb2f95175e44cfd0c95fec62f741b9186768ac0bc8d28c.json",
+        "sha256": "ec8a53e7f5530cb247bb2f95175e44cfd0c95fec62f741b9186768ac0bc8d28c"
+      },
+      "original": {
+        "path": "workspace/tile-failure.json",
+        "sha256": "ec8a53e7f5530cb247bb2f95175e44cfd0c95fec62f741b9186768ac0bc8d28c"
+      },
+      "category": "probe",
+      "role": "trigger",
+      "finding": "Current failure log: candidate.py:130 (_log10_streaming warmup, SUB=16384) fails BiSheng ConvertLinalgIRToBinary with 'ub overflow, requires 2097152 bits while 1572864 bits available' for log10_-timing-11 (float32, 16777216 elements) and 'requires 2621440 bits while 1572864 bits available' for log10_-timing-3 (float16) and log10_-timing-7 (bfloat16); 60/66 supplemental cases pass, no valid performance obtained.",
+      "source_sha256": "f574e5e5922c54e2aac118cb39ee43443d921fa6cd0c6d697fdff310c6427e9e"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/0231727c00c821de93c00b6eaa1963a2680a7fb41d91b9dd086d51aaa308e11d.json",
+        "sha256": "0231727c00c821de93c00b6eaa1963a2680a7fb41d91b9dd086d51aaa308e11d"
+      },
+      "original": {
+        "path": "workspace/retired-evidence/performance-feedback-0231727c00c821de.json",
+        "sha256": "0231727c00c821de93c00b6eaa1963a2680a7fb41d91b9dd086d51aaa308e11d"
+      },
+      "category": "paired_profiling",
+      "role": "background",
+      "finding": "Prior accepted result belongs to old source sha256 d5ba772425b156c2f9377b8c07ceb338c5045024f81169042d76690645c5f049 (geo_mean 0.8067895931x), not to the current source f574e5e5; used only as background for which large-input cases matter, not as evidence about the current compile footprint or speed.",
+      "source_sha256": "d5ba772425b156c2f9377b8c07ceb338c5045024f81169042d76690645c5f049"
+    }
+  ],
+  "hypothesis": "The 16384-element streaming half exceeds the UB budget for every large-input dtype in the current compiler: per loop iteration both loads, both fp32 conversions, both mask/address vectors and both stores stay live, so peak UB per basic block scales with the half width (2 MiB required for float32, 2.5 MiB for 2-byte dtypes versus 1572864 bits available). The earlier claim that two 16384 halves reuse the already-compiled pair-tile footprint was wrong.",
+  "change": "In _make_streaming_entry only: choose the streaming half width from element size. float32 uses SUB=8192, the half width of the previously accepted streaming geometry; 2-byte dtypes try SUB=16384 and drop back to 8192 when the warmup compile rejects that footprint. Grid, tail tuple, launcher/stream entry and fallback closure keep their current construction; kernel math, masking, tails and all non-streaming paths are untouched.",
+  "expected": "The three large timing cases stop failing at compile time (no ub overflow), live UB per block stays within 1572864 bits, and each loop iteration still covers one 2*SUB tile. No speedup is claimed; performance must be measured by the host run.",
+  "validation": "Preflight the edited candidate, then the host runs full KGS plus both references and the supplemental suite; require 66/66 supplemental cases and read measured timings before any performance statement.",
+  "alternatives": [
+    "One global SUB for all dtypes (the failed 16384 choice) versus a dtype-aware half width that keeps live UB inside the 1572864-bit budget."
+  ],
+  "discriminating_observation": "",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

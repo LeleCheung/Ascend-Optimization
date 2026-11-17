@@ -1,0 +1,165 @@
+attrs:
+- description: 输入特征维度
+  name: inputSize
+  required: true
+  type: int
+- description: 隐藏状态特征维度
+  name: hiddenSize
+  required: true
+  type: int
+- default: 1
+  description: 循环层数
+  name: numLayers
+  required: false
+  type: int
+- default: true
+  description: 是否使用偏置
+  name: bias
+  required: false
+  type: bool
+- default: false
+  description: 输入是否为 (batch, seq, feature) 格式
+  name: batchFirst
+  required: false
+  type: bool
+- default: 0.0
+  description: Dropout 概率（层间）
+  name: dropout
+  required: false
+  type: float
+- default: false
+  description: 是否双向 LSTM
+  name: bidirectional
+  required: false
+  type: bool
+- default: 0
+  description: 投影维度（>0 时启用 LSTM with Projection）
+  name: projSize
+  required: false
+  type: int
+category: FusedComposite
+description: Long Short-Term Memory 循环神经网络
+difficulty: L4
+formula: 'i_t = σ(W_i @ x_t + U_i @ h_{t-1} + b_i)  # 输入门
+
+  f_t = σ(W_f @ x_t + U_f @ h_{t-1} + b_f)  # 遗忘门
+
+  g_t = tanh(W_g @ x_t + U_g @ h_{t-1} + b_g)  # 候选细胞状态
+
+  o_t = σ(W_o @ x_t + U_o @ h_{t-1} + b_o)  # 输出门
+
+  c_t = f_t ⊙ c_{t-1} + i_t ⊙ g_t  # 细胞状态
+
+  h_t = o_t ⊙ tanh(c_t)  # 隐藏状态
+
+  '
+inputs:
+- description: 输入序列张量，shape 为 (S, B, input_size) 或 (B, S, input_size) if batch_first
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: x
+- description: '输入到隐藏层权重列表（TensorList），每层/每个方向独立 tensor:
+
+    - 单向 numLayers=1: [weight_ih_l0], shape=(4*hiddenSize, inputSize)
+
+    - 双向 numLayers=1: [weight_ih_l0, weight_ih_l0_reverse], 每个 shape=(4*hiddenSize,
+    inputSize)
+
+    - 单向 numLayers=2: [weight_ih_l0, weight_ih_l1], shape 分别为 (4*hiddenSize, inputSize),
+    (4*hiddenSize, hiddenSize)
+
+    - 双向 numLayers=2: [weight_ih_l0, weight_ih_l0_reverse, weight_ih_l1, weight_ih_l1_reverse]
+
+    列表长度 = numLayers * num_directions
+
+    '
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: weight_ih
+- description: '隐藏层到隐藏层权重列表（TensorList），每层/每个方向独立 tensor:
+
+    - 每个 tensor shape: (4*hiddenSize, hiddenSize) 或 (4*hiddenSize, projSize) if projSize>0
+
+    列表长度 = numLayers * num_directions
+
+    '
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: weight_hh
+- description: '输入到隐藏层偏置列表（可选），每个 tensor shape: (4*hiddenSize)，列表长度 = numLayers *
+    num_directions'
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: bias_ih
+  optional: true
+- description: '隐藏层到隐藏层偏置列表（可选），每个 tensor shape: (4*hiddenSize)，列表长度 = numLayers *
+    num_directions'
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: bias_hh
+  optional: true
+- description: '投影矩阵列表（可选，仅 projSize>0 / LSTMP 需要），每层/每方向一个 tensor，shape: (projSize,
+    hiddenSize)，列表长度 = numLayers * num_directions'
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: weight_hr
+  optional: true
+- description: 初始隐藏状态 (可选，默认全 0)，shape 为 (num_layers * num_directions, B, hiddenSize
+    或 projSize)
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: h0
+  optional: true
+- description: 初始细胞状态 (可选，默认全 0)，shape 为 (num_layers * num_directions, B, hiddenSize)
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: c0
+  optional: true
+name: LSTM
+outputs:
+- description: 输出序列 (S, B, num_directions * hiddenSize) 或 (B, S, num_directions *
+    hiddenSize)
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: y
+- description: 最终隐藏状态 (num_layers * num_directions, B, hiddenSize 或 projSize)
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: hn
+- description: 最终细胞状态 (num_layers * num_directions, B, hiddenSize)
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: cn
+precision_thresholds:
+  bfloat16: 0.05
+  float16: 0.05
+  float32: 0.05
+schema: lstm(Tensor x, Tensor[] weight_ih, Tensor[] weight_hh, int inputSize, int
+  hiddenSize, int numLayers, bool bias=True, bool batchFirst=False, float dropout=0.0,
+  bool bidirectional=False, int projSize=0, Tensor[]? bias_ih=None, Tensor[]? bias_hh=None,
+  Tensor[]? weight_hr=None, Tensor? h0=None, Tensor? c0=None) -> (Tensor y, Tensor
+  hn, Tensor cn)
+shape_support: 'x: (S, B, input_size), (h0, c0): (num_layers * num_directions, B,
+  hidden_size)'

@@ -1,0 +1,65 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "b5205b3fad5748be90dcdd64cfffd048",
+  "recorded_at": "2026-11-17T06:34:51.459125+00:00",
+  "round_id": "performance-01",
+  "input_source": {
+    "path": "trace/sources/ca3ff529fa06e3a4c799037311aad9c3f3edaf3179fba26a2646705a0fd1ccef.py",
+    "sha256": "ca3ff529fa06e3a4c799037311aad9c3f3edaf3179fba26a2646705a0fd1ccef"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/5b20b0f75a33335fb5c686f9c5d4cd002bea3ddca99ee84e2696857a46d7156c.json",
+        "sha256": "5b20b0f75a33335fb5c686f9c5d4cd002bea3ddca99ee84e2696857a46d7156c"
+      },
+      "original": {
+        "path": "workspace/performance-feedback.json",
+        "sha256": "5b20b0f75a33335fb5c686f9c5d4cd002bea3ddca99ee84e2696857a46d7156c"
+      },
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "当前源码的10个计时case的candidate_us落在214.7-227.9us（极差约6%），而元素量从131072到2097152跨16倍；设备数据工作量随规模变化约16倍，完整调用时间几乎不变，说明固定每次调用开销主导，逐元素分块优化不是首要方向。逐case损失最大的是fp32的三个case（timing-6/7/8，speedup约1.22/1.23/1.44），几何平均1.7235，距阈值1.82约需整体再降5.6%。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/ca3ff529fa06e3a4c799037311aad9c3f3edaf3179fba26a2646705a0fd1ccef.py",
+        "sha256": "ca3ff529fa06e3a4c799037311aad9c3f3edaf3179fba26a2646705a0fd1ccef"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "ca3ff529fa06e3a4c799037311aad9c3f3edaf3179fba26a2646705a0fd1ccef"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "每次调用路径为 libentry 包装 -> triton.autotune(key=['batch_dim','spatial_dim']：每次重建key、查表、构造config.all_kwargs()) -> triton.heuristics -> JITFunction参数绑定 -> 单次kernel发射；同一shape的autotune选择在首次确定后不会再变，但上述元数据重建每调用都重复。宿主侧另有5-6次 torch.empty（输出、save_mean、save_invstd、running_mean_out、running_var_out、reserve），running_mean/running_var为None时还多两次小fill kernel发射。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/61a6f1307e46fcfb6ef61f8e9616a20a5e3059bc041d261aae10ac5ef8149e79.py",
+        "sha256": "61a6f1307e46fcfb6ef61f8e9616a20a5e3059bc041d261aae10ac5ef8149e79"
+      },
+      "original": {
+        "path": "method-package/src/hgkda/runtime/agent_tools.py",
+        "sha256": "61a6f1307e46fcfb6ef61f8e9616a20a5e3059bc041d261aae10ac5ef8149e79"
+      },
+      "category": "probe",
+      "role": "disambiguation",
+      "finding": "以当前sha运行preflight直接AssertionError(['logging'])，桥接器只接受 torch/torch_npu/triton/math/functools/typing/os 顶层导入；当前文件的import logging与from flag_gems导入均不被接受，因此达标候选取代flag_gems的autotune/heuristics/libentry并自带确定性分块选择，这是进入只读审查前的必要结构，不代表已测得性能因果。",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "固定每次调用开销主导：单次kernel发射前的autotune/heuristics两层Python包装（每次重建key、查表、复制config kwargs）与宿主分配调用占了大部分walltime，而设备端两遍扫描的数据量在这些shape下很小。把分块参数改为按shape确定性计算并在发射时作为显式constexpr给出，可去掉这两层包装的每次调用元数据工作，使每次调用时间下降；数据搬运与数值路径保持不变。",
+  "change": "把 batch_norm_with_update_kernel 的启动组织改为自持Triton路径：去掉 libentry/autotune/heuristics 三层包装与flag_gems导入，用宿主侧纯算术的确定性分块（batch维度取不超过8的二次幂，spatial维度取32..256之间的二次幂）在发射时显式传 BLOCK_M/BLOCK_N；kernel体内复用已算好的 m_num_steps/n_num_steps。保留严格Triton存储辅助函数（_strict_*）、非连续布局支持、save_mean/save_invstd的input.dtype、running stats更新公式、独立输出与全部返回项。",
+  "expected": "每次调用的宿主元数据/发射路径变短，candidate_us在所有case上同向下降；若整体下降≥5.6%，fp32 case的speedup改善会带动几何平均从1.7235升向1.82阈值。设备端时间可能因分块改变而小幅变化，方向未知。",
+  "validation": "先preflight（静态筛查+36项补充检查），通过后由宿主执行一次完整KGS正式评测，按case比对candidate_us与speedup；不达到阈值则据新反馈继续，未测到变化不声明因果收益。",
+  "alternatives": [
+    "设备kernel执行时间主导：若成立，131072元素case应显著快于2097152元素case，与观测到的平坦时间不符。",
+    "宿主内存分配（5-6次torch.empty + reserve）主导：与autotune元数据开销无法由现有证据区分，本轮不针对它。"
+  ],
+  "discriminating_observation": "10个case的元素量相差16倍而完整调用时间几乎相同（214.7-227.9us），指向不随数据量变化的每次调用固定开销；未取得成对profiling，不能进一步把该固定开销拆分到包装、分配或发射中的某一项。",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

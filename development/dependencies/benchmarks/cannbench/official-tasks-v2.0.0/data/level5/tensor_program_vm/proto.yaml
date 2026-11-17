@@ -1,0 +1,41 @@
+category: FusedComposite
+description: 张量程序虚拟机——kernel 即解释器，程序即数据；指令序列存在真依赖，逐条驱动寄存器堆的行向量运算
+difficulty: L5
+formula: "对 t = 0..P-1 顺序执行。译码: op = program[t,0] mod 8, dst = program[t,1] mod R,\n\
+  \                              a = program[t,2] mod R,  b = program[t,3] mod R\n\
+  ISA（操作数为寄存器堆行向量 [W]，fp32 计算，sat(x) = clamp(x, -10000, 10000)）:\n  0 ADD    regs[dst]\
+  \ = sat(regs[a] + regs[b])\n  1 MUL    regs[dst] = sat(regs[a] * regs[b])\n  2 RELU\
+  \   regs[dst] = max(regs[a], 0)\n  3 MEANB  regs[dst] = broadcast(mean(regs[a]))\
+  \        # 沿 W 求均值后广播\n  4 MAX    regs[dst] = elementwise_max(regs[a], regs[b])\n\
+  \  5 ROLL   regs[dst][j] = regs[a][(j-1+W) mod W]       # 向右循环移 1 位\n  6 MULADD\
+  \ regs[dst] = sat(regs[dst] + regs[a] * regs[b])   # 读 dst，写 dst\n  7 COPY   regs[dst]\
+  \ = regs[a]\nfinal_regs = 全部 P 条指令执行完后的寄存器堆\n"
+inputs:
+- description: 指令序列，每行经 mod 译码为 (op, dst, a, b)，任意非负整数合法（评测取值范围 [0, 1073741823]）
+  dtype:
+  - int32
+  name: program
+  shape: '[P, 4]'
+- description: 寄存器堆初值，R 个宽 W 的行向量寄存器（评测取值范围 [-1, 1]）
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: init_regs
+  shape: '[R, W]'
+name: TensorProgramVm
+outputs:
+- description: 全部指令执行完后的寄存器堆，dtype 与 init_regs 一致
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: final_regs
+  shape: '[R, W]'
+precision_thresholds:
+  bfloat16: 0.008
+  float16: 0.001
+  float32: 0.0001
+schema: tensor_program_vm(Tensor program, Tensor init_regs) -> Tensor final_regs
+shape_support: program [P, 4] int32（任意非负整数合法），init_regs [R, W] float32/float16/bfloat16，输出
+  final_regs [R, W] 同 init_regs dtype

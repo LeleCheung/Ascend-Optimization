@@ -21,9 +21,15 @@ prepare以交付清单中已选用源码为起点，原字节复制并声明prio
 
 生成适配器当前支持本机Claude Code命令，由run目录中的model-settings.json选择模型和凭据；该文件由宿主另行提供，不随发布或实验归档。生成与设备操作各执行一个明确动作，宿主负责只读源码审查、多轮编排及停止判断。不要将这些单项入口表述为完整无人值守调度器。
 
+原生参考的同一次API调用可以包含多个设备任务。成对采集会分别保存这些实际任务及各自CSV，比较器保留逐kernel分布并按调用次数汇总计数；不根据任务别名猜测同名布局转换的二进制。多kernel参考的单一Task Duration保留未知，完整调用时间由正式评测另行取得。带时间戳后缀的CSV按逻辑表名识别，同时保留原文件SHA。
+
+模拟器trace单位通过同PC的Vector／搬运等非同步指令与CSV交叉核验。Scalar的CSV／trace量化口径可能不同，单列对照而不强行拟合；时间轴仍保留工具实际报告区间。同步等待和单核空闲的解释边界见skill接口。
+
 调用前保存源码审查到run/source-reviews/<SHA>.json。生成模型修改源码后，旧审查不再适用。完整性能反馈进入下一轮上下文，未完成正式评测不能以预检代替验收。配置允许device_pythonpath显式提供设备侧外部依赖，不默认使用内部FlagGems快照。
 
 ## 分析与复现
+
+新实验自动保存trace事件和版本／结果引用；具体修改前用`python -m hgkda.runtime decision`登记显式依据，最后用`python -m hgkda.runtime trace`导出连续事件JSONL。文件结构、参数及“作者声明不等于因果证明”的边界见[连续trace](../skills/hgkda/references/trace.md)。原始模型工具日志继续保留。
 
 比较、热点、区域和上下文命令见[Skill接口](../skills/hgkda/references/interface.md)。公开包内知识是完整安装数据；记录中历史来源链接是追溯信息，不在运行时加载开发档案。算子补测通过operators/<name>/checks与references执行。
 

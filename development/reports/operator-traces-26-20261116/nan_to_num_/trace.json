@@ -1,0 +1,812 @@
+{
+  "operator": "nan_to_num_",
+  "kind": "saved_ledger_attempt_order",
+  "selected_source": {
+    "path": "/data/hanle/ascend-optimization/runs/threeway-20261030/kg-runs/nan_to_num_-threeway-20261030-attempt-1/stages/optimize/work/.ledger.json",
+    "sha256": "0af95a3653342c2f55273d84d18b6a90a26c8f415fe7c253510212cce21fd128"
+  },
+  "points": [
+    {
+      "id": "nan_to_num_:round-1",
+      "score": 0.7142152693274566,
+      "source_sha256": "7d653eba8d6c8db8b7aef5179622f59337422e96efd6975785a1a6f609c1fa97",
+      "method": "本批起点",
+      "raw": {
+        "ledger_sha256": "0af95a3653342c2f55273d84d18b6a90a26c8f415fe7c253510212cce21fd128",
+        "round": 1,
+        "source_sha256": "7d653eba8d6c8db8b7aef5179622f59337422e96efd6975785a1a6f609c1fa97",
+        "evaluation": {
+          "evaluated_at": "2026-10-30T06:50:44.455623Z",
+          "status": "PASSED",
+          "geo_mean": 0.7142152693274566,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "baseline",
+          "strategy": "Submit the unmodified seed (compact-default-dispatch-v1: direct compiled launch + native-dtype clamp tile for saturating defaults) to establish this workspace's authoritative baseline.",
+          "code_changes": "None; seed written verbatim to tmp/main.py.",
+          "hypothesis": "The seed already passes correctness for all 30 workloads; measure its geo_mean and per-workload latencies so later experiments can be compared against this workspace's own baseline instead of the external batch numbers.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "establish_baseline",
+            "mechanism": "No change; records authoritative latency for both the small (overhead-dominated) and 4096x4096 (bandwidth-dominated) timing cases."
+          },
+          "source": {
+            "origin": "baseline",
+            "parent_round_num": null
+          },
+          "key_params": {},
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "failed",
+          "analysis_path": ".kernelgen/profile-analysis/round-0001.json",
+          "summary": "failed: msprof base collection exited successfully without profile completion marker. 7 collection attempts (6 workloads in one metrics-level batch + 1 independent single-workload retry on nan_to_num_-timing-3) all returned status=failed, capabilities=[], empty measurements and zero artifacts; the artifact registry for round 1 is therefore empty and no evidence-bearing finding could be validated. Only manifest.json was written per attempt: no msprof output tree, no op_summary, no pipeline counte"
+        },
+        "conclusion": {
+          "round_num": 1,
+          "expectation_status": "baseline",
+          "root_cause": "Baseline of the seed (compact-default-dispatch) in this workspace: 30/30 PASSED, geo_mean 0.7142. Per-workload data splits into two regimes: nine timing cases (timing-0..2,4..6,8..10, numel 1024 to 1048576, i.e. 4 KiB to 8.4 MB of traffic) are all flat at 15.86-16.91 us (mean 16.32) while the reference is 10.91-14.14 us (mean 12.06); traffic does not affect them, so they are host/launch-cost bound, not device bound. The three large cases (16,777,216 elements) are device bound: fp16 57.59 vs 30.60, bf16 84.04 vs 62.07, fp32 83.60 vs 58.45.",
+          "perf_gap_analysis": "No prior measurement in this workspace; this round only establishes the reference point. Absolute gaps: +4.25 us mean on the nine host-bound cases (1.35x), and the min_speedup 0.531 is timing-3 (fp16 4096x4096). Two independent observations delimit the work: (a) since latency is invariant from 4 KiB to 8.4 MB, no tiling/byte-level change can move those nine cases - only host launch cost can; (b) timing-3 (fp16) and timing-7 (bf16) take identical host decisions (element_size 2, native clamp, BLOCK 16384, grid 1024) and move identical 67,108,864 bytes, yet differ by 26.45 us, which excludes volume and grid and points at bf16 lowering in the native-dtype clamp.",
+          "next_suggestion": "Bounded target-side probe (debug job) to attribute the 16.32 us floor between Python-side work, the Triton compiled-launch call, current-stream read and device kernel duration, using prebuilt-plan loops plus npu-event device timing; then attack the dominant term. Keep the bf16 large-case lowering question for a separate round.",
+          "optimization_level": "L1_architecture",
+          "debug_lesson": "Walltime mode plus a latency that is invariant over a 2048x traffic range is a usable signature of host-bound measurement; a broken msprof channel (7/7 collections produced no completion marker) means this round has no MTE/AIV evidence and only arithmetic on eval latencies.",
+          "strategy_evolution": "",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "nan_to_num_:round-2",
+      "score": 0.8443210025250412,
+      "source_sha256": "bc76af89591db5b5c0bfae901edf6c4fb153395c26f5d2b104f7f3e354d3f5cf",
+      "method": "简化启动参数",
+      "raw": {
+        "ledger_sha256": "0af95a3653342c2f55273d84d18b6a90a26c8f415fe7c253510212cce21fd128",
+        "round": 2,
+        "source_sha256": "bc76af89591db5b5c0bfae901edf6c4fb153395c26f5d2b104f7f3e354d3f5cf",
+        "evaluation": {
+          "evaluated_at": "2026-10-30T07:11:19.344407Z",
+          "status": "PASSED",
+          "geo_mean": 0.8443210025250412,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Slim the host launch path for the saturating-default request: bake posinf/neginf/nan defaults into constexpr kernel bounds (2 runtime arguments instead of 5) and collapse run() to two dict lookups plus a prebuilt closure, keeping every device kernel's math bit-identical.",
+          "code_changes": "Added _ntn_default/_ntn_default_masked (native clamp with POS/NEG baked as constexpr) and _ntn_stage_default/_ntn_stage_default_masked (same fp32-staged compare/select math, constants baked). run() now does one dict get by dtype, one by numel, pointer-alignment and contiguity tests, then fires a prebuilt closure whose argument list is 2 runtime scalars (ptr, nan) instead of 5. Below 4 MiB of traffic the smaller-tile slim kernel is preferred (device time hidden under the host floor); above it the measured-fastest tile per dtype is kept (fp16 native clamp 16384, bf16/fp32 staged 8192). Generic/strided/explicit-arg paths untouched.",
+          "hypothesis": "Round 1's nine small/medium timing cases are launch-cost bound (16.32 us flat from 4 KiB to 8.4 MB), and the prebuilt Triton launch is the dominant term: measured 11.24 us with the seed's 5 runtime arguments versus 9.86 us with 2 (probe, same kernel math, repeated twice). Slimming the argument list plus the Python hot path should cut those cases by ~2 us without touching device behavior.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Launch argument marshalling and Python dispatch shrink per call while every device kernel keeps bit-identical math, so the nine host-bound timing cases (flat at 16.3 us) drop toward the 9.9 us prebuilt-launch floor; the three device-bound 4096x4096 cases should not move."
+          },
+          "source": {
+            "origin": "coder",
+            "parent_round_num": null
+          },
+          "key_params": {
+            "block_2b_large": 16384,
+            "block_stage": 8192,
+            "runtime_args_default_path": 2,
+            "slim_bytes_threshold": 4194304
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "pending",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 2,
+          "expectation_status": "partially_met",
+          "root_cause": "Launch-argument marshalling was indeed the dominant term for the nine host-bound cases: reducing the default-request launch from five runtime arguments to two (with a prebuilt closure instead of per-call entry unpacking) cut those cases by 2.3 us on average and brought them to reference parity. The regression on the two large non-fp16 cases comes from the same edit: compile-time bounds (POS/NEG as constexpr) changed the generated code for the large-input kernels, and the fp16 4096x4096 case now runs the fp32-staged 8192 tile (82.02 us, matching the measured 82.75 us staged time) instead of the mask-free native clamp at 16384 (measured 58.30 us), a 1.4x device slowdown that no host-side gain can offset.",
+          "perf_gap_analysis": "Observed vs frozen plan: the host-side half of the prediction held and slightly exceeded it - the nine host-bound cases moved from 15.86-16.91 us (mean 16.32) to 13.64-14.91 us (mean 14.02), -2.3 us or -14%, and timing-0 now beats the reference (1.025x) while timing-1/2/4/5/6/10 sit at 0.960-0.982. Aggregate geo_mean rose 0.7142 -> 0.8443 (+18.2%) and all 30 workloads pass with abs_err 0 and rel_err 0. The predicted 'no change' for the three device-bound cases did NOT hold: timing-3 regressed 57.59 -> 82.02 us (speedup 0.531 -> 0.373) and timing-11 83.60 -> 93.37 us (0.699 -> 0.697), while timing-7 stayed 84.04 -> 83.65. Diagnosis from the frozen probe evidence: for 4096x4096 fp16 the plan should have been the mask-free native clamp at BLOCK 16384 (measured 58.30 us device), yet 82.02 us matches the fp32-staged BLOCK 8192 kernel (82.75 us). So baking posinf/neginf as constexpr bounds changed the large-input codegen path (staged fallback or worse lowering) even though the arithmetic is identical; the same mechanism plausibly explains the fp32 case (93.37 vs 84.80 staged). Net: the +18.2% is real and kept, and ~2.8 geo_mean points are recoverable by restoring the round-1 device kernels for the >4 MiB regime.",
+          "next_suggestion": "Keep the slim kernel for inputs whose traffic is under the host floor, but route large inputs (traffic > 4 MiB) through the exact round-1 device kernels (mask-free native clamp at BLOCK 16384 for 2-byte fp16, mask-always fp32-staged at BLOCK 8192 for bfloat16/float32), whose device times were measured at 58.3/85.2/84.8 us. Host cost is irrelevant there because device time dominates.",
+          "optimization_level": "host_side_special",
+          "debug_lesson": "A host-side launch-cost change can silently perturb device codegen: timing-3 landed at 82.02 us, which matches the staged-8192 device time (82.75 us) rather than the native clamp-16384 time (58.30 us) for identical math. Any host experiment must therefore be validated case-by-case on the device-bound cases too, not only on the cases it targets.",
+          "strategy_evolution": "",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "nan_to_num_:round-3",
+      "score": 0.8879340338122681,
+      "source_sha256": "e2cf0a4f47e367574bc492f3076544b2281bcebd8062a50f35bff21a36efaf5a",
+      "method": "区分大小输入路径",
+      "raw": {
+        "ledger_sha256": "0af95a3653342c2f55273d84d18b6a90a26c8f415fe7c253510212cce21fd128",
+        "round": 3,
+        "source_sha256": "e2cf0a4f47e367574bc492f3076544b2281bcebd8062a50f35bff21a36efaf5a",
+        "evaluation": {
+          "evaluated_at": "2026-10-30T07:14:08.953080Z",
+          "status": "PASSED",
+          "geo_mean": 0.8879340338122681,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Split the default-request launch plan by traffic regime: device-optimal round-1 kernels above 4 MiB, slim 2-argument kernels below it.",
+          "code_changes": "_build_default now has two regimes: traffic <= 4 MiB keeps the slim 2-runtime-argument constexpr kernels; traffic > 4 MiB uses the exact round-1 kernels and 5-runtime-argument launch (_nan_to_num_clamp/_nan_to_num_clamp_masked at BLOCK 16384 for 2-byte dtypes with fallback to _nan_to_num_stage at BLOCK 8192, and the mask-always _nan_to_num_stage at BLOCK 8192 for float32). The small-input path, the generic dispatch, strided kernels and public signature are unchanged.",
+          "hypothesis": "The >4 MiB cases are device bound, so routing them through the round-1 kernels restores timing-3 to ~57.6 us (speedup 0.373 -> ~0.53) and timing-11 to ~84 us, while the round-2 host gains are retained because the launch argument count is irrelevant when device time dominates.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Large inputs return to the device kernels whose device times were measured at 58.30/85.19/84.80 us (clamp16384 for fp16, staged8192 for bfloat16/float32) instead of the 82.02 us staged path the constexpr variants produced, while the nine host-bound cases keep their round-2 13.6-14.9 us latencies."
+          },
+          "source": {
+            "origin": "coder",
+            "parent_round_num": 2
+          },
+          "key_params": {
+            "block_2b_large": 16384,
+            "block_stage": 8192,
+            "runtime_args_large": 5,
+            "slim_bytes_threshold": 4194304
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "pending",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 3,
+          "expectation_status": "met",
+          "root_cause": "The remaining cost is device-bound: the large cases are limited by the per-program load/compute/store structure of the clamp (fp16) and fp32-staged (bfloat16/float32) kernels, which reach 1.15-1.6 TB/s versus 2.1-2.3 TB/s for the reference and 3.5 TB/s for a native copy of the same bytes. Tile size is the strongest measured driver (fp16 BLOCK 16384 = 58.30 us vs 8192 = 81.39 us), and bfloat16/float32 cannot grow past 8192 because bfloat16's native clamp needs 18.1 bytes/element of UB and fp32's staged form 22, against a 192 KiB budget.",
+          "perf_gap_analysis": "Frozen expectation: routing >4 MiB traffic through the round-1 kernels restores the large cases without losing the round-2 host gains. Both halves held. timing-3 went 82.02 -> 57.59 us (speedup 0.373 -> 0.531, exactly the round-1 value) and timing-11 93.37 -> 83.60 us (0.697 -> 0.700), while the nine host-bound cases stayed at 12.49-13.93 us (timing-0 1.013x, timing-2 1.033x, timing-6 1.070x now faster than the reference; timing-1/4/5/9 at 0.976-0.989). Aggregate geo_mean 0.8443 -> 0.8879 (+5.2%). Remaining deficits, all device bound: timing-3 57.59 vs 30.57 (0.531), timing-7 84.02 vs 62.13 (0.739), timing-11 83.60 vs 58.55 (0.700). Against the probe's native copy_ calibration (19.2 us for the same 67 MB of 2-byte traffic, 3.5 TB/s) our clamp16384 reaches only 1.15 TB/s, so the gap is kernel structure rather than unavoidable bandwidth; the two smaller residual host gaps are fp32 1024/1048576 (0.903/0.918, 13.91-13.93 us vs 12.58-12.78).",
+          "next_suggestion": "The three 4096x4096 cases now dominate the remaining gap (0.531/0.739/0.700) and are device bound. Sweep device-side launch/compile parameters that leave semantics untouched (num_warps, num_stages) for the winning kernels per dtype, and test a pipelined in-program loop for bfloat16/float32 whose tiles cannot grow past the 192 KiB UB budget; the native copy_ of the same bytes measured 19.2 us for 2-byte, so ~3x of device headroom exists.",
+          "optimization_level": "L2_memory",
+          "debug_lesson": "The two regimes must be routed by measured mechanism, not by one rule: below the launch floor the argument count matters and the device tile does not, above it the device tile matters and the argument count does not. Round 2 and round 3 together pin that crossover at ~4 MiB of traffic for this operator.",
+          "strategy_evolution": "",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "nan_to_num_:round-4",
+      "score": 0.9552018880239987,
+      "source_sha256": "8db3017f41401d6eaa16584fca0ae77b27022244ceeea14e3afbf0e40c4000c3",
+      "method": "单阶段多块循环",
+      "raw": {
+        "ledger_sha256": "0af95a3653342c2f55273d84d18b6a90a26c8f415fe7c253510212cce21fd128",
+        "round": 4,
+        "source_sha256": "8db3017f41401d6eaa16584fca0ae77b27022244ceeea14e3afbf0e40c4000c3",
+        "evaluation": {
+          "evaluated_at": "2026-10-30T07:26:06.927755Z",
+          "status": "PASSED",
+          "geo_mean": 0.9552018880239987,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Use sequential-loop device kernels (2-4 tiles per program, num_stages=1) for the device-bound >4 MiB regime, chosen from the measured per-dtype winners.",
+          "code_changes": "Added _ntn_clamp_loop and _ntn_stage_loop: masked sequential-loop bodies taking runtime bounds with ITERS/BLOCK constexpr, compiled with num_stages=1. The >4 MiB branch of _build_default now selects (clamp loop, tile 16384, ITERS=2) for 2-byte dtypes, falling back to (staged loop, tile 8192, ITERS=4) if that build fails, and float32 uses (staged loop, tile 8192, ITERS=4). The <=4 MiB slim path, the generic/strided dispatch and the public signature are unchanged.",
+          "hypothesis": "All three 4096x4096 cases are limited by per-task load/compute/store serialisation rather than by UB-limited tile size alone, so processing 2 (fp16) or 4 (bf16/fp32) sequential tiles per program with num_stages=1 improves them by 8-12% and lifts geo_mean from 0.888 to ~0.905.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Halving-to-quartering the task count while keeping the fastest measured tile amortises per-task setup: timing-3 58.4 -> 51.5 us, timing-7 84.8 -> 78.2 us, timing-11 84.4 -> 77.0 us of device time."
+          },
+          "source": {
+            "origin": "coder",
+            "parent_round_num": 3
+          },
+          "key_params": {
+            "fp16_iters": 2,
+            "fp16_tile": 16384,
+            "num_stages": 1,
+            "stage_iters": 4,
+            "stage_tile": 8192
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "pending",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 4,
+          "expectation_status": "met",
+          "root_cause": "The 4096x4096 cases were limited by per-task load/compute/store serialisation as well as tile size: each task paid its own MTE setup, and with ~1024-2048 tasks over 20 vector cores that overhead was paid 25-50 times per core. Processing 2 sequential tiles per program for float16 (BLOCK 16384) and 4 for bfloat16/float32 (BLOCK 8192) with num_stages=1 amortises it without exceeding the 192 KiB UB budget, which the double-buffered default (num_stages=2) cannot do at these tiles.",
+          "perf_gap_analysis": "Frozen expectation: timing-3 58.4 -> 51.5 us, timing-7 84.8 -> 78.2 us, timing-11 84.4 -> 77.0 us, geo_mean 0.888 -> ~0.905. Observed: timing-3 50.86 us (speedup 0.600, prediction 0.59-0.60), timing-7 77.48 us (0.802, predicted 0.79), timing-11 76.41 us (0.764, predicted 0.76) - all met within noise, and the nine host-bound cases held at 11.92-12.77 us, seven of them now faster than the reference. Aggregate geo_mean 0.8879 -> 0.9552 (+7.6%), all 30 PASSED with abs_err 0 and rel_err 0. Residual gap is now only the three 4096x4096 cases: timing-3 50.86 vs 30.53 (0.600), timing-7 77.48 vs 62.13 (0.802), timing-11 76.41 vs 58.41 (0.764). Against the probe calibration (copy_ 19.2 us, torch 32.1 us for the same 67 MB) fp16 still runs at 1.30 TB/s versus 2.1-3.5 TB/s attainable, so device headroom remains but the host-side opportunity is exhausted (those cases are at 0.997-1.125).",
+          "next_suggestion": "Keep pushing the device-bound regime: sweep more sequential tiles per program (8/16) for bfloat16/float32, and test two-stage software pipelining (num_stages=2 with the tile halved so the doubled buffer still fits UB) for all three dtypes, since tile and task count now dominate and both are UB-limited.",
+          "optimization_level": "L2_memory",
+          "debug_lesson": "The winning device structure was invisible to per-kernel micro-benchmarks until the kernel body was compiled with num_stages=1: the same 2-iteration loop overflowed UB at the default num_stages=2 (double buffering), which is why probe 7's first attempt failed and probe 6 only succeeded on the variant that passed num_stages=1 explicitly.",
+          "strategy_evolution": "",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "nan_to_num_:round-5",
+      "score": 0.9483905147288372,
+      "source_sha256": "625dc012d2d4ad7b240eab2a784eaa006c548040a1b53e351ad2ed0646770186",
+      "method": "原精度计算尝试：未提升",
+      "raw": {
+        "ledger_sha256": "0af95a3653342c2f55273d84d18b6a90a26c8f415fe7c253510212cce21fd128",
+        "round": 5,
+        "source_sha256": "625dc012d2d4ad7b240eab2a784eaa006c548040a1b53e351ad2ed0646770186",
+        "evaluation": {
+          "evaluated_at": "2026-10-30T07:31:42.473706Z",
+          "status": "PASSED",
+          "geo_mean": 0.9483905147288372,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Try a native-dtype compare/select loop on the large bfloat16 tile, falling back to the measured staged loop when the tile does not fit UB.",
+          "code_changes": "Added _ntn_cs_loop: a masked sequential-loop compare/select body kept entirely in the input dtype (no fp32 staging), same signature and num_stages=1 convention as the other loop kernels. In the >4 MiB branch, bfloat16 now tries (_ntn_clamp_loop tile 16384 ITERS 2) then (_ntn_cs_loop tile 16384 ITERS 2) then the existing (_ntn_stage_loop tile 8192 ITERS 4); float16 and float32 candidate lists are unchanged.",
+          "hypothesis": "bfloat16's 4096x4096 deficit (77.48 us vs the 62.13 us reference) comes from its staged kernel upconverting to fp32, which doubles UB per element and forces an 8192 tile where float16 uses 16384. A native-dtype compare/select on the 16384 tile should recover most of the tile-size advantage if the build fits; if it does not compile, the existing staged loop (measured 78.2 us) is retained unchanged, so the downside is bounded.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Removing the fp32 staging for bfloat16 should cut its UB per element from 18-22 B toward the ~10-12 B of the fp16 native path, letting the 16384 tile compile so timing-7 can approach float16's 50.9 us instead of 77.5 us."
+          },
+          "source": {
+            "origin": "coder",
+            "parent_round_num": 4
+          },
+          "key_params": {
+            "bf16_candidate_tile": 16384,
+            "bf16_iters": 2,
+            "fallback_tile": 8192,
+            "num_stages": 1
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": false,
+          "status": "not_required",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 5,
+          "expectation_status": "not_met",
+          "root_cause": "Replacing the fp32-staged bfloat16 body with a compare/select kept in the input dtype did not free the UB budget: at tile 16384 the build still overflowed, so bfloat16 stays capped at tile 8192 (its per-element UB cost is inherent to the bf16 compare/select lowering, not only to the explicit upconvert) and timing-7 kept its staged-loop time of 77.5 us. The round is therefore a no-op on device behaviour, and the small geo_mean movement is reference-side noise on unchanged paths.",
+          "perf_gap_analysis": "Frozen expectation: bfloat16's timing-7 would drop from 77.5 us toward float16's 50.9 us if the native compare/select freed enough UB for a 16384 tile; if it did not compile the staged loop (78.2 us) would be retained with bounded downside. Observed: timing-7 = 77.52 us (speedup 0.802), identical to round 4, so the native-dtype body at tile 16384 did not fit and the fallback ran - the hypothesis is falsified but the downside materialised only as the expected no-change on that case. Aggregate geo_mean moved 0.9552 -> 0.9484 (-0.7%), which is entirely measurement variation on cases whose code path did not change: the nine host-bound cases re-timed at 12.47-13.89 us and their references were re-measured at 13.34-14.25 us (round 4 references were 12.55-13.87 us), and timing-3/timing-11 reproduced to within 0.01 us (50.86 vs 50.86, 76.41 vs 76.41).",
+          "next_suggestion": "Try the native compare/select at the size bfloat16 can actually fit (tile 8192, ITERS 2 and 4) to see whether dropping the fp32 conversions alone beats the staged loop's 77.5 us, and check whether float16 benefits from the same body at 16384. If neither wins, the three large cases are at the practical ceiling of this backend's elementwise codegen and the remaining work is host-side only.",
+          "optimization_level": "L2_memory",
+          "debug_lesson": "The bfloat16 tile cap cannot be escaped by removing the fp32 staging: the native compare/select body still exceeded the UB budget at tile 16384 (timing-7 stayed at the staged fallback, 77.52 us), so bfloat16's per-element UB cost comes from the bf16 compare/select lowering itself, not only from the explicit upconvert.",
+          "strategy_evolution": "",
+          "knowledge_assessments": []
+        }
+      }
+    }
+  ],
+  "view": {
+    "id": "mainline",
+    "session": "nan_to_num_",
+    "title": "nan_to_num_ 优化轨迹",
+    "subtitle": "历史 KGS 参考 · 本批 5 次正式评测",
+    "ylim": [
+      0,
+      1.2
+    ],
+    "annotations": [
+      {
+        "point": 2,
+        "method": "简化启动参数",
+        "color": "probe",
+        "position": [
+          220,
+          285
+        ],
+        "arrow": [
+          540,
+          325
+        ]
+      },
+      {
+        "point": 3,
+        "method": "区分大小输入路径",
+        "color": "probe",
+        "position": [
+          930,
+          285
+        ],
+        "arrow": [
+          1210,
+          325
+        ]
+      },
+      {
+        "point": 4,
+        "method": "单阶段多块循环",
+        "color": "probe",
+        "position": [
+          220,
+          775
+        ],
+        "arrow": [
+          540,
+          730
+        ]
+      },
+      {
+        "point": 5,
+        "method": "原精度计算尝试：未提升",
+        "color": "ir",
+        "position": [
+          930,
+          775
+        ],
+        "arrow": [
+          1200,
+          730
+        ]
+      }
+    ],
+    "legend": [
+      "paired",
+      "sim",
+      "knowledge",
+      "probe",
+      "ir"
+    ],
+    "gap": null,
+    "x_label": "本批正式评测顺序",
+    "plot_bottom": 650,
+    "nodes": [
+      {
+        "point": 1,
+        "location": "mixed"
+      },
+      {
+        "point": 2,
+        "location": "host"
+      },
+      {
+        "point": 3,
+        "location": "mixed"
+      },
+      {
+        "point": 4,
+        "location": "device"
+      },
+      {
+        "point": 5,
+        "location": "device"
+      }
+    ],
+    "delivery": {
+      "score": 0.8632075997255874,
+      "source": "operators/nan_to_num_/versions/independent_strict/retained/kernel.py",
+      "source_sha256": "8db3017f41401d6eaa16584fca0ae77b27022244ceeea14e3afbf0e40c4000c3",
+      "passed": 30,
+      "total": 30,
+      "result": "operators/nan_to_num_/evidence/retained/evaluation/result.json",
+      "result_sha256": "57b427b9b17ab8cd5622632ec0b04a59089e9e350ab57b0dbbac74e0fe9d3335",
+      "endpoint_same_source": false
+    },
+    "result_only": false,
+    "line_status": "下图：历史优化片段"
+  },
+  "history": [
+    {
+      "ledger_sha256": "ce805d13145c9c80db1f0caa6fb40fe5799417ceaccf41a9cbd5404e280101f4",
+      "round": 1,
+      "source_sha256": "3144b315f9a75f41cdc18c7a4035017a3e64994b63280d1f7c33c538789a156a",
+      "evaluation": {
+        "evaluated_at": "2026-10-29T14:42:58.056390Z",
+        "status": "PASSED",
+        "geo_mean": 0.20772089523510373,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Replace the FlagGems composite with one self-contained Triton pass: flat kernel for contiguous input, constexpr-stride flat kernel for uniformly strided views, up-to-8D index-math kernel otherwise; write back into the caller's storage and return A.",
+        "code_changes": "New tmp/main.py: _nan_to_num_flat / _nan_to_num_scaled / _nan_to_num_nd kernels, metadata-only layout dispatch, block picker (min 1024, cap 8192, ~8 programs for tiny inputs), fp32 staging with exact round-trip casts.",
+        "hypothesis": "A single fused pass that replaces NaN and both infinities in place removes the multi-kernel FlagGems chain, so correctness (in-place mutation of strided views) is restored and each workload drops to one device launch.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "First measured round of this workspace: establishes correctness and per-workload latency for the single-pass Triton design."
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {},
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "Baseline established: single fused in-place Triton pass fixes the three INCORRECT_NUMERICAL strided cases of the FlagGems seed (30/30 PASSED). Perf is limited by host-side Triton JIT dispatch, not by device work: every tiny case (N=1024) measures 72.0-78.0 us while the 16.7M-element cases measure only 83.5-85.2 us, so ~55 us of per-call Python/JIT dispatch dominates every workload.",
+        "perf_gap_analysis": "No previous measurement (baseline). Absolute view: correctness is now complete; latency is essentially flat across four orders of magnitude of N (72 us at N=1024 vs 84 us at N=16777216), which localises the cost in the kernel[grid](...) dispatch path rather than in memory traffic. Reference latencies are 10.5-11.8 us on the tiny cases, so the headroom there is pure launch cost.",
+        "next_suggestion": "Resolve the compiled Triton launcher once per (dtype, numel) and invoke it directly with grid + raw stream + device pointer, removing the per-call JIT binder/cache-key work; keep the ordinary kernel[grid](...) launch as the fallback for masked-free/misaligned/debug-profiling cases. Expected effect: tiny cases approach the ~16 us launch floor already demonstrated by the in-place negative_ reference, and the large cases shed the same fixed overhead.",
+        "optimization_level": "L1_architecture",
+        "debug_lesson": "",
+        "strategy_evolution": "",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "ce805d13145c9c80db1f0caa6fb40fe5799417ceaccf41a9cbd5404e280101f4",
+      "round": 2,
+      "source_sha256": "b6c90a39837c4d3ed65a6247d675b397dc87178d82f24bda6ee90106b8261192",
+      "evaluation": {
+        "evaluated_at": "2026-10-29T14:46:50.709234Z",
+        "status": "PASSED",
+        "geo_mean": 0.7481787214417248,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Cache the resolved compiled Triton launcher per (dtype, numel) and drive it directly instead of re-entering JITFunction.run on every call.",
+        "code_changes": "Added _build_entry: one warmup per (dtype, numel) resolves launcher.launch/function/packed_metadata/grid/block plus a per-device current-stream getter, cached in _ENTRIES; run() then calls the compiled launcher directly and keeps kernel[grid](...) only as fallback (build failure, debug/msprof launches, non-contiguous layouts). Also cached torch.finfo per dtype.",
+        "hypothesis": "Round 1 latency was flat at ~72 us for N=1024 and ~84 us for N=16.7M, i.e. dominated by the Python-side JIT dispatch path rather than device work; bypassing the binder and invoking the already-compiled launcher with grid + raw stream + device pointer should cut the tiny-case cost toward the ~16 us launch floor while nan/posinf/neginf remain ordinary runtime args (no recompile, values still honoured).",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Removes the per-call Triton JIT binder/cache-key/dispatch work (~55 us of the measured ~72 us on tiny inputs), so all workloads converge on max(host launch rate, device time)."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": 1
+        },
+        "key_params": {
+          "fast_launch_entry_cache_key": "dtype+numel",
+          "block_max": 8192,
+          "block_min": 1024
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "partially_met",
+        "root_cause": "Per-call Triton JIT dispatch was the dominant cost for small tensors and removing it delivered a 3.6x geo_mean gain; the remaining 4096x4096 cases are limited on the device by per-program/tile granularity (2048 programs of 16 KiB staging tiles) rather than by the launch path.",
+        "perf_gap_analysis": "Frozen expectation: bypassing the JIT binder cuts ~55 us of per-call host cost so every workload converges on max(host launch rate, device time), raising geo_mean. Observed: tiny cases fell from 72.0-78.0 us to 19.0-20.0 us (-73%) and geo_mean rose from 0.208 to 0.748, so the host-overhead mechanism is confirmed. Gap: the same fixed cost was not the whole story for the large workloads - their latency did not move at all (timing-3 83.51 -> 83.44 us, timing-7 85.22 -> 85.12 us) and timing-11 regressed 84.21 -> 88.72 us, which proves those three cases are device-bound, not dispatch-bound. A bounded debug job (MEASURED on target, staging kernel = 84.4 us at 4096x4096 float16) confirmed that the device time is real and that the tile size, not the host path, is what limits it (native-dtype clamp with a 16384-element tile measured 58.5 us). My round-1 inference that the large cases were mostly host overhead was wrong because it came from subtracting two independent measurements.",
+        "next_suggestion": "Attack the device side for the three 4096x4096 workloads: keep the validated fp32-staged compare/select kernel for float32 and general (non-saturating) values, but for 2-byte float dtypes in the saturating case lower the infinity handling to max(min(x,pos),neg) in the input dtype and raise the tile to 16384 elements (32 KiB staging cap).",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "",
+        "strategy_evolution": "",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "ce805d13145c9c80db1f0caa6fb40fe5799417ceaccf41a9cbd5404e280101f4",
+      "round": 3,
+      "source_sha256": "bc15a97302db628a0ab002043b597d4247fccca8fdd112a37018e12c6123ee8d",
+      "evaluation": {
+        "evaluated_at": "2026-10-29T14:56:32.399257Z",
+        "status": "PASSED",
+        "geo_mean": 0.7712978993982609,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Lower the infinity replacement to a saturating clamp in the input dtype for 2-byte floats and double that tile to 16384 elements, keeping the validated staged path for float32 and for non-saturating replacement values.",
+        "code_changes": "Added _nan_to_num_clamp / _nan_to_num_clamp_masked (native dtype, max(min(x,pos),neg) + NaN select) selected when posinf>=finfo.max and neginf<=finfo.min and element_size==2; tile cap raised to 16384 elements for that path (_BLOCK_CLAMP_2B) and _pick_block now takes an explicit cap plus a masked-tile cap. float32 and non-saturating requests keep the fp32-staged compare/select kernel at 8192, with automatic fallback if the clamp build fails.",
+        "hypothesis": "The three 4096x4096 workloads are device-bound at ~84-89 us with 2048 programs of 16 KiB staging tiles; a target debug job measured the native-dtype clamp tile at 16384 elements as 58.5 us versus 84.4 us for the staged kernel on float16, while float32 measured worse natively (120.7 us) and staging tiles above 8192 overflow UB, so only the 2-byte dtypes should move.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Fewer vector ops per element (2 clamp ops instead of 2 compares + 2 selects, no fp32 round trip) at a 2x larger tile halves the program count, so the 2-byte 4096x4096 workloads become memory-bound instead of tile-issue-bound."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": 2
+        },
+        "key_params": {
+          "block_clamp_2byte": 16384,
+          "block_stage": 8192,
+          "tile_bytes": 32768
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "failed",
+        "analysis_path": ".kernelgen/profile-analysis/round-0003.json",
+        "summary": "failed: msprof base collection exited successfully without profile completion marker (deterministic across 6 attempts: timing-0/3/7/11 at metrics level, 1 metrics retry on timing-3, 1 instruction-level attempt on timing-0; every result had artifacts: [], metrics: {}, capabilities: [], summary.stage_count 1)"
+      },
+      "conclusion": {
+        "round_num": 3,
+        "expectation_status": "partially_met",
+        "root_cause": "The 4096x4096 cases were limited by tile granularity and per-element vector work: doubling the float16 tile to 32 KiB and replacing two compare/select pairs with a saturating clamp cut 31% off the device time, but that recipe is blocked for bfloat16 (slow native min/max, UB overflow at 16384) and unhelpful for float32, where saturating/wider-tile variants measured worse and staging at 8192 remains the best known configuration.",
+        "perf_gap_analysis": "Frozen expectation: the native-dtype clample tile at 16384 elements makes the 2-byte 4096x4096 cases memory-bound, moving geo_mean from 0.748 toward ~0.80, with float32 explicitly left unchanged. Observed: geo_mean 0.7482 -> 0.7713, all 30 PASSED. timing-3 (float16 4096x4096) went 83.44 -> 57.59 us exactly as the debug job predicted (58.5 us), speedup 0.366 -> 0.530. timing-11 (float32) stayed staged at 84.13 us (0.694, the round-2 88.7 us reading was noise). Gap: timing-7 (bfloat16 4096x4096) did not move at all (85.12 -> 85.14 us, 0.729) because its clamp tile could not be built at 16384 and the automatic fallback produced the staged kernel; the follow-up measurement showed why bfloat16 was never a candidate for that path - its native clamp costs 120.0 us at an 8192 tile versus 81.4 us for float16, so bfloat16 min/max is not a cheap native vector op. A grid-stride loop over several tiles per program (the other per-program-overhead remedy) gave only 8% on float32 (85.3 -> 78.1 us at 4 tiles) and would not compile at all for float16 at a 16384 tile.",
+        "next_suggestion": "Leave bfloat16 and float32 on the validated staged kernel and switch effort to the host path, which now dominates 9 of 12 timing workloads (17.7-19.9 us against 14.5-16.0 us references at N=1024): fold the per-call dtype lookups into one cached info tuple, keep a dedicated default-argument entry so the saturating test leaves the hot path, and inline the dispatch to remove two Python calls and one tuple hash per invocation.",
+        "optimization_level": "L2_memory",
+        "debug_lesson": "",
+        "strategy_evolution": "",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "0af95a3653342c2f55273d84d18b6a90a26c8f415fe7c253510212cce21fd128",
+      "round": 1,
+      "source_sha256": "7d653eba8d6c8db8b7aef5179622f59337422e96efd6975785a1a6f609c1fa97",
+      "evaluation": {
+        "evaluated_at": "2026-10-30T06:50:44.455623Z",
+        "status": "PASSED",
+        "geo_mean": 0.7142152693274566,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Submit the unmodified seed (compact-default-dispatch-v1: direct compiled launch + native-dtype clamp tile for saturating defaults) to establish this workspace's authoritative baseline.",
+        "code_changes": "None; seed written verbatim to tmp/main.py.",
+        "hypothesis": "The seed already passes correctness for all 30 workloads; measure its geo_mean and per-workload latencies so later experiments can be compared against this workspace's own baseline instead of the external batch numbers.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "No change; records authoritative latency for both the small (overhead-dominated) and 4096x4096 (bandwidth-dominated) timing cases."
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {},
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "failed",
+        "analysis_path": ".kernelgen/profile-analysis/round-0001.json",
+        "summary": "failed: msprof base collection exited successfully without profile completion marker. 7 collection attempts (6 workloads in one metrics-level batch + 1 independent single-workload retry on nan_to_num_-timing-3) all returned status=failed, capabilities=[], empty measurements and zero artifacts; the artifact registry for round 1 is therefore empty and no evidence-bearing finding could be validated. Only manifest.json was written per attempt: no msprof output tree, no op_summary, no pipeline counte"
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "Baseline of the seed (compact-default-dispatch) in this workspace: 30/30 PASSED, geo_mean 0.7142. Per-workload data splits into two regimes: nine timing cases (timing-0..2,4..6,8..10, numel 1024 to 1048576, i.e. 4 KiB to 8.4 MB of traffic) are all flat at 15.86-16.91 us (mean 16.32) while the reference is 10.91-14.14 us (mean 12.06); traffic does not affect them, so they are host/launch-cost bound, not device bound. The three large cases (16,777,216 elements) are device bound: fp16 57.59 vs 30.60, bf16 84.04 vs 62.07, fp32 83.60 vs 58.45.",
+        "perf_gap_analysis": "No prior measurement in this workspace; this round only establishes the reference point. Absolute gaps: +4.25 us mean on the nine host-bound cases (1.35x), and the min_speedup 0.531 is timing-3 (fp16 4096x4096). Two independent observations delimit the work: (a) since latency is invariant from 4 KiB to 8.4 MB, no tiling/byte-level change can move those nine cases - only host launch cost can; (b) timing-3 (fp16) and timing-7 (bf16) take identical host decisions (element_size 2, native clamp, BLOCK 16384, grid 1024) and move identical 67,108,864 bytes, yet differ by 26.45 us, which excludes volume and grid and points at bf16 lowering in the native-dtype clamp.",
+        "next_suggestion": "Bounded target-side probe (debug job) to attribute the 16.32 us floor between Python-side work, the Triton compiled-launch call, current-stream read and device kernel duration, using prebuilt-plan loops plus npu-event device timing; then attack the dominant term. Keep the bf16 large-case lowering question for a separate round.",
+        "optimization_level": "L1_architecture",
+        "debug_lesson": "Walltime mode plus a latency that is invariant over a 2048x traffic range is a usable signature of host-bound measurement; a broken msprof channel (7/7 collections produced no completion marker) means this round has no MTE/AIV evidence and only arithmetic on eval latencies.",
+        "strategy_evolution": "",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "0af95a3653342c2f55273d84d18b6a90a26c8f415fe7c253510212cce21fd128",
+      "round": 2,
+      "source_sha256": "bc76af89591db5b5c0bfae901edf6c4fb153395c26f5d2b104f7f3e354d3f5cf",
+      "evaluation": {
+        "evaluated_at": "2026-10-30T07:11:19.344407Z",
+        "status": "PASSED",
+        "geo_mean": 0.8443210025250412,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Slim the host launch path for the saturating-default request: bake posinf/neginf/nan defaults into constexpr kernel bounds (2 runtime arguments instead of 5) and collapse run() to two dict lookups plus a prebuilt closure, keeping every device kernel's math bit-identical.",
+        "code_changes": "Added _ntn_default/_ntn_default_masked (native clamp with POS/NEG baked as constexpr) and _ntn_stage_default/_ntn_stage_default_masked (same fp32-staged compare/select math, constants baked). run() now does one dict get by dtype, one by numel, pointer-alignment and contiguity tests, then fires a prebuilt closure whose argument list is 2 runtime scalars (ptr, nan) instead of 5. Below 4 MiB of traffic the smaller-tile slim kernel is preferred (device time hidden under the host floor); above it the measured-fastest tile per dtype is kept (fp16 native clamp 16384, bf16/fp32 staged 8192). Generic/strided/explicit-arg paths untouched.",
+        "hypothesis": "Round 1's nine small/medium timing cases are launch-cost bound (16.32 us flat from 4 KiB to 8.4 MB), and the prebuilt Triton launch is the dominant term: measured 11.24 us with the seed's 5 runtime arguments versus 9.86 us with 2 (probe, same kernel math, repeated twice). Slimming the argument list plus the Python hot path should cut those cases by ~2 us without touching device behavior.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Launch argument marshalling and Python dispatch shrink per call while every device kernel keeps bit-identical math, so the nine host-bound timing cases (flat at 16.3 us) drop toward the 9.9 us prebuilt-launch floor; the three device-bound 4096x4096 cases should not move."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": null
+        },
+        "key_params": {
+          "block_2b_large": 16384,
+          "block_stage": 8192,
+          "runtime_args_default_path": 2,
+          "slim_bytes_threshold": 4194304
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "partially_met",
+        "root_cause": "Launch-argument marshalling was indeed the dominant term for the nine host-bound cases: reducing the default-request launch from five runtime arguments to two (with a prebuilt closure instead of per-call entry unpacking) cut those cases by 2.3 us on average and brought them to reference parity. The regression on the two large non-fp16 cases comes from the same edit: compile-time bounds (POS/NEG as constexpr) changed the generated code for the large-input kernels, and the fp16 4096x4096 case now runs the fp32-staged 8192 tile (82.02 us, matching the measured 82.75 us staged time) instead of the mask-free native clamp at 16384 (measured 58.30 us), a 1.4x device slowdown that no host-side gain can offset.",
+        "perf_gap_analysis": "Observed vs frozen plan: the host-side half of the prediction held and slightly exceeded it - the nine host-bound cases moved from 15.86-16.91 us (mean 16.32) to 13.64-14.91 us (mean 14.02), -2.3 us or -14%, and timing-0 now beats the reference (1.025x) while timing-1/2/4/5/6/10 sit at 0.960-0.982. Aggregate geo_mean rose 0.7142 -> 0.8443 (+18.2%) and all 30 workloads pass with abs_err 0 and rel_err 0. The predicted 'no change' for the three device-bound cases did NOT hold: timing-3 regressed 57.59 -> 82.02 us (speedup 0.531 -> 0.373) and timing-11 83.60 -> 93.37 us (0.699 -> 0.697), while timing-7 stayed 84.04 -> 83.65. Diagnosis from the frozen probe evidence: for 4096x4096 fp16 the plan should have been the mask-free native clamp at BLOCK 16384 (measured 58.30 us device), yet 82.02 us matches the fp32-staged BLOCK 8192 kernel (82.75 us). So baking posinf/neginf as constexpr bounds changed the large-input codegen path (staged fallback or worse lowering) even though the arithmetic is identical; the same mechanism plausibly explains the fp32 case (93.37 vs 84.80 staged). Net: the +18.2% is real and kept, and ~2.8 geo_mean points are recoverable by restoring the round-1 device kernels for the >4 MiB regime.",
+        "next_suggestion": "Keep the slim kernel for inputs whose traffic is under the host floor, but route large inputs (traffic > 4 MiB) through the exact round-1 device kernels (mask-free native clamp at BLOCK 16384 for 2-byte fp16, mask-always fp32-staged at BLOCK 8192 for bfloat16/float32), whose device times were measured at 58.3/85.2/84.8 us. Host cost is irrelevant there because device time dominates.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "A host-side launch-cost change can silently perturb device codegen: timing-3 landed at 82.02 us, which matches the staged-8192 device time (82.75 us) rather than the native clamp-16384 time (58.30 us) for identical math. Any host experiment must therefore be validated case-by-case on the device-bound cases too, not only on the cases it targets.",
+        "strategy_evolution": "",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "0af95a3653342c2f55273d84d18b6a90a26c8f415fe7c253510212cce21fd128",
+      "round": 3,
+      "source_sha256": "e2cf0a4f47e367574bc492f3076544b2281bcebd8062a50f35bff21a36efaf5a",
+      "evaluation": {
+        "evaluated_at": "2026-10-30T07:14:08.953080Z",
+        "status": "PASSED",
+        "geo_mean": 0.8879340338122681,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Split the default-request launch plan by traffic regime: device-optimal round-1 kernels above 4 MiB, slim 2-argument kernels below it.",
+        "code_changes": "_build_default now has two regimes: traffic <= 4 MiB keeps the slim 2-runtime-argument constexpr kernels; traffic > 4 MiB uses the exact round-1 kernels and 5-runtime-argument launch (_nan_to_num_clamp/_nan_to_num_clamp_masked at BLOCK 16384 for 2-byte dtypes with fallback to _nan_to_num_stage at BLOCK 8192, and the mask-always _nan_to_num_stage at BLOCK 8192 for float32). The small-input path, the generic dispatch, strided kernels and public signature are unchanged.",
+        "hypothesis": "The >4 MiB cases are device bound, so routing them through the round-1 kernels restores timing-3 to ~57.6 us (speedup 0.373 -> ~0.53) and timing-11 to ~84 us, while the round-2 host gains are retained because the launch argument count is irrelevant when device time dominates.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Large inputs return to the device kernels whose device times were measured at 58.30/85.19/84.80 us (clamp16384 for fp16, staged8192 for bfloat16/float32) instead of the 82.02 us staged path the constexpr variants produced, while the nine host-bound cases keep their round-2 13.6-14.9 us latencies."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": 2
+        },
+        "key_params": {
+          "block_2b_large": 16384,
+          "block_stage": 8192,
+          "runtime_args_large": 5,
+          "slim_bytes_threshold": 4194304
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 3,
+        "expectation_status": "met",
+        "root_cause": "The remaining cost is device-bound: the large cases are limited by the per-program load/compute/store structure of the clamp (fp16) and fp32-staged (bfloat16/float32) kernels, which reach 1.15-1.6 TB/s versus 2.1-2.3 TB/s for the reference and 3.5 TB/s for a native copy of the same bytes. Tile size is the strongest measured driver (fp16 BLOCK 16384 = 58.30 us vs 8192 = 81.39 us), and bfloat16/float32 cannot grow past 8192 because bfloat16's native clamp needs 18.1 bytes/element of UB and fp32's staged form 22, against a 192 KiB budget.",
+        "perf_gap_analysis": "Frozen expectation: routing >4 MiB traffic through the round-1 kernels restores the large cases without losing the round-2 host gains. Both halves held. timing-3 went 82.02 -> 57.59 us (speedup 0.373 -> 0.531, exactly the round-1 value) and timing-11 93.37 -> 83.60 us (0.697 -> 0.700), while the nine host-bound cases stayed at 12.49-13.93 us (timing-0 1.013x, timing-2 1.033x, timing-6 1.070x now faster than the reference; timing-1/4/5/9 at 0.976-0.989). Aggregate geo_mean 0.8443 -> 0.8879 (+5.2%). Remaining deficits, all device bound: timing-3 57.59 vs 30.57 (0.531), timing-7 84.02 vs 62.13 (0.739), timing-11 83.60 vs 58.55 (0.700). Against the probe's native copy_ calibration (19.2 us for the same 67 MB of 2-byte traffic, 3.5 TB/s) our clamp16384 reaches only 1.15 TB/s, so the gap is kernel structure rather than unavoidable bandwidth; the two smaller residual host gaps are fp32 1024/1048576 (0.903/0.918, 13.91-13.93 us vs 12.58-12.78).",
+        "next_suggestion": "The three 4096x4096 cases now dominate the remaining gap (0.531/0.739/0.700) and are device bound. Sweep device-side launch/compile parameters that leave semantics untouched (num_warps, num_stages) for the winning kernels per dtype, and test a pipelined in-program loop for bfloat16/float32 whose tiles cannot grow past the 192 KiB UB budget; the native copy_ of the same bytes measured 19.2 us for 2-byte, so ~3x of device headroom exists.",
+        "optimization_level": "L2_memory",
+        "debug_lesson": "The two regimes must be routed by measured mechanism, not by one rule: below the launch floor the argument count matters and the device tile does not, above it the device tile matters and the argument count does not. Round 2 and round 3 together pin that crossover at ~4 MiB of traffic for this operator.",
+        "strategy_evolution": "",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "0af95a3653342c2f55273d84d18b6a90a26c8f415fe7c253510212cce21fd128",
+      "round": 4,
+      "source_sha256": "8db3017f41401d6eaa16584fca0ae77b27022244ceeea14e3afbf0e40c4000c3",
+      "evaluation": {
+        "evaluated_at": "2026-10-30T07:26:06.927755Z",
+        "status": "PASSED",
+        "geo_mean": 0.9552018880239987,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Use sequential-loop device kernels (2-4 tiles per program, num_stages=1) for the device-bound >4 MiB regime, chosen from the measured per-dtype winners.",
+        "code_changes": "Added _ntn_clamp_loop and _ntn_stage_loop: masked sequential-loop bodies taking runtime bounds with ITERS/BLOCK constexpr, compiled with num_stages=1. The >4 MiB branch of _build_default now selects (clamp loop, tile 16384, ITERS=2) for 2-byte dtypes, falling back to (staged loop, tile 8192, ITERS=4) if that build fails, and float32 uses (staged loop, tile 8192, ITERS=4). The <=4 MiB slim path, the generic/strided dispatch and the public signature are unchanged.",
+        "hypothesis": "All three 4096x4096 cases are limited by per-task load/compute/store serialisation rather than by UB-limited tile size alone, so processing 2 (fp16) or 4 (bf16/fp32) sequential tiles per program with num_stages=1 improves them by 8-12% and lifts geo_mean from 0.888 to ~0.905.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Halving-to-quartering the task count while keeping the fastest measured tile amortises per-task setup: timing-3 58.4 -> 51.5 us, timing-7 84.8 -> 78.2 us, timing-11 84.4 -> 77.0 us of device time."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": 3
+        },
+        "key_params": {
+          "fp16_iters": 2,
+          "fp16_tile": 16384,
+          "num_stages": 1,
+          "stage_iters": 4,
+          "stage_tile": 8192
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 4,
+        "expectation_status": "met",
+        "root_cause": "The 4096x4096 cases were limited by per-task load/compute/store serialisation as well as tile size: each task paid its own MTE setup, and with ~1024-2048 tasks over 20 vector cores that overhead was paid 25-50 times per core. Processing 2 sequential tiles per program for float16 (BLOCK 16384) and 4 for bfloat16/float32 (BLOCK 8192) with num_stages=1 amortises it without exceeding the 192 KiB UB budget, which the double-buffered default (num_stages=2) cannot do at these tiles.",
+        "perf_gap_analysis": "Frozen expectation: timing-3 58.4 -> 51.5 us, timing-7 84.8 -> 78.2 us, timing-11 84.4 -> 77.0 us, geo_mean 0.888 -> ~0.905. Observed: timing-3 50.86 us (speedup 0.600, prediction 0.59-0.60), timing-7 77.48 us (0.802, predicted 0.79), timing-11 76.41 us (0.764, predicted 0.76) - all met within noise, and the nine host-bound cases held at 11.92-12.77 us, seven of them now faster than the reference. Aggregate geo_mean 0.8879 -> 0.9552 (+7.6%), all 30 PASSED with abs_err 0 and rel_err 0. Residual gap is now only the three 4096x4096 cases: timing-3 50.86 vs 30.53 (0.600), timing-7 77.48 vs 62.13 (0.802), timing-11 76.41 vs 58.41 (0.764). Against the probe calibration (copy_ 19.2 us, torch 32.1 us for the same 67 MB) fp16 still runs at 1.30 TB/s versus 2.1-3.5 TB/s attainable, so device headroom remains but the host-side opportunity is exhausted (those cases are at 0.997-1.125).",
+        "next_suggestion": "Keep pushing the device-bound regime: sweep more sequential tiles per program (8/16) for bfloat16/float32, and test two-stage software pipelining (num_stages=2 with the tile halved so the doubled buffer still fits UB) for all three dtypes, since tile and task count now dominate and both are UB-limited.",
+        "optimization_level": "L2_memory",
+        "debug_lesson": "The winning device structure was invisible to per-kernel micro-benchmarks until the kernel body was compiled with num_stages=1: the same 2-iteration loop overflowed UB at the default num_stages=2 (double buffering), which is why probe 7's first attempt failed and probe 6 only succeeded on the variant that passed num_stages=1 explicitly.",
+        "strategy_evolution": "",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "0af95a3653342c2f55273d84d18b6a90a26c8f415fe7c253510212cce21fd128",
+      "round": 5,
+      "source_sha256": "625dc012d2d4ad7b240eab2a784eaa006c548040a1b53e351ad2ed0646770186",
+      "evaluation": {
+        "evaluated_at": "2026-10-30T07:31:42.473706Z",
+        "status": "PASSED",
+        "geo_mean": 0.9483905147288372,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Try a native-dtype compare/select loop on the large bfloat16 tile, falling back to the measured staged loop when the tile does not fit UB.",
+        "code_changes": "Added _ntn_cs_loop: a masked sequential-loop compare/select body kept entirely in the input dtype (no fp32 staging), same signature and num_stages=1 convention as the other loop kernels. In the >4 MiB branch, bfloat16 now tries (_ntn_clamp_loop tile 16384 ITERS 2) then (_ntn_cs_loop tile 16384 ITERS 2) then the existing (_ntn_stage_loop tile 8192 ITERS 4); float16 and float32 candidate lists are unchanged.",
+        "hypothesis": "bfloat16's 4096x4096 deficit (77.48 us vs the 62.13 us reference) comes from its staged kernel upconverting to fp32, which doubles UB per element and forces an 8192 tile where float16 uses 16384. A native-dtype compare/select on the 16384 tile should recover most of the tile-size advantage if the build fits; if it does not compile, the existing staged loop (measured 78.2 us) is retained unchanged, so the downside is bounded.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Removing the fp32 staging for bfloat16 should cut its UB per element from 18-22 B toward the ~10-12 B of the fp16 native path, letting the 16384 tile compile so timing-7 can approach float16's 50.9 us instead of 77.5 us."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": 4
+        },
+        "key_params": {
+          "bf16_candidate_tile": 16384,
+          "bf16_iters": 2,
+          "fallback_tile": 8192,
+          "num_stages": 1
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": false,
+        "status": "not_required",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 5,
+        "expectation_status": "not_met",
+        "root_cause": "Replacing the fp32-staged bfloat16 body with a compare/select kept in the input dtype did not free the UB budget: at tile 16384 the build still overflowed, so bfloat16 stays capped at tile 8192 (its per-element UB cost is inherent to the bf16 compare/select lowering, not only to the explicit upconvert) and timing-7 kept its staged-loop time of 77.5 us. The round is therefore a no-op on device behaviour, and the small geo_mean movement is reference-side noise on unchanged paths.",
+        "perf_gap_analysis": "Frozen expectation: bfloat16's timing-7 would drop from 77.5 us toward float16's 50.9 us if the native compare/select freed enough UB for a 16384 tile; if it did not compile the staged loop (78.2 us) would be retained with bounded downside. Observed: timing-7 = 77.52 us (speedup 0.802), identical to round 4, so the native-dtype body at tile 16384 did not fit and the fallback ran - the hypothesis is falsified but the downside materialised only as the expected no-change on that case. Aggregate geo_mean moved 0.9552 -> 0.9484 (-0.7%), which is entirely measurement variation on cases whose code path did not change: the nine host-bound cases re-timed at 12.47-13.89 us and their references were re-measured at 13.34-14.25 us (round 4 references were 12.55-13.87 us), and timing-3/timing-11 reproduced to within 0.01 us (50.86 vs 50.86, 76.41 vs 76.41).",
+        "next_suggestion": "Try the native compare/select at the size bfloat16 can actually fit (tile 8192, ITERS 2 and 4) to see whether dropping the fp32 conversions alone beats the staged loop's 77.5 us, and check whether float16 benefits from the same body at 16384. If neither wins, the three large cases are at the practical ceiling of this backend's elementwise codegen and the remaining work is host-side only.",
+        "optimization_level": "L2_memory",
+        "debug_lesson": "The bfloat16 tile cap cannot be escaped by removing the fp32 staging: the native compare/select body still exceeded the UB budget at tile 16384 (timing-7 stayed at the staged fallback, 77.52 us), so bfloat16's per-element UB cost comes from the bf16 compare/select lowering itself, not only from the explicit upconvert.",
+        "strategy_evolution": "",
+        "knowledge_assessments": []
+      }
+    }
+  ],
+  "gap": null,
+  "relation_note": "按同一原始账本正式轮次展示；未逐编辑恢复的关系不声称直接源码继承。",
+  "delivery": {
+    "score": 0.8632075997255874,
+    "source": "operators/nan_to_num_/versions/independent_strict/retained/kernel.py",
+    "source_sha256": "8db3017f41401d6eaa16584fca0ae77b27022244ceeea14e3afbf0e40c4000c3",
+    "passed": 30,
+    "total": 30,
+    "result": "operators/nan_to_num_/evidence/retained/evaluation/result.json",
+    "result_sha256": "57b427b9b17ab8cd5622632ec0b04a59089e9e350ab57b0dbbac74e0fe9d3335",
+    "endpoint_same_source": false
+  },
+  "current_cann_score": 0.8632075997255874,
+  "historical_simulator_files": 0
+}

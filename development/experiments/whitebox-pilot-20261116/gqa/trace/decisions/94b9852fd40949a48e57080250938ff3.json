@@ -1,0 +1,63 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "94b9852fd40949a48e57080250938ff3",
+  "recorded_at": "2026-11-16T12:30:31.971373+00:00",
+  "round_id": "precision-02",
+  "input_source": {
+    "path": "trace/sources/2979bc0e238eaf12eac9d74c66fe226b3acbd583160184c4a94e0b38dd31212a.py",
+    "sha256": "2979bc0e238eaf12eac9d74c66fe226b3acbd583160184c4a94e0b38dd31212a"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "workspace/results-01.json",
+        "sha256": "b34ae9c8b500c01e05de1c59419c536b9a6f02ed764afcf879fc6968b39d2bae"
+      },
+      "category": "other",
+      "role": "trigger",
+      "finding": "Official metrics from results-01.json (candidate / native): case1 fp16 MERE=1.5260e-3 / 1.5780e-3, MARE=47.09 / 116.90, max_abs=3.70059e-4 (identical candidate and native); case2 fp16 MERE=1.6305e-3 / 1.6067e-3, max_abs=9.17e-5 / 1.023e-4; case4 bf16 MERE=1.3736e-2 / 1.3927e-2, max_abs=7.0390e-4 / 6.9005e-4; case7 bf16 MERE=1.3505e-2 / 1.3183e-2, max_abs=6.1245e-4 / 6.2911e-4. Every case has official_formula_pass=false for both candidate and native; supplementary_allclose=true does not count. The candidate/native max_abs agreement (3.700592284897608e-4 for case1 on both sides) indicates a shared precision ceiling rather than a candidate-specific logic bug.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "workspace/results-01.json",
+        "sha256": "b34ae9c8b500c01e05de1c59419c536b9a6f02ed764afcf879fc6968b39d2bae"
+      },
+      "category": "other",
+      "role": "mechanism",
+      "finding": "MERE/threshold ratios: case1 fp16 1.5625 (thr=2^-10=9.765625e-4), case4 bf16 1.7582 (thr=2^-7=7.8125e-3). Measured max_abs expressed in input unit roundoff: case1 3.70059e-4 / 2^-11 = 0.758 ulp_fp16; case4 7.0390e-4 / 2^-8 = 0.180 ulp_bf16. These absolute errors are far above an fp32 accumulate floor and far above the output-rounding floor for y~O(0.03) (0.03*2^-11/2 ~ 7.3e-6 fp16, 0.03*2^-8/2 ~ 5.9e-5 bf16). This is consistent with cancellation error injected by rounding softmax probabilities before PV, which grows relative to small |golden|.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "workspace/candidate.py",
+        "sha256": "2979bc0e238eaf12eac9d74c66fe226b3acbd583160184c4a94e0b38dd31212a"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Line 90 computes acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v). p is the fp32 online-softmax probability but is rounded to v.dtype (fp16 or bf16) before the PV tensor-core dot. For a cancellation output y=sum_j p_j v_j / l, this injects an absolute error ~u*sum_j p_j|v_j|/l with u=2^-11 (fp16) or 2^-8 (bf16); at outputs near zero it produces the huge MARE. QK (line 74) consumes the exact fp16/bf16 q,k with fp32 accumulation, and the softmax max/sum/rescale are already fp32, so PV probability rounding is the sole high-impact precision loss.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "workspace/task-description.md",
+        "sha256": "8b94349587799c9074cd8f7bb38e960be2e0973c4617c70d60b5019971bf24ac"
+      },
+      "category": "other",
+      "role": "background",
+      "finding": "Section 4 fixes official thresholds (fp16 2^-10, bf16 2^-7) and defines MERE/MARE with denominator |golden|+1e-7; section 3 fixes output dtype to the input dtype (fp16/bf16), so final output rounding is irreducible. Candidate must not relax thresholds or alter golden.",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "The dominant numerical error is the pre-PV downcast of the fp32 softmax probabilities to fp16/bf16. It is an absolute error proportional to the probability-weighted magnitude of V and therefore blows up as a relative error for near-zero outputs. QK and softmax are already effectively fp32-accurate, so a probability representation that retains fp32-level precision through PV should collapse max_abs toward the output-rounding / fp32-accumulation floor and bring MERE under the official thresholds.",
+  "change": "Precision-first PV using a residual-split probability: compute p_hi = fp16/bf16(p), r = p - fp32(p_hi) exactly in fp32, p_lo = fp16/bf16(r * 2048) to keep residuals normal, then acc = acc*alpha + tl.dot(p_hi, v) + tl.dot(p_lo, v)/2048. Both dots use the already-supported fp16/bf16 inputs with fp32 accumulation; QK and the fp32 online softmax are unchanged. The 2048 scale avoids fp16 subnormal flush of the residual term. This retains ~2^-22 (fp16) / ~2^-16 (bf16) relative probability precision, i.e. fp32-level through PV, at the cost of a second PV dot (performance second).",
+  "expected": "max_abs should fall from measured 9.2e-5..7.0e-4 to the output-rounding/fp32-accumulation floor (~1e-5 fp16, ~1e-4 bf16 for y~O(0.03)); MERE should drop below 2^-10 (fp16) and 2^-7 (bf16). MARE is expected to improve by orders of magnitude (currently 47-1189) but may remain limited by true golden values within ~1e-7 of zero, which no fp16/bf16 output can resolve; this is recorded as an open unknown, not assumed fixed.",
+  "validation": "External fixed benchmark attention_bench.py on the official case subset will recompute MERE/MARE/max_abs for this source; no preflight/benchmark is run in this call and no thresholds/golden change. Success criterion for the mechanism: candidate max_abs and MERE drop close to the stated output-rounding floor and MERE passes both dtype thresholds; MARE and native failure are reported honestly.",
+  "alternatives": [
+    "QK fp16 tensor-core accumulation is low precision. Argued against: q,k are exact input fp16 values, products are exact in fp32 and tl.dot accumulates fp32; measured candidate error matches the P-downcast scale and native has the same max_abs.",
+    "The failure is solely the final fp16/bf16 output rounding. Argued against: output-rounding floor is ~7e-6 (fp16) / ~6e-5 (bf16) at y~0.03, 5-50x below measured max_abs; and it would not scale with the P precision as observed."
+  ],
+  "discriminating_observation": "Case1 native and candidate share the same max_abs=3.700592284897608e-4 while both round softmax probabilities to fp16 before PV; the value is ~0.76 ulp_fp16 and far above the output-rounding floor. Removing only the probability downcast should reduce max_abs by ~1-2 orders of magnitude while leaving QK/softmax untouched.",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

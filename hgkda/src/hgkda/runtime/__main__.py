@@ -5,6 +5,8 @@ import sys
 
 ACTIONS={
  'upstream-test':('upstream_test',[]),
+ 'trace':('trace',[]),
+ 'decision':('agent_tools',['decision']),
  'prepare':('prepare',[]),
  'generate':('host_action',['generate']), 'context':('agent_tools',['context']),
  'preflight':('host_action',['preflight']), 'evaluate':('host_action',['evaluate']),

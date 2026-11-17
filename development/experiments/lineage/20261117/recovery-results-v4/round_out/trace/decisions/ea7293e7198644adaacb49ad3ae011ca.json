@@ -1,0 +1,62 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "ea7293e7198644adaacb49ad3ae011ca",
+  "recorded_at": "2026-11-17T07:02:45.448507+00:00",
+  "round_id": "focused-v3",
+  "input_source": {
+    "path": "trace/sources/847744f8a1720561a7d2999673b0b98ba01d59540b39b16424521807095083f4.py",
+    "sha256": "847744f8a1720561a7d2999673b0b98ba01d59540b39b16424521807095083f4"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/d116212e4e8136119dfe10e1545df31ebe3bc5684afda5c5720ca1fd840cdcdb.json",
+        "sha256": "d116212e4e8136119dfe10e1545df31ebe3bc5684afda5c5720ca1fd840cdcdb"
+      },
+      "original": {
+        "path": "workspace/host-review.json",
+        "sha256": "d116212e4e8136119dfe10e1545df31ebe3bc5684afda5c5720ca1fd840cdcdb"
+      },
+      "category": "other",
+      "role": "trigger",
+      "finding": "Review bound to current SHA 847744f8: the previous smaller UB tile worsened FP32 large 86.94us -> 105.50us; directive is to implement the planned larger tile or pipelining experiment with bounded UB usage and unchanged math. method_update notes full evaluation is category=evaluation, not paired profiling.",
+      "source_sha256": "847744f8a1720561a7d2999673b0b98ba01d59540b39b16424521807095083f4"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/c5d05d59ecafbc848f5ddd44586b641f96f7abf32cb6a63d435c471b842872f9.json",
+        "sha256": "c5d05d59ecafbc848f5ddd44586b641f96f7abf32cb6a63d435c471b842872f9"
+      },
+      "original": {
+        "path": "workspace/performance-feedback.json",
+        "sha256": "c5d05d59ecafbc848f5ddd44586b641f96f7abf32cb6a63d435c471b842872f9"
+      },
+      "category": "other",
+      "role": "background",
+      "finding": "Formal full-contract result on this same SHA: geo_mean 0.99826 (threshold 1.05). Limiting cases: bf16 4096x4096 23.57us vs ref 19.07 (0.809), fp32 1048576 17.24 vs 15.72 (0.912), fp32 65536 17.29 vs 15.82 (0.915), fp32 4096x4096 105.50 vs 102.37 (0.970). fp16 4096x4096 already 1.477. Whole-run timings only, no per-region attribution.",
+      "source_sha256": "847744f8a1720561a7d2999673b0b98ba01d59540b39b16424521807095083f4"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/847744f8a1720561a7d2999673b0b98ba01d59540b39b16424521807095083f4.py",
+        "sha256": "847744f8a1720561a7d2999673b0b98ba01d59540b39b16424521807095083f4"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "847744f8a1720561a7d2999673b0b98ba01d59540b39b16424521807095083f4"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "_geometry uses cap = min(8192, max(64, 16384 // itemsize)), so the per-iteration tile is only a 16KB element budget for every dtype (fp32 4096 elem, fp16/bf16 8192 elem); _round_stream loads, rounds and stores exactly one such tile per loop step with a grid of at most num_vectorcore programs. This 16KB tile is the smallest tried geometry and matches the 105.50us regression window.",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "Large-input time is set by per-iteration tile granularity rather than by the math: with a 16KB tile each loop step moves too few bytes to keep the load/vector/store pipeline busy, so fixed loop overhead and limited bytes in flight dominate and FP32 4096x4096 lands at 105.50us. Raising the tile to a 32KB element budget (fp32 8192, fp16/bf16 16384 elements) doubles bytes in flight per iteration while staying far under the UB, so large FP32/bf16 cases should improve with unchanged arithmetic.",
+  "change": "In _geometry replace the 16384-byte budget with a bounded 32768-byte budget and raise the element cap to 16384: cap = min(16384, max(64, 32768 // itemsize)) -> fp32 8192 elem (32KB), fp16/bf16 16384 elem (32KB). The small-input branch (n <= cap) keeps the same power-of-two rounding and grid stays min(num_vectorcore, ceil(n/block)). Per-program UB use is bounded at 32KB in + 32KB out (+ one 32KB fp32 staging buffer for the fp32 path). Kernel math (_value magic rounding, div_rn), the fast-path ABI and launch caching are untouched.",
+  "expected": "FP32 4096x4096 should move back toward the previously observed ~86.94us (about 1.15x vs the 102.37us reference) instead of 105.50us; bf16 4096x4096 (currently 0.809, worst ranked case) should gain from the same doubled tile. Small and mid cases stay neutral because they already run a single power-of-two block. Risk: at 32KB load/store overlap may degrade, which would reappear as a FP32-large regression.",
+  "validation": "Tool-bridge preflight of candidate.py for compile/ABI/entry checks, then the formal full KGS contract through the bridge; compare candidate_us for fp32 4096x4096, bf16 4096x4096, fp32 65536 and fp32 1048576 against the recorded numbers, and confirm the small cases stay flat. No simulator was used, so no simulator evidence is claimed.",
+  "alternatives": [],
+  "discriminating_observation": "",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

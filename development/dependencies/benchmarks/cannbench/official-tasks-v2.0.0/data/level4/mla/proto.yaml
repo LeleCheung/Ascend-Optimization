@@ -1,0 +1,79 @@
+attrs:
+- default: 1
+  description: KV 头数
+  name: numKVHeads
+  required: true
+  type: int
+- default: -1.0
+  description: 缩放因子，<=0 时自动使用 1/sqrt(d_nope + d_rope)
+  name: scaleValue
+  required: false
+  type: float
+- default: BSND
+  description: 输入输出 layout，"BSND" 或 "BNSD"
+  name: inputLayout
+  required: false
+  type: str
+- default: false
+  description: 是否启用因果掩码（右下角对齐），True 时仅计算 attention 矩阵中 j <= i + (S_kv - S) 的位置
+  name: is_causal
+  required: false
+  type: bool
+category: FusedComposite
+description: 多头潜在注意力 (Multi-Head Latent Attention)，Q 和 K 均分为 nope/rope 两部分拼接；v 与 k_nope
+  在数值上完全相同 (共享 latent KV cache)，接口保留独立入参以兼容通用 attention API；支持 BSND/BNSD layout
+difficulty: L4
+formula: 'Q = concat(Q_nope, Q_rope)   dim: d_nope + d_rope
+
+  K = concat(K_nope, K_rope)   dim: d_nope + d_rope
+
+  V = K_nope                    dim: d_nope        (语义上等价)
+
+  y = softmax(Q @ K^T * scaleValue) @ V
+
+  '
+inputs:
+- description: query 的 nope 部分
+  dtype:
+  - float16
+  - bfloat16
+  name: q_nope
+  shape: 'BSND: [B, S, N_q, d_nope]；BNSD: [B, N_q, S, d_nope]'
+- description: query 的 rope 部分
+  dtype:
+  - float16
+  - bfloat16
+  name: q_rope
+  shape: 'BSND: [B, S, N_q, d_rope]；BNSD: [B, N_q, S, d_rope]'
+- description: key 的 nope 部分
+  dtype:
+  - float16
+  - bfloat16
+  name: k_nope
+  shape: 'BSND: [B, S_kv, N_kv, d_nope]；BNSD: [B, N_kv, S_kv, d_nope]'
+- description: key 的 rope 部分
+  dtype:
+  - float16
+  - bfloat16
+  name: k_rope
+  shape: 'BSND: [B, S_kv, N_kv, d_rope]；BNSD: [B, N_kv, S_kv, d_rope]'
+- description: 值张量，head dim 为 d_nope。语义上 v 与 k_nope 数值完全相同 (共享同一份 latent KV cache，生产环境中即同一段
+    HBM)；接口保留独立入参以兼容通用 attention API
+  dtype:
+  - float16
+  - bfloat16
+  name: v
+  shape: 'BSND: [B, S_kv, N_kv, d_nope]；BNSD: [B, N_kv, S_kv, d_nope]'
+name: MLA
+outputs:
+- description: 注意力输出张量，head dim 为 d_nope
+  dtype:
+  - float16
+  - bfloat16
+  name: y
+  shape: 'BSND: [B, S, N_q, d_nope]；BNSD: [B, N_q, S, d_nope]'
+schema: mla(Tensor q_nope, Tensor q_rope, Tensor k_nope, Tensor k_rope, Tensor v,
+  int numKVHeads=1, float scaleValue=-1.0, str inputLayout="BSND", bool is_causal=False)
+  -> Tensor y
+shape_support: 'BSND: q_nope/v [B, S, N, d_nope]，q_rope [B, S, N, d_rope]，k_nope [B,
+  S_kv, N_kv, d_nope]，k_rope [B, S_kv, N_kv, d_rope]；BNSD 对应交换 S 和 N 维度'

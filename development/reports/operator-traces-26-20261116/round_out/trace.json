@@ -1,0 +1,579 @@
+{
+  "operator": "round_out",
+  "kind": "saved_ledger_attempt_order",
+  "selected_source": {
+    "path": "/data/hanle/ascend-optimization/runs/strict-night-20261102/kg-runs/round_out-strict-night-20261102-attempt-1/stages/optimize/work/.ledger.json",
+    "sha256": "009743b303a70c3a5f7841b3e1181e0f840ce7194282f3db043978d21d3fa486"
+  },
+  "points": [
+    {
+      "id": "round_out:round-1",
+      "score": 0.6220013871657709,
+      "source_sha256": "9624900771b248e310101e9a5628ee84dcf57718ce6ad9ef6c0b99cbe3dd3cba",
+      "method": "本批起点",
+      "raw": {
+        "ledger_sha256": "009743b303a70c3a5f7841b3e1181e0f840ce7194282f3db043978d21d3fa486",
+        "round": 1,
+        "source_sha256": "9624900771b248e310101e9a5628ee84dcf57718ce6ad9ef6c0b99cbe3dd3cba",
+        "evaluation": {
+          "evaluated_at": "2026-11-02T15:59:50.628321Z",
+          "status": "PASSED",
+          "geo_mean": 0.6220013871657709,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "baseline",
+          "strategy": "Establish the measured baseline of the provided seed implementation (per-program flat kernel, BLOCK<=4096, FP32 magic-constant rounding with abs/sign restore).",
+          "code_changes": "None: the seed source is submitted verbatim as tmp/main.py.",
+          "hypothesis": "The seed's 4096-element per-program grid leaves large 4096x4096 workloads far behind the CANN reference; baseline will quantify per-workload gaps.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "establish_baseline",
+            "mechanism": "No change; establishes reference point for later rounds."
+          },
+          "source": {
+            "origin": "baseline",
+            "parent_round_num": null
+          },
+          "key_params": {},
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "pending",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 1,
+          "expectation_status": "baseline",
+          "root_cause": "Baseline of the provided seed: one 4096-element program per tile (4096 programs on the 4096x4096 cases), FP32 magic-constant rounding with abs/sign-restore plus NaN/Inf select. Small workloads sit at 0.83-0.89 (host launch overhead dominated, ~16-17us vs ~14us reference). Large workloads collapse: timing-3 0.192 (163us vs 31.5us), timing-7 0.116 (165us vs 19.1us), timing-11 0.531 (177us vs 94us).",
+          "perf_gap_analysis": "Expected an established baseline only. Observed geo_mean 0.6220 with min_speedup 0.1158 on round_out-timing-7. The gap is concentrated in the three 4096x4096 workloads, where the per-block fan-out (4096 programs) plus a ~12-vector-instruction rounding sequence per element leaves the kernel far from the reference's 40-program streaming kernel (independent paired msprof: reference aiv_mte2_ratio 0.85 vs candidate 0.175, GM_to_UB bandwidth 32.5 GB/s per block vs 4.4 GB/s per block, same total GM_to_UB bytes). Small workloads lose 2-3us of wall time to wrapper/launch overhead, which matters because 10 of 12 timing workloads are small.",
+          "next_suggestion": "Replace the per-tile program model with a vector-core persistent streaming loop (grid = reported num_vectorcore) over unmasked full blocks plus a masked tail, and cut the rounding sequence from ~12 vector ops to ~4: use the (x + 1.5*2^23) - 1.5*2^23 magic constant, which is round-half-to-even for negative and positive operands alike and propagates NaN/Inf naturally, dropping abs/sign-restore and the NaN/Inf select.",
+          "optimization_level": "L1_architecture",
+          "debug_lesson": "",
+          "strategy_evolution": "Baseline recorded; next round changes both the program geometry (streaming persistent kernel) and the per-element arithmetic (2-op magic constant).",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "round_out:round-2",
+      "score": 1.0226070695584362,
+      "source_sha256": "e67b73611626207b7e8c25247173d2d98f7be0ed0f1b68fe328653f3e2ca1819",
+      "method": "流式循环与舍入简化",
+      "raw": {
+        "ledger_sha256": "009743b303a70c3a5f7841b3e1181e0f840ce7194282f3db043978d21d3fa486",
+        "round": 2,
+        "source_sha256": "e67b73611626207b7e8c25247173d2d98f7be0ed0f1b68fe328653f3e2ca1819",
+        "evaluation": {
+          "evaluated_at": "2026-11-02T16:10:25.589027Z",
+          "status": "PASSED",
+          "geo_mean": 1.0226070695584362,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Replace the 4096-element fan-out with a vector-core persistent streaming loop and cut the rounding sequence to two FP32 adds using the (x + 1.5*2^23) - 1.5*2^23 half-to-even identity.",
+          "code_changes": "tmp/main.py rewritten: (1) _round_stream persistent kernel, grid = min(num_vectorcore=40, cdiv(n,BLOCK)), unmasked full-tile loop with step = num_programs*BLOCK plus one masked tail tile, BLOCK=8192 for n>8192 and next_pow2(n) below that; (2) _value replaced by the 2-op FP32 magic constant (x+12582912.0)-12582912.0 (decimals!=0 keeps mul/round/div_rn), dropping abs, sign bit restore, the >=2^23 select and the NaN/Inf select; (3) host side uses the raw NPULauncher with three int grid args (verified signature and numeric match in a bounded debug job) behind a single-slot identity-checked fast path; (4) non-contiguous path unchanged in spirit (_round_strided with real strides).",
+          "hypothesis": "The 4096x4096 workloads are limited by per-block launch/MTE organization plus a ~12-instruction rounding sequence; a 40-program persistent streaming kernel with a 2-op magic-constant rounding removes both, while the raw launcher trims small-input host overhead.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Per-element vector work drops from ~12 FP32 ops to 2 (debug: full fp16/bf16 domain bit-exact vs torch.round, fp32 adversarial 0 mismatches), and 4096 programs collapse to 40 persistent programs, so the memory-bound 4096x4096 cases should move from 163/165/177us to about 59/60/94us per the debug microbenchmark."
+          },
+          "source": {
+            "origin": "coder",
+            "parent_round_num": null
+          },
+          "key_params": {
+            "BLOCK": 8192,
+            "grid": 40,
+            "magic": 12582912
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "failed",
+          "analysis_path": ".kernelgen/profile-analysis/round-0002.json",
+          "summary": "failed: msprof base collection exited successfully without profile completion marker (round_out-timing-7 profile_id 0b94062d16c8487abbf1affd8b89339c and round_out-timing-3 profile_id bf3c6ee6b3c14b0b8afe6b038d2d9c95 both status=failed, artifacts=[], metrics={}, empty per-result capabilities). Zero round-2 device counters were produced, so no counter-backed finding can be registered; the analysis below rests on the frozen round-1 paired msprof counters, the round-1/round-2 eval snapshots and targ"
+        },
+        "conclusion": {
+          "round_num": 2,
+          "expectation_status": "met",
+          "root_cause": "The remaining bottleneck is 16-bit streaming organization, not arithmetic: with 40 persistent programs and unmasked 16KB full tiles the per-core GM->UB rate reaches ~34.9GB/s on bf16 versus ~43.0GB/s for the reference, and the single-stage loop gives no load/compute overlap. Small workloads are already at or above the reference and sit on a fixed ~13.5us host floor.",
+          "perf_gap_analysis": "Predicted 59/60/94us for the three 4096x4096 cases from the debug microbenchmark; observed 21.2/23.5/105.7us and geo_mean 1.0226 vs the 0.622 baseline. The prediction was wrong in the favorable direction because the debug microbenchmark used the JIT kernel[grid] path, which a later probe measured at ~59.8us of pure host cost per call, so those numbers were host-bound and not device evidence. The observed per-workload direction matched the hypothesis: timing-3 went 163.4->21.2us (0.19->1.48), timing-7 165.3->23.5us (0.116->0.811), timing-11 177.5->105.7us (0.531->1.012), and every small workload moved from 0.83-0.89 to 0.97-1.03 through the raw launcher. The residual gap is timing-7 only: bf16 4096x4096 is 4.4us behind the reference and is streaming-bound rather than vector-bound (fp16 vs bf16 at identical bytes, grid and BLOCK differ by only ~2.3us, so the whole convert+2-add charge is <=10% of the block time; the round-1 paired profile shows the reference is MTE2-dominated at ~22.8KB per MTE2 burst and ~37.7GB/s active).",
+          "next_suggestion": "Pipeline only the 16-bit streaming path: tl.range(pid*BLOCK, full, step, num_stages=2) with BLOCK=8192 and grid=40 unchanged, leaving fp32 at one stage (a 2-stage fp32 path would need ~192KB UB). Verify in the compiled artifact that a second load buffer actually materialized and confirm timing-11 does not regress.",
+          "optimization_level": "L2_memory",
+          "debug_lesson": "Microbenchmarks that launch through JIT kernel[grid] measure host cost (~60us/call here), not device time; only the raw launcher plus a long loop reproduces eval-representative latency. Also: native fp16/bf16 magic arithmetic is numerically invalid (fp16 overflows to Inf near 65504, bf16 sub-rounds small values), confirmed by a full-domain sweep.",
+          "strategy_evolution": "Architecture is now a persistent 40-program streaming kernel with a 2-op rounding identity; remaining work is pipeline depth (and only for the 16-bit path), not op count or partition style.",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "round_out:round-3",
+      "score": 0.9868466178482644,
+      "source_sha256": "b22c083f1a540055a872d19e66875c9da060732a2e352c23c198ea2a37d16948",
+      "method": "双阶段流水尝试",
+      "raw": {
+        "ledger_sha256": "009743b303a70c3a5f7841b3e1181e0f840ce7194282f3db043978d21d3fa486",
+        "round": 3,
+        "source_sha256": "b22c083f1a540055a872d19e66875c9da060732a2e352c23c198ea2a37d16948",
+        "evaluation": {
+          "evaluated_at": "2026-11-02T16:19:26.699679Z",
+          "status": "PASSED",
+          "geo_mean": 0.9868466178482644,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Pipeline only the 16-bit streaming loop with two stages to overlap DMA and vector work, leaving the fp32 path single-stage.",
+          "code_changes": "Added _round_pipe, an otherwise identical copy of _round_stream whose full-tile loop uses tl.range(..., num_stages=2) so the next GM->UB load overlaps the current tile's convert+2-add+store. _build selects _round_pipe for float16/bfloat16 and keeps the single-stage _round_stream for float32 (a 2-stage fp32 path would need about 192KB UB). BLOCK=8192, grid=min(40, cdiv(n,BLOCK)), raw-launcher argument layout unchanged (xp, yp, n, decimals, block).",
+          "hypothesis": "The 16-bit streaming path is limited by a single-stage loop with no load/compute overlap (bf16 at ~34.9GB/s vs reference ~43.0GB/s per core); pipelining two stages should recover most of that gap without touching arithmetic or partition style.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Overlapping the 16KB next-tile DMA with vector work raises effective GM->UB rate toward the reference's ~43GB/s per core; timing-7 bf16 4096x4096 should fall from 23.5us toward ~20.5us and timing-3 fp16 from 21.2us toward ~19us."
+          },
+          "source": {
+            "origin": "profile_next_experiment",
+            "parent_round_num": 2
+          },
+          "key_params": {
+            "BLOCK": 8192,
+            "grid": 40,
+            "num_stages": 2
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": false,
+          "status": "not_required",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 3,
+          "expectation_status": "not_met",
+          "root_cause": "The 16-bit streaming loop is not limited by load/compute overlap: adding a second pipeline stage materialized no gain, and the residual bf16 4096x4096 gap (23.5us vs reference 19.3us) must come from DMA burst organization, per-core concurrency, or the dtype conversion path rather than from pipeline depth.",
+          "perf_gap_analysis": "Two-stage pipelining produced no measurable change on the workloads it targeted: timing-3 fp16 4096x4096 21.258us vs 21.240us in round 2, timing-7 bf16 4096x4096 23.566us vs 23.492us, timing-11 fp32 105.7us vs 106.3us (fp32 was deliberately left single-stage). All 18 correctness workloads still passed, so the change was neutral-to-slightly-negative rather than harmful. The aggregate fell from 1.0226 to 0.9868 mainly because the reference itself measured faster in this run (small-workload references 13.23-13.53us here vs 13.67-14.05us in round 2) while candidate small latencies stayed at 13.20-14.88us; the reference shift is run-to-run drift, not a candidate regression. Conclusion: the single-stage loop was already at the streaming limit for the 16-bit path, so pipeline depth is not the residual bottleneck; the predicted 3us bf16 gain did not exist.",
+          "next_suggestion": "Revert to the single-stage kernel (round 2). Before spending another round, measure with the raw launcher (device-dominated, unlike the JIT path) the pure load/store copy floor for bf16 4096x4096 plus BLOCK in {4096, 8192, 16384}, grid in {20, 40, 80}, and a max_contiguous/multiple_of alignment hint variant, to separate a conversion cost from a DMA-organization limit.",
+          "optimization_level": "L2_memory",
+          "debug_lesson": "num_stages on tl.range neither helped nor hurt on this backend for this kernel; the JIT-vs-raw-launcher distinction (60us vs 13.4us host cost) must be respected when designing any device-time microbenchmark.",
+          "strategy_evolution": "Pipelining is a dead end; the next probe isolates the streaming floor (pure copy) and DMA-organization parameters (tile size, grid, alignment hints) before another round.",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "round_out:round-4",
+      "score": 0.9846892247480565,
+      "source_sha256": "2074745f531b8c7230af397ea3bf2d48739acb988eae3d47477dc0b982e96c48",
+      "method": "扩大16位分块：未提升",
+      "raw": {
+        "ledger_sha256": "009743b303a70c3a5f7841b3e1181e0f840ce7194282f3db043978d21d3fa486",
+        "round": 4,
+        "source_sha256": "2074745f531b8c7230af397ea3bf2d48739acb988eae3d47477dc0b982e96c48",
+        "evaluation": {
+          "evaluated_at": "2026-11-02T16:23:50.967873Z",
+          "status": "PASSED",
+          "geo_mean": 0.9846892247480565,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Raise the streaming tile to 16384 elements on the 16-bit path only, which the device-level probe showed to be ~5% faster than 8192 at grid=40.",
+          "code_changes": "In _geometry, the streaming tile cap is now dtype dependent: 16-bit (float16/bfloat16) inputs use BLOCK=16384, float32 keeps BLOCK=8192 (a 16384 fp32 tile would need ~192KB UB). Everything else (grid=min(40, cdiv(n,BLOCK)), single-stage loop, tail tile, 2-op magic rounding, raw launcher) is unchanged from the round-2 best.",
+          "hypothesis": "The residual 16-bit streaming gap is per-tile transfer/handshake overhead rather than pipeline depth; a 32KB tile should lift timing-7 from 23.5us toward 22.3us and timing-3 from 21.2us toward 20.3us.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Doubling the 16-bit tile to 32KB per GM<->UB burst and per program iteration reduces per-tile instruction and handshake overhead; device-side probe measured bf16 4096x4096 at 23.09us with BLOCK=16384 versus 24.32us with BLOCK=8192 (same protocol, host floor 11.35us)."
+          },
+          "source": {
+            "origin": "coder",
+            "parent_round_num": null
+          },
+          "key_params": {
+            "BLOCK_16bit": 16384,
+            "BLOCK_fp32": 8192,
+            "grid": 40
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": false,
+          "status": "not_required",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 4,
+          "expectation_status": "partially_met",
+          "root_cause": "The 16-bit tile change works as intended (about 1us on each large 16-bit case) but is smaller than the run-to-run measurement drift of the shared device, and 9 of 12 timing workloads are pinned at a ~13.5us host/launch floor where the candidate already sits within 0.3-0.6us of the reference.",
+          "perf_gap_analysis": "Both targeted predictions held at the workload level: timing-7 bf16 4096x4096 fell from 23.492us to 22.494us (speedup 0.8113 -> 0.8549) and timing-3 fp16 from 21.240us to 20.334us (1.4794 -> 1.5512); timing-6 bf16 1M also improved 14.624 -> 13.372us. The aggregate nevertheless fell (1.0226 -> 0.9847) because the untargeted, floor-bound cases compared against a faster reference this run: reference small-case latencies were 12.96-13.90us here versus 13.67-14.16us in round 2, and timing-11 (an unchanged fp32 code path) moved 105.7 -> 96.3us alongside its reference 107.0 -> 92.7us. That reference-side drift of 4-9% exceeded the ~4% aggregate effect of the tile change.",
+          "next_suggestion": "Re-apply the 16-bit BLOCK=16384 tile (device-verified win on the three 16-bit timing cases) together with a slimmer host launch path, and stop chasing sub-microsecond host-floor effects afterwards.",
+          "optimization_level": "L3_parameter",
+          "debug_lesson": "Device-level microbenchmarks must use the raw launcher; with it, the bf16 4096x4096 streaming floor is a pure copy at 15.3us versus 23.8us with the 2-add rounding, and each extra FP32 vector pass costs about 4us, which is why op count matters more than tile size on the 16-bit path.",
+          "strategy_evolution": "Tile tuning is now understood: BLOCK=16384 for 16-bit is the best streaming tile, grid=40 is optimal, and the remaining work is host-path slimming plus combining both verified wins in one candidate.",
+          "knowledge_assessments": []
+        }
+      }
+    }
+  ],
+  "view": {
+    "id": "mainline",
+    "session": "round_out",
+    "title": "round_out 优化轨迹",
+    "subtitle": "历史 KGS 参考 · 本批 4 次正式评测",
+    "ylim": [
+      0,
+      1.2
+    ],
+    "annotations": [
+      {
+        "point": 2,
+        "method": "流式循环与舍入简化",
+        "color": "probe",
+        "position": [
+          220,
+          285
+        ],
+        "arrow": [
+          540,
+          325
+        ]
+      },
+      {
+        "point": 3,
+        "method": "双阶段流水尝试",
+        "color": "probe",
+        "position": [
+          930,
+          285
+        ],
+        "arrow": [
+          1210,
+          325
+        ]
+      },
+      {
+        "point": 4,
+        "method": "扩大16位分块：未提升",
+        "color": "probe",
+        "position": [
+          220,
+          775
+        ],
+        "arrow": [
+          540,
+          730
+        ]
+      }
+    ],
+    "legend": [
+      "paired",
+      "sim",
+      "knowledge",
+      "probe",
+      "ir"
+    ],
+    "gap": null,
+    "x_label": "本批正式评测顺序",
+    "plot_bottom": 650,
+    "nodes": [
+      {
+        "point": 1,
+        "location": "mixed"
+      },
+      {
+        "point": 2,
+        "location": "device"
+      },
+      {
+        "point": 3,
+        "location": "device"
+      },
+      {
+        "point": 4,
+        "location": "device"
+      }
+    ],
+    "delivery": {
+      "score": 0.9164535037019819,
+      "source": "operators/round_out/versions/independent_strict/retained/kernel.py",
+      "source_sha256": "3107d0133832158b73bfa0b456ba4fe2ffb599e1773e14085cb686361a1efe84",
+      "passed": 30,
+      "total": 30,
+      "result": "operators/round_out/evidence/retained/evaluation/result.json",
+      "result_sha256": "3c078297f99ce54f15f6fd2e6d24f4345f1741d82375d4beb2a3b9d5f41e6788",
+      "endpoint_same_source": false
+    },
+    "result_only": false,
+    "line_status": "下图：历史优化片段"
+  },
+  "history": [
+    {
+      "ledger_sha256": "9cd96bef3bc667f2ac0fda86136a0da2626657360e7fc884c9e97ab1f4744bde",
+      "round": 1,
+      "source_sha256": "39dd6a26980fd70ba33f5f552b61c46a1128b72198c3d4772a89a66545b4e935",
+      "evaluation": {
+        "evaluated_at": "2026-10-29T20:36:20.355457Z",
+        "status": "PASSED",
+        "geo_mean": 0.4911116728069753,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Evaluate the provided seed (non-contiguous-safe FP32 ties-to-even round with cached direct launch) unchanged",
+        "code_changes": "None; tmp/main.py is byte-identical to the seed (kernel_sha256 39dd6a26...)",
+        "hypothesis": "Seed passes all 30 workloads but is far below the torch reference on the 4096x4096 cases because _round_value emits ~24 vector ops per element (floor/fraction/int32 parity selects); baseline measurement is needed to quantify the per-workload gap before changing the rounding formula",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "Reference measurement of the unchanged seed"
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {},
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "failed",
+        "analysis_path": ".kernelgen/profile-analysis/round-0001.json",
+        "summary": "failed: msprof base collection exited successfully without profile completion marker (5/5 collection attempts across 5 workloads and both levels; 0 artifacts, 0 metrics, capabilities [] returned for every profile)"
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "Two regimes. (a) 4096x4096 cases (t3/t7/t11): measured 0.26895 / 0.27153 / 0.27835 ms with only a 4.7% spread across fp16/bf16/fp32 even though fp32 moves 2x the bytes in each direction, so the time is not MTE-bound but is governed by the dtype-independent FP32 per-element vector-op count of _round_value (abs/floor/sub/tl.minimum/int32 cast/parity and/eq/ne/or/3x tl.where/2x bitcast/2x guard where, ~20-24 vector ops after the up-convert). (b) N<=1048576 cases (9 workloads): 16.5-19.4 us against a 12.4-14.5 us reference, flat across a 1024x range in N, so the 2.6-4.7 us gap is a constant host-dispatch/launch cost, not workload work. Profiler (msprof) produced zero artifacts on 5 attempts (base collection never signaled completion), so no counter-level pipeline split is available; the dtype-flatness argument above is eval-latency evidence only.",
+        "perf_gap_analysis": "geo_mean 0.4911 with all 30/30 workloads passing and matched_ratio 1.0. The three large workloads carry the whole deficit: t3 0.1169, t7 0.0705, t11 0.3552 versus 0.643-0.846 for the nine small ones. Reference latency itself scales with bytes on the large cases (0.0314 fp16 / 0.0191 bf16 / 0.0988 fp32), i.e. the reference sits near cache-bandwidth rates, while the candidate is pinned at ~0.27 ms regardless of dtype: eliminating the arithmetic redundancy is the only lever with enough range to move the geometric mean, and the small-case ceiling (<=4.7 us of host overhead) is worth at most a few percent.",
+        "next_suggestion": "Replace the floor/fraction/int32-parity/3x-select RNE core of _round_value with the magic-constant form: r = (|v| + 2^23) - 2^23 (the add is exact RNE at ulp=1 for all |v| < 2^23, and the existing passthrough select at |v| >= 2^23 covers the already-integral range), drop the redundant NaN/Inf guard because NaN falls through the compare and Inf takes the passthrough branch, and keep abs() plus the sign-bit re-application (the magic path yields +0.0 for small negative inputs while round(-0.4) must be -0.0). Keep the DECIMALS!=0 scale/div_rn tail. This cuts ~24 ops/element to ~9 and removes several live FP32 temporaries; if the large cases do not drop by at least ~40%, the ALU-op hypothesis is falsified and the next attack must be block/UB geometry or a single-instruction RNE intrinsic (tl.math.rint / round-to-nearest-even convert) instead.",
+        "optimization_level": "L1_architecture",
+        "debug_lesson": "For this operator the dtype-flatness of the candidate latency across fp16/bf16/fp32 is by itself a discriminating signal: an MTE-bound kernel cannot be flat against a byte-scaling reference. msprof collection currently fails at the base stage on this server, so plan to discriminate hypotheses with eval-latency structure plus bounded debug microbenchmarks rather than pipeline counters.",
+        "strategy_evolution": "",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "009743b303a70c3a5f7841b3e1181e0f840ce7194282f3db043978d21d3fa486",
+      "round": 1,
+      "source_sha256": "9624900771b248e310101e9a5628ee84dcf57718ce6ad9ef6c0b99cbe3dd3cba",
+      "evaluation": {
+        "evaluated_at": "2026-11-02T15:59:50.628321Z",
+        "status": "PASSED",
+        "geo_mean": 0.6220013871657709,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Establish the measured baseline of the provided seed implementation (per-program flat kernel, BLOCK<=4096, FP32 magic-constant rounding with abs/sign restore).",
+        "code_changes": "None: the seed source is submitted verbatim as tmp/main.py.",
+        "hypothesis": "The seed's 4096-element per-program grid leaves large 4096x4096 workloads far behind the CANN reference; baseline will quantify per-workload gaps.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "No change; establishes reference point for later rounds."
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {},
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "Baseline of the provided seed: one 4096-element program per tile (4096 programs on the 4096x4096 cases), FP32 magic-constant rounding with abs/sign-restore plus NaN/Inf select. Small workloads sit at 0.83-0.89 (host launch overhead dominated, ~16-17us vs ~14us reference). Large workloads collapse: timing-3 0.192 (163us vs 31.5us), timing-7 0.116 (165us vs 19.1us), timing-11 0.531 (177us vs 94us).",
+        "perf_gap_analysis": "Expected an established baseline only. Observed geo_mean 0.6220 with min_speedup 0.1158 on round_out-timing-7. The gap is concentrated in the three 4096x4096 workloads, where the per-block fan-out (4096 programs) plus a ~12-vector-instruction rounding sequence per element leaves the kernel far from the reference's 40-program streaming kernel (independent paired msprof: reference aiv_mte2_ratio 0.85 vs candidate 0.175, GM_to_UB bandwidth 32.5 GB/s per block vs 4.4 GB/s per block, same total GM_to_UB bytes). Small workloads lose 2-3us of wall time to wrapper/launch overhead, which matters because 10 of 12 timing workloads are small.",
+        "next_suggestion": "Replace the per-tile program model with a vector-core persistent streaming loop (grid = reported num_vectorcore) over unmasked full blocks plus a masked tail, and cut the rounding sequence from ~12 vector ops to ~4: use the (x + 1.5*2^23) - 1.5*2^23 magic constant, which is round-half-to-even for negative and positive operands alike and propagates NaN/Inf naturally, dropping abs/sign-restore and the NaN/Inf select.",
+        "optimization_level": "L1_architecture",
+        "debug_lesson": "",
+        "strategy_evolution": "Baseline recorded; next round changes both the program geometry (streaming persistent kernel) and the per-element arithmetic (2-op magic constant).",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "009743b303a70c3a5f7841b3e1181e0f840ce7194282f3db043978d21d3fa486",
+      "round": 2,
+      "source_sha256": "e67b73611626207b7e8c25247173d2d98f7be0ed0f1b68fe328653f3e2ca1819",
+      "evaluation": {
+        "evaluated_at": "2026-11-02T16:10:25.589027Z",
+        "status": "PASSED",
+        "geo_mean": 1.0226070695584362,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Replace the 4096-element fan-out with a vector-core persistent streaming loop and cut the rounding sequence to two FP32 adds using the (x + 1.5*2^23) - 1.5*2^23 half-to-even identity.",
+        "code_changes": "tmp/main.py rewritten: (1) _round_stream persistent kernel, grid = min(num_vectorcore=40, cdiv(n,BLOCK)), unmasked full-tile loop with step = num_programs*BLOCK plus one masked tail tile, BLOCK=8192 for n>8192 and next_pow2(n) below that; (2) _value replaced by the 2-op FP32 magic constant (x+12582912.0)-12582912.0 (decimals!=0 keeps mul/round/div_rn), dropping abs, sign bit restore, the >=2^23 select and the NaN/Inf select; (3) host side uses the raw NPULauncher with three int grid args (verified signature and numeric match in a bounded debug job) behind a single-slot identity-checked fast path; (4) non-contiguous path unchanged in spirit (_round_strided with real strides).",
+        "hypothesis": "The 4096x4096 workloads are limited by per-block launch/MTE organization plus a ~12-instruction rounding sequence; a 40-program persistent streaming kernel with a 2-op magic-constant rounding removes both, while the raw launcher trims small-input host overhead.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Per-element vector work drops from ~12 FP32 ops to 2 (debug: full fp16/bf16 domain bit-exact vs torch.round, fp32 adversarial 0 mismatches), and 4096 programs collapse to 40 persistent programs, so the memory-bound 4096x4096 cases should move from 163/165/177us to about 59/60/94us per the debug microbenchmark."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": null
+        },
+        "key_params": {
+          "BLOCK": 8192,
+          "grid": 40,
+          "magic": 12582912
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "failed",
+        "analysis_path": ".kernelgen/profile-analysis/round-0002.json",
+        "summary": "failed: msprof base collection exited successfully without profile completion marker (round_out-timing-7 profile_id 0b94062d16c8487abbf1affd8b89339c and round_out-timing-3 profile_id bf3c6ee6b3c14b0b8afe6b038d2d9c95 both status=failed, artifacts=[], metrics={}, empty per-result capabilities). Zero round-2 device counters were produced, so no counter-backed finding can be registered; the analysis below rests on the frozen round-1 paired msprof counters, the round-1/round-2 eval snapshots and targ"
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "met",
+        "root_cause": "The remaining bottleneck is 16-bit streaming organization, not arithmetic: with 40 persistent programs and unmasked 16KB full tiles the per-core GM->UB rate reaches ~34.9GB/s on bf16 versus ~43.0GB/s for the reference, and the single-stage loop gives no load/compute overlap. Small workloads are already at or above the reference and sit on a fixed ~13.5us host floor.",
+        "perf_gap_analysis": "Predicted 59/60/94us for the three 4096x4096 cases from the debug microbenchmark; observed 21.2/23.5/105.7us and geo_mean 1.0226 vs the 0.622 baseline. The prediction was wrong in the favorable direction because the debug microbenchmark used the JIT kernel[grid] path, which a later probe measured at ~59.8us of pure host cost per call, so those numbers were host-bound and not device evidence. The observed per-workload direction matched the hypothesis: timing-3 went 163.4->21.2us (0.19->1.48), timing-7 165.3->23.5us (0.116->0.811), timing-11 177.5->105.7us (0.531->1.012), and every small workload moved from 0.83-0.89 to 0.97-1.03 through the raw launcher. The residual gap is timing-7 only: bf16 4096x4096 is 4.4us behind the reference and is streaming-bound rather than vector-bound (fp16 vs bf16 at identical bytes, grid and BLOCK differ by only ~2.3us, so the whole convert+2-add charge is <=10% of the block time; the round-1 paired profile shows the reference is MTE2-dominated at ~22.8KB per MTE2 burst and ~37.7GB/s active).",
+        "next_suggestion": "Pipeline only the 16-bit streaming path: tl.range(pid*BLOCK, full, step, num_stages=2) with BLOCK=8192 and grid=40 unchanged, leaving fp32 at one stage (a 2-stage fp32 path would need ~192KB UB). Verify in the compiled artifact that a second load buffer actually materialized and confirm timing-11 does not regress.",
+        "optimization_level": "L2_memory",
+        "debug_lesson": "Microbenchmarks that launch through JIT kernel[grid] measure host cost (~60us/call here), not device time; only the raw launcher plus a long loop reproduces eval-representative latency. Also: native fp16/bf16 magic arithmetic is numerically invalid (fp16 overflows to Inf near 65504, bf16 sub-rounds small values), confirmed by a full-domain sweep.",
+        "strategy_evolution": "Architecture is now a persistent 40-program streaming kernel with a 2-op rounding identity; remaining work is pipeline depth (and only for the 16-bit path), not op count or partition style.",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "009743b303a70c3a5f7841b3e1181e0f840ce7194282f3db043978d21d3fa486",
+      "round": 3,
+      "source_sha256": "b22c083f1a540055a872d19e66875c9da060732a2e352c23c198ea2a37d16948",
+      "evaluation": {
+        "evaluated_at": "2026-11-02T16:19:26.699679Z",
+        "status": "PASSED",
+        "geo_mean": 0.9868466178482644,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Pipeline only the 16-bit streaming loop with two stages to overlap DMA and vector work, leaving the fp32 path single-stage.",
+        "code_changes": "Added _round_pipe, an otherwise identical copy of _round_stream whose full-tile loop uses tl.range(..., num_stages=2) so the next GM->UB load overlaps the current tile's convert+2-add+store. _build selects _round_pipe for float16/bfloat16 and keeps the single-stage _round_stream for float32 (a 2-stage fp32 path would need about 192KB UB). BLOCK=8192, grid=min(40, cdiv(n,BLOCK)), raw-launcher argument layout unchanged (xp, yp, n, decimals, block).",
+        "hypothesis": "The 16-bit streaming path is limited by a single-stage loop with no load/compute overlap (bf16 at ~34.9GB/s vs reference ~43.0GB/s per core); pipelining two stages should recover most of that gap without touching arithmetic or partition style.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Overlapping the 16KB next-tile DMA with vector work raises effective GM->UB rate toward the reference's ~43GB/s per core; timing-7 bf16 4096x4096 should fall from 23.5us toward ~20.5us and timing-3 fp16 from 21.2us toward ~19us."
+        },
+        "source": {
+          "origin": "profile_next_experiment",
+          "parent_round_num": 2
+        },
+        "key_params": {
+          "BLOCK": 8192,
+          "grid": 40,
+          "num_stages": 2
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": false,
+        "status": "not_required",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 3,
+        "expectation_status": "not_met",
+        "root_cause": "The 16-bit streaming loop is not limited by load/compute overlap: adding a second pipeline stage materialized no gain, and the residual bf16 4096x4096 gap (23.5us vs reference 19.3us) must come from DMA burst organization, per-core concurrency, or the dtype conversion path rather than from pipeline depth.",
+        "perf_gap_analysis": "Two-stage pipelining produced no measurable change on the workloads it targeted: timing-3 fp16 4096x4096 21.258us vs 21.240us in round 2, timing-7 bf16 4096x4096 23.566us vs 23.492us, timing-11 fp32 105.7us vs 106.3us (fp32 was deliberately left single-stage). All 18 correctness workloads still passed, so the change was neutral-to-slightly-negative rather than harmful. The aggregate fell from 1.0226 to 0.9868 mainly because the reference itself measured faster in this run (small-workload references 13.23-13.53us here vs 13.67-14.05us in round 2) while candidate small latencies stayed at 13.20-14.88us; the reference shift is run-to-run drift, not a candidate regression. Conclusion: the single-stage loop was already at the streaming limit for the 16-bit path, so pipeline depth is not the residual bottleneck; the predicted 3us bf16 gain did not exist.",
+        "next_suggestion": "Revert to the single-stage kernel (round 2). Before spending another round, measure with the raw launcher (device-dominated, unlike the JIT path) the pure load/store copy floor for bf16 4096x4096 plus BLOCK in {4096, 8192, 16384}, grid in {20, 40, 80}, and a max_contiguous/multiple_of alignment hint variant, to separate a conversion cost from a DMA-organization limit.",
+        "optimization_level": "L2_memory",
+        "debug_lesson": "num_stages on tl.range neither helped nor hurt on this backend for this kernel; the JIT-vs-raw-launcher distinction (60us vs 13.4us host cost) must be respected when designing any device-time microbenchmark.",
+        "strategy_evolution": "Pipelining is a dead end; the next probe isolates the streaming floor (pure copy) and DMA-organization parameters (tile size, grid, alignment hints) before another round.",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "009743b303a70c3a5f7841b3e1181e0f840ce7194282f3db043978d21d3fa486",
+      "round": 4,
+      "source_sha256": "2074745f531b8c7230af397ea3bf2d48739acb988eae3d47477dc0b982e96c48",
+      "evaluation": {
+        "evaluated_at": "2026-11-02T16:23:50.967873Z",
+        "status": "PASSED",
+        "geo_mean": 0.9846892247480565,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Raise the streaming tile to 16384 elements on the 16-bit path only, which the device-level probe showed to be ~5% faster than 8192 at grid=40.",
+        "code_changes": "In _geometry, the streaming tile cap is now dtype dependent: 16-bit (float16/bfloat16) inputs use BLOCK=16384, float32 keeps BLOCK=8192 (a 16384 fp32 tile would need ~192KB UB). Everything else (grid=min(40, cdiv(n,BLOCK)), single-stage loop, tail tile, 2-op magic rounding, raw launcher) is unchanged from the round-2 best.",
+        "hypothesis": "The residual 16-bit streaming gap is per-tile transfer/handshake overhead rather than pipeline depth; a 32KB tile should lift timing-7 from 23.5us toward 22.3us and timing-3 from 21.2us toward 20.3us.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Doubling the 16-bit tile to 32KB per GM<->UB burst and per program iteration reduces per-tile instruction and handshake overhead; device-side probe measured bf16 4096x4096 at 23.09us with BLOCK=16384 versus 24.32us with BLOCK=8192 (same protocol, host floor 11.35us)."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": null
+        },
+        "key_params": {
+          "BLOCK_16bit": 16384,
+          "BLOCK_fp32": 8192,
+          "grid": 40
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": false,
+        "status": "not_required",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 4,
+        "expectation_status": "partially_met",
+        "root_cause": "The 16-bit tile change works as intended (about 1us on each large 16-bit case) but is smaller than the run-to-run measurement drift of the shared device, and 9 of 12 timing workloads are pinned at a ~13.5us host/launch floor where the candidate already sits within 0.3-0.6us of the reference.",
+        "perf_gap_analysis": "Both targeted predictions held at the workload level: timing-7 bf16 4096x4096 fell from 23.492us to 22.494us (speedup 0.8113 -> 0.8549) and timing-3 fp16 from 21.240us to 20.334us (1.4794 -> 1.5512); timing-6 bf16 1M also improved 14.624 -> 13.372us. The aggregate nevertheless fell (1.0226 -> 0.9847) because the untargeted, floor-bound cases compared against a faster reference this run: reference small-case latencies were 12.96-13.90us here versus 13.67-14.16us in round 2, and timing-11 (an unchanged fp32 code path) moved 105.7 -> 96.3us alongside its reference 107.0 -> 92.7us. That reference-side drift of 4-9% exceeded the ~4% aggregate effect of the tile change.",
+        "next_suggestion": "Re-apply the 16-bit BLOCK=16384 tile (device-verified win on the three 16-bit timing cases) together with a slimmer host launch path, and stop chasing sub-microsecond host-floor effects afterwards.",
+        "optimization_level": "L3_parameter",
+        "debug_lesson": "Device-level microbenchmarks must use the raw launcher; with it, the bf16 4096x4096 streaming floor is a pure copy at 15.3us versus 23.8us with the 2-add rounding, and each extra FP32 vector pass costs about 4us, which is why op count matters more than tile size on the 16-bit path.",
+        "strategy_evolution": "Tile tuning is now understood: BLOCK=16384 for 16-bit is the best streaming tile, grid=40 is optimal, and the remaining work is host-path slimming plus combining both verified wins in one candidate.",
+        "knowledge_assessments": []
+      }
+    }
+  ],
+  "gap": null,
+  "relation_note": "按同一原始账本正式轮次展示；未逐编辑恢复的关系不声称直接源码继承。",
+  "delivery": {
+    "score": 0.9164535037019819,
+    "source": "operators/round_out/versions/independent_strict/retained/kernel.py",
+    "source_sha256": "3107d0133832158b73bfa0b456ba4fe2ffb599e1773e14085cb686361a1efe84",
+    "passed": 30,
+    "total": 30,
+    "result": "operators/round_out/evidence/retained/evaluation/result.json",
+    "result_sha256": "3c078297f99ce54f15f6fd2e6d24f4345f1741d82375d4beb2a3b9d5f41e6788",
+    "endpoint_same_source": false
+  },
+  "current_cann_score": 0.9164535037019819,
+  "historical_simulator_files": 0
+}

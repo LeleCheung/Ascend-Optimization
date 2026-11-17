@@ -1,0 +1,90 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "81880e942e274c97b32d45d5fc6127e7",
+  "recorded_at": "2026-11-17T05:34:26.759373+00:00",
+  "round_id": "performance-01",
+  "input_source": {
+    "path": "trace/sources/f574e5e5922c54e2aac118cb39ee43443d921fa6cd0c6d697fdff310c6427e9e.py",
+    "sha256": "f574e5e5922c54e2aac118cb39ee43443d921fa6cd0c6d697fdff310c6427e9e"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/ef7dac101e14fcd525bbfbf757003af9f25eeccd797e0e329b788f45b160626d.json",
+        "sha256": "ef7dac101e14fcd525bbfbf757003af9f25eeccd797e0e329b788f45b160626d"
+      },
+      "original": {
+        "path": "workspace/current-timing.json",
+        "sha256": "ef7dac101e14fcd525bbfbf757003af9f25eeccd797e0e329b788f45b160626d"
+      },
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "The three 4096x4096 cases are the only large losses: FP16 41.69us vs CANN 16.94us (0.4063x), BF16 42.98us vs 25.28us (0.5881x), FP32 43.54us vs 25.66us (0.5894x). All 1024-65536 element cases sit at 16.2-18.3us against 16.1-16.8us CANN, i.e. near the fixed launch floor.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/ef7dac101e14fcd525bbfbf757003af9f25eeccd797e0e329b788f45b160626d.json",
+        "sha256": "ef7dac101e14fcd525bbfbf757003af9f25eeccd797e0e329b788f45b160626d"
+      },
+      "original": {
+        "path": "workspace/current-timing.json",
+        "sha256": "ef7dac101e14fcd525bbfbf757003af9f25eeccd797e0e329b788f45b160626d"
+      },
+      "category": "paired_profiling",
+      "role": "disambiguation",
+      "finding": "The three max cases take nearly the same time (41.7/43.0/43.5us) although FP16 moves half the bytes of FP32 (33.5MB vs 67MB per direction). A pure bandwidth limit would separate them; a per-iteration/task-count term shared by equal element counts matches the flat ~42us. The marginal cost of doubled bytes is only about 1.8us.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/f574e5e5922c54e2aac118cb39ee43443d921fa6cd0c6d697fdff310c6427e9e.py",
+        "sha256": "f574e5e5922c54e2aac118cb39ee43443d921fa6cd0c6d697fdff310c6427e9e"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "f574e5e5922c54e2aac118cb39ee43443d921fa6cd0c6d697fdff310c6427e9e"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "The n >= 8*40*_TILE_MAX path (_make_streaming_entry) launches 40 programs, each running a strided loop over 2*SUB elements per iteration with SUB=8192, so 16777216 elements need about 25.6 serial trips per program (1024 blocks / 40 programs).",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/f574e5e5922c54e2aac118cb39ee43443d921fa6cd0c6d697fdff310c6427e9e.py",
+        "sha256": "f574e5e5922c54e2aac118cb39ee43443d921fa6cd0c6d697fdff310c6427e9e"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "f574e5e5922c54e2aac118cb39ee43443d921fa6cd0c6d697fdff310c6427e9e"
+      },
+      "category": "source_ir",
+      "role": "background",
+      "finding": "The non-streaming pair path already compiles and runs a 32768-element live tile (SUB=16384, two 16384-element loads/stores) for FP32 at n=1048576, so 2*16384 elements per loop iteration is a proven UB footprint on this backend; it is the same _TILE_MAX geometry, not a new prefetch schedule.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/47abd9b28aa446ca87c336a0c30cf75529cb6b3f9f6f38e28d72150b5452b133.json",
+        "sha256": "47abd9b28aa446ca87c336a0c30cf75529cb6b3f9f6f38e28d72150b5452b133"
+      },
+      "original": {
+        "path": "workspace/knowledge.json",
+        "sha256": "47abd9b28aa446ca87c336a0c30cf75529cb6b3f9f6f38e28d72150b5452b133"
+      },
+      "category": "knowledge",
+      "role": "background",
+      "finding": "log10-layout-and-streaming records trip count per program as a live hypothesis (e.g. 16777216 elements, 40 programs, 4096 per round implying about 103 rounds) and asks that a larger contiguous per-round payload be tested against UB, with benefit confirmed only by the full KGS contract. Earlier double-block prefetch failed and must not be repeated blindly.",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "For the 4096x4096 cases the streaming path is dominated by the serial loop trip count (element-count driven, dtype independent), not by arithmetic or pure bandwidth. Doubling the per-iteration payload from 2*8192 to 2*16384 elements keeps the same proven 32768-element UB footprint as the existing FP32 pair tile while halving the trips per program (about 25.6 to about 12.8 at 16777216 elements with grid 40), so device time should drop for all three max dtypes without changing math or semantics.",
+  "change": "Pre-edit source d5ba772425b156c2f9377b8c07ceb338c5045024f81169042d76690645c5f049. In _make_streaming_entry set sub = 16384 instead of 8192; grid = min(40, cdiv(n, 2*sub)) and the N % (2*SUB) mask elision stay unchanged. No math, masking, layout, address, stream, or launcher-guard changes.",
+  "expected": "FP16/BF16/FP32 4096x4096 latency to fall from about 42-43.5us toward about 29-32us (speedup about 0.55-0.58x, 0.80-0.84x, 0.80-0.84x). Small and medium cases should stay within noise at 16-18us. Geometric mean expected to rise from 0.8068x into roughly the 0.87-0.93x range if the trip-count term dominates. If UB or register pressure rises instead, the max cases may not improve or may regress.",
+  "validation": "Run the bridge preflight on the edited candidate, then the full KGS contract (36 formal cases plus both 66-case supplementary sets). Compare per-case latencies in current-timing.json, especially timing-3/7/11, and confirm no small-case or correctness regression, including noncontiguous, offset/unaligned tail, in-place and special values. Benefit is accepted only from the complete formal result, not from this reasoning.",
+  "alternatives": [],
+  "discriminating_observation": "",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

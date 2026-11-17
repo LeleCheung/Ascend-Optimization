@@ -1,0 +1,65 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "7488c25d98fe424bb80924a76d237c32",
+  "recorded_at": "2026-11-17T05:37:10.833630+00:00",
+  "round_id": "performance-02",
+  "input_source": {
+    "path": "trace/sources/2e694b5e5214028177dafc5be1e8bbf45c7b8ebbffee33e33cf58f863ad1e42a.py",
+    "sha256": "2e694b5e5214028177dafc5be1e8bbf45c7b8ebbffee33e33cf58f863ad1e42a"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/6893c50ecd3507eba3363e69497df9267e49e58da0e702800f3b880a3d7c4787.json",
+        "sha256": "6893c50ecd3507eba3363e69497df9267e49e58da0e702800f3b880a3d7c4787"
+      },
+      "original": {
+        "path": "workspace/performance-feedback.json",
+        "sha256": "6893c50ecd3507eba3363e69497df9267e49e58da0e702800f3b880a3d7c4787"
+      },
+      "category": "other",
+      "role": "trigger",
+      "finding": "Native-dtype arithmetic candidate scored geo_mean 0.915038 (below the 0.9625098543 unchanged starting point). Worst cases: bf16 16M 0.637x, fp16 16M 0.803x; fp32 16M 0.931x; small fp16 1024/65536 0.915/0.898x. All three large-input losses concentrate around the 16M dtype paths, i.e. the changed multiply dtype.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/5e47796a38a467c41bf25f2e30c4354b82d08535cf43d02991c181a4a4a6f1ce.py",
+        "sha256": "5e47796a38a467c41bf25f2e30c4354b82d08535cf43d02991c181a4a4a6f1ce"
+      },
+      "original": {
+        "path": "workspace/starter.py",
+        "sha256": "5e47796a38a467c41bf25f2e30c4354b82d08535cf43d02991c181a4a4a6f1ce"
+      },
+      "category": "other",
+      "role": "background",
+      "finding": "The prior delivered candidate (measured 0.9625098543x starting point) computes y=(x.to(tl.float32)*57.29577951308232).to(x.dtype) in BOTH kernels. Its host run/_install/_launch_strided path is otherwise byte-identical to the regressed candidate, so the 0.9625->0.915 drop is attributable to the arithmetic-dtype change alone, not to host or launch code.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/dd6c9a236b5e1a35fa0075ab2c6e6a663cdf6b4774967f743026e0e8e62c11e4.json",
+        "sha256": "dd6c9a236b5e1a35fa0075ab2c6e6a663cdf6b4774967f743026e0e8e62c11e4"
+      },
+      "original": {
+        "path": "workspace/knowledge.json",
+        "sha256": "dd6c9a236b5e1a35fa0075ab2c6e6a663cdf6b4774967f743026e0e8e62c11e4"
+      },
+      "category": "knowledge",
+      "role": "mechanism",
+      "finding": "Transferred host-side method: on the contiguous hot path query immutable launch metadata from a plan cache and avoid repeated bookkeeping; keep device/dtype/numel/alignment/scalar keys and dynamically read current pointer and stream; never cache tensor, pointer or stream values; preserve non-contiguous/unaligned/tail fallbacks.",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "Materialising the reciprocal constant in the input dtype makes 16-bit tiles run a native bf16/fp16 multiply, which the Ascend vector pipeline executes far slower than an fp32 multiply with explicit up/down converts (bf16 16M fell to 0.637x). Restoring the fp32 multiply-and-cast semantics returns to the 0.9625x starting arithmetic. Beyond that, the remaining fixed per-call cost on small inputs is generic host bookkeeping in run(): two separate size-class dictionaries plus branch-based block/key selection. Consolidating them into one immutable plan cache (launch handle, function, packed metadata, block, keyed by device/dtype/alignment/scalar/size-class) and binding hot-path lookups as local defaults removes a dict-selection branch and repeated global lookups, without caching tensor, pointer or stream, and without removing device/alignment/scalar-specialization correctness.",
+  "change": "1) Restore y=(x.to(tl.float32)*57.29577951308232).to(x.dtype) in both _rad2deg_contig_kernel and _rad2deg_strided_kernel (original precision semantics). 2) Replace the two size-class dicts with one plan cache keyed by (device, dtype, ptr&15, n==1, size_class) storing (launch, function, packed_metadata, block); compute grid once; bind _plans/_plans.get/_get_stream as default-arg locals on run to cut per-call global lookups. Keep max-i32 path, strided/tail branches, dynamic pointer and stream queries, and cold compile-then-execute-once.",
+  "expected": "Restoring fp32 multiply-and-cast recovers the fp16/bf16 16M cases toward starting-point levels (the 0.9625x baseline). The consolidated plan cache trims a small, fixed sub-microsecond host cost per call, mainly benefiting the 1024/65536 cases; geometric mean should exceed the measured 0.9625098543x starting point. Reaching a full 1.0x CANN still depends on 16-bit conversion throughput and fp32 16M bandwidth and is not guaranteed.",
+  "validation": "Run preflight on the edited candidate; then the full 36-case KGS contract plus 42/42 supplementary checks on the same source; read the per-case performance feedback (especially fp16/bf16/fp32 16M and the two smallest sizes) and compare geo_mean against 0.9625098543x.",
+  "alternatives": [
+    "Attribute the regression to host launch bookkeeping: rejected because starter.py and candidate.py share an identical host path and differ only in the two kernel arithmetic lines.",
+    "Keep the native-dtype multiply but change block size: rejected because the per-dtype 16M losses track the multiply dtype, not tiling, and this would repeat the disallowed low-precision mechanism."
+  ],
+  "discriminating_observation": "Host code is identical between the 0.9625x starter and the 0.9150x candidate (single diff in each kernel's arithmetic); therefore the large-input regression must originate in the changed dtype of the multiply, and restoring it is a precondition rather than a new optimization.",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

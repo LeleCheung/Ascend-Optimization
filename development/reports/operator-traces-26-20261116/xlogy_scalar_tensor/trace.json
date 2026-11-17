@@ -1,0 +1,299 @@
+{
+  "operator": "xlogy_scalar_tensor",
+  "kind": "saved_ledger_attempt_order",
+  "selected_source": {
+    "path": "/data/hanle/ascend-optimization/runs/next25-20261029-v2/kg-runs/xlogy_scalar_tensor-next25-20261029-v2-attempt-1/stages/optimize/work/.ledger.json",
+    "sha256": "016df1329de10df369bf7ba396b7330f24b9c5469fd11c64f336a630f6efd253"
+  },
+  "points": [
+    {
+      "id": "xlogy_scalar_tensor:round-1",
+      "score": 0.419130789515486,
+      "source_sha256": "3f29a37d95f1493ad8da3f626ea73fab217753d09eaaea55598d7bfad3da0c02",
+      "method": "本批起点",
+      "raw": {
+        "ledger_sha256": "016df1329de10df369bf7ba396b7330f24b9c5469fd11c64f336a630f6efd253",
+        "round": 1,
+        "source_sha256": "3f29a37d95f1493ad8da3f626ea73fab217753d09eaaea55598d7bfad3da0c02",
+        "evaluation": {
+          "evaluated_at": "2026-10-29T17:50:49.668574Z",
+          "status": "PASSED",
+          "geo_mean": 0.419130789515486,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "baseline",
+          "strategy": "Establish a measured baseline with the simplest self-contained Triton implementation: one fused elementwise kernel (fp32 math, multiply-by-log), plain kernel[grid](...) launch, flat contiguous path plus a stride-driven path for non-contiguous views.",
+          "code_changes": "Replaced the FlagGems pointwise_dynamic seed (which fails candidate admission because no Triton launch is statically visible) with a self-contained module: _xlogy_flat / _xlogy_strided kernels, block chooser capped at 32 KiB source tiles, HAS_LOG constexpr to drop the transcendental when self == 0.",
+          "hypothesis": "A plain single-launch Triton kernel removes the FlagGems wrapper overhead and should beat the reference 0.148 geo_mean seed by a wide margin; the remaining per-call cost is dominated by Triton JIT dispatch and allocation for the nine small timing workloads.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "establish_baseline",
+            "mechanism": "One fused elementwise launch with no wrapper layer instead of the generic pointwise_dynamic code path."
+          },
+          "source": {
+            "origin": "baseline",
+            "parent_round_num": null
+          },
+          "key_params": {
+            "BLOCK_2B": 16384,
+            "BLOCK_4B": 8192,
+            "BLOCK_STRIDED": 512,
+            "TARGET_PROGS": 32
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "pending",
+          "analysis_path": "",
+          "summary": ""
+        },
+        "conclusion": {
+          "round_num": 1,
+          "expectation_status": "baseline",
+          "root_cause": "Per-call host overhead, not arithmetic: a targeted target-side probe measured plain Triton JIT dispatch at 62.1 us amortized for a 1024-element launch whose device work is a few microseconds, plus 7.9 us for torch.empty(shape). That overhead, not the fused fp32 log kernel, explains the ~90 us latency of every small workload.",
+          "perf_gap_analysis": "No previous measurement (first round in this workspace). The seed itself is not admissible (no statically visible Triton launch), so this simplest self-contained implementation is the reference point: geo_mean 0.4191, all 30 workloads correct (abs_err/rel_err 0). Nine of twelve timing workloads are 1024..1048576-element cases measured at 0.083-0.096 ms while their reference is 0.021-0.023 ms (speedup 0.24-0.29); those workloads are host-dispatch bound, not device bound. Only the three 4096x4096 cases are device bound: fp16 2.69x (0.0934 vs 0.2509 ms), bf16 2.43x (0.1022 vs 0.2483 ms), fp32 1.13x (0.1028 vs 0.1165 ms).",
+          "next_suggestion": "Cut the per-call host cost: replace plain JITFunction dispatch with the cached compiled-launcher path and use the cheapest output allocation. Debug-job measurements on this target showed plain kernel[grid](...) dispatch at 62.1 us amortized vs 10.3 us through the compiled Ascend launcher, torch.empty(shape) at 7.9 us vs y.new_empty(shape) at 5.8 us, and torch.npu.current_stream() object construction at 15.8 us vs 0.8 us for the raw stream handle. Keep the same tiles so the change is isolated.",
+          "optimization_level": "host_side_special",
+          "debug_lesson": "",
+          "strategy_evolution": "",
+          "knowledge_assessments": []
+        }
+      }
+    },
+    {
+      "id": "xlogy_scalar_tensor:round-2",
+      "score": 1.2910928299324418,
+      "source_sha256": "9156ff91ad0e1ac313baf8a6a288de3c7bdd4c100cd8f6cd32ee5d6b4f3bd027",
+      "method": "缓存启动计划与输出分配",
+      "raw": {
+        "ledger_sha256": "016df1329de10df369bf7ba396b7330f24b9c5469fd11c64f336a630f6efd253",
+        "round": 2,
+        "source_sha256": "9156ff91ad0e1ac313baf8a6a288de3c7bdd4c100cd8f6cd32ee5d6b4f3bd027",
+        "evaluation": {
+          "evaluated_at": "2026-10-29T17:59:06.264325Z",
+          "status": "PASSED",
+          "geo_mean": 1.2910928299324418,
+          "num_workloads": 30,
+          "num_passed": 30
+        },
+        "plan": {
+          "kind": "performance",
+          "strategy": "Remove the per-call Triton JIT dispatch and allocation overhead by caching a compiled-launcher closure per specialisation and using the cheapest equivalent output allocation, leaving kernels and tiles untouched.",
+          "code_changes": "run() now caches, per (dtype, numel, scalar-class, device), a closure that drives the compiled Ascend launcher directly: launcher.launch(grid, 1, 1, raw_stream_handle, ck.function, ck.packed_metadata, None, None, None, y.data_ptr(), out.data_ptr(), *tail) with tail = (n, s, BLOCK, HAS_LOG) or (s, BLOCK, HAS_LOG). Output allocation switched from torch.empty(shape) to y.new_empty(y.shape). Raw stream handle comes from torch_npu._C._npu_getCurrentRawStreamNoWait, re-queried every call; unaligned pointers and any launcher metadata flag fall back to the bound JIT call. Kernels, tiles and masking are unchanged from round 1.",
+          "hypothesis": "Round 1 measured 0.083-0.096 ms on the nine 1024..1048576-element workloads whose reference is 0.021-0.023 ms, while the device-side work is only a few microseconds. Target-side measurement put plain JIT dispatch at 62.1 us amortized and the compiled Ascend launcher at 10.3 us, with torch.empty(shape) 7.9 us vs y.new_empty(shape) 5.8 us. Switching only the host dispatch path and the allocation form should cut those nine workloads to roughly a third of their current latency without touching the device-bound 4096x4096 cases.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "The nine host-bound workloads stop paying ~62 us of JIT binder/cache-key work plus ~2 us of construct-and-resolve allocation per call, landing near the ~16 us floor (10 us launcher + 6 us allocation) instead of ~90 us."
+          },
+          "source": {
+            "origin": "coder",
+            "parent_round_num": 1
+          },
+          "key_params": {
+            "allocation": "y.new_empty(y.shape)",
+            "stream_query": "_npu_getCurrentRawStreamNoWait",
+            "tail_masked": "(n, s, BLOCK, HAS_LOG)",
+            "alignment_guard": "16B"
+          },
+          "knowledge_uses": []
+        },
+        "profile": {
+          "required": true,
+          "status": "failed",
+          "analysis_path": ".kernelgen/profile-analysis/round-0002.json",
+          "summary": "failed: msprof base collection exited successfully without profile completion marker (6 attempts over 5 workloads and 2 levels; every result carried summary.stage_count=1, metrics={}, artifacts=[] and no capabilities). No profiler counters, physical bytes or device kernel durations were produced."
+        },
+        "conclusion": {
+          "round_num": 2,
+          "expectation_status": "met",
+          "root_cause": "Round 1's cost was per-call JIT binder/cache-key work (62.1 us measured) plus a 7.9 us allocation; caching the compiled launcher and switching to y.new_empty(y.shape) removed it. What remains is the irreducible-looking per-call stack: 5.8 us for the output allocation, ~2.6 us for pointer/stream acquisition, and ~7.7 us inside the 15-argument compiled launcher, plus a harness-side constant paid by reference and candidate alike.",
+          "perf_gap_analysis": "Predicted a ~3x cut on the nine host-bound workloads (from ~85-96 us toward the ~16 us launcher+allocation floor); observed exactly that direction: 0.0251-0.0293 ms, i.e. 0.89x-1.01x of reference instead of 0.24-0.29x, a 3.1-3.4x latency reduction per small workload. geo_mean 0.4191 -> 1.2911. The device-bound cases kept their round-1 kernel and improved to 5.77x (fp16 0.0428 vs 0.2470 ms) and 5.55x (bf16 0.0444 vs 0.2466 ms) purely because the host overhead no longer hides their real device time; fp32 4096x4096 moved only 1.13x -> 1.16x (0.1037 vs 0.1204 ms). Residual gap: small workloads are not yet above reference (0.89-1.01x), because our ~18 us of per-call host work is roughly what the native reference spends too, and about 7-8 us per iteration appears to be harness-side and is paid by both; fp32 4096x4096 is device-bound at 1.33 TB/s, below the 1.57 TB/s the same kernel reaches with 2-byte tiles.",
+          "next_suggestion": "Two independent leaks remain. (1) Host path: the nine small workloads still sit at 0.0251-0.0293 ms because per call we pay ~5.8 us allocation + ~1.8 us for two data_ptr() calls + ~0.8 us for the stream handle + ~7.7 us inside the 15-argument pybind launch; trim launch arguments (dedicated HAS_LOG-specialised kernels) and test whether the Ascend launcher accepts tensors directly instead of pre-extracted pointers. (2) Device path: the fp32 4096x4096 case runs at 1.33 TB/s (0.1037 ms) while the 2-byte cases reach 1.57 TB/s with a 32 KiB tile, so test a 16384-element 4-byte tile (64 KiB source, still inside UB) for that case.",
+          "optimization_level": "host_side_special",
+          "debug_lesson": "",
+          "strategy_evolution": "",
+          "knowledge_assessments": []
+        }
+      }
+    }
+  ],
+  "view": {
+    "id": "mainline",
+    "session": "xlogy_scalar_tensor",
+    "title": "xlogy_scalar_tensor 优化轨迹",
+    "subtitle": "历史 KGS 参考 · 本批 2 次正式评测",
+    "ylim": [
+      0,
+      1.5
+    ],
+    "annotations": [
+      {
+        "point": 2,
+        "method": "缓存启动计划与输出分配",
+        "color": "probe",
+        "position": [
+          550,
+          285
+        ],
+        "arrow": [
+          950,
+          325
+        ]
+      }
+    ],
+    "legend": [
+      "paired",
+      "sim",
+      "knowledge",
+      "probe",
+      "ir"
+    ],
+    "gap": null,
+    "x_label": "本批正式评测顺序",
+    "plot_bottom": 745,
+    "nodes": [
+      {
+        "point": 1,
+        "location": "mixed"
+      },
+      {
+        "point": 2,
+        "location": "host"
+      }
+    ],
+    "delivery": {
+      "score": 1.5355652255472225,
+      "source": "operators/xlogy_scalar_tensor/versions/independent_strict/retained/kernel.py",
+      "source_sha256": "f4f49782fe8d32856da04d94771f15ff43242d35dce33b05b25bd67ef80f4b0e",
+      "passed": 30,
+      "total": 30,
+      "result": "operators/xlogy_scalar_tensor/evidence/retained/evaluation/result.json",
+      "result_sha256": "021bad862d81441d7902b6528f840b00afebb24c9d8d5727d71861018d057685",
+      "endpoint_same_source": false
+    },
+    "result_only": false,
+    "line_status": "下图：历史优化片段"
+  },
+  "history": [
+    {
+      "ledger_sha256": "016df1329de10df369bf7ba396b7330f24b9c5469fd11c64f336a630f6efd253",
+      "round": 1,
+      "source_sha256": "3f29a37d95f1493ad8da3f626ea73fab217753d09eaaea55598d7bfad3da0c02",
+      "evaluation": {
+        "evaluated_at": "2026-10-29T17:50:49.668574Z",
+        "status": "PASSED",
+        "geo_mean": 0.419130789515486,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "baseline",
+        "strategy": "Establish a measured baseline with the simplest self-contained Triton implementation: one fused elementwise kernel (fp32 math, multiply-by-log), plain kernel[grid](...) launch, flat contiguous path plus a stride-driven path for non-contiguous views.",
+        "code_changes": "Replaced the FlagGems pointwise_dynamic seed (which fails candidate admission because no Triton launch is statically visible) with a self-contained module: _xlogy_flat / _xlogy_strided kernels, block chooser capped at 32 KiB source tiles, HAS_LOG constexpr to drop the transcendental when self == 0.",
+        "hypothesis": "A plain single-launch Triton kernel removes the FlagGems wrapper overhead and should beat the reference 0.148 geo_mean seed by a wide margin; the remaining per-call cost is dominated by Triton JIT dispatch and allocation for the nine small timing workloads.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "establish_baseline",
+          "mechanism": "One fused elementwise launch with no wrapper layer instead of the generic pointwise_dynamic code path."
+        },
+        "source": {
+          "origin": "baseline",
+          "parent_round_num": null
+        },
+        "key_params": {
+          "BLOCK_2B": 16384,
+          "BLOCK_4B": 8192,
+          "BLOCK_STRIDED": 512,
+          "TARGET_PROGS": 32
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "pending",
+        "analysis_path": "",
+        "summary": ""
+      },
+      "conclusion": {
+        "round_num": 1,
+        "expectation_status": "baseline",
+        "root_cause": "Per-call host overhead, not arithmetic: a targeted target-side probe measured plain Triton JIT dispatch at 62.1 us amortized for a 1024-element launch whose device work is a few microseconds, plus 7.9 us for torch.empty(shape). That overhead, not the fused fp32 log kernel, explains the ~90 us latency of every small workload.",
+        "perf_gap_analysis": "No previous measurement (first round in this workspace). The seed itself is not admissible (no statically visible Triton launch), so this simplest self-contained implementation is the reference point: geo_mean 0.4191, all 30 workloads correct (abs_err/rel_err 0). Nine of twelve timing workloads are 1024..1048576-element cases measured at 0.083-0.096 ms while their reference is 0.021-0.023 ms (speedup 0.24-0.29); those workloads are host-dispatch bound, not device bound. Only the three 4096x4096 cases are device bound: fp16 2.69x (0.0934 vs 0.2509 ms), bf16 2.43x (0.1022 vs 0.2483 ms), fp32 1.13x (0.1028 vs 0.1165 ms).",
+        "next_suggestion": "Cut the per-call host cost: replace plain JITFunction dispatch with the cached compiled-launcher path and use the cheapest output allocation. Debug-job measurements on this target showed plain kernel[grid](...) dispatch at 62.1 us amortized vs 10.3 us through the compiled Ascend launcher, torch.empty(shape) at 7.9 us vs y.new_empty(shape) at 5.8 us, and torch.npu.current_stream() object construction at 15.8 us vs 0.8 us for the raw stream handle. Keep the same tiles so the change is isolated.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "",
+        "strategy_evolution": "",
+        "knowledge_assessments": []
+      }
+    },
+    {
+      "ledger_sha256": "016df1329de10df369bf7ba396b7330f24b9c5469fd11c64f336a630f6efd253",
+      "round": 2,
+      "source_sha256": "9156ff91ad0e1ac313baf8a6a288de3c7bdd4c100cd8f6cd32ee5d6b4f3bd027",
+      "evaluation": {
+        "evaluated_at": "2026-10-29T17:59:06.264325Z",
+        "status": "PASSED",
+        "geo_mean": 1.2910928299324418,
+        "num_workloads": 30,
+        "num_passed": 30
+      },
+      "plan": {
+        "kind": "performance",
+        "strategy": "Remove the per-call Triton JIT dispatch and allocation overhead by caching a compiled-launcher closure per specialisation and using the cheapest equivalent output allocation, leaving kernels and tiles untouched.",
+        "code_changes": "run() now caches, per (dtype, numel, scalar-class, device), a closure that drives the compiled Ascend launcher directly: launcher.launch(grid, 1, 1, raw_stream_handle, ck.function, ck.packed_metadata, None, None, None, y.data_ptr(), out.data_ptr(), *tail) with tail = (n, s, BLOCK, HAS_LOG) or (s, BLOCK, HAS_LOG). Output allocation switched from torch.empty(shape) to y.new_empty(y.shape). Raw stream handle comes from torch_npu._C._npu_getCurrentRawStreamNoWait, re-queried every call; unaligned pointers and any launcher metadata flag fall back to the bound JIT call. Kernels, tiles and masking are unchanged from round 1.",
+        "hypothesis": "Round 1 measured 0.083-0.096 ms on the nine 1024..1048576-element workloads whose reference is 0.021-0.023 ms, while the device-side work is only a few microseconds. Target-side measurement put plain JIT dispatch at 62.1 us amortized and the compiled Ascend launcher at 10.3 us, with torch.empty(shape) 7.9 us vs y.new_empty(shape) 5.8 us. Switching only the host dispatch path and the allocation form should cut those nine workloads to roughly a third of their current latency without touching the device-bound 4096x4096 cases.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "The nine host-bound workloads stop paying ~62 us of JIT binder/cache-key work plus ~2 us of construct-and-resolve allocation per call, landing near the ~16 us floor (10 us launcher + 6 us allocation) instead of ~90 us."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": 1
+        },
+        "key_params": {
+          "allocation": "y.new_empty(y.shape)",
+          "stream_query": "_npu_getCurrentRawStreamNoWait",
+          "tail_masked": "(n, s, BLOCK, HAS_LOG)",
+          "alignment_guard": "16B"
+        },
+        "knowledge_uses": []
+      },
+      "profile": {
+        "required": true,
+        "status": "failed",
+        "analysis_path": ".kernelgen/profile-analysis/round-0002.json",
+        "summary": "failed: msprof base collection exited successfully without profile completion marker (6 attempts over 5 workloads and 2 levels; every result carried summary.stage_count=1, metrics={}, artifacts=[] and no capabilities). No profiler counters, physical bytes or device kernel durations were produced."
+      },
+      "conclusion": {
+        "round_num": 2,
+        "expectation_status": "met",
+        "root_cause": "Round 1's cost was per-call JIT binder/cache-key work (62.1 us measured) plus a 7.9 us allocation; caching the compiled launcher and switching to y.new_empty(y.shape) removed it. What remains is the irreducible-looking per-call stack: 5.8 us for the output allocation, ~2.6 us for pointer/stream acquisition, and ~7.7 us inside the 15-argument compiled launcher, plus a harness-side constant paid by reference and candidate alike.",
+        "perf_gap_analysis": "Predicted a ~3x cut on the nine host-bound workloads (from ~85-96 us toward the ~16 us launcher+allocation floor); observed exactly that direction: 0.0251-0.0293 ms, i.e. 0.89x-1.01x of reference instead of 0.24-0.29x, a 3.1-3.4x latency reduction per small workload. geo_mean 0.4191 -> 1.2911. The device-bound cases kept their round-1 kernel and improved to 5.77x (fp16 0.0428 vs 0.2470 ms) and 5.55x (bf16 0.0444 vs 0.2466 ms) purely because the host overhead no longer hides their real device time; fp32 4096x4096 moved only 1.13x -> 1.16x (0.1037 vs 0.1204 ms). Residual gap: small workloads are not yet above reference (0.89-1.01x), because our ~18 us of per-call host work is roughly what the native reference spends too, and about 7-8 us per iteration appears to be harness-side and is paid by both; fp32 4096x4096 is device-bound at 1.33 TB/s, below the 1.57 TB/s the same kernel reaches with 2-byte tiles.",
+        "next_suggestion": "Two independent leaks remain. (1) Host path: the nine small workloads still sit at 0.0251-0.0293 ms because per call we pay ~5.8 us allocation + ~1.8 us for two data_ptr() calls + ~0.8 us for the stream handle + ~7.7 us inside the 15-argument pybind launch; trim launch arguments (dedicated HAS_LOG-specialised kernels) and test whether the Ascend launcher accepts tensors directly instead of pre-extracted pointers. (2) Device path: the fp32 4096x4096 case runs at 1.33 TB/s (0.1037 ms) while the 2-byte cases reach 1.57 TB/s with a 32 KiB tile, so test a 16384-element 4-byte tile (64 KiB source, still inside UB) for that case.",
+        "optimization_level": "host_side_special",
+        "debug_lesson": "",
+        "strategy_evolution": "",
+        "knowledge_assessments": []
+      }
+    }
+  ],
+  "gap": null,
+  "relation_note": "按同一原始账本正式轮次展示；未逐编辑恢复的关系不声称直接源码继承。",
+  "delivery": {
+    "score": 1.5355652255472225,
+    "source": "operators/xlogy_scalar_tensor/versions/independent_strict/retained/kernel.py",
+    "source_sha256": "f4f49782fe8d32856da04d94771f15ff43242d35dce33b05b25bd67ef80f4b0e",
+    "passed": 30,
+    "total": 30,
+    "result": "operators/xlogy_scalar_tensor/evidence/retained/evaluation/result.json",
+    "result_sha256": "021bad862d81441d7902b6528f840b00afebb24c9d8d5727d71861018d057685",
+    "endpoint_same_source": false
+  },
+  "current_cann_score": 1.5355652255472225,
+  "historical_simulator_files": 0
+}

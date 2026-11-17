@@ -137,4 +137,5 @@ def main():
 
 
 if __name__=='__main__':
-    main()
+    from hgkda.runtime.trace import traced_main
+    traced_main(main, 'simulate')

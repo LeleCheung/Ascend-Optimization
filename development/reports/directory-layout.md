@@ -44,6 +44,8 @@ Python 核心安装只使用 src/hgkda/，不会顺带安装 KG/KGS、FlagGems�
 
 ## 910B
 
+Windows 控制端到 910B 的 SSH 连接、容器映射和 KGS 复测流程见[远程评测手册](../runbooks/910b-testing.md)。
+
     /data/hanle/ascend-optimization/
     ├── Ascend-Optimization/   与 GitHub、Windows 同步的维护仓库
     ├── runtime/

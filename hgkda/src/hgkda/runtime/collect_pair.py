@@ -69,12 +69,42 @@ def main():
                 device(side+'-discover',[c['device_python'],Path(__file__).with_name('discover_kernel.py'),
                        '--spec',spec,'--side',side,'--output',trace])
             assert read(trace)['source_sha256']==digest and read(trace)['side']==side
-            names=read(trace)['kernels'];assert len(names)==1,'目标路径包含多个kernel，须逐个采集，不能默认选择第一项：'+str(names)
+            discovery=read(trace);names=discovery['kernels'];assert names
+            if len(names)>1:
+                assert side=='reference','多kernel候选须明确模拟器目标，当前不自动选择'
+                # 同一API可以多次调用同名TransData，但每次对应不同二进制；
+                # 不用别名猜映射，直接采集本次调用的全部实际二进制任务。
+                all_profile=folder/'all-kernels'
+                task_count=len(discovery['tasks'])
+                application=shlex.join([c['device_python'],str(Path(__file__).with_name('paired_driver.py')),'--spec',str(spec),'--side',side])
+                command=['msprof','op','--application='+application,'--output='+str(all_profile),
+                         '--launch-count='+str(task_count),'--warm-up=0','--aic-metrics=Roofline']
+                if not list(all_profile.rglob('OpBasicInfo*.csv')):device(side+'-all-kernels',command)
+                basics=sorted(all_profile.rglob('OpBasicInfo*.csv'))
+                assert len(basics)==task_count,'未完整采集同一API全部任务：'+str((len(basics),task_count))
+                children=[]
+                for index,basic in enumerate(basics):
+                    with basic.open() as stream:rows=list(csv.DictReader(stream))
+                    assert len(rows)==1
+                    symbol=rows[0]['Op Name'];child=folder/('task-'+str(index).zfill(3));child.mkdir(exist_ok=True)
+                    profile=child/'profile';profile.mkdir(exist_ok=True)
+                    for table in basic.parent.glob('*.csv'):
+                        target=profile/table.name
+                        if target.exists():assert sha(target)==sha(table)
+                        else:shutil.copyfile(table,target)
+                    save(child/'collection.json',dict(status='completed',side=side,expected_kernel=symbol,groups='Roofline',
+                         task_alias=None,spec_sha256=sha(spec),command=command,discovery_sha256=sha(trace),
+                         raw_basic=dict(path=str(basic),sha256=sha(basic))))
+                    children.append(dict(directory=child.name,symbol=symbol,occurrences=1))
+                save(folder/'collection.json',dict(status='completed',side=side,groups='Roofline',spec_sha256=sha(spec),
+                    kernels=children,discovery_sha256=sha(trace),runtime_tasks=discovery['tasks'],
+                    scope='完整API的所有实际任务分别保存，不由任务别名猜测TransData二进制；无完整调用关键路径推断'))
+                continue
             folder.mkdir(exist_ok=True);symbol=names[0]
             application=shlex.join([c['device_python'],str(Path(__file__).with_name('paired_driver.py')),'--spec',str(spec),'--side',side])
             first_log=a.output/(side+'-collect.log')
             resolution=None
-            if first_log.exists() and not list((folder/'profile').rglob('OpBasicInfo.csv')):
+            if first_log.exists() and not list((folder/'profile').rglob('OpBasicInfo*.csv')):
                 symbol=resolve_reported_symbol(symbol,first_log.read_text(errors='replace'))
                 resolution=dict(task_alias=names[0],reported_binary_symbol=symbol,log_sha256=sha(first_log))
                 if (folder/'profile').exists():(folder/'profile').rename(folder/'profile-unmatched')
@@ -82,13 +112,13 @@ def main():
                      '--kernel-name='+symbol,'--launch-count=1','--warm-up=5','--aic-metrics=Roofline']
             label=side+'-collect-symbol' if resolution else side+'-collect'
             device(label,command)
-            if not list((folder/'profile').rglob('OpBasicInfo.csv')) and resolution is None:
+            if not list((folder/'profile').rglob('OpBasicInfo*.csv')) and resolution is None:
                 symbol=resolve_reported_symbol(symbol,first_log.read_text(errors='replace'))
                 resolution=dict(task_alias=names[0],reported_binary_symbol=symbol,log_sha256=sha(first_log))
                 if (folder/'profile').exists():(folder/'profile').rename(folder/'profile-unmatched')
                 command=[('--kernel-name='+symbol if word.startswith('--kernel-name=') else word) for word in command]
                 device(side+'-collect-symbol',command)
-            basic=list((folder/'profile').rglob('OpBasicInfo.csv'));assert len(basic)==1
+            basic=list((folder/'profile').rglob('OpBasicInfo*.csv'));assert len(basic)==1
             with basic[0].open() as stream:rows=list(csv.DictReader(stream))
             assert len(rows)==1 and rows[0]['Op Name']==symbol
             save(folder/'collection.json',dict(status='completed',side=side,expected_kernel=symbol,groups='Roofline',
@@ -104,4 +134,6 @@ def main():
     print(json.dumps(dict(status='completed',source_sha256=digest,case=a.case,context=str(context))))
 
 
-if __name__=='__main__':main()
+if __name__=='__main__':
+    from hgkda.runtime.trace import traced_main
+    traced_main(main, 'pair')

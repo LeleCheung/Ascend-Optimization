@@ -1,0 +1,95 @@
+attrs:
+- description: 注意力头数 N
+  name: n_heads
+  required: true
+  type: int
+- default: 1e-5
+  description: Query 路径 RMSNorm 的 epsilon
+  name: rmsnorm_epsilon_cq
+  required: false
+  type: float
+- default: 1e-5
+  description: Key 路径 RMSNorm 的 epsilon
+  name: rmsnorm_epsilon_ckv
+  required: false
+  type: float
+category: FusedComposite
+description: Multi-Head Latent Attention 前处理算子，融合 Query/Key 投影、RMSNorm 和 RoPE
+difficulty: L4
+formula: "Query: c_q = RMSNorm(x @ W_DQ, γ_cq, ε_cq)\n       q_c, q_r_raw = split(c_q\
+  \ @ W_UQ_QR)\n       query = q_c @ W_UK (per-head)\n       query_rope = RoPE(q_r_raw,\
+  \ cos, sin)\nKey:   c_kv_raw, k_r_raw = split(x @ W_DKV_KR)\n       c_kv = RMSNorm(c_kv_raw,\
+  \ γ_ckv, ε_ckv)\n       k_rope = RoPE(k_r_raw, cos, sin)\n"
+inputs:
+- description: 输入 hidden states
+  dtype:
+  - bfloat16
+  name: token_x
+  shape: '[B, S, He]'
+- description: Query 下投影权重 W^DQ
+  dtype:
+  - bfloat16
+  name: w_dq
+  shape: '[He, Hcq]'
+- description: Query 上投影 + RoPE 权重（W^UQ 和 W^QR 合并）
+  dtype:
+  - bfloat16
+  name: w_uq_qr
+  shape: '[Hcq, N*(D+Dr)]'
+- description: Key 上投影权重 W^UK（吸收到 Query 侧）
+  dtype:
+  - bfloat16
+  name: w_uk
+  shape: '[N, D, Hckv]'
+- description: KV 下投影 + Key RoPE 权重（W^DKV 和 W^KR 合并）
+  dtype:
+  - bfloat16
+  name: w_dkv_kr
+  shape: '[He, Hckv+Dr]'
+- description: Query 路径 RMSNorm 缩放参数 γ
+  dtype:
+  - bfloat16
+  name: rmsnorm_gamma_cq
+  shape: '[Hcq]'
+- description: Key 路径 RMSNorm 缩放参数 γ
+  dtype:
+  - bfloat16
+  name: rmsnorm_gamma_ckv
+  shape: '[Hckv]'
+- description: RoPE 正弦值（已按位置索引）
+  dtype:
+  - bfloat16
+  name: rope_sin
+  shape: '[B, S, Dr]'
+- description: RoPE 余弦值（已按位置索引）
+  dtype:
+  - bfloat16
+  name: rope_cos
+  shape: '[B, S, Dr]'
+name: MlaProlog
+outputs:
+- description: 吸收 W_UK 后的 Query
+  dtype:
+  - bfloat16
+  name: query
+  shape: '[B, S, N, Hckv]'
+- description: Query 位置编码
+  dtype:
+  - bfloat16
+  name: query_rope
+  shape: '[B, S, N, Dr]'
+- description: 归一化后的压缩 KV
+  dtype:
+  - bfloat16
+  name: c_kv
+  shape: '[B, S, Hckv]'
+- description: Key 位置编码
+  dtype:
+  - bfloat16
+  name: k_rope
+  shape: '[B, S, Dr]'
+schema: mla_prolog(Tensor token_x, Tensor w_dq, Tensor w_uq_qr, Tensor w_uk, Tensor
+  w_dkv_kr, Tensor rmsnorm_gamma_cq, Tensor rmsnorm_gamma_ckv, Tensor rope_sin, Tensor
+  rope_cos, int n_heads, float rmsnorm_epsilon_cq=1e-5, float rmsnorm_epsilon_ckv=1e-5)
+  -> (Tensor query, Tensor query_rope, Tensor c_kv, Tensor k_rope)
+shape_support: token_x [B, S, He]，输出 4 个张量

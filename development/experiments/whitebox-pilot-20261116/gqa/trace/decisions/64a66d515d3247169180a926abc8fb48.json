@@ -1,0 +1,54 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "64a66d515d3247169180a926abc8fb48",
+  "recorded_at": "2026-11-16T12:17:21.221917+00:00",
+  "round_id": "bootstrap-01",
+  "input_source": {
+    "path": "trace/sources/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.py",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "workspace/task-description.md",
+        "sha256": "8b94349587799c9074cd8f7bb38e960be2e0973c4617c70d60b5019971bf24ac"
+      },
+      "category": "knowledge",
+      "role": "background",
+      "finding": "官方语义: y[b,:,h_q,:] = softmax(Q_h * K_{g(h_q)}^T * scale) * V_{g(h_q)}, g = floor(h_q*N_kv/N_q); scaleValue<=0 时取 1/sqrt(D); causal 为右下角对齐 mask, j > i + (S_kv - S) 置 -inf, 要求 S <= S_kv; 精度 MERE<2^-10(fp16)/2^-7(bf16) 且 MARE<10*Threshold, 额外 allclose 不等于正式达标。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "workspace/contract.json",
+        "sha256": "98c7f29509c54f06c254cfb308c0042969a479113b6f3096741ee1c1b163646b"
+      },
+      "category": "knowledge",
+      "role": "background",
+      "finding": "需覆盖 4 个官方 case: case1 fp16 B2 S128 Nq32 Nkv8 D128 causal; case2 fp16 B2 S128 Nq48 Nkv4 D128; case4 bf16 B4 S256 Nq64 Nkv8 D128; case7 bf16 B2 S128 Skv256 Nq32 Nkv8 D128 非因果 cross。值域 [-1,1], scaleValue 均为 -1.0。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "workspace/golden.py",
+        "sha256": "802d5450ae8d145f3d27f1d33820fc7a10f3cd609f01af4687eb2f67908a9d6d"
+      },
+      "category": "knowledge",
+      "role": "mechanism",
+      "finding": "golden 把 G 折进 matmul 的 M 维、K/V 保持 N_kv 头复用, 不物化 G 份 KV; 并对全 mask 行显式把 softmax 权重置 0, 说明候选应按 h_q//G 复用 KV 指针, 并对 l_i==0 的行输出 0。",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "空 candidate.py 没有任何设备实现, 当前若被调用只能由 PyTorch 承担全部设备计算, 既不合规也没有性能基线。需要一个纯 Triton 的 online-softmax flash-attention 起点: 每个 program 负责 (batch b, query head h_q, BLOCK_M 行), 按 kvh = h_q // G 复用同一份 K/V 指针(不物化重复 KV); QK 用输入 dtype 的 tl.dot 累积到 fp32, softmax 的 max/sum/重标定全在 fp32, PV 用 p.to(input dtype) 的 tl.dot 累积到 fp32, 最后一次 cast 回输出 dtype; 因果块用右下角对齐的 delta = S_kv - S, 并据此截断循环上界以跳过整块全 mask 的 KV 分块。",
+  "change": "新建 candidate.py: 单个 @triton.jit kernel (online softmax, 在 S_kv 上按 BLOCK_N 分块) 加 run(query,key,value,scaleValue=-1.0,is_causal=False) 包装器; 仅用 torch.empty 分配输出, 按真实 shape/stride 传参, causal 使用右下角对齐 mask。",
+  "expected": "4 个官方 case 可编译执行, 返回与 query 同 shape/dtype 的 BSND 输出; fp32 累积的 softmax/PV 预期满足 fp16 MERE<2^-10 与 MARE<2^-9、bf16 MERE<2^-7 与 MARE<2^-6, 近零输出元素是主要风险; 性能只是起点, 未做调优。",
+  "validation": "宿主审查后由工具桥 preflight 编译, 再跑完整正式评测核对 4 个 case 的 MERE/MARE 与逐 case 计时; 若 MARE 超限, 先查 bf16 下 p.to(bf16) 与近零输出, 再考虑 fp32 PV 或 hi/lo 拆分。",
+  "alternatives": [
+    "把 G 个 q head 折叠进 M 维(与 golden 同构), program 数更少、并行度更低, 首版不采用。",
+    "PV 改用 fp32 的 tl.dot(input_precision=ieee) 提升近零输出精度, 但可能不是 Ascend 后端的高效路径, 首版先对齐 CANN 原生算子的低精度 P 路径。",
+    "对整段 S_kv 做单块 tl.dot 的非分块实现, UB 放不下, 不采用。"
+  ],
+  "discriminating_observation": "",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

@@ -1,0 +1,116 @@
+attrs:
+- default: 2048
+  description: TTT 块大小 C，序列按 C 切块、末块按实际长度处理；影响数学结果（每块一步权重更新）
+  name: chunk_size
+  required: false
+  type: int
+- default: false
+  description: True 时权重增量 Δ = Muon(g)（Newton–Schulz 5 步 zeropower，系数 a=3.4445, b=−4.7750,
+    c=2.0315），False 时 Δ = g
+  name: use_muon
+  required: false
+  type: bool
+- default: false
+  description: False 为 apply-then-update（因果，块内用进入该块前的权重），True 为 update-then-apply（双向，块内可见未来）
+  name: update_first
+  required: false
+  type: bool
+category: FusedComposite
+description: Large-Chunk Test-Time Training（LaCT）层前向，SwiGLU 快权重以大 chunk 为单位做一步梯度更新（可选
+  Muon 正交化）
+difficulty: L5
+formula: "q̂, k̂ = q, k 沿 D 做 L2 归一化（eps 1e-6）；快权重 f_W(x) = W2 [SiLU(W1 x) ⊙ (W3 x)]\n\
+  序列按 chunk_size 切块，对每块 I_c（update_first=False 时先 apply 后 update）：\n  apply:  y_t\
+  \ = f_{W^{(c)}}(q̂_t)，t ∈ I_c\n  update: ℒ = Σ_{i∈I_c} lr_i · (−f_W(k̂_i)ᵀ v_i)，g\
+  \ = ∇_W ℒ（W1/W2/W3 闭式梯度）\n          Δ = Muon(g)（use_muon=True，Newton–Schulz 5 步\
+  \ zeropower）或 g\n          W ← RowL2Normalize(W − Δ)（逐输出神经元 L2 归一，eps 1e-6）\n输出\
+  \ y 与最终快权重 w1_out / w2_out / w3_out\n"
+inputs:
+- description: 查询张量，算子内部沿 D 做 L2 归一化后送入快权重网络
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: q
+  shape: '[B, L, H, D]'
+- description: 键张量，算子内部沿 D 做 L2 归一化后作为快权重更新的输入
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: k
+  shape: '[B, L, H, D]'
+- description: 值张量，快权重更新的回归目标（负内积损失）
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: v
+  shape: '[B, L, H, D]'
+- description: 快权重 W1（SwiGLU 门分支），逐样本、逐头独立
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: w1
+  shape: '[B, H, Dh, D]'
+- description: 快权重 W2（输出投影），逐样本、逐头独立
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: w2
+  shape: '[B, H, D, Dh]'
+- description: 快权重 W3（SwiGLU 线性分支），逐样本、逐头独立
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: w3
+  shape: '[B, H, Dh, D]'
+- description: 逐 token 逐头学习率，要求恒正（评测取值范围 [0.001, 0.05]）
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: lr
+  shape: '[B, L, H]'
+name: LactTttChunk
+outputs:
+- description: 输出序列 y_t = f_W(q̂_t)，dtype 与 q 一致
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: y
+  shape: '[B, L, H, D]'
+- description: 序列末尾的快权重 W1，dtype 与 q 一致
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: w1_out
+  shape: '[B, H, Dh, D]'
+- description: 序列末尾的快权重 W2，dtype 与 q 一致
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: w2_out
+  shape: '[B, H, D, Dh]'
+- description: 序列末尾的快权重 W3，dtype 与 q 一致
+  dtype:
+  - float32
+  - float16
+  - bfloat16
+  name: w3_out
+  shape: '[B, H, Dh, D]'
+precision_thresholds:
+  bfloat16: 0.02
+  float16: 0.005
+  float32: 0.001
+schema: lact_ttt_chunk(Tensor q, Tensor k, Tensor v, Tensor w1, Tensor w2, Tensor
+  w3, Tensor lr, int chunk_size=2048, bool use_muon=False, bool update_first=False)
+  -> (Tensor y, Tensor w1_out, Tensor w2_out, Tensor w3_out)
+shape_support: q/k/v [B, L, H, D]，w1/w3 [B, H, Dh, D]，w2 [B, H, D, Dh]，lr [B, L, H]；输出
+  y [B, L, H, D]，w1_out/w2_out/w3_out 与输入快权重同 shape

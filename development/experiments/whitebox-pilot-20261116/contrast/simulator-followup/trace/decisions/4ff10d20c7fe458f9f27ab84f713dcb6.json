@@ -1,0 +1,80 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "4ff10d20c7fe458f9f27ab84f713dcb6",
+  "recorded_at": "2026-11-16T13:18:10.126902+00:00",
+  "round_id": "UB-repair-01",
+  "input_source": {
+    "path": "trace/sources/b4e0dde612b71fcd12b59ae8cbe487dcee1b0325f6fd78f23812373c842159e9.py",
+    "sha256": "b4e0dde612b71fcd12b59ae8cbe487dcee1b0325f6fd78f23812373c842159e9"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "workspace/compile-failure.json",
+        "sha256": "a0957bebb0ac1e5df1e976f55bd7d3c3d37913a8017056eed4c8799bd8139c7e"
+      },
+      "category": "source_ir",
+      "role": "trigger",
+      "finding": "status=failed for source_sha256 b4e0dde6...; log_tail repeats 'loc(candidate.py:101:0): error: ub overflow, requires 4194304 bits while 1572864 bits available!' inside 'Failed to run BiShengHIR pipeline' at the ConvertLinalgIRToBinary stage, i.e. 512 KiB demanded against 192 KiB UB for the specialization whose kernel is defined at line 101.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "workspace/compile-failure.log",
+        "sha256": "59af9ae4aac913444f05e390d134b8fc0712c96764ecb4256b72b0bea100cc21"
+      },
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "All 8 ub-overflow messages name candidate.py:101 only, which is '_blk2x_kernel' (the exact-2x block kernel); the host traceback fails while launching '_blk2x_kernel[plan[1]]' from '_ordinary' line 494. '_bilinear_int_kernel' and '_bilinear_flat_kernel' are not named, so the repair is local to the block kernel and its tile sizing.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "workspace/candidate.py",
+        "sha256": "b4e0dde612b71fcd12b59ae8cbe487dcee1b0325f6fd78f23812373c842159e9"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Lines 154-174. The new store arrangement issues four 2-D stride-2 stores (even/odd column of two output rows, 'ptr_o + e_base + 2*k' and '+1') over a (QB, IW) tile. A stride-2 store cannot become one contiguous DMA: the compiler materialises a contiguous interleaved output tile plus its own scratch per store. On the fixed case QB=16, IW=128, OW=256, fp16 that is 4 stores x 4096 output elements x 2 B = 32 KiB of payload, yet the compiler asks for 512 KiB, i.e. ~16 buffer slots per interleaved output element.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "workspace/candidate.py",
+        "sha256": "b4e0dde612b71fcd12b59ae8cbe487dcee1b0325f6fd78f23812373c842159e9"
+      },
+      "category": "source_ir",
+      "role": "trigger",
+      "finding": "Lines 376-390 and 424-428. '_pick_block_rows' sizes the tile only by the input block budget 'QB*IW <= _BLK_ELEMS_32 = 2048' (float32-equivalent elements), which was calibrated for the previous contiguous-store kernel. With IH=IW=128, N*C=128 it returns QB=16 -> NB=8, so the strided-store expansion is never bounded by UB bytes; the budget model predates the store change and is the direct cause of the 512 KiB request.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "workspace/candidate.py",
+        "sha256": "b4e0dde612b71fcd12b59ae8cbe487dcee1b0325f6fd78f23812373c842159e9"
+      },
+      "category": "source_ir",
+      "role": "background",
+      "finding": "Lines 196-199. The 'b == NB' edge program of the same kernel already stores through 'tl.join' + 'tl.reshape' into one contiguous 1-D row (a (OW,) tile) and is not implicated in the overflow. This is the established safe store path that can be reused inside the same kernel, with identical values, whenever the strided arrangement cannot be made to fit.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "workspace/contract.json",
+        "sha256": "22e74ddbffcb57c28c70823ee8d30da01dc4bc4cdf3cc17a93db446794ad710f"
+      },
+      "category": "other",
+      "role": "background",
+      "finding": "Public entrypoint 'run(input, output_size, align_corners=False, scales_h=None, scales_w=None)' with a single output 'out' and no mutation; 24 formal cases plus 30 supplementary cases per reference. Fixed research case stays FP16 [4,32,128,128] -> [4,32,256,256], align_corners=False, so any tile choice must be derived from shape/dtype only and must not narrow semantics.",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "The exact-2x block kernel overflows UB because its tile is still sized for the old contiguous-store kernel: four stride-2 stores each force the compiler to expand the (QB, IW) tile into a contiguous interleaved (QB, OW) output buffer with extra scratch and multi-buffering, roughly 16 element slots per interleaved output element. Bounding QB by the strided-store footprint in UB bytes (instead of only by the input element budget) should let the same strided-store mechanism compile on the fixed case with a smaller tile, while configurations that cannot fit even one row of stride-2 stores keep a safe path: the kernel-internal join + contiguous row store already used by the edge program.",
+  "change": "In candidate.py only: (1) add a byte-level UB budget model for the stride-2 store arrangement (_UB_BYTES = 192 KiB from the reported 1572864 bits, 0.75 safety fraction, 4 stores x _STRIDED_EXPAND = 16 element slots per interleaved output element, dtype element size) and derive the largest legal QB from it; (2) give _blk2x_kernel a STRIDED constexpr selecting either the four stride-2 stores (bounded tile) or the established tl.join + contiguous (QB, OW) row store under the previous _BLK_ELEMS_32 tile budget, so no legal configuration is silently mis-sized; (3) in _plan, pick the strided tile when it fits and is still a useful contiguous block (QB*IW >= 256 elements), else fall back to the packed tile. Host launch, grids, plan cache keys, the other two kernels and all numerical formulas are unchanged. Fixed case expected: QB 16 -> 4, NB 8 -> 32, grid 128*(32+1)=4224, strided footprint estimate 4*4*256*2*16 = 128 KiB < 192 KiB.",
+  "expected": "Preflight compiles every specialization: the exact-2x block kernel now requests ~128 KiB of the 192 KiB UB on the fixed FP16 case with the stride-2 store mechanism intact and 4x smaller but still contiguous multi-row block loads (2 x 512 fp16 elements = 1 KiB per load); no other kernel's tiles change. Numerical values are byte-identical to the failed candidate because the stored per-column values and the block/row ownership rules ('lb = max(r0-1, 0)', 'b == 0' drops the last pair) are untouched; output equivalence is expected against the frozen KGS contract and both supplementary references.",
+  "validation": "One tool-bridge preflight of the edited candidate.py (compiling all specializations is the pass/fail gate for this UB repair). If it compiles, the full fixed KGS evaluation (24 formal cases) plus the 30-case PyTorch and 30-case CANN supplementary checks must pass; any bandwidth or regression claim would need a separate paired profiling round, which this follow-up does not assert.",
+  "alternatives": [],
+  "discriminating_observation": "",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

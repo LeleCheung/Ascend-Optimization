@@ -1,0 +1,84 @@
+attrs:
+- default: 4
+  description: hyper-connection 通道数 HC，须等于 keys.shape[2]
+  name: hc_mult
+  required: false
+  type: int
+- default: 1024
+  description: 每通道隐层维度 D，须等于 keys.shape[3]
+  name: hidden_size
+  required: false
+  type: int
+- default: 4
+  description: ShortConv 卷积核大小 K
+  name: kernel_size
+  required: false
+  type: int
+- default: 3
+  description: ShortConv 扩张率（max_ngram_size）
+  name: dilation
+  required: false
+  type: int
+- default: 1.0e-05
+  description: 所有 RMSNorm 的 epsilon
+  name: norm_eps
+  required: false
+  type: float
+category: VVFusion
+description: DeepSeek Engram 模块 (arXiv:2601.07372) 的 7 步融合算子，双路 RMSNorm + 缩放点积门控 +
+  Sigmoid + 门控广播乘法 + 因果扩张深度可分离卷积 (ShortConv) + SiLU + 残差。支持 Prefill 与 Decode 两阶段，Decode
+  通过 conv_state 缓存历史卷积上下文。
+difficulty: L3
+formula: output = value_gated + SiLU(DepthwiseConv1d(RMSNorm(value_gated, conv_norm_w),
+  conv_w, dil)); value_gated = sigmoid(sqrt(clamp(|raw_gate|,1e-6))*sign(raw_gate))
+  * value, raw_gate = sum(RMSNorm(keys,w1) * RMSNorm(hidden,w2), dim=-1)/sqrt(D)
+inputs:
+- description: key_proj 输出，shape [B, L, HC, D]
+  dtype:
+  - bfloat16
+  name: keys
+- description: Transformer 隐层 (query)，shape [B, L, HC, D]
+  dtype:
+  - bfloat16
+  name: hidden_states
+- description: value_proj 输出，shape [B, L, D]
+  dtype:
+  - bfloat16
+  name: value
+- description: key-RMSNorm 的 γ 权重，shape [HC, D]
+  dtype:
+  - float32
+  name: norm1_weight
+- description: query-RMSNorm 的 γ 权重，shape [HC, D]
+  dtype:
+  - float32
+  name: norm2_weight
+- description: ShortConv 内 RMSNorm 的 γ 权重，shape [HC, D]
+  dtype:
+  - float32
+  name: conv_norm_weight
+- description: 深度可分离 Conv1d 权重（无 bias），shape [HC*D, 1, K]
+  dtype:
+  - float32
+  name: conv_weight
+- description: Decode 阶段的 ShortConv 历史缓存，shape [B, HC*D, (K-1)*dil]；Prefill 可为 None
+  dtype:
+  - bfloat16
+  name: conv_state
+  optional: true
+name: EngramGateFusion
+outputs:
+- description: 融合后的 Engram 输出，shape [B, L, HC, D]
+  dtype:
+  - bfloat16
+  name: output
+- description: 更新后的 ShortConv 缓存，shape [B, HC*D, (K-1)*dil]
+  dtype:
+  - bfloat16
+  name: conv_state_out
+schema: engram_gate_fusion(Tensor keys, Tensor hidden_states, Tensor value, Tensor
+  norm1_weight, Tensor norm2_weight, Tensor conv_norm_weight, Tensor conv_weight,
+  Tensor? conv_state=None, int hc_mult=4, int hidden_size=1024, int kernel_size=4,
+  int dilation=3, float norm_eps=1e-5) -> (Tensor output, Tensor conv_state_out)
+shape_support: 'keys/hidden_states: [B, L, HC, D]，value: [B, L, D]，norm*_weight: [HC,
+  D]，conv_weight: [HC*D, 1, K]，conv_state (可选): [B, HC*D, (K-1)*dil]'

@@ -1,0 +1,49 @@
+{
+  "case": "upsample_bilinear2d-timing-1 [4,32,128,128] fp16 -> [4,32,256,256] align_corners=False", 
+  "category": "vector_shuffle_to_memory_shift", 
+  "unknown": [
+    "Cost of a one-element-misaligned contiguous MTE2 read on Ascend910B4 is not measured in the supplied evidence.", 
+    "Whether the misc-class vector ratio is dominated by gather vs by the join/reshape interleave copies; no per-instruction breakdown was supplied.", 
+    "Whether the 4 extra loads hit L2 (same rows just read) or add HBM traffic; read_main_memory_datas 8399KB is already ~2x input."
+  ], 
+  "source_sha256": "e46260c2c74a1b1f852f938eb39e2a9b85693c24e8fb393f2ecf8e8a3a2e70c5", 
+  "evidence": [
+    {
+      "category": "source_ir", 
+      "path": "workspace/actual-ir/e46260c2c74a/paired-0-_blk2x_kernel.ttir", 
+      "finding": "The fast-path body of the captured IR issues exactly four tt.gather ops on tensor<16x128xf16> (lines 68,72,75,79), one per (vertical tile x {left,right} neighbour), immediately before the 0.25/0.75 mixes and the tt.join/tt.reshape interleave. Those four gathers are the only data movement in the kernel besides the two tt.loads (lines 46,50) and two tt.stores.", 
+      "role": "trigger"
+    }, 
+    {
+      "category": "source_ir", 
+      "path": "workspace/actual-ir/e46260c2c74a/paired-1-_blk2x_kernel.bcmlir", 
+      "finding": "At BC level each tt.gather becomes an opaque call to @triton_gather/_0.._2 with a broadcast int32 index tensor (lines 95,99,102,106); the source rows themselves are plain contiguous memref.copy DMAs (lines 65-73). So the +-1 column neighbour is obtained through four library gather calls over 16x128 halves, while the row data arrives by two contiguous copies.", 
+      "role": "mechanism"
+    }, 
+    {
+      "category": "paired_profiling", 
+      "path": "workspace/context-brief.json", 
+      "finding": "[paired_evidence.differences] Candidate vector pipe is near saturation (aiv_vec_ratio 0.8463 vs ref 0.3281, 2.58x) and its instruction mix is dominated by the misc class (aiv_vec_misc_ratio 0.7981 vs 0.1920, 4.16x; aiv_vec_int32_ratio 0.0227 vs 0.0057, 4.01x), i.e. index/shuffle-style ops, consistent with four gathers per program.", 
+      "role": "trigger"
+    }, 
+    {
+      "category": "paired_profiling", 
+      "path": "workspace/context-brief.json", 
+      "finding": "[paired_evidence.differences + transfer_granularity] The memory pipe is nearly idle: aiv_mte2_ratio 0.0414 (ref 0.4701), aiv_mte3_ratio 0.0475, aiv_mte2_time 0.30us vs aiv_vec_time 7.96us per program; GM_to_UB sum 8256KB for a 8192KB input (row pair read twice) with 1054 bytes per MTE2 transfer. Byte volume is already read once per (row pair) and there is ~10x headroom on MTE2, so extra contiguous reads are affordable while extra vector work is not.", 
+      "role": "disambiguation"
+    }, 
+    {
+      "category": "paired_profiling", 
+      "path": "workspace/context-brief.json", 
+      "finding": "[paired_evidence.task_information] Candidate Task Duration 269.065us with Block Dim 1152 (= 128 images x 9 programs, QB=16) on one vector op _blk2x_kernel; the fixed-case latency is the whole-kernel time of this single launch.", 
+      "role": "background"
+    }
+  ], 
+  "finding": "On the fixed 2x fp16 case the per-program vector stage is bottlenecked by four UB gathers that realise the +-1 column neighbour, while the MTE2 pipe that brings the same rows in is ~95% idle.", 
+  "role": "mechanism", 
+  "schema_version": "hgkda.diagnosis/v1", 
+  "expected": "Per-program aiv_vec_time and aiv_vec_misc_ratio fall (four gathers removed, ~10 more flat f16 ops added); aiv_mte2_time rises roughly 3x on the load side (2 aligned + 4 one-element-shifted reads) but stays far under the vector time; candidate Task Duration below the current 269.065us for the fixed case; aiv_vec_ratio should fall below 0.846. Bitwise output equality is not claimed (fp16 association changes), values stay within the 0.015 atol/rtol contract because the tap weights are identical.", 
+  "hypothesis": "The +-1 column neighbours do not need a UB shuffle at all: because each input row is contiguous in GM and the flat tile address is base+tensor(range), the left/right neighbours can be fetched as two extra contiguous, one-element-shifted DMA reads per source row tile, with the row-edge clamp applied by a cheap select (IW is a power of two on this path, so the column index is offs & (IW-1)). Moving that neighbour access from the saturated vector/shuffle pipe (vec_ratio 0.846, misc 0.798) to the idle MTE2 pipe (0.041) should cut per-program vector instructions and hence kernel duration.", 
+  "validation": "Tool-bridge preflight --source candidate.py (compile + admission); external host runs the full 24-formal + 30-supplementary-per-case KGS contract with required_matched_ratio 1.0, then compares Task Duration and the pipe metrics against this paired reference. Risk to watch: one-element-misaligned contiguous DMA could be disproportionately expensive on this target (an earlier probe note reports shifted *2-D* block loads being 6x slower because their addressing left the 1-D shape; this change deliberately keeps 1-D addressing). If mte2 time grows more than the vector time shrinks, the mechanism is rejected and the gather form restored.", 
+  "change": "In _blk2x_kernel, only the H16 (fp16) block-grid branch: replace the four tl.gather calls with four additional flat contiguous loads (offs-1 / offs+1 relative to the two row tiles, exactly the same data the aligned loads already touch) plus per-row clamp selects, and factor the arithmetic as horizontal-then-vertical (Hf_e, Hf_o, Hg_e, Hg_o, then 0.25/0.75 vertical mixes), which has identical coefficients to the current vertical-then-horizontal order. Stores, store masks, grid, the b == NB clamped-edge program, the non-H16 (bf16/fp32) branch, and all other kernels/paths stay byte-for-byte unchanged."
+}

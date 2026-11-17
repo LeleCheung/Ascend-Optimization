@@ -1,0 +1,80 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "4ae36719a3c341d0ae478ca855edeb34",
+  "recorded_at": "2026-11-16T12:50:14.946432+00:00",
+  "round_id": "bf16-precision-03",
+  "input_source": {
+    "path": "trace/sources/bfe40d78acff15adcecbb3eb028895e198c5683621ee8cae293b7fd3d2339e87.py",
+    "sha256": "bfe40d78acff15adcecbb3eb028895e198c5683621ee8cae293b7fd3d2339e87"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "workspace/candidate.py",
+        "sha256": "bfe40d78acff15adcecbb3eb028895e198c5683621ee8cae293b7fd3d2339e87"
+      },
+      "category": "source_ir",
+      "role": "trigger",
+      "finding": "Lines 104-106 are the only probability-precision mechanism: p_hi = round_dtype(p); p_lo = round_dtype((p - p_hi)*2048); acc += dot(p_hi,v) + dot(p_lo,v)/2048. Residual after the two terms is |p - p_hi - p_lo/2048| <= u*|p - p_hi| ~ u^2*|p| with u = 2^-8 for bf16 (7 explicit mantissa bits) => ~1.53e-5 relative probability error. The docstring comment at lines 91-103 itself claims ~2^-16 for bf16, which is exactly this squared-unit-roundoff floor and is too coarse for the near-zero cancellation elements.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "workspace/results-02.json",
+        "sha256": "56943e5bdfacdd54ec6aaa33c4a6a453ea177f55d27527526516a8a4039544a6"
+      },
+      "category": "probe",
+      "role": "trigger",
+      "finding": "Measured candidate (source_sha256 bfe40d78acff15adcecbb3eb028895e198c5683621ee8cae293b7fd3d2339e87): case 4 bf16 MARE 1.3323454801715964 and case 7 bf16 MARE 1.1813596401978237 against max-relative threshold 0.0078125, with max_abs already 4.8827628880834806e-04 / 4.8818959581398147e-04 (identical to the floor). Cases 1 and 2 fp16 MARE 0.1830849027730895 / 0.19728936034930172 are bit-identical to the nearest-FP16 floor, so the FP16 path is saturated and its stated threshold 0.0009765625 is unattainable for these inputs with declared fp16 output. BF16 error is ~342x / ~304x the achievable floor, therefore improvable.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "workspace/precision-floor.json",
+        "sha256": "8c84826bde7567269eef4e5174e914fca5e0a7da12cfaf05a013f25195890516"
+      },
+      "category": "probe",
+      "role": "mechanism",
+      "finding": "nearest_representable_correctness gives the achievable floors: case 4 mare 0.00389109267560594 (official_formula_pass true), case 7 mare 0.0038898757177023937 (pass true), max_abs 4.8827e-04 / 4.8819e-04. Both BF16 floors are ~2^-8, i.e. pure bf16 unit-roundoff of the final store; bf16 shares fp32 exponent range so that bound is scale invariant. FP16 floors are 0.1830849027730895 / 0.19728936034930172 (fp16 subnormal granularity). Implication: BF16 must shed essentially all accumulated PV error down to about one bf16 half-ulp, leaving ~2x headroom under the 0.0078125 threshold.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "workspace/results-01.json",
+        "sha256": "b34ae9c8b500c01e05de1c59419c536b9a6f02ed764afcf879fc6968b39d2bae"
+      },
+      "category": "probe",
+      "role": "background",
+      "finding": "Cross-source context (artifact source_sha256 2979bc0e..., i.e. a previous candidate, not the current source; recorded as background because its payload is bound to that older source): single-term probability, p rounded once to v.dtype, measured bf16 case 4 MARE 924.9460050155029 and case 7 1188.7607055618432; the current two-term version gives 1.3323 / 1.1814, i.e. 694x / 1006x. Removing one probability-error term therefore bought far more than the nominal u/u^2 = 256x, and the residual is still u^2-scaled (above the floor), so a third term (residual u^3 ~ 5.96e-8 relative) should reach the floor-limited regime. The same comparison shows the QK/scale/exp and final-division paths were not the binding error source at the u^2 level.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "workspace/golden.py",
+        "sha256": "802d5450ae8d145f3d27f1d33820fc7a10f3cd609f01af4687eb2f67908a9d6d"
+      },
+      "category": "source_ir",
+      "role": "background",
+      "finding": "Golden is matmul(q, k^T)*scale -> softmax -> matmul(attn_weights, v) with a float64-capable torch reference. In the kernel V already enters in the declared bf16/fp16 dtype, so V is exactly representable in the dot dtype and needs no splitting; only the fp32 probability p carries representation error. The semantics are y = sum_j p_j v_j with p in (0,1]; no algebraic rewrite is needed and the output dtype must stay as declared.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "workspace/contract.json",
+        "sha256": "98c7f29509c54f06c254cfb308c0042969a479113b6f3096741ee1c1b163646b"
+      },
+      "category": "other",
+      "role": "background",
+      "finding": "Cases 4 and 7 are bf16 with value_range [-1,1]: B4S256Nq64Nkv8D128-G8 and B2Sq128Skv256Nq32Nkv8D128-G4 cross, both non-causal with scaleValue -1.0 => scale 1/sqrt(128). Benchmark, golden, inputs and thresholds are fixed; only the probability/PV path may be changed.",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "The BF16 MARE of 1.33/1.18 is dominated by the two-term probability expansion, whose residual is u^2*|p| with u = 2^-8. Output elements that are near zero by cancellation are of order 1e-5 while sum_j p_j |v_j| is O(0.4), so a 1.5e-5 relative probability error becomes an absolute output error of that order, i.e. relative error of order 1 at the worst element. Replacing the two-term split by a three-term expansion p = p_hi + p_lo/2048 + p_lo2/2048^2 (bf16x3: 3*8 = 24 mantissa bits, residual u^3 ~ 5.96e-8 relative) pushes the probability representation error below the fp32 accumulation and fp32 exp2/qk-scale rounding level (~2^-24 = 5.96e-8), which is the true floor for any fp32-accumulating low-precision-dot kernel. Because V is exact in bf16 and p is the only lossy operand, three terms is the minimal sufficient representation; a fourth term buys nothing since fp32 addition inside tl.dot already limits accuracy at that level. The FP16 mechanism (two terms, u^2 = 2^-22) is already bit-identical to its floor and must be preserved.",
+  "change": "candidate.py only, inside the KV loop: keep p_hi = p.to(v.dtype) and p_lo = ((p - p_hi.to(fp32))*2048).to(v.dtype) exactly as today, and additionally, for bf16 only (new host-side constexpr NSPLIT = 3 for bfloat16, 2 for float16 so the fp16 path is emitted unchanged), compute r2 = (p - p_hi)*2048 - p_lo.to(fp32) in fp32 (exact residual of the first scaled term), p_lo2 = (r2*2048).to(v.dtype), and acc += dot(p_lo2, v) * (1/2048^2). The low-order dot is accumulated last so the tiny contribution is not rounded against the O(sum p|v|) accumulator. No other arithmetic changes: QK stays tl.dot with fp32 accumulation, the exp2-based online softmax keeps fp32 m/l/alpha rescaling, and out = acc/l_safe is fp32 with a single final cast to the declared output dtype. No PyTorch/native/CPU fallback and no target-side computation; every device op stays strict Triton.",
+  "expected": "BF16 cases 4 and 7: probability representation error u^2 -> u^3 removes a 256x factor from that term; extrapolating the measured 694x/1006x response of the first term removal but capped by the fp32 accumulation limit, expected candidate MARE ~0.004-0.006, i.e. at or slightly above the nearest-BF16 floors 0.003891/0.003890 and below the 0.0078125 threshold => official_formula_pass true. max_abs should remain at the floor values 4.8827e-04 / 4.8819e-04 since the largest elements were already floor-limited. FP16 cases 1 and 2: unchanged emitted code path, expected identical MARE 0.1830849027730895 / 0.19728936034930172, so the documented unattainable-threshold fact is preserved, the metric is not gamed and the output dtype is unchanged. Performance: one extra bf16 tl.dot per KV-block iteration for bf16 cases only (3 vs 2 dots per block, 4 iterations at SKV=256), so bf16 full_call latency may rise; FP16 latency unchanged. Performance is explicitly secondary here.",
+  "validation": "External gate re-runs the unchanged benchmark/golden/thresholds on the new candidate: (1) bf16 cases 4 and 7 candidate_correctness.mare <= 0.0078125 with official_formula_pass true; (2) fp16 cases 1 and 2 mare still 0.1830849027730895 / 0.19728936034930172 and max_abs unchanged, confirming the FP16 mechanism is preserved; (3) supplementary_allclose true for all four cases and max_abs not above the declared floor values; (4) strict-Triton preflight of the new source. Diagnostic branch to record afterwards: if bf16 MARE improves by roughly u^2/u^3 but stalls well above the floor, the remaining term is fp32 accumulation inside tl.dot plus the fp32 qk*scale multiply and exp2 rounding (all ~2^-24 relative), which no supported low-precision dot formulation removes; the next lever would be a compensated/higher-precision accumulation, not more split terms. If MARE does not move at all, the third dot was not actually accumulated and the compiled IR must be re-checked.",
+  "alternatives": [],
+  "discriminating_observation": "",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

@@ -1,0 +1,90 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "f9d8f022458148c2811cc8c982687909",
+  "recorded_at": "2026-11-17T06:41:55.351155+00:00",
+  "round_id": "performance-02",
+  "input_source": {
+    "path": "trace/sources/39eead43fb7da8013341f6eeabbbe48083fb6e3be705190cc5f2ad815594ecba.py",
+    "sha256": "39eead43fb7da8013341f6eeabbbe48083fb6e3be705190cc5f2ad815594ecba"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/8cb09b3b77999cbc7995a52a0ac7c069170cdffa63dedb3313a1e33e16cf8eb3.json",
+        "sha256": "8cb09b3b77999cbc7995a52a0ac7c069170cdffa63dedb3313a1e33e16cf8eb3"
+      },
+      "original": {
+        "path": "workspace/performance-feedback.json",
+        "sha256": "8cb09b3b77999cbc7995a52a0ac7c069170cdffa63dedb3313a1e33e16cf8eb3"
+      },
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "timing-11 float32 4096x4096 candidate 97.93us (前次 86.94us), ref 102.59us; timing-3 fp16 21.33us, timing-7 bf16 23.60us; 所有小输入约15-16us。FP32大输入是本轮唯一变慢用例。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/39eead43fb7da8013341f6eeabbbe48083fb6e3be705190cc5f2ad815594ecba.py",
+        "sha256": "39eead43fb7da8013341f6eeabbbe48083fb6e3be705190cc5f2ad815594ecba"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "39eead43fb7da8013341f6eeabbbe48083fb6e3be705190cc5f2ad815594ecba"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "n>8192时 BLOCK 恒为8192个元素，与dtype宽度无关；每iter一个program搬入8192元素再写回，grid=min(cores,cdiv(n,block))。故 fp32 单tile为32KiB入+32KiB出，是 fp16/bf16 tile字节数的2倍；尾块与strided路径不受影响，_value 数学表达式与 out 语义不随tile变化。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/8cb09b3b77999cbc7995a52a0ac7c069170cdffa63dedb3313a1e33e16cf8eb3.json",
+        "sha256": "8cb09b3b77999cbc7995a52a0ac7c069170cdffa63dedb3313a1e33e16cf8eb3"
+      },
+      "original": {
+        "path": "workspace/performance-feedback.json",
+        "sha256": "8cb09b3b77999cbc7995a52a0ac7c069170cdffa63dedb3313a1e33e16cf8eb3"
+      },
+      "category": "roofline",
+      "role": "mechanism",
+      "finding": "总墙钟约等于 max(宿主约15us, 核时间)：fp16大输入67MB/21.3us约3.1TB/s（接近HBM峰值），fp32大输入134MB/约95us约1.4TB/s，仅约峰值44%。fp32算术量按向量吞吐估算约6us，远小于95us，故瓶颈在流式搬运组织而非数学；FP32路径的组织（tile字节翻倍）与带宽利用率下降同时出现。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/dd6c9a236b5e1a35fa0075ab2c6e6a663cdf6b4774967f743026e0e8e62c11e4.json",
+        "sha256": "dd6c9a236b5e1a35fa0075ab2c6e6a663cdf6b4774967f743026e0e8e62c11e4"
+      },
+      "original": {
+        "path": "workspace/knowledge.json",
+        "sha256": "dd6c9a236b5e1a35fa0075ab2c6e6a663cdf6b4774967f743026e0e8e62c11e4"
+      },
+      "category": "knowledge",
+      "role": "background",
+      "finding": "历史机制强调大/小输入损失不同、宿主启动路径已优化、设备数学公式不得改动；本轮只允许有界通用改动。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/2e7ee330fe50680cb256eed4af99b5e53749b6a1dba65e6bc19c92d11de28baa.json",
+        "sha256": "2e7ee330fe50680cb256eed4af99b5e53749b6a1dba65e6bc19c92d11de28baa"
+      },
+      "original": {
+        "path": "workspace/contract.json",
+        "sha256": "2e7ee330fe50680cb256eed4af99b5e53749b6a1dba65e6bc19c92d11de28baa"
+      },
+      "category": "other",
+      "role": "background",
+      "finding": "合同要求 out 可选、resize/device 校验、返回 out 别名；decimals 为关键字；改动不得触碰这些语义。",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "fp32 路径每tile的 UB 占用（32KiB入+32KiB出）是 fp16 的2倍，压缩了同一循环的 DMA 多缓冲/重叠深度，使 fp32 流式带宽只有峰值约44%；把每tile字节数按元素宽度归一（目标16KiB）可恢复重叠，从而降低 FP32 大输入的数据搬运开销。",
+  "change": "仅改 _geometry：新增 itemsize 参数，tile 元素数上限 = min(8192, 16384//itemsize)（fp16/bf16/int8 仍为8192，与原实现逐字节一致；fp32 变为4096；fp64/int64 为2048）。_value 公式、_round_stream/_round_strided 计算、grid=min(cores,cdiv)、out/resize/device 语义与缓存键（已含dtype）均不变。",
+  "expected": "timing-11 fp32 4096x4096 从约98us 降到约55-70us；timing-10 fp32 1M 大致持平；timing-9 fp32 65536 轻微变化；fp16/bf16 全部用例逐字节不变；数值结果按位不变。",
+  "validation": "先 preflight（设备只读路径/地址边界审查），再跑正式合同：确认 FP32 大输入改善、FP16/BF16 无退步、几何均值相对固定 CANN 基线不下降；若资源压力或数值不正确，据反馈回退或改tile目标字节，不放宽检查。",
+  "alternatives": [],
+  "discriminating_observation": "",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

@@ -1,0 +1,72 @@
+attrs:
+- default: false
+  description: 'False: SwiGLU = SiLU(B) * A，B 为 split 后的右半边
+
+    True : SwiGLU = SiLU(A) * B，A 为 split 后的左半边
+
+    '
+  name: activate_left
+  required: false
+  type: bool
+category: FusedComposite
+description: 反量化 + SwiGLU + 动态量化（per-token）三步融合（精简版，去掉 group_index/swiglu_mode/bias/quant_offset/static-quant-mode）
+difficulty: L3
+formula: 'dequant_out = (x.float() * weight_scale + 0) * activation_scale.unsqueeze(-1)   #
+  x=int32 path
+
+  dequant_out = x                                                                  #
+  x=bfloat16 path
+
+  A, B = split(dequant_out, last_dim, 2)
+
+  swiglu_out = SiLU(A) * B   if activate_left else   SiLU(B) * A
+
+  if quant_scale is not None: swiglu_out = swiglu_out * quant_scale
+
+  y, scale  = Quantize(swiglu_out)   # static (quant_mode=0) or dynamic per-token
+  (=1)
+
+  '
+inputs:
+- description: 主输入张量；尾轴必须为偶数
+  dtype:
+  - int32
+  - bfloat16
+  - float16
+  name: x
+  shape: '[TokensNum, 2H]'
+- description: 权重量化的反量化系数；当 x=int32 时必须非 None，当 x=bfloat16/float16 时必须 None
+  dtype:
+  - float32
+  name: weight_scale
+  optional: true
+  shape: '[1, 2H]'
+- description: per-token 激活量化的反量化系数；当 x=int32 时必须非 None，当 x=bfloat16/float16 时必须 None
+  dtype:
+  - float32
+  name: activation_scale
+  optional: true
+  shape: '[TokensNum]'
+- description: smooth quant 系数，量化前对 swiglu_out 逐元素乘
+  dtype:
+  - float32
+  name: quant_scale
+  optional: true
+  shape: '[1, H]'
+name: DequantSwigluQuant
+outputs:
+- description: 量化后的输出张量
+  dtype:
+  - int8
+  name: y
+  shape: '[TokensNum, H]'
+- description: per-token 量化 scale；动态量化模式下为实测值
+  dtype:
+  - float32
+  name: scale
+  shape: '[TokensNum]'
+precision_thresholds:
+  int8: 1.0
+schema: dequant_swiglu_quant(Tensor x, Tensor? weight_scale=None, Tensor? activation_scale=None,
+  Tensor? quant_scale=None, bool activate_left=False) -> (Tensor y, Tensor scale)
+shape_support: 'x: [TokensNum, 2H]; 输出 y: [TokensNum, H], scale: [TokensNum]'

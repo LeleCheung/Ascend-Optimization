@@ -76,4 +76,6 @@ def main():
     save(Path(c['run_directory'])/'workspace/performance-feedback.json',feedback)
     print(json.dumps(dict(status='completed',directory=str(run),decision=feedback['decision'],score=result.get('geo_mean'))))
 
-if __name__=='__main__':main()
+if __name__=='__main__':
+    from hgkda.runtime.trace import traced_main
+    traced_main(main, 'evaluate')

@@ -1,0 +1,73 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "6b51c254a63e4f9e9680758bed404e94",
+  "recorded_at": "2026-11-16T12:34:49.092141+00:00",
+  "round_id": "round-01",
+  "input_source": {
+    "path": "trace/sources/e46260c2c74a1b1f852f938eb39e2a9b85693c24e8fb393f2ecf8e8a3a2e70c5.py",
+    "sha256": "e46260c2c74a1b1f852f938eb39e2a9b85693c24e8fb393f2ecf8e8a3a2e70c5"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "workspace/paired-evidence.json",
+        "sha256": "48d72641777aa697682abe7d1df5f99c4c5b4c044bda089b1a99b426c868be77"
+      },
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "candidate aiv_vec_ratio mean 0.846, of which aiv_vec_misc_ratio mean 0.798 (fp16 0.0253, int32 0.0227); MTE2/MTE3 ratio only 0.041/0.047; Task Duration 269.07 us for 1152 blocks. Vector-pipe 'misc' (data permutation/slice) work, not arithmetic, dominates.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "workspace/actual-ir/e46260c2c74a/paired-1-_blk2x_kernel.bcmlir",
+        "sha256": "d962ac9fec51eaebc6eba914ca51a61e40d5264693165882cd756260e15c7102"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "tl.join(even, odd)+tl.reshape lowers to two tensor.insert_slice ops writing into a tensor<16x128x2xf16> with inner stride 2 (lines 'inserted_slice' / 'inserted_slice_8', for both pe and po) followed by tensor.reshape; i.e. the even/odd interleave is done as four strided vector copies inside UB, counted as vector 'misc' work, before the contiguous store.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "workspace/context-brief.json",
+        "sha256": "36ff3769ad0e468feb9fd95b1df3d69d276e41919d479793773a8a1a44c807e6"
+      },
+      "category": "simulator",
+      "role": "trigger",
+      "finding": "Per-instruction hotspots on _blk2x_kernel/core0.veccore0: the largest single-instruction times sit on line 137 (tl.reshape(tl.join(even_f, odd_f))) - four BAR/WAIT_FLAG entries with 21 calls each at 101.98/101.93/101.49/101.41 us and three more at 74.6/73.2/72.9 us - plus four BARs at 80.3 us on the gather lines 133-135 (336 calls). Region 108-175 has trace_interval_union 304 us of a 319 us capture.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "workspace/candidate.py",
+        "sha256": "e46260c2c74a1b1f852f938eb39e2a9b85693c24e8fb393f2ecf8e8a3a2e70c5"
+      },
+      "category": "other",
+      "role": "background",
+      "finding": "Exact-2x fast path currently: vertical mix -> two tl.gather horizontal neighbours -> four madds -> tl.join + tl.reshape to (QB, OW) -> two contiguous stores (masked form for b == 0). The interleave is the only remaining bulk permutation besides the four gathers.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "workspace/knowledge.json",
+        "sha256": "0e6ab24bd669303865082f8f7b6863d339b46b203cc971a3d2fa453812f1323a"
+      },
+      "category": "knowledge",
+      "role": "background",
+      "finding": "knowledge retrieval is empty (exact 0, type_transfer 0); no specialized record exists for this operator, so only this workspace's evidence is used.",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "On the fixed 4x32x128x128 -> 256x256 FP16 case the fast path is vector-pipe bound by 'misc' permutation work (aiv_vec_misc_ratio 0.798 out of aiv_vec_ratio 0.846), not by fp16 arithmetic (0.025). Half of that permutation volume is the even/odd interleave that tl.join+tl.reshape compiles to four stride-2 tensor.insert_slice copies in UB (8192 of ~16384 permuted elements per program), and the simulator attributes the largest per-instruction times to exactly those line-137 BARs. Since the output elements are already produced as separate even-column (2k) and odd-column (2k+1) tiles, the interleave can be expressed purely in the store addressing: two strided column stores per output row instead of one contiguous store of an interleaved tile.",
+  "change": "In _blk2x_kernel only (the exact-2x fast path, which covers the fixed case): keep the vertical mix, the two tl.gather neighbour tiles and the four madds bit-identically, but delete pe = reshape(join(even_f, odd_f), (QB, OW)) and po likewise, and store the four (QB, IW) tiles directly at even-column offsets 2*k and odd-column offsets 2*k+1 of output rows 2*(lb+r)+2 and 2*(lb+r)+1, with the same b == 0 row mask. No arithmetic, indexing rule, dtype handling, gate condition, cache/launch mechanism or other kernel (_bilinear_int_kernel, _bilinear_flat_kernel, plan gating, host path) changes.",
+  "expected": "aiv_vec_misc_ratio falls from ~0.80 toward ~0.4-0.5, aiv_vec_time per block falls, aiv_mte3_time/UB_to_GM_datas rise (strided writes, from ~0.31 us to at most a few us per block), and the fixed-case Task Duration drops from 269.07 us (target: measurable decrease, e.g. <=240 us). Numerical output identical in structure (same per-output arithmetic), so all 24 formal cases and both 30-case supplementary suites must still match.",
+  "validation": "Preflight (compile + read-only admission + supplementary checks) on candidate.py, then the host's full KGS formal evaluation and supplementary suites; compare Task Duration, aiv_vec_misc_ratio, aiv_vec_time and aiv_mte3_time against the recorded 269.07 us / 0.798 / 9.13 us / 0.307 us baselines, and require every fixed and supplementary case to pass unchanged.",
+  "alternatives": [
+    "The same latency could be limited by the four tl.gather horizontal-neighbour tiles rather than by the join; those are not touched by this change and their BARs would remain if the join is the smaller share.",
+    "Strided (stride-2, 2-byte-element) GM writes might be lowered to an inefficient element-wise path, in which case the interleave cost moves to MTE3/vector instead of disappearing."
+  ],
+  "discriminating_observation": "If misc-bounded interleave dominates, aiv_vec_misc_ratio must drop clearly (>=0.1 absolute) while aiv_mte3_time / UB_to_GM_datas grow only mildly; if instead the gathers dominate, aiv_vec_misc_ratio stays near 0.80 and Task Duration is roughly unchanged.",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

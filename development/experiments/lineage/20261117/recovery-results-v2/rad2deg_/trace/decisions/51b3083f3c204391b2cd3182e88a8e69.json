@@ -1,0 +1,90 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "51b3083f3c204391b2cd3182e88a8e69",
+  "recorded_at": "2026-11-17T05:29:17.144047+00:00",
+  "round_id": "performance-01",
+  "input_source": {
+    "path": "trace/sources/5e47796a38a467c41bf25f2e30c4354b82d08535cf43d02991c181a4a4a6f1ce.py",
+    "sha256": "5e47796a38a467c41bf25f2e30c4354b82d08535cf43d02991c181a4a4a6f1ce"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/168e094fc848dec2f8cdd1c52e7489aabcf8f563f3909bc000198b1fa40e6573.json",
+        "sha256": "168e094fc848dec2f8cdd1c52e7489aabcf8f563f3909bc000198b1fa40e6573"
+      },
+      "original": {
+        "path": "workspace/performance-feedback.json",
+        "sha256": "168e094fc848dec2f8cdd1c52e7489aabcf8f563f3909bc000198b1fa40e6573"
+      },
+      "category": "other",
+      "role": "trigger",
+      "finding": "Formal 12-case geo_mean 0.9625098543. Largest cases (4096x4096, 16777216 elems) speedup: fp16 0.614 (27.84us vs 17.10us), bf16 0.636 (29.92 vs 19.03), fp32 0.933 (30.97 vs 28.91). All <=1M-element cases are ~0.98-1.16, so launch/hot-path overhead is already at parity. exp(-sum(log_loss)/12)=exp(-0.4586/12)=0.9625 reproduces the geo_mean; the two 16-bit large cases alone contribute 0.9403 of the 0.4586 loss sum.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/168e094fc848dec2f8cdd1c52e7489aabcf8f563f3909bc000198b1fa40e6573.json",
+        "sha256": "168e094fc848dec2f8cdd1c52e7489aabcf8f563f3909bc000198b1fa40e6573"
+      },
+      "original": {
+        "path": "workspace/performance-feedback.json",
+        "sha256": "168e094fc848dec2f8cdd1c52e7489aabcf8f563f3909bc000198b1fa40e6573"
+      },
+      "category": "other",
+      "role": "disambiguation",
+      "finding": "Candidate fp16-large / fp32-large = 27.84/30.97 = 0.90, but reference fp16-large / fp32-large = 17.10/28.91 = 0.59. The reference gains ~41% by halving bytes (bandwidth-bound) while the candidate gains only ~10%, so the 16-bit path is not bandwidth-bound: extra per-element fp32-promotion vector work dominates the large 16-bit calls. Small cases at parity confirm the gap is device arithmetic, not host launch.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/5e47796a38a467c41bf25f2e30c4354b82d08535cf43d02991c181a4a4a6f1ce.py",
+        "sha256": "5e47796a38a467c41bf25f2e30c4354b82d08535cf43d02991c181a4a4a6f1ce"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "5e47796a38a467c41bf25f2e30c4354b82d08535cf43d02991c181a4a4a6f1ce"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Both Triton kernels compute y = (x.to(tl.float32) * 57.29577951308232).to(x.dtype). For float16/bfloat16 this materializes a full fp32 tile and adds two full-tile type-conversion vector ops (16-bit->fp32 and fp32->16-bit) that the fp32 path does not have; it also introduces a second rounding relative to a single native-dtype multiply.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/dd6c9a236b5e1a35fa0075ab2c6e6a663cdf6b4774967f743026e0e8e62c11e4.json",
+        "sha256": "dd6c9a236b5e1a35fa0075ab2c6e6a663cdf6b4774967f743026e0e8e62c11e4"
+      },
+      "original": {
+        "path": "workspace/knowledge.json",
+        "sha256": "dd6c9a236b5e1a35fa0075ab2c6e6a663cdf6b4774967f743026e0e8e62c11e4"
+      },
+      "category": "knowledge",
+      "role": "background",
+      "finding": "Prior pointwise candidate 8600ce070318 that only changed the math dtype passed the same formal contract >0.8, i.e. dtype-selective arithmetic is an accepted, correctness-preserving lever here. The launch-path/cached-launcher work is already present in this candidate (small cases ~1.0).",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/2d79322f2cdb2b1d33331ba6085847e404cc0da44e6f3c6b15dffdee8418ef4b.json",
+        "sha256": "2d79322f2cdb2b1d33331ba6085847e404cc0da44e6f3c6b15dffdee8418ef4b"
+      },
+      "original": {
+        "path": "workspace/context-brief.json",
+        "sha256": "2d79322f2cdb2b1d33331ba6085847e404cc0da44e6f3c6b15dffdee8418ef4b"
+      },
+      "category": "other",
+      "role": "background",
+      "finding": "No actual_ir, no paired_evidence, no roofline, no simulator, no runtime_api excerpt (host_diagnosis/compiler_comparison null). Therefore no instruction-level or bandwidth claim is asserted; the mechanism is inferred only from per-dtype per-case walltime ratios.",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "The 16-bit gap is caused by promoting the whole tile to fp32 for the single scale multiply. The native-dtype CANN reference performs the multiply in the input dtype; doing the same removes two full-tile conversion vector ops, making the fp16/bf16 large calls bandwidth-bound and close to the reference. float32 arithmetic is numerically unchanged (a single fp32 multiply either way).",
+  "change": "In both Triton kernels replace (x.to(tl.float32) * 57.29577951308232).to(x.dtype) with x * tl.full((1,), 57.29577951308232, x.dtype), forcing the multiply to run in the input dtype (native fp16/bf16; identical fp32). Launcher ABI, cache keys, alignment/device/stream guards, strided index decomposition, tail mask and exactly-once cold path are all left unchanged.",
+  "expected": "4096x4096 fp16 and bf16 candidate_us should drop toward the reference (roughly 17-19us) with speedups moving from 0.61/0.64 toward ~0.9-1.0; fp32 and all <=1M cases unchanged; geo_mean should rise from 0.9625 toward/over 1.0 (parity on both 16-bit large cases alone gives exp(0.4817/12)=1.041). Correctness: max relative deviation ~8e-4 (fp16) / ~6e-3 (bf16), within the tolerance that already accepts the native CANN reference.",
+  "validation": "Tool-bridge preflight, then full KGS 36/36 plus both 42/42 supplementary checks; compare per-case speedups against the 0.9625098543 starting measurement. If any correctness case fails, revert the kernels to fp32 promotion and record the regression.",
+  "alternatives": [],
+  "discriminating_observation": "",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

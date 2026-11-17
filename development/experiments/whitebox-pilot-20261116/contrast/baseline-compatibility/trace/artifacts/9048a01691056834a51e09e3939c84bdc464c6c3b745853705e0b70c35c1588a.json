@@ -1,0 +1,32 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "e46260c2c74a1b1f852f938eb39e2a9b85693c24e8fb393f2ecf8e8a3a2e70c5",
+  "evidence": [
+    {
+      "path": "compatibility-feedback.json",
+      "category": "other",
+      "role": "trigger",
+      "finding": "sha256 709e50ad... matches candidate source sha e46260c2...; status PARTIAL_PASS, 18/24. All correctness cases passed but every profiler timing case fails inside the cached generated launcher at source/main.py:526 -> \"AttributeError: 'int' object has no attribute 'size'\"."
+    },
+    {
+      "path": "candidate.py",
+      "category": "other",
+      "role": "disambiguation",
+      "finding": "Lines 510-529: run() looks up _LAUNCH_CACHE filled by _ordinary() with (compiled.run.launch, compiled.function, compiled.packed_metadata, grid0, device_index), then calls entry[0](grid, 1, 1, _current_raw_stream(dev), function, packed_metadata, None, None, None, out_ptr, in_ptr, None*7). The tensor arguments are reduced to bare data_ptr() integers at line 517-518. Under the msprof L1 flag the generated launcher calls _get_tensor_shape() on each pointer argument, which requires a tensor with .size(); an int has no .size(). This is the sole trigger: the same launch is byte-identical and passes when the profiler is off."
+    },
+    {
+      "path": "contract.json",
+      "category": "other",
+      "role": "background",
+      "finding": "upsample_bilinear2d contract: single output out, no mutation/aliasing; public entry run(input, output_size, align_corners=False, scales_h=None, scales_w=None). The fix is confined to host-side argument marshalling in run()."
+    }
+  ],
+  "hypothesis": "The generated Triton launcher accepts tensor arguments (it derives data_ptr itself, exactly as kernel[grid](...) does) and only needs the real tensor objects so its msprof L1 registration path can call _get_tensor_shape(). The cached fast-path bypasses that marshalling by pre-extracting data_ptr integers. Passing the current call's out/input tensors to the cached launcher removes the AttributeError without touching kernels, grids, metadata, stream, or specialization keying; pointer identity is still used only for the cache key's low-4-bit alignment component.",
+  "change": "In candidate.py run() cached-launch branch only: pass the current `out` and `input` tensors instead of the pre-computed `out_ptr`/`in_ptr` integers as the two pointer launch arguments. `in_ptr`/`out_ptr` remain in the launch-cache key; stream expression, grid, function, packed_metadata, hooks placeholders and all scalar specializations are unchanged. Triton kernels, launch grids and arithmetic untouched.",
+  "expected": "Profiler timing cases launch through the cached generated launcher without AttributeError; non-profiler behavior identical (launcher calls data_ptr() on the tensors, same addresses, same stream, same grid). Correctness unchanged.",
+  "validation": "Bridge preflight on the edited candidate.py; if it reports awaiting_source_review, stop with candidate unchanged (no further edits).",
+  "unknown": [
+    "Whether the launcher's msprof path additionally validates tensor dtype/shape beyond size(); standard generated launchers accept ordinary contiguous tensors.",
+    "Whether _cacheable's enable_msprof_register_tensor guard should also suppress the cache; not changed because the observed failure proves the cached entry is built and used, and the tensors-argument fix is generic to both profiler and non-profiler launches."
+  ]
+}

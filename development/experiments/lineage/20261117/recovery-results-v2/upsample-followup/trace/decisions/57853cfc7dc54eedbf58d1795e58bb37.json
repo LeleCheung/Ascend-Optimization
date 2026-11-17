@@ -1,0 +1,94 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "57853cfc7dc54eedbf58d1795e58bb37",
+  "recorded_at": "2026-11-17T05:53:56.193044+00:00",
+  "round_id": "performance-01",
+  "input_source": {
+    "path": "trace/sources/dc722edadbd965c559f914c32564fbc00f5d94936feb180f6512d65fa6a49138.py",
+    "sha256": "dc722edadbd965c559f914c32564fbc00f5d94936feb180f6512d65fa6a49138"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/0c4ef40ba83893cd180b1384f9376e0e940c4f54350e6bde7edd1c0b9bc3c939.json",
+        "sha256": "0c4ef40ba83893cd180b1384f9376e0e940c4f54350e6bde7edd1c0b9bc3c939"
+      },
+      "original": {
+        "path": "workspace/baseline-comparison.json",
+        "sha256": "0c4ef40ba83893cd180b1384f9376e0e940c4f54350e6bde7edd1c0b9bc3c939"
+      },
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "Same fixed KGS walltime service, one full measurement each. Current vs original candidate_us: fp16 small 31.961->41.917, bf16 small 32.006->41.460, fp32 small 30.340->41.254 (all +9.4..10.9us, uniform across the three dtypes); fp16 large 265.113->218.174 (device gain preserved); bf16 large 273.641->273.663 and fp32 large 276.229->276.310 unchanged. Overall geomean 1.020642x (current) vs 1.121873x (original) against CANN.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/e46260c2c74a1b1f852f938eb39e2a9b85693c24e8fb393f2ecf8e8a3a2e70c5.py",
+        "sha256": "e46260c2c74a1b1f852f938eb39e2a9b85693c24e8fb393f2ecf8e8a3a2e70c5"
+      },
+      "original": {
+        "path": "workspace/starter.py",
+        "sha256": "e46260c2c74a1b1f852f938eb39e2a9b85693c24e8fb393f2ecf8e8a3a2e70c5"
+      },
+      "category": "source_ir",
+      "role": "background",
+      "finding": "Historical original source SHA e46260c2c74a1b1f852f938eb39e2a9b85693c24e8fb393f2ecf8e8a3a2e70c5. Its cached direct launch passes current-call int pointers (out_ptr, in_ptr); the plan cache, launch cache key, grid, packed metadata, function and current-raw-stream lookup are otherwise identical to candidate.py.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/dc722edadbd965c559f914c32564fbc00f5d94936feb180f6512d65fa6a49138.py",
+        "sha256": "dc722edadbd965c559f914c32564fbc00f5d94936feb180f6512d65fa6a49138"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "dc722edadbd965c559f914c32564fbc00f5d94936feb180f6512d65fa6a49138"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Compared with starter.py the only host-path difference is that the cached fast path passes the tensors out/input instead of int pointers. Device kernels are identical for the non-fp16 branch; only the fp16 branch differs. _cacheable refuses to populate _LAUNCH_CACHE for a launcher whose enable_msprof_register_tensor is truthy, so cached entries are non-profiling launchers; _ordinary (tensor arguments) remains the path for profiling-registering compiles.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/39fa3221827548899dd36157b5ad64b8a3b5298928e49dcc5317dabeb0ca67ac.md",
+        "sha256": "39fa3221827548899dd36157b5ad64b8a3b5298928e49dcc5317dabeb0ca67ac"
+      },
+      "original": {
+        "path": "workspace/skills/hgkda/references/upstream-validation.md",
+        "sha256": "39fa3221827548899dd36157b5ad64b8a3b5298928e49dcc5317dabeb0ca67ac"
+      },
+      "category": "knowledge",
+      "role": "disambiguation",
+      "finding": "Guidance states that unconditionally using Tensor parameters may increase host launch overhead on small inputs; normal runs and capture runs may use representations satisfying their respective argument contracts as long as computation is identical, and profiler state must be checked after capture rather than assumed reset. This distinguishes host argument marshalling from a device-side explanation, but is method guidance, not proof of the measured delta.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/1916472afb2f79831700f61ef23b4a24c513b460234380822991921b04c8acc3.md",
+        "sha256": "1916472afb2f79831700f61ef23b4a24c513b460234380822991921b04c8acc3"
+      },
+      "original": {
+        "path": "workspace/skills/hgkda/references/launch-and-feedback.md",
+        "sha256": "1916472afb2f79831700f61ef23b4a24c513b460234380822991921b04c8acc3"
+      },
+      "category": "knowledge",
+      "role": "background",
+      "finding": "Records that ordinary kernel[grid](tensor,...) pays argument binding / device-stream / runtime dispatch per call, and that a compiled launcher may be called directly while preserving the Triton device product; it also warns to keep tensor metadata where a supported profiler entry requires it.",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "The uniform ~10us fixed increase on all three small cases is per-call host marshalling of Tensor pointer arguments in the cached direct launch, not device work (bf16/fp32 use the unchanged gather branch yet regress identically). Cached launches only ever hold non-profiling launchers (guarded by _cacheable), so they need only the current-call int pointers; the tensor metadata contract is only required by a launcher that actually reports profiler tensor registration. Passing current-call int pointers on cached launches, while routing any profiler-registering launcher to the tensor form, removes the fixed overhead without changing device computation, pointers or stream.",
+  "change": "Store the compiled launcher object alongside the existing cached launch tuple. In the cached fast path, inspect that launcher's enable_msprof_register_tensor: if truthy pass the current tensors (satisfying the profiler tensor-metadata contract), otherwise pass the current call's int pointers. Grid, function, packed metadata, current raw stream, plan, alignment key and all device kernels are unchanged; the ordinary/profiling path still launches with tensors.",
+  "expected": "Small-case walltime returns toward the original ~30-32us (bf16/fp32 recover to the unchanged-kernel baseline exactly; fp16 keeps its device improvement), fp16 large stays near 218us, bf16/fp32 large unchanged, and the full fixed walltime geomean rises back above the original 1.121873x (roughly ~1.16 if the ~10us fixed cost is removed).",
+  "validation": "Preflight compiles/static-checks the edit. Then the host runs full 24/24 formal cases plus both 30/30 supplementary checks and a full KGS walltime measurement (same fixed service, one measurement); compare per-case candidate_us and the reconstructed geomean against baseline-comparison.json. Confirm no change in fp16 large and in bf16/fp32 kernels; if small cases do not recover, the tensor-marshalling hypothesis is false and the residual is recorded as unknown rather than claimed.",
+  "alternatives": [
+    "The +10us is device-side: the added fp16 contiguous-load branch changes the compiled binary for bf16/fp32 too. Rejected as primary because bf16/fp32 else-branch device code is unchanged and their regressions are the same uniform magnitude as fp16.",
+    "The overhead is the cache-key construction (shape/stride tuple hashing + two data_ptr calls). Rejected as primary because starter.py has the identical key construction yet measured ~32us small cases.",
+    "The delta is run-to-run measurement variance. Kept as residual unknown; the one-measurement-per-version scope and the cross-dtype uniformity make a fixed host cost more likely."
+  ],
+  "discriminating_observation": "All three small dtypes regressed by the same ~10us although only fp16 changed device code, and the pre-improvement source differs on the host path only in int-vs-Tensor pointer arguments; caches only store launchers that report no profiler tensor registration.",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

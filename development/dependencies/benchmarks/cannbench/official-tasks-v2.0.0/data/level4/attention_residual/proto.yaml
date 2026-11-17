@@ -1,0 +1,60 @@
+attrs:
+- description: 门控系数，定义域 [0.05, 0.95]
+  name: alpha
+  type: float
+- default: 1.0e-06
+  description: RMSNorm 数值稳定项，定义域 [1e-8, 1e-3]
+  name: epsilon
+  type: float
+category: FusedComposite
+description: Block Attention Residuals 前向聚合：RMSNorm + 伪查询深度打分 + 块轴 softmax + 加权求和
+  + 门控混合的单 kernel 融合
+difficulty: L4
+formula: 'k = RMSNorm(v_stack; gamma, epsilon)                 # 沿 D，逐 (n,b,t) 向量
+
+  s[n,b,t] = (Σ_d w[d]·k[n,b,t,d]) / sqrt(D)           # 伪查询打分，√D 温度
+
+  p = softmax(s, dim=n)                                # 深度(块轴) softmax
+
+  agg[b,t,d] = Σ_n p[n,b,t]·v_stack[n,b,t,d]           # 对原始 V 加权求和
+
+  y = (1 - alpha)·x + alpha·agg                        # 门控混合（残差替换）
+
+  '
+inputs:
+- description: 深度堆叠的块表示（键路径经 RMSNorm，值路径使用原始值）
+  dtype:
+  - bfloat16
+  - float16
+  name: v_stack
+  shape: '[N, B, T, D]'
+- description: 当前层输入（门控混合的残差支）
+  dtype:
+  - bfloat16
+  - float16
+  name: x
+  shape: '[B, T, D]'
+- description: 可学习伪查询向量
+  dtype:
+  - bfloat16
+  - float16
+  name: w
+  shape: '[D]'
+- description: 键路径 RMSNorm 的逐维权重
+  dtype:
+  - bfloat16
+  - float16
+  name: gamma
+  shape: '[D]'
+name: AttentionResidual
+outputs:
+- description: 聚合后的层输入，shape 与 x 一致
+  dtype:
+  - bfloat16
+  - float16
+  name: y
+  shape: '[B, T, D]'
+schema: attention_residual(Tensor v_stack, Tensor x, Tensor w, Tensor gamma, float
+  alpha, float epsilon=1e-6) -> Tensor y
+shape_support: v_stack [N, B, T, D]，x [B, T, D]，w [D]，gamma [D]，输出 y [B, T, D]；N ≥
+  2

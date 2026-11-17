@@ -46,6 +46,17 @@ class SimulatorTests(unittest.TestCase):
         with self.assertRaises(ValueError):validate_time_unit(trace,instructions,'ns')
         with self.assertRaises(ValueError):validate_time_unit(trace,instructions[3:],'us')
 
+    def test_scalar_quantization_is_reported_but_does_not_override_mte_vector_units(self):
+        rows=[dict(pc=hex(i),instruction='ADD' if i>2 else 'LOAD',pipeline='SCALAR' if i>2 else 'MTE2',
+                   running_time_us=.2,cycles=336) for i in range(6)]
+        trace=dict(traceEvents=[dict(ph='X',dur=.336 if i>2 else .2,args=dict(pc_addr=hex(i))) for i in range(6)])
+        result=validate_time_unit(trace,rows,'us')
+        self.assertEqual(result['compared_pcs'],3)
+        self.assertAlmostEqual(result['scalar_comparison']['median_ratio'],1.68)
+        self.assertEqual(result['scalar_comparison']['matching_pcs'],0)
+        with self.assertRaises(ValueError):validate_time_unit(trace,rows,'ns')
+        with self.assertRaises(ValueError):validate_time_unit(trace,rows[3:],'us')
+
 
 if __name__=='__main__':
     unittest.main()

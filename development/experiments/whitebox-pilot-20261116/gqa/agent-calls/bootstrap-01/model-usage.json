@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 25,
+    "duration_ms": 115139,
+    "usage": {
+      "input_tokens": 23762,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 527232,
+      "output_tokens": 19917,
+      "output_tokens_details": {
+        "thinking_tokens": 11984
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 23762,
+        "outputTokens": 19917,
+        "cacheReadInputTokens": 527232,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 0.880351,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 11984,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 0.880351,
+    "result": "起点已生成并交接。摘要：\n\n**诊断与决策**：先重写 `workspace/diagnosis.json`（source_sha = e3b0c44…空文件），三条证据（task-description / contract / golden，均 `knowledge`+`background|mechanism`，非因果归因），记录假设、替代方案、UB/数值不确定项，然后调用工具桥 `decision --record diagnosis.json` 成功落盘（decision_id `64a66d51…`，绑定修改前 SHA）。未调用 preflight、未探测环境、未采集 profiling/模拟器，也没有虚构指标。\n\n**实现（candidate.py，单 Triton kernel）**\n- 入口 `run(query,key,value,scaleValue=-1.0,is_causal=False)`：Python 侧只读 shape/stride、算 `G=N_q//N_kv` 与 `scale`、`torch.empty` 分配 BSND 同 dtype 输出、启动 kernel；设备计算全在 Triton（`tl.dot` QK、fp32 online softmax、`tl.dot` PV）。\n- 布局：grid = (cdiv(S,BLOCK_M), B·N_q)，每 program 处理 `(b, h_q, BLOCK_M 行)`，`kvh = h_q // G` 直接复用共享 KV 指针，不物化 G 份 KV；四个张量的全部 4 个 stride 传入 kernel，不假设连续；按 `q//G` 头序写回，等价于 golden 的 `n_kv*G+g`。\n- 因果：用 `delta = S_kv - S` 做右下角对齐 `j <= i + delta`（不用左上角），并据此把循环上界截断到 `pid_m*BLOCK_M+BLOCK_M+delta`，整块全 mask 的 KV 分块直接跳过；全 mask 行以 `l_i>0` 保护输出 0（对齐 golden 的 F217 行为）。\n- 数值：QK 与 PV 均 fp32 累积，max/sum/重标定全 fp32，仅最终一次 cast 到输出 dtype；scale 并入 `exp2`（×log2e）。PV 的 P 按输入 dtype 参与 dot，与 CANN 原生 flash 路径一致；若正式评测在近零输出上 MARE 超限，下一步是 P hi/lo 拆分或 fp32 PV 累积，而非放宽阈值。\n- UB：D=128 时 BLOCK_M=64/BLOCK_N=64/BLOCK_D=128（acc 32KB fp32 + q/k/v/p 约 100KB），D=256/512 相应降到 32/16，留 softmax 临时量余量；`num_warps=1, num_stages=1` 待实测确认。\n\n**未决**：golden 评测精度口径；Ascend 后端对 `tl.trans`、行归约与 runtime 循环上界的支持；bf16 case 的 MARE。等待宿主审查后的 preflight 与正式评测反馈再改。"
+  }
+}

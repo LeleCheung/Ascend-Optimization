@@ -1,0 +1,19 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "5fe9010bb7b2e861d7f94ca8580b8de3087045bb44a933029ff4b3fedf053f14",
+  "evidence": [
+    {
+      "path": "/data/hanle/ascend-optimization/runs/night-research-20261116/no-simulator/workspace/launcher-compatibility.json",
+      "category": "other",
+      "role": "background",
+      "finding": "Traceback from the installed launcher: with msprof L1 enabled the generated launcher inspects Tensor.size() on its pointer parameters, so the cached fast-path launch that passed raw Python int addresses (out_ptr, in_ptr) failed with AttributeError: 'int' object has no attribute 'size'. The observation was recorded on the shared original baseline (source e46260c2...), whose raw-pointer launch path is byte-identical to the current host wrapper, so the compatibility defect transfers to this source and to both experimental variants."
+    }
+  ],
+  "hypothesis": "The compiled-kernel launcher used by the cached fast path expects tensor-like pointer arguments (it calls .size() on them when the profiler registers tensors); passing int raw addresses from data_ptr() is the sole cause of the AttributeError. The Triton kernels, grid, scalars, compiled metadata, cache keys and allocation are unaffected.",
+  "change": "Host-only, minimal: in run(), pass the current-call tensor objects out and input as the pointer parameters of the cached launch instead of the int out_ptr/in_ptr. Everything else is untouched: the same _LAUNCH_CACHE key (still built from data_ptr() & 15 alignment), the same stream via _current_raw_stream(entry[4]), the same grid (1, 1) and the same metadata/scalars entry[1]/entry[2]. No kernel, arithmetic, grid, contract, reference or profiler change.",
+  "expected": "Under msprof L1 the launcher can read size() from both pointer arguments and the cached fast-path launch no longer raises AttributeError; non-profiled launches behave identically because the launcher derives addresses from the tensors. No change in numerics, dispatch/plan selection or allocation.",
+  "validation": "Run the preflight on candidate.py (bridge preflight --source candidate.py) and require it to be accepted or awaiting_source_review with the source retained. Kernel bodies remain byte-identical; only the two pointer arguments of the single cached launch call in run() change.",
+  "unknown": [
+    "Preflight on the edited source (sha256 dc722edadbd965c559f914c32564fbc00f5d94936feb180f6512d65fa6a49138) returned status=awaiting_source_review (external read-only path/address-boundary review); source retained unchanged, no measurement taken yet."
+  ]
+}

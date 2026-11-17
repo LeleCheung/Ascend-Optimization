@@ -1,0 +1,76 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "51f3924d25b64a61baa1f73d2394f3d4",
+  "recorded_at": "2026-11-17T06:16:43.528105+00:00",
+  "round_id": "performance-01",
+  "input_source": {
+    "path": "trace/sources/3107d0133832158b73bfa0b456ba4fe2ffb599e1773e14085cb686361a1efe84.py",
+    "sha256": "3107d0133832158b73bfa0b456ba4fe2ffb599e1773e14085cb686361a1efe84"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/6e34a1bdf26f267a217cf0001066c3285847e0eebcd985256653afa141cbf385.json",
+        "sha256": "6e34a1bdf26f267a217cf0001066c3285847e0eebcd985256653afa141cbf385"
+      },
+      "original": {
+        "path": "workspace/performance-feedback.json",
+        "sha256": "6e34a1bdf26f267a217cf0001066c3285847e0eebcd985256653afa141cbf385"
+      },
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "12-case geomean 0.9972x. Small/mid cases (1024-1048576 elems) cluster 0.92-0.97x at a ~14.7-16us full-call floor (host bound, kernel tiny); large bf16 4096x4096 is worst at 0.815x (23.57 vs 19.22us), while large fp16 is 1.485x and fp32 1.002x. The dominant reusable loss is per-call host dispatch on the many small cases, not the single bf16 device case.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/3107d0133832158b73bfa0b456ba4fe2ffb599e1773e14085cb686361a1efe84.py",
+        "sha256": "3107d0133832158b73bfa0b456ba4fe2ffb599e1773e14085cb686361a1efe84"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "3107d0133832158b73bfa0b456ba4fe2ffb599e1773e14085cb686361a1efe84"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "run() performs device/shape/contiguity/numel guard work unconditionally: out.get_device() vs input.get_device(), out.shape!=input.shape, out.is_contiguous(), input.is_contiguous(), input.numel(), even when out was freshly allocated by torch.empty_like(..., contiguous_format) so shape/device/contiguity are known true by construction. The compiled launcher is already cached in _FAST/_PLANS and launched with dynamically-read integer pointers and current stream.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/dd6c9a236b5e1a35fa0075ab2c6e6a663cdf6b4774967f743026e0e8e62c11e4.json",
+        "sha256": "dd6c9a236b5e1a35fa0075ab2c6e6a663cdf6b4774967f743026e0e8e62c11e4"
+      },
+      "original": {
+        "path": "workspace/knowledge.json",
+        "sha256": "dd6c9a236b5e1a35fa0075ab2c6e6a663cdf6b4774967f743026e0e8e62c11e4"
+      },
+      "category": "knowledge",
+      "role": "background",
+      "finding": "Historical host sampling: run plus _run_one self-time ~9.71us/call; flat contiguous path can use a light key while non-contiguous keeps full layout identity. Must not cache pointers, tensors, or old stream; dynamic device/pointer/stream are re-read each call. Confirms host-side dispatch is the lever and that guards on user-provided layout must stay.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/2e7ee330fe50680cb256eed4af99b5e53749b6a1dba65e6bc19c92d11de28baa.json",
+        "sha256": "2e7ee330fe50680cb256eed4af99b5e53749b6a1dba65e6bc19c92d11de28baa"
+      },
+      "original": {
+        "path": "workspace/contract.json",
+        "sha256": "2e7ee330fe50680cb256eed4af99b5e53749b6a1dba65e6bc19c92d11de28baa"
+      },
+      "category": "other",
+      "role": "background",
+      "finding": "Public ABI run(input, *, decimals=0, out=None). Must keep optional out allocation, resize on shape mismatch, cross-device ValueError, and exact numerical/special-value behavior. This edit only elides guard work that is provably implied by our own allocation.",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "When out is None we allocate a contiguous, same-shape, same-device tensor, so the shape/resize check, cross-device check, and out.is_contiguous() check are trivially satisfied. Hoisting input.get_device() into one local and skipping these provably-redundant checks on the fresh-allocation branch (while leaving every guard intact on the user-supplied out branch, and the fast launcher/kernel unchanged) reduces per-call host dispatch and raises full-call throughput on small/mid inputs without touching correctness or numerics.",
+  "change": "Edit only candidate.py run(): compute device once, branch on fresh out; on fresh branch allocate and skip implied shape/device/out-contiguity checks; keep resize_/cross-device ValueError and out.is_contiguous() for provided out; reorder the fast-path guard to reject cheaply. No kernel, launcher ABI, or _slow/_build changes.",
+  "expected": "Small/mid full-call latency drops by the removed guard-call overhead (target ~0.3-1us of ~15us); large-input cases unchanged. Semantics identical for out=None and out-provided paths.",
+  "validation": "Preflight (compile + supplementary semantics) must pass; then full KGS formal timing compared against the 0.9971932405x baseline. Confirm resize/device-raise behavior and special values still hold.",
+  "alternatives": [],
+  "discriminating_observation": "",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

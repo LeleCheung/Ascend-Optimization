@@ -16,7 +16,7 @@ def validate_time_unit(trace, instructions, unit):
         args=event.get('args',{});duration=number(event.get('dur'))
         if event.get('ph')!='X' or 'pc_addr' not in args or not duration or names.get(event.get('pid'))=='CACHEMISS':continue
         key=pc(args['pc_addr']);durations[key]=durations.get(key,0)+duration
-    ratios=[];excluded_sync=[]
+    ratios=[];excluded_sync=[];scalar_ratios=[]
     for row in instructions:
         reference=row.get('cycles' if unit=='cycles' else 'running_time_us')
         # 同步指令的CSV累计等待可能包含入队时间，trace则呈现实际等待区间。
@@ -24,7 +24,13 @@ def validate_time_unit(trace, instructions, unit):
         if re.fullmatch(r'BAR|SET_FLAG|WAIT_FLAG',row.get('instruction',''),re.I):
             excluded_sync.append(row['pc']);continue
         if unit!='cycles' and (not reference or reference<.1):continue
-        if reference and row['pc'] in durations:ratios.append(durations[row['pc']]/reference)
+        if reference and row['pc'] in durations:
+            ratio=durations[row['pc']]/reference
+            # SCALAR逐周期指令在CSV和trace中可能分别采用周期换算与纳秒量化。
+            # 用Vector/MTE等独立交叉核验单位；Scalar差异完整保留，不冒充精确一致。
+            if unit!='cycles' and row.get('pipeline','').upper() in {'SCALAR','SCALARLDST','FLOWCTRL'}:
+                scalar_ratios.append(ratio)
+            else:ratios.append(ratio)
     expected=1000 if unit=='ns' else 1
     matching=sum(abs(value/expected-1)<.05 for value in ratios)
     if len(ratios)<3 or matching/len(ratios)<.8:
@@ -33,7 +39,10 @@ def validate_time_unit(trace, instructions, unit):
     return dict(status='verified',unit=unit,compared_pcs=len(ratios),matching_pcs=matching,
                 median_ratio=median(ratios),expected_ratio=expected,
                 excluded_sync_pcs=excluded_sync,
-                method='同PC的非同步指令trace正时长总和对照CSV；排除同步等待口径及不足0.1us的舍入项')
+                scalar_comparison=dict(compared_pcs=len(scalar_ratios),median_ratio=median(scalar_ratios) if scalar_ratios else None,
+                    matching_pcs=sum(abs(value/expected-1)<.05 for value in scalar_ratios),
+                    scope='保留Scalar时间口径／量化差异，未用于校准单位；时间轴使用工具报告区间'),
+                method='同PC的非Scalar、非同步指令trace正时长总和对照CSV；排除同步等待口径及不足0.1us的舍入项')
 
 
 def pc(value):
