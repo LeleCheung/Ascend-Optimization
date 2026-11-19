@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 53,
+    "duration_ms": 121811,
+    "usage": {
+      "input_tokens": 38894,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1312000,
+      "output_tokens": 18368,
+      "output_tokens_details": {
+        "thinking_tokens": 7960
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 38894,
+        "outputTokens": 18368,
+        "cacheReadInputTokens": 1312000,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.30967,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 7960,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.30967,
+    "result": "Repair authored and handed off. Summary:\n\n## Failure stage and exact diagnostic\n- Not numerics, not Triton frontend: the preflight died in **BiShengHIR**, `ConvertLinalgIRToBinary`, when `bishengir-compile --enable-auto-multi-buffer=True` returned status 1.\n- Exact diagnostic: `loc(candidate.py:39:0): error: ub overflow, requires 1841152 bits while 1572864 bits available!` → `Failed to run BiShengHIR pipeline`.\n- Actual IR of the failing variant (`failed-ir/.../DSKZWROGLNV3-13-*.ttir`) is BLOCK_S=128 × BLOCK_D=64, bf16 → one tile = 16384 B (the `[8,512,3072]`, head_dim 64 cases).\n\n## Resource accounting (why exactly this much)\nThe number matches the source exactly:\n- 6 in-flight tiles (q/k/v in + q/k/v out) doubled by the `num_stages=2` GROUP loop = 12 × 16384 = 196608 B\n- one float32 copy of the tile on the q path (the verified overflow-safe opmath) = 32768 B\n- three f32 bias vectors = 768 B\n→ **230144 B = 1841152 bits** vs 196608 B available.\n\n## Repair (focused, hypothesis preserved)\n`_TILE_BYTES: 16384 → 8192` (comment rewritten with the measured accounting). Indexing, EXACT/masked paths, the GROUP=2 pipelined loop, float32 bias-add/rescale and generic strides are untouched. Predicted request: 12·8192 + 2·8192 + 768 = **115456 B (59 % of budget, 1.7× margin)**.\n\n## Records\n- diagnosis.json written (evidence: trigger = previous-result + compiled.log, mechanism = failing ttir + source byte accounting, background = earlier 2146304-bit UB failures and the qualified 0.0794/0.0635 ms attempts), then registered pre-edit through the bridge as decision `8725879ade4f4420bbcaeea27429e1ec` bound to source `4bfa839d…`.\n- Preflight on the edited source (`0af5d533…`) returned **`awaiting_source_review`**; candidate left unchanged and handed off. Unverified until then: the UB prediction, and correctness of both EXACT and masked paths."
+  }
+}

@@ -1,0 +1,62 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "2b069e41834e56ad77dbdb73a78e060f2c49ae76cd9e5e447e3dd8d035b32f98",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "Target case timing-7 (fp32 8x64x64x64, 64 programs): per-block aiv_time 27.17us vs reference 18.56us; aiv_vec_time 16.57us vs 10.52us; aiv_scalar_time 11.46us vs 5.10us; aiv_mte2_time 13.84us vs 8.68us. ArithmeticUtilization aiv_vec_misc_ratio 0.2557 vs 0.0404 (6.3x) while aiv_vec_fp32 ratio is only 1.14x of reference; GM_to_UB_datas sum 16384KB vs 16408KB (traffic equal). So the candidate spends much more non-FP32 vector/scalar work per element at equal memory traffic."
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "disambiguation",
+      "finding": "PipeUtilization per-block means: candidate aiv_vec_ratio 0.613, aiv_mte2_ratio 0.512, aiv_scalar_ratio 0.419, aiv_scalar_wait_time 10.40us (ref 6.94), aiv_scalar_mte2_stall_time 5.18us (ref 0.0), aiv_mte2_active_bw 17.7GB/s vs ref 50.8GB/s. Reference has aiv_scalar_vector_stall_time 4.09us while candidate is 0.0, so the stall taxonomy differs; the candidate is not limited by a single saturated unit and its scalar/mask bookkeeping coexists with mid-level MTE2 and vector occupancy."
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "mechanism",
+      "finding": "core0.veccore0 partial normalized timeline (absolute_time_qualified=false, relative_only, partial capture window): VECTOR productive_ratio 0.724 / wait_only 0.036 / idle 0.240; MTE2 productive 0.494 / wait_only 0.097 / idle 0.409; SCALAR productive 0.112 / wait_only 0.388 / idle 0.501; SCALARLDST productive 0.434 / idle 0.566; CACHEMISS ~0.003. Hotspot regions place the whole stats tile loop (source lines 59-79) at 47.29us summed instruction time vs 2.34us for the loop prologue, and top instructions are the tile load MOV_SRC_TO_DST_ALIGN (4.75us), a SCALAR WAIT_FLAG on a VECTOR flag at the cnt update (3.0us), and five VECTOR BARs at the Welford update lines 75-77 (2.58/2.26/1.55/1.23/1.09us, 17 calls each) plus three VECTOR BARs at the mask line 70 (0.82/0.80/0.71us)."
+    },
+    {
+      "path": "workspace/current-ir/2b069e41834e/target-0-batch_norm_with_update_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Compiled target IR for timing-7 has BLOCK_M=8, BLOCK_N=128, n_num_steps=cdiv(4096,128)=32, m_num_steps=cdiv(8,8)=1. Every stats-loop iteration materializes cmp (1x128) + broadcast + and (8x128 i1) + select + extui (cnt) and the same predicate again for the next-tile load; the normalize loop repeats mask generation and a masked store. batch_dim (8) is an exact multiple of BLOCK_M (8) and spatial_dim (4096) an exact multiple of BLOCK_N (128), so all these predicates are constant-true predicates and every load/store is fully in bounds."
+    },
+    {
+      "path": "workspace/exploration-feedback.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "Retained attempt-003 (2b069e41) introduced the delta-form Welford plus the one-tile software-pipeline lookahead and moved target latency 0.07155ms -> 0.05562ms; both are preserved. attempt-002 (8340b189) failed at compile time in ConvertTritonIRToLinalgIR with a structurally different kernel (f16 stat buffers / no spatial tiling), so dtype and loop structure are kept unchanged; only compile-time-constant predicate elision is attempted."
+    }
+  ],
+  "hypothesis": "For divisible shapes the per-tile mask chain in both loops of batch_norm_with_update_kernel is dead work: it adds i1 compare/broadcast/and/select/extui vector ops plus scalar predicate address arithmetic each iteration, and the scalar<->vector flag chain around them shows up as VECTOR BARs and a SCALAR WAIT_FLAG in the hotspot list. A constexpr EVEN fast path (batch_dim % BLOCK_M == 0 and spatial_dim % BLOCK_N == 0) that drops those predicates while keeping the established one-tile lookahead (clamped to the last valid tile so no out-of-bounds access) will lower per-program vector/scalar work and shorten the target-case kernel without changing any numerical operation on valid lanes.",
+  "alternatives": [
+    "Widen BLOCK_N (fewer, larger tiles) to cut loop iterations: plausible, but changes the UB footprint/pipelining contract that attempt-003 tuned, so it is deferred.",
+    "Replace Welford with sum/sumsq accumulation: fewer vector ops, but it would discard an established numerical fix and is rejected.",
+    "Remove the lookahead and rely on backend scheduling: already rejected by attempt-003 evidence (0.07155 -> 0.05562ms with lookahead).",
+    "Fold weight*inv_std into a single affine a*x+b in the normalize pass: a smaller, real but separate vector-op reduction; kept as a later candidate rather than mixed into this change.",
+    "Split each feature across programs / reduce program count: needs cross-program reduction, a different mechanism outside this focused step."
+  ],
+  "discriminating_observation": "If the mask/predicate bookkeeping is what is being removed, then after the change aiv_vec_misc_ratio must fall well below 0.2557 toward the reference 0.04 with aiv_vec_time and aiv_scalar_time dropping, while GM_to_UB_datas stays 16384KB and mte2 traffic per block is unchanged (plus at most one extra duplicated in-bounds tile per program per pass from the clamped lookahead). A fall in aiv_time with unchanged misc ratio would point instead at scheduling, and unchanged aiv_time with a falling misc ratio would show the vector misc work was not on the per-program critical path.",
+  "change": "Add a host-side heuristic EVEN (batch_dim % BLOCK_M == 0 and spatial_dim % BLOCK_N == 0, computed with the same helpers that pick BLOCK_M/BLOCK_N), pass it as a constexpr, and in both tile loops branch at compile time: when EVEN, use unmasked tl.load/tl.store, delta = curr_input - mean without the where-select, and cnt += 1, keeping the same one-tile lookahead with its index clamped to n_num_steps-1 so the prefetch never leaves the feature slice. The non-EVEN path is the current code unchanged.",
+  "expected": "Target timing-7: per-block aiv_time 27.17us -> about 22-24us and latency 55.6us -> about 45-50us (speedup 0.52 -> 0.58-0.64); aiv_vec_misc_ratio 0.256 -> <0.10; aiv_scalar_time 11.5us -> lower; all even-shaped timing cases (fp32/fp16/bf16 8x64x64x64, 16x128x32x32, 4x32x32x32) get the same fast path. Odd-shaped correctness cases take the byte-identical fallback path, so their results must not change.",
+  "validation": "Run preflight --source candidate.py on this one hypothesis; then formal evaluation of 27 cases plus 36 supplementary correctness cases. Accept only if all correctness/supplementary cases still pass with matched_ratio 1.0 and target latency drops; compare aiv_vec_misc_ratio, aiv_time, aiv_scalar_time and GM_to_UB_datas against this diagnosis's stated predictions, and re-diagnose if the per-block misc ratio falls but latency does not.",
+  "selected_layer": "candidate.py Triton kernel source: batch_norm_with_update_kernel tile loops (statistics and normalize passes) plus the host-side triton.heuristics entry that supplies the constexpr",
+  "layer_reason": "The paired profiling locates the excess in per-block vector misc/scalar work inside the kernel, the simulator hotspot list puts the accumulated instruction time in the stats tile loop (source lines 59-79) with VECTOR BARs on the Welford updates and mask line, and the actual target IR shows the mask chain is redundant for this shape. Host allocation/metadata and Triton compute are the only layers this candidate may change, and the predicate is a Triton-source construct.",
+  "simulator_incremental_judgment": "Using the simulator: VECTOR is the busiest execution lane (productive 0.724) while MTE2 shows 41% idle and SCALAR is 89% wait-or-idle, so the observation favors vector-side/predicate work over raw load volume, consistent with equal GM bytes but 6.3x vector-misc in profiling. What the hotspots add: the whole attention mass sits in the stats tile loop and the top wait items are flag/barrier synchronizations attached to the mask and accumulator lines, not to the stores. What the waiting/observable idle adds: the empty intervals are distributed across the loop, so there is no single long bubble to blame; they are consistent with per-iteration predicate/dependency overhead but do not prove a dependency stall. These are fractions of a partial observed common-clock window with absolute_time_qualified=false, so they only discriminate the vector/mask hypothesis from a memory-bound one and are not converted into time or critical-path claims.",
+  "postchange_status": {
+    "changed_source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+    "preflight": "awaiting_source_review (compile path accepted; no device numbers yet)",
+    "observation": "No performance measurement exists for this source yet. The diagnosis predictions above are unverified until the host runs the paired profiling/simulator and formal evaluation on b8d4d4a2.",
+    "next": "If formal target latency does not drop while aiv_vec_misc_ratio falls, treat vector misc as off the per-program critical path and move to the deferred BLOCK_N/affine-fold alternatives; if latency regresses, restore 2b069e41 and re-read the target IR of the EVEN path before further changes."
+  },
+  "unknown": [
+    "Whether the Ascend Triton lowering keeps the constexpr branch as a single specialized loop body or duplicates both bodies; if it duplicates, instruction-cache pressure (aiv_icache_miss_rate is currently 0.0) could offset part of the gain.",
+    "Whether the clamped lookahead's one duplicated last-tile read per program per pass is negligible at MB-per-kernel scale.",
+    "Whether vector misc is on the per-program critical path or merely concurrent; the aiv_time check after the change is the discriminator."
+  ]
+}

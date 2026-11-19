@@ -1,0 +1,56 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "62a02c203a3e54a09f6479ca8526168bf1529821284cd1b42bc6cbdf3c980a12",
+  "evidence": [
+    {
+      "path": "workspace/profiling-comparison.json",
+      "category": "paired_profiling",
+      "role": "mechanism",
+      "finding": "Candidate kernel (Block Dim 1024, Task Duration 255453 us) per-block mean aiv_time 9824.9 us with min 9787.1 / max 9847.1 across all 1024 blocks: every program executes identical work and per-block time is uniform. Per block only ~32 KB of output is produced (128 serial iterations x 256 B), yet aiv_mte3_instructions=8193 (8192 per block, ~128 B per instruction) and write_main_memory_datas=1024 KB per block (32x the bytes the program actually has to write), while aiv_main_mem_write_bw is only 0.099 GB/s per block and read BW ~0.008 GB/s (sum over blocks ~8 GB/s). Pipe use: aiv_vec_ratio 0.5387, mte2_ratio 0.0010, mte3_ratio 0.1038, vec_wait_ratio 0.1510. So the cost is instruction/memory-op fragmentation at tiny granularity, not HBM/L2 bandwidth."
+    },
+    {
+      "path": "workspace/actual-ir/upsample_bilinear2d_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Compiled with BLOCK_X=128, BLOCK_Y=1 for the target case. Program maps only over spatial output; all N*C planes are handled by nested scf.for loops (128 serial iterations). Output row/column indices are produced by arith.remsi (`(pid_x*BLOCK_X+arange) % OW`), so the store offsets are a 2-D tensor<1x128> whose contiguity/alignment the compiler cannot prove; the IR keeps tensor<1x128> pointer arithmetic with mixed i32/i64 and the store is emitted from that wrapped index tensor."
+    },
+    {
+      "path": "workspace/baseline-evaluation.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "Target case upsample_bilinear2d-timing-1: 253.949 ms vs reference 0.2455 ms (speedup 0.00097x); timing-0/2/4 are ~8.6-9.9 ms and timing-3/5 ~256-294 ms. 6 of 24 formal cases fail with MLIRCompilationError in ConvertTritonIRToLinalgIR (correctness-2,3,8,9,14,15), i.e. part of the contract does not even compile."
+    },
+    {
+      "path": "workspace/native-runtime-facts.json",
+      "category": "knowledge",
+      "role": "background",
+      "finding": "All 16 tuned configs keep BLOCK_X in {64..512} and BLOCK_Y in {1,2} with num_warps 4/8: the supplied tuning space never expresses a full-output-row tile, so the retile mechanism I test is outside the supplied search space rather than a repetition of it."
+    }
+  ],
+  "hypothesis": "The 254 ms on the target case is set by per-program instruction count, not by occupancy or bandwidth: the kernel writes its 128-element row chunk through a `% OW`-wrapped, shape-[1,128] index tensor, so Triton-Ascend emits ~8192 tiny mte3 stores (and ~8192 mte2 loads) per program with ~128 B granularity and ~32x write amplification, and every program additionally replays a 128-iteration serial N*C loop over that fragmented index pattern. Retiling to (plane, row-block, column-block) with explicit block indices plus a bounds mask instead of modular wrap should let the compiler prove the full-width row store is contiguous/aligned and emit a few wide DMAs instead of thousands of tiny ones.",
+  "alternatives": [
+    "The kernel is HBM/L2-bandwidth-bound: contradicted by aiv_main_mem_write_bw 0.099 GB/s and aiv_main_mem_read_bw 0.008 GB/s per block (sum ~100 and ~8 GB/s), far below device capability, and by mte2_ratio 0.0010.",
+    "The serial N*C loop starves parallelism: contradicted by uniform per-block aiv_time (min 9787 us, max 9847 us) over 1024 blocks; the machine is already fully occupied and total time is waves x per-program time, so only per-program work/instruction count can reduce the total."
+  ],
+  "discriminating_observation": "Per block: only ~32 KB of output exists, but mte3 instruction count is 8193 (~128 B per instruction) and write_main_memory_datas is 1024 KB (32x amplification), while block time is perfectly uniform across all 1024 blocks (~9.8 ms). Together these separate 'fragmented tiny memory ops per program' from both a bandwidth limit and an occupancy limit.",
+  "change": "Single mechanism: retile programs. Replace the spatial-only grid + `% OW`/`% OH` index wrap + serial N*C loop with a 3-D grid (column block, row block, plane = n*C+c), full-width row tiles whose column index is `pid*BLOCK_W + arange` plus an explicit `ow < OW`/`oh < OH` mask, and 2-D [BLOCK_H, BLOCK_W] weights/taps computed from the same formulas. Per-element math (fp32 coordinate mapping, clamping, 2-D bilinear weights, fp32 accumulation order) is kept identical. Compatibility edits (recorded separately from performance): (a) move the align_corners ratio (IH-1)/(OH-1) computation to the host in Python and feed it as a float kernel argument so no integer division appears in the kernel (the align_corners branch currently fails ConvertTritonIRToLinalgIR on 6 formal cases); (b) add the required public entrypoint alias `run(input, output_size, align_corners=False, scales_h=None, scales_w=None)` next to the preserved FlagGems `upsample_bilinear2d`. No caching, no host-side computation of tensor values.",
+  "expected": "If the diagnosis holds, the candidate kernel's mte3 instruction count per program drops from thousands to a handful of wide stores and the 32x write amplification disappears; target-case full-call time should drop by at least an order of magnitude from 253.95 ms (expected tens of ms or below), with the target still correct. The 6 previously non-compiling align_corners cases should start running. Gather loads (4 taps per output element) remain and are expected to become the next visible limit; if time stays near 254 ms and per-block mte3 counts stay ~8000, this mechanism is falsified.",
+  "validation": "Preflight: source review + compile of the edited candidate. Then the host formal evaluation over the 24 formal cases plus supplementary and CANN supplementary checks; compare per-case latency and pass count with baseline-evaluation.json, and confirm the align_corners cases now compile and match within atol/rtol 0.015 at required_matched_ratio 1.0. No re-collected paired profiling is available from this call, so the mte3-instruction prediction stays an expectation, not a measurement.",
+  "unknown": [
+    "Whether Triton-Ascend proves the masked full-width row store contiguous and emits wide DMAs (predicted, not observed).",
+    "Whether 1024 output elements per program (BLOCK_W=256, BLOCK_H=4 for this case) is a good tile size or small tiles remain faster on this device, as the supplied autotuner chose for 128 elements.",
+    "Whether the 4-tap gather loads keep the kernel scatter-limited after the store fix; a separable or duplicate-aware load scheme would be a later, separate mechanism.",
+    "Whether a 3-D grid with plane = n*C on axis 2 hits any per-dimension grid limit for shapes with very large N*C (not exercised by the listed cases)."
+  ],
+  "compatibility_edits": [
+    "Removed `import logging`, `from flag_gems import runtime`, `from flag_gems.runtime import torch_device_fn`, `from flag_gems.utils import triton_lang_extension as tle` and the module logger: the preflight bridge admits only {torch, torch_npu, triton, math, functools, typing, os} top-level imports. Replaced with `import torch_npu` (backend registration) and the same device assertion written directly as `input.device.type == \"npu\"`. No change to computation.",
+    "Dropped the `with torch_device_fn.device(input.device)` context and the `@triton.autotune` wrapper (the latter needs runtime.get_tuned_config): the static review rejected `torch.npu.device` as a host/external execution entry, and the autotune config space is replaced by a deterministic tile choice. The kernel is launched directly on the current NPU stream; no host compute or data movement added.",
+    "Host-side helper `bilinear_reciprocal_scale` reused unchanged; the align_corners ratio is now computed by it in Python and passed as a float argument, so no integer division remains in the kernel (the failing ConvertTritonIRToLinalgIR branch).",
+    "Added the required public entrypoint alias `run(input, output_size, align_corners=False, scales_h=None, scales_w=None)`; `upsample_bilinear2d` is still exported unchanged in signature.",
+    "Kept an int32 offset-range assertion in the launcher (metadata only) because the retiled kernel uses 32-bit offsets."
+  ],
+  "observation": "Source edited and preflight completed with status awaiting_source_review (sha256 6de74451513318550228ddbf6e57ea07cf898312d11bc857ba04a29b2a51452e); the host now reviews the read-only path/address bounds and runs the checks and full performance itself. No device measurement exists yet for this candidate, so the mte3-fragmentation prediction and the expected >=10x target-case gain are unverified. Two earlier preflight attempts were statically rejected (forbidden `logging` import; `torch.npu.device` context) and were fixed as compatibility edits before this submission; no performance text in this diagnosis was rewritten because of them.",
+  "selected_layer": "Triton",
+  "layer_reason": "The mechanism is the program/tile map and the provability of the emitted memory indices; an IR or pass-level change cannot recover contiguity that the Triton source never expresses through its modulo index wrap, and the kernel body itself is what generates the fragmented mte2/mte3 traffic.",
+  "simulator_incremental_judgment": "Control arm: no simulator is provided or used for this call, so it contributes no incremental evidence. The mechanism is supported only by the paired hardware profiling, the actual TTIR, and the evaluation rows."
+}

@@ -1,0 +1,36 @@
+--- parent
+
++++ candidate
+
+@@ -157,9 +157,17 @@
+
+ ):
+     # One program owns TILE_I consecutive source rows of a single (n, c)
+     # plane and produces the 2*TILE_I output rows (2*i, 2*i+1) they drive.
+-    # The rows are processed one at a time with a static loop so the
+-    # horizontal interleave stays a 1-D join/reshape, which compiles; the
+-    # tiling amortises the fixed per-program cost over TILE_I rows.
++    # The rows are processed one at a time so the horizontal interleave stays
++    # a 1-D join/reshape, which compiles; the tiling amortises the fixed
++    # per-program cost over TILE_I rows.
++    #
++    # The row loop is a dynamic device loop, not an unrolled static range:
++    # unrolling emitted 16 copies of the whole per-row body (3 loads + 2
++    # stores + ~20 vector ops each, ~1000 IR lines of straight-line code) and
++    # the measured per-program icache miss rate and scalar wait-on-instruction
++    # -buffer time were over 100x the reference, i.e. the program was
++    # refetching its own instructions.  Emitting the body once keeps the
++    # identical loads, stores and weights while shrinking the code by ~16x.
+     #
+     # The horizontally expanded row of a source row is shared by the output
+     # rows above and below it, so the row loop keeps a two-row rolling window
+@@ -187,7 +195,7 @@
+
+     e_prev = _hrow_2x_row(ptr_i, in_plane + iu0 * IW, IW, j, m, BLOCK_OW)
+     e_cur = _hrow_2x_row(ptr_i, in_plane + ic0 * IW, IW, j, m, BLOCK_OW)
+ 
+-    for k in tl.static_range(0, TILE_I):
++    for k in tl.range(0, TILE_I):
+         i = i0 + k
+         idn = tl.minimum(i + 1, IH - 1)
+         e_next = _hrow_2x_row(ptr_i, in_plane + idn * IW, IW, j, m, BLOCK_OW)

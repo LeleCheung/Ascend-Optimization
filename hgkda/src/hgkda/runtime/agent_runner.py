@@ -31,14 +31,27 @@ def target_met(workspace, digest):
     return False
 
 
+def generation_limits(max_turns=0, timeout_seconds=0):
+    """Zero means no workflow-imposed generation budget; host limits still apply."""
+    if max_turns < 0 or timeout_seconds < 0:
+        raise ValueError('generation limits must be nonnegative')
+    return (['--max-turns', str(max_turns)] if max_turns else [], timeout_seconds or None)
+
+
+def should_finish(config, workspace, digest):
+    return config.get('optimization_policy', 'performance_first') == 'target_only' and target_met(workspace, digest)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', type=Path, required=True)
     parser.add_argument('--model-settings', type=Path, required=True)
     parser.add_argument('--invocation', default='first')
-    parser.add_argument('--max-turns', type=int, default=36)
+    parser.add_argument('--max-turns', type=int, default=0, help='0: no workflow turn cap (default)')
+    parser.add_argument('--generation-timeout', type=int, default=0, help='seconds; 0: no generation deadline (default)')
     parser.add_argument('--prompt-file', type=Path)
     args = parser.parse_args()
+    turn_flags, generation_timeout = generation_limits(args.max_turns, args.generation_timeout)
     config = read(args.config)
     run = Path(config['run_directory'])
     repo = Path(config.get('repository', config['run_directory']))
@@ -93,14 +106,17 @@ def main():
          initial_evidence_policy='原始起点含目标设备非Triton回退时，先由模型建立合规候选，再采集其IR及成对profiling；不以缺失采集阻塞初始适配',
          feedback_file=('next-performance-feedback.json' if (workspace/'next-performance-feedback.json').exists()
                         else 'performance-feedback.json'),
-         optimization_stop='完整正式性能超过阈值且所需补测通过；模型调用返回不代表优化任务完成',
+         optimization_stop=('性能优先：不因验收阈值、默认轮数、时间或cost结束搜索；模型调用返回后宿主继续取证、评测与优化'
+                            if config.get('optimization_policy','performance_first')=='performance_first'
+                            else '达到用户明确指定的目标及补测后结束'),
+         generation_limits=dict(max_turns=args.max_turns or None, timeout_seconds=generation_timeout),
          public_entrypoint=config.get('public_entrypoint', 'run; arguments follow contract.json'),
          candidate_file='candidate.py',device_probe='工具桥仅预检候选实现，不执行任意测试脚本；不要提交starter.py或probe脚本',
          current_best_source_read_allowed=supplied_best,phase=config.get('phase','development'),
          method_manifest_sha256=(hashlib.sha256(Path(config['method_manifest']).read_bytes()).hexdigest() if config.get('method_manifest') else None),
          experiment_goal=config.get('experiment_goal'),
          starter_provenance=read(workspace/'starter-provenance.json') if (workspace/'starter-provenance.json').exists() else None,
-         target=config.get('generation_target','同CANN参考完整调用争取超过0.8，至少相对固定起点产生有效优化')))
+         target=config.get('generation_target','固定合同下持续提高相对CANN及逐case性能；验收阈值不是默认搜索停止条件')))
     prompt = '''加载并遵循 skills/hgkda/SKILL.md，任务见 task.json。只在当前工作目录读取和写入，不读取历史最佳源码或其他实验目录，不使用其他agent。
 宿主已按当前源码与本次固定方法刷新上下文，先读取context-brief.json、contract.json和knowledge.json，并核对源码身份。工具桥context可重新整理证据；用法已在task.json完整给出，不浏览工具实现、help或workspace外的方法清单，这些由宿主校验。已有候选时直接围绕失败反馈修改，不重复探索环境。按task.json中的算子和合同，从starter.py或当前candidate.py生成并优化candidate.py，公共入口run(A)，其余辅助函数单下划线命名。
 所有设备计算、布局处理和回退严格Triton，CANN仅为参考。原始starter可能含非Triton后端，必须由你自行改写，不得保留。Codex不直接修补候选，你负责全部候选实现及编译/语义修复。
@@ -126,9 +142,13 @@ diagnosis.json已重置为本轮短空模板，旧诊断由宿主保存，不要
         prompt=prompt.replace('初始candidate.py仅是固定FlagGems起点的原字节副本，入口及实现仍由你改写；后续调用则继续当前生成候选。',
                               '初始candidate.py来自明确提供的既有交付版本；保留来源，不将修改表述为从上游从零生成。')
     prompt=prompt.replace('公共入口run(A)，','公共入口及参数遵循contract.json，')
+    if config.get('optimization_policy','performance_first')=='performance_first':
+        prompt=prompt.replace('若绑定当前源码的正式结果已达任务阈值且全部所需补测通过，保留candidate.py原字节，仅在diagnosis.json记录结论并结束；不为追求更高分无条件再改源码。',
+            '验收达标只是保留候选的条件，不是搜索终点。继续依据逐case损失、编译结果和硬件证据寻找更高性能，保留已验证最佳，失败或短期停滞时换假设、方法或修改层次。')
+        prompt+='\n性能优先策略：不因默认轮数、耗时、cost或已达验收线停止优化。每次交接审查与完整评测只是阶段边界；宿主应根据真实反馈继续调用。保留每个候选的源码与证据，不为减少调用次数省略验证。\n'
     prompt += '''\n开始一个具体修改前，先把当前源码SHA、引用证据、假设、改法、预期变化及验证方式写入diagnosis.json，
 再调用工具桥decision --record diagnosis.json，保存修改前决策。证据项包含path、category、role、finding；
-category取paired_profiling/simulator/source_ir/roofline/knowledge/probe/other，role取trigger/disambiguation/mechanism/background。
+category取paired_profiling/simulator/source_ir/roofline/knowledge/evaluation/probe/other，role取trigger/disambiguation/mechanism/background。
 没有使用模拟器就不填模拟器；读过多个工具不自动声明因果贡献。编译失败、退步及保持源码不变也保留记录。
 每个机制可对应多次小编辑，不要求每次文本替换都重新写长分析；正式结果后更新诊断中的观测与未决问题。\n'''
     (workspace/'prompt.md').write_text(prompt, encoding='utf8')
@@ -150,7 +170,7 @@ category取paired_profiling/simulator/source_ir/roofline/knowledge/probe/other�
          'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE': '80', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS': str(output_tokens),
          'MAX_THINKING_TOKENS': str(thinking_tokens)}))
     command = ['claude', '-p', '--bare', '--output-format', 'stream-json', '--verbose',
-               '--max-turns', str(args.max_turns), '--tools', 'Read,Edit,Bash',
+               *turn_flags, '--tools', 'Read,Edit,Bash',
                '--allowedTools', 'Read', 'Edit',
                'Bash('+str(sys.executable)+' '+str(tool_path)+' *)',
                '--permission-mode', 'acceptEdits', '--no-session-persistence',
@@ -162,6 +182,7 @@ category取paired_profiling/simulator/source_ir/roofline/knowledge/probe/other�
     save(call/'host-invocation.json', dict(argv=command, model=configuration.get('model'),
          started_at=datetime.now(timezone.utc).isoformat(),
          secret_environment_recorded=False,
+         generation_limits=dict(max_turns=args.max_turns or None, timeout_seconds=generation_timeout),
          runner_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
          tool_bridge_sha256=hashlib.sha256(tool_path.read_bytes()).hexdigest(),
          config_sha256=hashlib.sha256((call/'config.json').read_bytes()).hexdigest(),
@@ -180,7 +201,7 @@ category取paired_profiling/simulator/source_ir/roofline/knowledge/probe/other�
     try:
         with (call/'agent-events.jsonl').open('xb') as out, (call/'agent-stderr.log').open('xb') as err:
             process = subprocess.run(command, input=prompt.encode(), stdout=out, stderr=err,
-                                     env=environment, cwd=workspace, timeout=2400)
+                                     env=environment, cwd=workspace, timeout=generation_timeout)
         result = {}
         for line in (call/'agent-events.jsonl').read_bytes().splitlines():
             try:
@@ -199,7 +220,7 @@ category取paired_profiling/simulator/source_ir/roofline/knowledge/probe/other�
                  and previous.get('source_sha256')==final_digest and previous.get('status') == 'passed')
         state.update(status='awaiting_source_review' if valid else 'requires_attention',
                      returncode=process.returncode)
-        if process.returncode==0 and not model_error and final_digest==initial_digest and target_met(workspace,final_digest):
+        if process.returncode==0 and not model_error and final_digest==initial_digest and should_finish(config,workspace,final_digest):
             state['status']='generation_target_met'
         if not model_error and previous.get('source_sha256')==final_digest and previous.get('status')=='awaiting_source_review':
             state['status']='awaiting_preflight_source_review'

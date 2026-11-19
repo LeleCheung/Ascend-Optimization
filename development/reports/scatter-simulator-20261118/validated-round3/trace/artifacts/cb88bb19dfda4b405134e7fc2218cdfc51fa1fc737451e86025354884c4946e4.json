@@ -1,0 +1,63 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "72c4d40d831f72028f60e079ac9aae9cf921c33f32b515c2c042c43cc795d97e",
+  "case": "scatter_add-timing-8",
+  "evidence": [
+    {
+      "path": "/data/hanle/ascend-optimization/runs/scatter-simulator-20261118/workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "For source 72c4d40d on timing-8 (fp32 2048x2048) the candidate task split is _scatter_add_sort_key_kernel 798.8 us (806.2 us runtime) + _scatter_add_sort_out_kernel 603.6 us (599.8 us runtime) = ~1402 us of the 1400.8 us case latency; CANN ScatterElementsV2 alone is 3318.9 us. Per-program sort_key: aiv_time 15.377 us, aiv_vec_time 14.031 us, aiv_vec_ratio 0.913, MTE2 ratio 0.045, MTE3 0.022, scalar 0.086. Per-program sort_out: aiv_time 11.638 us, aiv_vec_time 9.969 us, aiv_vec_ratio 0.857, int32 sub-ratio 0.444, misc 0.251, fp32 0.162, bankgroup conflict 0.146, MTE2 0.059, MTE3 0.014."
+    },
+    {
+      "path": "/data/hanle/ascend-optimization/runs/scatter-simulator-20261118/workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "disambiguation",
+      "finding": "Partial 12.366 us common-clock window (capture 128.600-140.966, absolute_time_qualified=false, application_completed=false) on core0 for _scatter_add_sort_key_kernel: VECTOR productive 0.907, wait_only 0.026, idle 0.067; SCALAR productive 0.024, wait_only 0.688, idle 0.288; MTE2 productive 0.051, idle 0.949; MTE3 productive 0.017, idle 0.983; SCALARLDST productive 0.121. The near-saturated VECTOR plus mostly-waiting SCALAR and idle MTE lanes supports a vector-issue-limited hypothesis and does not support memory/prefetch or scalar mechanisms. The 0.067 observable VECTOR idle is unobserved lane time in a partial window, not proof of a dependency stall, and no cause is attributed to it."
+    },
+    {
+      "path": "/data/hanle/ascend-optimization/runs/scatter-simulator-20261118/workspace/current-ir/72c4d40d831f/target-2-_scatter_add_sort_out_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "SHA d89172f8... lower_bound is fully unrolled to 12 rounds. Each round does gather(keys, mid) plus addi/shrsi, mid = min((lo+hi)>>1, B-1), cmpf, lo<hi test, andi, lo select, hi=min(mid,hi) select (~11 vector ops). The mid clamp must stay: when a destination is absent from index (e.g. duplicated/limited index values) lo legitimately converges to B, and the clamp keeps the gather index <=B-1 and makes that converged update a no-op. Given the clamp, hi=min(mid,hi) is dead because mid<hi whenever lo<hi; and the (lo<hi) guard is dead because in every converged state (lo==hi<B or lo==hi==B) the resulting selects leave lo and hi unchanged. Removing the guard and the hi clamp eliminates 3 of ~11 vector ops on every one of the 12 rounds while preserving the exact lower_bound result including the lo==B case that the end>lo test relies on."
+    },
+    {
+      "path": "/data/hanle/ascend-optimization/runs/scatter-simulator-20261118/workspace/current-ir/72c4d40d831f/target-0-_scatter_add_sort_key_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "SHA 902eca88... segmented inclusive scan is 11 unrolled rounds with two gathers each (previous_target and previous_sum), plus per-round fptosi(previous_target) before an int equality. src_lane = min(keyi & (B-1), ncols-1); keyi&(B-1) is always in [0,B-1] so the min clamp is dead and the gather stays in bounds. previous_target is an exact small integer (<=4096) in fp32, so the per-round fptosi only converts back for comparison and can be replaced by exact fp32 equality. For ncols==B (all hot shapes 1024/2048) there are no sentinel lanes, so the per-lane mask/where on sv and the masked idx/src loads are compile-time unnecessary."
+    },
+    {
+      "path": "/data/hanle/ascend-optimization/runs/scatter-simulator-20261118/workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "Retained source 72c4d40d is fully qualified: 18/18 formal cases PASSED, geomean speedup 2.094, timing-8 2.4523 (1.4008 ms vs 3.4353 ms). Numerical results (abs_err 2.38e-7, rel_err 1.69e-6 on correctness-8) must be preserved."
+    },
+    {
+      "path": "/data/hanle/ascend-optimization/runs/scatter-simulator-20261118/workspace/exploration-feedback.json",
+      "category": "knowledge",
+      "role": "background",
+      "finding": "Historical identities: 3bd9aac1 failed segment_independence numerics (large_finite/positive_infinity/nan); 4932b8f9 and f41ba9a0 qualified but were not retained (target latency 1.4199 ms / 2.7924 ms). Lesson kept as a constraint: do not alter accumulation order, dtype rounding, or special-value handling; this change only removes provably dead index/guard arithmetic and specializes already-true uniforms."
+    }
+  ],
+  "hypothesis": "In the retained sorted-segment path the VECTOR pipeline is the limiting resource (per-program vec time 14.03/9.97 us; observed VECTOR productive 0.907 with MTE lanes idle). A measurable share of that vector issue is provably redundant bookkeeping: two dead clamps and a never-firing loop guard in every one of the 12 lower_bound rounds of sort_out, a dead src_lane clamp in sort_key, a per-round int<->float round-trip in the segmented scan that can be exact fp equality, and mask work on lanes that are all-true when ncols==B. Removing this dead vector work should shorten both kernels proportionally to the removed issue slots without changing any output value.",
+  "alternatives": [
+    "Replace the 11-round segmented scan with global cumsum plus segment-start subtraction (fewer gathers). Rejected: subtracting two large cumulative fp32 sums loses about log2(prefix/segment) bits and can exceed the 1e-4 tolerance; it also changes the established accumulation order.",
+    "Fuse sort_key and sort_out into one program. Rejected: profiling MTE2/MTE3 ratios are 0.045/0.022 and 0.059/0.014, the two task durations already sum to the case latency, so there is no memory or launch gap to recover.",
+    "Use tl.histogram for run starts instead of lower_bound. Rejected: the same candidate file records histogram at 1.79/8.30 ms for 1024/2048, far above the 0.60 ms sort_out.",
+    "Use atomics / inverse permutation to get per-destination sums or starts. Rejected: the file records data-dependent atomic stores at ~4.7 ns/element (MTE3 bound) and a dynamic global store is the pattern already measured ~25x an on-chip gather.",
+    "Reduce lower_bound from LOG+1 to LOG rounds. Rejected after checking the worst-case shrink sequence 2048->...->2->1->0: 12 rounds are required for lower_bound with an exclusive hi, so only the dead arithmetic inside each round is removable."
+  ],
+  "discriminating_observation": "If dead vector issue is on the limiting path, then after removing it the per-program aiv_vec_time of _scatter_add_sort_out_kernel should fall by roughly the removed-op fraction (~25-35% of its per-round arithmetic) and _scatter_add_sort_key_kernel by a smaller amount, task durations should move the same direction, and MTE2/MTE3 ratios should stay <=0.06. If instead gather latency or MTE dominates, vec time and task durations should be unchanged while only instruction counts fall.",
+  "change": "Edit candidate.py only: (1) in _scatter_add_sort_out_kernel keep mid=min((lo+hi)>>1,B-1) but drop hi=min(mid,hi) and the (lo<hi) guard, i.e. go = gather(keys,mid) < t1; lo=where(go,mid+1,lo); hi=where(go,hi,mid); (2) in _scatter_add_sort_key_kernel drop src_lane=min(...), compare targets in exact fp32 instead of per-round fptosi, and under a new EVEN constexpr skip sentinel masking (mask/where) and use unmasked idx/src loads when ncols==B; (3) in _scatter_add_sort_out_kernel under EVEN use unmasked init load/store when ncols==B; (4) pass EVEN=(ncols==B) from run(). No change to accumulation order, dtypes, launch grid, dense owner path, atomic path, generic N-d path, or special-value handling.",
+  "expected": "On timing-8 sort_out ~604 us -> ~520-560 us and sort_key ~799 us -> ~740-780 us, case ~1.40 ms -> ~1.27-1.34 ms, speedup ~2.45 -> ~2.57-2.70. Similar relative gains on timing-1/2/4/5/7 (1024/2048 sorted path). 128x128 cases (dense owner path) unchanged. Outputs bit-identical for ncols==B; unchanged values for ncols<B because removed clamps/guards are identity or only affect already-masked lanes.",
+  "validation": "Bridge preflight --source candidate.py (compile + 21 supplementary cases) to confirm the IR still builds and numerical/special-case behavior is unchanged; then host KGS 18-case formal evaluation comparing per-case latency/speedup and the new per-kernel vec_time/vec_ratio against current-profiling.json for the same source identity.",
+  "selected_layer": "device Triton compute (sorted-segment kernels _scatter_add_sort_key_kernel / _scatter_add_sort_out_kernel)",
+  "layer_reason": "Both paired profiling (vec_ratio 0.913/0.857, MTE2 0.045/0.059, MTE3 0.022/0.014) and the simulator's partial-window timeline (VECTOR productive 0.907, MTE2/MET3 idle 0.949/0.983, SCALAR wait_only 0.688) localize the cost to vector instruction issue inside the two sorted-segment kernels; host allocation/metadata is untouched because no new buffer, shape or launch metadata is introduced.",
+  "simulator_incremental_judgment": "What the hotspots add: they split the 1.40 ms case into 0.80 ms sort_key (57%) and 0.60 ms sort_out (43%) and show both are vector-issue-dominated with int32/misc-heavy sort_out; they are cumulative instruction-time rankings, not critical paths. What the waiting/observable idle adds: in the 12.37 us partial common-clock window the VECTOR lane is busy 90.7% while SCALAR spends 68.8% in wait-only and MTE2/MTE3 are ~95%/98% idle, which distinguishes vector-issue from memory-bound and from scalar-bound hypotheses. It does not distinguish gather latency from arithmetic issue inside the VECTOR lane, and the 6.7% observable idle does not prove a dependency stall, so the simulator contributes only resource attribution, while the exact per-round redundancy comes from the actual IR. The out kernel was not traced, so the 12-round lower_bound cost is supported by profiling+IR, not by simulator timing.",
+  "unknown": [
+    "No simulator trace exists for _scatter_add_sort_out_kernel; its round-cost split is inferred from profiling vec_time and the unrolled IR.",
+    "Absolute time is unqualified (partial window, application did not finish), so the 0.907 productive fraction is not full-device utilization.",
+    "Within VECTOR, gather issue vs arithmetic issue cannot be separated by the current metrics."
+  ]
+}

@@ -4,6 +4,8 @@ HG-KDA 面向昇腾算子的性能诊断与严格 Triton 优化，将同输入�
 
 实现由 **skill、独立 Python 核心与可选后端适配器** 组成。模型由调用宿主提供，KernelGen（KG）可作为优化执行器；KernelGen Server（KGS）负责完整评测，msprof 负责设备采集。离线分析只依赖 Python 标准库。
 
+算子级采集与解析由 MindStudio Ops Profiler（msOpProf）工具提供。当前验证环境使用 CANN 9.0.0 的 `msprof op` 和 `msprof op simulator` 命令；公开新版文档使用独立的 `msopprof` 命令。仿真模式调用 CANN 的 Ascend910B4 仿真库，HG-KDA分析其指令热点、源码区域及流水等待／可观测空闲。msOpProf工具层已开源，底层硬件仿真库的公开源码与周期精确性仍待核实；正式性能由真机评测给出。
+
 ## 核心能力
 
 | 能力 | 输出 |

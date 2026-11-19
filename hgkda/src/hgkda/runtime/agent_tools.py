@@ -82,8 +82,10 @@ def main():
         previous=read(attempt/'preflight.json')
         (workspace/'latest-preflight.json').write_text(json.dumps(previous,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
         report(previous);return
-    limit=config.get('maximum_preflight_sources',3)
-    assert len(list((run/'attempts').glob('*/preflight.json'))) < limit, '已达到本轮显式配置的设备预检数量限制'
+    limit=config.get('maximum_preflight_sources',0)
+    assert isinstance(limit,int) and limit>=0, 'maximum_preflight_sources must be a nonnegative integer'
+    if limit:
+        assert len(list((run/'attempts').glob('*/preflight.json'))) < limit, '已达到本轮显式配置的设备预检数量限制'
     attempt.mkdir(parents=True,exist_ok=False)
     frozen=attempt/'candidate.py';frozen.write_bytes(source.read_bytes())
     checks=config['job']['checks'];environment={

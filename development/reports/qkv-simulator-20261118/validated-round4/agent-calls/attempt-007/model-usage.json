@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 48,
+    "duration_ms": 200627,
+    "usage": {
+      "input_tokens": 75452,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 2163584,
+      "output_tokens": 33229,
+      "output_tokens_details": {
+        "thinking_tokens": 20357
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 75452,
+        "outputTokens": 33229,
+        "cacheReadInputTokens": 2163584,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 2.289777,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 20357,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 2.289777,
+    "result": "Diagnosis recorded (`decision_id f5800e8b65b943199c3f087f52a8f683`, bound to source `c133a5a3…`), candidate edited, preflight invoked.\n\n## What the two analyses contributed\n\n**Hotspots (`simulator-evidence.json`, source `c133a5a3…`, partial 6.6 µs core0 window, `absolute_time_qualified=false`):** the largest instruction-time entries are the kernel-entry `BAR` (5.65 µs, line 35), a `WAIT_FLAG` before the q store (4.65 µs, line 113) and three `VECTOR BAR`s around the q add/scale/cast (4.38–4.62 µs, lines 107–109). Taken alone these only *locate* synchronisation points on the load→vector→store chain; their sums overlap other pipelines and cannot be added into a duration, so they do not by themselves separate pipelining from a bandwidth limit.\n\n**Waiting/observable idle:** MTE3 `wait_only` 0.704 (productive 0.153) and VECTOR `wait_only` 0.649 (productive 0.101) versus MTE2 productive 0.701. That *does* distinguish a producer→consumer serialisation from a load-bandwidth wall, which the hotspots cannot. The 0.25 VECTOR / 0.14 MTE3 idle fractions are observed partial-window gaps only — not proven causal stalls, not full-device time.\n\n**Paired profiling (`current-profiling.json`, same SHA):** 512 blocks on 40 cores ⇒ 12.8 serial programs per core; per-block means aiv_time 3.18 µs, mte2 1.51 µs, mte3 0.66 µs, vec 0.67 µs, scalar 0.78 µs; mte3_wait 0.654, vec_wait 0.464; total 42.98 µs. **Target IR:** fully straight-line 128×64 loads/stores — there is no second independent tile inside a program to overlap.\n\n**Historical separation (kept apart from current evidence):** the demonstrated 2× tile win `a5afde4c→c133a5a3` (0.0794→0.0635 ms) says work-per-program amortisation is real; the `bb15ccd3`/`28d7c8a2` UB overflows (262 KB requested vs 192 KB) and their 3-D grouped tiles `[32,4,16]` are constraints — so the new grouping stays 2-D and does not grow the live tile set.\n\n## Selected mechanism (one focused change)\n\nExact-path only: each program now walks **GROUP=2 consecutive seq blocks** of the same (batch, head) in a `tl.range(0, GROUP, num_stages=2)` loop, with bias loads and pid decomposition hoisted out of the loop; grid becomes `batch*num_heads*num_seq_groups`. Masked/non-dividing shapes fall back to GROUP=1 with the original semantics; fp32 q-opmath-then-single-cast and fp16 k/v adds, strides, layouts and host allocation are untouched.\n\nPredicted: paired duration 42.98 → ~36–39 µs, formal target 63.51 → ≤60 µs, with per-block mte2 time ≈2× but aiv_time < 2×; if aiv_time ≈ 6.36 µs with unchanged wait ratios, the pipelining mechanism is rejected.\n\n## Handoff\n\n`preflight --source candidate.py` returned **`awaiting_source_review`** (source SHA `4bfa839d0c2080b254448cb65893118179bba2c84cff17c2eaacb9984a977eaa`). candidate.py is unchanged from that point and unmeasured; `diagnosis.json` records the post-edit SHA and that no device/simulator/formal observation exists yet for it. Host should complete the read-only path/address-boundary review and the full 21-case formal evaluation against the retained best `c133a5a3…`."
+  }
+}

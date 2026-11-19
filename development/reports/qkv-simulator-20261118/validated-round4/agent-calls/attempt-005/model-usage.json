@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 37,
+    "duration_ms": 91119,
+    "usage": {
+      "input_tokens": 23910,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 495104,
+      "output_tokens": 14935,
+      "output_tokens_details": {
+        "thinking_tokens": 8888
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 23910,
+        "outputTokens": 14935,
+        "cacheReadInputTokens": 495104,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 0.740477,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 8888,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 0.740477,
+    "result": "Preflight returned `awaiting_source_review`; per the hand-off rule I stopped there and left the candidate unchanged.\n\n## Actual failure stage and diagnostic\n- Stage: **compiler (BiShengHIR) resource overflow** at `_transform_bias_rescale_qkv_kernel` (source line 46). No device execution happened — `failed_cases` is empty and both `previous-result.json` and `latest-preflight.json` carry the same message:\n  `ub overflow, requires 2146304 bits while 1572864 bits available` → **262 KiB needed vs 192 KiB AIV UB**.\n- Root cause accounting for the target case (fp16 `[8,512,3072]`, heads=16 → hidden=1024, head_dim=64): `_TILE_BYTES=16384` → 8192 elements, `min_rows=32`, so `BLOCK_H=4, BLOCK_S=32`. Per element the kernel stages two 3D **int64** offset tensors (`q_in`, `out_off`, 8 B each), three fp16 loads, fp32 q-opmath temporaries and two fp16 results ≈ 34 B/elem → ≈262 KiB, matching the reported requirement. Tile element count is the sole driver.\n\n## Repair (focused, one mechanism: tile geometry)\n- `_TILE_BYTES` 16384 → **8192**; `_MIN_STORE_BYTES` 4096 → **2048**.\n- Target case becomes `BLOCK_D=64, BLOCK_H=4, BLOCK_S=16` (4096-element tile, ~139 KiB UB, ~72 % of budget). Head grouping — the actual performance hypothesis — is preserved, so the strided input rows stay `BLOCK_H*head_dim` contiguous; only the S partition halves (programs 512 → 1024).\n- Untouched: index arithmetic, strides, masks/`EXACT` paths, fp32 bias-add-then-rescale numeric order, and the three independent q/k/v stores. No host-side computation or allocation changes.\n\n## Validation path\n1. Preflight compile of the new source (`28d7c8a2…`) — **returned `awaiting_source_review`**, so compile has not yet been confirmed on device.\n2. After review: full KGS formal evaluation; expect `failed_cases` empty, supplementary semantics pass, and per-case speedups in the prior range (historical 1.435× on the target case).\n\n## Decision record\n`diagnosis.json` (diagnostic, evidence with paths/categories/roles, hypothesis, change, expected, validation, unknowns) was registered **before** the edit via `decision --record`, decision id `5bb32d2d712f4ee6b86b6cdf324fced6`, bound to the pre-edit source `bb15ccd3…`. Evidence for the trigger is `previous-result.json`/`latest-preflight.json` (`evaluation`/`trigger`); historical `performance-feedback.json` is cited only as `background` with its own source SHA. No simulator evidence was claimed."
+  }
+}

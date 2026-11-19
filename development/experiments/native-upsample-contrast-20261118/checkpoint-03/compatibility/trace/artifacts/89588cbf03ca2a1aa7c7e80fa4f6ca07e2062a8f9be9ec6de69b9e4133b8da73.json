@@ -1,0 +1,48 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "62a02c203a3e54a09f6479ca8526168bf1529821284cd1b42bc6cbdf3c980a12",
+  "evidence": [
+    {
+      "path": "workspace/compiler-evidence.json",
+      "category": "source_ir",
+      "role": "trigger",
+      "finding": "Untouched native kernel fails verification at the store line: tl.store(ptr_o + offset_o, result) stores an fp32 expression into a pointer whose element type is the output dtype. TritonToStructuredIncubated/Canonicalizer pipeline aborts, so the native source cannot compile for Ascend as-is."
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Kernel computes the bilinear result in tl.float32 and stores without casting to the output element type. It also imports FlagGems-only runtime helpers (runtime.get_tuned_config, runtime.device.name, torch_device_fn.device, triton_lang_extension.program_id) and exposes only upsample_bilinear2d, not the contract's run entrypoint."
+    },
+    {
+      "path": "workspace/contract.json",
+      "category": "other",
+      "role": "background",
+      "finding": "Contract requires public run(input, output_size, align_corners=False, scales_h=None, scales_w=None) returning out, with no mutation or aliasing; output dtype/device follow input. Semantic algorithm must be preserved."
+    },
+    {
+      "path": "workspace/task.json",
+      "category": "other",
+      "role": "background",
+      "finding": "Shared compatibility phase: make the unmodified FlagGems algorithm compile and satisfy the contract, no performance optimization, preserve source ancestry and launch geometry; maximum 2 generation calls, formal evaluation pending."
+    }
+  ],
+  "hypothesis": "The compilation failure is a dtype mismatch at the store: the 2x2 bilinear accumulation is fp32 while output buffers may be fp16/bf16. Casting the result to ptr_o.dtype.element_ty should satisfy tt.store's value/pointer type rule without changing the interpolation math. Separately, FlagGems-only module metadata (tuned configs, device-name assert, device context, tle.program_id) must be replaced by plain Triton/host equivalents so the module imports and exposes run.",
+  "change": "Keep the kernel algorithm, loop structure, interpolation formula, 2D grid geometry (BLOCK_X over OW, BLOCK_Y over OH) and autotune key unchanged. Minimal edits: (1) tl.store(ptr_o + offset_o, result.to(ptr_o.dtype.element_ty)); (2) replace tle.program_id with tl.program_id; (3) replace runtime.get_tuned_config with a local single triton.Config list for BLOCK_X/BLOCK_Y; (4) drop the FlagGems device-name assert and torch_device_fn.device context, using torch.empty on input.device and a plain kernel launch; (5) expose run as the public entrypoint while keeping the original function name as an alias.",
+  "expected": "Candidate imports without FlagGems dependencies and compiles under Triton-Ascend: no tt.store verifier error, one kernel program per (BLOCK_X, BLOCK_Y) output tile, and numerically identical results to the preserved fp32 accumulation (cast only at store). No performance change is claimed or targeted.",
+  "validation": "Submit the single candidate to the provided decision bridge preflight (compile-only). Then stop if the bridge reports awaiting_source_review. Formal correctness/performance is out of scope for this compatibility phase.",
+  "alternatives": [
+    "Pass an explicit OUT_DTYPE constexpr and cast result accordingly; rejected as more invasive than reading ptr_o.dtype.element_ty.",
+    "Compute the accumulation in the output dtype; rejected because it changes numerical behavior of the preserved formula.",
+    "Replace autotune entirely with hardcoded launch meta; rejected as a larger structural change than a local one-config equivalent of get_tuned_config."
+  ],
+  "selected_layer": "compatibility",
+  "layer_reason": "The task is shared compatibility: the native source must compile and satisfy the unchanged contract before any simulator/control experiment; no performance layer is in scope.",
+  "simulator_incremental_judgment": "No simulation in common compatibility phase",
+  "observation": "Preflight first rejected the module because the host-side import checker only allows torch, torch_npu, triton, math, functools, typing and os; the inherited logging import was removed (no algorithmic change). Second preflight returned status=awaiting_source_review for source_sha256 7b6870a9d281fb574a45c4af85e2f3f8263c3310601bb92255473fd2ee84ef31, so the candidate is unchanged and no compile/correctness/performance result exists yet.",
+  "unknown": [
+    "Whether Triton-Ascend accepts scalar tl.where conditions and pointer .dtype.element_ty exactly as written (expected from standard Triton 3.x).",
+    "Actual FlagGems tuned BLOCK_X/BLOCK_Y values are not provided; a single local 32x32 config is used as equivalent metadata without any performance claim.",
+    "Whether the runtime harness selects the npu device itself now that the FlagGems device context is removed."
+  ]
+}

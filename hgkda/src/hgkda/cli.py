@@ -16,14 +16,14 @@ def parser():
     root = argparse.ArgumentParser(description="HG-KDA：性能证据、机制诊断与评测适配")
     root.add_argument("--version", action="version", version=__version__)
     commands = root.add_subparsers(dest="command", required=True)
-    for name in ["doctor", "compare", "diagnose", "hotspots", "regions", "roofline", "context", "knowledge"]:
+    for name in ["doctor", "compare", "diagnose", "hotspots", "regions", "timeline", "roofline", "context", "knowledge"]:
         p = commands.add_parser(name)
         p.add_argument("--output", type=Path, help="新 JSON 文件；已有文件不会覆盖")
         if name == "compare":
             p.add_argument("--directory", type=Path, required=True)
         if name in {"diagnose", "roofline"}:
             p.add_argument("--input", type=Path, required=True)
-        if name in {"hotspots", "regions"}:
+        if name in {"hotspots", "regions", "timeline"}:
             p.add_argument("--listing", type=Path, required=True)
             p.add_argument("--source", type=Path, required=name == "hotspots")
             p.add_argument("--top", type=int, default=12)
@@ -32,6 +32,10 @@ def parser():
             p.add_argument("--core")
             p.add_argument("--trace", type=Path)
             p.add_argument("--trace-unit", choices=["us", "ns", "cycles"], default="us")
+            p.add_argument("--source-map", type=Path)
+        if name == "timeline":
+            p.add_argument("--trace", type=Path, required=True)
+            p.add_argument("--binding", type=Path, required=True)
             p.add_argument("--source-map", type=Path)
         if name in {"context", "knowledge"}:
             p.add_argument("--operator", required=True)
@@ -103,7 +107,7 @@ def dispatch(args):
             raise ValueError("指令清单与源码身份未绑定或不同")
         result = instruction_hotspots(listing, args.source.read_text(encoding="utf8"), count=args.top)
         return result, [identity(args.listing), source]
-    if cmd == "regions":
+    if cmd in {"regions", "timeline"}:
         from .regions import analyze
         sources, inputs = {}, [identity(args.listing)]
         if args.source_map:
@@ -115,6 +119,10 @@ def dispatch(args):
                     raise ValueError("源码映射哈希不符：" + file)
                 sources[file] = dict(text=path.read_bytes().decode("utf8"), sha256=entry["sha256"])
                 inputs.append(entry_id)
+        if cmd == "timeline":
+            from .timeline import relative_timeline
+            result=relative_timeline(read_json(args.listing),args.trace.read_bytes(),binding=read_json(args.binding),sources=sources)
+            return result,inputs+[identity(args.trace),identity(args.binding)]
         if args.trace:
             inputs.append(identity(args.trace))
             if not read_json(args.trace).get('hgkda_binding'):

@@ -1,0 +1,45 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "69d4c107ba8395317f7b97c6c2a46e15176007b2e8572cc2747407567a2b3001",
+  "evidence": [
+    {
+      "path": "workspace/next-performance-feedback.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "Last round's mechanism (pre-scaled p_lo_s/p_lo2_s so all three bf16 PV products chain through one L0C accumulator) produced no gain: case4 1927.97us vs baseline 1900.72us (ratio 0.986), case2 189.03 vs 181.71 (0.961), cases 1/7 ~flat; all four still pass. Source review additionally reports the third contribution is cast((r1-p_lo)/2048^2) instead of the intended second residual, i.e. it is missing a factor 2048."
+    },
+    {
+      "path": "workspace/evidence-summary.json",
+      "category": "paired_profiling",
+      "role": "background",
+      "finding": "Target case4 (bf16, B4 S256 Nq64 Nkv8 D128, non-causal): candidate 1893.98us vs reference 127.84us. Per-record pipeline ratios on the candidate core are all near zero (aic_cube 0.00088, aic_fixpipe 0.00237, aic_scalar 0.00869, aiv_vec 0.0059), so the kernel is not limited by pipe throughput of the tiles it issues; the block count is 1024 with tiny per-block work, so cost is per-block/per-iteration fixed overhead (loads, cross-core handoffs, syncs), and the profiling limitations note that these ratios cannot be summed into a time decomposition."
+    },
+    {
+      "path": "workspace/simulator-summary.json",
+      "category": "simulator",
+      "role": "mechanism",
+      "finding": "Partial capture of the pre-change source (core window ~36.8us, no completion manifest). On both vector cores the largest stalls are WAIT_FLAG_DEVI attributed to the PV dot lines: 10.81us/4 calls at the p_lo2 dot and 8.99us/4 calls at the two-term dot expression, plus three BAR instructions at the p_lo2 derivation (3.09/3.43/3.63us). On the cube core FIXP is the busiest pipeline (productive 14.69us = 40% of window, another 4.15+3.87+3.85us of L0C_TO_DST/SET_FLAG around the PV dots) while CUBE is productive only 1.55us (4%). VECTOR productive is 11.3/36.6us with 7.06us wait-only. So the per-iteration cost is dominated by cube<->vector accumulator handoffs (one L0C->UB movout + SET_FLAG/WAIT + UB reload per PV tl.dot) and by the vector-side derivation of the extra residual term, not by cube MACs."
+    },
+    {
+      "path": "workspace/ir-excerpt.txt",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "Inside the scf.for body (line 110) each PV residual term is its own linalg.matmul with a different accumulator producer: line 178 matmul ins(%97,%96) outs(%102=acc*alpha), line 179 matmul ins(%101,%96) outs(%1) then %105 = mulf %104,%9 (1/2048), line 185 arith.truncf then line 186 matmul outs(%1) then %112 = mulf %111,%10 (2^-22). Each term therefore carries its own fixpipe/L0C exit and its own vector post-scale read; the excerpt also shows a per-iteration memref.copy + linalg.transpose of the K tile (lines 129-133)."
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "trigger",
+      "finding": "Lines 111-128: the bf16 branch issues three chained tl.dot calls into acc, with p_lo2_s = ((r1 - p_lo) * 2^-22).to(bf16). Because r1 = 2048*(p - p_hi) and p_lo = bf16(r1), the true second residual back in p units is (r1-p_lo)/2048, so the implemented operand is 2048x too small: its contribution to the PV sum is ~2^-29*p*v, i.e. numerically inert. The bf16 path is therefore already, in effect, a two-term split whose remaining p error (~2^-18 relative) is what the official checker currently accepts."
+    }
+  ],
+  "hypothesis": "Per loop iteration the dominant cost is the cube<->vector accumulator handoff created by each PV tl.dot (L0C movout + SET_FLAG/WAIT + UB read-back + fp32 post-scale), not cube arithmetic (CUBE productive 4% of the capture while FIXP is 40%). The bf16 path pays this three times per iteration for three residual terms, but its third term is inert (~2^-29*p). Reducing bf16 PV to a properly scaled two-term split therefore removes one of three handoffs per iteration while leaving the numerics equal to what already passes.",
+  "change": "Collapse the dtype-dependent PV precision branch into a single two-term split (p = p_hi + p_lo/2048, p_lo = bf16/fp16(2048*(p - p_hi)), low-order dot rescaled by 1/2048 after the dot, added in fp32 to the UB-resident accumulator). Remove the P_TERMS constexpr, the p_lo_s/p_lo2_s pre-scaled operands and the chained-accumulator form; both dtypes now take the same per-iteration path with two PV dots. Selection still depends only on metadata (dtype/shape) via the shared code path; no case ids or tensor values are inspected.",
+  "expected": "Target case4 (bf16) loses one PV dot per iteration: per-iteration handoffs 3 -> 2 and no vector-side p_lo2 derivation/barriers, expected 15-30% lower kernel time (below the 1900.72us baseline; the last round's chained variant measured 1927.97us). Case7 (bf16, S=128) should improve similarly. Cases 1/2 (fp16) already executed exactly this two-dot form, so their math and timing should be unchanged. Accuracy: the new PV sum differs from the currently passing bf16 result only by the dropped inert term, ~2^-29 relative in p, far below output rounding, so all four cases should still pass the official checker. Output dtype and math semantics unchanged.",
+  "validation": "Full four-case evaluation with the official checker on the next round's fixed results: require case1/2/4/7 all pass, case4 candidate_us materially below 1900.72us, and fp16 cases within noise of their current times. If case4 does not improve beyond 1%, the handoff hypothesis is falsified and the next mechanism should target per-block fixed cost (iteration count / tile shape) instead of PV term count.",
+  "unknown": [
+    "The simulator capture is a partial window with no completion manifest, so the wait times are observed stalls, not a proven critical path.",
+    "Whether the compiler keeps the two PV dots' results in UB or re-materialises an L0C accumulator, and how much UB the bf16 path needs at BLOCK_M=64/BLOCK_N=64/BLOCK_D=128.",
+    "Whether the previous round's 1.4% case4 regression was real or noise; this change also removes the chained-accumulator (UB->L0C acc init) pattern, so both effects are re-measured together.",
+    "Whether the accepted accuracy floor really is the two-term 2^-18 relative p error (checker behaviour, not proved here); if the checker rejects this, the third term must be restored with the corrected 2048 scaling."]
+}

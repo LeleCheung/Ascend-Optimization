@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 45,
+    "duration_ms": 571611,
+    "usage": {
+      "input_tokens": 49283,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1592320,
+      "output_tokens": 91168,
+      "output_tokens_details": {
+        "thinking_tokens": 79356
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 49283,
+        "outputTokens": 91168,
+        "cacheReadInputTokens": 1592320,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 3.3217749999999997,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 79356,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 3.3217749999999997,
+    "result": "Done for this call. Summary:\n\n**Read/diagnosed**\n- `previous-result.json`: current source `ed7951…` passes all 24 formal cases, but target `timing-1` is 424.4 µs vs 245.2 µs reference (0.578×); the large exact-2x cases are the slow ones.\n- `current-profiling.json` (current candidate): the 2x kernel is **not** bandwidth bound — it moves only ~30 MB in ~424 µs (~70 GB/s) while the reference moves ~107 MB in 245 µs. Per block: `mte2_time` 8.0 µs of a 16.6 µs block at 1.6 GB/s, `mte3_time` 4.05 µs at 3.8 GB/s, `scalar_wait` 12.7 µs, and ~141 mte2 issues per block for only 48 logical row loads (~3 issues per 256-byte load).\n- `current-ir/ed7951f16989/19-kernel.ttir` (current 2x kernel): every load/store carries a runtime i1 mask (`%m_5`, `%m_5 & has_left`, `store_w & splat(i < IH)`), and `IH/IW/OH/OW` are runtime i32 args, so none of the bound compares fold, and each row is a predicated small DMA.\n\n**Decision (registered before editing)**: decision id `f93e99552cfd44cfb29373f6f5719855`, layer Triton — the removable cost is runtime (non-constexpr) geometry forcing per-row predication.\n\n**One mechanism change**: the exact-2x kernel now takes `IH, IW, TILE_I` as `constexpr` (OW derived), drops the runtime shape args, drops every store mask (grid is exact: `TILE_I` chosen as a divisor of `IH`), makes the left-neighbour load unmasked via a scalar-clamped base (`max(base-1,0)`), keeps only a constant-mask right-neighbour load (would otherwise read one element past the tensor), and folds the column predicates to constants. Arithmetic, weights, fp32 accumulation, dtype handling, the general gather path, and `run()` are unchanged; the fast path is additionally restricted to power-of-two `IW` (non-pow2 falls back to the unchanged general kernel).\n\n**Preflight**: `awaiting_source_review` (new sha `4d475d550a19b204ce7525d6ae80be2ed24401f0f489bcc59a342135ca291be7`); source is left unchanged for host path/address review and the full run.\n\n**Actual uncertainties**: the split between per-row DMA *issue* overhead and predicated-DMA serialization cannot be separated from the counters, so the size of the gain is uncertain; constexpr geometry means one specialization per shape (more compiles); and whether an unmasked 256-byte row load becomes a single DMA instruction on this backend is an inference, not a measured fact."
+  }
+}

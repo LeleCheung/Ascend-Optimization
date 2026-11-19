@@ -5,6 +5,7 @@ import importlib.util
 import json
 from pathlib import Path
 import time
+import sys
 
 
 def load(path, name):
@@ -24,9 +25,22 @@ def main():
         import torch_npu
         torch.npu.set_device(0)
     contract=json.loads(a.contract.read_bytes())
+    official_compare=None
+    checker_identity=None
+    if contract.get('checker_source'):
+        checker_root=Path(contract['checker_source'])
+        checker_file=checker_root/'kernel_eval/utils/compare.py'
+        checker_identity=dict(path=str(checker_file),sha256=hashlib.sha256(checker_file.read_bytes()).hexdigest(),
+                              commit=contract['checker_commit'])
+        assert checker_identity['sha256']==contract['checker_sha256']
+        sys.path.insert(0,str(checker_root))
+        from kernel_eval.utils.compare import compare_tensors
+        official_compare=compare_tensors
     golden_sha256=hashlib.sha256(Path(contract['golden']).read_bytes()).hexdigest()
     if contract.get('golden_sha256'):assert contract['golden_sha256']==golden_sha256,'golden reference changed'
-    golden=load(contract['golden'],'official_gqa').gqa
+    golden_module=load(contract['golden'],'official_gqa')
+    golden=golden_module.gqa
+    native_reference=getattr(golden_module,'gqa_bench',golden)
     candidate=load(a.candidate,'candidate_gqa').run if a.candidate else None
     rows=[]
     for case in contract['cases']:
@@ -35,13 +49,19 @@ def main():
             dtype=getattr(torch,case['dtype'][0]);gen=torch.Generator(device='cpu').manual_seed(1729+case['case_id'])
             cpu=[(torch.rand(shape,generator=gen)*2-1).to(dtype) for shape in case['input_shape']]
             expected=golden(*(x.to(torch.float64) for x in cpu),**case['attrs'])
+            native_cpu=native_reference(*cpu,**case['attrs']) if official_compare else None
             def correctness(value):
                 actual=value.detach().cpu().double();error=(actual-expected).abs();relative=error/(expected.abs()+1e-7)
                 threshold=2**(-10 if dtype==torch.float16 else -7)
                 mere=relative.mean().item();mare=relative.max().item()
-                return dict(mere=mere,mare=mare,threshold=threshold,max_abs=error.max().item(),
+                result=dict(mere=mere,mare=mare,threshold=threshold,max_abs=error.max().item(),
                     official_formula_pass=mere<threshold and mare<10*threshold,
                     supplementary_allclose=bool(torch.allclose(actual,expected,atol=.015,rtol=.015)))
+                if official_compare:
+                    checked=official_compare(output=value.detach().cpu(),golden=expected,
+                        dtype=case['dtype'][0],threshold=threshold,native_output=native_cpu)
+                    result['official_checker']=checked.to_dict()
+                return result
             row['nearest_representable_correctness']=correctness(expected.to(dtype))
             if a.precision_floor_only:
                 row['status']='precision_floor_only';rows.append(row)
@@ -84,6 +104,7 @@ def main():
     result=dict(schema='hgkda.cannbench-pilot/v1',task='level4/gqa',scope='explicit official case subset; not full CANNBench acceptance or leaderboard',
         contract_sha256=hashlib.sha256(a.contract.read_bytes()).hexdigest(),
         golden_sha256=golden_sha256,harness_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        official_checker_identity=checker_identity,
         source_sha256=hashlib.sha256(a.candidate.read_bytes()).hexdigest() if a.candidate else None,cases=rows)
     a.output.parent.mkdir(parents=True,exist_ok=True);a.output.write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
     print(json.dumps(dict(cases=len(rows),measured=sum(r['status']=='measured' for r in rows),output=str(a.output))))

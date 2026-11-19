@@ -265,6 +265,81 @@
       "method": {
         "note": "",
         "evidence": "/data/hanle/ascend-optimization/archive/Ascend-Optimization-pre-release-20261103/project/Ascend-Optimization-v1/operators/campaigns/remaining-nine-20261030/paths/special_round_out/case-1/PyTorch-1df2d942fa6b/spec.json"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "1df2d942fa6b321e28a709dd6313fc6bfb13c86cda3ea095edf0c5562fd4befc",
+        "role": "guidance",
+        "method": "复用直接启动方法",
+        "primary": "paired",
+        "secondary": [
+          "knowledge",
+          "ir"
+        ],
+        "confidence": "confirmed",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/reports/trace-attribution-matrix-20261116.json",
+            "sha256": "ae1f2bb9a53639218c0d522e3c48c3c7058e3f70eb1ca0f471fc9c850fe26a23"
+          },
+          {
+            "path": "development/experiments/lineage/20261117/links-v7/artifacts/1df2d942fa6b321e28a709dd6313fc6bfb13c86cda3ea095edf0c5562fd4befc.py",
+            "sha256": "1df2d942fa6b321e28a709dd6313fc6bfb13c86cda3ea095edf0c5562fd4befc"
+          }
+        ],
+        "inference_basis": "recorded_plan",
+        "reason": "计划引用msprof设备核2.694μs与完整调用62.75μs，并明确借鉴同批xlogy直接启动方案；Profiling为主，知识／经验为辅。",
+        "plan_evidence": [
+          {
+            "kind": "performance",
+            "strategy": "Launch the already-compiled Ascend kernel directly from a cached closure instead of going through Triton's per-call JIT binding path",
+            "code_changes": "Added _stream_getter / _pick_block / _direct_launcher / _guarded helpers and per-key plans: the first call per (dtype, numel, decimals, layout) calls jitfn.warmup once and caches a closure that issues launcher.launch(gridX,1,1,current_raw_stream,function,packed_metadata,None,None,None, x_ptr, out_ptr, N, SCALE, INV_SCALE, DECIMALS, BLOCK). Pointers, N, scalars and the stream handle are re-passed every call; unaligned pointers or any launcher exception drop back to the bound JIT call. Kernel bodies, strided indexing and NaN/Inf handling are unchanged.",
+            "hypothesis": "Round-1 msprof showed timing-0 spends 2.694 us in the device kernel inside a 62.75 us call while the reference torch.round finishes in 14.25 us, so ~60 us per call is host launch overhead; driving the compiled Ascend launcher directly (validated pattern from the batch's xlogy runtime-scalar-v3 proposal) should bring the nine small workloads from ~63-70 us to well below 30 us while leaving device-bound large workloads within a few percent",
+            "expected_effect": {
+              "metric": "geo_mean",
+              "direction": "increase",
+              "mechanism": "Removing the per-call JIT binder/cache-key/arg-packing work drops the ~60 us fixed cost that currently dominates the nine small workloads, whose device kernel is only 2.694 us"
+            },
+            "source": {
+              "origin": "profile_next_experiment",
+              "parent_round_num": 1
+            },
+            "key_params": {
+              "_MAX_BLOCK": 4096,
+              "_MIN_BLOCK": 256,
+              "_STRIDED_BLOCK": 1024
+            },
+            "knowledge_uses": []
+          }
+        ],
+        "changed_symbols": {
+          "kernel": [
+            "_rnd_value",
+            "_round_flat",
+            "_round_strided",
+            "_round_value"
+          ],
+          "host": [
+            "3",
+            "_ENTRIES",
+            "_GETTERS",
+            "_MAX_BLOCK",
+            "_MIN_BLOCK",
+            "_PLANS",
+            "_STRIDED_BLOCK",
+            "_direct_launcher",
+            "_dispatch",
+            "_flat_plan",
+            "_guarded",
+            "_pick_block",
+            "_stream",
+            "_stream_getter",
+            "_strided_plan"
+          ],
+          "shared": []
+        },
+        "event_id": "8f9231cb5fe39351"
       }
     },
     {
@@ -353,6 +428,44 @@
       "method": {
         "note": "Use floor/fraction/parity ties-to-even and FP32 div_rn for decimal scaling; preserve input NaN/Inf and output alias; remove unsupported FP64 path",
         "evidence": "/data/hanle/ascend-optimization/archive/Ascend-Optimization-pre-release-20261103/project/Ascend-Optimization-v1/operators/campaigns/next25-20261029-v2/proposals/special_round_out/vector-round-v1/proposal.json"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "ccb7b81108437cc81f08e070c64e44838e69ee21aeba66fe56401f9fcf02a95b",
+        "role": "guidance",
+        "method": "对齐偶数舍入与特殊值",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/experiments/lineage/20261117/links-v2/artifacts/ccb7b81108437cc81f08e070c64e44838e69ee21aeba66fe56401f9fcf02a95b.py",
+            "sha256": "ccb7b81108437cc81f08e070c64e44838e69ee21aeba66fe56401f9fcf02a95b"
+          }
+        ],
+        "inference_basis": "retrospective_code",
+        "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+        "changed_symbols": {
+          "kernel": [
+            "_round_flat",
+            "_round_strided",
+            "_round_value",
+            "_special_round_kernel"
+          ],
+          "host": [
+            "_ENTRIES",
+            "_dispatch",
+            "_special_round_kernel:launch_decorators",
+            "_stream",
+            "logger",
+            "run",
+            "special_round",
+            "special_round_out"
+          ],
+          "shared": []
+        },
+        "event_id": "d16a168d04697b19"
       }
     },
     {
@@ -441,6 +554,32 @@
       "method": {
         "note": "Round finite magnitudes below 2^23 by adding/subtracting 2^23; preserve larger FP32 values, original sign, NaN/Inf, decimal scaling and real input/output strides",
         "evidence": "/data/hanle/ascend-optimization/archive/Ascend-Optimization-pre-release-20261103/project/Ascend-Optimization-v1/operators/campaigns/next25-20261029-v2/proposals/special_round_out/fp32-rounding-shift-v2/proposal.json"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "2bf1d321fb41b0459f51ba0d73f025265c7ed4cc8ca55751dde77d15eaad2783",
+        "role": "guidance",
+        "method": "浮点偏移简化舍入",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "kernel",
+        "evidence": [
+          {
+            "path": "development/experiments/lineage/20261117/source-evidence/sources/2bf1d321fb41b0459f51ba0d73f025265c7ed4cc8ca55751dde77d15eaad2783.py",
+            "sha256": "2bf1d321fb41b0459f51ba0d73f025265c7ed4cc8ca55751dde77d15eaad2783"
+          }
+        ],
+        "inference_basis": "retrospective_code",
+        "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+        "changed_symbols": {
+          "kernel": [
+            "_round_value"
+          ],
+          "host": [],
+          "shared": []
+        },
+        "event_id": "51b6d4dfaa694cbd"
       }
     },
     {
@@ -860,6 +999,55 @@
       "method": {
         "note": "",
         "evidence": "/data/hanle/ascend-optimization/archive/Ascend-Optimization-pre-release-20261103/project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/proposals/special_round_out/codex-streaming-round-v1/actual-device/spec.json"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "ceebc9436287020db7c36cc00f8124ee0bc408ce3bf55e1cb848b3effcb7fe08",
+        "role": "guidance",
+        "method": "流式舍入与启动缓存",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/experiments/lineage/20261117/links-v7/artifacts/ceebc9436287020db7c36cc00f8124ee0bc408ce3bf55e1cb848b3effcb7fe08.py",
+            "sha256": "ceebc9436287020db7c36cc00f8124ee0bc408ce3bf55e1cb848b3effcb7fe08"
+          }
+        ],
+        "inference_basis": "retrospective_code",
+        "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+        "changed_symbols": {
+          "kernel": [
+            "_flat",
+            "_rnd_value",
+            "_round_flat",
+            "_round_strided",
+            "_streaming",
+            "_strided",
+            "_value"
+          ],
+          "host": [
+            "3",
+            "_GETTERS",
+            "_MAX_BLOCK",
+            "_MIN_BLOCK",
+            "_RAW",
+            "_STRIDED_BLOCK",
+            "_build",
+            "_direct_launcher",
+            "_dispatch",
+            "_flat_plan",
+            "_guarded",
+            "_pick_block",
+            "_stream",
+            "_stream_getter",
+            "_strided_plan",
+            "run"
+          ],
+          "shared": []
+        },
+        "event_id": "8b38eaf37d7c3b0f"
       }
     },
     {
@@ -1210,6 +1398,52 @@
       "method": {
         "note": "",
         "evidence": "/data/hanle/ascend-optimization/archive/Ascend-Optimization-pre-release-20261103/project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/proposals/special_round_out/codex-required-out-v4/actual-device/spec.json"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "52807976ab25e9d7506337fb70ce6d0f6c147ae5bc859f74dfca9d7496064b7e",
+        "role": "guidance",
+        "method": "复用 round_out 流式方法",
+        "primary": "knowledge",
+        "secondary": [
+          "ir"
+        ],
+        "confidence": "inferred",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/experiments/lineage/20261117/source-evidence/sources/52807976ab25e9d7506337fb70ce6d0f6c147ae5bc859f74dfca9d7496064b7e.py",
+            "sha256": "52807976ab25e9d7506337fb70ce6d0f6c147ae5bc859f74dfca9d7496064b7e"
+          }
+        ],
+        "inference_basis": "historical_context",
+        "reason": "根据相近实现的结构复用与历史迁移记录推断知识／经验复用；不等同于确认调用了知识库检索。",
+        "changed_symbols": {
+          "kernel": [
+            "_flat",
+            "_round_stream",
+            "_round_strided",
+            "_streaming",
+            "_strided",
+            "_value"
+          ],
+          "host": [
+            "_CORES",
+            "_FAST",
+            "_MAGIC",
+            "_RAW",
+            "_STREAM",
+            "_build",
+            "_cores",
+            "_geometry",
+            "_slow",
+            "_stream",
+            "_stream_getter",
+            "run"
+          ],
+          "shared": []
+        },
+        "event_id": "c71de28fa7ecd3a4"
       }
     },
     {
@@ -1453,6 +1687,34 @@
       "method": {
         "note": "",
         "evidence": "/data/hanle/ascend-optimization/archive/Ascend-Optimization-pre-release-20261103/project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/proposals/special_round_out/codex-kg-r2-out-v5/actual-device/spec.json"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "40e7338285537b1e10a9de341b3fc8f06af59a8d63a9b9b68e25155c18e1e145",
+        "role": "guidance",
+        "method": "精简 out 接口快速路径",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "host",
+        "evidence": [
+          {
+            "path": "development/experiments/lineage/20261117/links-v7/artifacts/40e7338285537b1e10a9de341b3fc8f06af59a8d63a9b9b68e25155c18e1e145.py",
+            "sha256": "40e7338285537b1e10a9de341b3fc8f06af59a8d63a9b9b68e25155c18e1e145"
+          }
+        ],
+        "inference_basis": "retrospective_code",
+        "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+        "changed_symbols": {
+          "kernel": [],
+          "host": [
+            "_FAST",
+            "_slow",
+            "run"
+          ],
+          "shared": []
+        },
+        "event_id": "0c7283e54334a8b7"
       }
     },
     {
@@ -2618,6 +2880,44 @@
           "shared": []
         },
         "location": "mixed"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "ccb7b81108437cc81f08e070c64e44838e69ee21aeba66fe56401f9fcf02a95b",
+        "role": "guidance",
+        "method": "对齐偶数舍入与特殊值",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/experiments/lineage/20261117/links-v2/artifacts/ccb7b81108437cc81f08e070c64e44838e69ee21aeba66fe56401f9fcf02a95b.py",
+            "sha256": "ccb7b81108437cc81f08e070c64e44838e69ee21aeba66fe56401f9fcf02a95b"
+          }
+        ],
+        "inference_basis": "retrospective_code",
+        "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+        "changed_symbols": {
+          "kernel": [
+            "_round_flat",
+            "_round_strided",
+            "_round_value",
+            "_special_round_kernel"
+          ],
+          "host": [
+            "_ENTRIES",
+            "_dispatch",
+            "_special_round_kernel:launch_decorators",
+            "_stream",
+            "logger",
+            "run",
+            "special_round",
+            "special_round_out"
+          ],
+          "shared": []
+        },
+        "event_id": "d16a168d04697b19"
       }
     },
     {
@@ -2808,6 +3108,32 @@
           "shared": []
         },
         "location": "kernel"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "2bf1d321fb41b0459f51ba0d73f025265c7ed4cc8ca55751dde77d15eaad2783",
+        "role": "guidance",
+        "method": "浮点偏移简化舍入",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "kernel",
+        "evidence": [
+          {
+            "path": "development/experiments/lineage/20261117/source-evidence/sources/2bf1d321fb41b0459f51ba0d73f025265c7ed4cc8ca55751dde77d15eaad2783.py",
+            "sha256": "2bf1d321fb41b0459f51ba0d73f025265c7ed4cc8ca55751dde77d15eaad2783"
+          }
+        ],
+        "inference_basis": "retrospective_code",
+        "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+        "changed_symbols": {
+          "kernel": [
+            "_round_value"
+          ],
+          "host": [],
+          "shared": []
+        },
+        "event_id": "51b6d4dfaa694cbd"
       }
     },
     {
@@ -3017,6 +3343,81 @@
           "shared": []
         },
         "location": "mixed"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "1df2d942fa6b321e28a709dd6313fc6bfb13c86cda3ea095edf0c5562fd4befc",
+        "role": "guidance",
+        "method": "复用直接启动方法",
+        "primary": "paired",
+        "secondary": [
+          "knowledge",
+          "ir"
+        ],
+        "confidence": "confirmed",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/reports/trace-attribution-matrix-20261116.json",
+            "sha256": "ae1f2bb9a53639218c0d522e3c48c3c7058e3f70eb1ca0f471fc9c850fe26a23"
+          },
+          {
+            "path": "development/experiments/lineage/20261117/links-v7/artifacts/1df2d942fa6b321e28a709dd6313fc6bfb13c86cda3ea095edf0c5562fd4befc.py",
+            "sha256": "1df2d942fa6b321e28a709dd6313fc6bfb13c86cda3ea095edf0c5562fd4befc"
+          }
+        ],
+        "inference_basis": "recorded_plan",
+        "reason": "计划引用msprof设备核2.694μs与完整调用62.75μs，并明确借鉴同批xlogy直接启动方案；Profiling为主，知识／经验为辅。",
+        "plan_evidence": [
+          {
+            "kind": "performance",
+            "strategy": "Launch the already-compiled Ascend kernel directly from a cached closure instead of going through Triton's per-call JIT binding path",
+            "code_changes": "Added _stream_getter / _pick_block / _direct_launcher / _guarded helpers and per-key plans: the first call per (dtype, numel, decimals, layout) calls jitfn.warmup once and caches a closure that issues launcher.launch(gridX,1,1,current_raw_stream,function,packed_metadata,None,None,None, x_ptr, out_ptr, N, SCALE, INV_SCALE, DECIMALS, BLOCK). Pointers, N, scalars and the stream handle are re-passed every call; unaligned pointers or any launcher exception drop back to the bound JIT call. Kernel bodies, strided indexing and NaN/Inf handling are unchanged.",
+            "hypothesis": "Round-1 msprof showed timing-0 spends 2.694 us in the device kernel inside a 62.75 us call while the reference torch.round finishes in 14.25 us, so ~60 us per call is host launch overhead; driving the compiled Ascend launcher directly (validated pattern from the batch's xlogy runtime-scalar-v3 proposal) should bring the nine small workloads from ~63-70 us to well below 30 us while leaving device-bound large workloads within a few percent",
+            "expected_effect": {
+              "metric": "geo_mean",
+              "direction": "increase",
+              "mechanism": "Removing the per-call JIT binder/cache-key/arg-packing work drops the ~60 us fixed cost that currently dominates the nine small workloads, whose device kernel is only 2.694 us"
+            },
+            "source": {
+              "origin": "profile_next_experiment",
+              "parent_round_num": 1
+            },
+            "key_params": {
+              "_MAX_BLOCK": 4096,
+              "_MIN_BLOCK": 256,
+              "_STRIDED_BLOCK": 1024
+            },
+            "knowledge_uses": []
+          }
+        ],
+        "changed_symbols": {
+          "kernel": [
+            "_rnd_value",
+            "_round_flat",
+            "_round_strided",
+            "_round_value"
+          ],
+          "host": [
+            "3",
+            "_ENTRIES",
+            "_GETTERS",
+            "_MAX_BLOCK",
+            "_MIN_BLOCK",
+            "_PLANS",
+            "_STRIDED_BLOCK",
+            "_direct_launcher",
+            "_dispatch",
+            "_flat_plan",
+            "_guarded",
+            "_pick_block",
+            "_stream",
+            "_stream_getter",
+            "_strided_plan"
+          ],
+          "shared": []
+        },
+        "event_id": "8f9231cb5fe39351"
       }
     },
     {
@@ -3222,6 +3623,55 @@
           "shared": []
         },
         "location": "mixed"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "ceebc9436287020db7c36cc00f8124ee0bc408ce3bf55e1cb848b3effcb7fe08",
+        "role": "guidance",
+        "method": "流式舍入与启动缓存",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/experiments/lineage/20261117/links-v7/artifacts/ceebc9436287020db7c36cc00f8124ee0bc408ce3bf55e1cb848b3effcb7fe08.py",
+            "sha256": "ceebc9436287020db7c36cc00f8124ee0bc408ce3bf55e1cb848b3effcb7fe08"
+          }
+        ],
+        "inference_basis": "retrospective_code",
+        "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+        "changed_symbols": {
+          "kernel": [
+            "_flat",
+            "_rnd_value",
+            "_round_flat",
+            "_round_strided",
+            "_streaming",
+            "_strided",
+            "_value"
+          ],
+          "host": [
+            "3",
+            "_GETTERS",
+            "_MAX_BLOCK",
+            "_MIN_BLOCK",
+            "_RAW",
+            "_STRIDED_BLOCK",
+            "_build",
+            "_direct_launcher",
+            "_dispatch",
+            "_flat_plan",
+            "_guarded",
+            "_pick_block",
+            "_stream",
+            "_stream_getter",
+            "_strided_plan",
+            "run"
+          ],
+          "shared": []
+        },
+        "event_id": "8b38eaf37d7c3b0f"
       }
     },
     {
@@ -3406,6 +3856,34 @@
           "shared": []
         },
         "location": "host"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "40e7338285537b1e10a9de341b3fc8f06af59a8d63a9b9b68e25155c18e1e145",
+        "role": "guidance",
+        "method": "精简 out 接口快速路径",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "host",
+        "evidence": [
+          {
+            "path": "development/experiments/lineage/20261117/links-v7/artifacts/40e7338285537b1e10a9de341b3fc8f06af59a8d63a9b9b68e25155c18e1e145.py",
+            "sha256": "40e7338285537b1e10a9de341b3fc8f06af59a8d63a9b9b68e25155c18e1e145"
+          }
+        ],
+        "inference_basis": "retrospective_code",
+        "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+        "changed_symbols": {
+          "kernel": [],
+          "host": [
+            "_FAST",
+            "_slow",
+            "run"
+          ],
+          "shared": []
+        },
+        "event_id": "0c7283e54334a8b7"
       }
     },
     {
@@ -3606,6 +4084,52 @@
           "shared": []
         },
         "location": "mixed"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "52807976ab25e9d7506337fb70ce6d0f6c147ae5bc859f74dfca9d7496064b7e",
+        "role": "guidance",
+        "method": "复用 round_out 流式方法",
+        "primary": "knowledge",
+        "secondary": [
+          "ir"
+        ],
+        "confidence": "inferred",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/experiments/lineage/20261117/source-evidence/sources/52807976ab25e9d7506337fb70ce6d0f6c147ae5bc859f74dfca9d7496064b7e.py",
+            "sha256": "52807976ab25e9d7506337fb70ce6d0f6c147ae5bc859f74dfca9d7496064b7e"
+          }
+        ],
+        "inference_basis": "historical_context",
+        "reason": "根据相近实现的结构复用与历史迁移记录推断知识／经验复用；不等同于确认调用了知识库检索。",
+        "changed_symbols": {
+          "kernel": [
+            "_flat",
+            "_round_stream",
+            "_round_strided",
+            "_streaming",
+            "_strided",
+            "_value"
+          ],
+          "host": [
+            "_CORES",
+            "_FAST",
+            "_MAGIC",
+            "_RAW",
+            "_STREAM",
+            "_build",
+            "_cores",
+            "_geometry",
+            "_slow",
+            "_stream",
+            "_stream_getter",
+            "run"
+          ],
+          "shared": []
+        },
+        "event_id": "c71de28fa7ecd3a4"
       }
     },
     {
@@ -3792,7 +4316,8 @@
           "shared": []
         },
         "location": "retest"
-      }
+      },
+      "attribution_status": "version_selection_or_retest"
     }
   ],
   "full_history": [
@@ -4030,6 +4555,44 @@
       "method": {
         "note": "Use floor/fraction/parity ties-to-even and FP32 div_rn for decimal scaling; preserve input NaN/Inf and output alias; remove unsupported FP64 path",
         "evidence": "/data/hanle/ascend-optimization/archive/Ascend-Optimization-pre-release-20261103/project/Ascend-Optimization-v1/operators/campaigns/next25-20261029-v2/proposals/special_round_out/vector-round-v1/proposal.json"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "ccb7b81108437cc81f08e070c64e44838e69ee21aeba66fe56401f9fcf02a95b",
+        "role": "guidance",
+        "method": "对齐偶数舍入与特殊值",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/experiments/lineage/20261117/links-v2/artifacts/ccb7b81108437cc81f08e070c64e44838e69ee21aeba66fe56401f9fcf02a95b.py",
+            "sha256": "ccb7b81108437cc81f08e070c64e44838e69ee21aeba66fe56401f9fcf02a95b"
+          }
+        ],
+        "inference_basis": "retrospective_code",
+        "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+        "changed_symbols": {
+          "kernel": [
+            "_round_flat",
+            "_round_strided",
+            "_round_value",
+            "_special_round_kernel"
+          ],
+          "host": [
+            "_ENTRIES",
+            "_dispatch",
+            "_special_round_kernel:launch_decorators",
+            "_stream",
+            "logger",
+            "run",
+            "special_round",
+            "special_round_out"
+          ],
+          "shared": []
+        },
+        "event_id": "d16a168d04697b19"
       }
     },
     {
@@ -4118,6 +4681,32 @@
       "method": {
         "note": "Round finite magnitudes below 2^23 by adding/subtracting 2^23; preserve larger FP32 values, original sign, NaN/Inf, decimal scaling and real input/output strides",
         "evidence": "/data/hanle/ascend-optimization/archive/Ascend-Optimization-pre-release-20261103/project/Ascend-Optimization-v1/operators/campaigns/next25-20261029-v2/proposals/special_round_out/fp32-rounding-shift-v2/proposal.json"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "2bf1d321fb41b0459f51ba0d73f025265c7ed4cc8ca55751dde77d15eaad2783",
+        "role": "guidance",
+        "method": "浮点偏移简化舍入",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "kernel",
+        "evidence": [
+          {
+            "path": "development/experiments/lineage/20261117/source-evidence/sources/2bf1d321fb41b0459f51ba0d73f025265c7ed4cc8ca55751dde77d15eaad2783.py",
+            "sha256": "2bf1d321fb41b0459f51ba0d73f025265c7ed4cc8ca55751dde77d15eaad2783"
+          }
+        ],
+        "inference_basis": "retrospective_code",
+        "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+        "changed_symbols": {
+          "kernel": [
+            "_round_value"
+          ],
+          "host": [],
+          "shared": []
+        },
+        "event_id": "51b6d4dfaa694cbd"
       }
     },
     {
@@ -4295,6 +4884,81 @@
       "method": {
         "note": "",
         "evidence": "/data/hanle/ascend-optimization/archive/Ascend-Optimization-pre-release-20261103/project/Ascend-Optimization-v1/operators/campaigns/remaining-nine-20261030/paths/special_round_out/case-1/PyTorch-1df2d942fa6b/spec.json"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "1df2d942fa6b321e28a709dd6313fc6bfb13c86cda3ea095edf0c5562fd4befc",
+        "role": "guidance",
+        "method": "复用直接启动方法",
+        "primary": "paired",
+        "secondary": [
+          "knowledge",
+          "ir"
+        ],
+        "confidence": "confirmed",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/reports/trace-attribution-matrix-20261116.json",
+            "sha256": "ae1f2bb9a53639218c0d522e3c48c3c7058e3f70eb1ca0f471fc9c850fe26a23"
+          },
+          {
+            "path": "development/experiments/lineage/20261117/links-v7/artifacts/1df2d942fa6b321e28a709dd6313fc6bfb13c86cda3ea095edf0c5562fd4befc.py",
+            "sha256": "1df2d942fa6b321e28a709dd6313fc6bfb13c86cda3ea095edf0c5562fd4befc"
+          }
+        ],
+        "inference_basis": "recorded_plan",
+        "reason": "计划引用msprof设备核2.694μs与完整调用62.75μs，并明确借鉴同批xlogy直接启动方案；Profiling为主，知识／经验为辅。",
+        "plan_evidence": [
+          {
+            "kind": "performance",
+            "strategy": "Launch the already-compiled Ascend kernel directly from a cached closure instead of going through Triton's per-call JIT binding path",
+            "code_changes": "Added _stream_getter / _pick_block / _direct_launcher / _guarded helpers and per-key plans: the first call per (dtype, numel, decimals, layout) calls jitfn.warmup once and caches a closure that issues launcher.launch(gridX,1,1,current_raw_stream,function,packed_metadata,None,None,None, x_ptr, out_ptr, N, SCALE, INV_SCALE, DECIMALS, BLOCK). Pointers, N, scalars and the stream handle are re-passed every call; unaligned pointers or any launcher exception drop back to the bound JIT call. Kernel bodies, strided indexing and NaN/Inf handling are unchanged.",
+            "hypothesis": "Round-1 msprof showed timing-0 spends 2.694 us in the device kernel inside a 62.75 us call while the reference torch.round finishes in 14.25 us, so ~60 us per call is host launch overhead; driving the compiled Ascend launcher directly (validated pattern from the batch's xlogy runtime-scalar-v3 proposal) should bring the nine small workloads from ~63-70 us to well below 30 us while leaving device-bound large workloads within a few percent",
+            "expected_effect": {
+              "metric": "geo_mean",
+              "direction": "increase",
+              "mechanism": "Removing the per-call JIT binder/cache-key/arg-packing work drops the ~60 us fixed cost that currently dominates the nine small workloads, whose device kernel is only 2.694 us"
+            },
+            "source": {
+              "origin": "profile_next_experiment",
+              "parent_round_num": 1
+            },
+            "key_params": {
+              "_MAX_BLOCK": 4096,
+              "_MIN_BLOCK": 256,
+              "_STRIDED_BLOCK": 1024
+            },
+            "knowledge_uses": []
+          }
+        ],
+        "changed_symbols": {
+          "kernel": [
+            "_rnd_value",
+            "_round_flat",
+            "_round_strided",
+            "_round_value"
+          ],
+          "host": [
+            "3",
+            "_ENTRIES",
+            "_GETTERS",
+            "_MAX_BLOCK",
+            "_MIN_BLOCK",
+            "_PLANS",
+            "_STRIDED_BLOCK",
+            "_direct_launcher",
+            "_dispatch",
+            "_flat_plan",
+            "_guarded",
+            "_pick_block",
+            "_stream",
+            "_stream_getter",
+            "_strided_plan"
+          ],
+          "shared": []
+        },
+        "event_id": "8f9231cb5fe39351"
       }
     },
     {
@@ -4626,6 +5290,55 @@
       "method": {
         "note": "",
         "evidence": "/data/hanle/ascend-optimization/archive/Ascend-Optimization-pre-release-20261103/project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/proposals/special_round_out/codex-streaming-round-v1/actual-device/spec.json"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "ceebc9436287020db7c36cc00f8124ee0bc408ce3bf55e1cb848b3effcb7fe08",
+        "role": "guidance",
+        "method": "流式舍入与启动缓存",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/experiments/lineage/20261117/links-v7/artifacts/ceebc9436287020db7c36cc00f8124ee0bc408ce3bf55e1cb848b3effcb7fe08.py",
+            "sha256": "ceebc9436287020db7c36cc00f8124ee0bc408ce3bf55e1cb848b3effcb7fe08"
+          }
+        ],
+        "inference_basis": "retrospective_code",
+        "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+        "changed_symbols": {
+          "kernel": [
+            "_flat",
+            "_rnd_value",
+            "_round_flat",
+            "_round_strided",
+            "_streaming",
+            "_strided",
+            "_value"
+          ],
+          "host": [
+            "3",
+            "_GETTERS",
+            "_MAX_BLOCK",
+            "_MIN_BLOCK",
+            "_RAW",
+            "_STRIDED_BLOCK",
+            "_build",
+            "_direct_launcher",
+            "_dispatch",
+            "_flat_plan",
+            "_guarded",
+            "_pick_block",
+            "_stream",
+            "_stream_getter",
+            "_strided_plan",
+            "run"
+          ],
+          "shared": []
+        },
+        "event_id": "8b38eaf37d7c3b0f"
       }
     },
     {
@@ -5158,6 +5871,34 @@
       "method": {
         "note": "",
         "evidence": "/data/hanle/ascend-optimization/archive/Ascend-Optimization-pre-release-20261103/project/Ascend-Optimization-v1/operators/campaigns/strict-night-20261102/proposals/special_round_out/codex-kg-r2-out-v5/actual-device/spec.json"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "40e7338285537b1e10a9de341b3fc8f06af59a8d63a9b9b68e25155c18e1e145",
+        "role": "guidance",
+        "method": "精简 out 接口快速路径",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "host",
+        "evidence": [
+          {
+            "path": "development/experiments/lineage/20261117/links-v7/artifacts/40e7338285537b1e10a9de341b3fc8f06af59a8d63a9b9b68e25155c18e1e145.py",
+            "sha256": "40e7338285537b1e10a9de341b3fc8f06af59a8d63a9b9b68e25155c18e1e145"
+          }
+        ],
+        "inference_basis": "retrospective_code",
+        "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+        "changed_symbols": {
+          "kernel": [],
+          "host": [
+            "_FAST",
+            "_slow",
+            "run"
+          ],
+          "shared": []
+        },
+        "event_id": "0c7283e54334a8b7"
       }
     },
     {
@@ -5660,7 +6401,27 @@
         "display_target_sha256": "52807976ab25e9d7506337fb70ce6d0f6c147ae5bc859f74dfca9d7496064b7e",
         "display_targets": [
           "52807976ab25e9d7506337fb70ce6d0f6c147ae5bc859f74dfca9d7496064b7e"
-        ]
+        ],
+        "attribution": {
+          "operator": "special_round_out",
+          "source_sha256": "b2c1cb9f85fe961ed73d630a41cb25c578e458716d1deec689d3ffc1943d6a70",
+          "method": "迁移舍入核并修复输出接口",
+          "primary": "knowledge",
+          "secondary": [
+            "ir"
+          ],
+          "confidence": "confirmed",
+          "role": "guidance",
+          "location": "mixed",
+          "reason": "KG/HG-KDA与CC/DeepSeek提出流式快速舍入，Codex修复out默认分配、尺寸及设备检查并独立完成门禁；设备数值代码保持父版本。",
+          "evidence": [
+            {
+              "path": "development/experiments/lineage/20261117/links-v9/artifacts/a9a1bfa901257b8dae76c40144cc30b981a3de052c4f96611cd8f93910b5967c.json",
+              "sha256": "a9a1bfa901257b8dae76c40144cc30b981a3de052c4f96611cd8f93910b5967c"
+            }
+          ],
+          "scope": "原始记录明确供体与作者；不表示调用知识库检索工具"
+        }
       },
       "source_inheritance": false,
       "explanation": "性能进展中的方案切换；代码父版本来自供体，并非前一同名版本"
@@ -9413,6 +10174,81 @@
           "shared": []
         },
         "location": "mixed"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "1df2d942fa6b321e28a709dd6313fc6bfb13c86cda3ea095edf0c5562fd4befc",
+        "role": "guidance",
+        "method": "复用直接启动方法",
+        "primary": "paired",
+        "secondary": [
+          "knowledge",
+          "ir"
+        ],
+        "confidence": "confirmed",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/reports/trace-attribution-matrix-20261116.json",
+            "sha256": "ae1f2bb9a53639218c0d522e3c48c3c7058e3f70eb1ca0f471fc9c850fe26a23"
+          },
+          {
+            "path": "development/experiments/lineage/20261117/links-v7/artifacts/1df2d942fa6b321e28a709dd6313fc6bfb13c86cda3ea095edf0c5562fd4befc.py",
+            "sha256": "1df2d942fa6b321e28a709dd6313fc6bfb13c86cda3ea095edf0c5562fd4befc"
+          }
+        ],
+        "inference_basis": "recorded_plan",
+        "reason": "计划引用msprof设备核2.694μs与完整调用62.75μs，并明确借鉴同批xlogy直接启动方案；Profiling为主，知识／经验为辅。",
+        "plan_evidence": [
+          {
+            "kind": "performance",
+            "strategy": "Launch the already-compiled Ascend kernel directly from a cached closure instead of going through Triton's per-call JIT binding path",
+            "code_changes": "Added _stream_getter / _pick_block / _direct_launcher / _guarded helpers and per-key plans: the first call per (dtype, numel, decimals, layout) calls jitfn.warmup once and caches a closure that issues launcher.launch(gridX,1,1,current_raw_stream,function,packed_metadata,None,None,None, x_ptr, out_ptr, N, SCALE, INV_SCALE, DECIMALS, BLOCK). Pointers, N, scalars and the stream handle are re-passed every call; unaligned pointers or any launcher exception drop back to the bound JIT call. Kernel bodies, strided indexing and NaN/Inf handling are unchanged.",
+            "hypothesis": "Round-1 msprof showed timing-0 spends 2.694 us in the device kernel inside a 62.75 us call while the reference torch.round finishes in 14.25 us, so ~60 us per call is host launch overhead; driving the compiled Ascend launcher directly (validated pattern from the batch's xlogy runtime-scalar-v3 proposal) should bring the nine small workloads from ~63-70 us to well below 30 us while leaving device-bound large workloads within a few percent",
+            "expected_effect": {
+              "metric": "geo_mean",
+              "direction": "increase",
+              "mechanism": "Removing the per-call JIT binder/cache-key/arg-packing work drops the ~60 us fixed cost that currently dominates the nine small workloads, whose device kernel is only 2.694 us"
+            },
+            "source": {
+              "origin": "profile_next_experiment",
+              "parent_round_num": 1
+            },
+            "key_params": {
+              "_MAX_BLOCK": 4096,
+              "_MIN_BLOCK": 256,
+              "_STRIDED_BLOCK": 1024
+            },
+            "knowledge_uses": []
+          }
+        ],
+        "changed_symbols": {
+          "kernel": [
+            "_rnd_value",
+            "_round_flat",
+            "_round_strided",
+            "_round_value"
+          ],
+          "host": [
+            "3",
+            "_ENTRIES",
+            "_GETTERS",
+            "_MAX_BLOCK",
+            "_MIN_BLOCK",
+            "_PLANS",
+            "_STRIDED_BLOCK",
+            "_direct_launcher",
+            "_dispatch",
+            "_flat_plan",
+            "_guarded",
+            "_pick_block",
+            "_stream",
+            "_stream_getter",
+            "_strided_plan"
+          ],
+          "shared": []
+        },
+        "event_id": "8f9231cb5fe39351"
       }
     },
     {
@@ -9615,6 +10451,44 @@
           "shared": []
         },
         "location": "mixed"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "ccb7b81108437cc81f08e070c64e44838e69ee21aeba66fe56401f9fcf02a95b",
+        "role": "guidance",
+        "method": "对齐偶数舍入与特殊值",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/experiments/lineage/20261117/links-v2/artifacts/ccb7b81108437cc81f08e070c64e44838e69ee21aeba66fe56401f9fcf02a95b.py",
+            "sha256": "ccb7b81108437cc81f08e070c64e44838e69ee21aeba66fe56401f9fcf02a95b"
+          }
+        ],
+        "inference_basis": "retrospective_code",
+        "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+        "changed_symbols": {
+          "kernel": [
+            "_round_flat",
+            "_round_strided",
+            "_round_value",
+            "_special_round_kernel"
+          ],
+          "host": [
+            "_ENTRIES",
+            "_dispatch",
+            "_special_round_kernel:launch_decorators",
+            "_stream",
+            "logger",
+            "run",
+            "special_round",
+            "special_round_out"
+          ],
+          "shared": []
+        },
+        "event_id": "d16a168d04697b19"
       }
     },
     {
@@ -9805,6 +10679,32 @@
           "shared": []
         },
         "location": "kernel"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "2bf1d321fb41b0459f51ba0d73f025265c7ed4cc8ca55751dde77d15eaad2783",
+        "role": "guidance",
+        "method": "浮点偏移简化舍入",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "kernel",
+        "evidence": [
+          {
+            "path": "development/experiments/lineage/20261117/source-evidence/sources/2bf1d321fb41b0459f51ba0d73f025265c7ed4cc8ca55751dde77d15eaad2783.py",
+            "sha256": "2bf1d321fb41b0459f51ba0d73f025265c7ed4cc8ca55751dde77d15eaad2783"
+          }
+        ],
+        "inference_basis": "retrospective_code",
+        "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+        "changed_symbols": {
+          "kernel": [
+            "_round_value"
+          ],
+          "host": [],
+          "shared": []
+        },
+        "event_id": "51b6d4dfaa694cbd"
       }
     },
     {
@@ -10699,6 +11599,55 @@
           "shared": []
         },
         "location": "mixed"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "ceebc9436287020db7c36cc00f8124ee0bc408ce3bf55e1cb848b3effcb7fe08",
+        "role": "guidance",
+        "method": "流式舍入与启动缓存",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/experiments/lineage/20261117/links-v7/artifacts/ceebc9436287020db7c36cc00f8124ee0bc408ce3bf55e1cb848b3effcb7fe08.py",
+            "sha256": "ceebc9436287020db7c36cc00f8124ee0bc408ce3bf55e1cb848b3effcb7fe08"
+          }
+        ],
+        "inference_basis": "retrospective_code",
+        "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+        "changed_symbols": {
+          "kernel": [
+            "_flat",
+            "_rnd_value",
+            "_round_flat",
+            "_round_strided",
+            "_streaming",
+            "_strided",
+            "_value"
+          ],
+          "host": [
+            "3",
+            "_GETTERS",
+            "_MAX_BLOCK",
+            "_MIN_BLOCK",
+            "_RAW",
+            "_STRIDED_BLOCK",
+            "_build",
+            "_direct_launcher",
+            "_dispatch",
+            "_flat_plan",
+            "_guarded",
+            "_pick_block",
+            "_stream",
+            "_stream_getter",
+            "_strided_plan",
+            "run"
+          ],
+          "shared": []
+        },
+        "event_id": "8b38eaf37d7c3b0f"
       }
     },
     {
@@ -11236,6 +12185,52 @@
           "shared": []
         },
         "location": "mixed"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "52807976ab25e9d7506337fb70ce6d0f6c147ae5bc859f74dfca9d7496064b7e",
+        "role": "guidance",
+        "method": "复用 round_out 流式方法",
+        "primary": "knowledge",
+        "secondary": [
+          "ir"
+        ],
+        "confidence": "inferred",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/experiments/lineage/20261117/source-evidence/sources/52807976ab25e9d7506337fb70ce6d0f6c147ae5bc859f74dfca9d7496064b7e.py",
+            "sha256": "52807976ab25e9d7506337fb70ce6d0f6c147ae5bc859f74dfca9d7496064b7e"
+          }
+        ],
+        "inference_basis": "historical_context",
+        "reason": "根据相近实现的结构复用与历史迁移记录推断知识／经验复用；不等同于确认调用了知识库检索。",
+        "changed_symbols": {
+          "kernel": [
+            "_flat",
+            "_round_stream",
+            "_round_strided",
+            "_streaming",
+            "_strided",
+            "_value"
+          ],
+          "host": [
+            "_CORES",
+            "_FAST",
+            "_MAGIC",
+            "_RAW",
+            "_STREAM",
+            "_build",
+            "_cores",
+            "_geometry",
+            "_slow",
+            "_stream",
+            "_stream_getter",
+            "run"
+          ],
+          "shared": []
+        },
+        "event_id": "c71de28fa7ecd3a4"
       }
     },
     {
@@ -11757,6 +12752,34 @@
           "shared": []
         },
         "location": "host"
+      },
+      "attribution": {
+        "operator": "special_round_out",
+        "source_sha256": "40e7338285537b1e10a9de341b3fc8f06af59a8d63a9b9b68e25155c18e1e145",
+        "role": "guidance",
+        "method": "精简 out 接口快速路径",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "host",
+        "evidence": [
+          {
+            "path": "development/experiments/lineage/20261117/links-v7/artifacts/40e7338285537b1e10a9de341b3fc8f06af59a8d63a9b9b68e25155c18e1e145.py",
+            "sha256": "40e7338285537b1e10a9de341b3fc8f06af59a8d63a9b9b68e25155c18e1e145"
+          }
+        ],
+        "inference_basis": "retrospective_code",
+        "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+        "changed_symbols": {
+          "kernel": [],
+          "host": [
+            "_FAST",
+            "_slow",
+            "run"
+          ],
+          "shared": []
+        },
+        "event_id": "0c7283e54334a8b7"
       }
     },
     {
@@ -12280,7 +13303,8 @@
           "shared": []
         },
         "location": "retest"
-      }
+      },
+      "attribution_status": "version_selection_or_retest"
     }
   ],
   "excluded": [
@@ -13795,6 +14819,312 @@
     "display_target_sha256": "52807976ab25e9d7506337fb70ce6d0f6c147ae5bc859f74dfca9d7496064b7e",
     "display_targets": [
       "52807976ab25e9d7506337fb70ce6d0f6c147ae5bc859f74dfca9d7496064b7e"
-    ]
-  }
+    ],
+    "attribution": {
+      "operator": "special_round_out",
+      "source_sha256": "b2c1cb9f85fe961ed73d630a41cb25c578e458716d1deec689d3ffc1943d6a70",
+      "method": "迁移舍入核并修复输出接口",
+      "primary": "knowledge",
+      "secondary": [
+        "ir"
+      ],
+      "confidence": "confirmed",
+      "role": "guidance",
+      "location": "mixed",
+      "reason": "KG/HG-KDA与CC/DeepSeek提出流式快速舍入，Codex修复out默认分配、尺寸及设备检查并独立完成门禁；设备数值代码保持父版本。",
+      "evidence": [
+        {
+          "path": "development/experiments/lineage/20261117/links-v9/artifacts/a9a1bfa901257b8dae76c40144cc30b981a3de052c4f96611cd8f93910b5967c.json",
+          "sha256": "a9a1bfa901257b8dae76c40144cc30b981a3de052c4f96611cd8f93910b5967c"
+        }
+      ],
+      "scope": "原始记录明确供体与作者；不表示调用知识库检索工具"
+    }
+  },
+  "attribution_review": [
+    {
+      "operator": "special_round_out",
+      "source_sha256": "b2c1cb9f85fe961ed73d630a41cb25c578e458716d1deec689d3ffc1943d6a70",
+      "method": "迁移舍入核并修复输出接口",
+      "primary": "knowledge",
+      "secondary": [
+        "ir"
+      ],
+      "confidence": "confirmed",
+      "role": "guidance",
+      "location": "mixed",
+      "reason": "KG/HG-KDA与CC/DeepSeek提出流式快速舍入，Codex修复out默认分配、尺寸及设备检查并独立完成门禁；设备数值代码保持父版本。",
+      "evidence": [
+        {
+          "path": "development/experiments/lineage/20261117/links-v9/artifacts/a9a1bfa901257b8dae76c40144cc30b981a3de052c4f96611cd8f93910b5967c.json",
+          "sha256": "a9a1bfa901257b8dae76c40144cc30b981a3de052c4f96611cd8f93910b5967c"
+        }
+      ],
+      "scope": "原始记录明确供体与作者；不表示调用知识库检索工具"
+    }
+  ],
+  "mainline_attribution_review": [
+    {
+      "operator": "special_round_out",
+      "source_sha256": "ccb7b81108437cc81f08e070c64e44838e69ee21aeba66fe56401f9fcf02a95b",
+      "role": "guidance",
+      "method": "对齐偶数舍入与特殊值",
+      "primary": "ir",
+      "secondary": [],
+      "confidence": "inferred",
+      "location": "mixed",
+      "evidence": [
+        {
+          "path": "development/experiments/lineage/20261117/links-v2/artifacts/ccb7b81108437cc81f08e070c64e44838e69ee21aeba66fe56401f9fcf02a95b.py",
+          "sha256": "ccb7b81108437cc81f08e070c64e44838e69ee21aeba66fe56401f9fcf02a95b"
+        }
+      ],
+      "inference_basis": "retrospective_code",
+      "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+      "changed_symbols": {
+        "kernel": [
+          "_round_flat",
+          "_round_strided",
+          "_round_value",
+          "_special_round_kernel"
+        ],
+        "host": [
+          "_ENTRIES",
+          "_dispatch",
+          "_special_round_kernel:launch_decorators",
+          "_stream",
+          "logger",
+          "run",
+          "special_round",
+          "special_round_out"
+        ],
+        "shared": []
+      },
+      "event_id": "d16a168d04697b19"
+    },
+    {
+      "operator": "special_round_out",
+      "source_sha256": "2bf1d321fb41b0459f51ba0d73f025265c7ed4cc8ca55751dde77d15eaad2783",
+      "role": "guidance",
+      "method": "浮点偏移简化舍入",
+      "primary": "ir",
+      "secondary": [],
+      "confidence": "inferred",
+      "location": "kernel",
+      "evidence": [
+        {
+          "path": "development/experiments/lineage/20261117/source-evidence/sources/2bf1d321fb41b0459f51ba0d73f025265c7ed4cc8ca55751dde77d15eaad2783.py",
+          "sha256": "2bf1d321fb41b0459f51ba0d73f025265c7ed4cc8ca55751dde77d15eaad2783"
+        }
+      ],
+      "inference_basis": "retrospective_code",
+      "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+      "changed_symbols": {
+        "kernel": [
+          "_round_value"
+        ],
+        "host": [],
+        "shared": []
+      },
+      "event_id": "51b6d4dfaa694cbd"
+    },
+    {
+      "operator": "special_round_out",
+      "source_sha256": "1df2d942fa6b321e28a709dd6313fc6bfb13c86cda3ea095edf0c5562fd4befc",
+      "role": "guidance",
+      "method": "复用直接启动方法",
+      "primary": "paired",
+      "secondary": [
+        "knowledge",
+        "ir"
+      ],
+      "confidence": "confirmed",
+      "location": "mixed",
+      "evidence": [
+        {
+          "path": "development/reports/trace-attribution-matrix-20261116.json",
+          "sha256": "ae1f2bb9a53639218c0d522e3c48c3c7058e3f70eb1ca0f471fc9c850fe26a23"
+        },
+        {
+          "path": "development/experiments/lineage/20261117/links-v7/artifacts/1df2d942fa6b321e28a709dd6313fc6bfb13c86cda3ea095edf0c5562fd4befc.py",
+          "sha256": "1df2d942fa6b321e28a709dd6313fc6bfb13c86cda3ea095edf0c5562fd4befc"
+        }
+      ],
+      "inference_basis": "recorded_plan",
+      "reason": "计划引用msprof设备核2.694μs与完整调用62.75μs，并明确借鉴同批xlogy直接启动方案；Profiling为主，知识／经验为辅。",
+      "plan_evidence": [
+        {
+          "kind": "performance",
+          "strategy": "Launch the already-compiled Ascend kernel directly from a cached closure instead of going through Triton's per-call JIT binding path",
+          "code_changes": "Added _stream_getter / _pick_block / _direct_launcher / _guarded helpers and per-key plans: the first call per (dtype, numel, decimals, layout) calls jitfn.warmup once and caches a closure that issues launcher.launch(gridX,1,1,current_raw_stream,function,packed_metadata,None,None,None, x_ptr, out_ptr, N, SCALE, INV_SCALE, DECIMALS, BLOCK). Pointers, N, scalars and the stream handle are re-passed every call; unaligned pointers or any launcher exception drop back to the bound JIT call. Kernel bodies, strided indexing and NaN/Inf handling are unchanged.",
+          "hypothesis": "Round-1 msprof showed timing-0 spends 2.694 us in the device kernel inside a 62.75 us call while the reference torch.round finishes in 14.25 us, so ~60 us per call is host launch overhead; driving the compiled Ascend launcher directly (validated pattern from the batch's xlogy runtime-scalar-v3 proposal) should bring the nine small workloads from ~63-70 us to well below 30 us while leaving device-bound large workloads within a few percent",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Removing the per-call JIT binder/cache-key/arg-packing work drops the ~60 us fixed cost that currently dominates the nine small workloads, whose device kernel is only 2.694 us"
+          },
+          "source": {
+            "origin": "profile_next_experiment",
+            "parent_round_num": 1
+          },
+          "key_params": {
+            "_MAX_BLOCK": 4096,
+            "_MIN_BLOCK": 256,
+            "_STRIDED_BLOCK": 1024
+          },
+          "knowledge_uses": []
+        }
+      ],
+      "changed_symbols": {
+        "kernel": [
+          "_rnd_value",
+          "_round_flat",
+          "_round_strided",
+          "_round_value"
+        ],
+        "host": [
+          "3",
+          "_ENTRIES",
+          "_GETTERS",
+          "_MAX_BLOCK",
+          "_MIN_BLOCK",
+          "_PLANS",
+          "_STRIDED_BLOCK",
+          "_direct_launcher",
+          "_dispatch",
+          "_flat_plan",
+          "_guarded",
+          "_pick_block",
+          "_stream",
+          "_stream_getter",
+          "_strided_plan"
+        ],
+        "shared": []
+      },
+      "event_id": "8f9231cb5fe39351"
+    },
+    {
+      "operator": "special_round_out",
+      "source_sha256": "ceebc9436287020db7c36cc00f8124ee0bc408ce3bf55e1cb848b3effcb7fe08",
+      "role": "guidance",
+      "method": "流式舍入与启动缓存",
+      "primary": "ir",
+      "secondary": [],
+      "confidence": "inferred",
+      "location": "mixed",
+      "evidence": [
+        {
+          "path": "development/experiments/lineage/20261117/links-v7/artifacts/ceebc9436287020db7c36cc00f8124ee0bc408ce3bf55e1cb848b3effcb7fe08.py",
+          "sha256": "ceebc9436287020db7c36cc00f8124ee0bc408ce3bf55e1cb848b3effcb7fe08"
+        }
+      ],
+      "inference_basis": "retrospective_code",
+      "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+      "changed_symbols": {
+        "kernel": [
+          "_flat",
+          "_rnd_value",
+          "_round_flat",
+          "_round_strided",
+          "_streaming",
+          "_strided",
+          "_value"
+        ],
+        "host": [
+          "3",
+          "_GETTERS",
+          "_MAX_BLOCK",
+          "_MIN_BLOCK",
+          "_RAW",
+          "_STRIDED_BLOCK",
+          "_build",
+          "_direct_launcher",
+          "_dispatch",
+          "_flat_plan",
+          "_guarded",
+          "_pick_block",
+          "_stream",
+          "_stream_getter",
+          "_strided_plan",
+          "run"
+        ],
+        "shared": []
+      },
+      "event_id": "8b38eaf37d7c3b0f"
+    },
+    {
+      "operator": "special_round_out",
+      "source_sha256": "40e7338285537b1e10a9de341b3fc8f06af59a8d63a9b9b68e25155c18e1e145",
+      "role": "guidance",
+      "method": "精简 out 接口快速路径",
+      "primary": "ir",
+      "secondary": [],
+      "confidence": "inferred",
+      "location": "host",
+      "evidence": [
+        {
+          "path": "development/experiments/lineage/20261117/links-v7/artifacts/40e7338285537b1e10a9de341b3fc8f06af59a8d63a9b9b68e25155c18e1e145.py",
+          "sha256": "40e7338285537b1e10a9de341b3fc8f06af59a8d63a9b9b68e25155c18e1e145"
+        }
+      ],
+      "inference_basis": "retrospective_code",
+      "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+      "changed_symbols": {
+        "kernel": [],
+        "host": [
+          "_FAST",
+          "_slow",
+          "run"
+        ],
+        "shared": []
+      },
+      "event_id": "0c7283e54334a8b7"
+    },
+    {
+      "operator": "special_round_out",
+      "source_sha256": "52807976ab25e9d7506337fb70ce6d0f6c147ae5bc859f74dfca9d7496064b7e",
+      "role": "guidance",
+      "method": "复用 round_out 流式方法",
+      "primary": "knowledge",
+      "secondary": [
+        "ir"
+      ],
+      "confidence": "inferred",
+      "location": "mixed",
+      "evidence": [
+        {
+          "path": "development/experiments/lineage/20261117/source-evidence/sources/52807976ab25e9d7506337fb70ce6d0f6c147ae5bc859f74dfca9d7496064b7e.py",
+          "sha256": "52807976ab25e9d7506337fb70ce6d0f6c147ae5bc859f74dfca9d7496064b7e"
+        }
+      ],
+      "inference_basis": "historical_context",
+      "reason": "根据相近实现的结构复用与历史迁移记录推断知识／经验复用；不等同于确认调用了知识库检索。",
+      "changed_symbols": {
+        "kernel": [
+          "_flat",
+          "_round_stream",
+          "_round_strided",
+          "_streaming",
+          "_strided",
+          "_value"
+        ],
+        "host": [
+          "_CORES",
+          "_FAST",
+          "_MAGIC",
+          "_RAW",
+          "_STREAM",
+          "_build",
+          "_cores",
+          "_geometry",
+          "_slow",
+          "_stream",
+          "_stream_getter",
+          "run"
+        ],
+        "shared": []
+      },
+      "event_id": "c71de28fa7ecd3a4"
+    }
+  ]
 }

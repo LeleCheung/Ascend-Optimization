@@ -1,0 +1,75 @@
+--- parent
+
++++ candidate
+
+@@ -160,6 +160,12 @@
+
+     # The rows are processed one at a time with a static loop so the
+     # horizontal interleave stays a 1-D join/reshape, which compiles; the
+     # tiling amortises the fixed per-program cost over TILE_I rows.
++    #
++    # The horizontally expanded row of a source row is shared by the output
++    # rows above and below it, so the row loop keeps a two-row rolling window
++    # (e_prev = expand(i-1), e_cur = expand(i)) and only expands the newly
++    # needed row i+1 per step.  That is 3 loads per source row instead of the
++    # previous 9, without changing any weight or mask semantics.
+     pid_i = tl.program_id(axis=0)
+     plane = tl.program_id(axis=1)
+ 
+@@ -171,28 +177,26 @@
+
+     in_plane = plane * (IH * IW)
+     out_plane = plane * (OH * OW)
+ 
++    i0 = pid_i * TILE_I
++    # Clamp the halo rows exactly like the general kernel: the top source row
++    # is its own upper neighbour and the bottom row is its own lower.  Clamping
++    # the indices also keeps tail programs (i0 >= IH) from forming out-of-range
++    # pointers, so the loads need no row mask.
++    iu0 = tl.maximum(i0 - 1, 0)
++    ic0 = tl.minimum(i0, IH - 1)
++    e_prev = _hrow_2x_row(ptr_i, in_plane + iu0 * IW, IW, j, m, BLOCK_OW)
++    e_cur = _hrow_2x_row(ptr_i, in_plane + ic0 * IW, IW, j, m, BLOCK_OW)
++
+     for k in tl.static_range(0, TILE_I):
+-        i = pid_i * TILE_I + k
+-        row_ok = i < IH
+-
+-        e_c = _hrow_2x_row(ptr_i, in_plane + i * IW, IW, j, m & row_ok, BLOCK_OW)
+-
+-        # Clamp the halo rows exactly like the general kernel: the top source
+-        # row is its own upper neighbour and the bottom row is its own lower.
+-        iu = tl.maximum(i - 1, 0)
+-        e_u = _hrow_2x_row(
+-            ptr_i, in_plane + iu * IW, IW, j, m & row_ok, BLOCK_OW
+-        )
++        i = i0 + k
+         idn = tl.minimum(i + 1, IH - 1)
+-        e_d = _hrow_2x_row(
+-            ptr_i, in_plane + idn * IW, IW, j, m & row_ok, BLOCK_OW
+-        )
+-
+-        out_even = 0.25 * e_u + 0.75 * e_c
+-        out_odd = 0.75 * e_c + 0.25 * e_d
++        e_next = _hrow_2x_row(ptr_i, in_plane + idn * IW, IW, j, m, BLOCK_OW)
++
++        out_even = 0.25 * e_prev + 0.75 * e_cur
++        out_odd = 0.75 * e_cur + 0.25 * e_next
+ 
+         out_base = out_plane + (2 * i) * OW
+-        store_ok = store_w & row_ok
++        store_ok = store_w & (i < IH)
+         tl.store(
+             ptr_o + out_base + ow,
+             out_even.to(ptr_o.dtype.element_ty),
+@@ -203,6 +207,9 @@
+
+             out_odd.to(ptr_o.dtype.element_ty),
+             mask=store_ok,
+         )
++
++        e_prev = e_cur
++        e_cur = e_next
+ 
+ 
+ def _bilinear_reciprocal_scale(src_size, dst_size, align_corners, scale):

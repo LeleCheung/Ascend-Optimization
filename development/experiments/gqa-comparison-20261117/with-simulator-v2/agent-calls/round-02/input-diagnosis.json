@@ -1,0 +1,41 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "770910b7b720dd72ebf498d1baec91d0e254f032d1201da6316747bf290ca585",
+  "mechanism": "bf16 three-term PV residual is emitted as three independent dots whose fp32 results each leave L0C, so every loop iteration pays three CUBE->FIXP->VECTOR flag round trips and one extra VECTOR barrier for the residual recompute, instead of a single chained L0C accumulation.",
+  "evidence": [
+    {
+      "path": "workspace/evidence-summary.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4 (bf16, B4 S256 Nq64 Nkv8 D128) candidate 1900.721us vs reference FusedInferAttentionScore 131.701us (14.4x), while fp16 case1/2 are 2.0x and bf16 case7 is 2.5x; device block dim of the candidate is 1024 programs. Its own pipelines are near-idle (aic_cube_ratio 0.000876, aiv_vec_ratio 0.0059), so the cost is not arithmetic throughput but per-program stalls."
+    },
+    {
+      "path": "workspace/simulator-summary.json",
+      "category": "simulator",
+      "role": "mechanism",
+      "finding": "In the captured 4-iteration windows (scope: partial capture, no full-kernel/critical-path claim) the largest instructions are WAIT_FLAG_DEVI attributed to candidate.py:115 (15.36us cubecore, 8.99/9.01us both veccores) and candidate.py:118 (14.15us cubecore, 10.81/10.82us veccores); FIXP shows FIX_L0C_TO_DST 4.15/3.87/3.85us plus SET_FLAG on those same PV dots, CUBE productive_ratio only 0.042 vs FIXP 0.399; VECTOR BAR 3.63/3.43/3.09us sit on candidate.py:117 (residual recompute). i.e. the three same-v PV dots each round-trip L0C->UB with a flag wait."
+    },
+    {
+      "path": "workspace/ir-excerpt.txt",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "Lines 178-179 are two separate linalg.matmul{input_precision=\"ieee\"} writing distinct f32 tensors and line 180 is arith.mulf %104, %9 (the 1/2048 rescale) between them; line 186 is a third matmul after arith.truncf %109 (line 185). The de-scaling scalar is applied in fp32 *after* each matmul, so the compiler cannot keep the products in the L0C accumulator and must move every dot result out to UB."
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Lines 112-118: p_hi/p_lo/p_lo2 are three separate tl.dot(p_*, v) calls combined in one fp32 expression with pairwise constants 1.0 and 1/2048 and 1/2048^2; BLOCK_M=64, BLOCK_N=64, BLOCK_D=128, num_warps=1 for case4, so the per-iteration stall is paid 4 times per program over 1024 programs."
+    }
+  ],
+  "hypothesis": "The bf16 3-term probability expansion is not the arithmetic problem (cube is ~4% busy); its cost is structural: three dots sharing the same v can only be summed in fp32 registers, which forces three L0C->UB movouts and three flag round trips plus a UB barrier per iteration. Folding the exact power-of-two de-scaling into the p operands and chaining the three products through tl.dot's accumulator argument should keep them in the cube accumulator, leaving one movout per iteration and removing the intermediate reads.",
+  "alternative_explanation": "The stalls may instead be dominated by the per-iteration K/V data path rather than the dots: ir-excerpt lines 1-16 show each K tile going through memref.copy of a strided subview plus linalg.transpose 64x128->128x64 and another memref.copy for V; if that copy/transpose path (MTE2 18% productive, VECTOR BARs) is the real critical path, then fusing the PV dots will move little and the next lever would be the K/V load layout (pre-transposed KV or contiguity-aware tiling) rather than the dot count.",
+  "change": "For the 3-term (bf16) path only: pre-scale the two residual operands by the exact power-of-two factors (r1/2048 and r2/2048^2 before the dtype cast, numerically identical to casting then de-scaling) and accumulate p_hi, p_lo, p_lo2 through tl.dot(p, v, acc) so the products chain inside the cube accumulator; the fp16 (2-term) path and all shapes/dtypes/tiling stay untouched.",
+  "expected": "Case4 duration falls well below 1900us toward the reference 132us as the per-iteration PV flag round trips drop from three to one; case7 also improves; cases1/2 unchanged. Confirmation would be WAIT_FLAG_DEVI count/time at candidate.py:115-118 dropping and FIX_L0C_TO_DST for the PV dots going from three per iteration to one.",
+  "validation": "Host runs the official checker on cases 1/2/4/7 (fixed beamp; all must keep passing with unchanged output dtype) and re-measures the candidate duration for case4; a re-profile should show fewer PV-dot flag waits / fixpipe movouts.",
+  "unknown": [
+    "Whether triton-ascend lowers tl.dot(a, b, acc) into an in-place L0C accumulation for this fp32 acc / bf16 operand combination, or introduces an extra movout anyway.",
+    "Whether the third residual term survives chained fp32 accumulation with the same effective accuracy (expect yes: fp32 rounding of the last term is ~6e-8 relative, far below the bf16 output roundoff); must be confirmed by the full evaluation, not by the diagnostic FP64 MARE.",
+    "How much of the case4 gap is attributable to the dot chain versus the K/V copy+transpose path noted in ir-excerpt lines 1-16; the simulator capture is partial and supports the wait/traffic attribution only as a hypothesis."
+  ]
+}

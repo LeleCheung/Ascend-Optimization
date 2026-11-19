@@ -321,6 +321,11 @@ def build(row, evidence, linkroot, linkdata):
 
 
 def method_label(event, known):
+    if event.get('is_baseline') or event.get('attribution_status')=='version_selection_or_retest':return None
+    if event.get('attribution'):
+        record=event['attribution']
+        return dict(method=record['method']+('*' if record['confidence']=='inferred' else ''),
+                    color=record['primary'],location=record['location'],attribution=record)
     if event.get('recovery_method'):return event['recovery_method']
     if event['source_sha256'] in known:return known[event['source_sha256']]
     path=event['record']['result']['path'].lower();note=(event.get('method') or {}).get('note','')
@@ -339,7 +344,7 @@ def method_label(event, known):
 
 def svg(row,known,all_history=False):
     es=row['full_history'] if all_history else row['display_events']
-    n=len(es);w=max(1600,200+125*(n-1));height=1000
+    n=len(es);w=max(1600,320+245*(n-1));height=1060
     left,right,top,bottom=180,w-125,355,735
     xs=[left+(right-left)*i/max(n-1,1) for i in range(n)]
     valid=[e['score'] for e in es if e['score'] is not None and e['score']>0]
@@ -356,7 +361,7 @@ def svg(row,known,all_history=False):
            '<defs><marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#596170"/></marker></defs>',
            '<g font-family="Microsoft YaHei,Noto Sans CJK SC,sans-serif">',
            text(52,62,row['operator'],min(42, (w-650)/(len(row['operator'])*.58))),
-           text(52,112,f"{row['delivery']['cann_score']:.3f}× CANN",30,GREEN)]
+           text(52,112,('交付 ' if row.get('progress_view') else '')+f"{row['delivery']['cann_score']:.3f}× CANN",30,GREEN)]
     used=['paired','knowledge','ir','sim']
     names={'paired':'Profiling','knowledge':'知识／经验','sim':'模拟器','ir':'源码／IR分析'}
     for k,cat in enumerate(used):
@@ -388,7 +393,7 @@ def svg(row,known,all_history=False):
     for i in range(n-1):
         a,b=es[i:i+2];conn=c_by_pair.get((a['id'],b['id']))
         same=a['source_key']==b['source_key']
-        confirmed=same or (conn and conn['kind'] in ('recorded_lineage','recorded_recovery'))
+        confirmed=same or (conn and conn['kind'] in ('recorded_lineage','recorded_recovery')) or (row.get('progress_view') and conn and conn['kind']=='progress_summary')
         refchange=a['reference']!=b['reference']
         color=GREEN if confirmed and not refchange else '#596170'
         dash='' if confirmed and not refchange else 'stroke-dasharray="8 8"'
@@ -403,6 +408,9 @@ def svg(row,known,all_history=False):
         parts.append(f'<path class="connection" d="M{xs[i]:.2f} {ys[i]:.2f} L{xs[i+1]:.2f} {ys[i+1]:.2f}" stroke="{color}" stroke-width="3.5" fill="none" {dash}/>')
         if refchange:parts.append(text((xs[i]+xs[i+1])/2,285,'换参考',23,anchor='middle'))
     if transfer:
+        if transfer.get('attribution'):
+            from .attribution import tooltip
+            parts.append('<g><title>'+html.escape(tooltip(transfer['attribution']))+'</title>')
         target=next(i for i,e in enumerate(es) if e['source_sha256']==transfer_targets[-1])
         tx=xs[target];bx=max(410,min(w-410,tx-180));by=270
         parts += [f'<rect class="donor" x="{bx-300}" y="{by-32}" width="600" height="62" rx="12" fill="{BG}" stroke="{COLORS["knowledge"]}" stroke-width="2"/>',
@@ -410,6 +418,7 @@ def svg(row,known,all_history=False):
         for digest in transfer_targets:
             target=next(i for i,e in enumerate(es) if e['source_sha256']==digest);tx=xs[target]
             parts.append(f'<path class="donor-connection" d="M{bx} {by+30} Q{bx} {ys[target]} {tx-18} {ys[target]}" stroke="{COLORS["knowledge"]}" stroke-width="2.5" fill="none" marker-end="url(#arr)"/>')
+        if transfer.get('attribution'):parts.append('</g>')
     annotations=[]
     for i,e in enumerate(es):
         method=method_label(e,known)
@@ -418,21 +427,27 @@ def svg(row,known,all_history=False):
         administrative = method and any(token in method['method'] for token in
                                         ('核验严格', '恢复历史有效版本'))
         if method and not administrative:annotations.append((i,method))
-    # At most four large method callouts; every underlying event remains in the table.
-    if len(annotations)>4:
-        annotations=[annotations[round(i*(len(annotations)-1)/3)] for i in range(4)]
+    # Every mainline modification receives a visible label; no top-k truncation.
     for k,(i,m) in enumerate(annotations):
-        tx=left+(right-left)*(k+.5)/max(len(annotations),1);ty=930
+        if m.get('attribution'):
+            from .attribution import tooltip
+            parts.append('<g class="attribution"><title>'+html.escape(tooltip(m['attribution']))+'</title>')
+        width=min(320,(right-left)/max(n-1,1)-28)
+        tx=max(width/2+30,min(w-width/2-30,xs[i]))
+        # Place the method opposite the numeric score, close to its version.
+        ty=ys[i]-110 if i%2 else ys[i]+85
         color=COLORS[m['color']]
-        width=(right-left)/max(len(annotations),1)-30
         lines=[];line='';size=0
         for char in re.findall(r'[A-Za-z0-9_+]+|.',m['method']):
             cw=sum(28 if ord(c)>127 else 16 for c in char)
-            if size+cw>width and line:lines.append(line);line='';size=0
+            if size+cw>width and line and char!='*':lines.append(line);line='';size=0
             line+=char;size+=cw
         if line:lines.append(line)
         parts.extend(text(tx,ty+j*33,line,28,color,anchor='middle') for j,line in enumerate(lines))
-        parts.append(f'<path d="M{tx:.2f} 892L{xs[i]:.2f} {ys[i]+18:.2f}" stroke="{color}" stroke-width="2" fill="none" marker-end="url(#arr)"/>')
+        start=ys[i]-45 if i%2 else ys[i]+50
+        end=ys[i]-18 if i%2 else ys[i]+18
+        parts.append(f'<path d="M{xs[i]:.2f} {start:.2f}L{xs[i]:.2f} {end:.2f}" stroke="{color}" stroke-width="2" fill="none"/>')
+        if m.get('attribution'):parts.append('</g>')
     for i,e in enumerate(es):
         x,yy=xs[i],ys[i];m=method_label(e,known);loc=e.get('change_location',{}).get('location') or (m['location'] if m else None)
         parts.append(f'<g class="node" data-id="{e["id"]}"><title>{html.escape(e["source_sha256"]+" | "+e["stage"]+" | "+e["reference"])}</title>')
@@ -444,7 +459,7 @@ def svg(row,known,all_history=False):
         label=(f"{e['score']:.4f}×" if e['score']<.01 else f"{e['score']:.3f}×") if e['score'] is not None else '未通过'
         if e.get('score_kind')=='rebased':label='≈'+label
         parts.append(text(x,yy+38 if i%2 else yy-23,label,27,anchor='middle'))
-        parts.append(text(x,844,'FlagGems' if e['is_baseline'] else ('交付' if e['is_delivery'] else ('本轮' if e.get('is_recovery') else str(i))),25,anchor='middle'))
+        parts.append(text(x,1005,'FlagGems' if e['is_baseline'] else (f'V{i} · 交付' if e['is_delivery'] else f'V{i}'),25,anchor='middle'))
         parts.append('</g>')
     parts+=['</g></svg>'];return '\n'.join(parts)
 

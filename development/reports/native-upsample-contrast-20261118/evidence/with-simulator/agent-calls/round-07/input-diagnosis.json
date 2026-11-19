@@ -1,0 +1,48 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "ff8ebf5847e5a78e43c79866847be7d00d71ebaecd75967d92214cd541f49d51",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "current candidate upsample_bilinear2d_2x_kernel on timing-1: task duration 1205.6us with Block Dim 16384; per-block means aiv_time 2.97us, aiv_mte2_time 1.14us at aiv_mte2_active_bw 1.92 GB/s, aiv_mte3_time 0.26us at 3.70 GB/s, aiv_scalar_dual_time 0.28us. Coverage is the partial block window 16361..16383 (23 rows, profiling_coverage_limited), so these are per-block distribution means, not whole-task averages."
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "mechanism",
+      "finding": "frontend capture on core0.veccore0 spans 28.4us over 8 consecutive program slots (idle gaps of ~3.56us each): MTE2 active 11.48us (40%, 254 events, productive 38.9%), MTE3 2.00us (7%), while ALL and FLOWCTRL lanes stay idle (<=0.0013 active ratio) and the vector lane is small. So a program's ~3.5us cadence is dominated by per-program setup plus its nine small GM->UB transfers, not by vector math."
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "formal round-05 result: 24/24 pass, but timing-1 1.2314ms vs reference 0.2459ms (0.1997x) and timing-3/5 ~1.21-1.23ms, geo-mean 0.3158 below the 0.8 threshold; the five small cases sit at a ~78-80us floor."
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "the exact-2x path launches grid (cdiv(IW,128), IH, N*C) = 16384 programs for timing-1; each program owns a single input row of 128 columns, issues 9 separately-masked row loads of 128 halfs and 2 interleaved 256-element stores, i.e. ~4 KB of traffic per program."
+    }
+  ],
+  "hypothesis": "For the exact-2x case the kernel is program-count bound rather than bandwidth or arithmetic bound: 16384 programs each move only ~4 KB, and the measured per-program cost is ~3.0-3.6us of which only ~1.4us is MTE2 and ~0.3us scalar/vector. Device time therefore scales with the number of programs and with the poor efficiency of 256-byte masked transfers. Letting one program own BLOCK_I input rows x BLOCK_J columns as 2-D tiles cuts the program count ~16x (16384 -> 1024 for timing-1) and replaces 9 loads per row with 9 tile loads per 16 rows, so per-program transfer size grows by 16x while the number of per-program fixed costs drops.",
+  "alternatives": [
+    "Per-lane masked loads are individually slow for an addressing reason, so enlarging tiles without removing masks would not help",
+    "Vector arithmetic / the tl.interleave lowering is the limiter (contradicted by the small vector fops and the nearly idle vector lane, but not fully excluded)",
+    "Host launch overhead dominates the full-call time (explains part of the 78us floor of the small cases, but cannot explain 1.23ms for timing-1 where the device task itself is 1205us)"
+  ],
+  "discriminating_observation": "Within the 28.4us single-core simulator window the inter-program cadence is ~3.56us for programs that only transfer ~2.3 KB, and MTE2 is the only materially active hardware lane (ALL/FLOWCTRL idle, small vector activity). A program-count/dispatch-bound explanation predicts total time roughly proportional to program count with per-program cost nearly independent of payload; a bandwidth- or arithmetic-bound explanation would predict the opposite scaling. Token-level: 16384 programs * ~2.97us / observed 1205us implies ~48 concurrently executing vector cores, consistent with one program at a time per core.",
+  "change": "Retile the exact-2x kernel over rows: one program handles BLOCK_I input rows x BLOCK_J input columns as 2-D tiles, grid = (cdiv(IW,BLOCK_J), cdiv(IH,BLOCK_I), N*C). The per-element arithmetic (0.25/0.75 blends, interleaved output columns, row/column edge replication) is kept bit-identical to the current kernel; only the memory organization and program count change. BLOCK_I is picked from call metadata as the largest of 16/8/4/2/1 that keeps at least ~192 programs, so the big timing cases drop to 1024 programs and the small cases to 256. The generic non-2x path, allocation, dispatch context and the run() signature are untouched.",
+  "expected": "timing-1 device duration from 1205us toward <=300us (program count 16384 -> 1024, per-program transfer 4 KB -> ~52 KB), timing-3/5 proportionally; small cases from ~78us toward ~25-35us (1024 -> 256 programs). Per-block aiv_mte2_active_bw should rise well above 1.9 GB/s and Block Dim should read 1024 on timing-1. Correctness unchanged (same element-wise arithmetic); numerics identical per element.",
+  "validation": "Preflight (static path review + compile check over the supplied cases) first; then the host's full formal evaluation (24 cases) plus supplementary checks, and a fresh paired profiling / simulator capture for the new SHA to confirm the program count and the per-program MTE2 behavior. Compile failure or UB-capacity overflow would show up in preflight.",
+  "unknown": [
+    "Whether the Triton-Ascend backend lowers 2-D masked tile loads of shape (BLOCK_I, BLOCK_J) and a 2-D tl.interleave to bulk contiguous copies; if it falls back to per-lane access the tiling gain may be much smaller than predicted",
+    "Whether a BLOCK_I=16, BLOCK_J=128 tile fits the 192 KB UB budget with the fp32 blend temporaries; halving BLOCK_I is the fallback",
+    "How much of the small cases' 78us floor is host launch overhead versus device program cadence"
+  ],
+  "selected_layer": "Triton",
+  "layer_reason": "The diagnosed cost is the number of programs the kernel launches and the granularity of its GM->UB transfers, both of which are expressed in the Triton program/grid and tile structure. No IR/pass-level tool is available to reshape grid size or transfer granularity, so the mechanism must be changed in the Triton source.",
+  "simulator_incremental_judgment": "The simulator adds a per-program time structure that the paired profiling summaries do not show: an explicit ~3.56us inter-program cadence with only ~1.43us of MTE2 activity inside it, plus near-idle ALL/FLOWCTRL lanes. That separates 'program-count/dispatch plus small-transfer bound' from 'vector-arithmetic bound' and from 'one slow instruction type'. It does not tell us how well 2-D tiled loads will lower, so the size of the tiling gain remains a prediction to be checked by the next capture."
+}

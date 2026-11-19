@@ -1,0 +1,62 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "53f4ac44d82f015fd3b7b3d036b3850f67cfa2edf6ee29759cdd4a25e401653e",
+  "evidence": [
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "The formal/preflight run on exactly this source failed before any timing: triton.autotune do_bench -> runtime.driver.active.clear_cache -> cache.zero_() reaches a non-metadata ATen entry (aten.zero_.default) that the capture harness forbids. The module-level @triton.autotune on upsample_bilinear2d_kernel is therefore a hard interface blocker for this source, independent of kernel math."
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "mechanism",
+      "finding": "For this exact source SHA on case upsample_bilinear2d-timing-1 the traced core spends the whole 33.02us window inside upsample_bilinear2d_2x_kernel: VECTOR productive 23.83us of 33.02us (72 percent) while MTE2 productive is only 5.9us; per-PC call counts show the kernel tail (source lines 207-258) executed 128 times (WAIT_FLAG at lines 207/209/211/223 and F16/F32 VSEL all calls=128), i.e. a 128-iteration loop over 2-wide items, matching the (BLOCK_J, 2) pair layout built with b2[None,:]. Block-level MTE2=21 and MTE3=3 instructions (current-profiling sums divided by 16384 programs) show the bulk copies are not per-lane scalarized, so the repeated 128x work is the mask/select/blend tail, not the loads."
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "mechanism",
+      "finding": "Candidate program is upsample_bilinear2d_2x_kernel with 16384 programs; mean aiv_time 135.2us and 223k aiv_total_cycles per program versus 51.6us and 85.1k for the reference (2.62x per program), so each program costs about 223k cycles to produce only 512 output elements. Sums: UB_to_GM 524288 KB for a 16 MiB output (32x write amplification with 3 MTE3 instructions per program) and GM_to_UB 2353152 KB (43x reference); aiv_scalar_wait_time dominates (97.7us of 135.2us), so the scalar pipe waits on the vector pipe while the write side moves 32x the payload."
+    },
+    {
+      "path": "workspace/native-runtime-facts.json",
+      "category": "knowledge",
+      "role": "background",
+      "finding": "Bound to the starter source (62a02c..), not to the current candidate: it records only that the native tuned config set for this operator is BLOCK_X in 64/128/256/512 by BLOCK_Y in 1/2 with num_warps 8/4. Used here only as metadata justification for replacing autotune with a static config; no performance claim."
+    }
+  ],
+  "hypothesis": "Two separable defects, one compatibility and one mechanism. (compat) The copied native @triton.autotune decorator makes the candidate run the autotuner benchmark on device, which calls a forbidden non-metadata ATen op, so this source can never be evaluated as-is; it must be replaced by a static metadata-only config choice. (mechanism) In the exact-2x path each program produces two output rows of 2*BLOCK_J columns by building (BLOCK_J, 2) pair tensors (pair_e/pair_o) and storing them; the 2-wide innermost dimension forces the whole mask/select/blend tail to be lowered as 128 iterations of width 2 (simulator: 128 calls per PC, VECTOR busy 72 percent of the block window), so roughly thirty flat vector instructions become thousands and each program pays about 223k cycles for 512 outputs, while the strided pair store also inflates written bytes 32x. Making the same computation purely one-dimensional at width BLOCK_J (clamped-index neighbour loads, separate even/odd output vectors, two stride-2 stores per output row) removes the 128x loop and the mask/other select chains.",
+  "alternatives": [
+    "A2: keep the (BLOCK_J, 2) pair tensors but flatten the store operand with tl.reshape/tl.interleave to get a contiguous 2*BLOCK_J store. Rejected for this call because reshape/interleave lowering support on this backend is unverified and could re-impose the same 2-wide layout for the arithmetic.",
+    "A3: fully flat 2*BLOCK_J tile with duplicated-index gather loads (index m = oc >> 1) so that both loads and the store are contiguous. Rejected for now: it doubles load lanes (nine gathers of 256 instead of nine contiguous loads of 128) and gather support/cost is unverified, while the evidence shows the load side already issues only 21 MTE2 instructions per program.",
+    "A4: remove the plus/minus one misaligned neighbour loads via a single wider aligned load plus in-register shift; Triton has no shift or roll primitive, and MTE2 instruction counts show loads are not the hot side.",
+    "A5: keep @triton.autotune but restrict configs to one entry; the autotuner still benchmarks (do_bench/clear_cache) and would still reach the forbidden ATen entry, so the decorator has to go rather than be narrowed.",
+    "A6: enlarge the tile (ROWS greater than 1, as round-02 attempted) to amortise per-program setup. Deferred: round-02 showed a ROWS=8/BLOCK_J=128 shape overflows the UB budget (requires 2621440 bits vs 1572864 available), so tile growth must follow the per-element lowering fix."
+  ],
+  "discriminating_observation": "The simulator trace separates 'bulk copies are slow' from 'compute is repetitively lowered': per-PC call counts are 128 for the vector/select instructions on source lines 207-258 while block-level MTE2 (21) and MTE3 (3) instruction counts stay small, and VECTOR productive occupies 72 percent of the 33us window with SCALAR waiting on VEC flags. A memory-granularity explanation would instead show MTE2/MTE3 instruction counts or MTE2 wait dominating, which this trace does not show.",
+  "change": "compatibility edit (recorded separately): drop the @triton.autotune decorator and its config-list helper, launch upsample_bilinear2d_kernel with a statically chosen BLOCK_X/BLOCK_Y (metadata-only heuristic), and make the generic path store dtype explicit (result.to(ptr_o.dtype.element_ty)). performance mechanism: rewrite upsample_bilinear2d_2x_kernel so every op is 1-D of width BLOCK_J - neighbour columns loaded through clamped indices (jl=max(j-1,0), jr=min(j+1,IW-1), no mask/other/where), vertical then horizontal blends kept as separate even/odd vectors, and four stride-2 stores (2*j and 2*j+1 for the two output rows) instead of the (BLOCK_J,2) pair layout. Every lane address stays inside the allocation, including width tails, because j is clamped to IW-1 and the stores carry the tail mask.",
+  "expected": "If the 128x width-2 lowering is the dominant cost, per-program aiv_time and aiv_total_cycles for the exact-2x kernel drop by an order of magnitude (from about 135us / 223k cycles toward the 1-10us class), the VECTOR productive share falls and MTE2 becomes comparatively visible, full-call time for upsample_bilinear2d-timing-1 improves well beyond the current source, and the byte counters stop showing 32x write amplification. No correctness change is expected (same 0.25/0.75 weights and the same clamping), and the case must still match at atol=rtol=0.015 on all elements.",
+  "validation": "Bridge preflight on the new source (compile plus formal correctness over all 24 contract cases and supplementary checks), then the host's full KGS performance run on upsample_bilinear2d-timing-1; compare the new per-program aiv_time/total_cycles and VECTOR/MTE2 shares against workspace/current-profiling.json bound to this source SHA, and re-collect simulator evidence for the new SHA before making any further mechanism claim.",
+  "selected_layer": "Triton",
+  "layer_reason": "The per-element cost comes from how the tile is expressed in Triton source (2-wide pair tensors, mask plus other selects), which decides the emitted vector widths; no pass option, IR annotation or launch-level heuristic can change that. The autotune removal is a launch/compatibility edit and is recorded separately in change.",
+  "simulator_incremental_judgment": "simulator-evidence.json adds a distinction that source reading alone could not give: the kernel tail executes 128 times per program (128 calls per vector PC, VSEL and WAIT_FLAG at 128) while block-level MTE2=21 and MTE3=3 instructions stay small, so the cost is repetitive narrow vector lowering rather than slow bulk copies. It does not by itself prove a speedup, and its window is a partial single-core capture (application_completed false), so the predicted magnitude remains an estimate to be checked by formal timing.",
+  "unknown": [
+    "Whether the backend lowers a 128-lane stride-2 fp16 store into one strided store or scalarizes it; if scalarized, the write side may stay expensive after the loop is removed and alternative A3 becomes relevant.",
+    "Whether clamping the neighbour indices (jl/jr) instead of masking keeps the loads affine enough; the duplicated index at lane 0 may take a slower path than a fully affine pattern.",
+    "The static BLOCK_X/BLOCK_Y choice for the generic (non-2x) path is a metadata heuristic, not a measured optimum, and that path is not the target timing case.",
+    "Absolute per-program cycle budget is only known for the old lowering, so the expected order-of-magnitude gain is unverified until the host runs full performance."
+  ],
+  "post_change_observation": {
+    "new_source_sha256": "a92926345d1bb8b42ed9ff973f63add782927d11dc0a048a0583d34aa52638b3",
+    "preflight_status": "awaiting_source_review",
+    "what_changed": "autotune decorator and config helper removed (static select_block_shape, metadata only); generic-path store now casts to ptr_o.dtype.element_ty; exact-2x kernel rewritten as width-BLOCK_J 1-D with clamped neighbour indices (jl/jr) and four stride-2 stores per program.",
+    "address_bounds_review": "Every load index is bounded: j is clamped to IW-1 under TAIL, jl=max(j-1,0), jr=min(j+1,IW-1), im/ip clamped to [0,IH-1]; stores cover only columns 2*j and 2*j+1 which are below OW=2*IW, and are masked under TAIL. This answers the round-02 reviewer finding (unbounded jl load lanes).",
+    "not_yet_observed": [
+      "No compile result, correctness result or formal timing for this SHA yet; the predicted order-of-magnitude gain and the stride-2 store lowering are both unverified.",
+      "Per-program aiv_time and the VECTOR/MTE2 shares for SHA a9292634 have not been measured, and no simulator trace exists for it."
+    ],
+    "next_if_confirmed": "If stride-2 stores turn out to be scalarized (write bytes stay inflated), move to the flat 2*BLOCK_J tile with duplicated-index loads (alternative A3); if the loop is gone but per-program cost is still high, revisit tile growth within the UB budget (A6)."
+  }
+}

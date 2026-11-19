@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 60,
+    "duration_ms": 362014,
+    "usage": {
+      "input_tokens": 151783,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 2518400,
+      "output_tokens": 48043,
+      "output_tokens_details": {
+        "thinking_tokens": 35015
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 153109,
+        "outputTokens": 56703,
+        "cacheReadInputTokens": 2653824,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 3.510032000000001,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 35015,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 3.510032000000001,
+    "result": "Preflight passed compilation and stopped at the review boundary. Handing off unchanged.\n\n**Handoff — awaiting host source review**\n\n- **New source SHA**: `a27f40a227126c5ffbe4e6bc1fd6e93cbb7c06d9a417091e1351785b90f0429e` (previous retained `72c4d40d…`)\n- **Decision recorded before edits**: `1bf2e05dde81465192f24e68628def92` (source `72c4d40d…`), after correcting the mid-clamp role in the diagnosis\n- **Preflight**: `awaiting_source_review` — compile accepted, no supplementary failures reported yet; candidate is frozen for host review and formal evaluation\n\n**Mechanism (one hypothesis: remove provably dead vector issue from the saturated sorted path)**\n\nEvidence used: paired profiling localizes the 1.40 ms timing-8 latency entirely to `_scatter_add_sort_key_kernel` (798.8 µs, per-program `aiv_vec_ratio` 0.913, MTE2 0.045, MTE3 0.022) and `_scatter_add_sort_out_kernel` (603.6 µs, vec 0.857, int32 sub-ratio 0.444). The simulator's partial 12.37 µs common-clock window (`absolute_time_qualified=false`) shows VECTOR productive 0.907 / wait_only 0.026 / idle 0.067, SCALAR wait_only 0.688, MTE2/MTE3 idle 0.949/0.983 — resource attribution only (vector issue, not memory, not scalar), no causal-stall or absolute-time claim; the out kernel was never traced. The actual IR supplied the exact redundancy.\n\nEdits (candidate.py only):\n\n1. `_scatter_add_sort_out_kernel`: dropped `hi = min(mid, hi)` and the `(lo < hi)` conjunct from `go`. Kept the `mid = min((lo+hi)>>1, B-1)` clamp, which is load-bearing: a destination absent from `index` gives `lo == hi == B`, and the clamp both keeps the gather index in range and makes that converged update a no-op (so `end > lo` still yields zero delta). Removes 3 of ~11 vector ops on each of the 12 rounds; lower-bound result, including the `lo == B` case, is unchanged.\n2. `_scatter_add_sort_key_kernel`: removed the dead `min(…, ncols-1)` on `src_lane` (`keyi & (B-1)` is always `< B`); replaced the per-round `fptosi` of the gathered target with exact fp32 integer equality; added `EVEN` (`ncols == B`) so the sentinel `where`, sentinel `other=B` load, and masked loads are compile-time skipped for the 1024/2048 hot shapes.\n3. `_scatter_add_sort_out_kernel`: under `EVEN`, unmasked `inp` load and `out` store.\n4. Host passes `even = (ncols == B)` to both launches.\n\nUnchanged: accumulation order and fp32 single-rounding, keys/prefix dtypes and layout, dense owner path (all 128² cases), atomic buffer path, generic N-d path, special-value handling.\n\n**Predicted measurable effect**: out kernel ≈604 → 520–560 µs, key kernel ≈799 → 740–780 µs, timing-8 ≈1.40 → 1.27–1.34 ms (≈2.57–2.70× vs current 2.452×), similar relative gains on the other five 1024/2048 sort-path cases, 128² cases unchanged. Discriminator: per-program `aiv_vec_time` and task durations should fall by roughly the removed-op fraction while MTE ratios stay ≤0.06; if gather latency dominates, durations stay flat while only instruction counts drop."
+  }
+}

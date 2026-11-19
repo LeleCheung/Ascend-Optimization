@@ -1,0 +1,63 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "7e467ac94eb533c7217cbfe95029f45b3ac3ef296a331641138938607a7635bd",
+  "evidence": [
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "Formal run of this exact source (7e467ac9) failed all 24 cases with BuildError: candidate defines conflicting public symbol 'upsample_bilinear2d'. The module-level operator function has the same name as the contract symbol, so the loader cannot bind the candidate; this is an interface defect that must be repaired before any performance claim."
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "Target case timing-1 (fp16 4x32x128x128 -> 256x256): candidate exact2x kernel Task Duration 70235 us, Block Dim 16384 programs, while reference task latency is 0.246 ms. Per-block mean aiv_time is 171.2 us vs 51.6 us reference; aiv_scalar_time is 123.2 us vs 7.26 us (scalar_ratio 0.72), aiv_mte3_time 37.4 us vs 8.0 us, aiv_mte2_time 15.7 vs 11.1. So the tiny 16384-program kernel is dominated by scalar address handling and store/sync per block, not by useful vector work (aiv_vec_time 20.9 us)."
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "disambiguation",
+      "finding": "Bound trace of upsample_bilinear2d_2x_kernel on core0.veccore0 for the same case: the source_function region has 435 instructions and 33.3 us trace-interval union; the largest items are BAR/WAIT_FLAG at the four stride-2 tl.store lines (246-249) and BARs after the vector blend lines 235-238 (about 10-17 us each, overlapping). It distinguishes the explanation 'input DMA bandwidth bound' from 'per-block store/sync plus scalar address work dominates'; it does not give an absolute critical path (capture is a partial window, application did not finish)."
+    },
+    {
+      "path": "workspace/current-ir/7e467ac94eb5/20-kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Exact2x TTIR shows 4 tt.store with per-lane offsets col_e_47 = 2*j (stride-2 scatter writes) and 9 tt.load whose offsets are max(j-1,0)/min(j+1,IW-1) results (non-affine clamped vectors). These force per-lane address generation instead of one bulk contiguous DMA per row, which matches the scalar-heavy, store-heavy per-block profile."
+    },
+    {
+      "path": "workspace/actual-ir/upsample_bilinear2d_kernel.ttir",
+      "category": "source_ir",
+      "role": "background",
+      "finding": "Original native starter (source 62a02c20) IR, bound to the historical source only; it is not evidence about the current candidate and is used solely as background for the native reference character."
+    },
+    {
+      "path": "workspace/profiling-comparison.json",
+      "category": "paired_profiling",
+      "role": "background",
+      "finding": "Historical original-source paired collection (source 62a02c20) for the same case; not the current candidate and not a current speedup measurement."
+    }
+  ],
+  "hypothesis": "For the exact-2x path the kernel currently issues 9 clamped (non-affine) gather loads and 4 stride-2 scatter stores per 128-lane block, so the Ascend backend must compute addresses per lane and serialize the stores; per-block cost is dominated by scalar address handling and store/sync (aiv_scalar_time 123 us, mte3 37 us per block). Making every access affine and contiguous (edge handling moved from address clamping to masks plus vector selects, and the two interleaved output columns written as one contiguous 2*BLOCK_J store via tl.interleave) should let MTE2/MTE3 emit bulk DMA and collapse the scalar and store time.",
+  "alternatives": [
+    "The cost is fixed per-program launch overhead of 16384 tiny programs rather than access shape; then contiguity alone would leave latency high and a row-tiled / larger-program design is needed.",
+    "The cost is the int64 base offset arithmetic; then removing int64 would be needed and contiguity changes would not help.",
+    "The cost is insufficient vector width (only 128 fp16 lanes per block), which would be addressed by processing several rows per program."
+  ],
+  "discriminating_observation": "If the mechanism is per-lane address generation/scatter stores, a contiguous-affine rewrite should sharply reduce aiv_scalar_time and aiv_mte3_time per block and reduce task duration by a large factor while leaving aiv_vec_time roughly unchanged. If task duration stays near 70 ms with the same per-block time, the dominant mechanism is program count overhead instead.",
+  "change": "Compatibility edit (recorded separately from performance): rename the public operator function upsample_bilinear2d to a private name and have run() call it, so the loader no longer sees a conflicting public symbol. Performance change: in upsample_bilinear2d_2x_kernel replace the clamped gather loads (max(j-1,0), min(j+1,IW-1)) with affine j-1 / j / j+1 offsets guarded by load masks and fixed up with tl.where on the constant edge lanes, and replace the four stride-2 stores with two contiguous stores of tl.interleave(even, odd) over 2*BLOCK_J lanes (masked only on the tail path). Arithmetic and weights are unchanged.",
+  "expected": "The module imports and binds under KGS (no BuildError). For timing-1, candidate task duration drops from ~70 ms by a large factor (target order of magnitude: a few ms or less), per-block aiv_scalar_time and aiv_mte3_time fall sharply, and aiv_vec_time stays approximately the same.",
+  "validation": "Run the supplied preflight (structural checks and 30 supplementary cases); then the host's full 24-case formal correctness + timing evaluation and a fresh paired profiling of the current SHA to compare scalar/mte3 per-block metrics and total task duration.",
+  "unknown": [
+    "Whether the Ascend Triton backend lowers tl.interleave + contiguous 2*BLOCK_J store to one bulk DMA or to a slow shuffle; no compile or device result yet for this source.",
+    "How much of the 171 us per block is irreducible program launch/teardown at 16384 programs; this determines whether row tiling is required next.",
+    "Correctness of the masked affine load / select edge handling for IW not a multiple of BLOCK_J and for IW == 1 edge cases is only argued from unchanged arithmetic, not yet measured."
+  ],
+  "selected_layer": "Triton",
+  "layer_reason": "The suspected cost is in the Triton kernel's memory-access form (per-lane clamped offsets and stride-2 stores) and program decomposition, not in an MLIR pass option; no compiler pass or IR flag is available to change and the compatibility rename is a Python-level interface edit recorded separately.",
+  "simulator_incremental_judgment": "The simulator adds a per-block distinction that the aggregate CSV cannot: within the bound 2x-kernel region the largest overlapping intervals are BAR/WAIT_FLAG at the four strided store sites and BARs after the vector blends, so the block is not simply waiting on input DMA. It does not provide an absolute critical path or a speedup prediction (partial window, application did not finish), and it cannot show whether a different access form is faster.",
+  "compatibility_edits": [
+    "Rename module-level operator function upsample_bilinear2d to _upsample_bilinear2d so only run() is a public contract symbol; run() keeps the same signature and semantics."
+  ]
+}

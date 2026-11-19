@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 52,
+    "duration_ms": 171279,
+    "usage": {
+      "input_tokens": 44313,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1770624,
+      "output_tokens": 28177,
+      "output_tokens_details": {
+        "thinking_tokens": 16238
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 44313,
+        "outputTokens": 28177,
+        "cacheReadInputTokens": 1770624,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.811302,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 16238,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.811302,
+    "result": "Handing off with the candidate unchanged.\n\n## What I found\n\n**Failure stage:** kernel compilation (BiShengHIR), *not* numerics and *not* timing. `previous-result.json` has `failed_cases=[]` and `supplementary=null` — no semantic check ever ran.\n\n**Exact diagnostic:**\n```\nloc(\"candidate.py\":56:0): error: ub overflow, requires 2146304 bits\nwhile 1572864 bits available!  -> Failed to run BiShengHIR pipeline\n```\ni.e. 268288 B required vs 196608 B (192 KiB AIV UB) available — a 1.365× overflow.\n\n**Mechanism (from the actual failed IR, `failed-ir/28d7c8a2e19d/`):** the previous fix shrank `_TILE_BYTES` to 8192 on a *byte-of-payload* model, but the IR shows the fp16 specialization still compiled as a `[32,4,16] = 2048`-element tile (`BLOCK_S` had been capped by `next_pow2(seq_len)`, so the byte budget never bound). The UB estimate is dominated by *address* tensors, not payload: six full-tile `tensor<...x!tt.ptr<f16>>` (3 input + 3 output, 8 B/element) plus a 4 B/element index tensor and the fp32 q opmath chain — ~131 B per tile element. The EXACT variant (512-element tile, dead-arg-eliminated) has the same six-pointer structure, which rules out masks as the cause.\n\n## Repair (same performance hypothesis: one affine `[BLOCK_S, BLOCK_H, BLOCK_D]` tile per program, adjacent heads grouped)\n\n- `_TILE_BYTES` 8192 → 2048 (fp16 tile ≤1024 elements, fp32 ≤512), `_MIN_STORE_BYTES` 2048 → 1024 so `BLOCK_H=2` grouping survives instead of degenerating to `BLOCK_H=1` (for head_dim 64 fp16: `[8,2,64]`, 128 contiguous input columns/row).\n- Kernel body restructured in both EXACT and masked branches into sequential q → k → v load/compute/store phases, so at most one input and one output pointer tensor is live at a time instead of six.\n- Preserved unchanged: fp32 q opmath and input-dtype k/v adds (verified numerical fix), masks, affine `(s,h,d)` indexing, generic `stride_qkv_d`/output-stride path, host-side tile/layout logic.\n\nDecision was registered before editing (`decision_id 6fec4673…`, bound to pre-edit sha `28d7c8a2…`); `diagnosis.json` records the diagnostic, evidence, hypothesis, change, expected effect, validation plan and open unknowns.\n\n## Status\n\nPreflight on the edited source (`ce4d1a36…`) returned **`awaiting_source_review`** (\"keep current candidate unchanged and return\"), so there is no compile/semantic/timing observation yet — the overflow repair is *not* verified. Per the rule I stopped without further edits and handed off. Next stage: re-invoke preflight on this sha; if UB still overflows, the documented lever order is `_TILE_BYTES` 2048 → 1024, then dropping head grouping."
+  }
+}

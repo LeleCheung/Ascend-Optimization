@@ -1,0 +1,76 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "0dd84ef70edfedb4836fa3f37dff8000406c89ff997dd82a7f0a32f79a3bca77",
+  "evidence": [
+    {
+      "path": "workspace/actual-ir/0-_transform_bias_rescale_qkv_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "实际TTIR确认：程序以线性 pid*1024+arange 起步，随后对 tensor<1024xi32> 连续执行 remsi/divsi(head_dim)、remsi/divsi(seq_len)、remsi/divsi(num_heads) 共6次按元素整数除/模，之后才用这些非仿射下标做 tt.addptr + tt.load/tt.store；三个 load、三个 store 的指针都是逐元素地址向量，编译器无法证明任何维度的连续性。"
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "trigger",
+      "finding": "core0.veccore0 部分窗口内，耗时最高的指令全部来自 SCALAR 流水且全部映射到源码第77行 tl.load(qkv_ptr + q_input_offset)：3条 S64 DIV(各292次调用、5840 cycles、3.54us，约20 cycles/调用，立即数 0x40=head_dim、0x200=seq_len、0x10=num_heads 正好对应6次张量除模)、2条 MADD、4条 MUL、SIGNEXT/ADD，以及 LD_XD_XN_IMM(3.05us) 与 ST_XD_XN_IMM(7.41us、42 cycles/调用)；instruction_calls_by_pipeline 为 SCALAR 7375 / VECTOR 5 / FLOWCTRL 292，即该窗口内向量流水几乎没有指令，工作全在标量地址计算上。"
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "disambiguation",
+      "finding": "观测限制必须保留：capture_scope=Partial instruction CSV observation only，application_completed=false，timeline.status=unsupported，limitations 明确禁止由此推算时间轴/等待/关键路径；各 region 的 wait_instruction_time_sum_us 均为0，因此模拟器本身不能证明“等待”成因，也不能把指令时间相加当耗时。它只提供“热点指令种类与调用次数”这一层证据。"
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "候选侧 4096 个 program 记录(参考侧40个)：aiv_time 均值 550.93us/块(参考48.12us)、aiv_total_cycles 909030/块；mte3_time 381.70us/块、mte3_ratio 0.694；mte2/mte3 指令计数合计各 12,587,008(参考约12.4千)，即每元素一条DMA指令；write_main_memory_datas 1,572,864KB(=1.5GiB)，恰为必需25.2MB的约64倍，说明逐元素写被放大成128B最小粒度写。"
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "mechanism",
+      "finding": "候选 aiv_scalar_wait_time 233.62us/块(参考2.09us，111.7倍)、aiv_scalar_vector_stall_time 358.32us/块、aiv_vec_ratio 仅0.085(参考0.419)、aiv_ub_read/write_bw_vector 仅1.37GB/s(参考100.9/68.8GB/s)、主存写带宽0.67GB/s(参考12.2GB/s)。等待与低带宽同时出现，指向“标量生成的逐元素地址”而非算术量或HBM容量上限。读取侧因L2命中率高(读命中88.5%、总命中99.2%)被掩盖，写侧无缓存掩盖所以最贵。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "目标 case transform_bias_rescale_qkv-timing-2 实测 56.626ms，CANN 参考 0.0924ms，比值 0.00163；21/21 通过、误差为0；timing-5 同量级(67.19ms)。可复制的对照事实：当前候选比参考慢约550倍。"
+    },
+    {
+      "path": "workspace/contract.json",
+      "category": "knowledge",
+      "role": "background",
+      "finding": "冻结合同：run(qkv,qkv_bias,num_heads) → (q,k,v)，无原地/别名副作用；21个正式case(12正确性+9计时)；正确性含 strided 输入/偏置，几何含 head_dim 16/32/64 及非2幂 7/48、seq_len 17/5 等需要掩码的形状。"
+    }
+  ],
+  "hypothesis": "唯一主因不是数据搬移量而是地址生成方式：kernel 用线性下标经6次按元素64位整数除/模解码 (b,h,s,d)，Triton-Ascend 把这些张量除模落到标量流水(模拟器实测 S64 DIV 约20 cycles/次、每元素约6次)，并把由此得到的非仿射地址向量退化成逐元素 LD/ST。于是 (1) 标量流水成为串行主线，向量与DMA流水等待地址描述符(profiling 中 scalar_wait 233.6us/块、scalar_vector_stall 358.3us/块)；(2) 每个元素的写变成一条最小粒度DMA，写出流量被放大64倍(1.5GiB vs 25.2MB)、写带宽只有0.67GB/s。若把映射改成“程序即 (b,h,seq块) 的2D仿射瓦片”，除模只剩每程序常数级标量计算，访存变成内维连续的2D DMA，则标量热点与写放大应同时消失。",
+  "alternatives": [
+    "备选A：保持线性索引但把 head_dim/seq_len/num_heads specialize 成 constexpr，让除模变移位/魔数乘法。可减少标量 DIV，但地址仍按元素几何构造，不能保证编译器恢复连续性，写放大可能残存，因此本轮不选。",
+    "备选B：加 num_warps/BLOCK_SIZE 调参或改 BLOCK_SIZE=2048/512。只改变块大小不改变逐元素地址结构，模拟器显示热点是每次调用的S64 DIV，属结构性而非分块性问题，预期收益小，不选。",
+    "备选C：先在host端 permute+contiguous 或用多个小 kernel 分三段搬运。会产生额外张量/额外kernel且违反“仅为分配与元数据使用torch”的边界，不选。",
+    "备选D：纯带宽论点(认为56ms是HBM写带宽上限)。被测量否定：写流量本应25.2MB却实际1.5GiB，主存写带宽0.67GB/s远低于可用带宽，且参考侧同样数据量只需48us。"
+  ],
+  "discriminating_observation": "可区分两种解释的观测：若是“地址生成/逐元素DMA”机制，改成2D仿射瓦片后 mte2/mte3 指令计数应从 12,587,008 塌缩若干数量级(至万级)，write_main_memory_datas 应从1,572,864KB回落到约25.2MB，且 aiv_scalar_wait_time、aiv_scalar_vector_stall_time 大幅下降而 aiv_vec_ratio 上升；若时间仍停在几十毫秒且上述计数不变，则说明瓶颈另有其因(例如DMA仍被逐元素拆解或存在未观测到的同步)，本假设被否定。",
+  "change": "把候选kernel的映射从“全局线性下标+6次按元素除模”改为“一维网格 pid → (batch, head, seq块) 的标量分解 + 2D仿射瓦片 [BLOCK_S, BLOCK_D]”：每程序只做2次标量除模，输入偏移用 b*stride_qb + (s0+s)*stride_qs + (sec*hidden + h*head_dim + d)*stride_qd 的三项线性组合，输出偏移用 b*stride_ob + h*stride_oh + (s0+s)*stride_os + d*stride_od；bias 只按 d 载入一次(1D)并广播到整块，不再每元素读三次；当 head_dim 为2幂且 seq_len 能被 BLOCK_S 整除时走无掩码快路径，否则用 (s,d) 二维掩码。Q 的缩放仍为“先按输入dtype相加、再转fp32乘 scale、再转回”的与原实现一致的数值顺序，K/V 只加偏置。",
+  "expected": "设备侧：目标 case 每块 aiv_time 551us → 约5-15us(总设备时间由约56ms降到约0.13-0.4ms量级)，mte2/mte3 指令计数 12.59M → 万级，write_main_memory_datas 1.5GiB → 约25.2MB，aiv_vec_ratio 0.085 → >0.3，aiv_scalar_wait_time/scalar_vector_stall_time 显著下降；aiv_scalar_ratio 仍可能不低(每程序仍有标量初始化)，但不再随元素数增长。KGS：timing-2 延迟由56.626ms降到0.1-0.4ms(相对CANN 0.0924ms 由0.0016提升到约0.3-0.9)，其余20个case全部保持通过，48项补测(含strided/非2幂head_dim=7/48、fp16大值60000、fresh-stream)保持通过。",
+  "validation": "一次完整KGS正式评测(21 formal cases)加两套各48项补测；重点核对：21/21通过、误差在给定容差内、timing-2 与 timing-5 延迟大幅下降而 timing-0/3/6 小case不出现显著退步；若宿主提供改后profiling，则核对 mte2/mte3 计数、write_main_memory_datas、scalar_wait/stall 与 vec_ratio 是否符合上述区分性预测。",
+  "selected_layer": "kernel_device_code(索引映射与访存形状)",
+  "layer_reason": "模拟器给出的热点是源码第77行前的标量S64除模与逐元素LD/ST地址描述符，profiling在同一case上给出1.5GiB写流量与0.67GB/s写带宽，两者都直接由kernel内部的索引构造方式产生；接口层(run签名/返回三元组/stride语义)无变化且不占用设备时间。数值层(先加后缩放的顺序、dtype)也保持不变，因此收益只能来自索引/访存层。",
+  "simulator_incremental_judgment": "模拟器相对profiling的增量是“指令级分解”：profiling 只能给出 scalar_wait 233.6us/块、mte3_time 381.7us/块这类流水/等待汇总，无法说明时间具体花在哪类指令上；模拟器指出该窗口内 VECTOR 仅5次调用、SCALAR 7375次，且 top 指令是3条 S64 DIV(20 cycles/次，立即数恰为 head_dim=0x40、seq_len=0x200、num_heads=0x10)与 MADD/MUL/SIGNEXT，全部映射到 tl.load 前的索引计算行，从而把“标量等待”具体落到“按元素64位除模”这一可修改的源码结构上；ST_XD_XN_IMM 42 cycles/调用也解释了逐元素写为何昂贵。该贡献是“定位具体热点操作”，不是宣称因果贡献：观测窗口是部分窗口(application 超时、时间单位未独立校验、timeline unsupported、wait 时长为0)，291/292次调用只相当于单块1024元素的一个窗口，不能外推为整任务耗时或等待比例；把等待归因于标量地址生成，是由profiling的独立指标(scalar_wait、scalar_vector_stall、写放大64倍)与该指令级热点共同支持的可验证假设，最终以改后完整评测为准。",
+  "interface_import_compatibility": {
+    "note": "以下为接口/导入兼容性改动，与设备侧优化分开记录，不计入性能归因。",
+    "entrypoint": "保持 run(qkv, qkv_bias, num_heads) → (q, k, v) 不变，参数名与位置均可关键字/位置调用。",
+    "removed_imports": "移除 from flag_gems.ops.contiguous import contiguous、from flag_gems.runtime import torch_device_fn、from flag_gems.utils import libentry 以及 logging 依赖：生成候选必须是自包含严格Triton；原 contiguous(qkv_bias) 的隐式拷贝由kernel内按 bias 自身 stride 读取替代，原 torch_device_fn.device 上下文由Triton按当前设备/当前流启动替代。",
+    "metadata_only_torch": "torch 仅用于 torch.empty 分配 q/k/v 与 shape/stride/dtype 元数据读取；不缓存输出、不做host端算术、不按test-ID分派。",
+    "preserved_semantics": "输入与bias的 stride/storage_offset 全部沿用(含 strided 用例的 stride_d=2、bias stride=2/3、转置输入的 stride_b=144/stride_s=288)，不原地修改输入、不返回输入别名，输出为新建张量。",
+    "numerics": "Q 保持 dtype内相加 → fp32乘 1/sqrt(head_dim) → 转回 dtype；K/V 仅加偏置；与原生FlagGems基线同序。"
+  },
+  "unknown": [
+    "改后2D瓦片是否会被Triton-Ascend直接编译成内维连续的2D DMA(而非再次逐元素拆解)；需以改后IR/指令计数核对。",
+    "目标case的写流量能否回落到25.2MB，以及是否还有bias重复读取造成的次生流量。",
+    "BLOCK_S=64/BLOCK_D=64 是否为最优瓦片；可能在后续轮次按实测微调。",
+    "目标case在40核上仅1024个程序的调度尾效(1024/40=25.6波)是否引入约4%的尾块损失。"
+  ]
+}

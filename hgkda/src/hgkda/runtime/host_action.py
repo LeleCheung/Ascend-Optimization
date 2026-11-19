@@ -17,7 +17,8 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--config',type=Path,required=True)
     p.add_argument('action',choices=['generate','preflight','evaluate','pair'])
-    p.add_argument('--invocation');p.add_argument('--max-turns',type=int,default=24)
+    p.add_argument('--invocation');p.add_argument('--max-turns',type=int,default=0)
+    p.add_argument('--generation-timeout',type=int,default=0)
     p.add_argument('--port',type=int,default=19696);p.add_argument('--case')
     a=p.parse_args();c=read(a.config);run=Path(c['run_directory']);package=Path(c['package'])
     workspace=run/'workspace';source=workspace/'candidate.py'
@@ -28,7 +29,8 @@ def main():
         c['active_source']='candidate.py' if source.exists() else 'starter.py'
         a.config.write_text(json.dumps(c,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
         command=[sys.executable,str(tools/'agent_runner.py'),'--config',str(a.config),
-            '--model-settings',str(run/'model-settings.json'),'--invocation',a.invocation,'--max-turns',str(a.max_turns)]
+            '--model-settings',str(run/'model-settings.json'),'--invocation',a.invocation,
+            '--max-turns',str(a.max_turns),'--generation-timeout',str(a.generation_timeout)]
     else:
         digest=sha(source)
         review=run/'source-reviews'/(digest+'.json')

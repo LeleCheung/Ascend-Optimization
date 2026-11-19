@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 22,
+    "duration_ms": 68569,
+    "usage": {
+      "input_tokens": 15825,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 193920,
+      "output_tokens": 10638,
+      "output_tokens_details": {
+        "thinking_tokens": 5246
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 15825,
+        "outputTokens": 10638,
+        "cacheReadInputTokens": 193920,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 0.442035,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 5246,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 0.442035,
+    "result": "Stopped at the required gate: preflight returned `awaiting_source_review`.\n\n## Decision record\nRegistered with the bridge before editing:\n- decision_id `ace2229282ff4f8797a016b393cdce4b`\n- source_sha256 `62a02c203a3e54a09f6479ca8526168bf1529821284cd1b42bc6cbdf3c980a12`\n\n## Evidence read\n- `workspace/compiler-evidence.json` — native baseline fails `tt.store` value/pointer type verification at the result store, aborting the Triton-to-structured pipeline.\n- `workspace/candidate.py` — fp32 accumulation stored without a cast; FlagGems-only imports/metadata; no `run` entrypoint.\n- `workspace/contract.json` / `task.json` — `run(input, output_size, align_corners=False, scales_h=None, scales_w=None)`, no mutation/alias, compatibility-only phase.\n\n## Exactly what changed for compatibility (algorithm untouched)\nKernel body, loop nesting, bilinear weights/formula, clamping, `align_corners` branches, autotune key `[\"N\",\"C\",\"OH\",\"OW\"]`, and the 2D grid `(cdiv(OW, BLOCK_X), cdiv(OH, BLOCK_Y))` are all preserved.\n\n1. `tl.store(ptr_o + offset_o, result)` → `tl.store(ptr_o + offset_o, result.to(ptr_o.dtype.element_ty))` — fixes the reported value/pointer dtype mismatch; accumulation stays fp32, cast only at store.\n2. `tle.program_id` → `tl.program_id` (FlagGems lang-extension dependency removed).\n3. `configs=runtime.get_tuned_config(\"upsample_bilinear2d\")` → local `_UPSAMPLE_BILINEAR2D_CONFIGS = [triton.Config({\"BLOCK_X\": 32, \"BLOCK_Y\": 32})]`; same autotune decorator, key, and grid lambda.\n4. Removed `from flag_gems import runtime`, `torch_device_fn`, the `input.device.type == runtime.device.name` assert and the `torch_device_fn.device(...)` context; launch is now a plain Triton launch, output still allocated with `torch.empty(..., device=input.device, dtype=input.dtype)`.\n5. Removed `import logging`/logger (the preflight import checker only permits torch, torch_npu, triton, math, functools, typing, os).\n6. Added `run = upsample_bilinear2d`; no other host-signature or semantic change.\n\nNo performance optimization, no historical implementation, no PyTorch/CANN target computation or native DMA.\n\n## Validation status\n- First preflight: rejected on disallowed `logging` import (host-only).\n- Second preflight: `status = awaiting_source_review`, source_sha256 `7b6870a9d281fb574a45c4af85e2f3f8263c3310601bb92255473fd2ee84ef31`, reason: awaiting external read-only path/address-boundary review. No compile, correctness, or performance result exists yet.\n\n## Remaining uncertainty\n- Whether Triton-Ascend accepts scalar `tl.where` conditions and `ptr.dtype.element_ty` exactly as written (expected from Triton 3.x; not yet compiled).\n- Actual upstream tuned BLOCK_X/BLOCK_Y are unavailable; the 32×32 local config is placeholder metadata, not a performance claim.\n- Whether the runtime harness sets the npu device now that the FlagGems device context is gone.\n- `diagnosis.json` now records the preflight observations; candidate left unchanged."
+  }
+}

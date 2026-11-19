@@ -40,7 +40,7 @@ def main():
  shutil.copytree(operator/'references/cann',run/'reference-catalog')
  c=dict(env,operator=m['operator'],context_kind='operator_transfer',phase='development',active_source='candidate.py',
    package=str(snapshot),run_directory=str(run),method_manifest=str(run/'method-manifest.json'),require_preflight_review=True,
-   formal_cases=m['formal_cases'],maximum_preflight_sources=3,maximum_formal_sources=3,
+   formal_cases=m['formal_cases'],maximum_preflight_sources=0,maximum_formal_sources=0,
    job=dict(operator=m['operator'],archive=str(run/'operator.tar'),request=str(run/'request.json'),checks=checks,
             reference_kind=m['reference_kind']))
  c['special_checks']={}

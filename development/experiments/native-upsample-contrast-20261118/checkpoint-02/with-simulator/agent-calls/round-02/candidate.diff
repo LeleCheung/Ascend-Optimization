@@ -1,0 +1,293 @@
+--- parent
+
++++ candidate
+
+@@ -35,33 +35,22 @@
+
+         return False
+ 
+ 
+-def device_context(device):
++def _device_context(device):
+     npu = getattr(torch, "npu", None)
+     if npu is not None:
+         return npu.device(device)
+     return _NullDeviceContext()
+ 
+ 
+-def get_upsample_bilinear2d_configs():
+-    """Self-contained copy of the FlagGems tuned config metadata for
+-    upsample_bilinear2d (same BLOCK_X/BLOCK_Y/num_warps grid as
+-    runtime.get_tuned_config); metadata only, no device computation."""
+-    return [
+-        triton.Config(
+-            {"BLOCK_X": block_x, "BLOCK_Y": block_y},
+-            num_warps=num_warps,
+-            num_stages=2,
+-        )
+-        for block_x in (64, 128, 256, 512)
+-        for block_y in (1, 2)
+-        for num_warps in (8, 4)
+-    ]
+-
+-
+-@triton.autotune(
+-    configs=get_upsample_bilinear2d_configs(),
+-    key=["N", "C", "OH", "OW"],
+-)
++# Compatibility edit: the native @triton.autotune wrapper is removed.  Its
++# benchmark path (do_bench -> driver clear_cache -> aten.zero_) is not an
++# allowed entry in this harness, so the generic kernel is launched with one
++# fixed constexpr config taken from the same native tuned space
++# (BLOCK_X=256, BLOCK_Y=2).  No arithmetic or geometry change.
++_GENERIC_BLOCK_X = 256
++_GENERIC_BLOCK_Y = 2
++
++
+ @triton.jit
+ def upsample_bilinear2d_kernel(
+     ptr_o,
+@@ -169,8 +158,9 @@
+
+     IW,
+     OH,
+     OW,
+-    TAIL: tl.constexpr,
++    ROWS: tl.constexpr,
+     BLOCK_J: tl.constexpr,
++    MASKED: tl.constexpr,
+ ):
+     # Exact-2x bilinear upsampling with align_corners=False.
+     #
+@@ -179,53 +169,47 @@
+
+     #   output row 2*i + 1 = 0.75 * in[i]   + 0.25 * in[i+1]
+     # and the same pair of weights applies along the width, so every input
+     # element of the (i-1, i, i+1) x (j-1, j, j+1) stencil is reached with an
+-    # affine, contiguous address.  (n, c) and the input row are grid axes, so
+-    # the kernel has no serial slice loop.
++    # affine, contiguous address.
++    #
++    # Each program covers a ROWS x BLOCK_J tile of the input, i.e. ROWS input
++    # rows and up to BLOCK_J input columns, and produces the corresponding
++    # 2*ROWS output rows.  Row-tiling keeps the number of programs small and
++    # makes every load one contiguous multi-row transfer instead of one
++    # 256-byte row fragment, so the fixed per-program cost is amortised over
++    # 8x more output.
+     pid_j = tl.program_id(axis=0)
+-    i = tl.program_id(axis=1)
++    pid_i = tl.program_id(axis=1)
+     nc = tl.program_id(axis=2)
+ 
+-    j = pid_j * BLOCK_J + tl.arange(0, BLOCK_J)
++    j = pid_j * BLOCK_J + tl.arange(0, BLOCK_J)  # (BLOCK_J,)
++    i = pid_i * ROWS + tl.arange(0, ROWS)  # (ROWS,)
+     b2 = tl.arange(0, 2)
+ 
+-    # Edge clamping keeps the fixed weights exact at the image border.
+-    m_left = j > 0
+-    m_right = j < (IW - 1)
+-    if TAIL:
+-        j_ok = j < IW
+-        m_left = m_left & j_ok
+-        m_right = m_right & j_ok
+-
+-    im = tl.maximum(i - 1, 0)
++    # Edge clamping is done on the *addresses*: for j == 0 the left sample
++    # degenerates to the centre sample, which is exactly PyTorch's border
++    # replication, so no mask and no register fix-up select are needed.
++    jl = tl.maximum(j - 1, 0)
++    jr = tl.minimum(j + 1, IW - 1)
++    jc = tl.minimum(j, IW - 1)  # in bounds even in the width tail
++
++    im = tl.minimum(tl.maximum(i - 1, 0), IH - 1)
++    ic = tl.minimum(i, IH - 1)  # in bounds even in the row tail
+     ip = tl.minimum(i + 1, IH - 1)
+ 
+     base_i = nc.to(tl.int64) * IH * IW
+-    row_m = ptr_i + (base_i + im * IW)
+-    row_c = ptr_i + (base_i + i * IW)
+-    row_p = ptr_i + (base_i + ip * IW)
+-
+-    ml = tl.load(row_m + (j - 1), mask=m_left, other=0.0).to(tl.float32)
+-    mr = tl.load(row_m + (j + 1), mask=m_right, other=0.0).to(tl.float32)
+-    cl = tl.load(row_c + (j - 1), mask=m_left, other=0.0).to(tl.float32)
+-    cr = tl.load(row_c + (j + 1), mask=m_right, other=0.0).to(tl.float32)
+-    pl = tl.load(row_p + (j - 1), mask=m_left, other=0.0).to(tl.float32)
+-    pr = tl.load(row_p + (j + 1), mask=m_right, other=0.0).to(tl.float32)
+-    if TAIL:
+-        mc = tl.load(row_m + j, mask=j_ok, other=0.0).to(tl.float32)
+-        cc = tl.load(row_c + j, mask=j_ok, other=0.0).to(tl.float32)
+-        pc = tl.load(row_p + j, mask=j_ok, other=0.0).to(tl.float32)
+-    else:
+-        mc = tl.load(row_m + j).to(tl.float32)
+-        cc = tl.load(row_c + j).to(tl.float32)
+-        pc = tl.load(row_p + j).to(tl.float32)
+-
+-    # Replace the masked lanes by the clamped (edge) sample in registers.
+-    ml = tl.where(j > 0, ml, mc)
+-    mr = tl.where(j < (IW - 1), mr, mc)
+-    cl = tl.where(j > 0, cl, cc)
+-    cr = tl.where(j < (IW - 1), cr, cc)
+-    pl = tl.where(j > 0, pl, pc)
+-    pr = tl.where(j < (IW - 1), pr, pc)
++    row_m = ptr_i + (base_i + im * IW)[:, None]
++    row_c = ptr_i + (base_i + ic * IW)[:, None]
++    row_p = ptr_i + (base_i + ip * IW)[:, None]
++
++    ml = tl.load(row_m + jl[None, :]).to(tl.float32)
++    mc = tl.load(row_m + jc[None, :]).to(tl.float32)
++    mr = tl.load(row_m + jr[None, :]).to(tl.float32)
++    cl = tl.load(row_c + jl[None, :]).to(tl.float32)
++    cc = tl.load(row_c + jc[None, :]).to(tl.float32)
++    cr = tl.load(row_c + jr[None, :]).to(tl.float32)
++    pl = tl.load(row_p + jl[None, :]).to(tl.float32)
++    pc = tl.load(row_p + jc[None, :]).to(tl.float32)
++    pr = tl.load(row_p + jr[None, :]).to(tl.float32)
+ 
+     # Vertical half of the separable interpolation.
+     e_l = 0.25 * ml + 0.75 * cl
+@@ -235,23 +219,23 @@
+
+     o_c = 0.75 * cc + 0.25 * pc
+     o_r = 0.75 * cr + 0.25 * pr
+ 
+-    # Horizontal half, laid out as (BLOCK_J, 2) column pairs so that both
+-    # stores are contiguous in the output row.
++    # Horizontal half, laid out as (ROWS, BLOCK_J, 2) column pairs so that both
++    # stores stay contiguous inside an output row.
+     pair_e = tl.where(
+-        b2[None, :] == 0,
+-        (0.25 * e_l + 0.75 * e_c)[:, None],
+-        (0.75 * e_c + 0.25 * e_r)[:, None],
++        b2[None, None, :] == 0,
++        (0.25 * e_l + 0.75 * e_c)[:, :, None],
++        (0.75 * e_c + 0.25 * e_r)[:, :, None],
+     )
+     pair_o = tl.where(
+-        b2[None, :] == 0,
+-        (0.25 * o_l + 0.75 * o_c)[:, None],
+-        (0.75 * o_c + 0.25 * o_r)[:, None],
+-    )
+-
+-    col = 2 * j[:, None] + b2[None, :]
+-    out0 = nc.to(tl.int64) * OH * OW + (2 * i) * OW
+-    if TAIL:
+-        m_store = (j < IW)[:, None] & (b2[None, :] < 2)
++        b2[None, None, :] == 0,
++        (0.25 * o_l + 0.75 * o_c)[:, :, None],
++        (0.75 * o_c + 0.25 * o_r)[:, :, None],
++    )
++
++    col = (2 * j)[None, :, None] + b2[None, None, :]
++    out0 = nc.to(tl.int64) * OH * OW + (2 * i)[:, None, None] * OW
++    if MASKED:
++        m_store = (i < IH)[:, None, None] & (j < IW)[None, :, None]
+         tl.store(ptr_o + out0 + col, pair_e, mask=m_store)
+         tl.store(ptr_o + out0 + OW + col, pair_o, mask=m_store)
+     else:
+@@ -259,7 +243,7 @@
+
+         tl.store(ptr_o + out0 + OW + col, pair_o)
+ 
+ 
+-def bilinear_reciprocal_scale(src_size, dst_size, align_corners, scale):
++def _bilinear_reciprocal_scale(src_size, dst_size, align_corners, scale):
+     if align_corners:
+         if dst_size > 1:
+             return (src_size - 1) / (dst_size - 1)
+@@ -272,7 +256,7 @@
+
+             return src_size / dst_size
+ 
+ 
+-def upsample_bilinear2d(
++def _upsample_bilinear2d(
+     input: torch.Tensor,
+     output_size: Tuple[int],
+     align_corners: bool = False,
+@@ -286,8 +270,8 @@
+
+     OH, OW = output_size
+     N, C, IH, IW = input.shape
+ 
+-    reciprocal_scale_h = bilinear_reciprocal_scale(IH, OH, align_corners, scales_h)
+-    reciprocal_scale_w = bilinear_reciprocal_scale(IW, OW, align_corners, scales_w)
++    reciprocal_scale_h = _bilinear_reciprocal_scale(IH, OH, align_corners, scales_h)
++    reciprocal_scale_w = _bilinear_reciprocal_scale(IW, OW, align_corners, scales_w)
+ 
+     # Allocate output
+     output = torch.empty((N, C, OH, OW), device=input.device, dtype=input.dtype)
+@@ -304,11 +288,12 @@
+
+         and reciprocal_scale_w == 0.5
+     )
+     if use_exact_2x:
++        rows = 8
+         block_j = 128
+-        tail = (IW % block_j) != 0
+-        with device_context(input.device):
++        masked = (IH % rows) != 0 or (IW % block_j) != 0
++        with _device_context(input.device):
+             upsample_bilinear2d_2x_kernel[
+-                (triton.cdiv(IW, block_j), IH, N * C)
++                (triton.cdiv(IW, block_j), triton.cdiv(IH, rows), N * C)
+             ](
+                 output,
+                 input,
+@@ -316,17 +301,18 @@
+
+                 IW,
+                 OH,
+                 OW,
+-                tail,
++                rows,
+                 block_j,
++                masked,
+             )
+         return output
+ 
+-    grid = lambda META: (
+-        triton.cdiv(OW, META["BLOCK_X"]),
+-        triton.cdiv(OH, META["BLOCK_Y"]),
+-    )
+-
+-    with device_context(input.device):
++    grid = (
++        triton.cdiv(OW, _GENERIC_BLOCK_X),
++        triton.cdiv(OH, _GENERIC_BLOCK_Y),
++    )
++
++    with _device_context(input.device):
+         upsample_bilinear2d_kernel[grid](
+             output,
+             input,
+@@ -339,12 +325,16 @@
+
+             reciprocal_scale_h,
+             reciprocal_scale_w,
+             align_corners,
++            _GENERIC_BLOCK_X,
++            _GENERIC_BLOCK_Y,
++            num_warps=4,
++            num_stages=2,
+         )
+     return output
+ 
+ 
+-# Public entrypoint required by the evaluation contract; same signature as the
+-# exported operator function.
++# Public entrypoint required by the evaluation contract (single public symbol,
++# same signature as the native exported operator).
+ def run(
+     input: torch.Tensor,
+     output_size: Tuple[int],
+@@ -352,6 +342,6 @@
+
+     scales_h: Optional[float] = None,
+     scales_w: Optional[float] = None,
+ ) -> torch.Tensor:
+-    return upsample_bilinear2d(
++    return _upsample_bilinear2d(
+         input, output_size, align_corners, scales_h, scales_w
+     )

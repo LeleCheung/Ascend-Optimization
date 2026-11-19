@@ -338,6 +338,19 @@ def render(rows,out,root):
             original=folder/name;backup=folder/('raw-'+name)
             if original.exists() and not backup.exists():backup.write_bytes(original.read_bytes())
         chart=svg(row,known)
+        attribution_html=''
+        attribution_records=row.get('mainline_attribution_review',[])+[r for r in row.get('attribution_review',[]) if r['source_sha256'] not in {a['source_sha256'] for a in row.get('mainline_attribution_review',[])}]
+        if attribution_records:
+            from .attribution import tooltip
+            save(folder/'method-attribution.json',attribution_records)
+            entries=[]
+            for record in attribution_records:
+                title=record['method']+('*' if record['confidence']=='inferred' else '')
+                entries.append('<tr><td>'+html.escape(title)+'</td><td>'+html.escape(tooltip(record))+'</td><td>'+html.escape(record.get('outcome',record.get('scope','')))+'</td></tr>')
+            attribution_html='<details><summary>逐点方法来源与推断依据</summary><p>* 表示推断；依据区分历史上下文与事后源码差异。未加星的条目有明确记录。源码差异可说明修改机制，不自动证明 Agent 当时使用了哪种工具。</p><table><tr><th>方法</th><th>依据</th><th>结果／范围</th></tr>'+''.join(entries)+'</table><p><a href="method-attribution.json">来源记录</a></p></details>'
+            if any(r['confidence']=='inferred' for r in row['attribution_review']):
+                (folder/'method-history.svg').write_text(svg(row,known,True),encoding='utf-8')
+                attribution_html=attribution_html.replace('</details>','<p><a href="method-history.svg">查看含推断标注的历史图</a></p></details>')
         (folder/'mainline.svg').write_text(chart,encoding='utf8');save(folder/'cann-view.json',row)
         main=[]
         for i,e in enumerate(row['display_events']):
@@ -365,18 +378,19 @@ def render(rows,out,root):
                            '<a href="method-transfer.json">查看原始迁移记录</a></p>')
         page=(f'<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{op} 有效交付进展</title><style>{css}</style>'
               '<p><a href="../index.html">返回26项总览</a> · <a href="mainline.png">PNG</a> · <a href="mainline.svg">SVG</a> · <a href="cann-view.json">换算与筛选证据</a> · <a href="../recovery.html">本轮实验</a></p>'
-              '<div class="viewport">'+chart+'</div>'+transfer_html+
+              '<div class="viewport">'+chart+'</div>'+transfer_html+attribution_html+
               '<p>≈为固定CANN参考重算；交付点为原验收实测。本轮点是后续验证，尚未覆盖交付包。未显示的探索仍保留。</p>'
               '<details><summary>主图数值：重算值与原始成绩</summary><p>节点形状按相邻展示版本的源码差异分类；灰点为原生起点或同实现复测。具体变化函数与源码SHA保存在换算与筛选证据的change_location字段。</p><table><tr><th>节点</th><th>CANN标尺</th><th>原始成绩</th><th>源码</th><th>批次</th><th>修改位置</th></tr>'+''.join(main)+'</table></details>'
               '<details><summary>移入历史详情的记录（含待审查与有效退步）</summary><table><tr><th>源码</th><th>原因</th><th>原始成绩</th><th>批次</th></tr>'+''.join(details)+'</table></details>'
               '<details><summary>原始探索图与全部证据</summary><p><a href="raw-mainline.svg">上版原始主线图</a> · <a href="history.svg">原始历史图</a> · <a href="trace.json">原始trace数据</a></p></details></html>')
         (folder/'index.html').write_text(page,encoding='utf8')
-        cards.append(f'<div class="card"><a href="{op}/index.html" aria-label="{op} 轨迹详情"><img src="{op}/mainline.svg" alt="{op} CANN加速比轨迹"></a></div>')
+        cards.append(f'<div class="card"><a href="{op}/index.html" aria-label="{op} 轨迹详情">'+chart.replace('<svg ','<svg style="display:block;width:100%;height:auto" ',1)+'</a></div>')
         first=row['display_events'][0];label='原生未通过' if first['score'] is None else f"≈{first['score']:.3f}×"
         notes.append(f'| [{op}]({op}/index.html) | {len(row["display_events"])} | {label} | {row["delivery"]["cann_score"]:.3f}× |')
     index=out/'index.html'
     if index.exists() and not (out/'raw-index.html').exists():(out/'raw-index.html').write_bytes(index.read_bytes())
     recovery_link=' · <a href="recovery.html">本轮恢复与优化</a>' if (out/'recovery.html').exists() else ''
+    recovery_link+=' · <a href="attribution-share.svg">方法来源占比</a>'
     index.write_text('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>26项有效交付进展</title><style>'+css+'</style><h1>26项有效交付进展 · CANN统一参考</h1><p>≈：历史耗时重算；交付终点：CANN实测。仅原生起点允许显示失败叉号。</p><p><a href="cann-view-method.md">换算公式与筛选说明</a> · <a href="cann-view.json">结构化证据</a>'+recovery_link+'</p><div class="cards">'+''.join(cards)+'</div></html>',encoding='utf8')
     (out/'cann-view-method.md').write_text('\n'.join(notes)+'\n',encoding='utf8')
 
@@ -392,9 +406,14 @@ def main():
     rows=[normalize(r,root,links,evidence,latencies,inventory) for r in graph['operators']]
     from .change_locations import annotate
     annotate(rows,root)
+    from .attribution import annotate as annotate_attribution
+    annotate_attribution(rows,root)
     save(out/'cann-view.json',dict(operators=rows))
     render(rows,out,root)
-    if a.png:export_check(out)
+    from .progress_view import update_catalog
+    if out==root/'development/reports/operator-traces-stitched-20261117':
+        update_catalog(root,png=a.png)
+    elif a.png:export_check(out)
     print(json.dumps({'operators':len(rows),'mainline_nodes':sum(len(r['display_events']) for r in rows),
         'rebased_points':sum(len(r['conversions']) for r in rows),'excluded':dict(collections.Counter(x['reason'] for r in rows for x in r['excluded'])),
         'exploratory_regressions_moved':sum(len(r['moved_exploration']) for r in rows)},ensure_ascii=False))

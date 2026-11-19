@@ -1,0 +1,13 @@
+{
+  "schema": "hgkda.trace-event/v1",
+  "id": "bd25be6351cc455c91aedd196275a66d",
+  "recorded_at": "2026-11-18T08:18:23.911778+00:00",
+  "kind": "research_layer_decision",
+  "operator": "upsample_bilinear2d",
+  "round_id": "attempt-002",
+  "parent_round_id": null,
+  "selected_layer": "kernel_writeback_layout",
+  "layer_reason": "证据把损失集中在写回端的寄存器级交织，而不是全局带宽或选路：目标 case（f16, 4x32x128x128 -> 256x256, align_corners=False, 精确 2x）走 upsample_bilinear2d_2x_kernel；成对 profiling 的逐块均值显示候选 aiv_vec_ratio=0.718（参考 0.326）而 aiv_mte3_ratio=0.027、aiv_mte2_ratio=0.251，说明块时间被 VECTOR 流水占满、写回 DMA 并非热点；模拟器部分窗口里时间权重最高的指令组（BAR/WAIT_FLAG/VREDUCEV2，单个 1.3-3.2us）全部归属到源码第 252 行 tl.interleave；实际 IR 进一步显示该 tl.interleave 被降成 tt.join + tt.reshape，bcmlir 里落实为对 16x128x2 缓冲的两次带步长 insert_slice 加一次 reshape/copy，即在 UB 内逐元素重排后再整行写回。因此修改点应放在同一 kernel 的写回数据组织上，不改网格、tile、掩码、寻址与通用路径。",
+  "simulator_incremental_judgment": "本轮模拟器报告的新增判断（相对已有成对 profiling）：在 application 未完成的 11.7us 部分窗口里，VECTOR 有效占用 48%、等待占用 23%，而 MTE3 只有 2 个事件（0.50us 有效），且窗口内时间权重最高的 9 条指令全部归属源码第 252 行的 tl.interleave（BAR 3.24us、WAIT_FLAG 3.24us、VREDUCEV2 1.31us 等）。这只支持'写回端的交织重排是该窗口内的热点、写回 DMA 不是'这一排序判断，不构成整核耗时或加速比结论：指令时间可重叠、窗口不完整、无硬件泳道关键路径，故整核收益仍以宿主完整评测为准。",
+  "decision_id": "9fbd1a17eb1647afaef7aef1d7238781"
+}

@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 33,
+    "duration_ms": 189111,
+    "usage": {
+      "input_tokens": 53080,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1260416,
+      "output_tokens": 31992,
+      "output_tokens_details": {
+        "thinking_tokens": 22453
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 53080,
+        "outputTokens": 31992,
+        "cacheReadInputTokens": 1260416,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.695408,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 22453,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.695408,
+    "result": "Preflight returned `awaiting_source_review`, so the source stays frozen as-is. Summary of this call:\n\n**Registered decision** — `b5b6602648b6434fab7f381c10f78074` (pre-edit, bound to `ff8ebf58…`).\n\n**Diagnosis (evidence-bound, not syntax-guessed)**\n- `workspace/current-profiling.json`: timing-1 device task 1205.6 us with `Block Dim` 16384; per-block mean `aiv_mte2_time` 1.14 us at only **1.92 GB/s** active bandwidth, `aiv_mte3_time` 0.26 us, scalar/vector small (coverage is the 23-row partial window, treated as distribution means only).\n- `workspace/simulator-evidence.json`: single-core 28.4 us window over 8 program slots — ~3.56 us cadence per program, MTE2 active 40 % (the only materially busy lane), ALL/FLOWCTRL idle, tiny vector work. That distinguishes *program-count/dispatch + small-transfer bound* from *vector-arithmetic bound*.\n- `workspace/previous-result.json`: 24/24 correct but 0.3158 geo-mean (timing-1 0.1997×), i.e. a performance failure, not a win.\n- `workspace/candidate.py`: 16384 programs each owning one 128-wide row, 9 masked row loads (256 B each) + 2 stores → ~4 KB per program.\n\n**Single mechanism change** — row tiling of the exact-2x path: one program now owns `BLOCK_I` input rows × `BLOCK_J` columns as 2-D tiles, grid `(cdiv(IW,BJ), cdiv(IH,BI), N*C)`. `BLOCK_I` is chosen from call metadata only (largest of 16/8/4/2/1 keeping ≥192 programs), so timing-1 goes 16384 → 1024 programs and small cases 1024 → 256. Per-element arithmetic (0.25/0.75 blends, interleave, edge replication, fp32 accumulate) is byte-for-byte the same as the passing kernel; the generic non-2x path, allocation and `run()` signature are untouched. No compatibility edits were needed this round.\n\n**Expected** — timing-1 device time from 1205 us toward ≤300 us, `Block Dim` 1024, `aiv_mte2_active_bw` well above 1.9 GB/s; small cases ~78 → ~25-35 us; correctness unchanged.\n\n**Real uncertainties** — (1) whether Triton-Ascend lowers 2-D masked tile loads and 2-D `tl.interleave` to bulk copies rather than per-lane access; (2) whether a 16×128 tile with fp32 temporaries fits the 192 KB UB (fallback: `BLOCK_I=8`); (3) how much of the small cases' ~78 us floor is host launch vs device cadence. Preflight (compile/path review) and the host's full evaluation plus a fresh profiling/simulator capture for SHA `6e7fed2d…` are needed to settle all three."
+  }
+}

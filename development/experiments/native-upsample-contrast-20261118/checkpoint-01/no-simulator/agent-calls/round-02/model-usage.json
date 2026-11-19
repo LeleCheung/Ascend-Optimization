@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 28,
+    "duration_ms": 64129,
+    "usage": {
+      "input_tokens": 42395,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 698880,
+      "output_tokens": 9817,
+      "output_tokens_details": {
+        "thinking_tokens": 3630
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 42395,
+        "outputTokens": 9817,
+        "cacheReadInputTokens": 698880,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 0.80684,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 3630,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 0.80684,
+    "result": "Preflight returned `awaiting_source_review` for source `3e25b7864bdfe7a33b4633fdf394f108885965c64100f651f3dc026153afeed8`; candidate left unchanged as instructed.\n\n## What this call did\n\n**Repair of the round-01 formal failure (interface, not performance).** All 24 formal cases of source `6de7445151…` died at module load with `BuildError: candidate defines conflicting public symbol 'upsample_bilinear2d'` — zero cases ever reached device, so the previous round has no measured latency/speedup.\n\nEvidence read:\n- `workspace/previous-result.json` (evaluation, trigger): identical loader traceback on every correctness and timing case.\n- `workspace/candidate.py` (other, mechanism): module exposed **two** public callables — an implementation literally named `upsample_bilinear2d` (same as the contract definition name) plus `run`.\n- `workspace/latest-preflight.json` (probe, disambiguation): same bytes pass preflight, 30/30 supplementary → kernel compiles and `run` is numerically correct, so the fault is namespace binding, not compile or numerics.\n- `workspace/current-ir/6de744515133/0-kernel.ttir` (source_ir, background): 21 compiled variants exist for this exact SHA with four unmasked f16 loads + f32 interpolation + one masked f16 store.\n- `workspace/task.json` (knowledge, background): fixed `public_entrypoint: run(...)`.\n\n**Change (compatibility layer only, recorded separately from performance work):** `upsample_bilinear2d` → `_upsample_bilinear2d_impl` and `bilinear_reciprocal_scale` → `_bilinear_reciprocal_scale`; `run` is now the sole public entrypoint and forwards to the private impl. Kernel body, grid `(cdiv(OW,BLOCK_W), cdiv(OH,BLOCK_H), N*C)`, `BLOCK_W=min(1024,pow2(OW))`, `BLOCK_H=min(1024//BLOCK_W, pow2(OH))`, and all launch arguments are byte-identical in meaning, so **no performance claim is made for this round**. Decision registered before editing (`47a685b4c6db…`).\n\n## Actual uncertainties\n- The loader's exact rule is inferred from the error text only (forbid any public name equal to the definition name, vs. require exactly one public callable); the rename satisfies both readings, but is unverified until the host's formal run executes.\n- Whether the harness also calls the entrypoint by keyword (definition allows positional_or_keyword) — signature is preserved, so it should be safe.\n- Real timing on `upsample_bilinear2d-timing-1` remains **unmeasured**; the fixed starter's historical profiling is background for a different source and cannot be used as this candidate's score.\n- `upsample_bilinear2d_kernel` remains a public module symbol (name ≠ definition name); if the loader is stricter than the error suggests, that would be the next compatibility item, not a Triton change.\n\nNext call should consume the host's formal per-case result and then propose one focused Triton mechanism (e.g. 2×-upsample weight/duplication structure or tile shape for the 128→256 case) rather than bundling speculative edits."
+  }
+}

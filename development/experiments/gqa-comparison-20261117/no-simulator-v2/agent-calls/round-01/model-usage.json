@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 9,
+    "duration_ms": 37283,
+    "usage": {
+      "input_tokens": 10239,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 49920,
+      "output_tokens": 6097,
+      "output_tokens_details": {
+        "thinking_tokens": 3520
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 10239,
+        "outputTokens": 6097,
+        "cacheReadInputTokens": 49920,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 0.22858,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 3520,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 0.22858,
+    "result": "已完成。停止并交接。\n\n**假设（一个具体机制）**：case4（bf16，[4,256,64,128]）的 1900.7us 与 reference 的 131.7us 之间的差距，来自**延迟隐藏不足**，而非计算量。所有流水线基本空闲：cube 0.00088、mte2 0.00187、vec 0.0059、scalar 0.0112，而 reference 约为 0.28–0.47（证据：paired_profiling，`evidence-summary.json`）。源码触发点在 `candidate.py` 的启动参数 `num_warps=1, num_stages=1`：KV 循环每一轮都是 load K → dot → softmax → load V → dots，串行等待完整 DMA 延迟，只有单 warp 承担 fp32 softmax 与概率拆分。IR 摘录显示 `scf.for step 64` 内只有 memref.copy/transpose 加 4 个 ieee matmul，且没有预取或双缓冲结构（source_ir，`ir-excerpt.txt`），与 `num_stages=1` 一致。\n\n**另一种解释**：那 ~1% 的流水线利用率可能是 profiler 对大量等待中 block 的平均；1024 个 block（reference 仅 19 个）意味着每 program 的调度/启动开销以及掩码地址的标量计算可能才是主因，此时单纯增加 stage 不会带来显著收益。该分歧由本轮评测判定：若利用率仍 ~1%，则转向第二机制（减少 program 数 / 掩码特化）。\n\n**修改内容（小范围，仅启动参数）**：`num_warps=1→4`、`num_stages=1→2`。分块、`P_TERMS` 精度路径、dtype 与全部算术保持不变，路径选择仍只依据 shape/dtype 元数据，无 case 编号或数值特判。\n\n**预期**：case4 耗时大幅下降（2–4x 量级），cube/mte2/vec 利用率从 ~0.1–1% 升到有效占比；case1/2/7 语义不变并继续通过 checker；若流水是瓶颈，收益应随 KV 循环长度增长，因此 case4（4 轮）相对增益按理最小。\n\n**验证方式**：宿主跑四项官方 checkpass + case4 paired profiling，与 1900.72us 基线及流水线比值对照；无改善则分别消融 `num_warps` 和 `num_stages`。\n\n诊断已先写入 `diagnosis.json`，并在修改前通过工具桥 `decision --record` 保存（decision_id `e551182e4194432fb6051be61f9f7cb3`，source_sha256 `770910b7…ca585`）。"
+  }
+}

@@ -1,0 +1,48 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "28dc6386fd019bb1c946d06b23c485805344af43cd8a16f1de8d59332bc3b335",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "Same-input paired device profiling of the current source (case upsample_bilinear2d-timing-1, Op upsample_bilinear2d_2x_kernel, Block Dim 1024): candidate aiv_icache_miss_rate mean 0.17355 vs reference 0.001638 (105.9x), and aiv_scalar_wait_ib_time mean 9.3432us vs 0.02236us (417x) inside an aiv_time mean of 18.7923us per program. mte2/mte3/vec times per program are 8.05/4.08/7.27us, so the instruction-buffer wait alone is about half the per-program time."
+    },
+    {
+      "path": "workspace/current-ir/28dc6386fd01/18-kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "IR of the exact-2x fast-path kernel for the f16 128->256 geometry: TILE_I=16 is fully unrolled in straight-line code (16 concrete per-step constants c0..c15) with 54 tt.load and 32 tt.store operations on 128/256-element tiles in one basic block, about 1000 IR lines. This is the code-size source behind the measured icache miss and instruction-buffer wait, not a bandwidth or arithmetic bound."
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "Formal run of the same source: 24/24 workloads PASSED, geo_mean 0.6336; target case upsample_bilinear2d-timing-1 latency 0.48674ms vs reference 0.24546ms (speedup 0.5043), so the target needs roughly a 2x device-side reduction."
+    },
+    {
+      "path": "workspace/knowledge.json",
+      "category": "knowledge",
+      "role": "background",
+      "finding": "No task-specific optimization mechanisms are supplied for this operator (empty mechanisms list); only common skill constraints apply, so the mechanism below is inferred from IR and paired profiling rather than from retrieved knowledge."
+    }
+  ],
+  "hypothesis": "The exact-2x fast path emits one fully unrolled copy of the per-source-row body (16 copies, each 3 loads + 2 stores + about 20 vector ops), producing a roughly 1000-line straight-line kernel. The AIV instruction buffer cannot hold it, so each program repeatedly refetches instructions: measured icache miss rate 17.4 percent and scalar_wait_ib 9.34us of 18.79us per program (417x the reference). Program count (1024 blocks over about 40 AIV cores) and per-instruction DMA granularity (98 B per mte2) are secondary: mte2_time is only 8.05us and the task moves far less data than the reference (13.8MB read, 16.0MB written vs 54.6/53.5MB), with GM bandwidth usage at 0.3-0.4 percent of the reported rate.",
+  "alternatives": [
+    "Small DMA granularity dominates: 144384 mte2 instructions for 13824KB (about 98 B per mte2) would be fixed-cost bound even with a small kernel body; this predicts time stays high if only code size shrinks, and a win from batching loads into 2D tiles instead.",
+    "Vector arithmetic in fp32 dominates: vec_time is 7.27us per program with aiv_vec_fp32_ratio 0.042; this predicts a win from fp16 arithmetic or fewer blend ops rather than from code size.",
+    "Wave quantization and launch overhead dominate: 1024 programs over about 40 AIVs is 25.6 waves, so tail waste and per-program prologue could matter; this predicts a win from larger tiles per program rather than from the loop form."
+  ],
+  "discriminating_observation": "Whether per-program aiv_scalar_wait_ib_time and aiv_icache_miss_rate fall together with per-program aiv_time after the kernel body is shrunk while loads, stores, arithmetic dtype, tile size and grid stay the same. If wait_ib and icache miss drop but time does not, the DMA-granularity or fp32-vector alternatives carry the cost instead.",
+  "change": "Keep the exact-2x fast path, tile size, grid, load/store pattern and all weights identical, and turn the unrolled per-source-row step into a dynamic device loop (tl.range instead of tl.static_range) with the same two-row rolling window carried across iterations, so the per-row body is emitted once instead of 16 times.",
+  "expected": "Kernel instruction footprint drops about 16x; aiv_icache_miss_rate and aiv_scalar_wait_ib_time per program should fall sharply from 0.1736 and 9.34us, and per-program aiv_time should drop from 18.79us toward the roughly 9.5us that remains once the instruction-buffer wait is removed. upsample_bilinear2d-timing-1 should move from 486.7us toward the 245.5us reference. Per-byte vector and DMA behaviour should stay essentially unchanged because tile sizes and arithmetic are unchanged, so a large time drop is attributed to code size rather than data movement.",
+  "validation": "Preflight the edited candidate (interface and compile check), then host-run the full frozen contract: 24 formal cases plus 30 supplementary checks, and read the new current-profiling.json for the same paired case to compare icache miss rate, wait_ib time and per-program time with the prediction. If the loop form fails to compile or numerics change, revert to the preserved static_range source.",
+  "unknown": [
+    "The dynamic loop keeps the rolling window in loop-carried vectors; the Ascend backend may materialize extra copies per iteration, trading code size for vector moves.",
+    "Whether BishengIR software-pipelines the resulting dynamic loop is unknown; without pipelining the per-iteration load latency may become exposed instead of hidden by unrolling.",
+    "Icach miss rate is a per-program mean over 1024 programs while the reference side has 142 programs, so the ratio is suggestive of code size but is not a direct decomposition of wall time."
+  ],
+  "selected_layer": "Triton",
+  "layer_reason": "The mechanism is the amount of straight-line code generated for one program, which is decided in the Triton source by static_range unrolling; no compiler pass flag, launch parameter or compatibility-only edit changes it, and loads, stores and weights must stay identical so the change stays distinguishable from the other alternatives.",
+  "simulator_incremental_judgment": "This run is the control (no-simulator) arm: no simulator evidence was requested or used and simulator-evidence.json was not read. The hypothesis rests only on the paired device profiling and the actual IR of the current source; nothing is claimed from simulation or from source syntax alone."
+}

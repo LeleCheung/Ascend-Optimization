@@ -1,0 +1,176 @@
+[
+  {
+    "operator": "hardswish",
+    "source_sha256": "492997f7aae410f9e0ccded09f4d90ad184344e9d841a173bb1fb5a9ed625e80",
+    "role": "guidance",
+    "method": "流式分块与启动缓存",
+    "primary": "ir",
+    "secondary": [],
+    "confidence": "inferred",
+    "location": "mixed",
+    "evidence": [
+      {
+        "path": "development/experiments/lineage/20261117/links-v2/artifacts/492997f7aae410f9e0ccded09f4d90ad184344e9d841a173bb1fb5a9ed625e80.py",
+        "sha256": "492997f7aae410f9e0ccded09f4d90ad184344e9d841a173bb1fb5a9ed625e80"
+      }
+    ],
+    "inference_basis": "retrospective_code",
+    "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+    "changed_symbols": {
+      "kernel": [
+        "_hardswish_stream",
+        "_strict_copy_kernel",
+        "_strict_fill_kernel",
+        "_strict_random_kernel",
+        "hardswish_kernel"
+      ],
+      "host": [
+        "_FAST",
+        "_PLANS",
+        "_STREAM",
+        "_build",
+        "_geometry",
+        "_launch_jit",
+        "_slow",
+        "_stream_getter",
+        "_strict_cast",
+        "_strict_clone",
+        "_strict_contiguous",
+        "_strict_copy_into",
+        "_strict_empty_like",
+        "_strict_flatten",
+        "_strict_full",
+        "_strict_ones",
+        "_strict_rand",
+        "_strict_reshape",
+        "_strict_zeros",
+        "_vector_cores",
+        "hardswish",
+        "hardswish_out",
+        "logger",
+        "run"
+      ],
+      "shared": []
+    },
+    "event_id": "c5bfebab76192e65"
+  },
+  {
+    "operator": "hardswish",
+    "source_sha256": "7ad08150b03d80c9a2eb17b48e613401d62c311ccdf1b9b139aea5937c9dc301",
+    "role": "guidance",
+    "method": "连续完整块去除掩码",
+    "primary": "paired",
+    "secondary": [
+      "ir"
+    ],
+    "confidence": "inferred",
+    "location": "mixed",
+    "evidence": [
+      {
+        "path": "development/reports/trace-attribution-matrix-20261116.json",
+        "sha256": "ae1f2bb9a53639218c0d522e3c48c3c7058e3f70eb1ca0f471fc9c850fe26a23"
+      },
+      {
+        "path": "development/experiments/lineage/20261117/links-v7/artifacts/7ad08150b03d80c9a2eb17b48e613401d62c311ccdf1b9b139aea5937c9dc301.py",
+        "sha256": "7ad08150b03d80c9a2eb17b48e613401d62c311ccdf1b9b139aea5937c9dc301"
+      }
+    ],
+    "inference_basis": "recorded_plan",
+    "reason": "优化计划明确记载改法；结合其中的假设与测量推断主要判断来源。",
+    "plan_evidence": [
+      {
+        "kind": "performance",
+        "strategy": "Make the traversal's transfers unmasked",
+        "code_changes": "Kernel _hardswish_stream only: split the single masked streaming loop into (1) a hot loop over the statically-truncated range [pid*BLOCK, full) where full=(N//step)*step, using unmasked tl.load/tl.store on contiguous bursts, and (2) exactly one trailing masked tile at offset = full + pid*BLOCK + lane with predicate offset<N. Host geometry, BLOCK=4096, the num_vectorcore cap, fp32 compute and the cached integer-address launch are byte-identical.",
+        "hypothesis": "The large-input deficit comes from per-element masking in the streaming loop, which prevents the load/store from lowering to full unmasked contiguous DMA bursts, rather than from tile size (tile size is UB-capped: 8192 fp32 elements needs 256 KB against 192 KB available with multi-buffering). Removing the predicate from all full tiles should cut the ~0.75 us per-iteration exposed cost and raise timing-3/7 from 0.098/0.101 ms toward the 1.0 speedup band; small workloads keep grid=1..few so they should move only marginally.",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Every hot-loop transfer becomes a full unmasked contiguous DMA burst instead of a predicated one, removing per-element predicate handling and the possible non-contiguous fallback that exposes ~0.75 us of serialized latency per 4096-element tile."
+        },
+        "source": {
+          "origin": "profile_next_experiment",
+          "parent_round_num": 1
+        },
+        "key_params": {
+          "BLOCK": 4096,
+          "masked_hot_loop": false
+        },
+        "knowledge_uses": []
+      }
+    ],
+    "changed_symbols": {
+      "kernel": [
+        "_hardswish_stream"
+      ],
+      "host": [
+        "_build",
+        "_geometry"
+      ],
+      "shared": []
+    },
+    "event_id": "19b0bdde61333f81"
+  },
+  {
+    "operator": "hardswish",
+    "source_sha256": "581ad44a1694f4311efaa907e84874a5b33e9df5e8a751cd2859513a72ac1101",
+    "role": "guidance",
+    "method": "缩减小输入启动开销",
+    "primary": "paired",
+    "secondary": [
+      "ir"
+    ],
+    "confidence": "confirmed",
+    "location": "mixed",
+    "evidence": [
+      {
+        "path": "development/reports/trace-attribution-matrix-20261116.json",
+        "sha256": "ae1f2bb9a53639218c0d522e3c48c3c7058e3f70eb1ca0f471fc9c850fe26a23"
+      },
+      {
+        "path": "operators/hardswish/evidence/independent_strict/581ad44a1694-candidate.py",
+        "sha256": "581ad44a1694f4311efaa907e84874a5b33e9df5e8a751cd2859513a72ac1101"
+      }
+    ],
+    "inference_basis": "recorded_plan",
+    "reason": "计划引用小中输入完整调用耗时几乎不随规模变化的结果，据此精简分配和Python封装；此处不声称失败的msprof采集提供了硬件计数器。",
+    "plan_evidence": [
+      {
+        "kind": "performance",
+        "strategy": "Cut per-call host overhead in the small-workload regime",
+        "code_changes": "Device kernel unchanged. Host path flattened to a single frame: the _strict_empty_like/torch.empty(tuple(shape), device, dtype) call becomes a module-level torch.empty_like alias, _strict_contiguous inlined to an is_contiguous test plus _strict_clone, the plan closure removed and replaced by a module-level flat plan list (_FAST) holding dtype/n/device/launcher/grid/block/fn/packed/stream-getter, and _build now returns that plan instead of a closure so run() calls the C launcher directly with no intermediate Python frame. Stream is still re-read every call.",
+        "hypothesis": "The small/medium workloads (10 of 12 timing cases, all at ~0.030-0.034 ms regardless of n from 1024 to 1M) are bound by per-call host cost, not device time, so trimming Python work and switching to torch.empty_like should reduce each call by ~1-3 us and lift those speedups from ~0.84 toward ~0.90, while the 4096x4096 cases are unaffected (they are tile-count bound on device and their host cost is already overlapped).",
+        "expected_effect": {
+          "metric": "geo_mean",
+          "direction": "increase",
+          "mechanism": "Removing one Python frame, a tuple(x.shape)/device/dtype reconstruction on every call and the closure indirection cuts the CPU-side cost of each invocation, which is the entire cost of the small-workload regime where the device kernel is only a few microseconds."
+        },
+        "source": {
+          "origin": "coder",
+          "parent_round_num": null
+        },
+        "key_params": {
+          "host_frames": 1,
+          "alloc": "torch.empty_like"
+        },
+        "knowledge_uses": []
+      }
+    ],
+    "changed_symbols": {
+      "kernel": [
+        "_hardswish_stream"
+      ],
+      "host": [
+        "_EMPTY_LIKE",
+        "_FAST",
+        "_build",
+        "_geometry",
+        "_launch_jit",
+        "_slow",
+        "run"
+      ],
+      "shared": []
+    },
+    "event_id": "5ce322055d1c1adc"
+  }
+]

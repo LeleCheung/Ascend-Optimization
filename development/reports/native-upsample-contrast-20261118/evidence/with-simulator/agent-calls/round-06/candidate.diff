@@ -1,0 +1,230 @@
+--- parent
+
++++ candidate
+
+@@ -165,10 +165,10 @@
+
+     IW,
+     OH,
+     OW,
+-    TAIL: tl.constexpr,
++    BLOCK_I: tl.constexpr,
+     BLOCK_J: tl.constexpr,
+ ):
+-    # Exact-2x bilinear upsampling with align_corners=False.
++    # Exact-2x bilinear upsampling with align_corners=False, row-tiled.
+     #
+     # For scale exactly 2 the pixel-centre mapping degenerates to fixed weights:
+     #   output row 2*i     = 0.25 * in[i-1] + 0.75 * in[i]
+@@ -177,52 +177,57 @@
+
+     # element of the (i-1, i, i+1) x (j-1, j, j+1) stencil is reached with an
+     # affine, contiguous address.
+     #
+-    # Memory-access form (performance): each of the nine row loads uses an
+-    # affine offset (j-1, j, j+1) so the backend can emit one contiguous bulk
+-    # transfer per row instead of per-lane gather addresses.  Out-of-range edge
+-    # lanes are excluded by the load mask and restored with a constant-lane
+-    # select, which removes the max()/min() clamps that made the offsets
+-    # non-affine.  The two interleaved output columns produced by one input
+-    # column are written as one contiguous 2*BLOCK_J vector via tl.interleave,
+-    # so an output row is a single contiguous store rather than the two
+-    # stride-2 scatter stores per row used before.
++    # Memory-organisation form (performance): one program owns BLOCK_I input
++    # rows x BLOCK_J input columns, so each of the nine stencil accesses is one
++    # 2-D tile transfer (row stride IW, contiguous in the column direction)
++    # instead of a separate 256-byte row load, and the total program count
++    # drops by BLOCK_I.  Column/row edges are excluded by the load mask and
++    # restored with a register select, keeping the offsets affine.  The two
++    # interleaved output columns produced by one input column are written as
++    # one contiguous 2*BLOCK_J run via tl.interleave, so an output row is a
++    # single contiguous store.
+     pid_j = tl.program_id(axis=0)
+-    i = tl.program_id(axis=1)
++    pid_i = tl.program_id(axis=1)
+     nc = tl.program_id(axis=2)
+ 
+-    j = pid_j * BLOCK_J + tl.arange(0, BLOCK_J)
+-    # Valid input columns for this program (tail lanes stay inactive; their
+-    # loads are masked off and their stores are masked off below).
+-    inb = j < IW
++    ii = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)  # input rows of this tile
++    j = pid_j * BLOCK_J + tl.arange(0, BLOCK_J)  # input columns of this tile
++
++    # Valid input rows/columns for this program (tail lanes stay inactive;
++    # their loads and stores are masked off below).
++    row_ok = ii < IH
++    in_col = j < IW
+     has_l = (j - 1) >= 0
+     has_r = (j + 1) < IW
+ 
+-    im = tl.maximum(i - 1, 0)
+-    ip = tl.minimum(i + 1, IH - 1)
++    im = tl.maximum(ii - 1, 0)
++    ip = tl.minimum(ii + 1, IH - 1)
+ 
+     base_i = nc.to(tl.int64) * IH * IW
+-    row_m = ptr_i + (base_i + im * IW)
+-    row_c = ptr_i + (base_i + i * IW)
+-    row_p = ptr_i + (base_i + ip * IW)
+-
+-    ml = tl.load(row_m + (j - 1), mask=inb & has_l, other=0.0).to(tl.float32)
+-    mc = tl.load(row_m + j, mask=inb, other=0.0).to(tl.float32)
+-    mr = tl.load(row_m + (j + 1), mask=inb & has_r, other=0.0).to(tl.float32)
+-    cl = tl.load(row_c + (j - 1), mask=inb & has_l, other=0.0).to(tl.float32)
+-    cc = tl.load(row_c + j, mask=inb, other=0.0).to(tl.float32)
+-    cr = tl.load(row_c + (j + 1), mask=inb & has_r, other=0.0).to(tl.float32)
+-    pl = tl.load(row_p + (j - 1), mask=inb & has_l, other=0.0).to(tl.float32)
+-    pc = tl.load(row_p + j, mask=inb, other=0.0).to(tl.float32)
+-    pr = tl.load(row_p + (j + 1), mask=inb & has_r, other=0.0).to(tl.float32)
++    off_m = base_i + im[:, None] * IW
++    off_c = base_i + ii[:, None] * IW
++    off_p = base_i + ip[:, None] * IW
++
++    m_c = row_ok[:, None] & in_col[None, :]
++    m_l = m_c & has_l[None, :]
++    m_r = m_c & has_r[None, :]
++    jl = (j - 1)[None, :]
++    jc = j[None, :]
++    jr = (j + 1)[None, :]
++
++    ml = tl.load(ptr_i + off_m + jl, mask=m_l, other=0.0).to(tl.float32)
++    mc = tl.load(ptr_i + off_m + jc, mask=m_c, other=0.0).to(tl.float32)
++    mr = tl.load(ptr_i + off_m + jr, mask=m_r, other=0.0).to(tl.float32)
++    cl = tl.load(ptr_i + off_c + jl, mask=m_l, other=0.0).to(tl.float32)
++    cc = tl.load(ptr_i + off_c + jc, mask=m_c, other=0.0).to(tl.float32)
++    cr = tl.load(ptr_i + off_c + jr, mask=m_r, other=0.0).to(tl.float32)
+ 
+     # Clamped replication at the row/column borders, matching the previous
+     # clamped-index loads.
+-    ml = tl.where(has_l, ml, mc)
+-    mr = tl.where(has_r, mr, mc)
+-    cl = tl.where(has_l, cl, cc)
+-    cr = tl.where(has_r, cr, cc)
+-    pl = tl.where(has_l, pl, pc)
+-    pr = tl.where(has_r, pr, pc)
++    ml = tl.where(has_l[None, :], ml, mc)
++    mr = tl.where(has_r[None, :], mr, mc)
++    cl = tl.where(has_l[None, :], cl, cc)
++    cr = tl.where(has_r[None, :], cr, cc)
+ 
+     # Vertical half of the separable interpolation: output row 2*i blends rows
+     # (i-1, i) with weights (0.25, 0.75), output row 2*i+1 blends rows
+@@ -230,34 +235,69 @@
+
+     e_l = 0.25 * ml + 0.75 * cl
+     e_c = 0.25 * mc + 0.75 * cc
+     e_r = 0.25 * mr + 0.75 * cr
++
++    out_dtype = ptr_o.dtype.element_ty
++    out_col = (2 * pid_j) * BLOCK_J + tl.arange(0, 2 * BLOCK_J)
++    out_even_row = nc.to(tl.int64) * OH * OW + (2 * ii) * OW
++    out_odd_row = out_even_row + OW
++    m_out = row_ok[:, None] & (out_col < OW)[None, :]
++
++    # Horizontal half: output column 2*j takes (0.25, 0.75) on columns
++    # (j-1, j), output column 2*j+1 takes (0.75, 0.25) on columns (j, j+1).
++    # Both are interleaved into one contiguous 2*BLOCK_J run per output row.
++    ev = (0.25 * e_l + 0.75 * e_c).to(out_dtype)
++    od = (0.75 * e_c + 0.25 * e_r).to(out_dtype)
++    tl.store(
++        ptr_o + out_even_row[:, None] + out_col[None, :],
++        tl.interleave(ev, od),
++        mask=m_out,
++    )
++
++    pl = tl.load(ptr_i + off_p + jl, mask=m_l, other=0.0).to(tl.float32)
++    pc = tl.load(ptr_i + off_p + jc, mask=m_c, other=0.0).to(tl.float32)
++    pr = tl.load(ptr_i + off_p + jr, mask=m_r, other=0.0).to(tl.float32)
++    pl = tl.where(has_l[None, :], pl, pc)
++    pr = tl.where(has_r[None, :], pr, pc)
++
+     o_l = 0.75 * cl + 0.25 * pl
+     o_c = 0.75 * cc + 0.25 * pc
+     o_r = 0.75 * cr + 0.25 * pr
+ 
+-    # Horizontal half: output column 2*j takes (0.25, 0.75) on columns
+-    # (j-1, j), output column 2*j+1 takes (0.75, 0.25) on columns (j, j+1).
+-    # The two results are interleaved into one contiguous 2*BLOCK_J vector so
+-    # each output row is a single contiguous bulk store.
+-    out_col = (2 * pid_j) * BLOCK_J + tl.arange(0, 2 * BLOCK_J)
+-    out_dtype = ptr_o.dtype.element_ty
+-    out_even_row = nc.to(tl.int64) * OH * OW + (2 * i) * OW
+-    out_odd_row = out_even_row + OW
+-
+-    ev = (0.25 * e_l + 0.75 * e_c).to(out_dtype)
+-    od = (0.75 * e_c + 0.25 * e_r).to(out_dtype)
+     ev2 = (0.25 * o_l + 0.75 * o_c).to(out_dtype)
+     od2 = (0.75 * o_c + 0.25 * o_r).to(out_dtype)
+-
+-    even_out = tl.interleave(ev, od)
+-    odd_out = tl.interleave(ev2, od2)
+-
+-    if TAIL:
+-        omask = out_col < OW
+-        tl.store(ptr_o + out_even_row + out_col, even_out, mask=omask)
+-        tl.store(ptr_o + out_odd_row + out_col, odd_out, mask=omask)
+-    else:
+-        tl.store(ptr_o + out_even_row + out_col, even_out)
+-        tl.store(ptr_o + out_odd_row + out_col, odd_out)
++    tl.store(
++        ptr_o + out_odd_row[:, None] + out_col[None, :],
++        tl.interleave(ev2, od2),
++        mask=m_out,
++    )
++
++
++def _pow2_ceil(n):
++    p = 1
++    while p < n:
++        p *= 2
++    return p
++
++
++def select_2x_tile(ih, iw, planes):
++    """(BLOCK_I, BLOCK_J) tile for the exact-2x kernel: metadata only.
++
++    BLOCK_J is the smallest power of two covering one input row, capped at 128
++    to bound UB usage; BLOCK_I is the largest of 16/8/4/2/1 that still leaves at
++    least ~192 programs so the device stays filled on small inputs.  A block
++    covers BLOCK_I rows x 2*BLOCK_J output columns, i.e. large enough transfers
++    to amortise the per-program cost while keeping enough parallelism.
++    """
++    block_j = max(1, min(128, _pow2_ceil(iw)))
++    block_i = max(1, min(16, _pow2_ceil(ih)))
++    col_blocks = (iw + block_j - 1) // block_j
++    min_programs = 192
++    while block_i > 1:
++        row_blocks = (ih + block_i - 1) // block_i
++        if row_blocks * col_blocks * planes >= min_programs:
++            break
++        block_i //= 2
++    return block_i, block_j
+ 
+ 
+ def bilinear_reciprocal_scale(src_size, dst_size, align_corners, scale):
+@@ -305,11 +345,10 @@
+
+         and reciprocal_scale_w == 0.5
+     )
+     if use_exact_2x:
+-        block_j = 128
+-        tail = (IW % block_j) != 0
++        block_i, block_j = select_2x_tile(IH, IW, N * C)
+         with device_context(input.device):
+             upsample_bilinear2d_2x_kernel[
+-                (triton.cdiv(IW, block_j), IH, N * C)
++                (triton.cdiv(IW, block_j), triton.cdiv(IH, block_i), N * C)
+             ](
+                 output,
+                 input,
+@@ -317,7 +356,7 @@
+
+                 IW,
+                 OH,
+                 OW,
+-                tail,
++                block_i,
+                 block_j,
+             )
+         return output

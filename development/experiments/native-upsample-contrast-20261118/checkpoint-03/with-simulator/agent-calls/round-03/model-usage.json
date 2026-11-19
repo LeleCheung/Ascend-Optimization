@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 37,
+    "duration_ms": 290884,
+    "usage": {
+      "input_tokens": 57403,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1370112,
+      "output_tokens": 49078,
+      "output_tokens_details": {
+        "thinking_tokens": 36731
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 57403,
+        "outputTokens": 49078,
+        "cacheReadInputTokens": 1370112,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 2.199021,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 36731,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 2.199021,
+    "result": "Preflight returned `awaiting_source_review` for source `a9292634…`, so I stopped with the candidate unchanged. Summary of round-03:\n\n**Registered decision (before editing):** decision `e59c7208…` on the pre-edit SHA `53f4ac44…`, citing `workspace/previous-result.json` (trigger: autotuner `cache.zero_()` = forbidden non-metadata ATen), `workspace/simulator-evidence.json` and `workspace/current-profiling.json` (mechanism), and `workspace/native-runtime-facts.json` (background, bound to the starter SHA).\n\n**What I changed in `candidate.py`**\n1. Compatibility repair (separate from the perf change):\n   - Removed `@triton.autotune` + `get_upsample_bilinear2d_configs`; the generic kernel is now launched with a static, metadata-only tile from `select_block_shape(OW)` (`BLOCK_X` from the same 64/128/256/512 family, `BLOCK_Y=1`). This is the exact repair for the round-02 formal failure (autotuner benchmark → `aten.zero_.default`).\n   - Generic path store now casts explicitly: `result.to(ptr_o.dtype.element_ty)`, fixing the tt.store/pointer type mismatch class of error.\n2. Performance mechanism (one focused change): the exact-2x kernel is now entirely 1-D of width `BLOCK_J` — neighbour columns come from clamped indices `jl=max(j-1,0)`, `jr=min(j+1,IW-1)` (no mask/`other`/`where`), vertical then horizontal blends stay as separate even/odd vectors, and each output row is written by two stride-2 stores (`2*j`, `2*j+1`) instead of the `(BLOCK_J, 2)` pair tile whose 2-wide inner dimension the simulator showed executing 128 times per program (128 calls per vector PC, VECTOR productive 72 % of a 33 µs window, while block MTE2=21 / MTE3=3 instructions stayed small).\n   - Address bounds are now explicitly reviewed: every lane index is clamped, stores are masked only under `TAIL`; this also answers the round-02 safety finding about unbounded `jl` loads in width tails.\n\n**Actual uncertainties (unverified until the host runs)**\n- Whether the backend lowers the 128-lane stride-2 fp16 stores as one strided store or scalarizes them; if scalarized, write-side bytes may stay inflated and the flat `2*BLOCK_J` duplicated-index-load variant (A3) becomes the next step.\n- Whether lane-0 duplicate indices (`jl`) keep the loads affine enough.\n- The static `BLOCK_X/BLOCK_Y` for the generic path is a heuristic, not a measured optimum (that path is not the target case).\n- The predicted order-of-magnitude per-program gain is an estimate from the old-lowering trace; no compile/correctness/performance result exists for SHA `a9292634…` yet, and tile growth (A6) remains blocked behind the UB-budget failure seen with ROWS=8/BLOCK_J=128."
+  }
+}

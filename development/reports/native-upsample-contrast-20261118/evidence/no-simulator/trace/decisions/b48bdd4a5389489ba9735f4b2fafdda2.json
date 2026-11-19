@@ -1,0 +1,80 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "b48bdd4a5389489ba9735f4b2fafdda2",
+  "recorded_at": "2026-11-18T03:39:00.900454+00:00",
+  "round_id": "round-03",
+  "input_source": {
+    "path": "trace/sources/3e25b7864bdfe7a33b4633fdf394f108885965c64100f651f3dc026153afeed8.py",
+    "sha256": "3e25b7864bdfe7a33b4633fdf394f108885965c64100f651f3dc026153afeed8"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/d02c95878836a0cbfecb20dd8701198d2ba841ffb5de620a7840855c635e5c53.json",
+        "sha256": "d02c95878836a0cbfecb20dd8701198d2ba841ffb5de620a7840855c635e5c53"
+      },
+      "original": {
+        "path": "workspace/current-profiling.json",
+        "sha256": "d02c95878836a0cbfecb20dd8701198d2ba841ffb5de620a7840855c635e5c53"
+      },
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "timing-1 candidate task 146174us vs reference 246us; per-block aiv_time mean 713us x 8192 blocks. Candidate GM_to_UB_datas(KB) and read_main_memory_datas ratio ~0.00-0.33 of reference while aiv_scalar_single_time is 37.4x and aiv_vec_time 9.3x reference: the kernel moves almost no data through DMA (MTE2) and spends its time in scalar work.",
+      "source_sha256": "3e25b7864bdfe7a33b4633fdf394f108885965c64100f651f3dc026153afeed8"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/d02c95878836a0cbfecb20dd8701198d2ba841ffb5de620a7840855c635e5c53.json",
+        "sha256": "d02c95878836a0cbfecb20dd8701198d2ba841ffb5de620a7840855c635e5c53"
+      },
+      "original": {
+        "path": "workspace/current-profiling.json",
+        "sha256": "d02c95878836a0cbfecb20dd8701198d2ba841ffb5de620a7840855c635e5c53"
+      },
+      "category": "paired_profiling",
+      "role": "disambiguation",
+      "finding": "aiv_mte2_ratio ratio 6e-06 and Memory GM_to_UB_bw usage 0.0 rule out a bandwidth-bound explanation; the cost is scalarized per-element address/load work, not memory volume.",
+      "source_sha256": "3e25b7864bdfe7a33b4633fdf394f108885965c64100f651f3dc026153afeed8"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/26911ed523219a60d94995d73c832ab5f5becc92226365f2cd49dba4d55427c8.ttir",
+        "sha256": "26911ed523219a60d94995d73c832ab5f5becc92226365f2cd49dba4d55427c8"
+      },
+      "original": {
+        "path": "workspace/current-ir/3e25b7864bdf/20-kernel.ttir",
+        "sha256": "26911ed523219a60d94995d73c832ab5f5becc92226365f2cd49dba4d55427c8"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "The 4 input reads are tt.load on tensor<4x256x!tt.ptr> built from broadcast irregular index vectors (row0/col0/col1). Addresses are non-affine in the lane axis, so the 1024-element tile cannot lower to a contiguous DMA copy and is emitted as scalar loads; the same holds for the other cases (all 21 IRs have 4 such loads).",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/22e74ddbffcb57c28c70823ee8d30da01dc4bc4cdf3cc17a93db446794ad710f.json",
+        "sha256": "22e74ddbffcb57c28c70823ee8d30da01dc4bc4cdf3cc17a93db446794ad710f"
+      },
+      "original": {
+        "path": "workspace/contract.json",
+        "sha256": "22e74ddbffcb57c28c70823ee8d30da01dc4bc4cdf3cc17a93db446794ad710f"
+      },
+      "category": "other",
+      "role": "background",
+      "finding": "Public signature run(input, output_size, align_corners=False, scales_h=None, scales_w=None); must stay general (align_corners and arbitrary scales) with the same output semantics.",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "The dominant cost is per-element scalar gather loads caused by the irregular 2D address tensor. For the integer 2x upsample geometry that the target case (and both other large timing cases) use with align_corners=False, bilinear interpolation degenerates to fixed weights 1/4 and 3/4 with unit index shifts: out_even = 0.25*prev+0.75*cur and out_odd = 0.75*cur+0.25*next, in both H and W. Those can be expressed with only stride-1 (affine) loads and two contiguous row stores, so all input/output traffic becomes DMA-able and all per-element index arithmetic disappears.",
+  "change": "Add a shape-gated 2x fast path (align_corners=False, OH==2*IH, OW==2*IW, reciprocal scales==0.5) that computes each source row's horizontally interpolated row with two clamped stride-1 shifted loads and one full-row load, interleaves even/odd columns with tl.join+tl.reshape, blends three consecutive source rows into two output rows and stores them contiguously. The existing general gather kernel is kept unchanged as fallback for every other geometry/scale.",
+  "expected": "Target case (FP16 4x32x128x128 -> 256x256, 16384 small programs) should fall from ~146ms by orders of magnitude and approach the reference ~0.25ms; no change for non-2x cases because they use the fallback path.",
+  "validation": "Bridge preflight: compile + 30 supplementary checks. Then host formal evaluation: 24 correctness cases plus 6 timing cases, comparing timing-1 full-call time and checking geo-mean speedup.",
+  "alternatives": [
+    "Keep the gather kernel and shrink BLOCK_H/BLOCK_W: reduces tile size but keeps scalarized loads, so it cannot remove the 37x scalar-time gap.",
+    "Load contiguous rows and use tl.gather along width to select neighbours: removes GM scalar loads but still emits one per-element UB gather per neighbour, so it may stay scalar-pipe bound.",
+    "Specialize for a general integer factor k with k-way tl.join/reshape interleave: more general but much larger change; a k=2 fast path plus the existing general fallback is the minimal discriminator."
+  ],
+  "discriminating_observation": "If the scalar-gather diagnosis is right, replacing the irregular pointer-tensor loads with affine stride-1 loads plus contiguous stores will drive aiv_scalar_single_time and aiv_vec_time down by ~1-2 orders of magnitude and expose MTE2 DMA traffic, while a further gather-based variant would leave the scalar pipe hot. The target-case full-call time should drop from ~146ms toward the sub-millisecond range.",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

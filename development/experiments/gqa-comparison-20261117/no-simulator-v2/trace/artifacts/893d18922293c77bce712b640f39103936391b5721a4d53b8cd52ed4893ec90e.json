@@ -1,0 +1,32 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "770910b7b720dd72ebf498d1baec91d0e254f032d1201da6316747bf290ca585",
+  "evidence": [
+    {
+      "path": "workspace/evidence-summary.json",
+      "category": "paired_profiling",
+      "role": "mechanism",
+      "finding": "case4 (bf16, [4,256,64,128], GQA G=8) candidate 1900.72us vs reference 131.70us. Candidate pipes are all near idle: aic_cube_ratio 0.00088, aic_mte2 0.00187, aic_fixpipe 0.00237, aiv_vec 0.0059, aiv_mte2 0.00217, aiv_scalar 0.0112 (reference: cube 0.279, mte2 0.413, vec 0.465). Every unit is <1.2% busy for the whole 1.9ms task, so the schedule is dominated by exposed latency / serialization, not by any pipe's throughput."
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "trigger",
+      "finding": "run() launches _gqa_fwd_kernel with num_warps=1, num_stages=1 (lines 172). With num_stages=1 the compiler emits no multi-buffered prefetch for the KV-block loop, so each iteration is load K -> dot -> softmax -> load V -> dots with a full DMA latency exposed between stages; with num_warps=1 all of the per-iteration vector work (exp2 on 64x64 fp32, 3-way p split on 64x64) sits on a single warp's share of the vector core."
+    },
+    {
+      "path": "workspace/ir-excerpt.txt",
+      "category": "source_ir",
+      "role": "background",
+      "finding": "The bf16 loop body (scf.for step 64) copies each K tile through a fresh memref (memref.copy into alloc, then bufferization.to_tensor), does an explicit linalg.transpose 64x128->128x64, then 4 ieee matmuls (1 QK + 3 PV terms at lines 134/178/179/186). There is no prefetch/double-buffer structure around the loads inside the loop, matching num_stages=1; the per-iteration tile work is small relative to the DMA latency it waits on."
+    }
+  ],
+  "hypothesis": "Case4's 1.4ms excess is a latency-hiding (pipelining/parallelism) deficit, not arithmetic cost: with num_stages=1 no K/V load overlaps the previous iteration's cube/vector work, and num_warps=1 leaves the fp32 softmax + 3-term probability split on a single warp. Enabling multi-stage prefetch and more warps should cut the stall time substantially without touching the math.",
+  "change": "Launch-parameter-only edit in run(): num_stages=1 -> 2 (multi-buffer the K/V loads across the KV-block loop) and num_warps=1 -> 4 (spread the per-iteration vector work over more of the vector core). Tiling (BLOCK_M/BLOCK_N/BLOCK_D), the P_TERMS precision path, dtype handling and all arithmetic are unchanged, so output values and output dtype are bit-identical in intent.",
+  "expected": "Case4 wall time drops well below 1900us (target: a large multiple, order 2-4x) with cube/mte2/vec ratios rising from ~0.1-1% to a meaningful fraction; case1/2/7 unchanged semantics and still passing, with a possible modest gain or neutral effect. If pipelining is the true bottleneck, the gain should scale with KV-loop length, i.e. case4 (4 iterations) gains least in relative terms of the four.",
+  "validation": "Host runs the four official cases (1/2/4/7) for correctness and paired profiling on case4; compare candidate Task Duration and pipe ratios against the recorded 1900.72us baseline. If case4 does not improve, ablate num_warps and num_stages separately; if utilization stays ~1%, the alternative explanation (per-program launch/schedule overhead from 1024 tiny programs, or masked-address scalar work) becomes primary.",
+  "unknown": [
+    "Whether the ~1% pipe ratios reflect true idleness or the profiler averaging many waiting blocks; block dim 1024 vs reference 19 blocks is consistent with heavy per-block overhead.",
+    "Whether num_warps=4 increases UB/register pressure enough to force spills on the BLOCK_D=128 tile.",
+    "Whether the 3-term bf16 PV (2 extra idle-looking cube matmuls + 2 extra p-split vector passes per iteration) becomes a real cost once latency is hidden."]
+}

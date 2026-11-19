@@ -21,6 +21,33 @@ def save(path, value):
     path.write_text(json.dumps(value, ensure_ascii=False, indent=2)+'\n', encoding='utf8')
 
 
+def select_kernel(names, requested=None):
+    """Require an explicit observed kernel for a multi-kernel invocation."""
+    names = list(dict.fromkeys(names))
+    if requested is not None:
+        if requested not in names:
+            raise ValueError('Selected kernel absent from current source discovery')
+        return requested
+    if len(names) != 1:
+        raise ValueError('Specify --kernel-name for the observed multi-kernel invocation')
+    return names[0]
+
+
+def freeze_autotune_replay(pair, out, digest, case):
+    """Bind simulator configuration to the same source and measured input."""
+    replay_path=pair/'actual-ir/autotune-cache.json'
+    if not replay_path.exists():
+        return {}, None
+    replay=read(replay_path)
+    if replay['source_sha256']!=digest or replay['case']!=case:
+        raise ValueError('Autotune replay source or case differs from measured invocation')
+    if not any(entry['cache'] for entry in replay['entries']):
+        return {}, None
+    frozen=out/'autotune-replay.json'
+    frozen.write_bytes(replay_path.read_bytes())
+    return dict(autotune_replay=str(frozen),warmup_before_capture=0),sha(frozen)
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--config',type=Path,required=True)
@@ -29,6 +56,7 @@ def main():
     p.add_argument('--soc',required=True)
     p.add_argument('--simulator-library',type=Path,required=True)
     p.add_argument('--core-id',type=int,default=0)
+    p.add_argument('--kernel-name',help='多kernel调用中显式选择已发现的候选符号')
     p.add_argument('--timeout-minutes',type=int,default=5)
     p.add_argument('--trace-unit',choices=['us','ns','cycles'],required=True,
                    help='原始trace ts/dur单位，须依据工具格式确认，displayTimeUnit不是换算依据')
@@ -42,15 +70,18 @@ def main():
     spec=read(pair/'spec.json');source=Path(spec['source']);digest=sha(source)
     assert digest==spec['source_sha256']
     assert digest==sha(Path(c['run_directory'])/'workspace/candidate.py'),'只采当前候选'
-    discovery=read(pair/'candidate-discovery.json');names=discovery['kernels'];assert len(names)==1
-    kernel=names[0]
+    discovery=read(pair/'candidate-discovery.json');names=discovery['kernels']
+    kernel=select_kernel(names,a.kernel_name)
     from hgkda.gate import admit
     admit(source.read_text(encoding='utf8'),read(Path(c['run_directory'])/'source-reviews'/(digest+'.json')))
     if not a.parse_only:
         out.mkdir(parents=True,exist_ok=False)
         # 真机和模拟器的编译产物可能不同；保留相同源码和case，分别写入独立目录。
         capture_spec=out/'spec.json'
-        save(capture_spec,dict(spec,ir_directory=str(out/'actual-ir')))
+        capture_values=dict(spec,ir_directory=str(out/'actual-ir'))
+        replay_values,replay_sha=freeze_autotune_replay(pair,out,digest,spec['case'])
+        capture_values.update(replay_values)
+        save(capture_spec,capture_values)
         app=shlex.join([c['device_python'],str(Path(__file__).with_name('paired_driver.py')),
                        '--spec',str(capture_spec),'--side','candidate'])
         command=['msprof','op','simulator','--application='+app,'--kernel-name='+kernel,
@@ -58,7 +89,8 @@ def main():
                  '--dump=on','--timeout='+str(a.timeout_minutes),'--output='+str(out/'raw/kernel-000')]
         save(out/'request.json',dict(source_sha256=digest,case=spec['case'],kernel=kernel,
              core_id=a.core_id,soc=a.soc,trace_time_unit=a.trace_unit,command=command,
-             paired_spec_sha256=sha(pair/'spec.json'),capture_spec_sha256=sha(capture_spec),collector_sha256=sha(__file__)))
+             paired_spec_sha256=sha(pair/'spec.json'),capture_spec_sha256=sha(capture_spec),collector_sha256=sha(__file__),
+             autotune_cache_sha256=replay_sha))
         environment=dict(ASCEND_RT_VISIBLE_DEVICES=str(c['device']),OMP_NUM_THREADS='1',
             PYTHONDONTWRITEBYTECODE='1',TRITON_DISABLE_LINE_INFO='false',
             TRITON_CACHE_DIR=str(out/'compiler-cache'),
@@ -77,6 +109,7 @@ def main():
         save(out/'execution.json',dict(returncode=result.returncode,child_exit_codes=codes))
     request=read(out/'request.json')
     assert request['source_sha256']==digest and request['case']==spec['case']
+    assert request['kernel']==kernel
     assert request['trace_time_unit']==a.trace_unit and request['soc']==a.soc and request['core_id']==a.core_id
     execution=read(out/'execution.json')
     qualification=dict(process_clean_exit=execution['returncode']==0 and not any(execution['child_exit_codes']))

@@ -1,0 +1,55 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "a5afde4c831634140d16625f90235d1fa958eee2a674dbc266a981bf3ee3bb21",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "Target case timing-2 (fp16 [8,512,3072]): candidate kernel 78.661575 us at Block Dim 1024; per-block aiv_time mean 2.9998 us (min 1.3139, max 5.9842), aiv_vec_ratio mean 0.1321. Same-case CANN reference 55.141102 us at Block Dim 40 with aiv_vec_ratio mean 0.4217 over 40 resident blocks. Work/data are identical, so the candidate spends most per-block time outside useful vector work and needs ~25.6 block waves on 40 AIV cores."
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "disambiguation",
+      "finding": "core0.veccore0 normalized timeline (partial common-clock window, absolute_time_qualified=false): MTE2 productive_ratio 0.359, idle_ratio 0.641, wait_only 0.0; VECTOR productive_ratio 0.101, wait_only_ratio 0.303, idle_ratio 0.596; MTE3 productive_ratio 0.499, wait_only_ratio 0.343, idle_ratio 0.158. The store lane is the most active lane and the vector lane is productive only one tenth of the observed window, so a compute-throughput ceiling is not supported; the pattern is compatible with many short serial load->vector->store chains."
+    },
+    {
+      "path": "workspace/current-ir/a5afde4c8316/target-0-_transform_bias_rescale_qkv_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "One program handles exactly one (batch, head, seq-block) tile: three 64x64 f16 loads, three bias loads, one straight-line add/scale, three 64x64 stores, no loop or software-pipelined iteration and no reuse across seq blocks. All tile sizes are compile-time constants (64x64 here)."
+    },
+    {
+      "path": "workspace/current-ir/a5afde4c8316/target-1-_transform_bias_rescale_qkv_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Lowered form is a single basic block: six memref.copy into freshly allocated buffers, three bufferization.materialize_in_destination stores, then return. There is no scf.for and therefore no multi-buffered overlap between the load, vector and store phases inside a program; overlap is only possible across serialized AIV blocks."
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "Retained best is fully qualified (21/21 formal, geo_mean 1.3826). Weakest cases are the large fp32 cases timing-7/8 (1.058, 1.077) and the large fp16/bf16 cases timing-2/5 (1.152, 1.136), i.e. exactly the shapes with the most block waves."
+    }
+  ],
+  "hypothesis": "For this elementwise op each Triton program's ~3.0 us contains only ~0.4 us of vector work; the remainder is the fixed per-program load/launch/store latency of one short serial tile chain, and 1024 programs must run in ~25.6 serialized waves on 40 AIV cores. Doubling the per-program tile budget (element budget 8192 -> 16384 bytes) halves the program count and amortizes that fixed per-program latency over twice the useful bytes, so total kernel time should drop even though per-program aiv_time rises.",
+  "alternatives": [
+    "Store-bandwidth saturation: MTE3 is the most active lane in the simulator window; if store bandwidth were the ceiling, halving program count would leave total time roughly unchanged.",
+    "Compute saturation of the fp32 q rescale path: rejected by aiv_vec_ratio 0.132 (candidate) and VECTOR productive_ratio 0.101; vector is mostly waiting/idle, not busy.",
+    "Intra-program software pipelining over a seq-block loop (grid = batch*heads, inner scf.for): potentially larger overlap, but the Ascend Triton lowering of a simple elementwise loop is not guaranteed to multi-buffer, so it is not the minimal first experiment.",
+    "Wider contiguous loads by fusing adjacent heads (head_dim stays 64, two heads are contiguous in the input row): would need tensor slicing/split for the non-contiguous [batch,head,seq,d] outputs and risks semantics; deferred."
+  ],
+  "discriminating_observation": "With total bytes and the numerical path unchanged, if fixed per-program latency dominates, total kernel duration should fall while mean per-program aiv_time rises sub-linearly (fewer, larger programs). If store DRAM bandwidth is the real ceiling, total duration stays flat across the same change. A large-case timing drop together with flat aiv_vec_ratio would confirm amortization; no change would favor the bandwidth hypothesis.",
+  "change": "In candidate.py raise the tile element budget _TILE_BYTES from 8192 to 16384 so BLOCK_S doubles (fp16 target case 64 -> 128, fp32 cases 32 -> 64, still power-of-two tiles), halving grid size and leaving every stride, mask, EXACT fast path and the fp32 q-rescale rounding order untouched.",
+  "expected": "Target case timing-2: program count 1024 -> 512, per-program aiv_time ~3.0 -> ~4.5-5.5 us, total duration from 78.7 us toward 55-65 us (~1.2-1.4x on top of current). Small seq_len=128 cases are unchanged because BLOCK_S is clamped by next_power_of_2(seq_len). Correctness must stay exact (bit-identical values, same masked/exact branches).",
+  "validation": "Preflight the edited candidate, then one full formal + supplementary evaluation; compare per-workload latency and speedup against previous-result.json (21 formal cases, 48 supplementary each), checking that timing-2/5/7/8 improve or stay flat and that all correctness cases still pass with abs_err/rel_err 0.",
+  "selected_layer": "host launch geometry and Triton tile budget (program count / per-program bytes)",
+  "layer_reason": "The paired profiling shows the deficit is per-program latency (3.0 us per block vs 0.4 us useful vector work, 1024 blocks over 40 cores) rather than vector throughput or a changed memory layout; the cheapest controllable lever is how many bytes one program handles, which needs no new layout, no cache and no non-Triton compute.",
+  "simulator_incremental_judgment": "Hotspots add location, not separation: the source_conditional region (lines 88-138, instruction_time 89 us) and the function-entry region (13.21 us wait instruction) rank where instructions sit but cannot separate launch/setup from tile work. The normalized per-core timeline adds the decisive lane-level distinction: MTE3 productive 49.9% / wait-only 34.3% / idle 15.8%, VECTOR productive only 10.1% / wait-only 30.3% / idle 59.6%, MTE2 productive 35.9% / idle 64.1%. This rejects a vector-throughput ceiling and shows each lane idle while another owns the window, i.e. short serial load->vector->store chains, supporting the per-program fixed-latency hypothesis; the paired profiling (Block Dim 1024 vs reference 40, per-block aiv_time 3.0 us vs 0.4 us useful vector) supplies the quantitative program-count lever. Incremental judgment: the simulator is the disambiguation between 'compute bound' (rejected) and 'per-program latency with little intra-program overlap' (supported), while the counting lever comes from profiling. Neither proves a dependency stall; the ratios are partial-window fractions with absolute_time_qualified=false, so the edit is accepted only if the differential program-count prediction holds.",
+  "unknown": [
+    "Whether the Ascend Triton lowering can pipeline a multi-seq-block loop (would allow true load/compute/store overlap); not assumed by this experiment.",
+    "Exact UB budget of the compiled kernel: a 16384-byte tile keeps six live tiles at ~96 KB, but a 32768-byte tile (~192 KB) may exceed it; the larger step is deferred until this one is measured.",
+    "Whether per-block cost includes an unavoidable DMA fence that scales sub-linearly with bytes; the formal timing will show the residual."
+  ]
+}

@@ -1,0 +1,66 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "7b6870a9d281fb574a45c4af85e2f3f8263c3310601bb92255473fd2ee84ef31",
+  "round": "compatibility-02",
+  "selected_layer": "compatibility",
+  "layer_reason": "Shared compatibility phase only: the goal is to make the fixed native FlagGems module importable and compilable under Triton-Ascend with unchanged contract semantics. No performance work is in scope, and no simulator exists in this phase.",
+  "simulator_incremental_judgment": "No simulation in common compatibility phase",
+  "evidence": [
+    {
+      "path": "workspace/compatibility-review.json",
+      "category": "other",
+      "role": "trigger",
+      "finding": "Read-only review of candidate sha 7b6870a9... requires three fixes: (1) Tuple/Optional appear in annotations but typing imports are absent, so the module fails to import; (2) the single invented 32x32 autotune Config is not equivalent to the original native search space; (3) the original tle.program_id returns int64, so that semantic must be preserved or the difference documented explicitly."
+    },
+    {
+      "path": "workspace/native-runtime-facts.json",
+      "source_sha256": "62a02c203a3e54a09f6479ca8526168bf1529821284cd1b42bc6cbdf3c980a12",
+      "category": "probe",
+      "role": "background",
+      "finding": "Observed native metadata bound to original source sha 62a02c20...: runtime.get_tuned_config for upsample_bilinear2d enumerates 16 configs, BLOCK_X in {64,128,256,512} x BLOCK_Y in {1,2} x num_warps in {8,4}, every config with num_stages=2 and num_ctas=1. program_id semantic is tl.program_id(axis).to(tl.int64) from flag_gems.utils.triton_lang_extension. This replaces the guessed 32x32 config with the actual native configuration space."
+    },
+    {
+      "path": "workspace/compiler-evidence.json",
+      "source_sha256": "62a02c203a3e54a09f6479ca8526168bf1529821284cd1b42bc6cbdf3c980a12",
+      "category": "source_ir",
+      "role": "background",
+      "finding": "Untouched native source (sha 62a02c20...) fails compilation on the target: tt.store op failed to verify that value type matches ptr type at the tl.store(ptr_o + offset_o, result) line, followed by an MLIR pipeline failure in TritonToStructuredIncubated/CSE. This motivates the explicit output-dtype cast, which remains an unverified hypothesis."
+    },
+    {
+      "path": "workspace/starter.py",
+      "source_sha256": "62a02c203a3e54a09f6479ca8526168bf1529821284cd1b42bc6cbdf3c980a12",
+      "category": "knowledge",
+      "role": "background",
+      "finding": "Original fixed native FlagGems module (sha 62a02c20...): imports logging and Optional/Tuple from typing, uses runtime.get_tuned_config for autotune configs, asserts runtime.device.name, wraps the launch in flag_gems.runtime.torch_device_fn.device(input.device), and uses tle.program_id for both program axes. Kernel body, loops over N and C, interpolation formula and grid lambda are otherwise reproduced unchanged in the current candidate."
+    },
+    {
+      "path": "workspace/contract.json",
+      "category": "other",
+      "role": "background",
+      "finding": "Contract requires run(input, output_size, align_corners=False, scales_h=None, scales_w=None) returning a single new tensor with no mutation or aliasing; the candidate already exposes run = upsample_bilinear2d and allocates output with torch.empty, so only FlagGems-only dependencies and metadata need replacing."
+    }
+  ],
+  "hypothesis": "The remaining blockers for Triton-Ascend compilation are host-side and metadata-side, not algorithmic: (a) missing typing imports prevent import at all; (b) the locally invented single 32x32 config both deviates from native metadata and uses a geometry the native kernel was never launched with; (c) dropping tle.program_id also dropped its int64 cast, changing the integer dtype of index arithmetic relative to the native kernel. Restoring the native 16-config space and the int64 program-id semantic, while keeping the explicit output cast that addresses the observed tt.store verifier error, should let the unchanged kernel body compile.",
+  "change": "In candidate.py, without touching the kernel body, the N/C loops, the interpolation formula, the grid lambda or the host API: (1) add the typing import for Optional and Tuple; (2) replace the single guessed triton.Config with the 16 observed native configs (BLOCK_X in 64/128/256/512, BLOCK_Y in 1/2, num_warps 8 and 4, num_stages=2, num_ctas=1) preserving the observed enumeration order; (3) restore the native program-id semantic with tl.program_id(axis).to(tl.int64) for both axes; (4) keep the explicit cast of result to ptr_o.dtype.element_ty at the store, labelled in a comment as an unverified hypothesis. FlagGems-only imports (runtime, torch_device_fn) stay removed; the device assert and the torch_device_fn.device wrapper are not reintroduced because the contract passes tensors on the current device and stream.",
+  "expected": "candidate.py imports without a NameError and preflight reaches Triton-Ascend code generation with the native tiling/launch geometry and native-scale index arithmetic instead of a single made-up block shape. No change to the numerical formula or to output values is expected; the only numerically relevant edit is the pre-existing fp32-to-out-dtype cast at the store, which is value-identity for float32 inputs. No performance claim is made.",
+  "validation": "Tool-bridge preflight on candidate.py (read-only path and address-boundary review gate). If it returns awaiting_source_review, stop there and do not resubmit. Confirmation of the cast hypothesis, correctness over the 24 formal cases and both supplementary check sets, and any performance measurement remain outstanding and are not asserted here.",
+  "alternatives": [
+    "Keep the guessed 32x32 config: rejected by review, and it is not the geometry the native kernel was tuned or launched with.",
+    "Vendor flag_gems.utils.triton_lang_extension to keep tle.program_id: rejected because allowed imports are local Triton/host metadata only; the equivalent one-line local form is tl.program_id(axis).to(tl.int64).",
+    "Omit the int64 cast or force index tensors to int32: rejected as an undocumented semantic change away from the native kernel, not justified by any observed error.",
+    "Re-add torch_device_fn.device and the runtime.device assert: rejected as FlagGems-only dependencies; the contract already supplies tensors on the active device.",
+    "Restructure the kernel for performance (e.g. flatten N*C into the grid): out of scope for a compatibility-only phase and would change launch geometry."
+  ],
+  "observed_after_edit": {
+    "edited_source_sha256": "028ec10c54fbeb6eb870b9f80bea49ec5304d79a0f95e40bd8f8a943e837789b",
+    "preflight_status": "awaiting_source_review",
+    "note": "Applied the three review corrections (typing import, native 16-config space, int64 program_id) plus comment-only clarification of the store cast. Preflight returned awaiting_source_review before any device operation, so nothing about compilation behaviour is verified. No further preflight was submitted."
+  },
+  "unknown": [
+    "Whether the explicit result cast to ptr_o.dtype.element_ty actually resolves the observed tt.store verifier error is unverified; it is retained as a hypothesis only.",
+    "Whether int64 program-id arithmetic is accepted by Triton-Ascend address/boundary review and by the TritonToStructuredIncubated pipeline has not been observed for this candidate.",
+    "Whether Triton-Ascend triton.Config accepts num_ctas explicitly in this installation; 1 is the upstream default, so a failure there would be a metadata-compat detail rather than a semantic one.",
+    "Autotune benchmarking cost over 16 configs (and its effect on the timing cases) is unmeasured; no verification of which config is selected has been done.",
+    "Full 24-case native evaluation was still pending in compiler-evidence.json; no correctness or performance result exists for either source."
+  ]
+}

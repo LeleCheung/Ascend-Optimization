@@ -1,0 +1,54 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "72c4d40d831f72028f60e079ac9aae9cf921c33f32b515c2c042c43cc795d97e",
+  "target_case": "scatter_add-timing-8 (float32, 2048x2048, dim=-1)",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "For source 72c4d40d on scatter_add-timing-8 the candidate is two launches: _scatter_add_sort_key_kernel Task Duration 798.836us with per-block aiv_vec_ratio mean 0.913 (aiv_time 15.38us, mte2 0.045, mte3 0.022) and _scatter_add_sort_out_kernel 603.612us with aiv_vec_ratio mean 0.857 (aiv_time 11.64us, mte2 0.059, mte3 0.014). Both kernels are bound by the VECTOR pipe with both memory pipes almost idle; total ~1.40ms matches the reported latency."
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "disambiguation",
+      "finding": "Partial common-clock window for _scatter_add_sort_key_kernel, core0.veccore0 (capture 12.366us, absolute_time_qualified=false): VECTOR productive_ratio 0.9068, wait_only 0.0262, idle 0.0670; MTE2 productive 0.0513; MTE3 productive 0.0168; SCALAR productive 0.0238 with wait_only 0.6884. The SCALAR wait adds no independent distinction: it is the scalar lane waiting on the vector engine that owns 91% active time, consistent with the profiling vector ratios, not evidence of a separate stall source."
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "mechanism",
+      "finding": "Hotspot regions on the same partial window: the source_function region (lines 182-211) has trace_interval_union 5.437us and the nested source_loop region (lines 206-210, the segmented-sum loop) has union 5.283us, i.e. the gather-based segmented scan accounts for nearly all mapped function time on this core; neighbouring region unions are <1us each. This localizes the vector work to be reduced but is a partial window, not a full-kernel duration."
+    },
+    {
+      "path": "workspace/current-ir/72c4d40d831f/target-0-_scatter_add_sort_key_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Actual target-case TTIR shows the segmented scan fully unrolled as 11 shifts x 2 data-dependent tt.gather (tt.gather of a 2048xf32 vector at a computed 2048xi32 index) plus arithmetic, i.e. 22 full-width cross-lane gathers for B=2048, on top of the single value gather and ascend.sort. This is the concrete vector instruction count the hypothesis targets."
+    },
+    {
+      "path": "workspace/exploration-feedback.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "Historical source 3bd9aac (attempt-001, distinct identity) implemented the same row prefix as a plain tl.cumsum and recovered destination totals by prefix[end-1]-prefix[lo-1]; it failed segment_independence on large_finite, positive_infinity and nan (1023/1024 mismatched). Constraint retained generically: a destination's fp32 total must be accumulated only within its own run, so no whole-row cumsum subtraction and no cross-segment contamination may be reintroduced."
+    }
+  ],
+  "hypothesis": "The sort-key kernel's VECTOR time is dominated by the hand-written Hillis-Steele segmented scan, whose 11 steps each issue two full-width on-chip tl.gather ops (22 gathers per row). Replacing it with one tl.associative_scan over the (value, segment-head) pair using the already-defined _segment_combine lets the backend emit its native scan primitive instead of 22 explicit cross-lane gathers, reducing VECTOR work in this kernel while keeping accumulation strictly per-segment.",
+  "alternatives": [
+    "Use a plain whole-row tl.cumsum and subtract the prefix at each run start: rejected by the historical segment-independence failure above (cancellation on large finite data, Inf/NaN contamination across segments).",
+    "Fuse the sort-key and sort-out kernels to remove the second launch and the keys/prefix global round trip: profiling shows mte2/mte3 near idle (0.04-0.06 / 0.01-0.02 ratios) and the binding resource is VECTOR, so this would not reduce the dominant work and is not selected.",
+    "Drop the redundant 12th binary-search gather in the sort-out kernel (range width already 1 after 11 halvings): a real but small (~1 of 14 sort-out gathers) independent saving, not the selected mechanism this round."
+  ],
+  "discriminating_observation": "If the scan is the dominant vector cost, replacing the 22 explicit tt.gather ops with one associative scan should lower _scatter_add_sort_key_kernel Task Duration below the current 798.836us and hence total timing-8 latency below ~1.4008ms, with sort_out unchanged (~603.6us); if the scan lowers to equivalent gather micro-code the durations will be unchanged, and if sort dominates they will also be unchanged. The simulator loop-region union (5.28us of the 5.44us mapped function union) is the observation that distinguishes the scan hypothesis from the launch/global-traffic fusion alternative.",
+  "change": "In _scatter_add_sort_key_kernel, form a segment-head flag (lane 0 or target[i] != target[i-1], using one neighbour gather of the already-computed target/cumsum-side vector) and replace the 11-step manual loop with seg_sum, _ = tl.associative_scan((sv, head), 0, _segment_combine); store seg_sum to prefix_ptr exactly as before. Keys, key construction, masking (other=B), fp32 accumulation dtype, the dense/atomic/generic paths and all host-side layout/allocation stay unchanged.",
+  "expected": "sort_key VECTOR productive time and kernel duration decrease (predicted roughly 10-25% of the 798.8us kernel if the backend scan is cheaper than 22 gathers); sort_out duration and all memory-pipe ratios are approximately unchanged; timing-8 latency moves from ~1.4008ms downward. No change in numerical semantics: each destination still accumulates only its own run in ascending lane order in fp32.",
+  "validation": "Compile via decision_bridge preflight --source candidate.py; then re-collect the paired profiling/simulator on the same frozen scatter_add-timing-8 case and compare source-bound Task Durations and vector ratios against 72c4d40d; complete the required 18 formal cases plus 21 supplementary semantics checks and the segment_independence special check through the host evaluation.",
+  "selected_layer": "device_kernel_vector_scan",
+  "layer_reason": "The profile and simulator both show VECTOR as the only saturated pipe (91%/86% productive, memory lanes idle), and the mapped hotspot plus actual TTIR locate the cost in 22 explicit cross-lane gathers inside the segmented scan; changing the scan implementation is the smallest source change that directly reduces that vector instruction count without touching layout, dispatch thresholds or special-case paths.",
+  "simulator_incremental_judgment": "The hotspots add localization: of the mapped code, the lines 206-210 loop carries 5.28us of the 5.44us function union on the sampled core, identifying the segmented scan rather than load/store as the work to cut. The pipeline view adds the binding-resource determination: VECTOR is 90.7% productive while MTE2/MTE3 are ~5%/1.7% productive, and the SCALAR lane's 68.8% wait_only is only the scalar side waiting on that busy VECTOR lane, so it does not independently distinguish alternatives. Both are partial-window, absolute_time_qualified=false observations used to rank hypotheses, not proof of a dependency stall or a full-device time; the incremental value over the paired profiling is that the profiling alone could not separate the scan loop from the sort within the VECTOR pipe.",
+  "unknown": [
+    "Whether the CANN/Triton-Ascend backend lowers tl.associative_scan on a (f32, i1) tuple without falling back to the same gather sequence; preflight compile and the post-change durations decide this.",
+    "How much of sort_key VECTOR time is ascend.sort versus the scan; the partial simulator window maps the loop but cannot attribute the whole 15.38us block time."
+  ]
+}

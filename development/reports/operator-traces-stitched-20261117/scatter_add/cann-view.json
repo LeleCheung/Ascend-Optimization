@@ -611,6 +611,100 @@
       "method": {
         "note": "",
         "evidence": "/data/hanle/ascend-optimization/archive/Ascend-Optimization-pre-release-20261103/project/Ascend-Optimization-v1/operators/campaigns/remaining-five-20261023-v2/results/scatter_add/attempt-1/input-provenance.json"
+      },
+      "attribution": {
+        "operator": "scatter_add",
+        "source_sha256": "7cb10fae0b6de198338c77ec1bf4dbeebee6912e92e9ea393994a793a61ddbf1",
+        "role": "guidance",
+        "method": "编译期固定列宽并去掩码",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/reports/trace-attribution-matrix-20261116.json",
+            "sha256": "ae1f2bb9a53639218c0d522e3c48c3c7058e3f70eb1ca0f471fc9c850fe26a23"
+          },
+          {
+            "path": "development/experiments/lineage/20261117/links-v2/artifacts/7cb10fae0b6de198338c77ec1bf4dbeebee6912e92e9ea393994a793a61ddbf1.py",
+            "sha256": "7cb10fae0b6de198338c77ec1bf4dbeebee6912e92e9ea393994a793a61ddbf1"
+          }
+        ],
+        "inference_basis": "recorded_plan",
+        "reason": "优化计划明确记载改法；结合其中的假设与测量推断主要判断来源。",
+        "plan_evidence": [
+          {
+            "kind": "performance",
+            "strategy": "Specialize the destination-owned kernel on a constant column extent and run it mask-free when the extent is an exact multiple of the block and chunk, to cut predication and dispatch work on the shapes that use it.",
+            "code_changes": "Owner kernel takes ncols as a tl.constexpr and gains an EVEN constexpr branch that runs the source loop and the final load/store completely unmasked with a compile-time trip count when ncols is an exact multiple of BLOCK and CHUNK (all powers-of-two frozen timing shapes); the masked branch is retained for non-multiple shapes such as the 9-column correctness cases.",
+            "hypothesis": "Making the destination-owned kernel's column extent a compile-time constant and removing all masking in its loop reduces per-iteration vector work and dispatch cost, improving the 1024x1024 and 128x128 shapes without changing the 2048x2048 atomic path.",
+            "expected_effect": {
+              "metric": "geo_mean",
+              "direction": "increase",
+              "mechanism": "Predication and per-chunk mask arithmetic removed from the destination-owned hot loop, plus one fewer runtime argument to specialize per launch."
+            },
+            "source": {
+              "origin": "coder",
+              "parent_round_num": 2
+            },
+            "key_params": {
+              "ATOMIC_BLOCK": 1024,
+              "DENSE_BLOCK": 256,
+              "DENSE_CHUNK": 32,
+              "DENSE_MAX_COLS": 1700,
+              "EVEN": true
+            },
+            "knowledge_uses": []
+          }
+        ],
+        "changed_symbols": {
+          "kernel": [
+            "_copy_contiguous_kernel",
+            "_copy_kernel",
+            "_copy_nd_kernel",
+            "_scatter_add_lastdim_kernel",
+            "_scatter_add_nd_kernel",
+            "_scatter_add_owner_kernel",
+            "scatter_add_2d_kernel",
+            "scatter_add_kernel_1"
+          ],
+          "host": [
+            "25",
+            "_ATOMIC_BLOCK",
+            "_COPY_BLOCK",
+            "_DENSE_CHUNK",
+            "_DENSE_MAX_COLS",
+            "_D_ARGS",
+            "_INT32_MAX",
+            "_IS_ARGS",
+            "_MAXR",
+            "_OS_ARGS",
+            "_SS_ARGS",
+            "_contig_strides",
+            "_copy",
+            "_copy_contiguous",
+            "_copy_contiguous_kernel:launch_decorators",
+            "_heur_block_2d",
+            "_heur_loop_2d",
+            "_scatter_func",
+            "clip_tensor_to_shape",
+            "generate_code",
+            "generate_destination_passing_wrapper",
+            "generate_imports",
+            "generate_scatter_kernel",
+            "logger",
+            "parameter_for_wrapper",
+            "run",
+            "scatter_add",
+            "scatter_add_",
+            "scatter_add_0",
+            "scatter_add_1",
+            "scatter_add_2d_kernel:launch_decorators"
+          ],
+          "shared": []
+        },
+        "event_id": "20d8205794acd922"
       }
     },
     {
@@ -869,7 +963,68 @@
         1,
         "2026-10-23T12:53:10.883058Z"
       ],
-      "method": null
+      "method": null,
+      "attribution": {
+        "operator": "scatter_add",
+        "source_sha256": "8a67a004fd75f9332094bcc3cc821e9d2dfa31dbcc10b474ac27937da9c1a04f",
+        "role": "guidance",
+        "method": "将索引查找移至片上",
+        "primary": "paired",
+        "secondary": [
+          "ir"
+        ],
+        "confidence": "inferred",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/reports/trace-attribution-matrix-20261116.json",
+            "sha256": "ae1f2bb9a53639218c0d522e3c48c3c7058e3f70eb1ca0f471fc9c850fe26a23"
+          },
+          {
+            "path": "development/experiments/lineage/20261117/links-v5/artifacts/8a67a004fd75f9332094bcc3cc821e9d2dfa31dbcc10b474ac27937da9c1a04f.py",
+            "sha256": "8a67a004fd75f9332094bcc3cc821e9d2dfa31dbcc10b474ac27937da9c1a04f"
+          }
+        ],
+        "inference_basis": "recorded_plan",
+        "reason": "优化计划明确记载改法；结合其中的假设与测量推断主要判断来源。",
+        "plan_evidence": [
+          {
+            "kind": "performance",
+            "strategy": "Fix the round-2 memory-locality mistake: keep the sorted-segment algorithm but stage the sorted keys and cumsum row in registers and run the whole run-location search with on-chip tl.gather instead of per-lane dynamic global loads.",
+            "code_changes": "Rewrote _scatter_add_sort_out_kernel so the combine pass issues only two contiguous row loads (sorted keys, cumsum) and then performs all lookups with on-chip tl.gather: the 12-step branchless binary search now gathers from the register-resident key vector instead of issuing a per-lane dynamic global load per step, and the begin/end prefix lookups plus the lane shift also use on-chip gathers. Round 2's structure, dispatch (ncols<=256 owner, <=4096 sorted, else atomic) and numerics are unchanged.",
+            "hypothesis": "Round 2's regression came entirely from the combine pass performing its search with data-dependent global loads; staging the sorted keys and the cumsum row once and searching on-chip recovers the predicted latency, so the six wide-row timing workloads should reach ~1.25x/1.32x and lift geo_mean well above the 0.411 baseline.",
+            "expected_effect": {
+              "metric": "geo_mean",
+              "direction": "increase",
+              "mechanism": "Removes 14 per-lane dynamic global gathers per row from the combine pass and replaces them with on-chip gathers that measured ~25x cheaper per gather, cutting the six wide-row workloads' latency from 6.72/28.6 ms back toward the 0.7/2.5 ms predicted by the isolated ingredient costs."
+            },
+            "source": {
+              "origin": "coder",
+              "parent_round_num": null
+            },
+            "key_params": {
+              "combine_search": "12-step branchless bisection via on-chip tl.gather",
+              "gathers_per_row": "15 on-chip, 2 contiguous loads",
+              "owner_max_cols": 256,
+              "sort_max_cols": 4096
+            },
+            "knowledge_uses": []
+          }
+        ],
+        "changed_symbols": {
+          "kernel": [
+            "_scatter_add_sort_key_kernel",
+            "_scatter_add_sort_out_kernel"
+          ],
+          "host": [
+            "_DENSE_MAX_COLS",
+            "_SORT_MAX_COLS",
+            "run"
+          ],
+          "shared": []
+        },
+        "event_id": "692812b129ee1000"
+      }
     },
     {
       "id": "10316c838fcaae96",
@@ -1465,6 +1620,34 @@
       "method": {
         "note": "",
         "evidence": "/data/hanle/ascend-optimization/archive/Ascend-Optimization-pre-release-20261103/project/Ascend-Optimization-v1/operators/campaigns/strict-triton-20261102/candidates/scatter_add/restored-v1/actual-compiled-v2/spec.json"
+      },
+      "attribution": {
+        "operator": "scatter_add",
+        "source_sha256": "72c4d40d831f72028f60e079ac9aae9cf921c33f32b515c2c042c43cc795d97e",
+        "role": "guidance",
+        "method": "优化分段合并与排序",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "kernel",
+        "evidence": [
+          {
+            "path": "operators/scatter_add/evidence/independent_strict/72c4d40d831f-candidate.py",
+            "sha256": "72c4d40d831f72028f60e079ac9aae9cf921c33f32b515c2c042c43cc795d97e"
+          }
+        ],
+        "inference_basis": "retrospective_code",
+        "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+        "changed_symbols": {
+          "kernel": [
+            "_scatter_add_sort_key_kernel",
+            "_scatter_add_sort_out_kernel",
+            "_segment_combine"
+          ],
+          "host": [],
+          "shared": []
+        },
+        "event_id": "1f286abb14642c84"
       }
     },
     {
@@ -2779,6 +2962,100 @@
           "shared": []
         },
         "location": "mixed"
+      },
+      "attribution": {
+        "operator": "scatter_add",
+        "source_sha256": "7cb10fae0b6de198338c77ec1bf4dbeebee6912e92e9ea393994a793a61ddbf1",
+        "role": "guidance",
+        "method": "编译期固定列宽并去掩码",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/reports/trace-attribution-matrix-20261116.json",
+            "sha256": "ae1f2bb9a53639218c0d522e3c48c3c7058e3f70eb1ca0f471fc9c850fe26a23"
+          },
+          {
+            "path": "development/experiments/lineage/20261117/links-v2/artifacts/7cb10fae0b6de198338c77ec1bf4dbeebee6912e92e9ea393994a793a61ddbf1.py",
+            "sha256": "7cb10fae0b6de198338c77ec1bf4dbeebee6912e92e9ea393994a793a61ddbf1"
+          }
+        ],
+        "inference_basis": "recorded_plan",
+        "reason": "优化计划明确记载改法；结合其中的假设与测量推断主要判断来源。",
+        "plan_evidence": [
+          {
+            "kind": "performance",
+            "strategy": "Specialize the destination-owned kernel on a constant column extent and run it mask-free when the extent is an exact multiple of the block and chunk, to cut predication and dispatch work on the shapes that use it.",
+            "code_changes": "Owner kernel takes ncols as a tl.constexpr and gains an EVEN constexpr branch that runs the source loop and the final load/store completely unmasked with a compile-time trip count when ncols is an exact multiple of BLOCK and CHUNK (all powers-of-two frozen timing shapes); the masked branch is retained for non-multiple shapes such as the 9-column correctness cases.",
+            "hypothesis": "Making the destination-owned kernel's column extent a compile-time constant and removing all masking in its loop reduces per-iteration vector work and dispatch cost, improving the 1024x1024 and 128x128 shapes without changing the 2048x2048 atomic path.",
+            "expected_effect": {
+              "metric": "geo_mean",
+              "direction": "increase",
+              "mechanism": "Predication and per-chunk mask arithmetic removed from the destination-owned hot loop, plus one fewer runtime argument to specialize per launch."
+            },
+            "source": {
+              "origin": "coder",
+              "parent_round_num": 2
+            },
+            "key_params": {
+              "ATOMIC_BLOCK": 1024,
+              "DENSE_BLOCK": 256,
+              "DENSE_CHUNK": 32,
+              "DENSE_MAX_COLS": 1700,
+              "EVEN": true
+            },
+            "knowledge_uses": []
+          }
+        ],
+        "changed_symbols": {
+          "kernel": [
+            "_copy_contiguous_kernel",
+            "_copy_kernel",
+            "_copy_nd_kernel",
+            "_scatter_add_lastdim_kernel",
+            "_scatter_add_nd_kernel",
+            "_scatter_add_owner_kernel",
+            "scatter_add_2d_kernel",
+            "scatter_add_kernel_1"
+          ],
+          "host": [
+            "25",
+            "_ATOMIC_BLOCK",
+            "_COPY_BLOCK",
+            "_DENSE_CHUNK",
+            "_DENSE_MAX_COLS",
+            "_D_ARGS",
+            "_INT32_MAX",
+            "_IS_ARGS",
+            "_MAXR",
+            "_OS_ARGS",
+            "_SS_ARGS",
+            "_contig_strides",
+            "_copy",
+            "_copy_contiguous",
+            "_copy_contiguous_kernel:launch_decorators",
+            "_heur_block_2d",
+            "_heur_loop_2d",
+            "_scatter_func",
+            "clip_tensor_to_shape",
+            "generate_code",
+            "generate_destination_passing_wrapper",
+            "generate_imports",
+            "generate_scatter_kernel",
+            "logger",
+            "parameter_for_wrapper",
+            "run",
+            "scatter_add",
+            "scatter_add_",
+            "scatter_add_0",
+            "scatter_add_1",
+            "scatter_add_2d_kernel:launch_decorators"
+          ],
+          "shared": []
+        },
+        "event_id": "20d8205794acd922"
       }
     },
     {
@@ -2953,6 +3230,67 @@
           "shared": []
         },
         "location": "mixed"
+      },
+      "attribution": {
+        "operator": "scatter_add",
+        "source_sha256": "8a67a004fd75f9332094bcc3cc821e9d2dfa31dbcc10b474ac27937da9c1a04f",
+        "role": "guidance",
+        "method": "将索引查找移至片上",
+        "primary": "paired",
+        "secondary": [
+          "ir"
+        ],
+        "confidence": "inferred",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/reports/trace-attribution-matrix-20261116.json",
+            "sha256": "ae1f2bb9a53639218c0d522e3c48c3c7058e3f70eb1ca0f471fc9c850fe26a23"
+          },
+          {
+            "path": "development/experiments/lineage/20261117/links-v5/artifacts/8a67a004fd75f9332094bcc3cc821e9d2dfa31dbcc10b474ac27937da9c1a04f.py",
+            "sha256": "8a67a004fd75f9332094bcc3cc821e9d2dfa31dbcc10b474ac27937da9c1a04f"
+          }
+        ],
+        "inference_basis": "recorded_plan",
+        "reason": "优化计划明确记载改法；结合其中的假设与测量推断主要判断来源。",
+        "plan_evidence": [
+          {
+            "kind": "performance",
+            "strategy": "Fix the round-2 memory-locality mistake: keep the sorted-segment algorithm but stage the sorted keys and cumsum row in registers and run the whole run-location search with on-chip tl.gather instead of per-lane dynamic global loads.",
+            "code_changes": "Rewrote _scatter_add_sort_out_kernel so the combine pass issues only two contiguous row loads (sorted keys, cumsum) and then performs all lookups with on-chip tl.gather: the 12-step branchless binary search now gathers from the register-resident key vector instead of issuing a per-lane dynamic global load per step, and the begin/end prefix lookups plus the lane shift also use on-chip gathers. Round 2's structure, dispatch (ncols<=256 owner, <=4096 sorted, else atomic) and numerics are unchanged.",
+            "hypothesis": "Round 2's regression came entirely from the combine pass performing its search with data-dependent global loads; staging the sorted keys and the cumsum row once and searching on-chip recovers the predicted latency, so the six wide-row timing workloads should reach ~1.25x/1.32x and lift geo_mean well above the 0.411 baseline.",
+            "expected_effect": {
+              "metric": "geo_mean",
+              "direction": "increase",
+              "mechanism": "Removes 14 per-lane dynamic global gathers per row from the combine pass and replaces them with on-chip gathers that measured ~25x cheaper per gather, cutting the six wide-row workloads' latency from 6.72/28.6 ms back toward the 0.7/2.5 ms predicted by the isolated ingredient costs."
+            },
+            "source": {
+              "origin": "coder",
+              "parent_round_num": null
+            },
+            "key_params": {
+              "combine_search": "12-step branchless bisection via on-chip tl.gather",
+              "gathers_per_row": "15 on-chip, 2 contiguous loads",
+              "owner_max_cols": 256,
+              "sort_max_cols": 4096
+            },
+            "knowledge_uses": []
+          }
+        ],
+        "changed_symbols": {
+          "kernel": [
+            "_scatter_add_sort_key_kernel",
+            "_scatter_add_sort_out_kernel"
+          ],
+          "host": [
+            "_DENSE_MAX_COLS",
+            "_SORT_MAX_COLS",
+            "run"
+          ],
+          "shared": []
+        },
+        "event_id": "692812b129ee1000"
       }
     },
     {
@@ -3125,6 +3463,34 @@
           "shared": []
         },
         "location": "kernel"
+      },
+      "attribution": {
+        "operator": "scatter_add",
+        "source_sha256": "72c4d40d831f72028f60e079ac9aae9cf921c33f32b515c2c042c43cc795d97e",
+        "role": "guidance",
+        "method": "优化分段合并与排序",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "kernel",
+        "evidence": [
+          {
+            "path": "operators/scatter_add/evidence/independent_strict/72c4d40d831f-candidate.py",
+            "sha256": "72c4d40d831f72028f60e079ac9aae9cf921c33f32b515c2c042c43cc795d97e"
+          }
+        ],
+        "inference_basis": "retrospective_code",
+        "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+        "changed_symbols": {
+          "kernel": [
+            "_scatter_add_sort_key_kernel",
+            "_scatter_add_sort_out_kernel",
+            "_segment_combine"
+          ],
+          "host": [],
+          "shared": []
+        },
+        "event_id": "1f286abb14642c84"
       }
     }
   ],
@@ -4119,6 +4485,100 @@
       "method": {
         "note": "",
         "evidence": "/data/hanle/ascend-optimization/archive/Ascend-Optimization-pre-release-20261103/project/Ascend-Optimization-v1/operators/campaigns/remaining-five-20261023-v2/results/scatter_add/attempt-1/input-provenance.json"
+      },
+      "attribution": {
+        "operator": "scatter_add",
+        "source_sha256": "7cb10fae0b6de198338c77ec1bf4dbeebee6912e92e9ea393994a793a61ddbf1",
+        "role": "guidance",
+        "method": "编译期固定列宽并去掩码",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/reports/trace-attribution-matrix-20261116.json",
+            "sha256": "ae1f2bb9a53639218c0d522e3c48c3c7058e3f70eb1ca0f471fc9c850fe26a23"
+          },
+          {
+            "path": "development/experiments/lineage/20261117/links-v2/artifacts/7cb10fae0b6de198338c77ec1bf4dbeebee6912e92e9ea393994a793a61ddbf1.py",
+            "sha256": "7cb10fae0b6de198338c77ec1bf4dbeebee6912e92e9ea393994a793a61ddbf1"
+          }
+        ],
+        "inference_basis": "recorded_plan",
+        "reason": "优化计划明确记载改法；结合其中的假设与测量推断主要判断来源。",
+        "plan_evidence": [
+          {
+            "kind": "performance",
+            "strategy": "Specialize the destination-owned kernel on a constant column extent and run it mask-free when the extent is an exact multiple of the block and chunk, to cut predication and dispatch work on the shapes that use it.",
+            "code_changes": "Owner kernel takes ncols as a tl.constexpr and gains an EVEN constexpr branch that runs the source loop and the final load/store completely unmasked with a compile-time trip count when ncols is an exact multiple of BLOCK and CHUNK (all powers-of-two frozen timing shapes); the masked branch is retained for non-multiple shapes such as the 9-column correctness cases.",
+            "hypothesis": "Making the destination-owned kernel's column extent a compile-time constant and removing all masking in its loop reduces per-iteration vector work and dispatch cost, improving the 1024x1024 and 128x128 shapes without changing the 2048x2048 atomic path.",
+            "expected_effect": {
+              "metric": "geo_mean",
+              "direction": "increase",
+              "mechanism": "Predication and per-chunk mask arithmetic removed from the destination-owned hot loop, plus one fewer runtime argument to specialize per launch."
+            },
+            "source": {
+              "origin": "coder",
+              "parent_round_num": 2
+            },
+            "key_params": {
+              "ATOMIC_BLOCK": 1024,
+              "DENSE_BLOCK": 256,
+              "DENSE_CHUNK": 32,
+              "DENSE_MAX_COLS": 1700,
+              "EVEN": true
+            },
+            "knowledge_uses": []
+          }
+        ],
+        "changed_symbols": {
+          "kernel": [
+            "_copy_contiguous_kernel",
+            "_copy_kernel",
+            "_copy_nd_kernel",
+            "_scatter_add_lastdim_kernel",
+            "_scatter_add_nd_kernel",
+            "_scatter_add_owner_kernel",
+            "scatter_add_2d_kernel",
+            "scatter_add_kernel_1"
+          ],
+          "host": [
+            "25",
+            "_ATOMIC_BLOCK",
+            "_COPY_BLOCK",
+            "_DENSE_CHUNK",
+            "_DENSE_MAX_COLS",
+            "_D_ARGS",
+            "_INT32_MAX",
+            "_IS_ARGS",
+            "_MAXR",
+            "_OS_ARGS",
+            "_SS_ARGS",
+            "_contig_strides",
+            "_copy",
+            "_copy_contiguous",
+            "_copy_contiguous_kernel:launch_decorators",
+            "_heur_block_2d",
+            "_heur_loop_2d",
+            "_scatter_func",
+            "clip_tensor_to_shape",
+            "generate_code",
+            "generate_destination_passing_wrapper",
+            "generate_imports",
+            "generate_scatter_kernel",
+            "logger",
+            "parameter_for_wrapper",
+            "run",
+            "scatter_add",
+            "scatter_add_",
+            "scatter_add_0",
+            "scatter_add_1",
+            "scatter_add_2d_kernel:launch_decorators"
+          ],
+          "shared": []
+        },
+        "event_id": "20d8205794acd922"
       }
     },
     {
@@ -4380,7 +4840,68 @@
         1,
         "2026-10-23T12:53:10.883058Z"
       ],
-      "method": null
+      "method": null,
+      "attribution": {
+        "operator": "scatter_add",
+        "source_sha256": "8a67a004fd75f9332094bcc3cc821e9d2dfa31dbcc10b474ac27937da9c1a04f",
+        "role": "guidance",
+        "method": "将索引查找移至片上",
+        "primary": "paired",
+        "secondary": [
+          "ir"
+        ],
+        "confidence": "inferred",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/reports/trace-attribution-matrix-20261116.json",
+            "sha256": "ae1f2bb9a53639218c0d522e3c48c3c7058e3f70eb1ca0f471fc9c850fe26a23"
+          },
+          {
+            "path": "development/experiments/lineage/20261117/links-v5/artifacts/8a67a004fd75f9332094bcc3cc821e9d2dfa31dbcc10b474ac27937da9c1a04f.py",
+            "sha256": "8a67a004fd75f9332094bcc3cc821e9d2dfa31dbcc10b474ac27937da9c1a04f"
+          }
+        ],
+        "inference_basis": "recorded_plan",
+        "reason": "优化计划明确记载改法；结合其中的假设与测量推断主要判断来源。",
+        "plan_evidence": [
+          {
+            "kind": "performance",
+            "strategy": "Fix the round-2 memory-locality mistake: keep the sorted-segment algorithm but stage the sorted keys and cumsum row in registers and run the whole run-location search with on-chip tl.gather instead of per-lane dynamic global loads.",
+            "code_changes": "Rewrote _scatter_add_sort_out_kernel so the combine pass issues only two contiguous row loads (sorted keys, cumsum) and then performs all lookups with on-chip tl.gather: the 12-step branchless binary search now gathers from the register-resident key vector instead of issuing a per-lane dynamic global load per step, and the begin/end prefix lookups plus the lane shift also use on-chip gathers. Round 2's structure, dispatch (ncols<=256 owner, <=4096 sorted, else atomic) and numerics are unchanged.",
+            "hypothesis": "Round 2's regression came entirely from the combine pass performing its search with data-dependent global loads; staging the sorted keys and the cumsum row once and searching on-chip recovers the predicted latency, so the six wide-row timing workloads should reach ~1.25x/1.32x and lift geo_mean well above the 0.411 baseline.",
+            "expected_effect": {
+              "metric": "geo_mean",
+              "direction": "increase",
+              "mechanism": "Removes 14 per-lane dynamic global gathers per row from the combine pass and replaces them with on-chip gathers that measured ~25x cheaper per gather, cutting the six wide-row workloads' latency from 6.72/28.6 ms back toward the 0.7/2.5 ms predicted by the isolated ingredient costs."
+            },
+            "source": {
+              "origin": "coder",
+              "parent_round_num": null
+            },
+            "key_params": {
+              "combine_search": "12-step branchless bisection via on-chip tl.gather",
+              "gathers_per_row": "15 on-chip, 2 contiguous loads",
+              "owner_max_cols": 256,
+              "sort_max_cols": 4096
+            },
+            "knowledge_uses": []
+          }
+        ],
+        "changed_symbols": {
+          "kernel": [
+            "_scatter_add_sort_key_kernel",
+            "_scatter_add_sort_out_kernel"
+          ],
+          "host": [
+            "_DENSE_MAX_COLS",
+            "_SORT_MAX_COLS",
+            "run"
+          ],
+          "shared": []
+        },
+        "event_id": "692812b129ee1000"
+      }
     },
     {
       "id": "6753b277014f0735",
@@ -4556,6 +5077,34 @@
       "method": {
         "note": "",
         "evidence": "/data/hanle/ascend-optimization/archive/Ascend-Optimization-pre-release-20261103/project/Ascend-Optimization-v1/operators/campaigns/strict-triton-20261102/candidates/scatter_add/restored-v1/actual-compiled-v2/spec.json"
+      },
+      "attribution": {
+        "operator": "scatter_add",
+        "source_sha256": "72c4d40d831f72028f60e079ac9aae9cf921c33f32b515c2c042c43cc795d97e",
+        "role": "guidance",
+        "method": "优化分段合并与排序",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "kernel",
+        "evidence": [
+          {
+            "path": "operators/scatter_add/evidence/independent_strict/72c4d40d831f-candidate.py",
+            "sha256": "72c4d40d831f72028f60e079ac9aae9cf921c33f32b515c2c042c43cc795d97e"
+          }
+        ],
+        "inference_basis": "retrospective_code",
+        "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+        "changed_symbols": {
+          "kernel": [
+            "_scatter_add_sort_key_kernel",
+            "_scatter_add_sort_out_kernel",
+            "_segment_combine"
+          ],
+          "host": [],
+          "shared": []
+        },
+        "event_id": "1f286abb14642c84"
       }
     }
   ],
@@ -8273,6 +8822,100 @@
           "shared": []
         },
         "location": "mixed"
+      },
+      "attribution": {
+        "operator": "scatter_add",
+        "source_sha256": "7cb10fae0b6de198338c77ec1bf4dbeebee6912e92e9ea393994a793a61ddbf1",
+        "role": "guidance",
+        "method": "编译期固定列宽并去掩码",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/reports/trace-attribution-matrix-20261116.json",
+            "sha256": "ae1f2bb9a53639218c0d522e3c48c3c7058e3f70eb1ca0f471fc9c850fe26a23"
+          },
+          {
+            "path": "development/experiments/lineage/20261117/links-v2/artifacts/7cb10fae0b6de198338c77ec1bf4dbeebee6912e92e9ea393994a793a61ddbf1.py",
+            "sha256": "7cb10fae0b6de198338c77ec1bf4dbeebee6912e92e9ea393994a793a61ddbf1"
+          }
+        ],
+        "inference_basis": "recorded_plan",
+        "reason": "优化计划明确记载改法；结合其中的假设与测量推断主要判断来源。",
+        "plan_evidence": [
+          {
+            "kind": "performance",
+            "strategy": "Specialize the destination-owned kernel on a constant column extent and run it mask-free when the extent is an exact multiple of the block and chunk, to cut predication and dispatch work on the shapes that use it.",
+            "code_changes": "Owner kernel takes ncols as a tl.constexpr and gains an EVEN constexpr branch that runs the source loop and the final load/store completely unmasked with a compile-time trip count when ncols is an exact multiple of BLOCK and CHUNK (all powers-of-two frozen timing shapes); the masked branch is retained for non-multiple shapes such as the 9-column correctness cases.",
+            "hypothesis": "Making the destination-owned kernel's column extent a compile-time constant and removing all masking in its loop reduces per-iteration vector work and dispatch cost, improving the 1024x1024 and 128x128 shapes without changing the 2048x2048 atomic path.",
+            "expected_effect": {
+              "metric": "geo_mean",
+              "direction": "increase",
+              "mechanism": "Predication and per-chunk mask arithmetic removed from the destination-owned hot loop, plus one fewer runtime argument to specialize per launch."
+            },
+            "source": {
+              "origin": "coder",
+              "parent_round_num": 2
+            },
+            "key_params": {
+              "ATOMIC_BLOCK": 1024,
+              "DENSE_BLOCK": 256,
+              "DENSE_CHUNK": 32,
+              "DENSE_MAX_COLS": 1700,
+              "EVEN": true
+            },
+            "knowledge_uses": []
+          }
+        ],
+        "changed_symbols": {
+          "kernel": [
+            "_copy_contiguous_kernel",
+            "_copy_kernel",
+            "_copy_nd_kernel",
+            "_scatter_add_lastdim_kernel",
+            "_scatter_add_nd_kernel",
+            "_scatter_add_owner_kernel",
+            "scatter_add_2d_kernel",
+            "scatter_add_kernel_1"
+          ],
+          "host": [
+            "25",
+            "_ATOMIC_BLOCK",
+            "_COPY_BLOCK",
+            "_DENSE_CHUNK",
+            "_DENSE_MAX_COLS",
+            "_D_ARGS",
+            "_INT32_MAX",
+            "_IS_ARGS",
+            "_MAXR",
+            "_OS_ARGS",
+            "_SS_ARGS",
+            "_contig_strides",
+            "_copy",
+            "_copy_contiguous",
+            "_copy_contiguous_kernel:launch_decorators",
+            "_heur_block_2d",
+            "_heur_loop_2d",
+            "_scatter_func",
+            "clip_tensor_to_shape",
+            "generate_code",
+            "generate_destination_passing_wrapper",
+            "generate_imports",
+            "generate_scatter_kernel",
+            "logger",
+            "parameter_for_wrapper",
+            "run",
+            "scatter_add",
+            "scatter_add_",
+            "scatter_add_0",
+            "scatter_add_1",
+            "scatter_add_2d_kernel:launch_decorators"
+          ],
+          "shared": []
+        },
+        "event_id": "20d8205794acd922"
       }
     },
     {
@@ -8760,6 +9403,67 @@
           "shared": []
         },
         "location": "mixed"
+      },
+      "attribution": {
+        "operator": "scatter_add",
+        "source_sha256": "8a67a004fd75f9332094bcc3cc821e9d2dfa31dbcc10b474ac27937da9c1a04f",
+        "role": "guidance",
+        "method": "将索引查找移至片上",
+        "primary": "paired",
+        "secondary": [
+          "ir"
+        ],
+        "confidence": "inferred",
+        "location": "mixed",
+        "evidence": [
+          {
+            "path": "development/reports/trace-attribution-matrix-20261116.json",
+            "sha256": "ae1f2bb9a53639218c0d522e3c48c3c7058e3f70eb1ca0f471fc9c850fe26a23"
+          },
+          {
+            "path": "development/experiments/lineage/20261117/links-v5/artifacts/8a67a004fd75f9332094bcc3cc821e9d2dfa31dbcc10b474ac27937da9c1a04f.py",
+            "sha256": "8a67a004fd75f9332094bcc3cc821e9d2dfa31dbcc10b474ac27937da9c1a04f"
+          }
+        ],
+        "inference_basis": "recorded_plan",
+        "reason": "优化计划明确记载改法；结合其中的假设与测量推断主要判断来源。",
+        "plan_evidence": [
+          {
+            "kind": "performance",
+            "strategy": "Fix the round-2 memory-locality mistake: keep the sorted-segment algorithm but stage the sorted keys and cumsum row in registers and run the whole run-location search with on-chip tl.gather instead of per-lane dynamic global loads.",
+            "code_changes": "Rewrote _scatter_add_sort_out_kernel so the combine pass issues only two contiguous row loads (sorted keys, cumsum) and then performs all lookups with on-chip tl.gather: the 12-step branchless binary search now gathers from the register-resident key vector instead of issuing a per-lane dynamic global load per step, and the begin/end prefix lookups plus the lane shift also use on-chip gathers. Round 2's structure, dispatch (ncols<=256 owner, <=4096 sorted, else atomic) and numerics are unchanged.",
+            "hypothesis": "Round 2's regression came entirely from the combine pass performing its search with data-dependent global loads; staging the sorted keys and the cumsum row once and searching on-chip recovers the predicted latency, so the six wide-row timing workloads should reach ~1.25x/1.32x and lift geo_mean well above the 0.411 baseline.",
+            "expected_effect": {
+              "metric": "geo_mean",
+              "direction": "increase",
+              "mechanism": "Removes 14 per-lane dynamic global gathers per row from the combine pass and replaces them with on-chip gathers that measured ~25x cheaper per gather, cutting the six wide-row workloads' latency from 6.72/28.6 ms back toward the 0.7/2.5 ms predicted by the isolated ingredient costs."
+            },
+            "source": {
+              "origin": "coder",
+              "parent_round_num": null
+            },
+            "key_params": {
+              "combine_search": "12-step branchless bisection via on-chip tl.gather",
+              "gathers_per_row": "15 on-chip, 2 contiguous loads",
+              "owner_max_cols": 256,
+              "sort_max_cols": 4096
+            },
+            "knowledge_uses": []
+          }
+        ],
+        "changed_symbols": {
+          "kernel": [
+            "_scatter_add_sort_key_kernel",
+            "_scatter_add_sort_out_kernel"
+          ],
+          "host": [
+            "_DENSE_MAX_COLS",
+            "_SORT_MAX_COLS",
+            "run"
+          ],
+          "shared": []
+        },
+        "event_id": "692812b129ee1000"
       }
     },
     {
@@ -9859,6 +10563,34 @@
           "shared": []
         },
         "location": "kernel"
+      },
+      "attribution": {
+        "operator": "scatter_add",
+        "source_sha256": "72c4d40d831f72028f60e079ac9aae9cf921c33f32b515c2c042c43cc795d97e",
+        "role": "guidance",
+        "method": "优化分段合并与排序",
+        "primary": "ir",
+        "secondary": [],
+        "confidence": "inferred",
+        "location": "kernel",
+        "evidence": [
+          {
+            "path": "operators/scatter_add/evidence/independent_strict/72c4d40d831f-candidate.py",
+            "sha256": "72c4d40d831f72028f60e079ac9aae9cf921c33f32b515c2c042c43cc795d97e"
+          }
+        ],
+        "inference_basis": "retrospective_code",
+        "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+        "changed_symbols": {
+          "kernel": [
+            "_scatter_add_sort_key_kernel",
+            "_scatter_add_sort_out_kernel",
+            "_segment_combine"
+          ],
+          "host": [],
+          "shared": []
+        },
+        "event_id": "1f286abb14642c84"
       }
     }
   ],
@@ -11482,5 +12214,191 @@
     },
     "score": 1.8918747719680011
   },
-  "view_policy": "有效交付进展摘要；换算、筛选与探索分支显式保存，不宣称是控制器原始逐轮轨迹"
+  "view_policy": "有效交付进展摘要；换算、筛选与探索分支显式保存，不宣称是控制器原始逐轮轨迹",
+  "attribution_review": [],
+  "mainline_attribution_review": [
+    {
+      "operator": "scatter_add",
+      "source_sha256": "7cb10fae0b6de198338c77ec1bf4dbeebee6912e92e9ea393994a793a61ddbf1",
+      "role": "guidance",
+      "method": "编译期固定列宽并去掩码",
+      "primary": "ir",
+      "secondary": [],
+      "confidence": "inferred",
+      "location": "mixed",
+      "evidence": [
+        {
+          "path": "development/reports/trace-attribution-matrix-20261116.json",
+          "sha256": "ae1f2bb9a53639218c0d522e3c48c3c7058e3f70eb1ca0f471fc9c850fe26a23"
+        },
+        {
+          "path": "development/experiments/lineage/20261117/links-v2/artifacts/7cb10fae0b6de198338c77ec1bf4dbeebee6912e92e9ea393994a793a61ddbf1.py",
+          "sha256": "7cb10fae0b6de198338c77ec1bf4dbeebee6912e92e9ea393994a793a61ddbf1"
+        }
+      ],
+      "inference_basis": "recorded_plan",
+      "reason": "优化计划明确记载改法；结合其中的假设与测量推断主要判断来源。",
+      "plan_evidence": [
+        {
+          "kind": "performance",
+          "strategy": "Specialize the destination-owned kernel on a constant column extent and run it mask-free when the extent is an exact multiple of the block and chunk, to cut predication and dispatch work on the shapes that use it.",
+          "code_changes": "Owner kernel takes ncols as a tl.constexpr and gains an EVEN constexpr branch that runs the source loop and the final load/store completely unmasked with a compile-time trip count when ncols is an exact multiple of BLOCK and CHUNK (all powers-of-two frozen timing shapes); the masked branch is retained for non-multiple shapes such as the 9-column correctness cases.",
+          "hypothesis": "Making the destination-owned kernel's column extent a compile-time constant and removing all masking in its loop reduces per-iteration vector work and dispatch cost, improving the 1024x1024 and 128x128 shapes without changing the 2048x2048 atomic path.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Predication and per-chunk mask arithmetic removed from the destination-owned hot loop, plus one fewer runtime argument to specialize per launch."
+          },
+          "source": {
+            "origin": "coder",
+            "parent_round_num": 2
+          },
+          "key_params": {
+            "ATOMIC_BLOCK": 1024,
+            "DENSE_BLOCK": 256,
+            "DENSE_CHUNK": 32,
+            "DENSE_MAX_COLS": 1700,
+            "EVEN": true
+          },
+          "knowledge_uses": []
+        }
+      ],
+      "changed_symbols": {
+        "kernel": [
+          "_copy_contiguous_kernel",
+          "_copy_kernel",
+          "_copy_nd_kernel",
+          "_scatter_add_lastdim_kernel",
+          "_scatter_add_nd_kernel",
+          "_scatter_add_owner_kernel",
+          "scatter_add_2d_kernel",
+          "scatter_add_kernel_1"
+        ],
+        "host": [
+          "25",
+          "_ATOMIC_BLOCK",
+          "_COPY_BLOCK",
+          "_DENSE_CHUNK",
+          "_DENSE_MAX_COLS",
+          "_D_ARGS",
+          "_INT32_MAX",
+          "_IS_ARGS",
+          "_MAXR",
+          "_OS_ARGS",
+          "_SS_ARGS",
+          "_contig_strides",
+          "_copy",
+          "_copy_contiguous",
+          "_copy_contiguous_kernel:launch_decorators",
+          "_heur_block_2d",
+          "_heur_loop_2d",
+          "_scatter_func",
+          "clip_tensor_to_shape",
+          "generate_code",
+          "generate_destination_passing_wrapper",
+          "generate_imports",
+          "generate_scatter_kernel",
+          "logger",
+          "parameter_for_wrapper",
+          "run",
+          "scatter_add",
+          "scatter_add_",
+          "scatter_add_0",
+          "scatter_add_1",
+          "scatter_add_2d_kernel:launch_decorators"
+        ],
+        "shared": []
+      },
+      "event_id": "20d8205794acd922"
+    },
+    {
+      "operator": "scatter_add",
+      "source_sha256": "8a67a004fd75f9332094bcc3cc821e9d2dfa31dbcc10b474ac27937da9c1a04f",
+      "role": "guidance",
+      "method": "将索引查找移至片上",
+      "primary": "paired",
+      "secondary": [
+        "ir"
+      ],
+      "confidence": "inferred",
+      "location": "mixed",
+      "evidence": [
+        {
+          "path": "development/reports/trace-attribution-matrix-20261116.json",
+          "sha256": "ae1f2bb9a53639218c0d522e3c48c3c7058e3f70eb1ca0f471fc9c850fe26a23"
+        },
+        {
+          "path": "development/experiments/lineage/20261117/links-v5/artifacts/8a67a004fd75f9332094bcc3cc821e9d2dfa31dbcc10b474ac27937da9c1a04f.py",
+          "sha256": "8a67a004fd75f9332094bcc3cc821e9d2dfa31dbcc10b474ac27937da9c1a04f"
+        }
+      ],
+      "inference_basis": "recorded_plan",
+      "reason": "优化计划明确记载改法；结合其中的假设与测量推断主要判断来源。",
+      "plan_evidence": [
+        {
+          "kind": "performance",
+          "strategy": "Fix the round-2 memory-locality mistake: keep the sorted-segment algorithm but stage the sorted keys and cumsum row in registers and run the whole run-location search with on-chip tl.gather instead of per-lane dynamic global loads.",
+          "code_changes": "Rewrote _scatter_add_sort_out_kernel so the combine pass issues only two contiguous row loads (sorted keys, cumsum) and then performs all lookups with on-chip tl.gather: the 12-step branchless binary search now gathers from the register-resident key vector instead of issuing a per-lane dynamic global load per step, and the begin/end prefix lookups plus the lane shift also use on-chip gathers. Round 2's structure, dispatch (ncols<=256 owner, <=4096 sorted, else atomic) and numerics are unchanged.",
+          "hypothesis": "Round 2's regression came entirely from the combine pass performing its search with data-dependent global loads; staging the sorted keys and the cumsum row once and searching on-chip recovers the predicted latency, so the six wide-row timing workloads should reach ~1.25x/1.32x and lift geo_mean well above the 0.411 baseline.",
+          "expected_effect": {
+            "metric": "geo_mean",
+            "direction": "increase",
+            "mechanism": "Removes 14 per-lane dynamic global gathers per row from the combine pass and replaces them with on-chip gathers that measured ~25x cheaper per gather, cutting the six wide-row workloads' latency from 6.72/28.6 ms back toward the 0.7/2.5 ms predicted by the isolated ingredient costs."
+          },
+          "source": {
+            "origin": "coder",
+            "parent_round_num": null
+          },
+          "key_params": {
+            "combine_search": "12-step branchless bisection via on-chip tl.gather",
+            "gathers_per_row": "15 on-chip, 2 contiguous loads",
+            "owner_max_cols": 256,
+            "sort_max_cols": 4096
+          },
+          "knowledge_uses": []
+        }
+      ],
+      "changed_symbols": {
+        "kernel": [
+          "_scatter_add_sort_key_kernel",
+          "_scatter_add_sort_out_kernel"
+        ],
+        "host": [
+          "_DENSE_MAX_COLS",
+          "_SORT_MAX_COLS",
+          "run"
+        ],
+        "shared": []
+      },
+      "event_id": "692812b129ee1000"
+    },
+    {
+      "operator": "scatter_add",
+      "source_sha256": "72c4d40d831f72028f60e079ac9aae9cf921c33f32b515c2c042c43cc795d97e",
+      "role": "guidance",
+      "method": "优化分段合并与排序",
+      "primary": "ir",
+      "secondary": [],
+      "confidence": "inferred",
+      "location": "kernel",
+      "evidence": [
+        {
+          "path": "operators/scatter_add/evidence/independent_strict/72c4d40d831f-candidate.py",
+          "sha256": "72c4d40d831f72028f60e079ac9aae9cf921c33f32b515c2c042c43cc795d97e"
+        }
+      ],
+      "inference_basis": "retrospective_code",
+      "reason": "依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。",
+      "changed_symbols": {
+        "kernel": [
+          "_scatter_add_sort_key_kernel",
+          "_scatter_add_sort_out_kernel",
+          "_segment_combine"
+        ],
+        "host": [],
+        "shared": []
+      },
+      "event_id": "1f286abb14642c84"
+    }
+  ]
 }

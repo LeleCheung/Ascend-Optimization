@@ -1,0 +1,90 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "8725879ade4f4420bbcaeea27429e1ec",
+  "recorded_at": "2026-11-18T12:46:06.176182+00:00",
+  "round_id": "attempt-008",
+  "input_source": {
+    "path": "trace/sources/4bfa839d0c2080b254448cb65893118179bba2c84cff17c2eaacb9984a977eaa.py",
+    "sha256": "4bfa839d0c2080b254448cb65893118179bba2c84cff17c2eaacb9984a977eaa"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/3b2cd5601a95f0aafd86e3c3b8d994e4fe3486823dd745cce47af8c87ec6cf03.json",
+        "sha256": "3b2cd5601a95f0aafd86e3c3b8d994e4fe3486823dd745cce47af8c87ec6cf03"
+      },
+      "original": {
+        "path": "workspace/previous-result.json",
+        "sha256": "3b2cd5601a95f0aafd86e3c3b8d994e4fe3486823dd745cce47af8c87ec6cf03"
+      },
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "Preflight of sha 4bfa839d failed at compile: ub overflow, 1841152 bits required vs 1572864 available (192 KiB AIV UB); no numerical or device result exists for this source.",
+      "source_sha256": "4bfa839d0c2080b254448cb65893118179bba2c84cff17c2eaacb9984a977eaa"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/9f52eecc56e30a12c92083ff6dd278f8eeb7b1e1a8d6e819043ff2b70fbe29da.log",
+        "sha256": "9f52eecc56e30a12c92083ff6dd278f8eeb7b1e1a8d6e819043ff2b70fbe29da"
+      },
+      "original": {
+        "path": "attempts/4bfa839d0c2080b254448cb65893118179bba2c84cff17c2eaacb9984a977eaa/compiled.log",
+        "sha256": "9f52eecc56e30a12c92083ff6dd278f8eeb7b1e1a8d6e819043ff2b70fbe29da"
+      },
+      "category": "other",
+      "role": "trigger",
+      "finding": "Full compiler log: the traceback ends in subprocess.CalledProcessError from /usr/local/Ascend/cann-9.0.0/bin/bishengir-compile (linalg-to-npu-binary stage), so the failure is a UB resource allocation inside BiShengHIR, not a Triton frontend, indexing or numerical error. The same UB message repeats for each oversized compilation variant.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/66dfda3b232496b14c1b544fe0dd6825deb116d98697fb926033e12f4147233f.ttir",
+        "sha256": "66dfda3b232496b14c1b544fe0dd6825deb116d98697fb926033e12f4147233f"
+      },
+      "original": {
+        "path": "workspace/failed-ir/4bfa839d0c20/DSKZWROGLNV3-13-_transform_bias_rescale_qkv_kernel.ttir",
+        "sha256": "66dfda3b232496b14c1b544fe0dd6825deb116d98697fb926033e12f4147233f"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Actual pre-compile IR of the failing variant: tt.make_range end=128 (BLOCK_S) and end=64 (BLOCK_D) with bf16 pointers, i.e. one tile = 8192 elements = 16384 bytes for the large two-byte cases ([8,512,3072], head_dim 64). The small-tile variants in the same directory (8x16, 32x16) are orders of magnitude below UB and are not the reported overflow.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/4bfa839d0c2080b254448cb65893118179bba2c84cff17c2eaacb9984a977eaa.py",
+        "sha256": "4bfa839d0c2080b254448cb65893118179bba2c84cff17c2eaacb9984a977eaa"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "4bfa839d0c2080b254448cb65893118179bba2c84cff17c2eaacb9984a977eaa"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Source accounting reproduces the reported bit count exactly for T=16384 B: the pipelined GROUP loop (tl.range num_stages=2) makes the compiler double-buffer the six in-flight tiles (q,k,v in plus q,k,v out) = 12*T = 196608 B, plus the float32 upcast tile of the q path (2*T = 32768 B, required so fp16/bfloat16 cannot overflow before the 1/sqrt(head_dim) rescale) plus three f32 bias vectors (3*64*4 = 768 B); 196608+32768+768 = 230144 B = 1841152 bits.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/0e99b48790f839ca5fdb1210a864389b611f9dc7eff700025563ef8f3ba5d0f8.json",
+        "sha256": "0e99b48790f839ca5fdb1210a864389b611f9dc7eff700025563ef8f3ba5d0f8"
+      },
+      "original": {
+        "path": "workspace/exploration-feedback.json",
+        "sha256": "0e99b48790f839ca5fdb1210a864389b611f9dc7eff700025563ef8f3ba5d0f8"
+      },
+      "category": "evaluation",
+      "role": "background",
+      "finding": "Two earlier attempts of this campaign failed the same UB check at 2146304 bits (268288 B) with still larger tiles, while qualified attempts 002/003 reached 0.0794 ms and 0.0635 ms, so smaller tile geometry is known to compile on this device.",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "The performance hypothesis (one program owns a [BLOCK_S, BLOCK_D] tile and walks GROUP consecutive seq blocks in a 2-stage loop so the next tile's MTE2 overlaps the current tile's vector/store) is sound; only the tile geometry exceeds the 192 KiB AIV UB once automatic multi-buffering is applied. Fitting the same pipeline needs 12*T + 2*T + 768 <= 196608 B, i.e. T <= 14043 B, and tile extents must be powers of two, so the largest fitting tile is 8192 bytes (BLOCK_S halved for the wide-head cases).",
+  "change": "Focused single-mechanism edit: _TILE_BYTES 16384 -> 8192, with the comment updated to record the measured UB accounting. Indexing, the EXACT and masked paths, the GROUP=2 pipelined loop, fp32 bias-add/rescale opmath and generic strides are untouched; the only other effect is that block_s halves wherever the seq_len cap does not bind, so the grid doubles and each program still walks GROUP=2 tiles with num_stages=2.",
+  "expected": "Compilation succeeds with a predicted UB request of 12*8192 + 16384 + 768 = 115456 B (59% of the 196608 B budget, 1.7x margin), leaving room for the extra local buffers the diagnostic mentions. Small shapes whose block_s is capped by seq_len keep their previous geometry and behaviour. Numerics unchanged: bias add and rescale stay in float32 with a single rounding to the output dtype. Performance should stay close to the pipelined hypothesis; the doubled program count on the large cases is the cost to be measured.",
+  "validation": "1) Record this diagnosis through the decision bridge before editing. 2) Preflight the new candidate: compilation must finish without any ub overflow, and every correctness check must pass, exercising both the EXACT and the masked path and the fp32 opmath path. 3) Then collect paired profiling/simulator evidence on transform_bias_rescale_qkv-timing-2 to test whether the GROUP pipelining still pays at the halved tile; tune GROUP or the per-path tile if it does not.",
+  "alternatives": [],
+  "discriminating_observation": "",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

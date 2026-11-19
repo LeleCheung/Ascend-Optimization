@@ -10,6 +10,15 @@ from hgkda.simulator import parse, validate_time_unit
 
 
 class SimulatorTests(unittest.TestCase):
+    def test_overlapping_invocations_use_union_for_time_and_sum_for_cycles(self):
+        events=[dict(ph='X',ts=start,dur=1,args=dict(pc_addr=hex(i)))
+                for i in range(3) for start in [0,.5]]
+        rows=[dict(pc=hex(i),instruction='LOAD',pipeline='MTE2',running_time_us=1.5,cycles=2)
+              for i in range(3)]
+        self.assertEqual(validate_time_unit(events,rows,'us')['matching_pcs'],3)
+        self.assertEqual(validate_time_unit(events,rows,'cycles')['matching_pcs'],3)
+        with self.assertRaises(ValueError):validate_time_unit(events,rows,'ns')
+
     def test_display_unit_cannot_override_csv_verified_timestamp_unit(self):
         trace=dict(displayTimeUnit='ns',traceEvents=[
             dict(ph='X',ts=i,dur=1000*(i+1),args=dict(pc_addr=hex(i))) for i in range(3)])

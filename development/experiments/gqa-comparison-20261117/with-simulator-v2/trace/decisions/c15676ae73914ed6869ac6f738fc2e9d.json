@@ -1,0 +1,76 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "c15676ae73914ed6869ac6f738fc2e9d",
+  "recorded_at": "2026-11-17T09:45:14.456234+00:00",
+  "round_id": "round-01",
+  "input_source": {
+    "path": "trace/sources/770910b7b720dd72ebf498d1baec91d0e254f032d1201da6316747bf290ca585.py",
+    "sha256": "770910b7b720dd72ebf498d1baec91d0e254f032d1201da6316747bf290ca585"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/301d64153391a72b5bc44c5dabb103ed5d905c62688cc6c71e018d7c86400042.json",
+        "sha256": "301d64153391a72b5bc44c5dabb103ed5d905c62688cc6c71e018d7c86400042"
+      },
+      "original": {
+        "path": "workspace/evidence-summary.json",
+        "sha256": "301d64153391a72b5bc44c5dabb103ed5d905c62688cc6c71e018d7c86400042"
+      },
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4 (bf16, B4 S256 Nq64 Nkv8 D128) candidate 1900.721us vs reference FusedInferAttentionScore 131.701us (14.4x), while fp16 case1/2 are 2.0x and bf16 case7 is 2.5x; device block dim of the candidate is 1024 programs. Its own pipelines are near-idle (aic_cube_ratio 0.000876, aiv_vec_ratio 0.0059), so the cost is not arithmetic throughput but per-program stalls.",
+      "source_sha256": "770910b7b720dd72ebf498d1baec91d0e254f032d1201da6316747bf290ca585"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/25b2e1543e4651634f73e220cf2ec1dfb5e6a5dae8a43274ce9217f102729b87.json",
+        "sha256": "25b2e1543e4651634f73e220cf2ec1dfb5e6a5dae8a43274ce9217f102729b87"
+      },
+      "original": {
+        "path": "workspace/simulator-summary.json",
+        "sha256": "25b2e1543e4651634f73e220cf2ec1dfb5e6a5dae8a43274ce9217f102729b87"
+      },
+      "category": "simulator",
+      "role": "mechanism",
+      "finding": "In the captured 4-iteration windows (scope: partial capture, no full-kernel/critical-path claim) the largest instructions are WAIT_FLAG_DEVI attributed to candidate.py:115 (15.36us cubecore, 8.99/9.01us both veccores) and candidate.py:118 (14.15us cubecore, 10.81/10.82us veccores); FIXP shows FIX_L0C_TO_DST 4.15/3.87/3.85us plus SET_FLAG on those same PV dots, CUBE productive_ratio only 0.042 vs FIXP 0.399; VECTOR BAR 3.63/3.43/3.09us sit on candidate.py:117 (residual recompute). i.e. the three same-v PV dots each round-trip L0C->UB with a flag wait.",
+      "source_sha256": "770910b7b720dd72ebf498d1baec91d0e254f032d1201da6316747bf290ca585"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/f08a8c34da570d24233e713564445f7cabf4316521b0aea59e6e7d10c3fbc07b.txt",
+        "sha256": "f08a8c34da570d24233e713564445f7cabf4316521b0aea59e6e7d10c3fbc07b"
+      },
+      "original": {
+        "path": "workspace/ir-excerpt.txt",
+        "sha256": "f08a8c34da570d24233e713564445f7cabf4316521b0aea59e6e7d10c3fbc07b"
+      },
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "Lines 178-179 are two separate linalg.matmul{input_precision=\"ieee\"} writing distinct f32 tensors and line 180 is arith.mulf %104, %9 (the 1/2048 rescale) between them; line 186 is a third matmul after arith.truncf %109 (line 185). The de-scaling scalar is applied in fp32 *after* each matmul, so the compiler cannot keep the products in the L0C accumulator and must move every dot result out to UB.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/770910b7b720dd72ebf498d1baec91d0e254f032d1201da6316747bf290ca585.py",
+        "sha256": "770910b7b720dd72ebf498d1baec91d0e254f032d1201da6316747bf290ca585"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "770910b7b720dd72ebf498d1baec91d0e254f032d1201da6316747bf290ca585"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Lines 112-118: p_hi/p_lo/p_lo2 are three separate tl.dot(p_*, v) calls combined in one fp32 expression with pairwise constants 1.0 and 1/2048 and 1/2048^2; BLOCK_M=64, BLOCK_N=64, BLOCK_D=128, num_warps=1 for case4, so the per-iteration stall is paid 4 times per program over 1024 programs.",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "The bf16 3-term probability expansion is not the arithmetic problem (cube is ~4% busy); its cost is structural: three dots sharing the same v can only be summed in fp32 registers, which forces three L0C->UB movouts and three flag round trips plus a UB barrier per iteration. Folding the exact power-of-two de-scaling into the p operands and chaining the three products through tl.dot's accumulator argument should keep them in the cube accumulator, leaving one movout per iteration and removing the intermediate reads.",
+  "change": "For the 3-term (bf16) path only: pre-scale the two residual operands by the exact power-of-two factors (r1/2048 and r2/2048^2 before the dtype cast, numerically identical to casting then de-scaling) and accumulate p_hi, p_lo, p_lo2 through tl.dot(p, v, acc) so the products chain inside the cube accumulator; the fp16 (2-term) path and all shapes/dtypes/tiling stay untouched.",
+  "expected": "Case4 duration falls well below 1900us toward the reference 132us as the per-iteration PV flag round trips drop from three to one; case7 also improves; cases1/2 unchanged. Confirmation would be WAIT_FLAG_DEVI count/time at candidate.py:115-118 dropping and FIX_L0C_TO_DST for the PV dots going from three per iteration to one.",
+  "validation": "Host runs the official checker on cases 1/2/4/7 (fixed beamp; all must keep passing with unchanged output dtype) and re-measures the candidate duration for case4; a re-profile should show fewer PV-dot flag waits / fixpipe movouts.",
+  "alternatives": [],
+  "discriminating_observation": "",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

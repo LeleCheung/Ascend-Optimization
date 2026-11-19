@@ -27,6 +27,27 @@ def resolve_reported_symbol(alias,log):
     return matches[0]
 
 
+def resolve_collected_symbol(alias, actual, log, side):
+    """Accept a unique CANN binary specialization explicitly reported by msprof."""
+    reported=set(re.findall(r'Start analyze kernel on device:[^\n]*?kernel:\s*([^,\s]+)',log))
+    operation=alias.rsplit('_',1)[-1] if alias.startswith('aclnn') else alias
+    if side!='reference' or reported!={actual} or not actual.startswith(operation+'_'):
+        raise ValueError('Collected binary differs from the discovered task without a unique specialization binding')
+    return actual
+
+
+def partition_profile_tasks(tasks):
+    """Keep DMA events explicit while counting AI-core metric reports separately."""
+    compute=[];other=[]
+    for task in tasks:
+        kind=task.get('task_type','')
+        if kind.startswith('KERNEL_AI'):compute.append(task)
+        elif kind=='SDMA_SQE':other.append(task)
+        else:raise ValueError('Unclassified device task requires explicit profiling support: '+kind)
+    if not compute:raise ValueError('No AI-core task available for metric collection')
+    return compute,other
+
+
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--config',type=Path,required=True);p.add_argument('--source',type=Path,required=True)
@@ -46,7 +67,8 @@ def main():
     else:
         frozen=a.output/'candidate-source.py';shutil.copyfile(source,frozen)
         save(spec,dict(operator=c['operator'],source=str(frozen),source_sha256=digest,leaf=str(leaf),case=case,
-             reference_kind=c['job']['reference_kind'],entrypoint='run',ir_directory=str(a.output/'actual-ir')))
+             reference_kind=c['job']['reference_kind'],entrypoint=c.get('capture_entrypoint','run'),
+             warmup_before_capture=c.get('capture_warmup',0),ir_directory=str(a.output/'actual-ir')))
     environment=dict(ASCEND_RT_VISIBLE_DEVICES=str(c['device']),OMP_NUM_THREADS='1',PYTHONDONTWRITEBYTECODE='1',
           PYTHONPATH=c.get('device_pythonpath', ''),TRITON_CACHE_DIR=str(a.output/'profile-triton-cache'))
     def device(label,arguments):
@@ -71,11 +93,12 @@ def main():
             assert read(trace)['source_sha256']==digest and read(trace)['side']==side
             discovery=read(trace);names=discovery['kernels'];assert names
             if len(names)>1:
-                assert side=='reference','多kernel候选须明确模拟器目标，当前不自动选择'
+                # 两侧均保留完整调用中的所有任务；模拟器另行显式选定目标。
                 # 同一API可以多次调用同名TransData，但每次对应不同二进制；
                 # 不用别名猜映射，直接采集本次调用的全部实际二进制任务。
                 all_profile=folder/'all-kernels'
-                task_count=len(discovery['tasks'])
+                compute_tasks,non_metric_tasks=partition_profile_tasks(discovery['tasks'])
+                task_count=len(compute_tasks)
                 application=shlex.join([c['device_python'],str(Path(__file__).with_name('paired_driver.py')),'--spec',str(spec),'--side',side])
                 command=['msprof','op','--application='+application,'--output='+str(all_profile),
                          '--launch-count='+str(task_count),'--warm-up=0','--aic-metrics=Roofline']
@@ -98,7 +121,8 @@ def main():
                     children.append(dict(directory=child.name,symbol=symbol,occurrences=1))
                 save(folder/'collection.json',dict(status='completed',side=side,groups='Roofline',spec_sha256=sha(spec),
                     kernels=children,discovery_sha256=sha(trace),runtime_tasks=discovery['tasks'],
-                    scope='完整API的所有实际任务分别保存，不由任务别名猜测TransData二进制；无完整调用关键路径推断'))
+                    non_metric_tasks=non_metric_tasks,
+                    scope='AI-core任务逐项保存指标；SDMA任务保留发现trace与耗时，完整调用由正式评测覆盖。'))
                 continue
             folder.mkdir(exist_ok=True);symbol=names[0]
             application=shlex.join([c['device_python'],str(Path(__file__).with_name('paired_driver.py')),'--spec',str(spec),'--side',side])
@@ -111,7 +135,8 @@ def main():
             command=['msprof','op','--application='+application,'--output='+str(folder/'profile'),
                      '--kernel-name='+symbol,'--launch-count=1','--warm-up=5','--aic-metrics=Roofline']
             label=side+'-collect-symbol' if resolution else side+'-collect'
-            device(label,command)
+            if not (a.resume and list((folder/'profile').rglob('OpBasicInfo*.csv'))):
+                device(label,command)
             if not list((folder/'profile').rglob('OpBasicInfo*.csv')) and resolution is None:
                 symbol=resolve_reported_symbol(symbol,first_log.read_text(errors='replace'))
                 resolution=dict(task_alias=names[0],reported_binary_symbol=symbol,log_sha256=sha(first_log))
@@ -120,7 +145,12 @@ def main():
                 device(side+'-collect-symbol',command)
             basic=list((folder/'profile').rglob('OpBasicInfo*.csv'));assert len(basic)==1
             with basic[0].open() as stream:rows=list(csv.DictReader(stream))
-            assert len(rows)==1 and rows[0]['Op Name']==symbol
+            assert len(rows)==1
+            if rows[0]['Op Name']!=symbol:
+                log_path=a.output/(label+'.log')
+                symbol=resolve_collected_symbol(symbol,rows[0]['Op Name'],log_path.read_text(errors='replace'),side)
+                resolution=dict(task_alias=names[0],reported_binary_symbol=symbol,log_sha256=sha(log_path),
+                    basis='unique analyzed binary specialization in the same msprof invocation')
             save(folder/'collection.json',dict(status='completed',side=side,expected_kernel=symbol,groups='Roofline',
                 task_alias=names[0],symbol_resolution=resolution,
                 spec_sha256=sha(spec),command=command,discovery_sha256=sha(trace),

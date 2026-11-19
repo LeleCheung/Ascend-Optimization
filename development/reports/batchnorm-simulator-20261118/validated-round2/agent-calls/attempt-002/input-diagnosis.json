@@ -1,0 +1,57 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "dbf938228eed7573e964dbae991d60822b3b2369e32767e4ed36e9fc7b348f57",
+  "evidence": [
+    {
+      "path": "/data/hanle/ascend-optimization/runs/batchnorm-simulator-20261118/workspace/candidate.py",
+      "category": "probe",
+      "role": "disambiguation",
+      "finding": "Bridge preflight on the Welford-edited source (SHA 4e2dda6a) first failed the harness import policy with AssertionError ['logging']; after removing logging it failed with ['flag_gems']. A further static pass rejected line 113 torch.npu.device with 'host compute/transfer or external execution entry requires rejection or separate review'. Replacing the flag_gems wrappers with local equivalents (identity libentry, one explicit triton.Config({}) with num_warps=2 num_stages=1, the Ascend batch_norm BLOCK_M/BLOCK_N heuristic formulas) and dropping the device context produced SHA dbf93822, which preflight accepted as awaiting_source_review with reason 'device-operation boundary review'."
+    },
+    {
+      "path": "/data/hanle/ascend-optimization/runs/batchnorm-simulator-20261118/workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "trigger",
+      "finding": "timing-7 partial trace: first-pass source loop lines 38-52 is the top region (564 instructions, instruction_time_sum 29.18us, wait_instruction_time_sum 20.75us). VECTOR productive_ratio 0.432, wait_only_ratio 0.222, idle_ratio 0.346; SCALAR productive 0.112, wait_only 0.421, idle 0.467; MTE2 productive 0.217, idle 0.783. Explicit WAIT/BAR instructions are attributed to the Welford lines 48-50 (top WAIT_FLAG 2.12us, BARs 1.4-2.3us each). This localizes attention to the per-tile Welford update, but absolute_time_qualified=false, so these fractions are not full-device time and do not prove a dependency stall."
+    },
+    {
+      "path": "/data/hanle/ascend-optimization/runs/batchnorm-simulator-20261118/workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "mechanism",
+      "finding": "Candidate timing-7 kernel: Task Duration 85.92us, Block Dim 64, per-block aiv_time 41.70us; aiv_vec_time 17.50us (vec_ratio 0.420), aiv_mte2_time 14.84us (ratio 0.356, active BW 16.46GB/s), aiv_mte3_time 4.86us, aiv_scalar_time 10.50us, aiv_scalar_wait_time 21.60us, aiv_scalar_mte2_stall 9.06us, ResourceConflict vec_wait_ratio 0.487. Reference BatchNormV3: Task Duration 21.64us, Block Dim 32, per-block aiv_time 19.46us, aiv_vec_time 11.17us, aiv_mte2_time 8.58us at 58.27GB/s. Candidate is 2.27x per-block aiv time and 3.5x lower MTE2 bandwidth; 64 blocks need two 32-core waves while the reference needs one."
+    },
+    {
+      "path": "/data/hanle/ascend-optimization/runs/batchnorm-simulator-20261118/workspace/current-ir/ca3ff529fa06/target-0-batch_norm_with_update_kernel.ttir",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "Compiled target IR for BLOCK_M=8, BLOCK_N=128, batch_dim=8, spatial_dim=4096: first loop runs 32 n_steps per program. Each tile executes a vector divf (arith.divf %new_mean, %new_mean_61), two vector subf, two mul/add pairs and two arith.select for mean/var, plus extui/add for cnt (lines 79-90). This confirms the per-tile Welford update contains an avoidable vector divide and redundant select/sub forms, and that the loop is elementwise/dependency-chained rather than a reduction."
+    },
+    {
+      "path": "/data/hanle/ascend-optimization/runs/batchnorm-simulator-20261118/workspace/performance-feedback.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "Retained best source ca3ff529 passes all 27 formal cases; geo_mean 1.196. timing-7 is worst at 0.3526 speedup (81.85us vs 28.86us CANN), timing-8 0.4189, timing-1/2/4/5 about 0.79-0.84. Large fp32 shapes are the loss leaders, matching the two-wave 64-block profile."
+    }
+  ],
+  "hypothesis": "The evaluable mechanism is the Welford delta-form compute refactor. It was masked by harness-compliance constraints: the candidate imported logging and flag_gems (outside the static import allowlist) and set an npu device context that counts as a host device entry. Replacing those wrappers with local, behavior-equivalent definitions (identity libentry, the single Ascend batch_norm autotune config of num_warps=2/num_stages=1 with empty META, the backend's BLOCK_M/BLOCK_N heuristic formulas) leaves all kernel arithmetic, tiling, allocation and special-case semantics unchanged, so the compute hypothesis becomes evaluable at the mandated preflight boundary. Dropping the device context is safe when the tensors and the process current device coincide, as in the single-device evaluation environment; this is flagged to the host for review.",
+  "alternatives": [
+    "Keep flag_gems imports and bypass preflight: not available, preflight is the mandated validation boundary and must pass before handoff.",
+    "Dynamically import flag_gems via os/importlib to evade the static allowlist: rejected as gaming the harness policy rather than satisfying it.",
+    "Keep torch.npu.device via a differently named host call: static policy rejects device-setting entries; instead the current device is left as configured by the host harness, and the implicit current-device launch is used.",
+    "Hard-code BLOCK_M=8 and BLOCK_N=128: rejected because it would change tiling for other shapes; the embedded formulas reproduce the backend heuristics for every key, including 8x128 for batch_dim=8/spatial_dim=4096."
+  ],
+  "discriminating_observation": "Preflight should return awaiting_source_review for the self-contained source, and formal evaluation should reproduce the retained candidate's correctness while changing only the Welford arithmetic. If tiling, launch config or device placement had been altered materially, timing-0/3/6 small-shape cases would shift; if the Welford delta form is effective, timing-7 per-block aiv_vec_time and Task Duration fall while MTE2 active bandwidth stays near 16.5GB/s.",
+  "change": "Remove logging and flag_gems imports; embed a local identity _libentry, _BN_CONFIGS = [triton.Config({}, num_warps=2, num_stages=1)], and _BN_HEURISTICS implementing batch_norm BLOCK_M=min(64,next_pow2(batch_dim)), BLOCK_N=min(next_pow2(spatial_dim),max(1,1024//BLOCK_M)); replace the torch_device_fn.device context with a direct kernel launch on the current device. Keep the Welford delta-form first-pass update and all other kernel/host logic unchanged.",
+  "expected": "Preflight accepted the source as awaiting_source_review (SHA dbf93822); no intended numerical or performance change from the compliance rewrite except removal of libentry wrapper launch overhead. On formal evaluation, all 27 cases remain PASSED and timing-7 speedup exceeds the retained 0.3526 if the Welford delta-form mechanism is effective.",
+  "validation": "Preflight compile via the bridge, then host formal evaluation of all 27 cases with per-case speedups and correctness; compare candidate per-block aiv_vec_time, aiv_time, Task Duration and vec/mte ratios against current-profiling.",
+  "selected_layer": "triton_kernel_compute",
+  "layer_reason": "The hotspot region and the top WAIT/BAR instructions are inside the Triton kernel's first-pass Welford loop; the same tile/thread mapping and host-side allocations are kept, so a source-level arithmetic refactor isolates this mechanism.",
+  "simulator_incremental_judgment": "The simulator adds localization, not proof: it shows the first-pass loop lines 38-52 carries the largest instruction-time sum and the explicit WAIT/BAR instructions, with VECTOR wait_only 0.222 and SCALAR wait_only 0.421 alongside high MTE2 idle (0.783). That distinguishes a serialized per-tile compute/latency hypothesis from a bandwidth-bound hypothesis. Because the window is partial and absolute_time_qualified=false, the ratios are used only for this ranking, not as evidence of a bounded dependency stall or as full-device time. The later compliance rewrite (imports, libentry, device context) is host-side metadata only and adds no new simulator distinction; the existing trace remains the basis for expecting a first-pass vector-time reduction.",
+  "unknown": [
+    "Absolute critical path of the first pass is unknown; the partial trace does not cover kernel completion.",
+    "How much of the vector divide maps to multiple hardware instructions on this compiler version is not quantified.",
+    "Whether MTE2 small-transfer inefficiency becomes co-limiting after the vector work shrinks.",
+    "Whether omitting the npu device context changes behavior if the evaluation harness selects a non-current device; the host review at this boundary should confirm single-device execution.",
+    "Whether removing the libentry wrapper changes cached-config dispatch or launch overhead; the explicit single config and local heuristics are intended to reproduce the same compiled variant."
+  ]
+}

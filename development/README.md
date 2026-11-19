@@ -1,5 +1,17 @@
 # HG-KDA开发与研究
 
+2026-11-18 夜间多算子推进：[结果与验证记录](reports/night-multi-operator-20261118.md)。QKV、BatchNorm、scatter_add均取得完整验证的性能改善，主图已接入26项总览。BatchNorm目标81.847→44.913μs，scatter_add目标1.400813→1.282337ms；QKV最新62.837μs，小幅改进经同源码完整复测方向一致。三项均完成修改后热点和相对流水分析，模型读取证据与修改顺序保留；实际修改位于Triton层。正式计时采用本批KGS profiler，历史walltime交付记录保持冻结。
+
+2026-11-18 性能续接完成：[upsample_bilinear2d第4轮](reports/upsample-performance-20261118.md)。目标309.716→165.744μs，相对CANN 0.790→1.480×；完整24/24及双方各30/30通过。模型根据模拟器交织热点与实际IR改为打包写回，并修正低半字掩码。复采显示Vector时间8.44→3.20μs，搬运指令数一致；本轮未新增对照实验。更新[单张主图](reports/native-upsample-contrast-20261118/index.html)，537份证据哈希验证完成，专用服务已停止。下一候选可从新最佳源码继续。
+
+2026-11-18 后续策略改为性能优先：不设总轮数、工具次数、耗时、token或cost预算，达到验收线不自动停止。公共generate默认不传宿主轮数上限、不设整次生成deadline；源码审查、完整评测和逐轮证据继续执行。Windows源码与910B公共安装已更新；910B新任务的`--package`使用`/data/hanle/ascend-optimization/runtime/hgkda-performance-first-20261118/hgkda`，解释器仍为`runtime/hgkda-release-venv/bin/python`。78项软件测试通过；原8轮对照与其method快照冻结保留，后续不要复用旧实验控制器的8／48预算设置。
+
+2026-11-18 已完成：[原生FlagGems上采样模拟器对照](reports/native-upsample-contrast-20261118.md)及[完整轨迹](reports/native-upsample-contrast-20261118/index.html)。同起点、同模型、同合同各8轮，最终均24/24及双方各30/30通过；目标无／有模拟器418.964／309.716μs，六项候选耗时几何比较为1.082倍。保留失败、回退、实际成本与局部模拟器限制，不作多任务因果外推；原26项交付不变。
+
+2026-11-17阶段安排（后续由上文更新）：新增实验围绕《白盒模拟器驱动的多层次优化：以昇腾算子优化为例》汇报，GQA为后续复杂研究线，逐轮记录模拟器证据、选层理由、修改和验证。26项历史确有模拟器参与或核验记录；主图主来源为0不等于未使用。源码／IR阅读不单列为模拟器贡献。见[执行计划与历史核对](reports/presentation-gqa-plan-20261117.md)。
+
+2026-11-17 当前结果：[26项轨迹](reports/operator-traces-stitched-20261117/index.html)接续完成，方法来源补查区分日志确认与带星号的上下文推断。[GQA有／无模拟器对照](reports/gqa-simulator-comparison-20261117/index.html)完成：接入固定官方checker后起点4/4通过；同一起点与两次修改预算下，有模拟器组目标1900.7→1378.7μs、4/4通过，无模拟器组保留起点。前后实际IR及指令计数符合减少一次PV乘法的预期。模拟器为超时留下的有限窗口，且包含Codex代码审查反馈；不宣称独立因果已被统计证明。详情见[报告](reports/attribution-and-gqa-20261117.md)，后文保留各日期的历史状态，原26项交付不变。
+
 2026-11-16 夜间研究已结束：[结果与证据](reports/night-research-20261116.md)。26项[主要优化线图册](reports/operator-traces-26-20261116/index.html)包含SVG／PNG／历史入口：21项多点、1项单账本节点、4项标出缺口。[上采样对照](reports/upsample-simulator-contrast-20261116/README.md)中成对profiling＋IR路线269→220 μs、完整KGS及补测通过，模拟器路线未形成有效候选；[GQA起点](reports/gqa-pilot-20261116.md)两个BF16子集通过，FP16格式下界问题单列。原26算子交付不变。
 
 2026-11-16 轨迹展示与记录更新：[log10精简图](reports/log10-trace-pilot-20261116/index.html)只展示一张主线；箭头颜色表示判断依据，节点形状表示修改位置。没有模拟器正向案例，不再单独呈现放大图。公共runtime增加自动事件记录和修改前decision登记；[记录规范](reports/trace-rollout-20261116.md)。图册生成不依赖新增设备测量。

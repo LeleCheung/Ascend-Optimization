@@ -1,0 +1,49 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "5d74700a475eae8f36188f11cc1eb1e200dab4ee0512826443f46226ef7c0688",
+  "round": "round-04",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "Current candidate (bound to source 5d74700a475e) on upsample_bilinear2d-timing-1: kernel upsample_bilinear2d_2x_kernel, single task duration 1326.7us, Block Dim 16384. Per-block mean aiv_time 3.096us and aiv_total_cycles 5109; aiv_mte2_active_bw only 1.77GB/s and aiv_mte3_active_bw 3.66GB/s with aiv_mte2_ratio 0.394. 16384 blocks over ~40 AIV cores (410 waves) x ~3.2us reproduces the 1.3ms task duration, so almost all time is per-block fixed DMA/latency cost on very small transfers, not bandwidth or vector math."
+    },
+    {
+      "path": "workspace/current-ir/5d74700a475e/20-kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "IR of the 2x fast path for the f32 variant: each program (grid = one source row x one (n,c) plane) issues 9 tt.load of only tensor<128xf32> (3 row windows x {base, left, right}) and 2 tt.store of tensor<256xf32>. Every transfer is a single 128-element (256B/512B) span, and no program covers more than one source row, so the kernel has maximum program count with minimum per-program DMA size."
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "Formal result for the current source: 24/24 PASSED (18 correctness + 6 timing), geo_mean 0.3047; timing-1 latency 1.2763ms vs reference 0.2470ms = 0.194x. Correctness is green and supplementary checks passed, so this round is a pure performance change; the 0.194x is the loss to repair, not a speedup."
+    },
+    {
+      "path": "workspace/baseline-evaluation.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "Original native FlagGems source: timing-1 253.9ms (0.00097x) and 6 correctness RUNTIME_ERROR (ConvertTritonIRToLinalgIR). The current 2x fast path already removed those compile failures and cut the target ~200x, i.e. the fast path itself is sound; what remains is its block granularity."
+    }
+  ],
+  "hypothesis": "The dominant cost is per-program fixed launch/DMA latency rather than data volume: 16384 programs of ~3.2us each, each moving only 3x256B loads per row window. Per-block aiv_time (3.1us) is ~100x larger than the block's data volume justifies, and aiv_mte2/mte3 active bandwidth is ~2-4GB/s (near-idle). Reducing the program count while making each program's transfers contiguous multi-KB spans should amortize the fixed per-block latency without changing arithmetic.",
+  "alternatives": [
+    "Per-element gather/scalarization from the left/right shifted loads makes each 128-lane load slow; if so, larger tiles at the same 9-load structure would not help much and the fix would be to reduce the number of shifted loads.",
+    "Vector math or fp32 conversion dominates; contradicted by aiv_vec_ratio 0.364 and aiv_vec_time 1.14us per block (well under aiv_time 3.1us).",
+    "Launch-side (host) overhead dominates rather than device work; the profiling shows a single 1326.7us device task matching 16384 blocks x per-block time, so host dispatch is not the limiter here."
+  ],
+  "discriminating_observation": "16384 blocks x 3.096us mean aiv_time / ~40 AIV cores ~= 1.27ms, which equals the measured 1.326ms task duration, while per-block aiv_vec_time is only 1.14us and mte2/mte3 active bandwidth is 1.8/3.7GB/s. That combination distinguishes 'per-block fixed latency x block count' from 'compute-bound' or 'bandwidth-bound' explanations.",
+  "change": "Triton-layer mechanism change in the exact-2x fast path only: replace the one-source-row-per-program kernel with a 2-D row-tile kernel. Each program now owns TILE_I=16 consecutive source rows of one (n,c) plane, loads three row-window tiles of shape (TILE_I, BLOCK_IW) (still 3 loads per window for the left/right column neighbours, but each load is a contiguous TILE_I*IW span), blends vertically on the register tiles (0.25*E_up + 0.75*E_center for even rows, 0.75*E_center + 0.25*E_down for odd rows) and issues two 2-D stores of (TILE_I, 2*IW). Grid changes from (IH, N*C) = 16384 to (ceil(IH/TILE_I), N*C) = 1024 for the target case; TILE_I is capped by UB budget (TILE_I*BLOCK_IW <= 8192) and by next_pow2(IH). Arithmetic, weights, dtype handling and the general (non-2x) gather kernel are unchanged.",
+  "expected": "Target case: program count 16384 -> 1024 and per-program DMA span 256B -> 4KB contiguous, so the u32 per-block fixed cost is amortized 16x. Expected total kernel time to drop from ~1326us to well below the 247us reference (roughly 60-120us, i.e. speedup >2x vs reference) unless the shifted loads themselves are the dominant per-block latency. Other timing cases (64x64->128x128, bf16/f32 variants) should improve for the same reason; no change in numerical output because the blend weights and clamping are identical.",
+  "validation": "Bridge preflight (compile + correctness + supplementary checks) on the new source, then one full formal KGS evaluation to compare all 24 workloads and the timing-1 latency against 1.2763ms/0.2470ms. Re-collect paired profiling only if the formal result does not show the expected drop, to distinguish 'per-block fixed cost still dominant' from 'shifted loads dominate'.",
+  "selected_layer": "Triton",
+  "layer_reason": "The dominant cost is program granularity and DMA transaction size, both expressed in the Triton kernel body (grid shape, tile shapes, number and span of tl.load/tl.store). No pass-level knob or IR rewrite is available that changes the block count, and the host wrapper only chooses grid/tile constants; so the mechanism must be changed in the Triton source.",
+  "simulator_incremental_judgment": "No simulator evidence is used: no simulator artifact is supplied for this arm (context-brief current_simulator is null), so simulation adds no useful distinction here. The attribution above rests only on the actual paired profiling, the current TTIR and the formal evaluation rows.",
+  "unknown": [
+    "Whether the 9 shifted loads per row-window tile are still latency-bound at 4KB granularity, or whether per-block time falls to the DMA-bandwidth estimate.",
+    "Whether the 3-D tl.join + reshape ((TILE_I,BLOCK_IW,2) -> (TILE_I,2*BLOCK_IW)) and the 2-D strided stores lower cleanly on the Ascend backend, and whether the (TILE_I=16, BLOCK_IW=128) fp32 working set fits the 192KB UB without spilling.",
+    "Whether TILE_I=16 (1024 blocks) is the best granularity; TILE_I=32 exceeds the UB budget estimate, so the block-count reduction is bounded by UB rather than by parallelism."
+  ]
+}

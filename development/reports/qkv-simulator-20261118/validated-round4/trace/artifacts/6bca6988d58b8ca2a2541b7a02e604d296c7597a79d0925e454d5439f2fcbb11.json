@@ -1,0 +1,57 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "28d7c8a2e19dadcd5412fda0175221f71d4a33f9e69d5b1574211b6cb7ca0785",
+  "selected_layer": "kernel_ub_budget_and_buffer_lifetime",
+  "layer_reason": "The only observed failure is a compile-time BiShengHIR ub overflow (268288 B required vs 196608 B available) on the Triton kernel body; the failing artifact is the kernel IR for this exact source, so the first controllable layer is per-program tile geometry and the live range of the full-tile pointer/opmath tensors. Host-side allocation/metadata logic, masks and arithmetic order are not implicated by any evidence and are left untouched.",
+  "simulator_incremental_judgment": "No simulator evidence is used or claimed: context-brief.json reports current_simulator=null and current_profiling=null for this source, and this control arm has no required simulator report. The mechanism is read directly from the failed compilation IR artifacts under failed-ir/28d7c8a2e19d/ plus the compiler diagnostic in previous-result.json.",
+  "stage": "kernel compilation (BiShengHIR pipeline) - compiler resource failure, not numerics and not timing",
+  "actual_diagnostic": "loc(candidate.py:56:0): error: ub overflow, requires 2146304 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.); [ERROR] Failed to run BiShengHIR pipeline, ERR99999. Requirement 2146304 bits = 268288 B vs available 1572864 bits = 196608 B (192 KiB AIV UB) => factor 1.365 over budget.",
+  "evidence": [
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "status=failed, source_sha256=28d7c8a2e19d..., failed_cases=[] and supplementary=null: no numerical or timing check ever ran. The whole failure is the BiShengHIR ub overflow above. (The 1.62x geo-mean in performance-feedback.json belongs to historical source c133a5a3, not to this candidate.)"
+    },
+    {
+      "path": "workspace/failed-ir/28d7c8a2e19d/2Z5AW5P7UXR3-3-_transform_bias_rescale_qkv_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Masked-path f16 specialization actually compiled with make_range 32/4/16 => tile [BLOCK_S=32, BLOCK_H=4, BLOCK_D=16] = 2048 elements, i.e. HALF the 4096 elements the _TILE_BYTES=8192 comment assumed, because block_s was capped by next_power_of_2(seq_len)=32. Body holds six full-tile pointer tensors (q_in_20, k_val_62, v_val_64, and %1/%3/%5 = q/k/v_ptr+out_off, each tensor<32x4x16x!tt.ptr<f16>> = 8 B/element), plus out_off_42 i32 and the fp32 q opmath chain (extf/addf/mulf/truncf). Address arithmetic, not payload data, dominates the UB estimate; the earlier byte-based tile budget did not control it."
+    },
+    {
+      "path": "workspace/failed-ir/28d7c8a2e19d/I4RMWORCHKVS-0-_transform_bias_rescale_qkv_kernel.ttir",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "The EXACT (unmasked) specialization has the same 6-pointer-tensor structure (tile 8/4/16 = 512 elements, num_head_groups/stride_qkv_d/stride_bias dead-argument-eliminated). So the overflow is not caused by the mask tensors nor by the EXACT/masked split; it tracks tile element count and live full-tile pointer tensors."
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Lines 124-145 / 152-173 load q, k and v and only then store all three, so all three payload tiles, all three fp32/intermediate results and all six pointer tensors are simultaneously live. Lines 26-52 comment claims 8192 B keeps ~139 KiB; the IR above shows the realized tile was 2048 elements and still needed 268288 B, so the byte model under-counts per-element address bytes (~131 B/element effective)."
+    },
+    {
+      "path": "workspace/context-brief.json",
+      "category": "other",
+      "role": "background",
+      "finding": "Repair must stay inside the existing hypothesis (one affine [BLOCK_S, BLOCK_H, BLOCK_D] tile per (batch, head_group, seq_block) program, adjacent heads grouped for wider contiguous input rows, no per-element index decoding). current_profiling/current_simulator are null: no profiling or simulator evidence exists for this source."
+    }
+  ],
+  "hypothesis": "The UB requirement is driven by tile ELEMENT count times the number of simultaneously live full-tile tensors, chiefly 8 B/element pointer tensors (effective ~131 B/element for f16 at 2048 elements). Two focused levers inside the same tile hypothesis: (1) lower the element budget so an f16 program never exceeds ~1024 elements (2048 B / element-size), and (2) make the three components sequential phases (load+compute+store q, then k, then v) so only one input and one output pointer tensor is live at a time instead of six. Combined forecast ~100 B/element * 1024 = ~100 KiB, comfortably under 196608 B.",
+  "change": "candidate.py only: _TILE_BYTES 8192 -> 2048; _MIN_STORE_BYTES 2048 -> 1024 so BLOCK_H=2 head grouping survives the smaller budget (for head_dim=64 fp16: BLOCK_S=8, BLOCK_H=2, BLOCK_D=64 = 1024 elements, 128 contiguous input columns per row; previously 16x2x64 = 2048). Kernel body restructured in both EXACT and masked branches into three sequential q -> k -> v phases; masks, affine (s,h,d) indexing, generic stride handling, fp32 q opmath + input-dtype k/v adds, and the host-side tile selection logic otherwise unchanged.",
+  "expected": "Preflight compile of all four specializations succeeds instead of 'ub overflow'; no change in computed values (same arithmetic order/rounding per output element, independent outputs); each program still issues one contiguous-column input row load and contiguous output block store, so the layout hypothesis is preserved. Throughput may drop versus the historical 63.5 us (fp16) / 122.5 us (fp32) points because programs get smaller; that is a tuning problem to revisit once a compiling point exists.",
+  "validation": "1) bridge preflight on the edited candidate.py (device compile of the operator's cases) - pass criterion: no BiShengHIR 'ub overflow' diagnostic. 2) formal + supplementary semantics checks through the supplied bridge to confirm numerics/independent outputs, since no semantic check has ever run for this source. 3) per-case timing to record the cost of the smaller tile and to decide the next tile step-up experiment. No simulator/profiling claim is made for this edit (current_simulator/current_profiling are null).",
+  "unknown": [
+    "Exact UB allocator model on this backend: per-element byte factor (~131 B/element at 2048 f16 elements) is inferred from one diagnostic, so fixed per-kernel overhead and the multi-buffer doubling factor are not pinned down.",
+    "Whether 512-element fp32 tiles (4 B/element, 3 payload tensors) stay under the limit with an equally comfortable margin.",
+    "How much the halved f16 tile costs in DMA efficiency on the 8x512x3072 cases; DMA row width drops from 512 B to 256 B for fp16.",
+    "Whether the compiler schedules the three now-sequential components back-to-back and thereby re-inflates peak liveness."
+  ],
+  "observations": [
+    "Edit applied to candidate.py: source_sha256 28d7c8a2e19dadcd5412fda0175221f71d4a33f9e69d5b1574211b6cb7ca0785 -> ce4d1a36e7ce3c0435734e0b9159cd21bfdda3d2bddbba6d4cf2a5aa2ca45f19 (decision_id 6fec46735ee44a68a3f269e26c3509c4 was recorded on the pre-edit source).",
+    "Preflight through the supplied bridge returned status=awaiting_source_review ('设备操作前等待外部只读路径与地址边界审查；保持当前候选不变并返回'). No compile, semantic or timing observation was produced, so the ub-overflow repair is NOT yet verified: neither the 'no ub overflow' pass criterion nor the numerics claims above are confirmed.",
+    "Handing off with candidate.py unchanged at ce4d1a36 per the awaiting_source_review rule. Next stage must re-invoke preflight on this sha; if the ub overflow persists, the lever order is: _TILE_BYTES 2048 -> 1024 (fp16 512 elements) first, then dropping the BLOCK_H grouping, since the element-count model is the mechanism under test.",
+    "Host-side tile plan for the contract shapes (computed from the current constants, not measured): fp16/bf16 head_dim 64 -> [BLOCK_S=8, BLOCK_H=2, BLOCK_D=64] = 1024 elements, 4096 programs; fp32 head_dim 64 -> [4, 2, 64] = 512 elements; head_dim 32 fp16 -> [16, 2, 32]; head_dim 16 fp16 -> [32, 2, 16]. All hit the EXACT branch for the power-of-two seq lengths; contiguous input row width is BLOCK_H*head_dim = 128 fp16 columns (256 B) for head_dim 64."
+  ]
+}

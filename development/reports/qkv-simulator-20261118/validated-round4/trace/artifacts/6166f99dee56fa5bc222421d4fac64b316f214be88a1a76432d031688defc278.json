@@ -1,0 +1,50 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "bb15ccd36053972716aedcffe5438e3e86931e384dd1646fc16da6c2840e8b31",
+  "selected_layer": "tile_geometry",
+  "layer_reason": "The failure is a compiler resource (UB/local-memory) overflow reported at kernel compilation, not a numeric or logic failure; the cheapest correct layer is the tile geometry constant that sizes every UB staging buffer.",
+  "simulator_incremental_judgment": "Simulator and profiling evidence for the current source are unavailable; simulator-evidence.json and current-profiling.json describe the earlier source c133a5a3 and were not used as causal evidence for this repair.",
+  "evidence": [
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "status=failed, failed_cases empty, no supplementary run: BiShengHIR compilation of _transform_bias_rescale_qkv_kernel (candidate.py:46) aborted with 'ub overflow, requires 2146304 bits while 1572864 bits available' (262 KiB required vs 192 KiB UB), repeated per kernel instance; error text notes multi-buffer is enabled so some ops need extra local buffer."
+    },
+    {
+      "path": "workspace/latest-preflight.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "Same diagnostic and same source_sha256 bb15ccd3..., so preflight never reached device execution; the compile step is the actual failure stage."
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Host tiling for the target case (fp16 [8,512,3072], heads=16 -> hidden_dim=1024, head_dim=64) gives BLOCK_D=64, tile_elems=_TILE_BYTES/elem=8192, min_rows=4096/(64*2)=32, BLOCK_H=4, BLOCK_S=32, i.e. an 8192-element [S,H,D] tile. Per element the kernel stages two 3D int64 offset tensors (q_in, out_off: 8 B each), three fp16 loads (3x2 B), fp32 q opmath temporaries (up to ~8 B) and two fp16 results (2x2 B) ~ 34 B/elem -> ~262 KiB, matching the reported requirement exactly, so tile element count is the single driver of the overflow."
+    },
+    {
+      "path": "workspace/performance-feedback.json",
+      "source_sha256": "c133a5a391deb3491b0ee14071e87dcfa1e6335a438d538155e778b7595980d0",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "Historical source c133a5a3 reached 1.435x on the target case and 1.62x geomean; its hypothesis is that BLOCK_H head grouping widens the strided input rows, which must be preserved by this repair."
+    },
+    {
+      "path": "workspace/context-brief.json",
+      "source_sha256": "bb15ccd36053972716aedcffe5438e3e86931e384dd1646fc16da6c2840e8b31",
+      "category": "other",
+      "role": "background",
+      "finding": "Declares current-source profiling/simulator unavailable and phase 'repair within prior performance hypothesis; preserve changed tiling and indexing'."
+    }
+  ],
+  "hypothesis": "The UB overrun comes only from the tile element budget (8192 elements for the target case), because the two int64 3D offset tensors alone cost 16 B/elem and the fp32 q opmath adds more. Halving the element budget to 4096 keeps every empirical B/elem term identical and should drop the requirement to ~139 KiB, below the 192 KiB UB, while still allowing BLOCK_H=4 head grouping to be retained so the strided input rows stay BLOCK_H*head_dim contiguous.",
+  "change": "In candidate.py set _TILE_BYTES 16384 -> 8192 and _MIN_STORE_BYTES 4096 -> 2048 (with comments updated). For the target case this keeps BLOCK_D=64, BLOCK_H=4 and shrinks BLOCK_S 32 -> 16 (tile 8192 -> 4096 elements, per-head output store stays 2 KiB contiguous); other shapes scale the same way with BLOCK_H grouping preferred. Index arithmetic, masks, strides, the fp32 q opmath order and the independent q/k/v output stores are untouched.",
+  "expected": "Kernel compilation succeeds on the target case with ~139 KiB of the 192 KiB UB in use (~72%), program count rises 512 -> 1024 for the target case, and numerical results are bit-identical to the previous mapping because only BLOCK_S/BLOCK_H partitioning changes.",
+  "validation": "Bridge preflight --source candidate.py must compile the target case (no ub overflow); if it compiles, request the full KGS formal evaluation and check failed_cases is empty, supplementary semantics pass, and the per-case speedups stay in the prior range.",
+  "unknown": [
+    "Exact UB accounting done by BiShengHIR (multi-buffer duplication factors) is inferred from the reported bit count, not from a compile-side report.",
+    "Whether 4096 elements leaves enough margin for the bf16/fp16 [4,1024,1536] and [2,128,768] shapes, where min_rows yields BLOCK_S 32 and 64 respectively.",
+    "Performance effect of halving BLOCK_S relative to the (uncompilable) 8192-element variant on the target case."
+  ]
+}

@@ -1,0 +1,138 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "9fbd1a17eb1647afaef7aef1d7238781",
+  "recorded_at": "2026-11-18T08:18:23.910825+00:00",
+  "round_id": "attempt-002",
+  "input_source": {
+    "path": "trace/sources/6e7fed2de3d73b4174300829abb9f07e46b7f3372fb0904a6e79a1e52a7f32c3.py",
+    "sha256": "6e7fed2de3d73b4174300829abb9f07e46b7f3372fb0904a6e79a1e52a7f32c3"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/47aab3648e48f6ad97208b80e620f180c77dd639f6c347b42c5a1d0de1cda535.json",
+        "sha256": "47aab3648e48f6ad97208b80e620f180c77dd639f6c347b42c5a1d0de1cda535"
+      },
+      "original": {
+        "path": "workspace/simulator-evidence.json",
+        "sha256": "47aab3648e48f6ad97208b80e620f180c77dd639f6c347b42c5a1d0de1cda535"
+      },
+      "category": "simulator",
+      "role": "trigger",
+      "finding": "本次模拟器报告状态为 qualified_observation：只覆盖 application 未完成的 11.7us 部分窗口（capture_scope 明确写明），因此不能当作整核耗时。可见事实：窗口内 VECTOR active_ratio=0.709、productive_ratio=0.482，MTE3 仅 2 个事件（productive 0.50us），SCALARLDST 2398 事件；top_instructions 里时间权重最高的 9 条指令（BAR 3.24/3.23/3.23/1.93/1.77/1.76us，WAIT_FLAG 3.24us，VREDUCEV2 1.31/1.28us）全部归属到源行 252 'tl.interleave(ev, od)'。其新增贡献是：把写回端的交织序列标成该窗口内时间权重最高的指令组，且写回 DMA（MTE3）不是窗口内热点。",
+      "source_sha256": "6e7fed2de3d73b4174300829abb9f07e46b7f3372fb0904a6e79a1e52a7f32c3"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/bacbe2fb7e0cecbbd7fcdd3984e3871bb6ac3f68366386bc8c4ee1be5de4bf1c.ttir",
+        "sha256": "bacbe2fb7e0cecbbd7fcdd3984e3871bb6ac3f68366386bc8c4ee1be5de4bf1c"
+      },
+      "original": {
+        "path": "workspace/current-ir/18-kernel.ttir",
+        "sha256": "bacbe2fb7e0cecbbd7fcdd3984e3871bb6ac3f68366386bc8c4ee1be5de4bf1c"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "f16 2x kernel 的实际 TTIR 里写回为 tt.join(ev,od) -> tensor<16x128x2xf16> 再 tt.reshape -> tensor<16x256xf16>（第 155-156、188-189 行），即 tl.interleave 被展开成 join+reshape；对应的 current-ir/18-kernel.bcmlir 第 235-246、324-327 行把该交织实现为两次带步长(最后一维步长 2)的 tensor.insert_slice 到 (16,128,2) 缓冲、随后的 reshape 与 materialize_in_destination。这解释了为什么交织要为每个输出元素做一次 UB 内定位。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/248444af75ca5ed121e3456a890066c1ba01497efea28855d9d49720859ee655.bcmlir",
+        "sha256": "248444af75ca5ed121e3456a890066c1ba01497efea28855d9d49720859ee655"
+      },
+      "original": {
+        "path": "workspace/current-ir/18-kernel.bcmlir",
+        "sha256": "248444af75ca5ed121e3456a890066c1ba01497efea28855d9d49720859ee655"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "同一份 bcmlir 显示九次输入加载各自 lowering 成 scf.for + memref.copy 的逐行(1x128, 256B)拷贝，并带 MOV_PAD_VAL 的掩码填充；写回侧则是每输出行一次连续 materialize。说明写回字节数本身是连续、最小的，可优化点只在交织重排，而不在写回突发形状。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/392a339afc11e53ee8f970e078978a2cd730d13f258c4e8b980155fd1918d62d.json",
+        "sha256": "392a339afc11e53ee8f970e078978a2cd730d13f258c4e8b980155fd1918d62d"
+      },
+      "original": {
+        "path": "workspace/current-profiling.json",
+        "sha256": "392a339afc11e53ee8f970e078978a2cd730d13f258c4e8b980155fd1918d62d"
+      },
+      "category": "paired_profiling",
+      "role": "mechanism",
+      "finding": "成对比较逐块均值（候选 1024 块 / 参考 142 块）：aiv_time 11.78us、aiv_vec_time 8.44us、aiv_vec_ratio 0.718（参考 0.326）、aiv_mte2_ratio 0.251、aiv_mte3_ratio 0.027、aiv_scalar_wait_time 9.65us。向量流水是块时间的主项，写回带宽与 MTEND 不是主项，因此改写的目标应是把向量侧的重排工作去掉，而不是减少写回字节。",
+      "source_sha256": "6e7fed2de3d73b4174300829abb9f07e46b7f3372fb0904a6e79a1e52a7f32c3"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/b9d060523aa6a99dd03b62e6efd8290ec64395729a170964826388adfb54ec06.json",
+        "sha256": "b9d060523aa6a99dd03b62e6efd8290ec64395729a170964826388adfb54ec06"
+      },
+      "original": {
+        "path": "workspace/history/lessons.json",
+        "sha256": "b9d060523aa6a99dd03b62e6efd8290ec64395729a170964826388adfb54ec06"
+      },
+      "category": "evaluation",
+      "role": "disambiguation",
+      "finding": "独立 hash 的历史失败源（attempt-7, 68b54c2b…）数学与寻址和当前源码一致，唯一差别是用 lo|(hi<<16) 把两个 f16 打包成 32 位字后写回，结果 28/30 补充检查通过并报 'incorrect values/NaNs'。该表达式里 lo 经过 16->32 位扩展后未做低半字掩码：若扩展按符号位填充（负 f16 得到 0xFFFF_xxxx），OR 会把高半字污染成 0xFFFF，恰好是小端下奇数列的 f16 NaN 位型——这与 '值错误/NaN' 的现象一致。因此本候选在同一机制上补上显式 &0xFFFF，避免重复同一失败。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/68b54c2bf706e77e10e4d34745588dfa24f9052d4a01e14936313c7cae3f8787.py",
+        "sha256": "68b54c2bf706e77e10e4d34745588dfa24f9052d4a01e14936313c7cae3f8787"
+      },
+      "original": {
+        "path": "workspace/history/attempt-7-source.py",
+        "sha256": "68b54c2bf706e77e10e4d34745588dfa24f9052d4a01e14936313c7cae3f8787"
+      },
+      "category": "other",
+      "role": "background",
+      "finding": "历史打包候选（独立 hash，不等同当前源码）的打包/写回寻址（plane 字数、行字偏移、列掩码）经复核正确，故失败不能归因于寻址公式，只能归因于位组装或后端 lowering；这支持保留同一寻址形式而只修正位组装。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/6fe93d87f9489186a69865691065d06d90ed66324f070913b4ed78d327dcdae3.json",
+        "sha256": "6fe93d87f9489186a69865691065d06d90ed66324f070913b4ed78d327dcdae3"
+      },
+      "original": {
+        "path": "workspace/previous-result.json",
+        "sha256": "6fe93d87f9489186a69865691065d06d90ed66324f070913b4ed78d327dcdae3"
+      },
+      "category": "evaluation",
+      "role": "background",
+      "finding": "verified best 的正式结果：24/24 formal 通过，几何平均 0.915，最差 upsample_bilinear2d-timing-4 0.739；目标 case timing-1 为 0.309226ms 对参考 0.244140ms（0.790x），距 1.0x 需约 21% 的时延下降。",
+      "source_sha256": "6e7fed2de3d73b4174300829abb9f07e46b7f3372fb0904a6e79a1e52a7f32c3"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/312644843109f227a7093a0f0a0cfc96f67b280a1592b046038d35e32d611880.json",
+        "sha256": "312644843109f227a7093a0f0a0cfc96f67b280a1592b046038d35e32d611880"
+      },
+      "original": {
+        "path": "workspace/knowledge.json",
+        "sha256": "312644843109f227a7093a0f0a0cfc96f67b280a1592b046038d35e32d611880"
+      },
+      "category": "knowledge",
+      "role": "background",
+      "finding": "本任务未提供算子专项历史知识（mechanisms 为空），只有技能通用约束，因此机制判断完全来自上述本轮证据。",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "目标 case 走精确 2x 快路径，其块时间主要耗在写回端的寄存器级交织：每个块把两个 16x128 的 f16 结果经 tt.join+tt.reshape（bcmlir 中为两次带步长 insert_slice 加 reshape）交织成 16x256 再整行写回，交织体积与输出元素数成正比且在 UB 内逐元素定位；模拟器把该源行标为窗口内时间权重最高的指令组，成对 profiling 又显示 VECTOR 占比 0.72 而 MTE3 仅 0.027。若把同一输入列产生的偶/奇输出列在寄存器里按小端序组装成一个 32 位字，直接按 32 位字对整行连续写回，则写回字节数与 DMA 形状完全不变，而 UB 内的交织重排被彻底消除。",
+  "change": "仅改 upsample_bilinear2d_2x_kernel 的写回组织与对应封装：新增设备端 _pack_f16_words(lo, hi)，其中 lo_bits = bitcast(f16->uint16)->int32 后显式 &0xFFFF（防符号扩展污染高半字），hi_bits = bitcast(f16->uint16)->int32 << 16，返回 lo_bits | hi_bits；kernel 增加 PACK16: tl.constexpr，在 PACK16 分支把输出按 32 位字寻址（plane 字数 OH*OW//2、行字数 OW//2、偶行 2*ii、奇行 +行字数，列掩码 j<OW//2），偶/奇输出行各一次连续 int32 store；非 PACK16 分支与通用 upsample_bilinear2d_kernel 保持原样。封装侧在精确 2x 且 input.dtype==torch.float16 时把输出张量按其 int32 视图传入（纯元数据 view，无拷贝、无结果缓存），其余 dtype 仍走原交织实现；ABI、网格、tile 选择、掩码与寻址一律不变。",
+  "expected": "目标 case 每块由交织重排带来的约 6-7us 向量侧开销被去掉，块内向量时间从约 8.4us 降到约 2-4us，块时间 11.8us 降到 6-8us，timing-1 总时延从 0.309ms 降到约 0.20-0.25ms（相对参考 0.244ms 由 0.79x 升到约 1.0-1.2x）；写回字节数、网格规模与输入侧 DMA 不变，因此 mte3 指标应基本不动；非 2x 与 bf16/f32 路径时延不变。",
+  "validation": "先 preflight 编译并核对生成的 IR 中写回不再是 join+reshape；再由宿主执行完整评测：24 项 formal 与两条 supplementary 各 30 项必须全过（尤其 f16 精确 2x 用例的 matched_ratio/abs_err 应与当前 0.00098 量级一致，误差不应变差），同时对比逐 case speedup 与 aiv_vec_ratio 是否按预期下降。",
+  "alternatives": [
+    "只把 (16,128,2) 的指针直接用于三维 store 而不显式 reshape：bcmlir 显示 insert_slice 的带步长交织仍然存在，预计收益有限，故未选。",
+    "偶列与奇列分两次步长 2 的 store：内层访问不连续，MTE3 只能退化成短突发或标量写，风险高于收益（且历史边界标量化教训提示不能破坏仿射连续地址），故未选。",
+    "仅把中间计算从 f32 改成 f16 或减少 select/掩码运算：逐块估算这些算术只占向量周期的很小部分（20 个 16x128 f32 运算约 640 周期，而块内向量时间约 13500 周期），收益上限低，故未选。",
+    "保留交织但增大 tile：交织体积与输出元素数成正比，且 UB 用量已随 BLOCK_I 增长接近上限，不消除根因，故未选。",
+    "历史打包式 lo|(hi<<16) 原样重试：已知会产生错误值/NaN，明确不做；本次改为先对低半字做 &0xFFFF 掩码后再 OR，使低半字与 16->32 位扩展的符号语义无关。"
+  ],
+  "discriminating_observation": "若机制成立：新候选的 TTIR/bcmlir 里第 252/258 行附近不应再出现 tt.join+tt.reshape 与 (16,128,2) 的带步长 insert_slice，而应是一条对 16x128 int32 连续写的 store；再次采集时该部分窗口内归属写回行的 BAR/VREDUCEV2 簇应消失，成对 profiling 中 aiv_vec_ratio 明显下降而 aiv_mte3 的写回字节数与突发形状基本不变（整核时延仍以宿主完整评测为准，模拟器只覆盖 application 未完成的部分窗口，不能作为耗时结论）。",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

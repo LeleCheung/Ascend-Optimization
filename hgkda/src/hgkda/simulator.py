@@ -11,11 +11,22 @@ def validate_time_unit(trace, instructions, unit):
     """用同核、同PC的CSV累计时间／cycles交叉核验trace单位，不读取显示单位。"""
     events=trace.get('traceEvents',[]) if isinstance(trace,dict) else trace
     names={e.get('pid'):e.get('args',{}).get('name') for e in events if e.get('ph')=='M' and e.get('name')=='process_name'}
-    durations={}
+    durations={};intervals={}
     for event in events:
         args=event.get('args',{});duration=number(event.get('dur'))
         if event.get('ph')!='X' or 'pc_addr' not in args or not duration or names.get(event.get('pid'))=='CACHEMISS':continue
         key=pc(args['pc_addr']);durations[key]=durations.get(key,0)+duration
+        start=number(event.get('ts'))
+        if start is not None:intervals.setdefault(key,[]).append((start,start+duration))
+    # CSV运行时间合并同PC重叠执行区间；cycles则保留累计执行周期。
+    # 无时间戳的旧离线样本仍使用时长和。
+    if unit!='cycles':
+        for key,spans in intervals.items():
+            merged=[]
+            for start,end in sorted(spans):
+                if merged and start<=merged[-1][1]:merged[-1][1]=max(end,merged[-1][1])
+                else:merged.append([start,end])
+            durations[key]=sum(end-start for start,end in merged)
     ratios=[];excluded_sync=[];scalar_ratios=[]
     for row in instructions:
         reference=row.get('cycles' if unit=='cycles' else 'running_time_us')
@@ -42,7 +53,7 @@ def validate_time_unit(trace, instructions, unit):
                 scalar_comparison=dict(compared_pcs=len(scalar_ratios),median_ratio=median(scalar_ratios) if scalar_ratios else None,
                     matching_pcs=sum(abs(value/expected-1)<.05 for value in scalar_ratios),
                     scope='保留Scalar时间口径／量化差异，未用于校准单位；时间轴使用工具报告区间'),
-                method='同PC的非Scalar、非同步指令trace正时长总和对照CSV；排除同步等待口径及不足0.1us的舍入项')
+                method='同PC的非Scalar、非同步指令trace区间并集对照CSV运行时间（cycles使用时长和）；排除同步等待口径及不足0.1us的舍入项')
 
 
 def pc(value):

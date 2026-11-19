@@ -1,0 +1,68 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "62a02c203a3e54a09f6479ca8526168bf1529821284cd1b42bc6cbdf3c980a12",
+  "evidence": [
+    {
+      "path": "workspace/candidate.py",
+      "category": "probe",
+      "role": "trigger",
+      "finding": "Preflight of the fast-path source (SHA b2a75a69..., same decision, exact-2x kernel already added) was rejected by the bridge's static import gate: AssertionError: ['logging']. The gate only admits top-level imports from {torch, torch_npu, triton, math, functools, typing, os}, so the starter's 'import logging', 'from flag_gems import runtime', 'from flag_gems.runtime import torch_device_fn' and 'from flag_gems.utils import triton_lang_extension as tle' cannot survive. They must be replaced by self-contained equivalents before any device compilation can happen; this is a compatibility edit under the same registered decision (decision_id 76a638066e5943a6adff998c8283e0f1), not a new performance mechanism. Note: the bridge asserts simulator-evidence.source_sha256 == current candidate SHA, so a second decision cannot be registered once the source changes; the initial decision therefore covers this call's whole mechanism, and the two rejected registration attempts (JSON syntax error, source-SHA mismatch) are left in the call log."
+    },
+    {
+      "path": "workspace/profiling-comparison.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "Candidate kernel 'upsample_bilinear2d_kernel' Task Duration = 255453.4 us for timing-1, while the CANN reference completes the same operator in 169.1 us (ResizeBilinearV2) + small casts/transdata. Per-block AccountingUtilization aiv_time mean = 9824.9 us and aiv_total_cycles mean = 16.21M for 1024 block rows (~126k cycles per iteration of the kernel's inner N*C loop), i.e. the cost is inside the kernel body, not launch/autotune: the harness latency 253.9 ms matches the kernel task duration."
+    },
+    {
+      "path": "workspace/actual-ir/upsample_bilinear2d_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "All four tl.load sites with data-dependent column indices (offset_00/01/10/11) are lowered to scalar scf.for loops over the 128 vector lanes containing one memref.load per element, tagged {DiscreteMemAccess}/{ExtractedLoadOrStore}, and the whole float index derivation (remsi on i64, sitofp, addf, mulf, subf, maxnumf, fptosi, minsi) is re-executed per lane inside that loop. The tl.store is lowered the same way (one bufferization.materialize_in_destination per lane). Consequence: 5 general-memory accesses per output element are scalar and their address math is scalar, so the vector unit cannot be used for the data movement."
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "disambiguation",
+      "finding": "Real-device selected config for timing-1 is BLOCK_X=128, BLOCK_Y=1, num_warps=8 (i.e. one output row per program, oh/real_h scalar). The dominant source_loop region (candidate lines 105-130) contains the four load sites, each followed by BAR and WAIT_FLAG on the VECTOR/SCALAR pipes; SCALARLDST has 20788 events and the SCALAR pipe spends 26.6 us of 72.2 us in waits. The capture is explicitly a partial window (application did not finish), so it can only support the per-iteration structure, not a total-duration or speedup claim."
+    },
+    {
+      "path": "workspace/baseline-evaluation.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "Starter result: 18/24 formal cases pass; correctness cases 2,3,8,9,14,15 fail with MLIRCompilationError (ConvertTritonIRToLinalgIR pass failure); all six timing cases run, timing-1 = 253.95 ms versus 0.2455 ms reference. This is the source that must not be regressed."
+    },
+    {
+      "path": "workspace/native-runtime-facts.json",
+      "category": "knowledge",
+      "role": "background",
+      "finding": "Native tuned config list for upsample_bilinear2d covers BLOCK_X in {64,128,256,512} x BLOCK_Y in {1,2} with num_warps in {4,8}; program_id is read through FlagGems triton_lang_extension. No task-specific optimization knowledge is supplied (knowledge.json mechanisms empty)."
+    }
+  ],
+  "hypothesis": "The 255 ms is caused by the access formulation, not by grid serialization alone: because every input address depends on a data-dependent column index (w0/w1 computed by float floor of the rescaled coordinate) and every output address contains '(pid_x*BLOCK_X + arange) % OW', the Ascend lowering scalarizes all four loads and the store into per-lane memref.load/memref.store loops and also re-executes the float coordinate/index arithmetic per lane (~2k cycles per produced element, 16.2M cycles per block). For the target case the scale is exactly 2, where the mapping is piecewise affine: output row 2i = 0.25*in[i-1]+0.75*in[i], row 2i+1 = 0.75*in[i]+0.25*in[i+1], and the same pair of weights applies horizontally, so the four gathers can be replaced by contiguous (affine) shifted loads of the same input rows and contiguous pair stores, with no data-dependent address at all.",
+  "alternatives": [
+    "The cost is dominated by the serial N*C loop (only 128 output elements per iteration) rather than by the scalarized accesses; if so, only moving (n,c) into the grid would give a large speedup and an affine-load rewrite would add little.",
+    "The cost is dominated by launch/autotune host work rather than device time; contradicted by the 255453 us kernel Task Duration matching the 253.9 ms harness latency, but the harness may still include per-call Python/launch overhead that a kernel-side change cannot remove.",
+    "The remsi/modulo and int64 address arithmetic alone account for most of the cost; then removing only the modulo (affine store) would already recover most of the time.",
+    "The 6 MLIRCompilationError cases are caused by constructs I am not touching (e.g. the align_corners branch), so they will persist after this change."
+  ],
+  "discriminating_observation": "The bcmlir shows the loads and the store as per-lane scalar loops with per-lane index recomputation, while the same kernel's vector-unit pipelines show only ~65% VECTOR activity and a 9.8 ms per-block residence: the wall time is ~1978 cycles per produced output element, which is only explicable by scalarized general-memory access plus scalar address math, not by the loop trip count alone (128 iterations) and not by launch overhead (kernel Task Duration equals harness latency). The simulator adds the concrete per-iteration structure (BLOCK_Y=1 selected; four load sites each followed by BAR/WAIT_FLAG) and, importantly, warns that its window is partial so it cannot be used to rank the loads by total time; the affine-vs-serialized distinction is settled by the bcmlir, not by the simulator.",
+  "change": "Add a self-contained exact-2x fast path kernel (upsample_bilinear2d_2x_kernel) selected purely from runtime metadata (align_corners False, OH == 2*IH, OW == 2*IW, reciprocal scale exactly 0.5 for both axes), which (a) parallelizes (n,c) on program_id(2) and the input row on program_id(1) instead of an in-kernel N*C loop, (b) replaces the four data-dependent gathers by nine contiguous shifted row loads (offsets j-1, j, j+1) with boundary clamping done by tl.where in registers, and (c) writes the two output rows as contiguous (BLOCK_J,2) column pairs (even = 0.25*v[j-1]+0.75*v[j], odd = 0.75*v[j]+0.25*v[j+1]) so all addresses are affine. The generic kernel's own computation is left untouched and remains the path for every non-2x case. Compatibility edits, recorded separately from the performance change and required by the preflight import gate seen above: (1) drop 'import logging'/'logger' (logging is not an admitted import), (2) replace 'from flag_gems import runtime' with a self-contained get_upsample_bilinear2d_configs() returning the same 16 BLOCK_X/BLOCK_Y/num_warps configurations listed in native-runtime-facts.json, (3) replace 'flag_gems.runtime.torch_device_fn.device(...)' with a tiny torch.npu.device context helper falling back to a no-op context, (4) replace 'tle.program_id' with 'tl.program_id' (the native extension returns the same i32 program id), (5) replace 'runtime.device.name' in the assertion with a literal device-type check, and (6) add a 'run' alias with the same signature as upsample_bilinear2d (public_entrypoint) in addition to the existing exported name.",
+  "expected": "For upsample_bilinear2d-timing-1 the kernel Task Duration should drop from ~255 ms to the order of a few ms (target >10x, plausibly 30-100x) because no general-memory access remains data-dependent; per-block aiv_time should fall from 9.8 ms to tens of microseconds. Correctness must stay bit-comparable within the 0.015 atol/rtol contract (2x weights 0.25/0.75 are exact and fp32 accumulation order differs by at most a few ulps). Non-2x cases are routed to the unchanged generic kernel, so their pass/fail status must be unchanged (18/24 plus the same 6 compile failures unless those cases are themselves exact 2x).",
+  "validation": "Preflight (bridge) must compile the new source. Then host full formal evaluation: 24 correctness cases and the supplementary checks, plus timing case 1 vs the 253.9 ms starter latency. If the fast path is taken by some supplementary case, its result must stay inside the frozen tolerances. Follow-up: re-capture paired profiling/IR for the new source to confirm the loads/stores are no longer emitted as per-lane memref.load loops and to re-measure per-block aiv_time.",
+  "selected_layer": "Triton",
+  "layer_reason": "The defect is in the emitted device structure of the Triton kernel (address form forces per-lane scalarization and an in-kernel serial N*C loop); it must be fixed by changing the kernel's tiling, index form and grid mapping, not by an IR pass or by tuning launch parameters (the kernel is 1000x off the reference, so no config choice can recover it).",
+  "simulator_incremental_judgment": "The simulator adds two facts not derivable from source syntax: (1) the real device actually selected BLOCK_Y=1, so every program handles a single output row and the N*C loop is the only source of per-program parallelism, and (2) each of the four load sites is bracketed by BAR/WAIT_FLAG on VECTOR/SCALAR, i.e. per-load synchronization, which is consistent with the per-lane scalar load lowering seen in bcmlir. It does NOT add a usable total-time or per-load ranking: its capture window is explicitly partial (72 us observed for a 255 ms kernel, 'application did not finish'), so I do not use it as a quantitative claim and do not infer the mechanism from simulator presence alone.",
+  "unknown": [
+    "Whether the Ascend lowering will vectorize the contiguous masked loads and the (BLOCK_J,2) pair stores; if it still emits per-lane loops, the gain will be smaller (though index math per lane is much cheaper).",
+    "Why correctness cases 2,3,8,9,14,15 fail to compile, and whether any of them is an exact-2x case that the new fast path would rescue or newly exercise.",
+    "Whether the harness's measured 'full-call time' includes per-call Python/launch overhead; the profiling Task Duration says the kernel itself is the 255 ms, but I cannot measure the host path.",
+    "How well BLOCK_J=128 suits other exact-2x shapes with much larger IW (multiple column tiles, more programs)."
+  ],
+  "post_decision_observation": {
+    "preflight_status": "awaiting_source_review",
+    "final_source_sha256": "53f4ac44d82f015fd3b7b3d036b3850f67cfa2edf6ee29759cdd4a25e401653e",
+    "note": "First preflight attempt (SHA b2a75a69..., fast path + original imports) was rejected by the static import gate on 'logging'; the flag_gems imports were then replaced by self-contained equivalents (config metadata copy, tl.program_id, torch.npu device context) under the same registered decision. Second preflight of SHA 53f4ac44... was accepted and now waits for host read-only path / address-boundary review. No device run has happened yet, so none of the numeric expectations above are confirmed; the exact-2x dispatch is exercised by timing-1 (FP16 [4,32,128,128] -> [4,32,256,256], align_corners=False, effective scale exactly 0.5 on both axes).",
+    "unresolved_risk": "The (BLOCK_J,2) interleaved store is the least proven construct: if the compiler scalarizes it, the gain will come mainly from the affine loads and the removed serial N*C loop. The nine 128-element f32 tiles are small in UB, so no spilling is expected."
+  }
+}

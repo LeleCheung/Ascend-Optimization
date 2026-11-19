@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 48,
+    "duration_ms": 274117,
+    "usage": {
+      "input_tokens": 79665,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 3074816,
+      "output_tokens": 46862,
+      "output_tokens_details": {
+        "thinking_tokens": 33617
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 79665,
+        "outputTokens": 46862,
+        "cacheReadInputTokens": 3074816,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 3.1072830000000002,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 33617,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 3.1072830000000002,
+    "result": "Preflight accepted (`awaiting_source_review`); source is now frozen for host review and full evaluation.\n\n## What I did this call\n\n**Diagnosis (registered before editing, decision_id `76a638066e5943a6adff998c8283e0f1`)**\n\nThe decisive evidence was the actual IR rather than the source:\n- `profiling-comparison.json`: candidate kernel Task Duration **255453 µs** ≈ harness 253.9 ms; per-block `aiv_time` mean **9824.9 µs**, `aiv_total_cycles` **16.2 M** (~126 k cycles per inner N·C iteration).\n- `upsample_bilinear2d_kernel.bcmlir`: **every** data-dependent `tl.load` (offset_00/01/10/11) and the `tl.store` are lowered to a scalar `scf.for` over the 128 lanes with one `memref.load`/materialize per element (`{DiscreteMemAccess}`), re-executing the whole float index derivation (`remsi` on i64, sitofp, …, fptosi) **per lane** — ~2000 cycles per produced element, which no grid/config tuning can fix.\n- `simulator-evidence.json`: adds that the real device selected `BLOCK_Y=1` (one output row/program) and that each load site is bracketed by BAR/WAIT_FLAG; its window is explicitly partial (72 µs of a 255 ms kernel), so I used it only for per-iteration structure, not as a quantitative claim.\n- Alternatives I kept open: serial N·C loop alone, host/autotune overhead (contradicted by kernel duration == harness latency), modulo/int64 math alone, and the 6 unrelated MLIR compile failures.\n\n**Change (one mechanism: affine access for exact 2× scaling)**\n\nFor scale exactly 2 with `align_corners=False`, the pixel-centre mapping degenerates to fixed weights, so I added `upsample_bilinear2d_2x_kernel`: `(n,c)` and the input row become grid axes (no serial slice loop), the four gathers become nine **contiguous** shifted row loads (`j-1, j, j+1`) with border clamping via `tl.where`, and output is written as contiguous `(BLOCK_J,2)` column pairs (`even = 0.25·v[j-1]+0.75·v[j]`, `odd = 0.75·v[j]+0.25·v[j+1]`). Dispatch uses only call metadata (`not align_corners`, `OH==2IH`, `OW==2IW`, both reciprocal scales exactly `0.5`); all other cases keep the untouched generic kernel path.\n\n**Compatibility edits (recorded separately)**: dropped `logging`, replaced `flag_gems` imports with self-contained equivalents (copied tuned-config metadata, `tl.program_id`, `torch.npu` device context), literal device-type assert, and added the `run` alias. Two decision-registration attempts failed (JSON syntax; then the bridge's `simulator-evidence.source_sha256 == candidate SHA` assertion, which makes a second decision impossible once the source changes) — both left in the log; the original decision covers this call's mechanism.\n\n**Real uncertainties**: whether the `(BLOCK_J,2)` store and the masked edge loads actually vectorize (if not, gains come mostly from affine loads + removing the serial loop); whether any of the 6 failing cases is exact-2×; and the true per-call host overhead, which I cannot measure."
+  }
+}

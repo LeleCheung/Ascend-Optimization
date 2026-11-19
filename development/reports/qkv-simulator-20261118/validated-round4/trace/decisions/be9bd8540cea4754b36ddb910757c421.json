@@ -1,0 +1,90 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "be9bd8540cea4754b36ddb910757c421",
+  "recorded_at": "2026-11-18T09:45:00.311041+00:00",
+  "round_id": "attempt-002",
+  "input_source": {
+    "path": "trace/sources/deca261ad3eda887d323ce2d25bfc31c7e8625d637efd446382424580a04b3b9.py",
+    "sha256": "deca261ad3eda887d323ce2d25bfc31c7e8625d637efd446382424580a04b3b9"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/02f9e3db0dedaca4a350eb4310440ffc3bb4aa9f19607915a87a2c3013b4b833.json",
+        "sha256": "02f9e3db0dedaca4a350eb4310440ffc3bb4aa9f19607915a87a2c3013b4b833"
+      },
+      "original": {
+        "path": "workspace/previous-result.json",
+        "sha256": "02f9e3db0dedaca4a350eb4310440ffc3bb4aa9f19607915a87a2c3013b4b833"
+      },
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "Current-source supplementary run: 47/48 passed; qkv-geometry-float16-fp16-range fails with 480/480 compared values mismatched, greatest absolute and relative difference = inf at (0,0,0,0), atol/rtol 0.015. 480 equals the Q tensor numel for that case (2*5*3*16), so the failure is confined to the Q output path.",
+      "source_sha256": "deca261ad3eda887d323ce2d25bfc31c7e8625d637efd446382424580a04b3b9"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/deca261ad3eda887d323ce2d25bfc31c7e8625d637efd446382424580a04b3b9.py",
+        "sha256": "deca261ad3eda887d323ce2d25bfc31c7e8625d637efd446382424580a04b3b9"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "deca261ad3eda887d323ce2d25bfc31c7e8625d637efd446382424580a04b3b9"
+      },
+      "category": "other",
+      "role": "mechanism",
+      "finding": "Both the EXACT and masked branches compute q_res = ((q_val + q_bias[None, :]).to(tl.float32) * scale_factor). The add is evaluated in the input dtype (fp16) and only afterwards extended to fp32, so the intermediate sum is rounded/overflowed in fp16 before the 1/sqrt(head_dim) rescale.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/99e0e0412f7cbde64e1cd261776dada558eb9bbf79d1b9060901e189324e51e2.ttir",
+        "sha256": "99e0e0412f7cbde64e1cd261776dada558eb9bbf79d1b9060901e189324e51e2"
+      },
+      "original": {
+        "path": "workspace/current-ir/deca261ad3ed/0-kernel.ttir",
+        "sha256": "99e0e0412f7cbde64e1cd261776dada558eb9bbf79d1b9060901e189324e51e2"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Compiled IR of the failing source shows arith.addf %q_val, %q_bias in tensor<8x16xf16> (line 71), then arith.extf to f32 (line 72), arith.mulf by scale_factor (line 74), then arith.truncf back to f16 (line 75). The fp16 add precedes the widening, confirming the intermediate-precision order in the emitted code, not just the Python text.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/66b55a5974fd39be942762c30ae86c2e292a4597990ec9db0cedc964a06dad0d.py",
+        "sha256": "66b55a5974fd39be942762c30ae86c2e292a4597990ec9db0cedc964a06dad0d"
+      },
+      "original": {
+        "path": "/data/hanle/ascend-optimization/Ascend-Optimization/operators/transform_bias_rescale_qkv/checks/check_semantics_pytorch.py",
+        "sha256": "66b55a5974fd39be942762c30ae86c2e292a4597990ec9db0cedc964a06dad0d"
+      },
+      "category": "other",
+      "role": "disambiguation",
+      "finding": "The fp16-range supplementary case sets qkv[..., :hidden] = 60000 and bias[:hidden] = 60000 with head_dim 16, and records float32_opmath_q = (x.float() + bias.float()) * (dimension**-0.5). 60000+60000 = 120000 overflows fp16 (inf), but (60000+60000)*0.25 = 30000 is representable in fp16. The recorded reference quantity therefore assumes the add and rescale are performed before the final fp16 rounding.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/6e513db5340f2e6d86b9289999bae46c074cdb7483c7673e2ece96672d3e0eab.py",
+        "sha256": "6e513db5340f2e6d86b9289999bae46c074cdb7483c7673e2ece96672d3e0eab"
+      },
+      "original": {
+        "path": "/data/hanle/ascend-optimization/Ascend-Optimization/operators/transform_bias_rescale_qkv/references/pytorch/oracle.py",
+        "sha256": "6e513db5340f2e6d86b9289999bae46c074cdb7483c7673e2ece96672d3e0eab"
+      },
+      "category": "other",
+      "role": "background",
+      "finding": "The pytorch leaf oracle delegates run(qkv, qkv_bias, num_heads) to torch.ops.aten._transform_bias_rescale_qkv; its aten implementation evaluates the bias add and the query rescaling with float32 opmath and casts the result to the output dtype once. The fp16-range failure (expected finite, candidate inf) confirms that numeric order on the target device.",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "The supplementary failure is a pure intermediate-precision/arithmetic-order defect in the Q path: adding q_val and q_bias in fp16 overflows to inf for the fp16-range case (60000+60000=120000 > 65504) before the 0.25 rescale is applied, whereas the reference performs the add and rescale in float32 and rounds to fp16 only once, yielding the finite value 30000. K/V are unaffected because their reference output is itself the single-rounded add, which overflows to inf in both orderings.",
+  "change": "Minimal semantic repair in candidate.py, applied identically to the EXACT and masked branches: widen q_val and q_bias to float32 before the add, i.e. q_res = ((q_val.to(tl.float32) + q_bias[None, :].to(tl.float32)) * scale_factor).to(q_val.dtype). K/V add expressions, the 2D affine tiling, masks, stride handling, program-id decoding and launch geometry are left untouched.",
+  "expected": "qkv-geometry-float16-fp16-range Q values become (60000+60000)*0.25 = 30000 (finite, fp16-representable) instead of inf, matching the float32-opmath reference and the finite expected values; K/V outputs are unchanged because a single fp32 add of two fp16 inputs rounded once to fp16 is numerically identical to the fp16 add for those inputs (overflow to inf preserved). The other 47 supplementary cases and the 21 formal cases should retain their current results, as the reference also uses float32 opmath for Q on those inputs.",
+  "validation": "Run the supplied bridge preflight on the edited candidate.py, then host full contract evaluation (21 formal + 48 supplementary per reference). Specifically re-check qkv-geometry-float16-fp16-range (all 480 Q values finite and within atol/rtol 0.015), the nonpower7/nonpower48 geometry cases, the layout/stride cases, and K/V equality, confirming the tiling and launch geometry are preserved.",
+  "alternatives": [],
+  "discriminating_observation": "",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

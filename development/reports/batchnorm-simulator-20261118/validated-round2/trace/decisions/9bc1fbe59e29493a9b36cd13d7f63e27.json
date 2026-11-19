@@ -1,0 +1,76 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "9bc1fbe59e29493a9b36cd13d7f63e27",
+  "recorded_at": "2026-11-18T12:24:55.206876+00:00",
+  "round_id": "attempt-003",
+  "input_source": {
+    "path": "trace/sources/8340b189f22d8d2546f3a7a8a359782fbde3f1f0d40cf1c2f0673db10f089d83.py",
+    "sha256": "8340b189f22d8d2546f3a7a8a359782fbde3f1f0d40cf1c2f0673db10f089d83"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/d8351acd227b6888c1f998846e58379f530e4d496bfc3ccca62d048bad156953.json",
+        "sha256": "d8351acd227b6888c1f998846e58379f530e4d496bfc3ccca62d048bad156953"
+      },
+      "original": {
+        "path": "workspace/previous-result.json",
+        "sha256": "d8351acd227b6888c1f998846e58379f530e4d496bfc3ccca62d048bad156953"
+      },
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "device evaluation failed before any case ran: triton.compiler.errors.MLIRCompilationError at stage [ConvertTritonIRToLinalgIR], 'PassManager::run failed', for cache key CL66NOC7IXNQ. No numerical or timing result exists for this source, so the failure stage is compiler lowering, not numerics.",
+      "source_sha256": "8340b189f22d8d2546f3a7a8a359782fbde3f1f0d40cf1c2f0673db10f089d83"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/0f1d268a0a3bf588a4fc72ed3b0653d6cf31f2a3944ca915ed07c717b2528be4.ttir",
+        "sha256": "0f1d268a0a3bf588a4fc72ed3b0653d6cf31f2a3944ca915ed07c717b2528be4"
+      },
+      "original": {
+        "path": "workspace/failed-ir/8340b189f22d/CL66NOC7IXNQ-2-batch_norm_with_update_kernel.ttir",
+        "sha256": "0f1d268a0a3bf588a4fc72ed3b0653d6cf31f2a3944ca915ed07c717b2528be4"
+      },
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "The failing specialization is BLOCK_M=2, BLOCK_N=64 with both batch_dim and spatial_dim runtime. It is the only captured specialization with real dynamic nested scf.for: the inner loop iter_args are (tensor<2x64xf32> mean, tensor<2x64xf32> var, tensor<2x64xi32> cnt, tensor<2x64xi1> mask, tensor<2x64xf32> tile). The i1 tensor block argument is then used directly as the mask of tt.load (line 83) and tt.store (line 112), and in arith.select (line 91).",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/860337a3896c62c0d9ae55df2596dcf19b1009420c5f7cdaa6610b3e52a7ae20.ttir",
+        "sha256": "860337a3896c62c0d9ae55df2596dcf19b1009420c5f7cdaa6610b3e52a7ae20"
+      },
+      "original": {
+        "path": "workspace/failed-ir/8340b189f22d/T2P64AC524HA-0-batch_norm_with_update_kernel.ttir",
+        "sha256": "860337a3896c62c0d9ae55df2596dcf19b1009420c5f7cdaa6610b3e52a7ae20"
+      },
+      "category": "source_ir",
+      "role": "background",
+      "finding": "Companion specializations T2P64AC524HA-0 and KE4OVNMH755V-1 converted successfully (bcmlir present) but have spatial_dim specialized away (tensor<4x1>), so their n_step loop is fully unrolled and they never exercise the loop-carried mask/tile pattern; their success does not contradict the failing pattern.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/2d00fb8bc86d96875febbad9aaddb4783d98acd0bb6da270763cbc2103a6beab.ttir",
+        "sha256": "2d00fb8bc86d96875febbad9aaddb4783d98acd0bb6da270763cbc2103a6beab"
+      },
+      "original": {
+        "path": "workspace/current-ir/ca3ff529fa06/3-kernel.ttir",
+        "sha256": "2d00fb8bc86d96875febbad9aaddb4783d98acd0bb6da270763cbc2103a6beab"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "The previously accepted source (sha ca3ff529) compiles the same tensor<2x64> shape with the same nested scf.for, carried iter_args (mean, var, cnt), same tt.reduce over reshaped tensor<128xf32>, same f16 load/store and extui. Its loop bodies recompute masks from the induction variable and never carry an i1 tensor; the only new constructs in the failing source are the carried i1 mask and the carried f32 tile, so the lowering rejection is localized to those loop-carried values.",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "ConvertTritonIRToLinalgIR rejects the i1 tensor as an scf.for iter_arg (a boolean tensor block argument used as tt.load/tt.store mask and arith.select condition). The tile prefetch carry itself is arithmetic-only and matches the accepted source's inner-loop arithmetic, so keeping the f32 tile carry while deriving both masks from the induction variable inside the loop body should lower identically to the accepted 2x64 kernel and preserve the one-tile software pipeline.",
+  "change": "In both passes of batch_norm_with_update_kernel, drop the loop-carried mask: compute curr_mask from the current n_step offset and next_mask from the lookahead offset inside each inner-loop iteration, carry only the prefetched f32 tile (plus mean/var/cnt in the statistics pass). The priming load before the loop keeps its own locally computed mask. No other arithmetic, tiling or indexing changes.",
+  "expected": "Compilation reaches the same lowering shape as the accepted 2x64 kernel (masks materialized per iteration from the induction variable, one extra compare per tile), the lookahead GM load stays one tile ahead of the consuming Welford/scale-shift math so the intended MTE2/vector overlap is unchanged, and numerics are bit-identical because masks and data values are the same as before. Target case timing-7 is expected to keep the recovered pipeline benefit rather than the compile failure.",
+  "validation": "Run bridge preflight on the edited candidate.py (device compile of all specializations). Success criterion: no MLIRCompilationError, i.e. the CL66NOC7IXNQ-class specialization converts. If the same ConvertTritonIRToLinalgIR failure persists, the remaining new construct is the carried f32 tile and the next focused repair is to remove the tile carry; if a numerical check fails later, inspect the Welford delta-form arithmetic.",
+  "alternatives": [],
+  "discriminating_observation": "",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

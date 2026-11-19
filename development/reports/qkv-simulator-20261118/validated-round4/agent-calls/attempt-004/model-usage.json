@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 38,
+    "duration_ms": 188829,
+    "usage": {
+      "input_tokens": 74725,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1808640,
+      "output_tokens": 31609,
+      "output_tokens_details": {
+        "thinking_tokens": 21386
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 74725,
+        "outputTokens": 31609,
+        "cacheReadInputTokens": 1808640,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 2.0681700000000003,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 21386,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 2.0681700000000003,
+    "result": "Preflight returned `awaiting_source_review`; I am handing off unchanged. No further edits made.\n\n## Handoff: candidate `bb15ccd3…` (pre-edit source was `c133a5a3…`)\n\n**What the hotspots add.** The paired OpProf shows the per-program logical bytes are symmetric — GM→UB 48.375 KB and UB→GM 48 KB — yet `aiv_mte2_time` is 1.509 µs vs `aiv_mte3_time` 0.663 µs (33.3 vs 73.7 GB/s active BW), and MTE2 is the largest execution lane at ratio 0.473. The simulator's top-instruction list locates that cost in the three strided MTE2 row loads and the bias loads/setup, not in vector math (vector productive only 0.10).\n\n**What the waiting/observable idle adds.** MTE3 wait-only 0.704, VECTOR wait-only 0.649, MTE2 productive 0.701 with a 1.60 µs tail idle. This says the chain is load-fed and that stores/vector mostly wait on upstream data; the partial per-core window (`absolute_time_qualified=false`) cannot prove dependency stalls or full-device time, and the idle fractions alone do **not** distinguish load granularity from bandwidth saturation — that distinction comes from the paired GB/s asymmetry plus the IR stride layout. I retain both observations but do not claim the idle as causal.\n\n**Mechanism selected.** The TTIR shows a `tensor<128x64xf16>` tile whose input rows are 64 contiguous f16 (128 B) with `stride_qkv_s=3072`, while the store is one fully contiguous 16 KB block (`stride_out_s=64`, `stride_out_d=1`). Change: map the tile as `[BLOCK_S, BLOCK_H, BLOCK_D]` with affine head/dim axes and group `BLOCK_H=4` adjacent heads so input rows become 256 contiguous f16 (512 B); `BLOCK_S` shrinks to keep the 16 KB element budget, so program count (512), bytes, and arithmetic are unchanged. `BLOCK_H=1` / non-power-of-two `head_dim` reproduces the prior mapping exactly.\n\nPreserved: fp32 bias-add+rescale for q (overflow fix), fp16 adds for k/v, EXACT and masked paths, arbitrary strides, output allocation and `run(qkv,qkv_bias,num_heads)`.\n\n**Predicted measurable effect:** `aiv_mte2_time`/`ratio` fall relative to MTE3 (load active BW moving toward ~70 GB/s), per-program `aiv_time` and target-case latency decrease; correctness metrics stay at 0 error.\n\n**Validation path:** preflight (done, awaiting review) → unchanged handoff for host path/address-boundary review → paired profiling/simulator re-capture on timing-2 (`mte2/mte3` time and ratios, bytes, program count) → one formal KGS evaluation (21 cases + 48 supplementary).\n\nDiagnosis was recorded pre-edit as decision `5bd9f910…`; the candidate is frozen for review."
+  }
+}

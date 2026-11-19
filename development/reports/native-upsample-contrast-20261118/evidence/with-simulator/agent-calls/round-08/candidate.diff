@@ -1,0 +1,242 @@
+--- parent
+
++++ candidate
+
+@@ -158,19 +158,6 @@
+
+ 
+ 
+ @triton.jit
+-def _pack_f16_pair(lo, hi):
+-    """Pack two f16 lanes into one 32-bit word: lo in bits 0..15, hi in 16..31.
+-
+-    On a little-endian device this is byte-identical to writing lo at even
+-    output columns and hi at odd output columns, so it replaces the pairwise
+-    interleave without any data movement.  Pure bit manipulation, no rounding.
+-    """
+-    lo_bits = lo.to(tl.uint16, bitcast=True).to(tl.uint32)
+-    hi_bits = hi.to(tl.uint16, bitcast=True).to(tl.uint32)
+-    return (lo_bits | (hi_bits << 16)).to(tl.int32, bitcast=True)
+-
+-
+-@triton.jit
+ def upsample_bilinear2d_2x_kernel(
+     ptr_o,
+     ptr_i,
+@@ -180,7 +167,6 @@
+
+     OW,
+     BLOCK_I: tl.constexpr,
+     BLOCK_J: tl.constexpr,
+-    PACK16: tl.constexpr,
+ ):
+     # Exact-2x bilinear upsampling with align_corners=False, row-tiled.
+     #
+@@ -195,10 +181,10 @@
+
+     # rows x BLOCK_J input columns, so each of the nine stencil accesses is one
+     # 2-D tile transfer (row stride IW, contiguous in the column direction)
+     # instead of a separate 256-byte row load, and the total program count
+-    # drops by BLOCK_I.  Column/row edges are excluded by the load mask and
+-    # restored with a register select, keeping the offsets affine.  The two
+-    # interleaved output columns produced by one input column are written as
+-    # one contiguous 2*BLOCK_J run via tl.interleave, so an output row is a
++    # drops by BLOCK_I.  Row/column edges are handled by clamping the stencil
++    # coordinates, so every load is unmasked and the offsets stay affine.  The
++    # two interleaved output columns produced by one input column are written
++    # as one contiguous 2*BLOCK_J run via tl.interleave, so an output row is a
+     # single contiguous store.
+     pid_j = tl.program_id(axis=0)
+     pid_i = tl.program_id(axis=1)
+@@ -207,41 +193,34 @@
+
+     ii = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)  # input rows of this tile
+     j = pid_j * BLOCK_J + tl.arange(0, BLOCK_J)  # input columns of this tile
+ 
+-    # Valid input rows/columns for this program (tail lanes stay inactive;
+-    # their loads and stores are masked off below).
++    # Valid output rows of this program; tail lanes of the last row block are
++    # only excluded at the store, so their loads stay in bounds (see clamp).
+     row_ok = ii < IH
+-    in_col = j < IW
+-    has_l = (j - 1) >= 0
+-    has_r = (j + 1) < IW
+-
+-    im = tl.maximum(ii - 1, 0)
+-    ip = tl.minimum(ii + 1, IH - 1)
++
++    # Clamp every stencil coordinate into the plane instead of masking the
++    # loads: out-of-range tail lanes and the tile's left/right/top/bottom
++    # neighbours all resolve to the border element, which is exactly the
++    # replicate-padding bilinear needs at the borders.  An unmasked load needs
++    # no pad value (MOV_PAD_VAL) and no per-load wait/barrier pair.
++    ii_c = tl.minimum(ii, IH - 1)
++    im = tl.maximum(ii_c - 1, 0)
++    ip = tl.minimum(ii_c + 1, IH - 1)
++    j_c = tl.minimum(j, IW - 1)
++    jl = tl.maximum(j_c - 1, 0)[None, :]
++    jc = j_c[None, :]
++    jr = tl.minimum(j_c + 1, IW - 1)[None, :]
+ 
+     base_i = nc.to(tl.int64) * IH * IW
+     off_m = base_i + im[:, None] * IW
+-    off_c = base_i + ii[:, None] * IW
++    off_c = base_i + ii_c[:, None] * IW
+     off_p = base_i + ip[:, None] * IW
+ 
+-    m_c = row_ok[:, None] & in_col[None, :]
+-    m_l = m_c & has_l[None, :]
+-    m_r = m_c & has_r[None, :]
+-    jl = (j - 1)[None, :]
+-    jc = j[None, :]
+-    jr = (j + 1)[None, :]
+-
+-    ml = tl.load(ptr_i + off_m + jl, mask=m_l, other=0.0).to(tl.float32)
+-    mc = tl.load(ptr_i + off_m + jc, mask=m_c, other=0.0).to(tl.float32)
+-    mr = tl.load(ptr_i + off_m + jr, mask=m_r, other=0.0).to(tl.float32)
+-    cl = tl.load(ptr_i + off_c + jl, mask=m_l, other=0.0).to(tl.float32)
+-    cc = tl.load(ptr_i + off_c + jc, mask=m_c, other=0.0).to(tl.float32)
+-    cr = tl.load(ptr_i + off_c + jr, mask=m_r, other=0.0).to(tl.float32)
+-
+-    # Clamped replication at the row/column borders, matching the previous
+-    # clamped-index loads.
+-    ml = tl.where(has_l[None, :], ml, mc)
+-    mr = tl.where(has_r[None, :], mr, mc)
+-    cl = tl.where(has_l[None, :], cl, cc)
+-    cr = tl.where(has_r[None, :], cr, cc)
++    ml = tl.load(ptr_i + off_m + jl).to(tl.float32)
++    mc = tl.load(ptr_i + off_m + jc).to(tl.float32)
++    mr = tl.load(ptr_i + off_m + jr).to(tl.float32)
++    cl = tl.load(ptr_i + off_c + jl).to(tl.float32)
++    cc = tl.load(ptr_i + off_c + jc).to(tl.float32)
++    cr = tl.load(ptr_i + off_c + jr).to(tl.float32)
+ 
+     # Vertical half of the separable interpolation: output row 2*i blends rows
+     # (i-1, i) with weights (0.25, 0.75), output row 2*i+1 blends rows
+@@ -250,45 +229,26 @@
+
+     e_c = 0.25 * mc + 0.75 * cc
+     e_r = 0.25 * mr + 0.75 * cr
+ 
+-    if PACK16:
+-        # Output buffer is addressed as 32-bit words; one word holds the two
+-        # adjacent f16 values (even column, odd column) of this input column.
+-        out_dtype = ptr_i.dtype.element_ty
+-        w_col = pid_j * BLOCK_J + tl.arange(0, BLOCK_J)
+-        w_even_row = nc.to(tl.int64) * OH * OW // 2 + ii.to(tl.int64) * OW
+-        w_odd_row = w_even_row + OW // 2
+-        m_out = row_ok[:, None] & (w_col < (OW // 2))[None, :]
+-    else:
+-        out_dtype = ptr_o.dtype.element_ty
+-        out_col = (2 * pid_j) * BLOCK_J + tl.arange(0, 2 * BLOCK_J)
+-        out_even_row = nc.to(tl.int64) * OH * OW + (2 * ii) * OW
+-        out_odd_row = out_even_row + OW
+-        m_out = row_ok[:, None] & (out_col < OW)[None, :]
++    out_dtype = ptr_o.dtype.element_ty
++    out_col = (2 * pid_j) * BLOCK_J + tl.arange(0, 2 * BLOCK_J)
++    out_even_row = nc.to(tl.int64) * OH * OW + (2 * ii) * OW
++    out_odd_row = out_even_row + OW
++    m_out = row_ok[:, None] & (out_col < OW)[None, :]
+ 
+     # Horizontal half: output column 2*j takes (0.25, 0.75) on columns
+     # (j-1, j), output column 2*j+1 takes (0.75, 0.25) on columns (j, j+1).
+-    # The two values per input column are written as one word (bit-packed)
+-    # for 16-bit dtypes, otherwise interleaved into one contiguous run.
++    # The two values per input column are written as one contiguous run.
+     ev = (0.25 * e_l + 0.75 * e_c).to(out_dtype)
+     od = (0.75 * e_c + 0.25 * e_r).to(out_dtype)
+-    if PACK16:
+-        tl.store(
+-            ptr_o + w_even_row[:, None] + w_col[None, :],
+-            _pack_f16_pair(ev, od),
+-            mask=m_out,
+-        )
+-    else:
+-        tl.store(
+-            ptr_o + out_even_row[:, None] + out_col[None, :],
+-            tl.interleave(ev, od),
+-            mask=m_out,
+-        )
+-
+-    pl = tl.load(ptr_i + off_p + jl, mask=m_l, other=0.0).to(tl.float32)
+-    pc = tl.load(ptr_i + off_p + jc, mask=m_c, other=0.0).to(tl.float32)
+-    pr = tl.load(ptr_i + off_p + jr, mask=m_r, other=0.0).to(tl.float32)
+-    pl = tl.where(has_l[None, :], pl, pc)
+-    pr = tl.where(has_r[None, :], pr, pc)
++    tl.store(
++        ptr_o + out_even_row[:, None] + out_col[None, :],
++        tl.interleave(ev, od),
++        mask=m_out,
++    )
++
++    pl = tl.load(ptr_i + off_p + jl).to(tl.float32)
++    pc = tl.load(ptr_i + off_p + jc).to(tl.float32)
++    pr = tl.load(ptr_i + off_p + jr).to(tl.float32)
+ 
+     o_l = 0.75 * cl + 0.25 * pl
+     o_c = 0.75 * cc + 0.25 * pc
+@@ -296,18 +256,11 @@
+
+ 
+     ev2 = (0.25 * o_l + 0.75 * o_c).to(out_dtype)
+     od2 = (0.75 * o_c + 0.25 * o_r).to(out_dtype)
+-    if PACK16:
+-        tl.store(
+-            ptr_o + w_odd_row[:, None] + w_col[None, :],
+-            _pack_f16_pair(ev2, od2),
+-            mask=m_out,
+-        )
+-    else:
+-        tl.store(
+-            ptr_o + out_odd_row[:, None] + out_col[None, :],
+-            tl.interleave(ev2, od2),
+-            mask=m_out,
+-        )
++    tl.store(
++        ptr_o + out_odd_row[:, None] + out_col[None, :],
++        tl.interleave(ev2, od2),
++        mask=m_out,
++    )
+ 
+ 
+ def _pow2_ceil(n):
+@@ -381,25 +334,14 @@
+
+     )
+     if use_exact_2x:
+         block_i, block_j = select_2x_tile(IH, IW, N * C)
+-        # For f16 the kernel writes bit-packed word pairs (metadata only: the
+-        # returned tensor aliases the same freshly allocated storage).
+-        pack16 = input.dtype == torch.float16
+-        if pack16:
+-            out_words = torch.empty(
+-                (N, C, OH, OW // 2), device=input.device, dtype=torch.int32
+-            )
+-            output = out_words.view(input.dtype)
+-            out_arg = out_words
+-        else:
+-            output = torch.empty(
+-                (N, C, OH, OW), device=input.device, dtype=input.dtype
+-            )
+-            out_arg = output
++        output = torch.empty(
++            (N, C, OH, OW), device=input.device, dtype=input.dtype
++        )
+         with device_context(input.device):
+             upsample_bilinear2d_2x_kernel[
+                 (triton.cdiv(IW, block_j), triton.cdiv(IH, block_i), N * C)
+             ](
+-                out_arg,
++                output,
+                 input,
+                 IH,
+                 IW,
+@@ -407,7 +349,6 @@
+
+                 OW,
+                 block_i,
+                 block_j,
+-                pack16,
+             )
+         return output
+ 

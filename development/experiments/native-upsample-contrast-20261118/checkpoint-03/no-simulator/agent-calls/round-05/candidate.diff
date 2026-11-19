@@ -1,0 +1,153 @@
+--- parent
+
++++ candidate
+
+@@ -115,41 +115,32 @@
+
+ 
+ 
+ @triton.jit
+-def _hrow_2x_tile(
++def _hrow_2x_row(
+     ptr_i,
+-    in_base,
+-    rows,
+-    row_ok,
++    base,
+     IW,
+     j,
+     m,
+-    TILE_I: tl.constexpr,
+     BLOCK_OW: tl.constexpr,
+ ):
+-    # Horizontally bilinear-expand a (TILE_I, BLOCK_IW) source row tile by 2x.
+-    # For align_corners=False and an exact 2x factor the source coordinate of
++    # Horizontally bilinear-expand one source row by 2x.  For
++    # align_corners=False and an exact 2x factor the source coordinate of
+     # output column w is 0.5*w - 0.25, so the two column classes are fixed
+     # blends of the current element and its left/right neighbour:
+     #   even columns: 0.25*left  + 0.75*cur
+     #   odd  columns: 0.75*cur   + 0.25*right
+-    # Every address is affine in the 2-D lane index, so a whole row window is
+-    # one contiguous DMA span instead of one DMA per row.
+-    base = in_base + rows * IW
+-    mcols = m[None, :]
+-    x = tl.load(ptr_i + base + j[None, :], mask=row_ok & mcols, other=0.0).to(tl.float32)
+-    has_left = (j >= 1)[None, :]
+-    xr = tl.load(
+-        ptr_i + base + (j - 1)[None, :], mask=row_ok & mcols & has_left, other=0.0
+-    ).to(tl.float32)
++    # The 1-D join/reshape interleave is kept deliberately: the batched
++    # (TILE_I, BLOCK_IW, 2) join form cannot be stride-aligned by BishengIR.
++    x = tl.load(ptr_i + base + j, mask=m, other=0.0).to(tl.float32)
++    has_left = j >= 1
++    xr = tl.load(ptr_i + base + (j - 1), mask=m & has_left, other=0.0).to(tl.float32)
+     xr = tl.where(has_left, xr, x)
+-    has_right = (j < IW - 1)[None, :]
+-    xl = tl.load(
+-        ptr_i + base + (j + 1)[None, :], mask=row_ok & mcols & has_right, other=0.0
+-    ).to(tl.float32)
++    has_right = j < IW - 1
++    xl = tl.load(ptr_i + base + (j + 1), mask=m & has_right, other=0.0).to(tl.float32)
+     xl = tl.where(has_right, xl, x)
+     xe = 0.25 * xr + 0.75 * x
+     xo = 0.75 * x + 0.25 * xl
+-    return tl.reshape(tl.join(xe, xo), (TILE_I, BLOCK_OW))
++    return tl.reshape(tl.join(xe, xo), (BLOCK_OW,))
+ 
+ 
+ @triton.jit
+@@ -166,52 +157,52 @@
+
+ ):
+     # One program owns TILE_I consecutive source rows of a single (n, c)
+     # plane and produces the 2*TILE_I output rows (2*i, 2*i+1) they drive.
+-    # Vertical weights are the same fixed 1/4-3/4 blend as the horizontal
+-    # ones, applied between register tiles whose row indices stay aligned.
++    # The rows are processed one at a time with a static loop so the
++    # horizontal interleave stays a 1-D join/reshape, which compiles; the
++    # tiling amortises the fixed per-program cost over TILE_I rows.
+     pid_i = tl.program_id(axis=0)
+     plane = tl.program_id(axis=1)
+ 
+-    k = tl.arange(0, TILE_I)
+     j = tl.arange(0, BLOCK_IW)
+     m = j < IW
+-
+-    r = (pid_i * TILE_I + k)[:, None]
+-    in_base = plane * (IH * IW)
+-    row_ok = r < IH
+-
+-    e_c = _hrow_2x_tile(
+-        ptr_i, in_base, r, row_ok, IW, j, m, TILE_I, BLOCK_OW
+-    )
+-    rm = r - 1
+-    e_u = _hrow_2x_tile(
+-        ptr_i, in_base, rm, row_ok & (rm >= 0), IW, j, m, TILE_I, BLOCK_OW
+-    )
+-    rp = r + 1
+-    e_d = _hrow_2x_tile(
+-        ptr_i, in_base, rp, row_ok & (rp < IH), IW, j, m, TILE_I, BLOCK_OW
+-    )
+-
+-    # Clamp the halo rows exactly like the general kernel: the top source row
+-    # is its own upper neighbour and the bottom row is its own lower one.
+-    e_u = tl.where(r > 0, e_u, e_c)
+-    e_d = tl.where(rp < IH, e_d, e_c)
+-
+-    out_even = 0.25 * e_u + 0.75 * e_c
+-    out_odd = 0.75 * e_c + 0.25 * e_d
+-
+     ow = tl.arange(0, BLOCK_OW)
+-    out_base = plane * (OH * OW) + (2 * r) * OW
+-    store_ok = row_ok & (ow < OW)[None, :]
+-    tl.store(
+-        ptr_o + out_base + ow[None, :],
+-        out_even.to(ptr_o.dtype.element_ty),
+-        mask=store_ok,
+-    )
+-    tl.store(
+-        ptr_o + out_base + OW + ow[None, :],
+-        out_odd.to(ptr_o.dtype.element_ty),
+-        mask=store_ok,
+-    )
++    store_w = ow < OW
++
++    in_plane = plane * (IH * IW)
++    out_plane = plane * (OH * OW)
++
++    for k in tl.static_range(0, TILE_I):
++        i = pid_i * TILE_I + k
++        row_ok = i < IH
++
++        e_c = _hrow_2x_row(ptr_i, in_plane + i * IW, IW, j, m & row_ok, BLOCK_OW)
++
++        # Clamp the halo rows exactly like the general kernel: the top source
++        # row is its own upper neighbour and the bottom row is its own lower.
++        iu = tl.maximum(i - 1, 0)
++        e_u = _hrow_2x_row(
++            ptr_i, in_plane + iu * IW, IW, j, m & row_ok, BLOCK_OW
++        )
++        idn = tl.minimum(i + 1, IH - 1)
++        e_d = _hrow_2x_row(
++            ptr_i, in_plane + idn * IW, IW, j, m & row_ok, BLOCK_OW
++        )
++
++        out_even = 0.25 * e_u + 0.75 * e_c
++        out_odd = 0.75 * e_c + 0.25 * e_d
++
++        out_base = out_plane + (2 * i) * OW
++        store_ok = store_w & row_ok
++        tl.store(
++            ptr_o + out_base + ow,
++            out_even.to(ptr_o.dtype.element_ty),
++            mask=store_ok,
++        )
++        tl.store(
++            ptr_o + out_base + OW + ow,
++            out_odd.to(ptr_o.dtype.element_ty),
++            mask=store_ok,
++        )
+ 
+ 
+ def _bilinear_reciprocal_scale(src_size, dst_size, align_corners, scale):

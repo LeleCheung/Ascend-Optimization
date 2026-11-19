@@ -1,0 +1,44 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "6e7fed2de3d73b4174300829abb9f07e46b7f3372fb0904a6e79a1e52a7f32c3",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "timing-1 case: candidate kernel upsample_bilinear2d_2x_kernel duration 308.5us vs reference 244.1us; per-block aiv_vec_ratio 0.718 (cand) vs 0.326 (ref), aiv_vec_misc_ratio 0.618 (cand) vs 0.190 (ref), while aiv_vec_fp32_ratio is only 0.082 and mte2_ratio 0.251. Float arithmetic and load bandwidth are not dominant; 'misc' vector work dominates the candidate."
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "disambiguation",
+      "finding": "Bound to source 6e7fed2d, kernel upsample_bilinear2d_2x_kernel, core0.veccore0. Top instructions by running time are all attributed to candidate-source.py:252 'tl.interleave(ev, od)': BAR 3.24us, WAIT_FLAG(PIPE:VEC) 3.24us, BAR 3.23us, BAR 3.23us, BAR 1.93us, BAR 1.77us, VREDUCEV2(Dtype:B16) 1.31us, VREDUCEV2 1.28us (~17.8us cumulative, overlapping); the load line 218 instructions are MOV_SRC_TO_DST_ALIGN 0.92us / MOV_SPR_XN 0.91us. VECTOR active_union 8.31us of an 11.72us window with wait_union 2.69us. This distinguishes 'interleave lowering inserts vector barriers/reduce movement' from the alternative 'loads or float math limit the block'."
+    },
+    {
+      "path": "workspace/current-ir/6e7fed2de3d7/18-kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "fp16 timing-1 2x kernel IR (line 161 of candidate.py) computes ev/od as 16x128 f16 tensors then lowers each output row to tt.join + tt.reshape (line 190 store and the earlier interleave store); nine 16x128 masked loads, six arith.select border fixes and nine extf to f32 are also present but are smaller vector work than the join/reshape store path."
+    }
+  ],
+  "hypothesis": "Each program writes two 16x256 output rows through tl.interleave = tt.join+tt.reshape. On this backend that layout change lowers to a vector barrier + VREDUCEV2 shuffle sequence per store (two per program), which the simulator attributes the largest vector instruction time to and which matches the high vec_misc_ratio. Replacing the f16 pairwise interleave with a 32-bit packed store (one f32/int32 word holds the even column in the low 16 bits and the odd column in the high 16 bits, little-endian) writes the same 16-bit values to the same addresses without any layout conversion, so the barrier/reduce sequence disappears.",
+  "alternatives": [
+    "Load bandwidth or fp32 promote/demote math dominates: contradicted by mte2_ratio 0.25 and vec_fp32_ratio 0.082 vs vec_misc_ratio 0.618, and by the simulator attributing the top instructions to line 252 rather than the loads.",
+    "Two separate strided stores (even columns, odd columns): cannot be validated as DMA-efficient on 2-byte stride, and would double MTE3 transactions; not chosen.",
+    "Rewrite in output-column lane space with per-lane gathers: removes interleave but raises MTE2 element count by ~33% and is a larger rewrite; deferred.",
+    "Skip the fp16/bf16->fp32 conversions by computing in input dtype: plausible second mechanism but does not remove the interleave barriers identified above; deferred to a later call.",
+    "Replace masked column-edge loads + select with clamped-index loads: removes six selects but again not the interleave hotspot; deferred."
+  ],
+  "discriminating_observation": "The simulator trace binds the largest vector instruction time (three BARs and two VREDUCEV2, ~17.8us cumulative) to the tl.interleave line 252, and VECTOR wait_union (2.69us) is a large share of the 11.72us window, whereas the load instruction at line 218 accounts for ~0.9us each. A pure arithmetic/load explanation would not concentrate the vector cost on the store/interleave line.",
+  "change": "In candidate.py, add a bit-packing helper and an exact-2x fp16 path: allocate the output as int32 words (one word = two adjacent f16 output columns), pass PACK16 as a constexpr, and store ev/od by packing lo=(uint16)ev bitcast into bits 0..15 and hi=(uint16)od into bits 16..31, per output row. The existing tl.interleave store path remains for non-fp16 dtypes (bf16, fp32) and the generic non-2x kernel is untouched. Compatibility edits: none beyond the added kernel argument/constexpr; public run() signature unchanged.",
+  "expected": "timing-1 fp16 exact-2x: per-program vector barrier/reduce work from the two interleaves disappears; per-block vector productive and vector wait time drop, aiv_vec_misc_ratio falls from ~0.62, and total timing-1 latency falls from ~309us toward <=250us (speedup from 0.79 toward >=1.0). Values are bit-identical to the current interleave for fp16, so correctness must stay at 24/24 (and supplementary checks) with unchanged bf16/fp32 timings.",
+  "validation": "Preflight compiles the new source; then the host runs the full frozen correctness contract (24 cases) plus supplementary checks and the full performance set. Verify timing-1 speedup improves, timing-3 (bf16) and timing-5 (fp32) remain at their previous values, and re-read the new profiling/IR to confirm the join/reshape sequence is gone from the fp16 2x kernel and vec_misc_ratio decreased.",
+  "selected_layer": "Triton",
+  "layer_reason": "The hotspot is inside the Triton kernel body: the tl.interleave store lowering. Host code only changes output allocation/view (int32 words) and one constexpr; no pass, IR or compatibility layer can remove a vector barrier inserted because of the join/reshape, the kernel must express the store differently.",
+  "simulator_incremental_judgment": "The simulator adds a real distinction beyond source syntax: tl.interleave looks like a cheap register shuffle in source, but the bound trace shows its lowered BAR/VREDUCEV2 instructions dominate vector time and that the vector pipeline spends 2.69us waiting. It also shows the loads (line 218) are not the hotspot, which the aggregate profiling alone could not separate.",
+  "unknown": [
+    "Whether Ascend MTE3 accepts the 32-bit-word contiguous store with the same efficiency as the previous f16 store (same bytes, same addresses, so expected equal).",
+    "Whether torch Tensor.view(dtype) on the NPU output allocation is a pure metadata alias in this environment (used only to return fp16), and whether the int32-word allocation/bitcast adds measurable host overhead.",
+    "How much of the 308us is barrier stall versus other per-block cost, so the actual latency drop may be smaller than the cumulative instruction-time sum suggests. "
+  ]
+}

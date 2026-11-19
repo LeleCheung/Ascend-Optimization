@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 112,
+    "duration_ms": 318170,
+    "usage": {
+      "input_tokens": 171663,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 6043008,
+      "output_tokens": 42055,
+      "output_tokens_details": {
+        "thinking_tokens": 22854
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 173013,
+        "outputTokens": 48874,
+        "cacheReadInputTokens": 6189952,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 5.181891,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 22854,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 5.181891,
+    "result": "Preflight now reaches the required handoff boundary, and `candidate.py` is frozen at that state for host review.\n\n**Source handed off (unchanged after preflight)**\n- SHA-256: `dbf938228eed7573e964dbae991d60822b3b2369e32767e4ed36e9fc7b348f57`\n- Preflight result: `awaiting_source_review` — reason: device-operation boundary review.\n\n**What changed**\n1. Evaluable compute mechanism: the first-pass online Welford update now uses the delta form\n   `delta = tl.where(mask, x - mean, 0)`, `mean += delta*inv_step`, `var += delta*delta*(1-inv_step)` with a scalar reciprocal. This removes one per-tile vector divide, one vector subtract and one redundant mask select, while preserving the Welford recurrence, masks, element ordering and all later mean/var/normalization/running-stat semantics.\n2. Harness-compliance rewrite required to pass the static preflight policy (no compute change intended):\n   - removed `logging` and its debug call;\n   - replaced `flag_gems` imports with local equivalents: identity `_libentry`, the Ascend `batch_norm` autotune config `triton.Config({}, num_warps=2, num_stages=1)` (the `gen: true`, empty-META config in `_ascend/tune_configs.yaml`), and the backend's exact heuristics `BLOCK_M=min(64,next_pow2(batch_dim))`, `BLOCK_N=min(next_pow2(spatial_dim), max(1, 1024//BLOCK_M))` — reproducing the observed 8×128 tiling for timing-7;\n   - dropped `torch_device_fn.device(...)` (rejected as a host device entry); launch now uses the process current device, flagged for reviewer confirmation.\n\nAll host allocations, storage helpers, layout, special-case paths (`weight/bias=None`, `running_*` default init, empty reserve, view restoration) are unchanged.\n\n**Evidence basis retained**\n- Hotspot: first-pass Welford loop (lines 38–52) is the top simulator region; VECTOR wait_only 0.222, SCALAR wait_only 0.421 with MTE2 idle 0.783 — consistent with a dependency-chained per-tile compute hypothesis rather than bandwidth.\n- Pipeline: 85.92us task, 64 blocks → two 32-core waves, 41.70us/block, vec 17.50us, MTE2 only 16.46GB/s vs reference 19.46us/block at 58.27GB/s.\n- IR: vector `divf` plus two selects per tile confirms the removable work.\n- The compliance rewrite itself contributes no new simulator distinction; only the Welford edit is expected to move timing-7.\n\n**Diagnosis state**\n- `diagnosis.json` updated with the final SHA, probe evidence of each preflight rejection, hypothesis/alternatives/change/expected/validation and open questions.\n- The earlier Welford pre-edit decision was recorded (`43b55d9…`) against SHA `ca3ff529`. A second `decision --record` for the compliance edit is impossible by construction: the bridge asserts the pinned simulator-evidence `source_sha256` equals the current candidate hash, and that report is fixed to `ca3ff529`. I left the candidate and diagnosis consistent with the actual final source rather than altering the pinned evidence.\n\n**Expected outcome at evaluation**\n- All 27 formal cases remain PASSED; timing-7 should improve beyond the retained 0.3526 speedup if the delta-form mechanism is effective, visible as lower per-block `aiv_vec_time`/`aiv_vec_ratio` and shorter Task Duration with MTE2 bandwidth still near 16.5 GB/s.\n- Watch items for the reviewer: single-device assumption from removing the device context, and whether identity `libentry` changes dispatch/launch overhead only."
+  }
+}

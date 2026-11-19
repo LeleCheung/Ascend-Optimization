@@ -57,8 +57,20 @@ def complement(intervals, start, end):
 
 
 def subtract(intervals, occupied):
-    result=[]
-    for a,b in union(intervals):result.extend(complement(occupied,a,b))
+    # Merge once, then sweep. Re-sorting every occupied interval for each wait
+    # makes long simulator traces quadratic in the number of instructions.
+    result=[];busy=union(occupied);j=0
+    for a,b in union(intervals):
+        while j<len(busy) and busy[j][1]<=a:j+=1
+        cursor=a;k=j
+        while k<len(busy) and busy[k][0]<b:
+            start,end=busy[k]
+            if start>cursor:result.append([cursor,min(start,b)])
+            cursor=max(cursor,end)
+            if cursor>=b:break
+            k+=1
+        if cursor<b:result.append([cursor,b])
+        j=k
     return result
 
 
@@ -103,7 +115,7 @@ def region_key(instruction, width=8, scopes=None):
 
 
 def analyze(listing, trace=None, *, core=None, kernel=None, width=8, top=12, trace_unit='us', capture=None, sources=None):
-    if width<=0 or top<=0 or trace_unit not in {'us','ns','cycles'}:raise ValueError('无效分组或单位')
+    if width<=0 or top<=0 or trace_unit not in {'us','ns','cycles','fraction'}:raise ValueError('无效分组或单位')
     kernels=[k for k in listing.get('kernels',[]) if kernel is None or k['name']==kernel]
     if not kernels:raise ValueError('没有匹配kernel')
     if trace is not None and (len(kernels)!=1 or core is None):raise ValueError('trace必须绑定唯一kernel和具体硬件核')
@@ -158,6 +170,9 @@ def analyze(listing, trace=None, *, core=None, kernel=None, width=8, top=12, tra
                 pc=pc_key(e.get('args',{}).get('pc_addr'))
                 if pc in lookup and pipe in HARDWARE_PIPELINES:by_region[lookup[pc]].append((a,b))
             rows=[]
+            # Declared hardware lanes with no events still have observable empty intervals.
+            for pipe in set(names.values()) & HARDWARE_PIPELINES:
+                by_pipeline.setdefault(pipe,[])
             for pipe,intervals in sorted(by_pipeline.items()):
                 active=union(intervals);gaps=complement(active,start,end);wait=union(waits[pipe])
                 productive_time=length(productive[pipe]);wait_only=length(subtract(wait,productive[pipe]))

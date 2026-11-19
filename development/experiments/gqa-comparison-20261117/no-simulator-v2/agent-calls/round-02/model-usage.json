@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 11,
+    "duration_ms": 114901,
+    "usage": {
+      "input_tokens": 12734,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 159360,
+      "output_tokens": 18751,
+      "output_tokens_details": {
+        "thinking_tokens": 14970
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 12734,
+        "outputTokens": 18751,
+        "cacheReadInputTokens": 159360,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 0.6121249999999999,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 14970,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 0.6121249999999999,
+    "result": "Edit applied; stopping here for host-side build/eval.\n\n**Mechanism chosen (keep nothing from last round's tune — it produced no target change)**\n\n- **Evidence used**: feedback (`category=evaluation`): last round case4 1900.72 → 1902.05 us (0.9993x) with all four passing, so structure-independent tuning is exhausted. Profiling summary (background, belongs to baseline source 770910b7): case4 runs 1893.98 us with every pipe ~idle (cube 8.8e-4, vec 5.9e-3, mte2 2.2e-3) and Block Dim 1024 vs reference 127.84 us / Block Dim 19 at real utilization (cube 0.28, vec 0.46) — i.e. stall-dominated, with ~54x more program instances than the reference. Source/IR (`category=source_ir`): `BLOCK_M, BLOCK_N = 64, 64` for `BLOCK_D ≤ 128` makes case4 launch grid (4, 256) = 1024 programs of only 4 KV iterations each; the IR excerpt shows each iteration is a chain of small dependent ops separated by `memref.copy` + `linalg.transpose` plus a loop-carried fp32 acc rescale.\n- **Assumption**: runtime ≈ (program waves) × (per-program serialized latency), one program resident per core — so halving the program count halves the target time.\n- **Alternative explanation**: if the stall is per-iteration cube↔vector sync latency independent of `BLOCK_M`, the gain is smaller (only wave count halves); if UB traffic / the copy-transpose chain dominates, or the 128-row fp32 acc plus the 3-term bf16 probability buffers exceed the 192 KB UB, this can be flat or fail to compile. Smaller block counts could also slightly hurt the small shapes (case1/case2).\n- **Change**: `BLOCK_D ≤ 128` path now uses `BLOCK_M=128, BLOCK_N=64` (was 64/64). Pure tiling metadata decision, no case-id or value-dependent branching, identical math and output dtype; causal masks, the fully-masked-row guard and the grid formula already generalize.\n- **Expected**: case4 grid (4,256) → (2,256), 512 programs, each doing 128-row dots — case4 clearly below 1900 us (target ~1000–1400 us); case1/2/7 flat-to-better and still checker-passing.\n- **Validation/rollback**: full four-case official checker + paired evaluation; accept only beyond the <1% inconclusive band with all four passing. On compile failure or no case4 gain, revert to 64/64 and next remove masked/dynamic-extent loads (full-tile `tl.load` with no `n_mask`/`d_mask` and no `-inf` where on off-diagonal blocks when `SKV % BLOCK_N == 0` and `D == BLOCK_D`).\n\nDecision recorded pre-edit: `876b0cf30e034f10aa1b625553d46fdf` (source sha 993722a6…)."
+  }
+}

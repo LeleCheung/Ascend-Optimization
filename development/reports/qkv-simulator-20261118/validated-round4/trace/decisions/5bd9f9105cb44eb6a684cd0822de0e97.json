@@ -1,0 +1,80 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "5bd9f9105cb44eb6a684cd0822de0e97",
+  "recorded_at": "2026-11-18T11:14:41.640981+00:00",
+  "round_id": "attempt-004",
+  "input_source": {
+    "path": "trace/sources/c133a5a391deb3491b0ee14071e87dcfa1e6335a438d538155e778b7595980d0.py",
+    "sha256": "c133a5a391deb3491b0ee14071e87dcfa1e6335a438d538155e778b7595980d0"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/72b906d3648a028e8b9a69967777f2df5478fc82974408d80b9075d5f7fca5c4.json",
+        "sha256": "72b906d3648a028e8b9a69967777f2df5478fc82974408d80b9075d5f7fca5c4"
+      },
+      "original": {
+        "path": "workspace/current-profiling.json",
+        "sha256": "72b906d3648a028e8b9a69967777f2df5478fc82974408d80b9075d5f7fca5c4"
+      },
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "Same-input candidate OpProf (target timing-2, f16 8x512x3072): per-program GM_to_UB 48.375KB and UB_to_GM 48KB, but aiv_mte2_time mean 1.509us vs aiv_mte3_time 0.663us, i.e. aiv_mte2_active_bw 33.25 GB/s vs aiv_mte3_active_bw 73.66 GB/s; aiv_mte2_ratio 0.473 is the largest hardware execution lane, aiv_mte3_ratio 0.217. Equal logical bytes move at very different active rates.",
+      "source_sha256": "c133a5a391deb3491b0ee14071e87dcfa1e6335a438d538155e778b7595980d0"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/a733b30f54917b42b291401cf5864fd088d91504d7f27b65f388a56003c7430b.ttir",
+        "sha256": "a733b30f54917b42b291401cf5864fd088d91504d7f27b65f388a56003c7430b"
+      },
+      "original": {
+        "path": "workspace/current-ir/c133a5a391de/target-0-_transform_bias_rescale_qkv_kernel.ttir",
+        "sha256": "a733b30f54917b42b291401cf5864fd088d91504d7f27b65f388a56003c7430b"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Compiled tile is tensor<128x64xf16> (8192 elems). q_in rows advance by stride_qkv_s=3072 elements while columns are only 64 contiguous f16 (128B) per row; out_off uses stride_out_s=64, stride_out_d=1, so each [128,64] output store is one fully contiguous 16KB block. Load side is 128B-strided, store side contiguous - the asymmetry the profile reports.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/53a6f3cad93e749cd64ad20825f4343dda0a4839ad5b5275d769f862e488b864.json",
+        "sha256": "53a6f3cad93e749cd64ad20825f4343dda0a4839ad5b5275d769f862e488b864"
+      },
+      "original": {
+        "path": "workspace/simulator-evidence.json",
+        "sha256": "53a6f3cad93e749cd64ad20825f4343dda0a4839ad5b5275d769f862e488b864"
+      },
+      "category": "simulator",
+      "role": "disambiguation",
+      "finding": "Partial common-clock per-core window (absolute_time_qualified=false): MTE2 productive_ratio 0.701; MTE3 productive_ratio 0.153 / wait_only_ratio 0.704; VECTOR productive 0.101 / wait_only 0.649; MTE2 idle_ratio 0.299 with a 1.60us tail idle after 119.767us. Top instructions are the three strided MTE2 row loads (3.09/2.99/2.12us attributed) plus WAIT_FLAG at the q store. This keeps the load-granularity explanation alive and shows the waiting is downstream of loads, but the idle fractions are not causal proof.",
+      "source_sha256": "c133a5a391deb3491b0ee14071e87dcfa1e6335a438d538155e778b7595980d0"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/a0aa7a6b4eab2348e567912e4ee7c173de8d12f5da67a33aad5fc74c359d2592.json",
+        "sha256": "a0aa7a6b4eab2348e567912e4ee7c173de8d12f5da67a33aad5fc74c359d2592"
+      },
+      "original": {
+        "path": "workspace/previous-result.json",
+        "sha256": "a0aa7a6b4eab2348e567912e4ee7c173de8d12f5da67a33aad5fc74c359d2592"
+      },
+      "category": "evaluation",
+      "role": "background",
+      "finding": "Retained best c133a5a3: formal 21/21 passed, geo_mean 1.623; target timing-2 candidate 63.51us vs reference 91.14us (1.435x), and f32 timing-8 is the worst case at 1.361x. Baseline for the next measured change.",
+      "source_sha256": "c133a5a391deb3491b0ee14071e87dcfa1e6335a438d538155e778b7595980d0"
+    }
+  ],
+  "hypothesis": "MTE2 is slower than MTE3 for identical logical bytes because each program reads only 64 contiguous f16 (128B) per sequence row with a 3072-element row stride, while the matching store is a fully contiguous 16KB block. If the 128B load granularity forces 512B-line fetches, neighbouring head groups re-fetch the same line in separate programs (up to 4x load waste). Grouping 4 adjacent heads into one program makes each input row a 256-element (512B) contiguous span, matching the store-side contiguity and cutting load transactions roughly 4x while keeping tile bytes, program count and all arithmetic unchanged.",
+  "change": "Rewrite the tile as [BLOCK_S, BLOCK_H, BLOCK_D] with affine h and d axes. When head_dim is an exact power of two and num_heads is divisible by the group, group BLOCK_H=4 heads (256 contiguous f16 columns = 512B rows) and shrink BLOCK_S to keep the same 16KB element budget; otherwise BLOCK_H=1 reproduces current behaviour. Input/bias/output offsets become 3D-affine; q fp32 bias+rescale, k/v fp16 adds, EXACT/masked paths and arbitrary strides are preserved. Grid decode gains num_head_groups and head0=group*BLOCK_H.",
+  "expected": "aiv_mte2_time and aiv_mte2_ratio fall relative to aiv_mte3 (active load BW rises toward the ~70 GB/s store rate), per-program aiv_time decreases, and target-case task duration / formal timing-2 latency decrease. Logical bytes (GM_to_UB 48.375KB, UB_to_GM 48KB) and program count 512 stay constant; no numeric change expected (abs_err/rel_err remain 0).",
+  "validation": "Preflight candidate.py; if awaiting_source_review hand off unchanged. Then paired profiling/simulator re-capture for the same timing-2 case (compare mte2/mte3 time and ratios, bytes, program count) and one formal KGS evaluation over 21 cases plus 48 supplementary checks.",
+  "alternatives": [
+    "The 1.5us MTE2 time is real DRAM/L2 bandwidth saturation, in which case widening per-program load spans will not reduce it.",
+    "The cost is per-program scalar/launch overhead (aiv_scalar_ratio 0.240) rather than load granularity; halving programs, not widening loads, would be the lever.",
+    "MTE3/VECTOR waiting (wait_only 0.70/0.65) is the critical chain and loads are already overlapped, so load-side changes would be invisible."
+  ],
+  "discriminating_observation": "MTE2 and MTE3 move the same 48KB per program yet MTE2 is 2.3x slower (33 vs 74 GB/s), and the compilation shows load rows are 128B-strided while stores are fully contiguous; this discriminates access granularity from pure bandwidth saturation. The scalar-share alternative predicts no MTE2/MTE3 asymmetry.",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

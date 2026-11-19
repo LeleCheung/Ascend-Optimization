@@ -1,0 +1,72 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "53f4ac44d82f015fd3b7b3d036b3850f67cfa2edf6ee29759cdd4a25e401653e",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "Same-source (53f4ac44) target case: candidate kernel upsample_bilinear2d_2x_kernel runs with Block Dim 16384 and Task Duration 55450.8us; per-block mean aiv_time 135.2us vs reference 51.6us (142 blocks, mean over different program counts, not a critical path). Per block means: aiv_mte2_time 52.4us, aiv_scalar_time 20.5us, aiv_scalar_wait_time 97.7us, aiv_vec_time 51.6us; totals aiv_mte2_instructions 344064 (=21 per block), aiv_mte3_instructions 49152 (=3 per block), GM_to_UB 2353152KB. 16384 tiny programs each moving ~9 loads of 128 fp16 (256B) are the structural signature of per-program fixed cost dominating."
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "mechanism",
+      "finding": "Single-core (core0.veccore0) static attribution for the same SHA: hot source region is lines 188-220 (the six masked tl.load calls and the where fix-ups); top instructions are WAIT_FLAG 5.83us/128 calls, BAR 3.91us, three VSEL 1.78us/128 calls and MOVEMASK/MOVEV 1.78us/128 calls all attributed to the masked-load and tl.where lines. Kernel window on that core is 33.0us (capture partial, application_completed false). This locates the fixed per-program select/mask sequences in source, but gives no whole-task, cross-core or aggregate timing, so it cannot size the expected gain."
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "Formal preflight of 53f4ac44 failed: triton.autotune benchmarking calls runtime.driver.active.clear_cache -> aten.zero_.default, rejected by the harness as a non-metadata ATen entry. No case results were produced, so no score exists for this source."
+    },
+    {
+      "path": "workspace/preflight-qualification.json",
+      "category": "other",
+      "role": "disambiguation",
+      "finding": "Tool-boundary review confirms the aten.zero_ failure comes from the Triton autotuner, not from upsample computation, and records the interface fact that KGS requires no conflicting public symbol (distinct upsample_bilinear2d and run definitions previously raised BuildError)."
+    },
+    {
+      "path": "workspace/native-runtime-facts.json",
+      "category": "knowledge",
+      "role": "background",
+      "finding": "Native FlagGems tuned space for the generic kernel is only BLOCK_X in {64..512}, BLOCK_Y in {1,2}, keys N,C,OH,OW; it contains no row-tiling or fast-path parameter and says nothing about the exact-2x path. Metadata only, no device measurement."
+    },
+    {
+      "path": "workspace/contract.json",
+      "category": "knowledge",
+      "role": "background",
+      "finding": "Frozen signature run(input, output_size, align_corners=False, scales_h=None, scales_w=None) with a single output; no mutation or aliasing requirements."
+    }
+  ],
+  "hypothesis": "For the target case (FP16 [4,32,128,128] -> [4,32,256,256], align_corners=False, exact scale 2) the current exact-2x fast path is bound by per-program fixed cost, not by arithmetic or DRAM traffic: 16384 programs each move only ~9 x 256B and pay a mask/select sequence per load. If each program instead covers a tile of ROWS=8 input rows x the full 128-wide row with unmasked, address-clamped loads and clamped edges, the program count drops 8x (16384 -> 2048), every load becomes one contiguous 2KB transfer, and the per-load MOVEMASK/MOVEV/VSEL fix-ups disappear because the address clamp already yields the edge sample.",
+  "alternatives": [
+    "Keep the grid unchanged and only remove the masks (address-clamped loads): removes select instructions but keeps 16384 programs and 256B transfers, so the per-program amortization is not addressed.",
+    "Keep the kernel and only raise BLOCK_J / process several (n,c) planes per program in a serial loop: reduces program count without enlarging the DMA transfer, and the native tuned space already shows BLOCK_X<=512 does not help.",
+    "Switch the interpolation math to fp16 to halve vector work: plausible later, but the reference computes in fp32 and this does not touch the dominant per-program overhead.",
+    "Write a fully data-dependent (generic) kernel for the 2x case: reintroduces per-lane coordinate arithmetic the fixed-weight path avoids."
+  ],
+  "discriminating_observation": "If per-program fixed cost dominates, cutting the program count 8x while keeping identical arithmetic must cut the device Task Duration far below the measured 55450.8us and cut the total MTE2 instruction count by roughly 8x (344064 -> ~43000) with per-block mean times only growing sub-linearly; vector FLOPs per output element stay unchanged. If instead the case were bound by vector arithmetic volume or DRAM bandwidth, the same edit would leave the duration nearly unchanged.",
+  "change": "Performance change (one mechanism: amortize per-program fixed cost in the exact-2x fast path): rewrite upsample_bilinear2d_2x_kernel to a row-tiled kernel, grid (cdiv(IW,BLOCK_J), cdiv(IH,ROWS), N*C) with ROWS=8, BLOCK_J=128, 2-D (ROWS,BLOCK_J) tiles, 9 loads per program instead of 9 per 2 output rows; replace masked loads plus tl.where edge fix-ups by address clamping (maximum/minimum on the index vectors), which is exactly PyTorch's edge clamp; keep the constant 0.25/0.75 separable weights, the fp32 accumulation and the (ROWS,BLOCK_J,2) interleaved contiguous store pattern; keep a mask on the store only when IH % ROWS or IW % BLOCK_J is non-zero. Compatibility edits (recorded separately, no performance claim): (a) remove @triton.autotune and the copied FlagGems config list from the generic kernel and launch it with one fixed constexpr config (BLOCK_X=256, BLOCK_Y=2) so no do_bench/clear_cache path is reachable; (b) expose a single public symbol `run` and make the FlagGems-named implementation and helpers private (_upsample_bilinear2d, _device_context, _bilinear_reciprocal_scale) so no conflicting public symbol exists.",
+  "expected": "Target case: program count 16384 -> 2048, MTE2 instruction total ~8x lower, contiguous 2KB loads instead of 256B loads, no mask/select instructions on the load path; expect device Task Duration to drop well below 55450.8us (conservative expectation >= 2x better, i.e. < 27ms) with identical outputs. Generic (non-2x) path: numerically unchanged, only the tuning constant changes.",
+  "validation": "Host preflight over the 24 formal cases plus supplementary checks (correctness of the exact-2x path against the frozen contract: even output row 2i = 0.25*x[i-1]+0.75*x[i], odd row 2i+1 = 0.75*x[i]+0.25*x[i+1], edge rows degenerate to the clamped sample; generic path is bit-identical code except the fixed BLOCK constants), then full performance on upsample_bilinear2d-timing-1; check that block count and total task duration move in the predicted direction before claiming a mechanism.",
+  "selected_layer": "Triton",
+  "layer_reason": "The evidence points at kernel launch geometry and instruction shape (16384 tiny programs, 9 small masked loads per program, select/mask instructions attributed to those loads by the simulator), so the change belongs in the Triton kernel/launch, not in IR passes or metadata layers. The autotune removal and public-symbol rename are pure compatibility edits to the same file.",
+  "simulator_incremental_judgment": "simulator-evidence.json adds a line-level mechanism attribution that the aggregate profiling cannot give: the VSEL/MOVEMASK/MOVEV sequences and the WAIT_FLAG/BAR waits are attributed to the masked tl.load lines (207/209/211) and the tl.where fix-up lines (223/228), which is why the rewrite drops masks in favour of address clamping and enlarges the tiles. It adds no quantitative distinction: the capture is single-core, covers a 33.0us partial window, records application_completed=false, and its own limitations state instruction times overlap with no critical path or speedup claim, so it cannot predict the magnitude of the 8x program-count reduction.",
+  "post_edit_status": {
+    "new_source_sha256": "19d37f1d2af612efd8d544138f2f536813e76ea302f6509e4be727e0ce39ab06",
+    "preflight": "awaiting_source_review",
+    "observed": "Bridge accepted the candidate for external read-only review before device operations; no device correctness or timing result yet, so the predicted 8x program-count reduction and the >=2x duration improvement are still unverified.",
+    "file_level_edits": [
+      "compatibility: removed @triton.autotune and the copied FlagGems config list from upsample_bilinear2d_kernel; launch now uses fixed constexpr BLOCK_X=256, BLOCK_Y=2 with num_warps=4, num_stages=2 (no do_bench/clear_cache path)",
+      "compatibility: single public symbol run(); native names made private (_upsample_bilinear2d, _bilinear_reciprocal_scale, _device_context)",
+      "performance: 2x fast path rewritten as row-tiled kernel, grid (cdiv(IW,128), cdiv(IH,8), N*C) = 2048 programs for the target case instead of 16384; loads are unmasked with address-clamped neighbours; store keeps the interleaved (ROWS,BLOCK_J,2) pattern and is masked only when IH%8 or IW%128 is non-zero"
+    ]
+  },
+  "unknown": [
+    "Whether the (ROWS,BLOCK_J,2) 3-D store compiles on this Ascend Triton backend; the previously executed code only used a 2-D (BLOCK_J,2) store. Fallback if it fails: four 2-D stores with 2*j / 2*j+1 column offsets.",
+    "Whether the 8-row tile (9 x (8,128) fp32 live tiles, ~36KB) fits without spills; per-block vector time may grow super-linearly.",
+    "Whether the harness re-checks the exact-2x path on cases with scale_h/scale_w explicitly given (reciprocal_scale == 0.5) - the selection condition is unchanged from the previously profiled source.",
+    "No correctness result exists yet for any fast-path variant of this source; the previous round ended in an interface failure before any case ran."
+  ]
+}

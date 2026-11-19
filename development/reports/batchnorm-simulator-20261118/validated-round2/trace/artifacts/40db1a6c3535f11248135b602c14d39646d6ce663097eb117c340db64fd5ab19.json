@@ -1,0 +1,49 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "dbf938228eed7573e964dbae991d60822b3b2369e32767e4ed36e9fc7b348f57",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "Candidate side (Op Name batch_norm_with_update_kernel, Block Dim 64, Task Duration 81.46us): per-block aiv_time mean 39.70us, of which aiv_vec_time 15.37us (ratio 0.388), aiv_mte2_time 14.68us (0.370), aiv_mte3_time 4.89us (0.123), aiv_scalar_time 10.69us (0.268); aiv_scalar_mte2_stall_time 8.86us. Per block MTE2 instructions 165, MTE3 37, read_main_memory 256KB, write_main_memory 128.5KB. Pipe time sums to ~1.15x the per-block wall, so MTE2 and VECTOR are almost additive rather than overlapped, and neither pipe is saturated (both <40%)."
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "disambiguation",
+      "finding": "Partial common-clock window (absolute_time_qualified=false, timeline_qualified=false): VECTOR productive_ratio 0.4919, wait_only_ratio 0.3089, idle_ratio 0.1991; SCALAR productive 0.0748, wait_only 0.5790, idle 0.3462; MTE2 productive 0.3114, idle 0.6886, wait_only 0.0; MTE3 has no timeline lane. Regions attribute repeated instruction time to the stats loop lines 51-66, with WAIT_FLAG/BAR entries mapped to lines 53/57 and largest single-instruction time 6.64us. Distinguishes 'tile load latency not hidden' from 'vector compute saturation': a large explicit-wait share coexists with low idle on VECTOR, i.e. the vector core is mostly waiting inside the loop rather than being compute-bound. These are fractions of a partial window, not device time and not proof of a dependency."
+    },
+    {
+      "path": "workspace/current-ir/dbf938228eed/target-0-batch_norm_with_update_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Both phases are plain nested scf.for loops over 8x128 fp32 tiles: each iteration performs a single tt.load of the current tile, then the dependent Welford delta recurrence on that loaded value, and the second loop does load -> arith -> tt.store. There is no lookahead/second load in flight, so the load of iteration k+1 cannot be issued before the compute of iteration k; the 8x128 tile is eight strided 512B rows per load."
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "Retained source dbf93822 evaluation: geo_mean 1.2923, timing-7 (8x64x64x64 fp32) 71.55us vs CANN 28.39us (0.397x), timing-8 71.81us, fp16/bf16 8x64 cases ~64-67us, all 27 formal cases PASSED."
+    }
+  ],
+  "hypothesis": "Each program (one per feature, 64 programs on the target case) executes a serial chain of 32 stats tiles plus 32 normalize tiles; every tile load is consumed immediately by the dependent Welford/normalize math, so the full GM load latency of each iteration is exposed and MTE2 cannot overlap VECTOR. With 24MB total traffic and MTE2 active bandwidth only ~16.6GB/s per core, the kernel is not bandwidth-bound and not vector-throughput-bound; it is bound by un-overlapped per-iteration load-use latency (~0.62us/iteration x 64 iterations ~= 39.7us per block).",
+  "alternatives": [
+    "Reduce iteration count with a larger tile (fewer, larger DMA transfers): would cut round-trip count but leaves the load-use dependency and raises UB pressure.",
+    "Set num_stages=2 in the triton.Config so the backend pipeliner multi-buffers the loop: depends on backend support for non-dot loops and may be a no-op.",
+    "Split the reduction across more programs with a second kernel/atomics: adds a launch and cross-block reduction, changes summation grouping, and is not justified while per-block latency dominates.",
+    "Replace Welford with plain sum/sum-of-squares to shorten the vector chain: numerically riskier on fp32 large-value cases and the vector pipe is not the saturated resource."
+  ],
+  "discriminating_observation": "Issue the next tile's GM load before computing the current tile (double buffering) while keeping tile shapes, masks, traffic (256KB read + 128.5KB write per block) and the Welford recurrence order per lane identical. If load-use serialization is the limiter, per-block aiv_time should fall and MTE2 busy time should overlap VECTOR busy time (both active ratios rise) with unchanged instruction/byte counts. If per-block time and the MTE2/VECTOR ratios stay put, the loop dependency is not the limiter and the larger-tile or sumsq explanations must be tested instead.",
+  "change": "Software-prefetch one tile ahead in both kernel loops: keep a current tile and issue the load for n_step+1 into a next tile before the Welford update / normalization of the current tile, then rotate. Same BLOCK_M/BLOCK_N heuristics, same mask construction, same delta-form Welford and same second-pass formula; only the load scheduling changes.",
+  "expected": "Per-block aiv_time 39.7us -> roughly 28-32us; kernel wall (profiled 81.5us, timed 71.5us for timing-7) -> about 52-62us; MTE2 and VECTOR active overlap increases while read/write byte counts and instruction counts stay essentially unchanged; numeric output identical (same values and recurrence per lane), so all 27 formal cases remain PASSED.",
+  "validation": "Bridge preflight --source candidate.py for compile/route review, then host-run formal 27-case evaluation plus 36 supplementary checks; if qualified, re-collect paired profiling and simulator evidence for this new source SHA and compare per-block aiv_time, MTE2/VECTOR ratios and byte counts against dbf93822.",
+  "selected_layer": "triton kernel loop scheduling (GM load prefetch / double buffering)",
+  "layer_reason": "Profiling shows both MTE2 and VECTOR below 40% busy with additive pipe times, negligible total traffic (24MB) and full-pass memory read reuse, and the IR shows a load-then-use loop with no second load in flight. The fix is therefore in how the existing loop issues loads, not in tile heuristics, launch shape or the reduction math.",
+  "simulator_incremental_judgment": "Hotspots/regions add that the largest per-instruction contributions and the WAIT_FLAG/BAR entries sit inside the stats loop (lines 51-66, with addresses attached to lines 53/57) and that a single wait instruction reaches 6.64us, which localizes the exposed wait to the tile loop rather than to the epilogue reduction or the running-stat stores. The normalized timeline adds the split between VECTOR productive (0.49) and explicit wait_only (0.31), plus SCALAR wait_only 0.58 and low VECTOR idle (0.20), which argues against vector-throughput saturation and for load-use waiting; MTE2's high idle (0.69) shows the load pipe is not the sustained bottleneck either. These ratios are a partial-window fraction only, so they distinguish hypotheses but cannot prove the dependency or give device time; the prefetch experiment is the test that would confirm it.",
+  "unknown": [
+    "Whether the Ascend lowering keeps the prefetch load issued ahead of the current tile's vector math, or re-serializes it at first use.",
+    "Cost of the one extra fully-masked prefetch load per m-step (m_num_steps is 1 for all listed cases except batch>BLOCK_M).",
+    "Whether 64 blocks over the available vector cores leaves a second-wave tail that also contributes to the 81us wall time; the prefetch change does not address wave quantization."
+  ]
+}

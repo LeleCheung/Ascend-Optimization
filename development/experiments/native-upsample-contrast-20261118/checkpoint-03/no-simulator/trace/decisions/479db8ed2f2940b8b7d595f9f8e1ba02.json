@@ -1,0 +1,80 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "479db8ed2f2940b8b7d595f9f8e1ba02",
+  "recorded_at": "2026-11-18T04:09:47.407480+00:00",
+  "round_id": "round-05",
+  "input_source": {
+    "path": "trace/sources/f23dd4c6ed1aeafb32de146d536c446f6ddd9ed9e9a4386b9af880a790db7a9b.py",
+    "sha256": "f23dd4c6ed1aeafb32de146d536c446f6ddd9ed9e9a4386b9af880a790db7a9b"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/f217a7ce25cb0dbaf650ea3e1be11499e0ae1920fa8396453b495bc7e1af2816.json",
+        "sha256": "f217a7ce25cb0dbaf650ea3e1be11499e0ae1920fa8396453b495bc7e1af2816"
+      },
+      "original": {
+        "path": "workspace/previous-result.json",
+        "sha256": "f217a7ce25cb0dbaf650ea3e1be11499e0ae1920fa8396453b495bc7e1af2816"
+      },
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "Current source f23dd4c6 preflight failed at compile time: BiShengIR reports 'cannot align 1 axis' for memref.alloc of shape memref<16x128x2xf32> (line 183) and memref<16x128x2xf16> (lines 207/212), i.e. exactly the tl.join intermediates of the new tiled 2x fast path. No formal kpi exists for this source.",
+      "source_sha256": "f23dd4c6ed1aeafb32de146d536c446f6ddd9ed9e9a4386b9af880a790db7a9b"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/49cb22f1fbcecf3cb5830593337af434e57af72d668d6ad406792bccc1bce7f2.json",
+        "sha256": "49cb22f1fbcecf3cb5830593337af434e57af72d668d6ad406792bccc1bce7f2"
+      },
+      "original": {
+        "path": "workspace/current-profiling.json",
+        "sha256": "49cb22f1fbcecf3cb5830593337af434e57af72d668d6ad406792bccc1bce7f2"
+      },
+      "category": "paired_profiling",
+      "role": "background",
+      "finding": "Historical (source 5d74700a, one source row per program, Block Dim 16384): upsample_bilinear2d_2x_kernel Task Duration 1326.7 us; 1326.7/16384 ~= 81 ns per program, and the small 64x64 cases (~1024 programs) take ~78 us. This matches a large fixed per-program/per-block overhead in the untitled 2x path; it is not a measurement of the current source.",
+      "source_sha256": "5d74700a475eae8f36188f11cc1eb1e200dab4ee0512826443f46226ef7c0688"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/f23dd4c6ed1aeafb32de146d536c446f6ddd9ed9e9a4386b9af880a790db7a9b.py",
+        "sha256": "f23dd4c6ed1aeafb32de146d536c446f6ddd9ed9e9a4386b9af880a790db7a9b"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "f23dd4c6ed1aeafb32de146d536c446f6ddd9ed9e9a4386b9af880a790db7a9b"
+      },
+      "category": "other",
+      "role": "mechanism",
+      "finding": "Current source builds (TILE_I, BLOCK_IW, 2) tensors via tl.join inside _hrow_2x_tile and reshapes to (TILE_I, BLOCK_OW); the join result gets an extra 3-D UB layout dimension that BishengIR cannot stride-align. The earlier compiled kernel used the same join/reshape but on 1-D row vectors (tensor<128xf32> -> tensor<128x2xf32> -> tensor<256xf32>, see historical 5d74700a IR), so the batched leading dimension is the new element.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/0f710b1a0347827a328dffe43184bbed97b2b027a5bfc099d140b06e9da369ae.ttir",
+        "sha256": "0f710b1a0347827a328dffe43184bbed97b2b027a5bfc099d140b06e9da369ae"
+      },
+      "original": {
+        "path": "workspace/actual-ir/upsample_bilinear2d_kernel.ttir",
+        "sha256": "0f710b1a0347827a328dffe43184bbed97b2b027a5bfc099d140b06e9da369ae"
+      },
+      "category": "source_ir",
+      "role": "background",
+      "finding": "Original-source IR (starter 62a02c20) for the general gather kernel compiles normally; compilation infrastructure is not the problem, only the tiled 2x path's 3-D join intermediates are.",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "The compile failure is caused by tl.join producing a batched 3-D tile (TILE_I=16, BLOCK_IW=128, 2), whose UB allocation cannot satisfy hivm stride alignment (stride_align_dims=[1], 32-byte) along an axis whose stride is not unit. Separately, the dominant cost of the 2x fast path is the fixed per-program overhead (~81 ns/program, 16384 programs -> ~1.3 ms) rather than arithmetic, so the row tiling mechanism itself is the right direction and only its 3-D join formulation must be repaired.",
+  "change": "Repair only: restructure the 2x fast path so each program keeps the same row-tiled grid (IH/TILE_I * N*C programs) but iterates over its TILE_I source rows with tl.static_range, performing the horizontal 2x expansion with the already-proven 1-D join/reshape (BLOCK_IW -> BLOCK_IW x 2 -> BLOCK_OW) and the fixed 1/4-3/4 vertical blend per row, storing two contiguous output rows. No arithmetic/weight change, general fallback kernel untouched.",
+  "expected": "Preflight compiles. Program count for timing-1 drops from 16384 to 1024 (TILE_I=16); if the ~81 ns/program fixed cost dominates as the historical profiling indicates, full-call time for upsample_bilinear2d-timing-1 should fall from the prior ~1.3 ms toward ~0.1-0.25 ms (speedup ~1-2.5x vs the 247 us reference), with identical numerical results.",
+  "validation": "Run the bridge preflight on the edited candidate (all frozen cases compile and match tolerance), then let the host run the full formal KGS evaluation and supplementary checks; compare per-case timing for upsample_bilinear2d-timing-1 and the other dtype/shape cases.",
+  "alternatives": [
+    "The failure is a UB capacity/alignment limit for the 16x128 tile, which would also break a per-row loop; contradicted by the fact that the per-row 1-D formulation already compiled (5d74700a IR).",
+    "Replacing interleaved join/reshape with two stride-2 stores would compile but likely serialize into element-wise DMA on Ascend, losing the contiguous-store property.",
+    "Doing the horizontal expansion in output-column space with duplicated-index gathers would avoid join but turn contiguous loads into gathers."
+  ],
+  "discriminating_observation": "The compiler error names the exact 3-D memref<16x128x2> allocations at the join call sites, while the historical IR shows the identical join/reshape on 1-D vectors compiles; therefore removing the batched leading dimension while keeping the TILE_I row tiling is the minimal repair that distinguishes layout incompatibility from the other explanations.",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

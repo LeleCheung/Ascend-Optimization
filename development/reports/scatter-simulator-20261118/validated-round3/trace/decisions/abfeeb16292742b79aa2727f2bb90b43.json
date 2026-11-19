@@ -1,0 +1,90 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "abfeeb16292742b79aa2727f2bb90b43",
+  "recorded_at": "2026-11-18T11:25:48.307668+00:00",
+  "round_id": "attempt-002",
+  "input_source": {
+    "path": "trace/sources/3bd9aac10b006d55a944a6b5689bde80aa5ee7270fa613acbea0dcd6db4d8406.py",
+    "sha256": "3bd9aac10b006d55a944a6b5689bde80aa5ee7270fa613acbea0dcd6db4d8406"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/0be7edea0a2362634660bbea6b514f42d148b24d712eebe55cb2508f80be9b88.json",
+        "sha256": "0be7edea0a2362634660bbea6b514f42d148b24d712eebe55cb2508f80be9b88"
+      },
+      "original": {
+        "path": "workspace/previous-result.json",
+        "sha256": "0be7edea0a2362634660bbea6b514f42d148b24d712eebe55cb2508f80be9b88"
+      },
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "segment_independence cases large_finite/positive_infinity/nan all fail with 1023/1024 mismatched elements; greatest abs/rel difference 1.0 at index (0,1) for large_finite and nan at (0,1) for inf/nan. Exactly one output element (index 0) is correct, so every destination whose run is not first in the row gets a wrong (zeroed / nan) total.",
+      "source_sha256": "3bd9aac10b006d55a944a6b5689bde80aa5ee7270fa613acbea0dcd6db4d8406"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/c572012ff8416ef141a1c372cf41896c6974c6a7d1a44107f1ca97b76f44844d.py",
+        "sha256": "c572012ff8416ef141a1c372cf41896c6974c6a7d1a44107f1ca97b76f44844d"
+      },
+      "original": {
+        "path": "/data/hanle/ascend-optimization/runs/check_scatter_segment_independence.py",
+        "sha256": "c572012ff8416ef141a1c372cf41896c6974c6a7d1a44107f1ca97b76f44844d"
+      },
+      "category": "evaluation",
+      "role": "disambiguation",
+      "finding": "Cases are inp=zeros((1,1024)) f32, index=arange(1024).reshape(1,1024) (all destinations unique), src=ones with src[0,0]=1e20 / +inf / nan, compared with atol=0, rtol=0. ncols=1024 selects the sorted-segment path, so the dense owner path, the atomic path and the generic N-d path are not exercised by this failure.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/3bd9aac10b006d55a944a6b5689bde80aa5ee7270fa613acbea0dcd6db4d8406.py",
+        "sha256": "3bd9aac10b006d55a944a6b5689bde80aa5ee7270fa613acbea0dcd6db4d8406"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "3bd9aac10b006d55a944a6b5689bde80aa5ee7270fa613acbea0dcd6db4d8406"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Lines 208-215 (sort key kernel) store a whole-row tl.cumsum over the reordered values; lines 254-258 (out kernel) reconstruct each destination total as prefix[end-1] - prefix[lo-1]. That difference equals the segment sum only in exact arithmetic: prefix[lo-1] already contains every earlier lane of the row, so an earlier 1e20 makes 1e20+1 round back to 1e20 (delta 0 for every dst>=1), and an earlier inf/nan makes the prefix inf/nan (delta inf-inf = nan). This reproduces the recorded signature exactly: out[0,0]=1e20 stays right, all other positions lose their 1.0. The other accumulation paths in the same file (dense owner lines 136-173, last-axis atomic lines 268-282, generic N-d lines 289-365) never mix distinct destinations, so the repair must stay confined to the sorted-segment path.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/65b65b3a563b24fd11ecddf3187ae52745137dddbf5db4f349aabcb9dfd1035c.ttir",
+        "sha256": "65b65b3a563b24fd11ecddf3187ae52745137dddbf5db4f349aabcb9dfd1035c"
+      },
+      "original": {
+        "path": "workspace/current-ir/3bd9aac10b00/12-kernel.ttir",
+        "sha256": "65b65b3a563b24fd11ecddf3187ae52745137dddbf5db4f349aabcb9dfd1035c"
+      },
+      "category": "source_ir",
+      "role": "background",
+      "finding": "Captured IR of the sorted-path output kernel shows 15 tt.gather, 3 tt.load (including the inp init load), 1 tt.store and no atomic_rmw, confirming the sorted path writes each output element exactly once as inp + prefix-difference; there is no hidden second accumulation that could explain the mismatch.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/1a7dade41379f2e201d0a70d2d5dc19a73ebe461fe7f52ef18988912ba8692fe.json",
+        "sha256": "1a7dade41379f2e201d0a70d2d5dc19a73ebe461fe7f52ef18988912ba8692fe"
+      },
+      "original": {
+        "path": "workspace/latest-preflight.json",
+        "sha256": "1a7dade41379f2e201d0a70d2d5dc19a73ebe461fe7f52ef18988912ba8692fe"
+      },
+      "category": "evaluation",
+      "role": "background",
+      "finding": "The same sha passed 21/21 supplementary checks, so the defect is not a general precision or layout error but specifically the cross-segment prefix subtraction, which only surfaces when one destination's magnitude dwarfs another's (unique-destination / special-value case).",
+      "source_sha256": "3bd9aac10b006d55a944a6b5689bde80aa5ee7270fa613acbea0dcd6db4d8406"
+    }
+  ],
+  "hypothesis": "The sorted-segment path's run-total formula (difference of a whole-row cumulative sum) is numerically non-independent across destinations; replacing the whole-row cumsum with a per-segment inclusive scan, stored per sorted lane, makes every destination total depend only on its own sources while keeping the same one-program-per-row sort/gather/binary-search structure and the same contiguous single store.",
+  "change": "In _scatter_add_sort_key_kernel compute target = key>>LOG once and turn the stored value row into a segmented inclusive scan: for i in static_range(LOG) with d=1<<i, add tl.gather(sv, lane-d) only where the gathered target equals this lane's target (equality suffices because equal-target lanes are contiguous in sorted order). The stored 'prefix' entry at any lane is then the running total of its own destination only. In _scatter_add_sort_out_kernel replace delta = prefix[end-1] - prefix[lo-1] with delta = prefix[end-1] masked by end > lo, dropping the now unnecessary 'before' gather. Remove the unused _segment_combine helper.",
+  "expected": "segment_independence: out[0,0]=1e20/inf/nan preserved and out[0,1..1023]=1.0 exactly (atol=0,rtol=0) for all three cases. Output elements are still written exactly once with the same fp32 accumulate-then-add-to-inp semantics, so the 21 supplementary checks and the timing-case values should be unchanged. Cost: the key kernel loses one whole-row cumsum and gains LOG steps of two on-chip gathers (the previously measured per-segment Hillis-Steele form), while the out kernel drops one gather. Net effect on the wide-row timing cases is expected to be a modest key-kernel slowdown, still well under the ~3.4 ms CANN reference, and no change on the ncols<=256 dense path.",
+  "validation": "Bridge preflight on the edited candidate.py must stay 21/21 supplementary with no compile or resource failure; the sorted-path numerics are additionally re-derived by hand from the recorded failure signature (large_finite/inf/nan) because the special checker runs only in the formal evaluation. Stale profiling/simulator evidence for this source is not used as confirmation.",
+  "alternatives": [],
+  "discriminating_observation": "",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

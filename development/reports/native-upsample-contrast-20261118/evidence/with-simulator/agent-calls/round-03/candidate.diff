@@ -1,0 +1,223 @@
+--- parent
+
++++ candidate
+
+@@ -42,26 +42,23 @@
+
+     return _NullDeviceContext()
+ 
+ 
+-def get_upsample_bilinear2d_configs():
+-    """Self-contained copy of the FlagGems tuned config metadata for
+-    upsample_bilinear2d (same BLOCK_X/BLOCK_Y/num_warps grid as
+-    runtime.get_tuned_config); metadata only, no device computation."""
+-    return [
+-        triton.Config(
+-            {"BLOCK_X": block_x, "BLOCK_Y": block_y},
+-            num_warps=num_warps,
+-            num_stages=2,
+-        )
+-        for block_x in (64, 128, 256, 512)
+-        for block_y in (1, 2)
+-        for num_warps in (8, 4)
+-    ]
+-
+-
+-@triton.autotune(
+-    configs=get_upsample_bilinear2d_configs(),
+-    key=["N", "C", "OH", "OW"],
+-)
++def select_block_shape(OW):
++    """Static tile choice for the generic kernel, taken from the same
++    BLOCK_X family as the native tuned metadata (64/128/256/512 x 1/2).
++    Metadata only: the device-side autotuner is deliberately not used
++    because its benchmark path calls a non-metadata ATen entry."""
++    if OW >= 256:
++        return 256, 1
++    if OW >= 128:
++        return 128, 1
++    if OW >= 64:
++        return 64, 1
++    block_x = 32
++    while block_x < OW and block_x < 512:
++        block_x *= 2
++    return block_x, 1
++
++
+ @triton.jit
+ def upsample_bilinear2d_kernel(
+     ptr_o,
+@@ -156,9 +153,10 @@
+
+                 + data_11.to(tl.float32) * w11
+             )
+ 
+-            # Store result
++            # Store result (explicit cast so the store operand type always
++            # matches the output pointer element type)
+             offset_o = ((n * C + c) * OH + oh[:, None]) * OW + ow[None, :]
+-            tl.store(ptr_o + offset_o, result)
++            tl.store(ptr_o + offset_o, result.to(ptr_o.dtype.element_ty))
+ 
+ 
+ @triton.jit
+@@ -179,23 +177,28 @@
+
+     #   output row 2*i + 1 = 0.75 * in[i]   + 0.25 * in[i+1]
+     # and the same pair of weights applies along the width, so every input
+     # element of the (i-1, i, i+1) x (j-1, j, j+1) stencil is reached with an
+-    # affine, contiguous address.  (n, c) and the input row are grid axes, so
+-    # the kernel has no serial slice loop.
++    # affine, contiguous address.
++    #
++    # Every tensor here is one-dimensional with width BLOCK_J.  Edge handling is
++    # folded into clamped column indices (jl/jr), so no load needs a mask plus a
++    # select on the loaded value, and the two output columns produced by one
++    # input column are written by two stride-2 stores per output row.  The
++    # kernel therefore keeps a BLOCK_J-wide vector layout end to end instead of
++    # the 2-wide innermost dimension of a (BLOCK_J, 2) pair tile.  (n, c) and
++    # the input row are grid axes, so there is no serial slice loop either.
+     pid_j = tl.program_id(axis=0)
+     i = tl.program_id(axis=1)
+     nc = tl.program_id(axis=2)
+ 
+     j = pid_j * BLOCK_J + tl.arange(0, BLOCK_J)
+-    b2 = tl.arange(0, 2)
+-
+-    # Edge clamping keeps the fixed weights exact at the image border.
+-    m_left = j > 0
+-    m_right = j < (IW - 1)
+     if TAIL:
+-        j_ok = j < IW
+-        m_left = m_left & j_ok
+-        m_right = m_right & j_ok
+-
++        # Inactive lanes are folded onto the last valid column so that every
++        # load address stays inside the allocation; only the stores are masked.
++        m_store = j < IW
++        j = tl.minimum(j, IW - 1)
++
++    jl = tl.maximum(j - 1, 0)
++    jr = tl.minimum(j + 1, IW - 1)
+     im = tl.maximum(i - 1, 0)
+     ip = tl.minimum(i + 1, IH - 1)
+ 
+@@ -204,30 +207,19 @@
+
+     row_c = ptr_i + (base_i + i * IW)
+     row_p = ptr_i + (base_i + ip * IW)
+ 
+-    ml = tl.load(row_m + (j - 1), mask=m_left, other=0.0).to(tl.float32)
+-    mr = tl.load(row_m + (j + 1), mask=m_right, other=0.0).to(tl.float32)
+-    cl = tl.load(row_c + (j - 1), mask=m_left, other=0.0).to(tl.float32)
+-    cr = tl.load(row_c + (j + 1), mask=m_right, other=0.0).to(tl.float32)
+-    pl = tl.load(row_p + (j - 1), mask=m_left, other=0.0).to(tl.float32)
+-    pr = tl.load(row_p + (j + 1), mask=m_right, other=0.0).to(tl.float32)
+-    if TAIL:
+-        mc = tl.load(row_m + j, mask=j_ok, other=0.0).to(tl.float32)
+-        cc = tl.load(row_c + j, mask=j_ok, other=0.0).to(tl.float32)
+-        pc = tl.load(row_p + j, mask=j_ok, other=0.0).to(tl.float32)
+-    else:
+-        mc = tl.load(row_m + j).to(tl.float32)
+-        cc = tl.load(row_c + j).to(tl.float32)
+-        pc = tl.load(row_p + j).to(tl.float32)
+-
+-    # Replace the masked lanes by the clamped (edge) sample in registers.
+-    ml = tl.where(j > 0, ml, mc)
+-    mr = tl.where(j < (IW - 1), mr, mc)
+-    cl = tl.where(j > 0, cl, cc)
+-    cr = tl.where(j < (IW - 1), cr, cc)
+-    pl = tl.where(j > 0, pl, pc)
+-    pr = tl.where(j < (IW - 1), pr, pc)
+-
+-    # Vertical half of the separable interpolation.
++    ml = tl.load(row_m + jl).to(tl.float32)
++    mc = tl.load(row_m + j).to(tl.float32)
++    mr = tl.load(row_m + jr).to(tl.float32)
++    cl = tl.load(row_c + jl).to(tl.float32)
++    cc = tl.load(row_c + j).to(tl.float32)
++    cr = tl.load(row_c + jr).to(tl.float32)
++    pl = tl.load(row_p + jl).to(tl.float32)
++    pc = tl.load(row_p + j).to(tl.float32)
++    pr = tl.load(row_p + jr).to(tl.float32)
++
++    # Vertical half of the separable interpolation: output row 2*i blends rows
++    # (i-1, i) with weights (0.25, 0.75), output row 2*i+1 blends rows
++    # (i, i+1) with weights (0.75, 0.25).
+     e_l = 0.25 * ml + 0.75 * cl
+     e_c = 0.25 * mc + 0.75 * cc
+     e_r = 0.25 * mr + 0.75 * cr
+@@ -235,28 +227,28 @@
+
+     o_c = 0.75 * cc + 0.25 * pc
+     o_r = 0.75 * cr + 0.25 * pr
+ 
+-    # Horizontal half, laid out as (BLOCK_J, 2) column pairs so that both
+-    # stores are contiguous in the output row.
+-    pair_e = tl.where(
+-        b2[None, :] == 0,
+-        (0.25 * e_l + 0.75 * e_c)[:, None],
+-        (0.75 * e_c + 0.25 * e_r)[:, None],
+-    )
+-    pair_o = tl.where(
+-        b2[None, :] == 0,
+-        (0.25 * o_l + 0.75 * o_c)[:, None],
+-        (0.75 * o_c + 0.25 * o_r)[:, None],
+-    )
+-
+-    col = 2 * j[:, None] + b2[None, :]
+-    out0 = nc.to(tl.int64) * OH * OW + (2 * i) * OW
++    # Horizontal half: output column 2*j takes (0.25, 0.75) on columns
++    # (j-1, j), output column 2*j+1 takes (0.75, 0.25) on columns (j, j+1).
++    col_e = 2 * j
++    out_dtype = ptr_o.dtype.element_ty
++    out_even_row = nc.to(tl.int64) * OH * OW + (2 * i) * OW
++    out_odd_row = out_even_row + OW
++
++    ev = (0.25 * e_l + 0.75 * e_c).to(out_dtype)
++    od = (0.75 * e_c + 0.25 * e_r).to(out_dtype)
++    ev2 = (0.25 * o_l + 0.75 * o_c).to(out_dtype)
++    od2 = (0.75 * o_c + 0.25 * o_r).to(out_dtype)
++
+     if TAIL:
+-        m_store = (j < IW)[:, None] & (b2[None, :] < 2)
+-        tl.store(ptr_o + out0 + col, pair_e, mask=m_store)
+-        tl.store(ptr_o + out0 + OW + col, pair_o, mask=m_store)
++        tl.store(ptr_o + out_even_row + col_e, ev, mask=m_store)
++        tl.store(ptr_o + out_even_row + col_e + 1, od, mask=m_store)
++        tl.store(ptr_o + out_odd_row + col_e, ev2, mask=m_store)
++        tl.store(ptr_o + out_odd_row + col_e + 1, od2, mask=m_store)
+     else:
+-        tl.store(ptr_o + out0 + col, pair_e)
+-        tl.store(ptr_o + out0 + OW + col, pair_o)
++        tl.store(ptr_o + out_even_row + col_e, ev)
++        tl.store(ptr_o + out_even_row + col_e + 1, od)
++        tl.store(ptr_o + out_odd_row + col_e, ev2)
++        tl.store(ptr_o + out_odd_row + col_e + 1, od2)
+ 
+ 
+ def bilinear_reciprocal_scale(src_size, dst_size, align_corners, scale):
+@@ -321,10 +313,8 @@
+
+             )
+         return output
+ 
+-    grid = lambda META: (
+-        triton.cdiv(OW, META["BLOCK_X"]),
+-        triton.cdiv(OH, META["BLOCK_Y"]),
+-    )
++    block_x, block_y = select_block_shape(OW)
++    grid = (triton.cdiv(OW, block_x), triton.cdiv(OH, block_y))
+ 
+     with device_context(input.device):
+         upsample_bilinear2d_kernel[grid](
+@@ -339,6 +329,8 @@
+
+             reciprocal_scale_h,
+             reciprocal_scale_w,
+             align_corners,
++            block_x,
++            block_y,
+         )
+     return output
+ 

@@ -1,0 +1,79 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "3cec3b2d36f6412e9f9ada02df1686fa",
+  "recorded_at": "2026-11-18T03:00:17.781147+00:00",
+  "round_id": "round-01",
+  "input_source": {
+    "path": "trace/sources/62a02c203a3e54a09f6479ca8526168bf1529821284cd1b42bc6cbdf3c980a12.py",
+    "sha256": "62a02c203a3e54a09f6479ca8526168bf1529821284cd1b42bc6cbdf3c980a12"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/d1480e8698be45f420275cc8a8304fab15f1141326e78e3fda37b4af14981a9a.json",
+        "sha256": "d1480e8698be45f420275cc8a8304fab15f1141326e78e3fda37b4af14981a9a"
+      },
+      "original": {
+        "path": "workspace/profiling-comparison.json",
+        "sha256": "d1480e8698be45f420275cc8a8304fab15f1141326e78e3fda37b4af14981a9a"
+      },
+      "category": "paired_profiling",
+      "role": "mechanism",
+      "finding": "Candidate kernel (Block Dim 1024, Task Duration 255453 us) per-block mean aiv_time 9824.9 us with min 9787.1 / max 9847.1 across all 1024 blocks: every program executes identical work and per-block time is uniform. Per block only ~32 KB of output is produced (128 serial iterations x 256 B), yet aiv_mte3_instructions=8193 (8192 per block, ~128 B per instruction) and write_main_memory_datas=1024 KB per block (32x the bytes the program actually has to write), while aiv_main_mem_write_bw is only 0.099 GB/s per block and read BW ~0.008 GB/s (sum over blocks ~8 GB/s). Pipe use: aiv_vec_ratio 0.5387, mte2_ratio 0.0010, mte3_ratio 0.1038, vec_wait_ratio 0.1510. So the cost is instruction/memory-op fragmentation at tiny granularity, not HBM/L2 bandwidth.",
+      "source_sha256": "62a02c203a3e54a09f6479ca8526168bf1529821284cd1b42bc6cbdf3c980a12"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/0f710b1a0347827a328dffe43184bbed97b2b027a5bfc099d140b06e9da369ae.ttir",
+        "sha256": "0f710b1a0347827a328dffe43184bbed97b2b027a5bfc099d140b06e9da369ae"
+      },
+      "original": {
+        "path": "workspace/actual-ir/upsample_bilinear2d_kernel.ttir",
+        "sha256": "0f710b1a0347827a328dffe43184bbed97b2b027a5bfc099d140b06e9da369ae"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Compiled with BLOCK_X=128, BLOCK_Y=1 for the target case. Program maps only over spatial output; all N*C planes are handled by nested scf.for loops (128 serial iterations). Output row/column indices are produced by arith.remsi (`(pid_x*BLOCK_X+arange) % OW`), so the store offsets are a 2-D tensor<1x128> whose contiguity/alignment the compiler cannot prove; the IR keeps tensor<1x128> pointer arithmetic with mixed i32/i64 and the store is emitted from that wrapped index tensor.",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/5dd9c010107e5f45ec14283fa398d5767bd162885242e7e88918b36d23014811.json",
+        "sha256": "5dd9c010107e5f45ec14283fa398d5767bd162885242e7e88918b36d23014811"
+      },
+      "original": {
+        "path": "workspace/baseline-evaluation.json",
+        "sha256": "5dd9c010107e5f45ec14283fa398d5767bd162885242e7e88918b36d23014811"
+      },
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "Target case upsample_bilinear2d-timing-1: 253.949 ms vs reference 0.2455 ms (speedup 0.00097x); timing-0/2/4 are ~8.6-9.9 ms and timing-3/5 ~256-294 ms. 6 of 24 formal cases fail with MLIRCompilationError in ConvertTritonIRToLinalgIR (correctness-2,3,8,9,14,15), i.e. part of the contract does not even compile.",
+      "source_sha256": "62a02c203a3e54a09f6479ca8526168bf1529821284cd1b42bc6cbdf3c980a12"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/85bf3d2ffd5a791362a39f54c5514abd2bb46e53200fa976cebd9455a10d990e.json",
+        "sha256": "85bf3d2ffd5a791362a39f54c5514abd2bb46e53200fa976cebd9455a10d990e"
+      },
+      "original": {
+        "path": "workspace/native-runtime-facts.json",
+        "sha256": "85bf3d2ffd5a791362a39f54c5514abd2bb46e53200fa976cebd9455a10d990e"
+      },
+      "category": "knowledge",
+      "role": "background",
+      "finding": "All 16 tuned configs keep BLOCK_X in {64..512} and BLOCK_Y in {1,2} with num_warps 4/8: the supplied tuning space never expresses a full-output-row tile, so the retile mechanism I test is outside the supplied search space rather than a repetition of it.",
+      "source_sha256": "62a02c203a3e54a09f6479ca8526168bf1529821284cd1b42bc6cbdf3c980a12"
+    }
+  ],
+  "hypothesis": "The 254 ms on the target case is set by per-program instruction count, not by occupancy or bandwidth: the kernel writes its 128-element row chunk through a `% OW`-wrapped, shape-[1,128] index tensor, so Triton-Ascend emits ~8192 tiny mte3 stores (and ~8192 mte2 loads) per program with ~128 B granularity and ~32x write amplification, and every program additionally replays a 128-iteration serial N*C loop over that fragmented index pattern. Retiling to (plane, row-block, column-block) with explicit block indices plus a bounds mask instead of modular wrap should let the compiler prove the full-width row store is contiguous/aligned and emit a few wide DMAs instead of thousands of tiny ones.",
+  "change": "Single mechanism: retile programs. Replace the spatial-only grid + `% OW`/`% OH` index wrap + serial N*C loop with a 3-D grid (column block, row block, plane = n*C+c), full-width row tiles whose column index is `pid*BLOCK_W + arange` plus an explicit `ow < OW`/`oh < OH` mask, and 2-D [BLOCK_H, BLOCK_W] weights/taps computed from the same formulas. Per-element math (fp32 coordinate mapping, clamping, 2-D bilinear weights, fp32 accumulation order) is kept identical. Compatibility edits (recorded separately from performance): (a) move the align_corners ratio (IH-1)/(OH-1) computation to the host in Python and feed it as a float kernel argument so no integer division appears in the kernel (the align_corners branch currently fails ConvertTritonIRToLinalgIR on 6 formal cases); (b) add the required public entrypoint alias `run(input, output_size, align_corners=False, scales_h=None, scales_w=None)` next to the preserved FlagGems `upsample_bilinear2d`. No caching, no host-side computation of tensor values.",
+  "expected": "If the diagnosis holds, the candidate kernel's mte3 instruction count per program drops from thousands to a handful of wide stores and the 32x write amplification disappears; target-case full-call time should drop by at least an order of magnitude from 253.95 ms (expected tens of ms or below), with the target still correct. The 6 previously non-compiling align_corners cases should start running. Gather loads (4 taps per output element) remain and are expected to become the next visible limit; if time stays near 254 ms and per-block mte3 counts stay ~8000, this mechanism is falsified.",
+  "validation": "Preflight: source review + compile of the edited candidate. Then the host formal evaluation over the 24 formal cases plus supplementary and CANN supplementary checks; compare per-case latency and pass count with baseline-evaluation.json, and confirm the align_corners cases now compile and match within atol/rtol 0.015 at required_matched_ratio 1.0. No re-collected paired profiling is available from this call, so the mte3-instruction prediction stays an expectation, not a measurement.",
+  "alternatives": [
+    "The kernel is HBM/L2-bandwidth-bound: contradicted by aiv_main_mem_write_bw 0.099 GB/s and aiv_main_mem_read_bw 0.008 GB/s per block (sum ~100 and ~8 GB/s), far below device capability, and by mte2_ratio 0.0010.",
+    "The serial N*C loop starves parallelism: contradicted by uniform per-block aiv_time (min 9787 us, max 9847 us) over 1024 blocks; the machine is already fully occupied and total time is waves x per-program time, so only per-program work/instruction count can reduce the total."
+  ],
+  "discriminating_observation": "Per block: only ~32 KB of output exists, but mte3 instruction count is 8193 (~128 B per instruction) and write_main_memory_datas is 1024 KB (32x amplification), while block time is perfectly uniform across all 1024 blocks (~9.8 ms). Together these separate 'fragmented tiny memory ops per program' from both a bandwidth limit and an occupancy limit.",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

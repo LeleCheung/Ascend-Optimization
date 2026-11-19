@@ -1,0 +1,49 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "d3d7b308320e84b9e1c8dcdcbbb8c90f2008be797ba7b3a94ce842ae480d6f96",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "timing-1 (fp16 4x32x128x128 -> 256x256): candidate kernel upsample_bilinear2d_2x_kernel runs 1159.9us with 1024 programs; per-program aiv_time mean 44.4us, aiv_mte2_time 19.9us, aiv_scalar_wait_ib_time 21.7us, aiv_icache_miss_rate 0.173, and 328704 mte2 instructions total (321 per program) moving only about 114 bytes per mte2 instruction versus about 6373 B per instruction on the reference side. read_main_memory_datas 112892KB is roughly 27x the 4.19MB input."
+    },
+    {
+      "path": "workspace/current-ir/d3d7b308320e/18-kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Kernel with TILE_I=16 and BLOCK_IW=128 is fully unrolled into 144 tt.load and 32 tt.store; each of 16 iterations issues 3 vertical variants times 3 horizontally shifted loads of 128 fp16 (256B) each. The same source row is horizontally expanded three times across consecutive iterations, which is the direct source of the redundant small DMAs and of the large instruction stream behind icache and instruction-buffer wait."
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "This source SHA passed all 24 formal cases and 30 supplementary checks, but timing-1 was 1.1264ms versus reference 0.2436ms (speedup 0.216); timing-3 and timing-5 behave the same at 1.128ms and 1.136ms. These numbers bind to this exact SHA and are only the starting point for this round."
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "disambiguation",
+      "finding": "Rules out a raw-bandwidth reading: UB_to_GM_datas is 16384KB on both sides, exactly the 16MB output, and the reference reaches about 21GB/s mean block read bandwidth while the candidate achieves about 2.4GB/s, so the candidate excess comes from per-instruction overhead (114 B per mte2, 21.7us scalar_wait_ib) rather than from byte volume or a slow store pipe."
+    }
+  ],
+  "hypothesis": "Each source row is horizontally expanded three times per program (once as center, once as lower neighbour, once as upper neighbour of a later row), so a program with TILE_I=16 issues 144 small masked 256B loads instead of the 54 needed. That triples mte2 instruction count and DMA setup cost and roughly triples the unrolled body that drives the 21.7us per-program instruction-buffer wait and the 0.173 icache miss rate. Carrying the already-expanded neighbouring rows through the row loop should cut mte2 instructions and read traffic about 2.7x without changing arithmetic, weights or output values.",
+  "alternatives": [
+    "Raw HBM bandwidth bound: contradicted because UB_to_GM_datas equals the pure output volume on both sides and the candidate moves only about 2.4GB/s mean block read bandwidth while the reference moves about 21GB/s.",
+    "Grid-size limited (1024 programs, about 39 concurrent): partly possible, but per-program aiv_time is 44us, so per-program work reduction is testable while holding grid and stores fixed.",
+    "Interleave arithmetic limited: vector math is about 6 flops per output element and aiv_vec_time is 18us of the 44us while scalar work plus instruction-buffer wait is over 30us, so issue and small DMA dominate over vector math."
+  ],
+  "discriminating_observation": "If redundant expansion is the mechanism, cutting loads from 144 to 54 per program at identical grid and store pattern must reduce mte2 instruction count and scalar_wait_ib per program and push read_main_memory_datas well below about 112896KB. A pure grid/block-count explanation would instead leave per-program mte2 time roughly unchanged.",
+  "change": "In upsample_bilinear2d_2x_kernel replace per-row recomputation with a rolling pipeline: initialise e_prev = expand(clamp(i0-1)) and e_cur = expand(clamp(i0)), then in each loop step compute only e_next = expand(clamp(i+1)) with 3 loads, emit out_even = 0.25*e_prev + 0.75*e_cur and out_odd = 0.75*e_cur + 0.25*e_next, then rotate e_prev = e_cur and e_cur = e_next. Loads per program go from 144 to 54 at TILE_I=16. Grid, tile size, masks, weights, stores and the general non-2x kernel stay unchanged. Compatibility edits: none this round.",
+  "expected": "timing-1 full-call time should move from about 1.126ms toward about 0.5-0.7ms, per-program aiv_time from 44us to about 22-28us, mte2 instructions per program from 321 to about 120, and read_main_memory_datas from about 112896KB to about 42000KB, with bit-comparable results because weights and masks are unchanged.",
+  "validation": "Preflight with the 30 supplementary checks on the new source, then the formal 24-case KGS evaluation; re-read paired profiling for the new SHA to confirm the mte2 instruction count and read volume actually fell and to see whether per-program time or grid concurrency is the new limiter.",
+  "selected_layer": "Triton",
+  "layer_reason": "The redundant work is visible directly in the Triton source and in the unrolled TTIR (144 loads). Removing it requires loop-carried reuse of expanded rows, which must be expressed in the Triton kernel rather than in a compiler pass available to us.",
+  "simulator_incremental_judgment": "No simulator was used or requested in this control arm; no simulation evidence is claimed from source syntax.",
+  "post_preflight_note": "Round-06 edit applied (rolling two-row window in upsample_bilinear2d_2x_kernel); loads per program 144 -> 54 at TILE_I=16. Preflight on the edited source 28dc6386fd019bb1c946d06b23c485805344af43cd8a16f1de8d59332bc3b335 returned awaiting_source_review, so no device timing or correctness result exists yet for this candidate; the expected numbers above are predictions, not measurements.",
+  "unknown": [
+    "Whether the remaining 256B-wide masked loads (about 114 B per mte2 instruction) still keep mte2 as the limiter once redundancy is removed; a 2-D contiguous tile load is the next candidate mechanism.",
+    "Whether instruction-buffer wait scales with the reduced body or is a fixed per-program cost.",
+    "Whether grid concurrency (about 39 concurrent of 1024 programs) bounds the reachable time once per-program work shrinks."
+  ]
+}

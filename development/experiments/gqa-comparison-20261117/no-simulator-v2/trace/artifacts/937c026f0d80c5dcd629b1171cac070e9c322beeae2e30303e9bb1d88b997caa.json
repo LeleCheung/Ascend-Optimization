@@ -1,0 +1,41 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "993722a66fcb3ccbdcdb9a559333d8abec7d17f99dd27f7db7529569e0fdbbe6",
+  "evidence": [
+    {
+      "path": "workspace/next-performance-feedback.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "Previous round (num_warps=4/num_stages=2 plus 3-term bf16 PV split) left case4 unchanged: 1900.72 -> 1902.05 us (0.9993x), case7 1.0034x, case1 1.053x, case2 0.895x. All four pass the official checker. So launch/tiling-independent tuning of the same structure is exhausted; the target needs a structural change, and the previously added precision path is not the limiter."
+    },
+    {
+      "path": "workspace/evidence-summary.json",
+      "category": "paired_profiling",
+      "role": "background",
+      "finding": "Historical paired profiling of the baseline source 770910b7 (not this round's candidate): case4 candidate: task duration 1893.98 us with every pipe near idle (aic_cube_ratio 8.8e-4, aic_mte2 1.9e-3, aiv_vec 5.9e-3, aiv_mte2 2.2e-3, aiv_scalar 1.1e-2) and Block Dim 1024. Reference FusedInferAttentionScore is 127.84 us with Block Dim 19 and real utilisation (cube 0.28, vec0 0.46, mte2 0.33). Aggregate busy time of the candidate is ~1e-2 of its runtime, i.e. the kernel is dominated by stall / serialisation latency per program wave, not by any pipe's throughput; the candidate also runs ~54x more program instances than the reference."
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "run() picks BLOCK_M, BLOCK_N = 64, 64 whenever BLOCK_D <= 128, so case4 (B=4,S=256,NQ=64,D=128) launches grid (cdiv(256,64), 4*64) = (4, 256) = 1024 programs, each with only 4 KV-block iterations of tiny 64x64x128 / 64x128x64 dots. The per-program prologue (Q tile load, index setup), causal/`-inf` where-masks, fp32 online-softmax rescale and cube<->vector syncs are therefore paid 1024 times for very little work per program."
+    },
+    {
+      "path": "workspace/ir-excerpt.txt",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "Inside the scf.for the excerpt shows memref.copy into a fresh tile followed by linalg.transpose of K, then matmuls, plus a loop-carried tensor<64x128xf32> accumulator with an arith.mulf rescale, and a truncf of the probabilities before the low-order matmul. Each iteration is a chain of small dependent ops separated by copies, consistent with roundtrip latency (not bandwidth) dominating; it also shows the acc rescale/step structure is per-iteration cost that scales with iteration count, not with BLOCK_M."
+    }
+  ],
+  "hypothesis": "case4 wall time is proportional to (number of program waves) x (per-program fixed serialised latency), not to pipe throughput. With one program resident per core and 1024 programs, the 64-row tile is too small: doubling BLOCK_M to 128 keeps the same KV iteration count per program but halves the program count (1024 -> 512 for case4) and doubles the work per dependent op, so the fixed per-program prologue/sync cost is amortised over 2x more useful cube work.",
+  "alternative_explanation": "The stall could instead be per-iteration cube<->vector sync latency that is independent of BLOCK_M, in which case only the wave count halves and the gain is smaller than 2x; and if the real limiter is UB traffic (the K copy + transpose chain in the excerpt) or if the 128x128 fp32 accumulator plus 3-term bf16 probability buffers exceed the 192KB UB, the change can regress or fail to compile. A third possibility is that fewer, larger blocks hurt load balance on the 20-core partition for the small shapes (case1/case2), which currently pass with ~1.05x / 0.89x noise-level ratios.",
+  "change": "In run(), for the BLOCK_D <= 128 path raise BLOCK_M from 64 to 128 (BLOCK_N stays 64). Pure tiling/metadata change: same kernel, same math, same output dtype; causal masking, the fully-masked-row guard and the grid formula already handle any BLOCK_M. No case-id or value-dependent branching.",
+  "expected": "case4 grid (4,256) -> (2,256): 512 programs, 2x fewer waves, each program doing 128x128 Q with 4 KV blocks of 128-row dots. Expect case4 to drop clearly below 1900 us (target ~1000-1400 us if wave-count bound); case7 grid 64 -> 32ish and case1/case2 axis0 2 -> 1 (small block counts, so those two may be flat or slightly worse; they must stay checker-passing). If it is only sync bound the change should be neutral-to-slightly-better rather than a regression.",
+  "validation": "Host runs the official checker plus one complete four-case paired evaluation (category=paired_profiling). Accept only if case4 improves beyond the <1% inconclusive band while case1/2/4/7 all still pass. If it fails to compile or case4 does not improve, revert BLOCK_M to 64 and next pursue mask-free full-tile loads (drop n_mask/d_mask and the -inf where on off-diagonal blocks when SKV%BLOCK_N==0, D==BLOCK_D) to remove the memref.copy/dynamic-extent load path seen in the IR.",
+  "unknown": [
+    "Whether the 128-row tile with P_TERMS=3 (bf16) stays inside the 192KB UB; liveness may reuse p_lo/p_lo2 slots but this is unverified without compiling.",
+    "Whether Triton-Ascend schedules one program per AI core at a time (assumed), which is what makes wave count proportional to runtime.",
+    "Whether the per-program cost is prologue-dominated or per-iteration sync-dominated; the two predict different gain magnitudes for the same edit.",
+    "No GQA-specific knowledge base entry was available; no simulator material was provided for this round, so no cycle-level claim is made."
+  ]
+}

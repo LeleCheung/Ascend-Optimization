@@ -1,0 +1,179 @@
+--- parent
+
++++ candidate
+
+@@ -118,9 +118,7 @@
+
+ def _hrow_2x_row(
+     ptr_i,
+     base,
+-    IW,
+-    j,
+-    m,
++    IW: tl.constexpr,
+     BLOCK_OW: tl.constexpr,
+ ):
+     # Horizontally bilinear-expand one source row by 2x.  For
+@@ -131,13 +129,20 @@
+
+     #   odd  columns: 0.75*cur   + 0.25*right
+     # The 1-D join/reshape interleave is kept deliberately: the batched
+     # (TILE_I, BLOCK_IW, 2) join form cannot be stride-aligned by BishengIR.
+-    x = tl.load(ptr_i + base + j, mask=m, other=0.0).to(tl.float32)
+-    has_left = j >= 1
+-    xr = tl.load(ptr_i + base + (j - 1), mask=m & has_left, other=0.0).to(tl.float32)
+-    xr = tl.where(has_left, xr, x)
+-    has_right = j < IW - 1
+-    xl = tl.load(ptr_i + base + (j + 1), mask=m & has_right, other=0.0).to(tl.float32)
+-    xl = tl.where(has_right, xl, x)
++    #
++    # IW is a compile-time constant on this path, so the column predicates
++    # below fold to constant vectors and the row loads are plain contiguous
++    # DMA.  The left neighbour is taken from a scalar-clamped base (the
++    # previous row's last element, or the row itself at the tensor start) so
++    # no load mask is needed; only the right neighbour keeps a constant mask,
++    # because it would otherwise read one element past the last row.
++    j = tl.arange(0, IW)
++    base_r = tl.maximum(base - 1, 0)
++    x = tl.load(ptr_i + base + j).to(tl.float32)
++    xr = tl.load(ptr_i + base_r + j).to(tl.float32)
++    xl = tl.load(ptr_i + base + 1 + j, mask=j < IW - 1, other=0.0).to(tl.float32)
++    xr = tl.where(j >= 1, xr, x)
++    xl = tl.where(j < IW - 1, xl, x)
+     xe = 0.25 * xr + 0.75 * x
+     xo = 0.75 * x + 0.25 * xl
+     return tl.reshape(tl.join(xe, xo), (BLOCK_OW,))
+@@ -147,13 +152,10 @@
+
+ def upsample_bilinear2d_2x_kernel(
+     ptr_o,
+     ptr_i,
+-    IW,
+-    OH,
+-    OW,
+-    IH,
+-    BLOCK_IW: tl.constexpr,
++    IH: tl.constexpr,
++    IW: tl.constexpr,
++    TILE_I: tl.constexpr,
+     BLOCK_OW: tl.constexpr,
+-    TILE_I: tl.constexpr,
+ ):
+     # One program owns TILE_I consecutive source rows of a single (n, c)
+     # plane and produces the 2*TILE_I output rows (2*i, 2*i+1) they drive.
+@@ -162,58 +164,53 @@
+
+     # per-program cost over TILE_I rows.
+     #
+     # The row loop is a dynamic device loop, not an unrolled static range:
+-    # unrolling emitted 16 copies of the whole per-row body (3 loads + 2
+-    # stores + ~20 vector ops each, ~1000 IR lines of straight-line code) and
+-    # the measured per-program icache miss rate and scalar wait-on-instruction
+-    # -buffer time were over 100x the reference, i.e. the program was
+-    # refetching its own instructions.  Emitting the body once keeps the
+-    # identical loads, stores and weights while shrinking the code by ~16x.
++    # unrolling emitted 16 copies of the whole per-row body and the measured
++    # per-program icache miss rate and scalar wait-on-instruction-buffer time
++    # were over 100x the reference, i.e. the program was refetching its own
++    # instructions.  Emitting the body once keeps the identical loads, stores
++    # and weights while shrinking the code by ~16x.
+     #
+     # The horizontally expanded row of a source row is shared by the output
+     # rows above and below it, so the row loop keeps a two-row rolling window
+     # (e_prev = expand(i-1), e_cur = expand(i)) and only expands the newly
+     # needed row i+1 per step.  That is 3 loads per source row instead of the
+-    # previous 9, without changing any weight or mask semantics.
++    # previous 9.
++    #
++    # Geometry is fully compile-time on this path: IH/IW/TILE_I are constexpr
++    # and the grid is exact (IH % TILE_I == 0), so every store is an unmasked
++    # contiguous span and no per-iteration mask or bound compare is emitted.
+     pid_i = tl.program_id(axis=0)
+     plane = tl.program_id(axis=1)
+ 
+-    j = tl.arange(0, BLOCK_IW)
+-    m = j < IW
+     ow = tl.arange(0, BLOCK_OW)
+-    store_w = ow < OW
+ 
+     in_plane = plane * (IH * IW)
+-    out_plane = plane * (OH * OW)
++    out_plane = plane * (IH * IW * 4)
+ 
+     i0 = pid_i * TILE_I
+     # Clamp the halo rows exactly like the general kernel: the top source row
+-    # is its own upper neighbour and the bottom row is its own lower.  Clamping
+-    # the indices also keeps tail programs (i0 >= IH) from forming out-of-range
+-    # pointers, so the loads need no row mask.
++    # is its own upper neighbour and the bottom row is its own lower.
+     iu0 = tl.maximum(i0 - 1, 0)
+     ic0 = tl.minimum(i0, IH - 1)
+-    e_prev = _hrow_2x_row(ptr_i, in_plane + iu0 * IW, IW, j, m, BLOCK_OW)
+-    e_cur = _hrow_2x_row(ptr_i, in_plane + ic0 * IW, IW, j, m, BLOCK_OW)
++    e_prev = _hrow_2x_row(ptr_i, in_plane + iu0 * IW, IW, BLOCK_OW)
++    e_cur = _hrow_2x_row(ptr_i, in_plane + ic0 * IW, IW, BLOCK_OW)
+ 
+     for k in tl.range(0, TILE_I):
+         i = i0 + k
+         idn = tl.minimum(i + 1, IH - 1)
+-        e_next = _hrow_2x_row(ptr_i, in_plane + idn * IW, IW, j, m, BLOCK_OW)
++        e_next = _hrow_2x_row(ptr_i, in_plane + idn * IW, IW, BLOCK_OW)
+ 
+         out_even = 0.25 * e_prev + 0.75 * e_cur
+         out_odd = 0.75 * e_cur + 0.25 * e_next
+ 
+-        out_base = out_plane + (2 * i) * OW
+-        store_ok = store_w & (i < IH)
++        out_base = out_plane + (2 * i) * (2 * IW)
+         tl.store(
+             ptr_o + out_base + ow,
+             out_even.to(ptr_o.dtype.element_ty),
+-            mask=store_ok,
+         )
+         tl.store(
+-            ptr_o + out_base + OW + ow,
++            ptr_o + out_base + 2 * IW + ow,
+             out_odd.to(ptr_o.dtype.element_ty),
+-            mask=store_ok,
+         )
+ 
+         e_prev = e_cur
+@@ -267,26 +264,25 @@
+
+         and OW == 2 * IW
+         and reciprocal_scale_h == 0.5
+         and reciprocal_scale_w == 0.5
+-        and BLOCK_IW <= 4096
++        and IW == BLOCK_IW
++        and 2 <= IW <= 4096
+     )
+     if is_exact_2x:
+         # One program per row tile: the per-program fixed DMA/launch latency of
+         # the old one-row-per-program grid (IH*N*C programs) dominated its
+-        # runtime.  The tile is capped by the UB budget for the fp32 working
+-        # set and by the source height.
++        # runtime.  TILE_I is a divisor of the source height so the grid is
++        # exact and the row stores need no mask; the geometry is passed as
++        # constexpr so the column predicates fold away as well.
+         tile_i = 16
+-        tile_i = min(tile_i, max(1, 8192 // BLOCK_IW))
+-        tile_i = min(tile_i, triton.next_power_of_2(max(IH, 1)))
+-        upsample_bilinear2d_2x_kernel[(triton.cdiv(IH, tile_i), N * C)](
++        while tile_i > 1 and IH % tile_i != 0:
++            tile_i //= 2
++        upsample_bilinear2d_2x_kernel[(IH // tile_i, N * C)](
+             output,
+             input,
+-            IW,
+-            OH,
+-            OW,
+-            IH,
+-            BLOCK_IW=BLOCK_IW,
+-            BLOCK_OW=2 * BLOCK_IW,
++            IH=IH,
++            IW=IW,
+             TILE_I=tile_i,
++            BLOCK_OW=2 * IW,
+         )
+         return output
+ 

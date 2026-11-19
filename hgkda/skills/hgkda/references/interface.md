@@ -7,6 +7,7 @@
     python -m hgkda context --operator expm1_ --source examples/paired-expm1/candidate.py --comparison /tmp/comparison.json --output /tmp/context.json
     python -m hgkda hotspots --listing examples/matmul-instructions/listing.json --source examples/matmul-instructions/candidate.py
     python -m hgkda regions --listing examples/matmul-instructions/listing.json --source-map examples/matmul-instructions/source-map.json
+    python -m hgkda timeline --listing <listing.json> --trace <raw-trace.json> --binding <binding.json> --output <relative-timeline.json>
     python -m hgkda knowledge --operator expm1_
 
 Windows 将 /tmp/ 换成项目外的新输出目录。每次输出使用新文件名。
@@ -20,6 +21,10 @@ context 的 facts 保存对照、源码/IR、Roofline、热点和区域；hypoth
 将结果通过`context --listing <listing.json> --regions <regions.json>`与相同源码、case的成对对照及实际IR一起交给模型。`idle`表示窗口内未观察到该流水执行，不等同已证实的阻塞原因或关键路径；模型须提出具体机制和验证预期。
 
 roofline --input <json> 接受已核验的 GEMM 工作量、同次采集指标和同环境经验参考：facts、shape（M,N,K）、dtype、empirical，并保留 source_sha256 与 case。缺少工作量合同时使用成对 profiling，不用估计值填补未知字段。
+
+## 窗口归一化流水分析
+
+`timeline`提供窗口归一化分析，适用于同核trace已有公共时间轴、绝对时间单位尚待独立核验的情况。`binding.json`须声明`source_sha256`、`case`、`kernel`、`core`和`raw_trace_sha256`，与原始文件及指令清单核对。输出`time_unit=fraction`、`clock_qualification=relative_only`和`absolute_time_qualified=false`；窗口范围为0至1，比例不受公共时钟的正比例缩放影响。按每条硬件流水统计执行、显式WAIT/BAR等待和可观测空闲，三者覆盖同一窗口。有元数据但无事件的硬件泳道保留空闲统计，未报告的泳道保持未知。部分采集边界、绝对单位核验问题及因果限制继续保留；归一化结果经`context --regions`提供给模型，绝对耗时另行核验。
 
 ## 知识整理
 

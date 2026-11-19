@@ -1,0 +1,54 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "6de74451513318550228ddbf6e57ea07cf898312d11bc857ba04a29b2a51452e",
+  "evidence": [
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "All 24 formal cases (18 correctness + 6 timing) failed as RUNTIME_ERROR at module load: loader BuildError 'candidate defines conflicting public symbol upsample_bilinear2d'. No case reached device execution, so no latency or speedup exists for this source."
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "other",
+      "role": "mechanism",
+      "finding": "The module exposes two public callables: an implementation named upsample_bilinear2d (identical to the operator/definition name in contract.json) and run, which forwards to it. The binding step rejects the module-level public symbol that collides with the operator definition name before binding the run entrypoint."
+    },
+    {
+      "path": "workspace/latest-preflight.json",
+      "category": "probe",
+      "role": "disambiguation",
+      "finding": "Preflight on the same source passed with 30/30 supplementary cases, so the Triton kernel compiles and the run path is numerically correct; the formal failure is at loader symbol binding, not in kernel source, compile or launch."
+    },
+    {
+      "path": "workspace/current-ir/6de744515133/0-kernel.ttir",
+      "category": "source_ir",
+      "role": "background",
+      "finding": "IR recorded for the current source SHA contains 21 compiled kernel variants (e.g. 16x32 tiles) with four unmasked f16 loads, f32 interpolation and one masked f16 store; compilation of the kernel itself is proven, so the repair needs no compile-level change."
+    },
+    {
+      "path": "workspace/task.json",
+      "category": "knowledge",
+      "role": "background",
+      "finding": "public_entrypoint is fixed as run(input,output_size,align_corners=False,scales_h=None,scales_w=None); the contract definition name is upsample_bilinear2d and must not be re-declared as a public callable in the candidate module."
+    }
+  ],
+  "hypothesis": "The formal harness binds the candidate entrypoint from the module namespace and refuses a module that also defines a public symbol equal to the operator definition name (upsample_bilinear2d). Keeping only run public, with the implementation demoted to a private helper, removes the binding conflict without changing kernel semantics.",
+  "alternatives": [
+    "The loader requires the operator-named function and rejects run as the conflicting symbol: contradicted by task.json fixing public_entrypoint=run(...) and by preflight executing the run path successfully.",
+    "The failure is a Triton compile error: contradicted by latest-preflight passing 30/30 supplementary cases and by existing per-shape IR for this exact source SHA.",
+    "The failure is a numerical discrepancy: contradicted by the same preflight pass; the traceback stops in the loader binding step before any device work."
+  ],
+  "discriminating_observation": "The traceback ends in the loader public-symbol binding step with a BuildError naming upsample_bilinear2d as a conflicting public symbol, while the same bytes pass preflight, produce IR and pass 30/30 supplementary checks. That isolates the fault to the module namespace shape (an extra public callable named after the operator), not to kernel code or numerics.",
+  "change": "Compatibility-only edit: rename the public implementation upsample_bilinear2d to a private _upsample_bilinear2d_impl (and helper bilinear_reciprocal_scale to _bilinear_reciprocal_scale), leaving run as the single public entrypoint. Kernel body, grid, block sizes and launch arguments are unchanged, so this call claims no performance change.",
+  "expected": "Module imports and the loader binds run; all 24 formal cases execute on device instead of raising BuildError at load. Latency and speedup for upsample_bilinear2d-timing-1 become measurable and should be close to the unchanged-kernel behavior of source 6de7445151; correctness stays equal to the already-passing 30/30 supplementary set.",
+  "validation": "Run preflight on the edited candidate (expect pass, 30/30 supplementary), then let the host run the single full KGS formal evaluation and read per-case latency and speedup from that formal result before proposing any performance mechanism.",
+  "selected_layer": "compatibility",
+  "layer_reason": "The reported failure is a module-namespace/loader-binding problem at import time, upstream of any Triton or IR transformation. No kernel semantics, tile shape or launch configuration is touched, so no Triton or IR layer change is justified yet.",
+  "simulator_incremental_judgment": "Control arm: no simulator evidence was requested or used, and none is needed because the blocking error is a host-side symbol binding visible in the formal result log.",
+  "unknown": [
+    "The exact loader rule (forbids any public name equal to the definition name, or requires exactly one public callable) is inferred from the error text; the minimal rename satisfies both readings.",
+    "Whether the harness calls the entrypoint strictly positionally or also by keyword (the definition allows both); the signature is preserved either way.",
+    "Actual timing of this kernel versus the fixed starter on upsample_bilinear2d-timing-1 is still unmeasured because no formal case has yet executed to completion."
+  ]
+}
