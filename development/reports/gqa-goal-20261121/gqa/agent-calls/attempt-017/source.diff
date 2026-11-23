@@ -1,0 +1,167 @@
+--- 
++++ 
+@@ -98,6 +98,92 @@
+ 
+ 
+ @triton.jit
++def _gqa_persist_kv_body(
++    Q, K, V, Out,
++    q_sb: tl.constexpr, q_ss: tl.constexpr, q_sh: tl.constexpr, q_sd: tl.constexpr,
++    k_sb: tl.constexpr, k_ss: tl.constexpr, k_sh: tl.constexpr, k_sd: tl.constexpr,
++    v_sb: tl.constexpr, v_ss: tl.constexpr, v_sh: tl.constexpr, v_sd: tl.constexpr,
++    o_sb: tl.constexpr, o_ss: tl.constexpr, o_sh: tl.constexpr, o_sd: tl.constexpr,
++    S: tl.constexpr, SKV: tl.constexpr, D: tl.constexpr,
++    NQ: tl.constexpr, G: tl.constexpr, NKV: tl.constexpr,
++    qk_scale: tl.constexpr, delta: tl.constexpr,
++    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
++    MASK_MD: tl.constexpr, MASK_KV: tl.constexpr,
++    NB_M: tl.constexpr,
++):
++    """每 (batch, 共享 KV 头) 一程序的持久化复用体。
++
++    程序先一次性载入该 KV 头的整段 K，并把 V 一次性转换成 fp16，二者都放在
++    query-tile 循环之外；随后按 G 个 query head × NB_M 个行块遍历本程序拥有的
++    全部 query tile。逐 tile 的 QK、FP32 softmax、单次 fp16 PV 与归一化写出
++    表达式与通用路径逐字一致，只有 K/V 的载入与转换从每 tile 一次降为每程序一次。
++    hq = kvh*G + gi 与行块 mb 是本程序的显式坐标，对 (b,hq,row-block) 的写出所有权唯一。
++    """
++    pid = tl.program_id(0)
++    b = pid // NKV
++    kvh = pid % NKV
++
++    offs_d = tl.arange(0, BLOCK_D)
++    offs_n = tl.arange(0, BLOCK_N)
++
++    k_base = K + b * k_sb + kvh * k_sh
++    v_base = V + b * v_sb + kvh * v_sh
++
++    # 循环外：整段 K 载入一次。
++    k_ptrs = k_base + offs_n[:, None] * k_ss + offs_d[None, :] * k_sd
++    if MASK_KV:
++        kv_mask = (offs_n[:, None] < SKV) & (offs_d[None, :] < D)
++        k = tl.load(k_ptrs, mask=kv_mask, other=0.0)
++    else:
++        k = tl.load(k_ptrs)
++
++    # 循环外：整段 V 载入一次并转换为 fp16（bf16→f16 的取值与逐 tile 内联转换相同）。
++    v_ptrs = v_base + offs_n[:, None] * v_ss + offs_d[None, :] * v_sd
++    if MASK_KV:
++        v = tl.load(v_ptrs, mask=kv_mask, other=0.0)
++    else:
++        v = tl.load(v_ptrs)
++    v16 = v.to(tl.float16)
++
++    # 扁平遍历 G*NB_M 个 query tile；显式坐标保证每个 (hq, mb) 只写一次。
++    for t in range(0, G * NB_M):
++        gi = t // NB_M
++        mb = t % NB_M
++        hq = kvh * G + gi
++        offs_m = mb * BLOCK_M + tl.arange(0, BLOCK_M)
++
++        q_ptrs = Q + b * q_sb + hq * q_sh + offs_m[:, None] * q_ss + offs_d[None, :] * q_sd
++        if MASK_MD:
++            q = tl.load(q_ptrs, mask=(offs_m[:, None] < S) & (offs_d[None, :] < D), other=0.0)
++        else:
++            q = tl.load(q_ptrs)
++
++        qk = tl.dot(q, tl.trans(k)) * qk_scale
++
++        if MASK_KV:
++            qk = tl.where(offs_n[None, :] < SKV, qk, -float("inf"))
++
++        # SINGLE_KV 无 online 重缩放：表达式与通用路径的 SINGLE_KV 分支一致。
++        m_safe = tl.max(qk, 1)
++        m_safe = tl.where(m_safe > -float("inf"), m_safe, 0.0)
++        p = tl.exp2(qk - m_safe[:, None])
++        l_new = tl.sum(p, 1)
++
++        acc = tl.dot(p.to(tl.float16), v16)
++
++        l_safe = tl.where(l_new > 0.0, l_new, 1.0)
++        out = acc / l_safe[:, None]
++        out = tl.where(l_new[:, None] > 0.0, out, 0.0)
++
++        o_ptrs = Out + b * o_sb + hq * o_sh + offs_m[:, None] * o_ss + offs_d[None, :] * o_sd
++        if MASK_MD:
++            tl.store(o_ptrs, out.to(Out.dtype.element_ty),
++                     mask=(offs_m[:, None] < S) & (offs_d[None, :] < D))
++        else:
++            tl.store(o_ptrs, out.to(Out.dtype.element_ty))
++
++
++@triton.jit
+ def _gqa_fwd_kernel(
+     Q, K, V, Out,
+     q_sb: tl.constexpr, q_ss: tl.constexpr, q_sh: tl.constexpr, q_sd: tl.constexpr,
+@@ -105,7 +191,7 @@
+     v_sb: tl.constexpr, v_ss: tl.constexpr, v_sh: tl.constexpr, v_sd: tl.constexpr,
+     o_sb: tl.constexpr, o_ss: tl.constexpr, o_sh: tl.constexpr, o_sd: tl.constexpr,
+     S: tl.constexpr, SKV: tl.constexpr, D: tl.constexpr,
+-    NQ: tl.constexpr, G: tl.constexpr,
++    NQ: tl.constexpr, G: tl.constexpr, NKV: tl.constexpr,
+     qk_scale: tl.constexpr, delta: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+@@ -115,7 +201,28 @@
+     MASK_KV: tl.constexpr,
+     PV_SINGLE_F16: tl.constexpr,
+     SINGLE_KV: tl.constexpr,
++    PERSIST_KV: tl.constexpr,
++    NB_M: tl.constexpr,
+ ):
++    # 本轮机制：每 (batch, 共享 KV 头) 一程序的持久复用分支。仅在
++    # BF16 非因果 SINGLE_KV D128 的原 128/256 分块下启用（见 run()），
++    # 此时把 K/V 的载入与 V 的 f16 转换提升到 query-tile 循环外。
++    # 其余元数据走下面的原实现，算术与 grid 逐字不变。
++    if PERSIST_KV:
++        _gqa_persist_kv_body(
++            Q, K, V, Out,
++            q_sb, q_ss, q_sh, q_sd,
++            k_sb, k_ss, k_sh, k_sd,
++            v_sb, v_ss, v_sh, v_sd,
++            o_sb, o_ss, o_sh, o_sd,
++            S=S, SKV=SKV, D=D, NQ=NQ, G=G, NKV=NKV,
++            qk_scale=qk_scale, delta=delta,
++            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
++            MASK_MD=MASK_MD, MASK_KV=MASK_KV,
++            NB_M=NB_M,
++        )
++        return
++
+     pid_m = tl.program_id(0)
+     pid_bh = tl.program_id(1)
+ 
+@@ -356,20 +463,31 @@
+     # SKV==BLOCK_N 的既有形状（如 case2）该路径与原来的 alpha=0 算术逐项等价。
+     SINGLE_KV = (not is_causal) and (BLOCK_N == SKV)
+ 
+-    grid = (triton.cdiv(S, BLOCK_M), B * NQ)
++    # 持久 KV 复用判据：只用元数据（dtype、causal、SINGLE_KV、分块），不读输入值、
++    # 不按 case_id 选路。命中时 grid 由 (行块, b×hq) 改为 (b×kvh)，每程序循环其
++    # G 个 query head 与 NB_M 个行块；K/V 载入与 V 转换在循环外只付一次。
++    NB_M = triton.cdiv(S, BLOCK_M)
++    PERSIST_KV = ((not is_causal) and PV_SINGLE_F16 and SINGLE_KV
++                  and BLOCK_M == 128 and BLOCK_N == 256 and BLOCK_D == 128)
++    if PERSIST_KV:
++        grid = (B * NKV,)
++    else:
++        grid = (triton.cdiv(S, BLOCK_M), B * NQ)
+     _gqa_fwd_kernel[grid](
+         query, key, value, y,
+         query.stride(0), query.stride(1), query.stride(2), query.stride(3),
+         key.stride(0), key.stride(1), key.stride(2), key.stride(3),
+         value.stride(0), value.stride(1), value.stride(2), value.stride(3),
+         y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+-        S=S, SKV=SKV, D=D, NQ=NQ, G=G,
++        S=S, SKV=SKV, D=D, NQ=NQ, G=G, NKV=NKV,
+         qk_scale=qk_scale, delta=SKV - S,
+         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+         IS_CAUSAL=bool(is_causal),
+         MASK_MD=MASK_MD, MASK_KV=MASK_KV,
+         PV_SINGLE_F16=PV_SINGLE_F16,
+         SINGLE_KV=SINGLE_KV,
++        PERSIST_KV=PERSIST_KV,
++        NB_M=NB_M,
+         num_warps=1, num_stages=1,
+     )
+     return y

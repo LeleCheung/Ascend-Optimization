@@ -1,0 +1,175 @@
+--- 
++++ 
+@@ -99,6 +99,25 @@
+ (causal fp16, non-causal fp16, and any shape where the KV span is not one
+ BLOCK_N block) keeps the two-term expression and its summation order verbatim.
+ 
++Head-major FP16 V scratch (this round's isolated experiment): on the same
++bf16 non-causal SINGLE_KV path the retained scratch kept the original BSND
++interleaving, and the actual BCMLIR shows the main kernel loading V as
++memref<256x128xf16, strided<[1024,1]>>, i.e. each 256-element row of a KV head
++is separated from the next by the other NKV-1 heads, so only 256B can be moved
++contiguously at a time. The one-shot preprocessing now writes physically
++contiguous [B,NKV,SKV,D] fp16 instead: each program selects batch and head as
++scalars and its vector axes are only the sequence-row and channel tiles, so the
++read side stays an affine 2-D load with the original strides (no per-element
++head gather), and every element is written exactly once. The main kernel's
++logical strides become v_ss=128, v_sh=32768 for case4, so its V copy row span
++drops from 1024 to 128. Q/K, the M128/N256 tiling, the probability expression,
++the PV precision split and the output store are unchanged; the bf16->f32->f16
++rounding per element is identical, so the PV operand bits are unchanged. Cost:
++the same ~2MiB read + 2MiB write as the previous flat scratch, but the read is
++now 256B rows with a 2048B stride instead of fully contiguous; one allocation
++and one extra launch remain. Non-contiguous V and every other path keep the
++012 flat/strided BSND scratch.
++
+ Compile-time geometry specialisation (earlier, retained mechanism): shape, stride,
+ head counts, scale and the causal offset are passed as tl.constexpr, because
+ they are legal input *metadata*, never input values.  The actual TTIR showed
+@@ -178,6 +197,42 @@
+     mask = offs < N
+     v = tl.load(V + offs, mask=mask, other=0.0)
+     tl.store(Vs + offs, v.to(tl.float32).to(tl.float16), mask=mask)
++
++
++@triton.jit
++def _gqa_v_cast_f16_headmajor_kernel(
++    V, Vs,
++    v_sb: tl.constexpr, v_ss: tl.constexpr, v_sh: tl.constexpr, v_sd: tl.constexpr,
++    SKV: tl.constexpr, D: tl.constexpr, NKV: tl.constexpr,
++    BLOCK_R: tl.constexpr, BLOCK_D: tl.constexpr,
++):
++    """把连续 BSND 原 V 一次性转成每头物理连续的 [B,NKV,SKV,D] fp16 scratch。
++
++    本轮机制：主 kernel 的实际 BCMLIR 把 V 重解释为
++    memref<256x128xf16, strided<[1024,1]>> 再 memref.copy，行跨度 1024 元素
++    意味着同一 KV 头的 256 行被其余头的 128 元素行隔开，每次只能连续搬 256B。
++    这里改为按头集中：program 标量 pid_h = b*NKV + h 只做一次整除/取模，向量轴
++    只有序列行块 offs_j 与通道 offs_d 两个仿射轴，读端没有逐元素 head/div/mod
++    gather；按原 V 真实 stride（批 v_sb、行 v_ss、头 v_sh、通道 v_sd）载入
++    [BLOCK_R, BLOCK_D] 瓦片，唯一写到 head-major 连续 scratch
++    (pid_h*SKV + j)*D + d。每个输出元素恰好由一个 program 的一条通道写一次，
++    掩码只处理尾部边界。
++    """
++    pid_r = tl.program_id(0)
++    pid_h = tl.program_id(1)
++    b = pid_h // NKV
++    h = pid_h % NKV
++
++    offs_j = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
++    offs_d = tl.arange(0, BLOCK_D)
++    mask = (offs_j[:, None] < SKV) & (offs_d[None, :] < D)
++
++    src = (V + b * v_sb + h * v_sh
++           + offs_j[:, None] * v_ss + offs_d[None, :] * v_sd)
++    v = tl.load(src, mask=mask, other=0.0)
++    dst = Vs + pid_h * (SKV * D) + offs_j[:, None] * D + offs_d[None, :]
++    # 与主 kernel 原路径同为 bf16→f32→f16（两次显式舍入），逐元素位型与父版本一致。
++    tl.store(dst, v.to(tl.float32).to(tl.float16), mask=mask)
+ 
+ 
+ @triton.jit
+@@ -457,45 +512,74 @@
+     # <=3e-8），|v|>65504 会溢出——超出合同 [-1,1] 输入域，仅记录为范围限制。
+     # 选路只用 V 的 dtype 元数据与编译期分块，不读输入值、不看 case_id。
+     V_ARG = value
++    # 传给主 kernel 的逻辑 V stride（按 BSND 语义：批/序列/头/通道）。
++    v_sb = value.stride(0)
++    v_ss = value.stride(1)
++    v_sh = value.stride(2)
++    v_sd = value.stride(3)
+     if PV_SINGLE_F16 and SINGLE_KV:
+-        C = NKV * D
+-        # UB 预算：每元素约 2B(bf16 入) + 4B(fp32 中间) + 2B(f16 出)，16K
+-        # 元素的 tile 约 128KB，仍在 196608B 以内；列块取 2 的幂以让内核里的
+-        # C//D、C%D 编译期折叠。
+-        BLOCK_C = min(2048, triton.next_power_of_2(C))
+-        BLOCK_R = max(1, 16384 // BLOCK_C)
+-        v16 = torch.empty((B, SKV, NKV, D), dtype=torch.float16, device=value.device)
+-        # 连续输入快路径：原 V 物理展平与连续 scratch 一一对应，用一维线性索引
+-        # 让读端成为连续块搬运（消除原二维 (//D,%D) 地址导致的逐元素标量
+-        # gather）。仅依据连续性元数据选路，不读输入值、不看 case_id；非连续
+-        # 输入仍走原二维 strided kernel。两条路径产出的 scratch 形状与逐元素
+-        # bf16→f32→f16 位型完全相同，主 kernel 实参不变。
+-        if value.is_contiguous():
+-            N = v16.numel()
+-            BLOCK_FLAT = 16384
+-            _gqa_v_cast_f16_flat_kernel[(triton.cdiv(N, BLOCK_FLAT),)](
+-                value, v16, N,
+-                BLOCK=BLOCK_FLAT,
++        BD = triton.next_power_of_2(D)
++        if value.is_contiguous() and D == BD:
++            # 本轮机制（head-major FP16 V scratch，仅连续 BF16 非因果单块路径）：
++            # 主 kernel 的 BCMLIR 显示 V 取块为 strided<[1024,1]>（同一 KV 头
++            # 的行被其余 NKV-1 个头隔开，256x128 只能按 256B 行搬）。这里改为
++            # head-major 物理布局 [B,NKV,SKV,D]：主 kernel 行跨度由 1024 变 128，
++            # 同一头的 SKVxD 成为整块连续（case4 为 64KiB）。预处理每个元素仍只
++            # 转一次，program 标量选 batch/head，向量轴仅序列/通道两个仿射轴，
++            # 无逐元素 head/div/mod gather。代价：读端由完全连续变为每 256B 行
++            # 跨 2048B（写出仍连续），总读写元素数与 012 flat 相同。
++            # 选路只用连续性、dtype 与编译期分块元数据，不读输入值、不看 case_id。
++            v16 = torch.empty((B, NKV, SKV, D), dtype=torch.float16, device=value.device)
++            # UB 预算：每元素约 2B(bf16 入) + 4B(fp32 中间) + 2B(f16 出)；
++            # 每 tile 8192 元素约 64KiB，SKV=256 时 case4 得 128 个 program。
++            BLOCK_R = max(1, min(SKV, 8192 // BD))
++            _gqa_v_cast_f16_headmajor_kernel[(triton.cdiv(SKV, BLOCK_R), B * NKV)](
++                value, v16,
++                value.stride(0), value.stride(1), value.stride(2), value.stride(3),
++                SKV=SKV, D=D, NKV=NKV,
++                BLOCK_R=BLOCK_R, BLOCK_D=BD,
+                 num_warps=1, num_stages=1,
+             )
++            V_ARG = v16
++            # 逻辑 BSND stride 映射到 head-major 物理缓冲。
++            v_sb, v_ss, v_sh, v_sd = v16.stride(0), v16.stride(2), v16.stride(1), v16.stride(3)
+         else:
+-            _gqa_v_cast_f16_kernel[(triton.cdiv(C, BLOCK_C),
+-                                    triton.cdiv(SKV, BLOCK_R), B)](
+-                value, v16,
+-                value.stride(0), value.stride(1), value.stride(2), value.stride(3),
+-                v16.stride(0), v16.stride(1),
+-                SKV=SKV, C=C, D=D,
+-                BLOCK_R=BLOCK_R, BLOCK_C=BLOCK_C,
+-                num_warps=1, num_stages=1,
+-            )
+-        V_ARG = v16
++            C = NKV * D
++            # UB 预算：每元素约 2B(bf16 入) + 4B(fp32 中间) + 2B(f16 出)，16K
++            # 元素的 tile 约 128KB，仍在 196608B 以内；列块取 2 的幂以让内核里的
++            # C//D、C%D 编译期折叠。
++            BLOCK_C = min(2048, triton.next_power_of_2(C))
++            BLOCK_R = max(1, 16384 // BLOCK_C)
++            v16 = torch.empty((B, SKV, NKV, D), dtype=torch.float16, device=value.device)
++            # 保留路径：非连续输入仍走原二维 strided kernel；连续但 D 非 2 的幂
++            # （不满足 head-major 的通道瓦片条件）仍走原一维 flat kernel。
++            if value.is_contiguous():
++                N = v16.numel()
++                BLOCK_FLAT = 16384
++                _gqa_v_cast_f16_flat_kernel[(triton.cdiv(N, BLOCK_FLAT),)](
++                    value, v16, N,
++                    BLOCK=BLOCK_FLAT,
++                    num_warps=1, num_stages=1,
++                )
++            else:
++                _gqa_v_cast_f16_kernel[(triton.cdiv(C, BLOCK_C),
++                                        triton.cdiv(SKV, BLOCK_R), B)](
++                    value, v16,
++                    value.stride(0), value.stride(1), value.stride(2), value.stride(3),
++                    v16.stride(0), v16.stride(1),
++                    SKV=SKV, C=C, D=D,
++                    BLOCK_R=BLOCK_R, BLOCK_C=BLOCK_C,
++                    num_warps=1, num_stages=1,
++                )
++            V_ARG = v16
++            v_sb, v_ss, v_sh, v_sd = (v16.stride(0), v16.stride(1), v16.stride(2), v16.stride(3))
+ 
+     grid = (triton.cdiv(S, BLOCK_M), B * NQ)
+     _gqa_fwd_kernel[grid](
+         query, key, V_ARG, y,
+         query.stride(0), query.stride(1), query.stride(2), query.stride(3),
+         key.stride(0), key.stride(1), key.stride(2), key.stride(3),
+-        V_ARG.stride(0), V_ARG.stride(1), V_ARG.stride(2), V_ARG.stride(3),
++        v_sb, v_ss, v_sh, v_sd,
+         y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+         S=S, SKV=SKV, D=D, NQ=NQ, G=G,
+         qk_scale=qk_scale, delta=SKV - S,

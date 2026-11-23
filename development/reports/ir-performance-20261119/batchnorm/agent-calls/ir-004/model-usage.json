@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 47,
+    "duration_ms": 228197,
+    "usage": {
+      "input_tokens": 57094,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1901312,
+      "output_tokens": 36431,
+      "output_tokens_details": {
+        "thinking_tokens": 24710
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 57094,
+        "outputTokens": 36431,
+        "cacheReadInputTokens": 1901312,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 2.1469009999999993,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 24710,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 2.1469009999999993,
+    "result": "已完成本次单算子 IR 续接交接（awaiting_ir_review），文件保持不变等待宿主审查。\n\n## 读取的材料\n`context.json`、`profiling.json`（候选 47.360947us / Block Dim 64，参考侧 BatchNormV3 22.12us+Add 1.74us+Rsqrt 2.50us，对标线 0.04491291751488147ms）、`hotspots.json`（窗口 9.371994567918591us：VECTOR active 0.8969/productive 0.6410/wait_only 0.2559、MTE2 active 0.8855/productive 0.7759、event 116 与 552）、`timeline.json`（`relative_only`、`absolute_time_qualified=false`）、`ir-inventory.json`、`lowered-inventory.json`（三个冻结低层条目，唯一可写面为 TTIR）、`feedback.json` + `failed-lowering-ir003.json`（UB 1310720B vs 196608B）、`codex-brief.json`、实际 `ir/…ttir` 与 `compiled-readonly/…bcmlir`、`frozen.py`。\n\n## 诊断（已写入 diagnosis.json，决策桥 decision_recorded）\n- **选层**：single_operator_ir。\n- **机制**：归一化/输出通道 tile 宽度 8x128 → 8x256，用运行时守卫 `remsi(spatial_dim,256)==0` 分流；假分支**逐字节保留**原 8x128 循环。\n- **证据链**：bcmlir 显示输出通道每 tile 一次 `memref.copy(8x128)` + 4 个张量算子 + 3 个 `linalg.fill`，而 mean 的 fill 已在循环外（证明后端保留外提、循环内广播不被消除）；地址张量被折叠，UB 只承载数据缓冲 → 加宽只增数据缓冲，避开 ir-003 的 1.31MB 累加器溢出。simulator 显示 VECTOR/MTE2 同时 ~89% 占用、边界同步事件多，故按“减少轮次/同步事件/DMA 命令数”做预测，而不是按循环数换算加速比；绝对时钟资质按 relative_only 处理，不把窗口与 47.36us 相减。\n- **未改**：统计 Welford 通道、两次 `tt.reduce`、running-stats 更新、weight/bias 空指针 scf.if、函数签名/ABI、常量 8/128/EVEN、源码与低层产物全部冻结。算术顺序 `subf → mulf(weight) → mulf(inv_std) → addf(bias)` 逐项一致。\n- **可测预测**：真分支轮次 32→16、MTE2 搬移 33→17 次/通道、事件数约 116→60–70、窗口相对下降 10–20%；是否超过当前最佳由宿主完整评测判定。\n- **备选（留给后续轮）**：循环内 3 个不变量 splat 外提（bcmlir 已证实每轮 3 个 fill）、消除末尾重复搬入最后一 tile 的 ~3% 冗余、8x512 加宽。"
+  }
+}

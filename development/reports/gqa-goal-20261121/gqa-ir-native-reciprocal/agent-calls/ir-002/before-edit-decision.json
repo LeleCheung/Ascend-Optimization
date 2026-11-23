@@ -1,0 +1,262 @@
+{
+  "timestamp": "2026-11-21T17:42:06.438157+00:00",
+  "diagnosis": {
+    "source_sha256": "98c755709dd428d0955bfc11a666b679f5afdc412ecb441e1c094568a3805661",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "ir/target.hivm.mlir",
+        "category": "source_ir",
+        "role": "本次可编辑的实际导出HIVM（IR001后端输出）中行归一化的完整倒数表达",
+        "finding": "第424-425行把标量1.0经broadcast_scalar_float_to_1d写入UB偏移114688的%58（64xf32）；第427-432行vdiv_1d_float以%58为分子、collapse_shape_38（分母den，UB偏移180224）为分母，就地写回%58，临时参数为memref<0xf32>空memref；第440-462行为单步Newton（vmul den*r0、vmuls -1、vadds 2、vmul r0*(2-den*r0)）写回114688；第471/462行保留输出乘法与2D广播。整段与分解前IR的vrec+Newton结构逐一对应。"
+      },
+      {
+        "path": "ir/target.hivm.mlir",
+        "category": "source_ir",
+        "role": "一元库调用的实际ABI样本",
+        "finding": "第253行声明vexp_1d_float为三个memref参数；第371行实际调用vexp_1d_float(src=16384xf32, dst=16384xf32, tmp=memref<0xf32>)，第250-255行vcast/load/store的自然序也先src后dst；二元库调用（第432行vdiv、第440行vmul）为src0,src1,dst,tmp四参。由此一元原生调用的参数序为src,dst,tmp_buf，且tmp_buf为rank-1空memref。"
+      },
+      {
+        "path": "compiled-readonly/vrec-before-decompose.mlir",
+        "category": "source_ir",
+        "role": "分解前的原始HIVM形态（vrec原生形态的直接证据）",
+        "finding": "第207-218行：vreduce<sum>出den(%alloc_10 64x1xf32)，第209行hivm.hir.vrec ins(%collapse_shape) outs(%alloc_11)落地到与den独立的缓冲区，随后vmul(den,r0)→vmul(*-1)→vadd(+2)→vmul(r0,·)→expand→vmul广播。当前目标文件的缓冲分配（%58=114688、den=180224）与该形态一致。"
+      },
+      {
+        "path": "compiled-readonly/vrec-after-decompose.mlir",
+        "category": "source_ir",
+        "role": "HIVMDecomposeOp重写结果",
+        "finding": "第210-211行把vrec替换为vbrc(1.0)写%alloc_12再vdiv(%alloc_12,den)就地写%alloc_12；该1.0填充仅服务这个除数分子，后续无其他读者。"
+      },
+      {
+        "path": "native-lowering-review.json",
+        "category": "source_ir",
+        "role": "IR001 各阶段降低记录",
+        "finding": "stage63(CVPipelining)保留hivm.hir.vrec四%77及其Newton链；stage378(InsertFreeLockVarBeforeReturn)只剩hivm.hir.vdiv与broadcast扩容，说明原生vrec在HIVMDecomposeOp被无条件改写为1/den。"
+      },
+      {
+        "path": "division-instructions.json",
+        "category": "simulator",
+        "role": "059基线的除法指令PC观测（源码绑定部分窗口）",
+        "finding": "core0.veccore0与core0.veccore1各有两个VDIV PC（0x10d11b9c与0x10d11b8c），各12次调用、F32，累计5208与2796 cycles，折算3.16us与1.69us；源码栈指向candidate.py第498行out = acc / l_new[:, None]。该观测属于059二进制，IR001未上机，因此只作机制与量级依据。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "paired_profiling",
+        "role": "同核指令计数与源码区间聚类",
+        "finding": "core0.veccore0的instruction_calls记录VECTOR/VDIV 24次、VECTOR/VBRCB 12次、VECTOR/VEXP 13次、VECTOR/VMULS 13次、VECTOR/VADD 36次；source_conditional 536-549区间含230条指令，累计指令时间332.95us、等待指令时间累计194.77us，解释口径明确为关注度排序而非因果耗时。VBRCB 12次即第425行1.0填充的落地指令。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "绝对时钟资质与泳道占用",
+        "finding": "core0.veccore0的raw_clock_window为113.98300170898438至214.12899890146218，unit初值未标注；absolute_unit_validation判定status=verified、unit=us、22/22个PC匹配、median_ratio=0.9998355543178519。同一窗口VECTOR泳道event_count=422、active_union=0.3427399388783807(34.27us)、wait_union=0.103611994042576、idle_union=0.6572600611216193，activity_includes_wait=false；未报告泳道保持未知。"
+      },
+      {
+        "path": "public-source/EltWise1D.cpp",
+        "category": "source_ir",
+        "role": "一元1D库符号存在性",
+        "finding": "第1493-1494行REGISTE_ELTWISE_V(vrec, VectorOpTy::VREC, 1, half)与(vrec, VectorOpTy::VREC, 1, float)注册了一元1D float变体，与同文件第1484-1491行vexp/vrsqrt/vsqrt的注册形式一致；模块内已在使用的vexp_1d_float正来自同一宏族，支持vrec_1d_float符号以相同ABI存在。"
+      },
+      {
+        "path": "public-source/EltWise2D.cpp",
+        "category": "source_ir",
+        "role": "一元库调用参数序的模板证据",
+        "finding": "第1603-1605行vector_eltwise_v_2d特化签名为(memref_t<T,2>* src0, memref_t<T,2>* dst, memref_t<T,1>* tmp_buf, VectorLastAxisMode mode)，确立一元运算库调用为src→dst→tmp_buf，且tmp_buf为rank-1。1D变体去掉mode参数，恰好对应vexp_1d_float的三参形式。"
+      },
+      {
+        "path": "public-source/HIVMDecomposeOp.cpp",
+        "category": "source_ir",
+        "role": "分解pass的设计意图",
+        "finding": "第256-266行注释写明VRecOp has a relatively low precision并重写为VBrcOp+VDivOp；这解释了导出HIVM为何出现1.0填充与vdiv，也表明本次修复是恢复前端本就存在的vrec表达式。"
+      },
+      {
+        "path": "installed-reciprocal-evidence.txt",
+        "category": "source_ir",
+        "role": "已安装AscendC对vrec的类型支持",
+        "finding": "dav_c220的ReciprocalIntrinsicsImpl以static_assert约束half/float后直接调用vrec，Level2版本以count掩码调用vrec；说明硬件对float倒数估计有原生指令入口。"
+      },
+      {
+        "path": "feedback.json",
+        "category": "paired_profiling",
+        "role": "059正式结果与精度余量",
+        "finding": "四例官方通过；case4（bfloat16）mismatch_count 14013/1048576、mismatch_ratio 0.01336、mere 4.5528e-4、mare 7.81249375e-3（阈值7.8125e-3）、max_diff 2^-10，说明该例精度余量很薄，任何改变倒数精度的改动都须由官方检查器重新核验。同文件确认IR001只完成CPU编译（binary 441ebc5b…），无设备测量。"
+      },
+      {
+        "path": "context.json",
+        "category": "paired_profiling",
+        "role": "父版本与测量归属",
+        "finding": "parent_invocation=attempt-059、retained_best为四例保留最佳（case4 154.8871us，native 130.6951us），input_status=unmeasured_ir001_lowering_repair，profiling与simulator均属059基线；可编辑层为hivm，目标marker为strides: [8192, 1]。"
+      }
+    ],
+    "hypothesis": "导出HIVM中1/den的VDIV库调用及专供该分子的1.0填充属于HIVMDecomposeOp为提升精度而追加的分解产物（分解前IR为vrec+单步Newton）。在导出层用一个私有声明vrec_1d_float(src,dst,tmp)直接对den求估计倒数，去掉了1.0填充，并原样保留单步Newton与输出乘法，可恢复前端既有的算术语义，同时把每个行归一化位置的高成本F32除法换成原生倒数估计指令，降低VECTOR流水占用与指令数。",
+    "alternatives": [
+      "保持IR原样：登记no-change，等待其他机制。理由：若宿主的精度复核要求分母倒数与IEEE除法逐位一致，本修复触及浮点结果，须放弃。",
+      "源码层调用libdevice.reciprocal（__hmf_recipf）：058/048已在057上实测仍降低为VDIV且完整调用持平，属已检验负结果，本次不重复。",
+      "把分母或倒数改到FP16：060已出现分母范围溢出回归，明确禁止重复。",
+      "手工增加第二/第三步Newton：可提高倒数精度，但增加VMUL链与流水占用，且与前端形态偏离，本次只保留原有单步Newton。",
+      "把行归一化改为Fixpipe/Cube侧缩放：改动公共ABI与Cube代码，超出本调用许可范围，留作独立候选。",
+      "在更早的BCMLIR层保留vrec：本调用冻结旧BCMLIR输入，且后端会再次分解，因此只在导出的最终HIVM层表达。"
+    ],
+    "change": "仅编辑ir/target.hivm.mlir（inventory登记的_gqa_fwd_kernel_mix_aiv符号所在模块），两处：1) 在模块私有声明区、vexp_1d_float声明（第253行）之后新增一行私有辅助声明，名称与签名严格按一元ABI推定：func.func private @vrec_1d_float(memref<?xf32, strided<[?], offset: ?>, #hivm.address_space<ub>>, memref<?xf32, strided<[?], offset: ?>, #hivm.address_space<ub>>, memref<?xf32, strided<[?], offset: ?>, #hivm.address_space<ub>>) attributes {hacc.always_inline, hivm.func_core_type = #hivm.func_core_type<AIV>, llvm.emit_c_interface} loc(#loc45)。2) 在第424-432行区间，删除仅供该分子使用的1.0填充（%cast_39与func.call @broadcast_scalar_float_to_1d(%cst_1,%cast_39)）以及%cast_40，把func.call @vdiv_1d_float(%cast_40,%cast_41,%cast_42,%cast_43)替换为func.call @vrec_1d_float(%cast_41,%cast_42,%cast_43)，即(src=分母collapse_shape_38→%cast_41, dst=%58→%cast_42, tmp=空memref<0xf32>的%cast_43)，保留其前的hivm.hir.pipe_barrier[<PIPE_V>]与%59空临时memref定义。其余全部保持字节不变：所有pointer_cast地址（%58=114688、den=180224、Newton暂存同址、输出%68=81920、%69=114944）、事件与跨核同步（set_flag/wait_flag/sync_block_*）、Newton三步、expand与vmul_2d广播、标量常量（含%cst_1定义本身保留）、Cube函数体、两个func.func公共ABI签名、以及broadcast_scalar_float_to_1d与vdiv_1d_float两条声明（改为未被调用，保留以缩小差异）。",
+    "expected": [
+      "指令变化1：每个行归一化位置的VECTOR/VDIV（059窗口内2个PC共24次）对应为一条VECTOR/VREC；在IR001导出的AIV函数中vdiv_1d_float调用点（1处）被vrec_1d_float调用点取代，编译后预期出现VREC指令并按同频率执行。",
+      "指令变化2：第425行broadcast_scalar_float_to_1d被删除，对应VECTOR/VBRCB计数由12次（每核窗口）降为0；同时减少一次64元素标量填充的VECTOR占用。",
+      "动态轮次：行归一化每tile执行一次，窗口内12轮保持；VDIV 24→0、VREC 0→24、VBRCB 12→0，其余（VEXP 13、VMULS 13、VADD 36、VCONV 50）预期不变。",
+      "等待与延迟：VE窗内两条VDIV的per-call代价分别约434与233 cycles（5208/12、2796/12），VREC预计显著更短；预测VECTOR泳道active_union由34.27us下降不超过4.85us（合计累计值），wait_union 10.36us预期基本保持，kernel总时长（case4 154.8871us基线）预测小幅下降，量级0.5–3us；该预测受流水重叠限制，须以实测为准。",
+      "资源：缓冲地址、别名关系与生存期完全保持（vrec读den 180224、写114688，与原先1.0填充写同一缓冲，临时为空memref<0xf32>），UB占用与分配不变；新增声明只增加符号表条目，硬件资源预期无变化。",
+      "精度：倒数由IEEE精确除法变为硬件估计加既有单步Newton，预期相对误差量级≤2^-16，主要影响bfloat16舍入边界；case4的mismatch_count与mare预期小幅上升，须由官方检查器判定是否仍通过。",
+      "编译面：预期hivmc能解析新增声明并链接到AIV bitcode中的vrec_1d_float符号，公开符号名与kernel arg元数据保持与IR001一致。"
+    ],
+    "validation": [
+      "IR可解析与差异范围：重新读回ir/target.hivm.mlir，确认与登记的两处改动一致、其余字节保持，SHA差异只出现在声明区与倒数调用区。",
+      "CPU续编译：用与IR001相同的hivmc命令行（original-resume-result.json记录）编译该文件，要求returncode 0；若链接报未定义vrec_1d_float，则本机制判为ABI不可支持，按no-change交接并把该负结果写入最终回复。",
+      "符号与元数据：核对编译产物的公共符号名与kernel arg元数据与IR001一致，AIC函数体与事件配对保持不变。",
+      "官方检查器：运行case1/2/4/7四例，重点核对case4的mismatch_count/mere/mare，阈值与golden保持冻结；若精度回落超阈值则回退本改动。",
+      "设备与模拟器复采：重新采集059同口径profiling与simulator，逐项核对VDIV 24→0、VBRCB 12→0、VREC出现次数、VECTOR泳道active/wait与窗口内动态轮次，并把未兑现项与偏差记入下一轮结论。",
+      "性能边界：以四例完整调用时长为比较起点（当前最佳case4 154.8871us），只有当样本比较满足合同口径时才声明收益；单条指令时间累计值只用于机制定位。"
+    ],
+    "layer_reason": "Triton表达能力：已安装的CANN Triton libdevice 只暴露__hmf_recipf 一类外部函数，058/048 两次在源码层改写倒数仍被降低为 VDIV；源码层没有可直达原生 vrec 的算子，因此在源码表达该意图的可选方向限于 libdevice/fast_dividef 一类调用，前景已被负结果覆盖。固定源码实验目的：本轮要求 frozen.py 逐字节一致，源码身份固定，故实验变量只能落在编译产物上。IR 控制点：inventory 登记的可编辑对象是 hivm 阶段的实际导出模块，它直接决定后端指令选择，且已通过独立后端续编译与二进制关联，能在保持公共 ABI、Cube 代码与事件同步的前提下只改行归一化的指令表达；这正是唯一可独立验证的编译缺陷控制点。",
+    "simulator_incremental_judgment": "现有 profiling/simulator 采集自 059 二进制，IR001 只有 CPU 编译结果，两者身份不同，因此本轮增量判断只看可核对的指令层面量：VECTOR/VDIV 24→0、VREC 0→24、VBRCB 12→0，以及 VECTOR 泳道的 active/wait 相对变化。窗口资质方面，core0.veccore0 的 raw_clock_window 113.98300170898438–214.12899890146218 经 22/22 PC 校验判为 us（median_ratio 0.99984），故窗口内累计时长可按 us 读；该窗口只覆盖部分泳道与部分动态执行，未报告泳道保持未知，完整调用时长仍以四例测量为准。各流水累计值可重叠，VDIV 的 3.16us 与 1.69us 只用于排序与量级，故预期收益写成上限区间并标注需实测兑现。",
+    "unknown": [
+      "原生 vrec 在 dav_c220 上 F32 的实际精度（未知，直接影响 case4 的 bf16 舍入与官方检查器余量）。",
+      "vrec_1d_float 在已安装 meta_op.aiv.bc 中的可链接性（按公开源码注册表推定存在，需本次 CPU 续编译确认）。",
+      "两个 VDIV PC 与导出模块单一 vdiv 调用点的动态对应关系（12+12 次的来源需在复采时核对）。",
+      "行归一化在设备关键路径上的实际权重：vec core 窗口内有 65.7% idle 与 10.4% wait，收益可能被重叠吸收。"
+    ]
+  },
+  "diagnosis_sha256": "98b73ba4f7c03ef13cf22937312bc94d77e88295e874f3f473a2d8bc738d27b4",
+  "evidence": [
+    {
+      "path": "ir/target.hivm.mlir",
+      "category": "source_ir",
+      "role": "本次可编辑的实际导出HIVM（IR001后端输出）中行归一化的完整倒数表达",
+      "finding": "第424-425行把标量1.0经broadcast_scalar_float_to_1d写入UB偏移114688的%58（64xf32）；第427-432行vdiv_1d_float以%58为分子、collapse_shape_38（分母den，UB偏移180224）为分母，就地写回%58，临时参数为memref<0xf32>空memref；第440-462行为单步Newton（vmul den*r0、vmuls -1、vadds 2、vmul r0*(2-den*r0)）写回114688；第471/462行保留输出乘法与2D广播。整段与分解前IR的vrec+Newton结构逐一对应。",
+      "sha256": "2e547dcea2ad549172d4085eb8bf9ac92dd3c58774b5daef7605ebb867ebdc98"
+    },
+    {
+      "path": "ir/target.hivm.mlir",
+      "category": "source_ir",
+      "role": "一元库调用的实际ABI样本",
+      "finding": "第253行声明vexp_1d_float为三个memref参数；第371行实际调用vexp_1d_float(src=16384xf32, dst=16384xf32, tmp=memref<0xf32>)，第250-255行vcast/load/store的自然序也先src后dst；二元库调用（第432行vdiv、第440行vmul）为src0,src1,dst,tmp四参。由此一元原生调用的参数序为src,dst,tmp_buf，且tmp_buf为rank-1空memref。",
+      "sha256": "2e547dcea2ad549172d4085eb8bf9ac92dd3c58774b5daef7605ebb867ebdc98"
+    },
+    {
+      "path": "compiled-readonly/vrec-before-decompose.mlir",
+      "category": "source_ir",
+      "role": "分解前的原始HIVM形态（vrec原生形态的直接证据）",
+      "finding": "第207-218行：vreduce<sum>出den(%alloc_10 64x1xf32)，第209行hivm.hir.vrec ins(%collapse_shape) outs(%alloc_11)落地到与den独立的缓冲区，随后vmul(den,r0)→vmul(*-1)→vadd(+2)→vmul(r0,·)→expand→vmul广播。当前目标文件的缓冲分配（%58=114688、den=180224）与该形态一致。",
+      "sha256": "16d49722976560a319829f0a23fb0ca8d98fc7c5631c0990e641a70a4e0ff866"
+    },
+    {
+      "path": "compiled-readonly/vrec-after-decompose.mlir",
+      "category": "source_ir",
+      "role": "HIVMDecomposeOp重写结果",
+      "finding": "第210-211行把vrec替换为vbrc(1.0)写%alloc_12再vdiv(%alloc_12,den)就地写%alloc_12；该1.0填充仅服务这个除数分子，后续无其他读者。",
+      "sha256": "2a07aa85972f23cb13dd0ee70e2e80b19f8d15b43948a60977c7829d63490db9"
+    },
+    {
+      "path": "native-lowering-review.json",
+      "category": "source_ir",
+      "role": "IR001 各阶段降低记录",
+      "finding": "stage63(CVPipelining)保留hivm.hir.vrec四%77及其Newton链；stage378(InsertFreeLockVarBeforeReturn)只剩hivm.hir.vdiv与broadcast扩容，说明原生vrec在HIVMDecomposeOp被无条件改写为1/den。",
+      "sha256": "cfdea4a0051c689a70287d4d3597096bb94c29c231261d6be064e0aaf631008f"
+    },
+    {
+      "path": "division-instructions.json",
+      "category": "simulator",
+      "role": "059基线的除法指令PC观测（源码绑定部分窗口）",
+      "finding": "core0.veccore0与core0.veccore1各有两个VDIV PC（0x10d11b9c与0x10d11b8c），各12次调用、F32，累计5208与2796 cycles，折算3.16us与1.69us；源码栈指向candidate.py第498行out = acc / l_new[:, None]。该观测属于059二进制，IR001未上机，因此只作机制与量级依据。",
+      "sha256": "c10796fd6653b72765e9617d878c1e8a157675cd3eb98b933a440a7566b888c8"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "paired_profiling",
+      "role": "同核指令计数与源码区间聚类",
+      "finding": "core0.veccore0的instruction_calls记录VECTOR/VDIV 24次、VECTOR/VBRCB 12次、VECTOR/VEXP 13次、VECTOR/VMULS 13次、VECTOR/VADD 36次；source_conditional 536-549区间含230条指令，累计指令时间332.95us、等待指令时间累计194.77us，解释口径明确为关注度排序而非因果耗时。VBRCB 12次即第425行1.0填充的落地指令。",
+      "sha256": "70efae82e9d798630f8b4f0029ef9775b29ac31712754a03872b2a416e33cb94"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "绝对时钟资质与泳道占用",
+      "finding": "core0.veccore0的raw_clock_window为113.98300170898438至214.12899890146218，unit初值未标注；absolute_unit_validation判定status=verified、unit=us、22/22个PC匹配、median_ratio=0.9998355543178519。同一窗口VECTOR泳道event_count=422、active_union=0.3427399388783807(34.27us)、wait_union=0.103611994042576、idle_union=0.6572600611216193，activity_includes_wait=false；未报告泳道保持未知。",
+      "sha256": "c381923538bec6526884796309b05546560932d713f28b46f513d9acc5cac888"
+    },
+    {
+      "path": "public-source/EltWise1D.cpp",
+      "category": "source_ir",
+      "role": "一元1D库符号存在性",
+      "finding": "第1493-1494行REGISTE_ELTWISE_V(vrec, VectorOpTy::VREC, 1, half)与(vrec, VectorOpTy::VREC, 1, float)注册了一元1D float变体，与同文件第1484-1491行vexp/vrsqrt/vsqrt的注册形式一致；模块内已在使用的vexp_1d_float正来自同一宏族，支持vrec_1d_float符号以相同ABI存在。",
+      "sha256": "adeefa4bb642711ecc76df257f8217fd91398e52453426e4f8736c5a973fa773"
+    },
+    {
+      "path": "public-source/EltWise2D.cpp",
+      "category": "source_ir",
+      "role": "一元库调用参数序的模板证据",
+      "finding": "第1603-1605行vector_eltwise_v_2d特化签名为(memref_t<T,2>* src0, memref_t<T,2>* dst, memref_t<T,1>* tmp_buf, VectorLastAxisMode mode)，确立一元运算库调用为src→dst→tmp_buf，且tmp_buf为rank-1。1D变体去掉mode参数，恰好对应vexp_1d_float的三参形式。",
+      "sha256": "84f63673a9662d96e0ecd6f8dd78467dfe5e6e1daa529e50163d1d9ae74a312e"
+    },
+    {
+      "path": "public-source/HIVMDecomposeOp.cpp",
+      "category": "source_ir",
+      "role": "分解pass的设计意图",
+      "finding": "第256-266行注释写明VRecOp has a relatively low precision并重写为VBrcOp+VDivOp；这解释了导出HIVM为何出现1.0填充与vdiv，也表明本次修复是恢复前端本就存在的vrec表达式。",
+      "sha256": "2fd26ffb92eb0fc6c8dfd6e424b5874be32582773b28063cb49adec68dc9bbb0"
+    },
+    {
+      "path": "installed-reciprocal-evidence.txt",
+      "category": "source_ir",
+      "role": "已安装AscendC对vrec的类型支持",
+      "finding": "dav_c220的ReciprocalIntrinsicsImpl以static_assert约束half/float后直接调用vrec，Level2版本以count掩码调用vrec；说明硬件对float倒数估计有原生指令入口。",
+      "sha256": "86370a5c6ff93e03b7b04a6e15de4a927a6922ec8322dc0f972502524b6bcf10"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "059正式结果与精度余量",
+      "finding": "四例官方通过；case4（bfloat16）mismatch_count 14013/1048576、mismatch_ratio 0.01336、mere 4.5528e-4、mare 7.81249375e-3（阈值7.8125e-3）、max_diff 2^-10，说明该例精度余量很薄，任何改变倒数精度的改动都须由官方检查器重新核验。同文件确认IR001只完成CPU编译（binary 441ebc5b…），无设备测量。",
+      "sha256": "d3a2459920b1b87af8e89b45b78ee763597df1bd52396eff8af87bf9169eeae3"
+    },
+    {
+      "path": "context.json",
+      "category": "paired_profiling",
+      "role": "父版本与测量归属",
+      "finding": "parent_invocation=attempt-059、retained_best为四例保留最佳（case4 154.8871us，native 130.6951us），input_status=unmeasured_ir001_lowering_repair，profiling与simulator均属059基线；可编辑层为hivm，目标marker为strides: [8192, 1]。",
+      "sha256": "4bb02d9718126b6a976c7aebeba0b7755b84da213c81e6c88e1c3620d57c226d"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "98c755709dd428d0955bfc11a666b679f5afdc412ecb441e1c094568a3805661",
+    "contract.json": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858",
+    "ir-inventory.json": "2cb16f5c4d4087e47e5ba666c319e99a6da2d825349c789636a77729c88c5053",
+    "feedback.json": "d3a2459920b1b87af8e89b45b78ee763597df1bd52396eff8af87bf9169eeae3",
+    "profiling.json": "6d954ae09c08f930230be01d9b34de36e6d5f37b029ce561b50495ea0a9dcd6f",
+    "hotspots.json": "70efae82e9d798630f8b4f0029ef9775b29ac31712754a03872b2a416e33cb94",
+    "timeline.json": "c381923538bec6526884796309b05546560932d713f28b46f513d9acc5cac888",
+    "installed-reciprocal-evidence.txt": "86370a5c6ff93e03b7b04a6e15de4a927a6922ec8322dc0f972502524b6bcf10",
+    "context.json": "4bb02d9718126b6a976c7aebeba0b7755b84da213c81e6c88e1c3620d57c226d",
+    "diagnosis.json": "68bbecd4d6ef8c386519dba4293940fde96547446100e8dd1cf436747b32122c",
+    "codex-brief.json": "e0835c809a0a8bc9d09a9ef0105db3a5250794378657ed6c199e0b17f8ec726e",
+    "division-instructions.json": "c10796fd6653b72765e9617d878c1e8a157675cd3eb98b933a440a7566b888c8",
+    "prior-scheduling-result.json": "4cb91763b1230ed3c80e5f9ee9091daa958e32f1838960aa56eaedb7c70f39c8",
+    "native-lowering-review.json": "cfdea4a0051c689a70287d4d3597096bb94c29c231261d6be064e0aaf631008f",
+    "original-resume-result.json": "dc0750b8c071b3f952f9005e0ab7f324177e06a05b4992b7cf1706f44e3f15f7",
+    "ir/target.hivm.mlir": "2e547dcea2ad549172d4085eb8bf9ac92dd3c58774b5daef7605ebb867ebdc98",
+    "ir/target/_gqa_fwd_kernel.bcmlir": "ae1194bbd06db270cb07da7fda7e26054873e007d80305c2f504dc0b4a127ce4",
+    "compiled-readonly/_gqa_fwd_kernel.ttir": "47d7d4032bee5f8b02650f7930329db8e3fe7535d9bc118d1c006cef2be116d9",
+    "compiled-readonly/_gqa_fwd_kernel.ttadapter": "7baa69025a03de424599dfef862da8caba4c1bc6ce472e86a2c25d9f15551e3f",
+    "compiled-readonly/_gqa_fwd_kernel.bcmlir": "810ba7cfb69fa55572bb2b331f3cb65c6bf8c4cbffba735601930c0ee8f652b8",
+    "compiled-readonly/current-cvpipelining.mlir": "33a2d3df731e612cc0e55c66d280b19ab6d7d86dc5df078bf4201792fb2396ac",
+    "compiled-readonly/vrec-before-decompose.mlir": "16d49722976560a319829f0a23fb0ca8d98fc7c5631c0990e641a70a4e0ff866",
+    "compiled-readonly/vrec-after-decompose.mlir": "2a07aa85972f23cb13dd0ee70e2e80b19f8d15b43948a60977c7829d63490db9",
+    "public-source/EltWise1D.cpp": "adeefa4bb642711ecc76df257f8217fd91398e52453426e4f8736c5a973fa773",
+    "public-source/EltWise2D.cpp": "84f63673a9662d96e0ecd6f8dd78467dfe5e6e1daa529e50163d1d9ae74a312e",
+    "public-source/hivm-op-decompose.mlir": "104b8f583e8a163892c2ce0ad9785237eb7ba43eb201feedd5ef2fd6f11c951a",
+    "public-source/HIVMDecomposeOp.cpp": "2fd26ffb92eb0fc6c8dfd6e424b5874be32582773b28063cb49adec68dc9bbb0",
+    "public-source/HIVMToStandard.cpp": "8c8654126e129d88cc0d73c8c28f9886bade5f67ce1619e9d3cc2a9038fd4d60",
+    "public-source/sources.json": "3433abc1a23aedb7494cd225ea96a45b5b0708dad5b55232402b2e92d09f7d6e",
+    "public-source/tree-query.json": "27bab0976fa7ab2ae66ac9914488cba4bb4f22c8efbe6618f8a7e8d0e6bfdb6d"
+  },
+  "decision_tool_sha256": "2ba55ebab8be5b8a2363da657d6ee81799d4cabcdfb8e1494846aecfd1fde624"
+}

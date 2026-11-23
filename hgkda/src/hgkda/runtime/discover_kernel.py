@@ -18,6 +18,9 @@ def main():
     spec=json.loads(a.spec.read_bytes())
     import torch,torch_npu
     torch.npu.set_device(0);torch.set_num_threads(1)
+    if a.side=='candidate' and spec.get('ir_input'):
+        from ir_input import install
+        install(spec)
     oracle=load('_discover_oracle',Path(spec['leaf'])/'oracle.py')
     fn=oracle.run if a.side=='reference' else getattr(load('_discover_candidate',spec['source']),spec.get('entrypoint','run'))
     for _ in range(5):fn(**oracle.gen_inputs(spec['case'],'npu:0'))
@@ -32,6 +35,7 @@ def main():
     result=dict(source_sha256=spec['source_sha256'],side=a.side,kernels=sorted({r['name'] for r in tasks}),
         tasks=[dict(name=r['name'],duration_us=r['dur'],task_type=r['args']['Task Type']) for r in tasks],
         trace=dict(path=str(trace),sha256=hashlib.sha256(trace.read_bytes()).hexdigest()))
+    if spec.get('ir_input'):result['ir_input']=spec['ir_input']
     a.output.write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
     print(json.dumps(dict(side=a.side,kernels=result['kernels'])))
 

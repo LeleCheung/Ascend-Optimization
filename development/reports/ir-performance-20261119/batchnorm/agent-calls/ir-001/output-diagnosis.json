@@ -1,0 +1,50 @@
+{
+  "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "目标用例与冻结基线定义",
+      "finding": "case b batch_norm_with_update_functional-timing-7, 输入 8x64x64x64 fp32 affine seed=1736, tolerance atol=rtol=1e-4 required_matched_ratio=1.0 equal_nan=true; 比较对象 source_sha256=b8d4d4a2..., target_latency_ms=0.0449129, target_speedup=0.62695; 对照 formal-b8d4d4a2c07d。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "流水线占用与指令级热点排序",
+      "finding": "core0.veccore0 上 MTE2 active0.8855/productive0.7759/wait0.1104/idle0.1145，VECTOR active0.8969/productive0.6410/wait_only0.2639，SCALAR active0.0553，SCALARLDST active0.2400(1667事件)。top_instructions 以同步指令为主：BAR@src101 8.36us、BAR@src101 8.34us、BAR@src87 8.29us、BAR@src102 8.11us、WAIT_FLAG(MTE2,line83)7.98us、MOV_SRC_TO_DST_ALIGN(load,line83)7.23us、SET_FLAG(line83)7.21us、WAIT_FLAG(line71)2.93us；算术指令很小：VADDS 'cnt += 1'@src88 1.42us(calls=29)、VMUL@src102 1.41us、VSUB@src87 0.95us。Welford 区域(source_loop 71-103) instruction_time_sum=78.1us、largest=8.36us。说明：cnt 自增是一条真实执行的向量指令且未被后端消除(VADDS@88仍出现)；Welford 主要成本是每步对加载的同步等待(BAR/WAIT_FLAG)。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "窗口范围与等待/空闲结构",
+      "finding": "仅报告 core0.veccore0，capture_scope 为 partial(首末可见事件，应用未完成)，故绝对时钟不可比。MTE2 最大 idle 位于 [0.0,0.1041](启动/首载延迟)；此后每约0.031 出现一次小间隙；两遍加载在窗口内连续、pass1/pass2 之间无大间隙。VECTOR 最大 idle 区间在起始段(0.0016-0.0783 等)。支持“受加载延迟与同步约束”的判断，而非纯带宽饱和。"
+    },
+    {
+      "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+      "category": "source_ir",
+      "role": "实际编译 IR 结构与冗余定位",
+      "finding": "唯一 EVEN 特化。外层 scf.for(第47行)携带 (mean,var,cnt tensor<8x128xi32>)，内层 scf.for(第64行)再携带 cnt；第81行 cnt_65=addi(cnt_52,dense<1>) 每步对 8x128 i32 做向量加；第90行 yield cnt；第94行 final_mean=sitofp(cnt_7#2) 将 1024 元素整型转 f32；第95行 mean*cnt。EVEN 路径下两层循环均无掩码，每个 lane 每步恰好 +1，故 cnt 逐 lane 恒等且等于 m_num_steps*n_num_steps(本例 1*32=32)。cnt 作为循环携带张量属可标量化冗余。"
+    },
+    {
+      "path": "frozen.py",
+      "category": "source_ir",
+      "role": "语义与常量来源确认",
+      "finding": "第54行 cnt=tl.zeros((BLOCK_M,BLOCK_N))，第88/100行 cnt+=1 仅 EVEN 分支无条件累加；BLOCK_M=min(64,next_pow2(8))=8、BLOCK_N=min(4096,max(1,1024//8))=128，_bn_even 对 8x64x64x64 成立(batch%8==0, spatial%128==0) → EVEN=true，与 TTIR 无掩码一致。cnt 最终=32，sitofp(32)=32.0 精确。"
+    }
+  ],
+  "hypothesis": "EVEN 特化下计数量 cnt 在每 lane 恒等(等于 m_num_steps*n_num_steps=32)，却被保留为 8x128 i32 循环携带张量：每步执行一次 VADDS 向量加(profiling 证实@src88 仍执行)、占用一个4KB循环携带 buffer 参与寄存器/UB 轮转，并在结尾对 1024 元素做整型→f32 转换。将其标量化为 m_num_steps*n_num_steps，再以 tt.splat 参与 mean*cnt 与 cnt*(mean-final_mean)^2 的同一逐元素乘序，可去掉每步向量加与一个循环携带 tile，且因 cnt=32.0 可精确表示，输出逐位不变。",
+  "alternatives": [
+    "移除内层循环末次 tl.minimum 钳制导致的重复预取(每个 feature 每遍多 load 一次同 tile)：需条件分支/循环剥离，可能破坏单级软件流水，且仅约1/33的流量，风险大于收益，暂不选。",
+    "加深预取到2级以隐藏加载延迟：需改循环结构并依赖 num_stages(已冻结为1)，改动面大。",
+    "pass2 将 weight*(curr-mean)*inv_std+bias 预组合为 curr*scale+shift 单 FMA：减少每次3个向量运算，但改变浮点结合顺序，在 rtol=1e-4、required_matched_ratio=1.0 下可能失配，违反精度要求，不选。",
+    "仅依赖后端消除 cnt 冗余：profiling 显示 VADDS@src88 仍执行，说明后端未消除，需显式改写。"
+  ],
+  "change": "仅修改唯一 EVEN 特化 IR：将 cnt 从外层/内层 scf.for 的 iter_args 及其结果计数中移除(第47/64行)，删除第81行 cnt 向量加与第29行 cnt 常量；内层 yield(第90行)与外层 yield(第92行)去掉 cnt；在外层循环后新增标量 %cnt_scalar=muli(m_num_steps_4,n_num_steps_6)、%cnt_f=sitofp(i32->f32)、%final_mean=tt.splat 为 tensor<8x128xf32>，替代原第94行的整张量 sitofp；第95/106/109行改为对新 splat 张量及 %cnt_7#0/#1(现仅 mean,var 两个结果)运算。函数 ABI/签名、张量形状与数值运算顺序不变。",
+  "expected": "可测预测：(1) profiling 中 source line88 的 VADDS(cnt+=1) 指令消失，Welford 每步少一次 8x128 i32 向量加；(2) 循环携带 tile 由3(mean,var,cnt)降为2，减少4KB活跃 buffer/寄存器轮转压力，结尾整型→f32 由1024元素降为标量；(3) 输出与基线逐位一致(cnt=32.0 精确，mean*cnt 及 cnt*(mean-fm)^2 乘序不变)；(4) MTE2 事件数/流量不变(不改变 GM 访问)，可作为机制隔离；(5) 因 VECTOR 多为等待 MTE2(productive0.641/wait0.264)，端到端收益可能偏小或落于噪声，但若 UB/寄存器压力曾限制单级软件流水，相应 BAR/WAIT_FLAG 停顿应下降，延迟应不高于当前最佳。",
+  "validation": "宿主对该 TTIR 重新编译：需通过解析且函数签名/特化常量与原一致；与参考(KGS 组合)按 atol=rtol=1e-4、required_matched_ratio=1.0、equal_nan 逐元素比对须全部匹配(预期逐位一致)；profiling 复核 line88 VADDS 消失、MTE2 event_count 不变；对 timing-7 重复测量，比较延迟与 speedup 相对 source_sha256=b8d4d4a2 基线(0.0449129ms / 0.627)。若无可测改善，也应作为“该冗余非关键路径”的明确结论记录。",
+  "layer_reason": "该冗余源于源码显式构造的计数张量在 EVEN 特化下的逐 lane 统一性，属编译期即可判定的标量化，IR 层可在不改变 API、形状与浮点运算顺序的前提下、无副作用地消除；无需改源码或编译选项，机制单一可独立验证。",
+  "simulator_incremental_judgment": "模拟器窗口为 partial(应用未完成)，绝对时钟资质不可比，仅采用相对 active/wait/idle 与指令级证据：窗口内 MTE2 与 VECTOR 均约0.89 active 且 VECTOR wait_only 0.264、MTE2 最大 idle 在启动段，表明受加载延迟/同步约束。本次仅去掉不触及 GM 流量的向量冗余，增量应以 VECTOR 指令数与 BAR/WAIT_FLAG 变化判定，端到端收益须宿主重测确认；未报告泳道(CACHEMISS 等辅助 lane)按材料视为辅助、不构成关键路径。",
+  "codex_contribution": "Codex 在 codex-brief.json 指出 TTIR 中 tensor<8x128xi32> 计数张量可疑、并给出 MTE2 高占比/Vector-Scalar 与 Welford 同步焦点的方向；据此核对实际 IR 后确认 cnt 为 EVEN 下逐 lane 恒等且其向量加在 profile 中仍执行，从而选定标量化 cnt 作为本次单一机制。",
+  "unknown": []
+}

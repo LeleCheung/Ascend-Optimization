@@ -1,0 +1,72 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "fb1233ed36410fed5adc7c210b0a4247f9ebc4ed54461feeffd450ec679003a6",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4 候选 512 程序、kernel 394.987885us：每程序 aic_cube_total_instr_number=4（2 个 KV 块 × (QK+PV)）、L0C_to_GM=256KiB、GM_to_L1=224KiB、aic_mte1=15、aic_mte2=8；每程序 aic_cube_time 仅 1.345455us，而 aic_scalar_wait_id1_time 达 10.260232us；AIV 侧 vec 5.004881us、mte2 1.686396us、mte3 1.173484us、scalar_wait 3.696625us。即每程序墙钟由跨核交接链的固定等待主导，算术与搬用量本身很小。"
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "disambiguation",
+      "finding": "同一报告里 CANN 参考仅 19 个 block、130.1026us，cube 指令总数 2048 与候选完全相同（每程序 4×512），AIV vec 59.04us/block、mte2 43.83us、mte3 36.13us，且没有 aic_scalar_wait_id1 字段。说明两者的总矩阵乘工作量一致，候选慢在把工作切成 512 个短程序、每个程序都要付数次跨核交接延迟（约 21 个波次 × 每波 ~18.8us），参考则用 1 个波次加块内流水覆盖交接。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "scf.for 以 %c256_i32 为终止、%c128_i32 为步长（即 SKV=256 被切成 2 个 KV 块）；循环内 acc_60 = acc*alpha 后作为 tt.dot 的初值参与 PV（第 99-103 行），因此每轮 acc 都要从 UB 写出再灌回 L0C；qk 的 row-max、exp2、row-sum 与 v 的 bf16→f32→f16 转换也每轮各做一遍。"
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "循环体里 linalg.matmul(PV) 的 outs(%52) 正是 %52 = acc*alpha（第 100 行），而 %53/%54/%55 显示 p 的 truncf 与 v 的 extf+truncf 每轮重复；QK 的 matmul outs 为零填充。可见每次迭代固定包含一次 QK 搬出、一次 p/v 转换搬入、一次 acc 乘缩放及其 L0C 初值搬运，这些与 M/N 尺寸无关，正是交接链的固定成本。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "当前候选四项 official checker 全部通过；耗时 case1 173.95715us、case2 186.5267us、case4 400.21285us、case7 185.79915us（native 分别为 92.1861/92.1861/131.84165/92.7701us）。case4 的 mare 已达 0.007812493750005，几乎顶到 0.0078125 阈值，因此本轮不得再引入额外精度损失，机制须以结构/调度为主。"
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "background",
+      "finding": "非因果路径当前 BLOCK_M=128、BLOCK_N=128；SKV=256 的 case4/case7 因此恒为 2 次 KV 迭代，SKV=128 的 case2 已是单迭代，因果 case1 为 64/64。内核里 online softmax 的 m_i/l_i/acc 均为循环携带量，单迭代时 alpha=exp2(-inf-m_safe)=0，acc*alpha 与 l_i*alpha 在算术上是精确的 0，属于可被编译期分支消掉的无用工作。"
+    },
+    {
+      "path": "workspace/contract.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "固定 case1/2/4/7、dtype（fp16/bf16）、原 checker 与 golden、warmup 5/trials 3/iterations 20；精度阈值 fp16 0.0009765625、bf16 0.0078125 保持不变，四项 checker 为唯一验收口径。"
+    }
+  ],
+  "hypothesis": "case4/case7 的墙钟与每程序的跨核交接链条数近似成正比，而不是与算术量成正比：每程序 2 条链（2 个 KV 块）中各含一次 QK 搬出、p/v 转换、acc 乘缩放与其 L0C 初值往返，这些是固定开销（aic_cube_time 仅 1.35us 对 scalar_wait 10.26us）。把 SKV=256 的整段 KV 放进单个 BLOCK_N=256 块，使每程序只剩 1 条链，即可把 chain 数减半，并把 online softmax 的 acc 重缩放与 L0C 初值往返整段删除。",
+  "alternatives": [
+    "BLOCK_M 由 128 提到 256：只对 S>=256 的 case4 有效，且需 256x128 fp32 的 qk 与 acc 同时驻留（每程序约 256KiB），L0C 也只有 128KiB，资源最紧；case7（S=128）无收益。",
+    "只剥离首轮迭代（alpha=0）：省一次 acc 乘缩放，约占单轮向量工作 1/4 的一半，收益远小于整段合并。",
+    "num_stages=2 软件流水：单/双迭代循环无跨轮可重叠空间，反而增加 K/V 双缓冲的 UB/L1 占用。",
+    "两遍法先求全 KV 行最大值再单遍 PV：需多 4 次 QK 搬入 L0C 与搬出，交接链反而增加。"
+  ],
+  "discriminating_observation": "若交接链条数主导：case4/case7 的 aic_cube_total_instr_number 总量与 L0C 总量基本不变，而每程序 chain 由 2 降至 1，kernel 时间应近似按链数下降（case4 394.99us 预期向 ~250-300us 移动），aic_scalar_wait_id1 每程序也近似减半。若实际是向量 ALU 或 L0C 带宽主导，则耗时基本不动。可区分点在于 cube 忙时（512×1.345=688 core-us）远小于墙钟这一已知事实是否随链数等比映射。",
+  "change": "在 candidate.py 的非因果 BLOCK_D<=128 分支，当 SKV>=256 且 SKV%256==0 时取 BLOCK_N=256（case4/case7 的 SKV=256 即整段 KV 一个块），其余路径 BLOCK_N 仍为 128（case2）/64（因果 case1）。内核新增编译期分支 SINGLE_KV=(not IS_CAUSAL) and (BLOCK_N==SKV)：该路径直接用本块 row-max 计算 p 与 l，PV 直接以 tl.dot(p,v) 结果作为 acc（无 acc*alpha、无 L0C 初值回灌），不进入 online 重缩放；SINGLE_KV 为假时保留原 online softmax 循环逐字不变。两项概率分解/单次 fp16 PV 的表达式与相加顺序、dtype 选择（仅由 V 的 dtype 元数据决定）均不变。",
+  "expected": "case4：每程序 KV 迭代 2→1、chain 数 512×2→512×1，L0C_to_GM 每程序 256→192KiB、matmul 4→2，aic_scalar_wait_id1 与 AIV scalar_wait 近似减半，kernel 394.99us 预期降至约 250-300us，full call 由 400.21285us 明显下降；case7 同构（64 程序、SKV=256）预期 185.80us 降至约 140-160us 区间；case2 已经单迭代，仅去掉精确为 0 的 acc*alpha/l_i*alpha，耗时应持平或微降；case1 因果路径完全不变。风险：BLOCK_N=256 使 qk(128x256 fp32=128KiB) 与 PV 的 L0C 累加器同处，可能超 UB/L0C 预算导致编译失败；失败时保存完整四项后改回并另选机制。",
+  "validation": "candidate.py 先经 preflight 与宿主只读路径/地址边界审查，再跑完整四项真机评测（原 checker、原 golden、原 dtype 与计时合同，阈值不变），逐 case 记录 full_call_us、official checker 的 mere/mare/mismatch 与 small_value/cancel 子项；同时保留 case4/case7 的成对 profiling 复核 cube 指令数、L0C_to_GM、scalar_wait 与程序数，随后做模拟器重放确认链数下降是否对应实际收益；任一 case 精度或性能退步均保留结果并另选机制。",
+  "selected_layer": "source_ir",
+  "layer_reason": "机制完全可由 Triton 源码表达：BLOCK_N 的取块几何与编译期（SKV/BLOCK_N/IS_CAUSAL 均为 constexpr 元数据）分支剥离 online 重缩放，不依赖编译器单算子缺陷修复；TTIR/BCMLIR 只作为每轮固定交接成本与 acc*alpha→L0C 初值往返的证据，IR 建议不构成本轮前置。",
+  "simulator_incremental_judgment": "本轮不新增模拟器输入。当前剩余歧义是：把这 2 条链合并为 1 条后，每链固定延迟是否真的按条数线性回收（即链内是否会因 BLOCK_N 变大而出现新的向量/搬运串行段）。成对 profiling 已给出 aic_cube_time 1.345us 对 aic_scalar_wait_id1 10.260us、以及 cube 忙时 688 core-us 远小于 394.99us 墙钟，足以支持“交接链条数主导”的假设并区分它与 ALU/带宽主导；宿主此前模拟器的部分窗口（Cube productive 7.90%/wait 33.27%/idle 58.83%）与该结论同向，但未隔离为独立工具增量，故只按范围引用。链内串行段的真实大小只能由修改后的成对 profiling 与模拟器重放回答，属修改后验证，不作为本轮前置输入。",
+  "unknown": [
+    "BLOCK_N=256 时 qk(128x256 fp32) 与 PV 累加器在 UB/L0C 的实际峰值是否可编译（历史 64/128/128 因果组合曾达 231488B 而失败，非因果 128/128 约 192KB 可编译）。",
+    "单链内部 BRAM/L0C 搬运是否随 N 翻倍而线性增长，从而吃掉部分链数减半的收益。",
+    "case4 的 mare 已贴近阈值 0.0078125，单块 softmax 改变了 PV 的累加分块（8 次 k=128 之和 → 4 次），需由原四项 checker 确认仍在阈值内。"
+  ],
+  "implementation_status": {
+    "modified_source_sha256": "aec8e907f907a8d647f70a343ba0fd38d3d848636a586276f96084e30930895d",
+    "preflight": "awaiting_source_review（设备操作前的只读路径与地址边界审查边界，候选字节保持不变并在此交接）",
+    "note": "本次只改 BLOCK_N 取块与内核 SINGLE_KV 编译期分支；因果 64/64、非因果 BLOCK_M=128、两项分解/单次 fp16 PV 的表达式与相加顺序、公共入口 run 的参数与语义均未变动。正式四项结果与修改后成对 profiling/模拟器重放待宿主反馈后再更新本节。"
+  }
+}

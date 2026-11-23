@@ -1,0 +1,67 @@
+{
+  "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "当前最佳的真实设备耗时与对标线（正式结果身份）",
+      "finding": "候选 kernel batch_norm_with_update_kernel Task Duration=47.360947us，Block Dim=64，Op Type=vector，即 64 个 program 各占一个 AIV 核并各处理一个 feature 的 8x4096 元素；参考侧由 BatchNormV3(22.120443us/32核)+Add(1.740035us)+Rsqrt(2.500050us) 组合而成，runtime_tasks 合计约 24.4us。context.json 给出当前最佳对标 target_latency=0.04491291751488147ms、target_speedup=0.626948209054333，因此候选必须把 47.36us 压到该线以下才算超过当前最佳；源码 SHA 未变（frozen.py 逐字节一致）。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "逐流水占用与热点排序（本次首选判据）",
+      "finding": "core0.veccore0 观测窗口 capture_duration=9.371994567918591us：VECTOR active_ratio=0.8969（productive 0.6410，wait_only 0.2559，event_count=552），MTE2 active_ratio=0.8855（productive 0.7759，wait 0.1104，event_count=116），SCALARLDST event_count=1667、SCALAR active 仅 0.0553。热点区域 'source_loop' 71-103（统计 Welford 内层）指令时间累计 78.1us 中 wait 占 52.2us。两条硬件流水几乎同时被占满、且各自带大量 WAIT/BAR，说明瓶颈是“每 tile 的 GM↔UB 搬移与向量计算之间的同步节奏”，而不是某一条多余算术；因此减少每通道的 tile 轮次（同步事件数与 DMA 命令数）是直接可测的作用点。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "相对时钟资质与空闲/等待解释（限制绝对结论）",
+      "finding": "clock_qualification='relative_only'，absolute_time_qualified=false，capture_scope='First to last visible hardware event on this core; partial capture boundaries preserved'，interpretation 明确“No full-kernel duration or dependency-stall attribution”；窗口仅以 fraction 表达（capture_start=0.0, capture_end=1.0），MTE2 idle 34 段、VECTOR idle 118 段。故本诊断只用窗口内的比例与事件计数做相对增量判断，不把 9.37us 窗口与 profiler 的 47.36us 整核 task duration 相减；未报告泳道（如 AIC/CACHEMISS）按辅助泳道处理，不进入关键路径推断。"
+    },
+    {
+      "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+      "category": "source_ir",
+      "role": "实际待编辑 TTIR（唯一可写面）",
+      "finding": "第160-211行是归一化/输出通道：m 循环（m_num_steps_4=cdiv(batch_dim,8)=1）内先做一次 8x128 prologue 载入（第178-182行），内层 n 循环（n_num_steps_6=cdiv(spatial_dim,128)=32）每轮预取下一 tile（第189行 minsi 夹紧到最后一 tile）、计算 addf(mulf(mulf(weight, subf(x,%var)), %inv_std_21), %9)（第197-203行）并写回（第208行）。该通道无归约、无跨 tile 依赖、无掩码（EVEN 路径），是纯逐 tile 流式循环；weight/inv_std/bias 的 tt.splat 位于最内层循环体内（第198、200、202行）。统计 Welford 通道（第47-115行）与两次 tt.reduce、running-stats 更新保持不动。"
+    },
+    {
+      "path": "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/eaea61f4850d20e42140da59577ec1ac4b6b7cf061027bbd093bb577c1d535d4/batch_norm_with_update_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "实际后端产物（冻结）核对疑似冗余是否已被消除",
+      "finding": "输出通道第197-238行：每个 tile 一次 memref.copy(GM→UB, memref<8x128xf32>) + 张量算术，另加 3 个 linalg.fill（第227、229、231行，分别广播 weight/inv_std/bias）；而 mean 的 fill(%19，第109行) 已在循环外被保留 —— 说明后端在源 IR 已外提时会保留外提，循环内的广播确实按每轮一次 fill 落盘（未被消除）。第214-238行的 prefectch 结构显示每通道搬入 33 次（32 tile + 末尾重复搬入最后一 tile，约 3% GM 冗余，后端未消除）；ptr 张量未在 bcmlir 中出现（被折叠为 DMA 描述符/地址寄存器），UB 只承载数据缓冲，这是评估 UB 预算的关键依据。"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "上一轮正式/补测结论（本轮约束来源）",
+      "finding": "ir-003（及探索父 ir-002）在 CPU lowering 阶段即失败：UB 需 10485760 bits=1310720 字节，可用 1572864 bits=196608 字节；结论要求下一轮选“更低占用、独立”的 IR 机制、不得改编译选项、必须为运行时适用条件加守卫。对应 failed-lowering-ir003.json 的 status='lowering_review_failed'。原始 TTIR 已按字节恢复。"
+    },
+    {
+      "path": "lowered-inventory.json",
+      "category": "source_ir",
+      "role": "冻结低层身份清单（可编辑面边界）",
+      "finding": "仅 3 个条目：ttadapter(38781B)、bcmlir(34642B)、npubin(7264B)，全部绑定 ast_sha256=5c1607c0…2508 与同一特化路径，scope='Read-only actual lowering and binary identities from the frozen-source capture'；配合 ir-inventory.json（唯一 TTIR 条目，compiler_options 已冻结：num_warps=2、num_stages=1、multibuffer=true、shared_mem_dynamic_size=221184），可编辑面仅 ir/…/batch_norm_with_update_kernel.ttir。"
+    }
+  ],
+  "hypothesis": "归一化/输出通道的 tile 宽度 8x128 太小：每个 program 在该通道要做 32 轮“搬入 8 行各 512B → 4 个向量张量运算 → 写回 8 行各 512B”，每轮夹带一对 MTE2↔VECTOR 的 SET_FLAG/WAIT_FLAG 与 BAR 同步事件（bcmlir 每轮一次 memref.copy；simulator 中 MTE2 event_count=116、VECTOR wait_only=0.2559、两条流水同时约 89% 占用）。该通道没有归约、没有跨 tile 依赖、逐元素算术只依赖标量 mean/inv_std/weight/bias，所以分块宽度是纯 IR 层可自由选择的结构参数，而编译器当前固定按 BLOCK_N=128 展开（该值来自源码 heuristics 常量 21/128，已被冻结进 TTIR 常量）。把输出通道加宽到 8x256 可把该通道轮次 32→16、DMA 命令数与同步事件数近似减半、连续搬运段 512B→1KB，而每个元素的算术次数与顺序完全不变。Codex 的分析（codex-brief.json）也指出应“只加宽归一化/输出通道、保留完整统计通道，并用运行时空间整除守卫+原输出路径兜底，先做二倍宽度试探”，本诊断核对实际 TTIR/bcmlir 后采纳这一方向，并把实现限定在 scf.if 的单一真分支内以控制 UB 占用（统计通道与累加器一律不动，避免 ir-003 的 1.31MB UB 溢出）。",
+  "alternatives": [
+    "加宽统计(Welford)通道或 8x512 累加器：ir-002/ir-003 已证明 UB 需 1.31MB 远超 192KB，予以排除；本轮不再触碰统计累加器。",
+    "一次直接加到 8x512：每 tile 数据缓冲翻到 16KB×若干，且在 multibuffer=true 下存在 UB 超限风险；先用 8x256 二倍试探，若 UB 与收益都成立再考虑下一轮加宽。",
+    "把循环内的 3 个不变量 splat(weight/inv_std/bias) 外提到输出通道循环之外：bcmlir 第227/229/231行确认它们当前每轮各落一个 linalg.fill（每轮 7 个张量算子中 3 个是广播）；但该改动只削算术指令、不削每轮同步/DMA 节奏，且与“减少轮次”属不同机制，留作下一轮的独立候选。",
+    "消除每通道末尾重复搬入最后一 tile 的 3% 冗余（33 次 copy/32 tile，后端确未消除）：需改写预取/夹紧与 yield 结构或引入条件载入，收益小、破坏流水结构的风险大，暂不做。",
+    "改编译选项（num_stages/multibuffer 等）或重写 frozen.py：按本轮要求分别属于独立研究身份且源码冻结，不作为本轮候选。"
+  ],
+  "change": "只编辑 ir/5c1607c0…2508/batch_norm_with_update_kernel.ttir 的归一化/输出通道（原第160-211行区域）。具体：1) 在原输出 m 循环之前新增运行时守卫：%c255/%c256 常量、%spatial_rem = arith.remsi %spatial_dim, 256、%spatial_wide = arith.cmpi eq %spatial_rem, 0、%n_num_steps_w = arith.divsi(%spatial_dim+255, 256)，以及 %tile_lane_w = tt.make_range end=256；2) 用 scf.if %spatial_wide 分流：真分支使用 8x256 tile 的等价循环 —— 同一 prologue 载入、同一 minsi 夹紧预取（步长 256，迭代上界 %n_num_steps_w）、同一元素算术顺序 arith.subf → arith.mulf(weight) → arith.mulf(inv_std) → arith.addf(bias) → tt.store；假分支逐字节保留原 8x128 循环（含其原有 splat/夹紧/写回结构）；3) 统计(Welford)通道、两次 tt.reduce、final_mean/inv_std、running_mean/var 更新、weight/bias 空指针 scf.if、函数签名与 ABI、常量 8/128/EVEN 一律不改。真分支所有新 SSA 名带 _w 后缀，避免与假分支同名；不改变任何指针算术语义（feat/batch stride 用法与原通道逐项对应）。",
+  "expected": "守卫为真时（本用例 spatial_dim=4096，4096%%256==0，走真分支）：归一化通道每 program 轮次 32→16，该通道 MTE2 搬移命令数 33→17，每轮一对 SET_FLAG/WAIT_FLAG 与 BAR 同步事件减半，连续搬运段 512B→1KB；统计通道与归约完全不变。可测预测：simulator 中该核 MTE2 event_count 由 116 降到约 60–70、VECTOR event_count 由 552 降到约 480–520，VECTOR/MTE2 的 wait_only 比例下降，单核观测窗口相对下降 10–20%（当前窗口 9.37us 量级 → 7.5–8.4us 量级），formal 侧 Task Duration 由 47.36us 对应下降。明确不把循环数减半直接换算成等比例加速（每轮工作量随宽度翻倍，且 MTE2 字节量不变）；是否超过当前最佳 target_latency=0.04491ms 由宿主完整评测判定。",
+  "validation": "宿主侧建议检查：1) TTIR 可解析、lowering 成功，UB 需求显著低于 196608 字节（真分支只新增一个 8x256 的当前/预取/输出/填充临时缓冲，地址张量应如 bcmlir 现状被折叠，统计累加器不变）；2) bcmlir 真分支出现 memref<8x256xf32> 与每通道约 17 次 memref.copy，假分支仍是 memref<8x128xf32> 与 33 次 copy，且 scf.if 守卫条件为运行时 remsi 判定；3) 数值：本用例走真分支，输出须与当前最佳逐元素一致（tolerance atol=rtol=1e-4，required_matched_ratio=1.0，equal_nan=true），save_mean/save_invstd/running_mean_out/running_var_out 也应逐字节同值（统计通道未改）；4) 另以 spatial_dim 不能被 256 整除的合法形状验证守卫回退分支与 numpy/torch 语义一致；5) 完整 KGS 与正式+补测基准，任何一项未过则回到原 TTIR。",
+  "layer_reason": "缺陷本质是“循环分块宽度/每 tile 同步节奏”，这是 TTIR 层可表达的结构参数：源码 frozen.py 与 heuristics 常量（BLOCK_N=128）已冻结并逐字节一致，编译选项与低层 ttadapter/bcmlir/npubin 只读，唯一可写面是清单列出的 ir/*.ttir。该修改不改变函数 ABI、不改变数学语义与 FP 结合顺序、不引入跨 tile 依赖或新的归约，属于编译器本可自行选择的 tiling 决策（后端确实按源码常量 8x128 逐 tile 落 33 次 copy 与每轮同步），所以在 single_operator_ir 层做最小修复是最合适且唯一可行的层。",
+  "simulator_incremental_judgment": "profiling 给出的是整核 47.360947us（Block Dim=64）；simulator/timeline 给出的是单核 partial trace 窗口（hotspots 以 us 标注且 unit_validation 通过，timeline 却标注 clock_qualification='relative_only'、absolute_time_qualified=false、capture_start/end 仅 fraction），两者时钟资质不同，不可相减、不可外推为整核加速比。因此本轮增量判据只用窗口内的可观测量：MTE2/VECTOR 的 event_count 与 active/wait_only 比例、以及每 tile 的同步节奏是否随轮次减半而下降；绝对收益仍以宿主 formal+补测的 Task Duration 是否低于 0.04491291751488147ms 为准。"
+  ,
+  "unknown": [
+    "8x256 真分支在 multibuffer=true 下的实际 UB 分配量（地址张量是否被完全折叠），需由 lowering 结果确认；若超限则回退 8x128 原路径再另选机制。",
+    "scf.if 双分支是否会因代码复制影响自动流水调度（是否把真分支的预取重排），只能由实际 bcmlir/器件观测确认。",
+    "减少轮次带来的同步节省与每轮变长的延迟暴露之间的净效应，属于需要在完整评测中测量而非由指令计数推断的量。"
+  ]
+}

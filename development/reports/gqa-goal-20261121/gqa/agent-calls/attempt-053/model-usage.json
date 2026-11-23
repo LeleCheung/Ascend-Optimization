@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 46,
+    "duration_ms": 113340,
+    "usage": {
+      "input_tokens": 48420,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1227520,
+      "output_tokens": 19072,
+      "output_tokens_details": {
+        "thinking_tokens": 7830
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 48420,
+        "outputTokens": 19072,
+        "cacheReadInputTokens": 1227520,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.3326599999999995,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 7830,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.3326599999999995,
+    "result": "已按流程完成本阶段修复与交接。总结如下：\n\n## 核对结果\n- 当前候选 SHA：`9d53bf02833dc781fa26abd94c4fa6122f2517e93dc062b12e8f60cf03538baf`（与 repair-feedback、host-review 一致）；`cases` 为空、无 formal result，确认尚未设备评测。\n- 真实问题只在 host 端的适用条件：\n  - `candidate.py:711` 在非因果、`BLOCK_D<=128` 路径上于 `SKV>=256 且 SKV%256==0` 时把 `BLOCK_N` 置为 256；\n  - 原 M256 谓词只查 `BLOCK_N==256`，未查 `SKV==BLOCK_N`，因此 SKV=512 也会把 `BLOCK_M` 抬到 256；\n  - 此时 `SINGLE_KV=false`、`PART_TILES=false`（`candidate.py:744–766`），内核落入通用二维 grid 的非 PART 分支，M256 仅改变该分支 tiling，既非所请求的 fullKV256 PART_TILES 实验，也让 256×256 fp32 `p` 与 256×128 fp32 `acc` 同时活跃、触碰 UB 预算。\n  - 实际 TTIR（`actual-ir/2-_gqa_fwd_kernel.ttir`）确认既有观测基础是 M128：QK `128x128xbf16 × 128x256xbf16 → 128x256xf32`、PV `128x256xf16 × 256x128xf16 → 128x128xf32`、`T=512`、`P=20`。`failed-ir/attempt-052` 为空，当前源码没有任何实测 IR。\n\n## 写入并记录的决策\n- 用 Edit 写入 `diagnosis.json`：`selected_layer`、`layer_reason`、`simulator_incremental_judgment`（本轮未用模拟器，原版证据仅历史背景）、证据（evaluation/source_ir，含 path/category/role/finding）、宿主建议与我的具体修复、假设、改法、预测、验证、未知项。\n- 工具桥记录成功：decision id `c623fcef0e304637b9365a06072cc6b9`，绑定修改前源码 `9d53bf…`。\n\n## 实际修复（仅谓词）\n- `candidate.py:730–732` 增加 `SKV == BLOCK_N`（在该非因果路径上等价于 `SKV==256`/`SINGLE_KV`）；文件头与该处注释记录适用边界。\n- 内核 body、M256 提前分母归约顺序、grid/P 公式、launch cache、dtype 与精度路径均未改动。新 SHA：`843cf1451ebed4a7c9adad71f53b48aa0f0e6df64d9e8c052d437ceefd41d93b`。\n- 取舍：合同四 case 的精度、活跃缓冲、交接链数（case4 T=256、每 worker 12/13 链；case7 T=64）与并行度（P=20）均按 host 元数据推导逐项不变；范围外 SKV≥512 恢复父版 M128 通用路径，仅放弃一个无证据支持、也未被请求的 M256 通用分支行为。\n\n## 交接状态\n- `preflight` 返回 `awaiting_source_review`（source `843cf145…`）。候选字节保持不变并交接，等待外部源码审查；本阶段不声称已编译或存在真机收益，`diagnosis.json` 已记录待验证项与未知项。原保留版 `3c34fdfb…` 独立冻结、未改动。"
+  }
+}

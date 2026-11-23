@@ -1,0 +1,91 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "round": "attempt-054",
+  "source_sha256": "843cf1451ebed4a7c9adad71f53b48aa0f0e6df64d9e8c052d437ceefd41d93b",
+  "retained_source_sha256": "3c34fdfb6ef2aacc3b0ae8cbd0683bd22d7610ffcb388c6ef2da50d0a72c04ee",
+  "retained_source_policy": "原保留版 starter.py（3c34fd…）独立冻结，不修改；本次修复只沿当前失败源码 candidate.py（843cf1…）明确接续。",
+  "selected_layer": "triton_kernel_tiling_geometry（编译期 BLOCK_M/BLOCK_N 选择与资源预算层）",
+  "layer_reason": "真实失败发生在 ConvertLinalgIRToBinary 的目标资源检查，既不是主机启动层也不是数值计算层：case4 的整段 KV 单块 M256 实验把 QK 的 fp32 cube 累加器抬到 256x256（256KiB），超出 cc/L0C 的 128KiB 上限 2 倍，同时 UB 超 512B。该失败由编译期 tile 几何唯一决定，因此优先修 tile 几何；不改 checker、golden、dtype、计时口径或其他三个 case 的执行路径。",
+  "host_repair_recommendation": {
+    "source": "host-repair-analysis.json",
+    "recommended_mechanism": "仅 M256 分支：在 FP16 截断/PV 之前先用同一个 FP32 分母归一化 FP32 p（p / l_new[:,None]），再做 p16 与 PV，out 直接取 dot 结果，删去 PV 后的除法；FP32 分母不变，不使用量化 sum、不用近似倒数 intrinsic、不把 l 转 FP16；若仍失败则如实保留 UB 结果，不静默降 M 或改精度。",
+    "host_finding": "M256 + 提前 FP32 sum 后 UB required 197120B 对 available 196608B，仅多 512B；宿主推测峰值为 FP32 P 128KiB + AIV P16 send 64KiB + 行分母 512B，属 liveness 假设。",
+    "gap_against_actual_ir": "宿主分析只处理了 UB 的 512B，而实际失败反馈与 IR 同时给出 cc overflow: requires 2097152 bits while 1048576 bits available；该 2097152 bits 正好等于 case4 的 tensor<256x256xf32> QK 累加器。把分母运算提前/归一化不改变 QK matmul 的输出 tile 形状，因而不可能消除这 2 倍 cc 超限。故未采纳该机制作为本次修复。"
+  },
+  "my_repair": {
+    "mechanism": "撤回 M256 的编译期抬升：非因果路径 BLOCK_M 保持 128，让 case4 回到与 case7 相同的 M128 x N256 SINGLE_KV PART_TILES 几何。仅删除/失效 candidate.py 中的 M256 选路条件，其余源码、表达式、精度路径、20 worker 分区逐字保留。",
+    "precision_tradeoff": "case4 回到与 case7 相同的 M128 精度路径：仍为 BF16 输入、QK fp32 累加后显式 FP16 往返、FP16 公共偏移 exp2、单次 FP16 PV、PV 后 fp32 归一化；相对于失败源码不引入新的数值近似，也不改变相加顺序。case7 的同一结构已在本次编译并通过 checker；但当前源码尚未重新编译，故不声称 case4 已通过。",
+    "buffer_tradeoff": "p 由 256x256 FP32（256KiB）回到 128x256 FP32（128KiB），QK 累加器由 256x256 FP32（256KiB）回到 128x256 FP32（128KiB，正好等于 cc 预算），K/V/Q 仍为 256x128 BF16。预计同时消除 cc 2 倍超限与 UB 512B 超限；测量前不宣称已通过编译。",
+    "handoff_tradeoff": "case4 的 tile 数 T 由 M256 意图的 256 回到 512，每 worker 串行链数由 12/13 回到 25/26；即放弃本实验预期的交接链减半，但该 M256 调度从未编译成功，故相对已验收 M128 路径没有实测回退。case1/2/7 的链数不变。",
+    "parallelism_tradeoff": "P=20 常驻 worker 与 floor 连续分区不变；grid 仍为 (20,)，并行度不变。",
+    "other_three_cases": "case1/case2/case7 的 constexpr、分块、精度、分区和发射路径逐字不变，目标是零行为变化。",
+    "dead_code_note": "当前源码中 BLOCK_M>=256 的提前分母归约分支在撤回 M256 后对本合同不可达；按要求沿失败源码最小接续，暂不删除该分支，以免扩大字节改动面。"
+  },
+  "post_edit_observation": {
+    "candidate_sha256_after_repair": "f6ffa802e8549e0e233db5401f6adb756d0baaba40a75ec53fbe4cc904819025",
+    "edit_summary": "仅把 candidate.py 的 M256 抬升改为一律保持 BLOCK_M=128，并在原位加入失败 IR 依据说明；未改动任何数学表达式、BLOCK_N、PART_TILES、P=20、dtype 选路或主机发射路径。",
+    "preflight": "awaiting_source_review：工具桥在设备操作前要求外部只读路径与地址边界审查，返回时保持当前候选不变。",
+    "claim_policy": "当前源码尚未在设备上重新编译或评测，因此不声称已通过编译，也不声称存在真机收益；等待审查/交接后的 preflight 与完整四项反馈。",
+    "not_yet_verified": [
+      "case4 的 cc/UB 是否实际落入预算（仅由 IR tile 尺寸推断，未重编译确认）",
+      "case4 的 official_checker 与 candidate_timing（本次无结果）",
+      "case1/2/7 是否仍与本次通过的字节行为完全一致"
+    ]
+  },
+  "simulator_incremental_judgment": "未使用模拟器：本轮未运行模拟器，也未把历史 simulator-evidence.json 重读为当前候选观测；不做模拟器增量判断，不声称模拟器对本次失败或修复有因果贡献。",
+  "evidence": [
+    {
+      "path": "workspace/repair-feedback.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "完整四项返回：case1/2/7 official_checker passed（case1 max_diff 0.000244140625，case2/7 亦通过），case4 error 为 MLIRCompilationError；resource_bytes required=197120 > available=196608，错误文本同时含 ub overflow（1576960>1572864 bits）与 cc overflow（2097152>1048576 bits）；case4 candidate_timing 为 null。即四项中唯一失败是 case4 编译期资源超限，不是数值不达标。"
+    },
+    {
+      "path": "workspace/failed-ir/attempt-053/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "case4（BF16，Q/K/V 均 256x128）的 QK 为 linalg.matmul ins 256x128xbf16 × 128x256xbf16 outs tensor<256x256xf32>；该输出 65536×4=262144B=2097152 bits，与 cc 报错 required 精确相等，而可用 1048576 bits=131072B。即单个 M256xN256 fp32 cube 累加器就是 cc 的 2 倍硬超限，与分母/p 的 liveness 无关。"
+    },
+    {
+      "path": "workspace/failed-ir/attempt-053/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "同一 case4 IR 已把 FP32 分母归约（linalg.reduce 256x256f32 -> 256xf32）排在 p 的 truncf 到 256x256xf16 与 PV matmul 之前，可见当前失败源码已经实现了宿主所说‘提前分母’的前半部分，但 UB 仍报 197120B；p 的 256x256 FP32（256KiB）与 p16 的 128KiB 是该分支的主要活跃缓冲。"
+    },
+    {
+      "path": "workspace/failed-ir/attempt-053/3-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "case7 的 M128 x N256 SINGLE_KV PART_TILES 几何：QK 为 linalg.matmul ins 128x128xbf16 × 128x256xbf16 outs tensor<128x256xf32>，即 131072B=1048576 bits，正好等于 cc 可用预算；该 case 在本次评测中成功编译且 official_checker passed，p 为 128x256 FP32（128KiB）。这给出 M128 几何可行的直接对照。"
+    },
+    {
+      "path": "workspace/failed-ir/attempt-053/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "case4 TTIR 显示 qk/p 均为 256x256 f32，p16 为 256x256 f16，out 为 256x128 f32；与 bcmlir 一致，确认超限来自 M256 的整块 tile 形状，而非指针/掩码临时量。"
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "trigger",
+      "finding": "第 730-733 行仅在 V=BF16、BLOCK_M==128、BLOCK_N==256==SKV、BLOCK_D==128 且 S%256==0 时把 BLOCK_M 抬到 256（case4 命中）；第 397-412 行是 M256 专属的提前分母/后 PV 分支。源 SHA 843cf145…与 feedback/context 一致，失败沿此源码接续。"
+    },
+    {
+      "path": "workspace/host-repair-analysis.json",
+      "category": "other",
+      "role": "background",
+      "finding": "宿主建议只在 M256 内先归一化 p 再 PV，目标是释放 512B 分母 liveness；其自身标注为 liveness 假设，未处理实际 IR 中的 cc 2 倍超限，故只能作为待比较建议而非本次选定机制。"
+    }
+  ],
+  "hypothesis": "case4 的失败主因是 M256 x N256 的 QK fp32 cube 累加器（256KiB）超过 cc/L0C 的 128KiB 硬上限 2 倍；UB 的 512B 超限是该 M256 tile 的次要后果。撤回 M256 抬升、让 case4 使用 M128 x N256 几何后，QK 累加器与 p 都回到 128x256 fp32（128KiB），与已成功编译并通过 checker 的 case7 同形，因此 cc 与 UB 应同时落入预算。",
+  "change": "在 candidate.py 中令 M256 选路不再生效：删除/停用第 730-733 行的 BLOCK_M=256 抬升，非因果 case4 保持 BLOCK_M=128；不改 BLOCK_N=256、SINGLE_KV、PART_TILES、P=20 分区、表达式、精度路径与主机发射缓存。M256 专属的提前分母分支保留为不可达历史代码，不做超出修复所需的改动。",
+  "expected": "预检阶段 case4 不再出现 cc overflow（QK 输出由 256x256xf32 降为 128x256xf32）与 UB overflow（p 由 256KiB 降为 128KiB）；case4 与 case7 走同一 M128/N256/SINGLE_KV/PART_TILES 结构，tile 数 T=512、每 worker 25/26 链、P=20。case1/2/7 预期字节级行为不变。上述均为待验证预测，当前源码尚未重新编译，不声称已通过。",
+  "validation": "1) 用工具桥 preflight 编译当前候选，确认四项均可编译；若返回 awaiting_source_review 则保持候选字节不变并交接。2) 运行完整四项正式评测：case1/2/7 的 official_checker、dtype、阈值、warmup/trials/iterations 与计时口径保持不变；case4 需 official_checker passed 且无编译错误。3) 对比 case4 的 candidate_timing 与冻结 retained 基线及历史 M128 数值，如实记录收益/退步。4) 核对新 IR：case4 QK 为 128x256xf32、p 为 128x256xf32，确认 cc/UB 不再超限。",
+  "unknown": [
+    "M128 case4 的 UB 峰值是否严格 ≤196608B：case7 同形已编译，但 case4 的 b=4、G=8、NKV=8、T=512 只影响标量与循环界，预计不新增张量；需实际 IR 确认。",
+    "撤回 M256 后 case4 的交接链回到 512 条（25/26 每 worker），相对失败实验的 256 条是明确代价；由于 M256 从未编译成功，没有可比的真机收益可损失，但相对其他未来调度的机会成本未知。",
+    "宿主建议的‘PV 前归一化’若单独用于 M256 是否仍会被 cc 阻断，未做编译验证；依据 IR 的算术判断为会阻断，但未实测。",
+    "本修复不改变 case1/2/7 的任何字节路径，但仍需完整四项评测确认没有非预期的 specialization 变化。",
+    "若 M128 路径在 case4 上出现新的资源或数值问题，需保留精确失败 IR，不用降精度或静默缩 M 的方式补救。"
+  ]
+}

@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 
@@ -13,6 +14,8 @@ def main():
     p.add_argument('--case',type=int,required=True)
     p.add_argument('--side',choices=['candidate','reference'],required=True)
     p.add_argument('--output',type=Path,required=True)
+    p.add_argument('--snapshot-kernel',help='Save true device inputs immediately before this launch')
+    p.add_argument('--kernel-replay',type=Path,help='Replay an analysis-only launch snapshot')
     a=p.parse_args()
     import torch,torch_npu
     torch.set_num_threads(1);torch.npu.set_device(0)
@@ -32,8 +35,26 @@ def main():
         torch.ops.npu.npu_fused_infer_attention_score(q,k,v,num_heads=q.shape[2],num_key_value_heads=k.shape[2],input_layout='BSND',scale=scale,atten_mask=mask,sparse_mode=0)
         torch.npu.synchronize()
     else:
+        ir_binding=None
+        if os.environ.get('GQA_BCMLIR_MANIFEST'):
+            from gqa_bcmlir_runtime import install
+            ir_binding=install(Path(os.environ['GQA_BCMLIR_MANIFEST']))
         spec=importlib.util.spec_from_file_location('gqa_candidate',a.source)
         module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        binding_spec=dict(source=str(a.source),source_sha256=hashlib.sha256(a.source.read_bytes()).hexdigest(),
+            case=case,contract_sha256=hashlib.sha256(a.contract.read_bytes()).hexdigest())
+        if a.snapshot_kernel:
+            from hgkda.runtime.launch_replay import capture_call
+            capture_call(binding_spec,a.snapshot_kernel,a.output/'launch-snapshot',
+                lambda:module.run(*inputs,**case['attrs']),binding_spec['contract_sha256'])
+            return
+        replay=None
+        if a.kernel_replay:
+            from hgkda.runtime.launch_replay import load_call
+            manifest=json.loads(a.kernel_replay.read_bytes())
+            binding_spec['kernel_replay']=dict(manifest=str(a.kernel_replay),
+                manifest_sha256=hashlib.sha256(a.kernel_replay.read_bytes()).hexdigest(),kernel=manifest['kernel'])
+            replay=load_call(binding_spec,module)
         from triton.runtime.jit import JITFunction
         original=JITFunction.run
         def capture(kernel,*values,**options):
@@ -46,9 +67,22 @@ def main():
                     if target.exists():assert target.read_bytes()==raw
                     else:target.write_bytes(raw)
                     artifacts.append({'path':target.name,'sha256':hashlib.sha256(raw).hexdigest()})
+                if ir_binding and kernel.__name__==ir_binding['symbol']:
+                    lowering_text=compiled.asm.get('bcmlir','')
+                    if ir_binding['target_marker'] in lowering_text:
+                        raw=Path(ir_binding['changed_ir']).read_bytes()
+                        target=a.output/(kernel.__name__+'.applied.bcmlir')
+                        target.write_bytes(raw)
+                        artifacts.append({'path':target.name,'sha256':hashlib.sha256(raw).hexdigest()})
             return compiled
         JITFunction.run=capture
-        try:module.run(*inputs,**case['attrs']);torch.npu.synchronize()
+        try:
+            if replay:
+                kernel,values,options=replay
+                kernel.run(*values,**options)
+            else:
+                module.run(*inputs,**case['attrs'])
+            torch.npu.synchronize()
         finally:JITFunction.run=original
     (a.output/'manifest.json').write_text(json.dumps(dict(source_sha256=hashlib.sha256(a.source.read_bytes()).hexdigest(),
         contract_sha256=hashlib.sha256(a.contract.read_bytes()).hexdigest(),case=case,side=a.side,

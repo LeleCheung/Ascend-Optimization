@@ -1,0 +1,61 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "662015b9edecc3a76cfe60656e2441f51fcfe31483fe514d387dda21d84aa730",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4成对profiling（候选20程序/参考19程序）：候选Task Duration 160.623215us、参考121.842438us；候选两路vector的aiv_vec_time均49.1915us，已低于参考59.014/59.015us，而aiv_scalar_wait_time为9.1234/9.3056us、参考仅1.4826/1.5213us（约6倍），即候选向量侧剩余差距集中在依赖等待而非向量算术量；cube侧aic_scalar_wait_id1_time 142.1835us为主等待项。候选L0C_to_GM 2457.6KB/程序（合计49152KB）= 512 tile×(QK 64KiB f16 + PV 32KiB f16)，说明两条交接已按f16搬出，输出归一化仍在FP32域。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "第99-109行：PV dot 输出 tensor<128x128xf32> 后先 arith.truncf 到 f16（acc_43）、再 arith.extf 回 f32（acc_44）；分母 %l_new 为 128xf32 归约，经 expand_dims+broadcast 成 tensor<128x128xf32>；第109行 %out_46 = arith.divf %acc_44, %out_45 : tensor<128x128xf32>，第116行再 arith.truncf 到 bf16 落盘。即归一化是整幅128x128 FP32除法，且 acc 的 f32 扩展只服务于该除法（唯一使用者），广播操作数亦为整幅f32。"
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "第94-96行 linalg.matmul (PV) outs f32 → arith.truncf 到 f16 → arith.extf 回 f32；第99-105行整幅 linalg.reduce 得 128xf32 分母 → linalg.broadcast 至 128x128x f32 → %57 = arith.divf %54, %broadcasted : tensor<128x128xf32>；第107行 arith.truncf 到 bf16。BCMLIR 与 TTIR 同形，确认该 FP32 除法与 f32 广播未被后端消除。"
+    },
+    {
+      "path": "workspace/current-fdiv-type-evidence.txt",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "已安装 Triton：semantic.fdiv 调用 binary_op_type_checking_impl(..., arithmetic_check=False, div_or_mod=True)，算术检查关闭故不做 computation_type_impl 提升，随后 create_fdiv(input, other) 并以 input.type 建结果张量，因此 f16 操作数可保持 f16；而 truediv(`/`) 走 computation_type_impl 的 div_or_mod 规则，fp16/bf16 一律返回 tl.float32。结论：只有显式 tl.fdiv 能表达 f16 除法，普通除法在本源码中必然升到 FP32。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "父版本(662015b9)正式四项候选用时：case1 103.65705us、case2 100.4906us、case4 158.34115us、case7 100.7191us，四项官方checker均passed；case4为本轮目标行，其余三项作为不回归基线。"
+    },
+    {
+      "path": "workspace/contract.json",
+      "category": "other",
+      "role": "background",
+      "finding": "固定case1/2/4/7与官方checker 12180ce7、golden c86aaa0b，计时warmup5/trials3/iterations20；case4为bfloat16 B4 S256 Nq64 Nkv8 D128 G8 非因果、scaleValue=-1，值域[-1,1]，即 PART_TILES 且 NO_OFF 判据命中的目标形状。"
+    }
+  ],
+  "hypothesis": "在 PART_TILES 且 NO_OFF 为真时，输出归一化 acc/l_new 是整个tile最后的跨域依赖：它要求 acc 先 extf 成 128x128 f32、分母广播成整幅 f32 再执行 16384 次 FP32 除法，之后才 truncf 到 bf16 落盘。该整幅 FP32 除法链是向量侧 aiv_scalar_wait_time 升到约9.2us（参考约1.5us）的主要串行段之一。若把除法显式表达为 f16（分子用既有 PV f16 交接值、分母 l_new 转 f16），后端可直接在半精度宽度上做除法，并因 acc 的 f32 扩展唯一使用者消失而被消除，同时整幅 f32 广播变为 f16 广播；输出本就以 bf16 落盘（2^-9），f16 除法引入的 2^-11 相对误差低于输出量化步长，故精度代价可被输出舍入吸收。",
+  "alternatives": [
+    "保持 FP32 除法但先算每行倒数再乘（32次倒数替代16384次除法）：058 曾以原生 FP32 倒数实现，内核时间改善但正式总时退化至163.8466us，且本轮明确禁止该路径，故不作为本机制。",
+    "只把分子转 f16、分母保留 f32：truediv/普通除法会按 computation_type 提升回 f32，无法得到 f16 除法；且额外插入一次 f32 扩展，无收益。",
+    "分母 l_new 转 bf16 做除法：Triton/Ascend 无 bf16 原生除法，仍会提升到 f32。",
+    "把整段归一化推迟到 host：违反设备计算必须严格 Triton 的合同。",
+    "继续调整分块/worker 划分：本轮凭证显示向量算术时间已低于参考、程序数已单波次，收益空间在其余依赖链，不在分块。"
+  ],
+  "discriminating_observation": "修改后读取实际 TTIR/BCMLIR：若出现 arith.divf 的 tensor<128x128xf16>（操作数为 PV 的 f16 交接值与 f16 宽度分母），且原 acc 的 arith.extf 与 128x128 f32 广播消失，则机制成立；若后端把 f16 divf 重新提升为 f32（出现新的 extf 到 f32 再 divf f32），或保留 f32 广播，则收益不存在，只能按真实无收益/退步记录。最终以四项真机评测判定 case4 是否低于158.34115us、case7 是否同向变化、case1/2 是否不回归。",
+  "change": "仅改 candidate.py 中 _gqa_tile_part_body 的输出归一化：NO_OFF 为真时用 out = tl.fdiv(acc.to(tl.float16), l_new[:, None].to(tl.float16))，随后沿用既有 out.to(Out.dtype.element_ty) 的 BF16 落盘；NO_OFF 为假时保留原 out = acc / l_new[:, None]（FP32 除法）。exp 仍为 FP32、分母 sum 仍为 FP32 归约、PV 仍为单次 BF16×BF16、QK 与 PV 两条 f16 交接、分块、grid、20 worker 分区、host 缓存与非 PART 路径全部逐字不变。不读输入值、不按 case_id 选路、不改 checker/阈值。",
+  "expected": "编译期预期：TTIR 出现 arith.divf %acc_f16, %broadcast_f16 : tensor<128x128xf16>，acc 的 arith.extf 被消除，分母仅需 128 个 f32→f16 转换，输出由 f16 转 bf16 落盘；L0C_to_GM 不变（49152KB，两条交接已是 f16）。性能预期：case4 总用时低于158.34115us，向量侧 aiv_scalar_wait_time 与 aiv_vec_time 至少一项下降；case7（同为 BF16 非因果 SKV=256、NO_OFF 命中）同向改善；case1/2 不走该分支，用时与数值保持不变。若后端内部把 f16 除法提升回 f32，则按真实无收益记录。",
+  "validation": "先用工具桥 preflight 复核编译（仅候选源码），再交宿主只读路径与地址边界审查；随后由原官方四项 checker 以不变阈值做完整四项真机评测，比对 case1 103.65705us / case2 100.4906us / case4 158.34115us / case7 100.7191us，并读取修改后实际 TTIR/BCMLIR 与成对 profiling（含 L0C_to_GM、aiv_scalar_wait_time、aiv_vec_time）与模拟器重放，逐项确认预期变化或按真实无收益记录。",
+  "selected_layer": "source_triton_kernel_elementwise_div",
+  "layer_reason": "证据把剩余串行段定位在单块体末尾的输出归一化表达式（整幅 FP32 除法 + f32 广播 + 仅服务于除法的 acc f32 扩展），属于 Triton 可表达的分块内计算组织；改动只替换这一处表达式的操作数类型，不触及分块、调度、搬运、host 与其它分支，因而能用最小实验区分『除法宽度与扩展消除』这一机制。",
+  "simulator_incremental_judgment": "当前剩余歧义只有两点：(1) 后端是否把 f16 arith.divf 落实为半精度向量除法，还是内部提升回 f32；(2) f16 除法是否改走更慢的近似迭代序列。二者都只能由修改后的实际 TTIR/BCMLIR 与真机 profiling 区分。宿主既有的模拟器知识来自 057 的三核部分窗口（各自归一化、application_completed=false），只给出跨核等待的排序，不含除法指令级时间或类型落实信息，无法回答上述歧义；本轮改动不改变分块、搬运与跨核交接结构，模拟器不会提供新的区分证据，故无需新增模拟器输入，修改后仍按既有材料做重放核对。",
+  "unknown": [
+    "Ascend 向量单元在半精度宽度上的除法实际指令序列与吞吐未知，需修改后编译产物确认。",
+    "l_new 转 f16 后分母的相对舍入为 2^-11；合同 [-1,1] 均匀输入下每行 l_new 典型约1.5e2~3e2（远低于65504），理论上界256·e^16.3≈3e9仍超 f16 上限，属适用范围限制，需原四项 checker 与真机确认不触发。"
+  ]
+}

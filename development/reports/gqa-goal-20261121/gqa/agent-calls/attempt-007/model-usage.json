@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 37,
+    "duration_ms": 78072,
+    "usage": {
+      "input_tokens": 32722,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 636800,
+      "output_tokens": 10790,
+      "output_tokens_details": {
+        "thinking_tokens": 3710
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 32722,
+        "outputTokens": 10790,
+        "cacheReadInputTokens": 636800,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 0.7517599999999998,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 3710,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 0.7517599999999998,
+    "result": "预检已返回 `awaiting_source_review`，候选字节保持为 `5e7b92e8…2ceb6`，交接宿主只读审查与完整四项真机评测。\n\n## 本轮执行的机制（宿主指定 BM256 编译实验）\n\n**改动（仅宿主分块元数据）**\n- `run()` 中因果路径保持 `BLOCK_M=64, BLOCK_N=64`（case1 不变）。\n- 非因果路径 `BLOCK_N` 恒为 128；仅当 `value.dtype == torch.bfloat16 and D <= 128 and S >= 256` 时 `BLOCK_M=256`，否则仍为 128。\n- 因此只有 case4（BF16, S=256, noncausal, D=128）受影响；case2（FP16, S=128）、case7（BF16, S=128）与 case1 走逐字不变的已验收分支。\n- `_gqa_fwd_kernel` 函数体从 `@triton.jit` 到函数结束与起点 SHA 完全一致（`4de045bf…8cddee`，两端相同）；未改 BLOCK_N，未引入更宽 N、SINGLE_KV、peeling。\n\n**证据（本轮实际读取）**\n- `current-profiling.json`：case4 512 program、394.99us，每程序 cube 1.345us vs scalar_wait 10.260us，GM→L1 224KiB/program、L0C→GM 256KiB/program；CANN 参考 19 block/130.1us。\n- `actual-ir/2-_gqa_fwd_kernel.ttir`：case4 BF16 特化为 `tensor<128x128xbf16>` Q、`scf.for 0..256 step 128`、单次 `128x128xf16` PV，确认现状确为 M128/N128/单 fp16 PV。\n- `actual-ir/0-_gqa_fwd_kernel.bcmlir`：两个 matmul 的 M 维即宿主 BLOCK_M，几何随 M 翻倍。\n- `previous-result.json`：已验收四项 92.1861 / 87.4386 / 400.21285 / 92.7701 us。\n\n**预期与风险（按指令保留）**\n- case4：grid 512→256 program，仍 2 次 KV 迭代/程序；总 K/V 搬运预计 112→80MiB 量级，总 L0C→GM 量级不变；Q/Out/acc 的 M 维翻倍（acc fp32 256×128 ≈ 128KiB 单缓冲）。\n- 未经验证的 UB/L0C 估算仅作预测：可能超出 196608B 而**真实编译失败**——该失败本身是本实验的有效结果，未用于取消实验。\n- 数值路径完全不变（同一 j 顺序、同一两项分解/单 fp16 PV、同一 alpha 重缩放），原四项 checker 阈值保持。\n\n**已登记**：`decision --record` → `5d4bae96…3b3`，绑定修改前源码 `fb1233ed…003a6`；诊断文件含 source_sha256、5 条 evidence（paired_profiling/source_ir/evaluation/other）、hypothesis、alternatives、discriminating_observation、change、expected、validation、selected_layer=`host_launch_metadata`、layer_reason、simulator_incremental_judgment（本轮未用模拟器、剩余歧义只能由真实编译回答）。\n\n请在真机编译/评测后反馈 case4 是否编译通过及其计时，以及 case1/2/7 的同口径变化；届时我会更新诊断观测与未决项并继续下一机制。"
+  }
+}

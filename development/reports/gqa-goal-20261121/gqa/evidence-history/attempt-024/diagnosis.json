@@ -1,0 +1,49 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113",
+  "evidence": [
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "PERSIST_KV 分支的输出 store 用 %cst_6=dense<8192>=NQ*D 作为行跨度、hq*128 作为头偏移（o_ss=8192、o_sh=128），128x128 输出 tile 每行仅 256B 却相距 16KB，是 128 段离散 256B 写。把 o_ss 改为 D=128、o_sh 改为 S*D=32768 后，同一 tile 变成连续 32KB 单块。"
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "trigger",
+      "finding": "veccore 窗口热点里有 MTE3/MOV_SRC_TO_DST_ALIGN，detail=Src:UB,Dst:OUT，source line 233 正是 o_sb/o_ss/o_sh/o_sd 参数，窗口内 7.26us 与 3.60us，并伴 SET_FLAG/WAIT_FLAG/BAR 交接；该核 MTE3 productive 0.229、wait_only 0.137，是内存流水里占用最高者。application_completed=false，仅三核部分窗口。"
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "disambiguation",
+      "finding": "case4 候选 kernel Task Duration 257.645us（对照 CANN 127.143us）；vector0/vector1 的 UB_to_GM 各 28672KB，说明输出经 UB 写出量固定，与算术无关。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "保留最佳 case4 full_call_us=262.27775，四项 official checker 在阈值 0.0078125 下全部通过；本轮即以该数为 case4 目标。"
+    }
+  ],
+  "hypothesis": "输出 tile 的写回形状是独立的搬运代价来源：当前物理 BSND 下 o_ss=NQ*D=8192、o_sh=D=128，128x128 tile 拆成 128 段跨 16KB 的 256B 写；只把 host 端输出分配改成逻辑 BSND、物理 BNSD（stride=(S*NQ*D, D, S*D, 1)，o_ss=128、o_sh=32768），同一 tile 即连续 32KB，MTE3 UB→OUT store 的段与描述符开销下降，可能缩短 case4 墙钟。",
+  "alternatives": [
+    "保持连续 BSND，只在 kernel 内按 head 重排 store 顺序：需改 JIT AST，本轮被明确禁止。",
+    "kernel 之后 permute/copy 成连续布局：引入额外分配与设备拷贝，禁止。",
+    "改 Q 的载入布局：输入 stride 固定，与输出 store 无关。",
+    "继续加大 M/N 分块减少 store 次数：上轮已在 UB/L0C 预算边界，且不改变每段形状。"
+  ],
+  "discriminating_observation": "总写出字节不变（输出=B*S*NQ*D*2），唯一变量是 tile 内行距由 8192 改为 128、store 段形状由 128x256B 离散变为单块 32KB 连续。因此任何墙钟差异只能归因于 store 搬运形状，而不是搬运量或算术，可与带宽/算术假设区分。",
+  "change": "仅改 run() 的 host 侧输出分配：把 y 的分配下移到 PERSIST_KV 判定之后，PERSIST_KV 为真时用 torch.empty_strided((B,S,NQ,D),(S*NQ*D,D,S*D,1),dtype,device) 分配逻辑 BSND、物理 BNSD 的输出；其余元数据路径仍分配原连续 torch.empty。每次调用恰好一次输出分配，PERSIST_KV 判据只用原 dtype/causal/SINGLE_KV/分块元数据，不读输入值、不看 case_id；kernel JIT AST、算术表达式与相加顺序、grid 全部不变；直接把该非连续张量按原逻辑 shape/dtype 返回，不新增转换、permute、额外分配或编译选项。",
+  "expected": "case4 输出 store 变为连续 32KB tile，MTE3 UB→OUT 的段/描述符开销下降，若 store 位于关键路径则 case4 full_call_us 低于保留最佳 262.27775；case7（bf16 非因果 SKV=256）同样走 PERSIST_KV 获新布局；case1（因果）与 case2（fp16）不命中 PERSIST_KV，保持原连续分配。代价：Q 与 Out 不再共享行距常量，store 侧多一次行距乘与广播（少量标量/向量地址运算）；接口性质变为返回非连续张量，下游若需连续布局须自付转换，本调用不新增转换。若 store 不在关键路径，则可能持平或小幅回退，由完整四项真机判定。",
+  "validation": "先 preflight --source candidate.py；收到 awaiting_source_review 后保持字节，交宿主只读审查与完整四项真机评测。原 official checker/golden/输入输出 dtype/计时合同不变、阈值保持 0.0078125，四项各自记录真实变化，case4 full_call_us 与 262.27775 对比。",
+  "selected_layer": "host_output_allocation_layout",
+  "layer_reason": "机制隔离在 host 端一次输出分配所携带的合法 stride 元数据；kernel AST/算术与设备 Triton 计算完全不变，因此改动只可能通过 store 搬运形状影响性能，可与算术假设干净区分，且不触及精度结构。",
+  "simulator_incremental_judgment": "模拟器把输出写回定位到具名 MTE3 MOV_SRC_TO_DST_ALIGN(Src:UB,Dst:OUT) 并给出窗口内 7.26/3.60us，属热点增量；MTE3 是该窗口占用最高的内存流水并伴随 SET_FLAG/WAIT_FLAG 交接链，属流水增量。但窗口仅为三核部分窗口、application_completed=false，不能单独证明新布局更快，收益须由完整四项真机计时确认。",
+  "unknown": [
+    "MTE3 输出 store 是否位于 case4 关键路径，或已被计算/交接链掩盖。",
+    "物理 BNSD 下连续 32KB 写在本硬件上相对 128 段 256B 写的实际带宽收益幅度。",
+    "case7 改用新布局后的真实变化方向。"
+  ]
+}

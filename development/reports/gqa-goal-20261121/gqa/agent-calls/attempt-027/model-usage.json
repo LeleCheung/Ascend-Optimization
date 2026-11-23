@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 45,
+    "duration_ms": 108707,
+    "usage": {
+      "input_tokens": 36745,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 961408,
+      "output_tokens": 16105,
+      "output_tokens_details": {
+        "thinking_tokens": 5624
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 36745,
+        "outputTokens": 16105,
+        "cacheReadInputTokens": 961408,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.067054,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 5624,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.067054,
+    "result": "Repair recorded and applied; source frozen at preflight.\n\n## What the failure actually was\nStage 2 casts `value` **element-for-element** into `v16` (`v16f[offs] = value_flat[offs]`), so the buffer keeps the input **BSND** order: element `(b,n,kvh,d)` sits at `b*(SKV*NKV*D) + n*(NKV*D) + kvh*D + d`. The old stage 3 read it as **BNSD**: `base=(b*NKV+kvh)*(SKV*D)`, row stride `D`, channel stride 1. For case4 (NKV=8, SKV=256, D=128) the two maps coincide only at `kvh=n=0` (`kvh*32640 == n*896` has no other integer solution), and every other program stays inside the 2 MiB buffer — so the math was silently wrong with no OOB fault. The parent TTIR (`actual-ir/2-_gqa_fwd_kernel.ttir`, bound to attempt-019, used only as background) confirms the real map for the same contiguous tensor: `v_base = b*262144 + kvh*128`, row advance `*1024` = `NKV*D`.\n\n## Repair (one computational line, host-scoped)\n- `v_base = b*(SKV*NKV*D) + kvh*D`, `offs_n*(NKV*D)`, `offs_d` — matching address; stage 2, the STAGED predicate, the fused/fp16 fallback, scratch sizes and launches are byte-identical.\n- Comments corrected in four places (kernel docstring, staged header, `run()` scratch comment, file header), including a note that the old BNSD read was the defect. Naming/stage count unchanged.\n- Rejected alternatives are recorded: writing `v16` in BNSD during stage 2 (host asked to keep the flat BSND cast) and a host-side permute (forbidden host computation).\n\n## Trade-offs stated before measurement\n- **Precision**: unchanged fp32 softmax path, fp16 P (2^-11 rel) and fp16 V; only the V rows read change.\n- **Active buffers**: unchanged (scores 64 MiB + P 32 MiB + V16 2 MiB for case4, 3 allocations).\n- **Handoffs**: unchanged 3 launches, one `tt.dot` + one L0C movout per stage-3 program; only the V mov-in becomes 256×256 B segments with 2048 B stride at identical byte count.\n- **Parallelism**: grids unchanged.\n\nProcess: decision `3ef0e9ec…` recorded against the pre-edit sha `9ab93d44…` before any text change; post-edit preflight returned `awaiting_source_review` for `fcde9630…`, bytes left untouched. No compile, device result or speedup is claimed — only the four-case + 4 supplementary run under the unchanged checker, golden, dtypes and full-call timing can settle accuracy and whether the staged path beats the retained parent."
+  }
+}

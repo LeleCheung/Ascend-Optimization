@@ -1,0 +1,95 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "77d01b21523e4c2280b22a0b8016657d",
+  "recorded_at": "2026-11-21T08:04:01.047560+00:00",
+  "round_id": "attempt-002",
+  "input_source": {
+    "path": "trace/sources/9c3488b743b2c953259e72c1f75ef3dc060f63cfd5362576bd227171aae0aa08.py",
+    "sha256": "9c3488b743b2c953259e72c1f75ef3dc060f63cfd5362576bd227171aae0aa08"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/bb52e43de672ef18f1136dd6d6cd79a9b674456dc79248e01ae5397770d57f9c.json",
+        "sha256": "bb52e43de672ef18f1136dd6d6cd79a9b674456dc79248e01ae5397770d57f9c"
+      },
+      "original": {
+        "path": "workspace/repair-feedback.json",
+        "sha256": "bb52e43de672ef18f1136dd6d6cd79a9b674456dc79248e01ae5397770d57f9c"
+      },
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "四项原合同全部返回且判定分明：case1 fp16 通过（mere 9.36e-08, mare 9.70e-04 < 9.77e-04, mismatch 2/1048576），case2 fp16 通过（mere 8.95e-08, mare 9.66e-04, mismatch 5/1572864）；case4/case7 均为 MLIRCompilationError，resource_bytes required=855552, available=196608（6844416 bits vs 1572864 bits），无 checker、无 candidate_timing。当前源码因此既未通过编译，也没有可用的设备收益数据。",
+      "source_sha256": "9c3488b743b2c953259e72c1f75ef3dc060f63cfd5362576bd227171aae0aa08"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/68f92b9bd54b3e99d76a5b10d90fb8c0af9dc70dfd8bec5a6d0a4bfc18a7284c.ttir",
+        "sha256": "68f92b9bd54b3e99d76a5b10d90fb8c0af9dc70dfd8bec5a6d0a4bfc18a7284c"
+      },
+      "original": {
+        "path": "workspace/failed-ir/attempt-001/5-_gqa_fwd_kernel.ttir",
+        "sha256": "68f92b9bd54b3e99d76a5b10d90fb8c0af9dc70dfd8bec5a6d0a4bfc18a7284c"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "bf16（BM128/BN128/BLOCK_D128）实际 TTIR：tt.join p_hi,p_lo -> tensor<128x128x2xbf16>，tt.reshape -> 128x256（末轴交错），tt.broadcast v 128x1x128 -> 128x2x128 后 tt.reshape -> 256x128，最后单次 tt.dot(128x256 * 256x128)。即 merge 分支在 UB 里额外物化了 4 个 65536B 级张量（join 3D、p_cat、v 广播、v_cat），并把 PV 的操作数从 2x32768B 放大到 2x65536B；这是该分支独有的、随 N 轴翻倍的活跃缓冲。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/3e195b4bf6ec29e98c1b8c17865bfe3b2c92c881a1211d8934c7e2f1af6fddc2.ttir",
+        "sha256": "3e195b4bf6ec29e98c1b8c17865bfe3b2c92c881a1211d8934c7e2f1af6fddc2"
+      },
+      "original": {
+        "path": "workspace/failed-ir/attempt-001/11-_gqa_fwd_kernel.ttir",
+        "sha256": "3e195b4bf6ec29e98c1b8c17865bfe3b2c92c881a1211d8934c7e2f1af6fddc2"
+      },
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "同一尝试集里的 fp16 编译单元（因果 64/64/128）TTIR 只有两次普通 tt.dot（p_hi、p_lo 各 64x64 * 64x128），没有 join/reshape/broadcast 拼块，其编译通过（case1/case2 均已返回 checker 结果）。结合 case4/case7 的唯一源码差异是 MERGE_PV，可区分两种解释：不是 BM=128 分块本身越界，而是 join/reshape 交错拼块带来的额外活跃缓冲把峰值推到 4.35 倍预算。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/f0a06b3458f7fb9760a9f7789de0770348e323940823925908bad67c361d7049.json",
+        "sha256": "f0a06b3458f7fb9760a9f7789de0770348e323940823925908bad67c361d7049"
+      },
+      "original": {
+        "path": "workspace/host-repair-analysis.json",
+        "sha256": "f0a06b3458f7fb9760a9f7789de0770348e323940823925908bad67c361d7049"
+      },
+      "category": "other",
+      "role": "background",
+      "finding": "宿主建议：可尝试把高低项排成连续两段、V 同样两段以避开末轴交错；并提示 tl.cat 只接受 1D 且要求 can_reorder=True（矩阵操作数对应关系必须保持），可用 join/transpose/reshape；允许分块调整但需说明较小 M/N 的程序数/KV 轮数代价，优先保留 BM128/BN128；bf16 残差直接转 dtype 有下溢风险，浮点合并顺序需实测。本诊断采纳其失败归因，但本轮不采用连续两段方案（见 alternatives）。",
+      "source_sha256": "9c3488b743b2c953259e72c1f75ef3dc060f63cfd5362576bd227171aae0aa08"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858.json",
+        "sha256": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858"
+      },
+      "original": {
+        "path": "workspace/contract.json",
+        "sha256": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858"
+      },
+      "category": "other",
+      "role": "background",
+      "finding": "固定合同：case1/2/4/7，官方 checker commit 12180ce7 / golden c86aaa0b，warmup5 trials3 iterations20；计时口径与四项 checker 不因修复改变。",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "bf16 的 MERGE_PV 分支为把两次 PV 合成一次 dot，用 tl.join 产生末轴步长 2 的 128x128x2 张量再 reshape 成 128x256，并用 broadcast+reshape 把 V 复制成 256x128。这两个操作数是交错/复制布局，BiSheng 不能在 UB 内与 p_hi/p_lo/v 别名复用，必须各自物化；于是活跃 UB 需求由普通两次 dot 的形态升到 855552B（>196608B），编译失败。因果 64x64 与 fp16 非因果 128 的普通两次 dot 均在同一尝试中编译通过，说明预算对普通 dot 形态足够，超出部分来自交错拼块。",
+  "change": "删除 MERGE_PV 的拼接式单 dot 表达（tl.join/tl.reshape/tl.broadcast_to 组成的 p_cat/v_cat），bf16 与 fp16 走同一段普通两次 PV：r1=(p-p_hi)*2048 -> p_lo，acc = acc*alpha + dot(p_hi,v) + dot(p_lo,v)*(1/2048)。两项概率分解、相加顺序、fp32 累加与掩码表达式全部保持（与已验收父版一致）；保留非因果 BLOCK_M=128 的链数减半机制与因果 64/64 分块。",
+  "expected": "精度：不变（同一两项分解、同一累加顺序，回到父版已验证的 bf16 数值路径；不引入新的残差直接转 dtype）。活跃缓冲：去掉 4 个 65536B 级拼块张量及 2 倍放大的 dot 操作数，bf16 非因果回到与 fp16 已编译形态相同的普通 dot 足迹，required 应回落到 196608B 以内。交接次数：每 KV 块由 QK+1 次 PV（2 次 dot 输出搬出）回到 QK+2 次 PV（3 次），即本轮放弃 3->2 的合并收益。并行度：grid 与 BLOCK_M=128 不变（相对父版 BM=64 程序数减半、case4 1024->512）。可观察结果：case4/case7 预计编译成功并产出 checker 与 candidate_timing；不预测具体微秒数，收益须由完整四项真机评测判定。",
+  "validation": "1) 修改后调用工具桥 preflight（当前流程返回 awaiting_source_review 时保持字节不变并交接）；2) 编译通过后由宿主对四项原合同重跑同一官方 checker/golden 与同一计时口径（warmup5/trials3/iterations20），逐 case 记录 resource_bytes、mere/mare/mismatch、small_value/cancel 子项；3) 与冻结父版（23d73229...，case4 472.4604us）逐 case 比较时同时看当轮 native timing，避免以不同轮 native 绝对值混淆；4) 若 case4/case7 仍越界，读取新 IR 核对是否仍有 2N 宽张量，再决定是否尝试连续两段或降 BLOCK_N。",
+  "alternatives": [
+    "连续两段布局：join->trans(0,2,1)->reshape 让 p_cat=[p_hi|p_lo] 列连续、v_cat=[v;v] 行连续。语义等价，但 TTIR 仍需要 3D 中间量与 2D 拼块各一份（transpose 在 UB 同样物化），总量与当前交错方案同阶（仍为 2N 宽的 p_cat 与 v_cat，合计 131072B 再加上游中间量），不能保证回到 196608B 以内；本轮不选，留作后续在实测 IR 上验证。",
+    "在 bf16 下把 BLOCK_N 降到 64 以线性减小拼块：join/p_cat/v_cat 减半，但 M 向固定缓冲（q 32768、acc 65536）不变，且 KV 轮数翻倍（case4 4->8、case7 2->4），交接次数增加，编译裕度仍不确定。",
+    "用 GM 重复行装载直接得到 v_cat（省掉 v 广播 3D 中间量），只对 p_cat 保留 join：只去掉 4 个额外张量中的 1 到 2 个，仍无法解释 4.35 倍缺口，风险高。",
+    "单算子（非 Triton）IR 备选：本调用只修 Triton，不落地。"
+  ],
+  "discriminating_observation": "case4/case7 唯一的源码/IR 差异是 MERGE_PV 的 join+broadcast+reshape（failed-ir/attempt-001/5 与 2），而同一尝试内 fp16 的普通两次 dot 单元（11）编译通过；因此越界可归到交错拼块而不是分块尺寸或平台整体预算。",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

@@ -1,0 +1,108 @@
+{
+  "source_sha256": "19f7fb238946cb9006286d4d222425d07c4ea9fc38a7d4ff85c71c72c49c584a",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "ir/target.hivm.mlir",
+      "category": "source_ir",
+      "role": "待改写的实际HIVM（_gqa_fwd_kernel_mix_aiv，loc(#loc212)组）",
+      "finding": "第470-477行是归一化组：%58=pointer_cast(81920)为64x128xf32累加器，%59=pointer_cast(114688)为512xf32临时区，随后pipe_barrier[PIPE_V]与func.call @vdiv_2d_float(%55 acc, %56 64x1分母@180224, %58 同址输出, %59 临时)。全模块仅此一处调用@vdiv_2d_float，声明在第310行。%56由第463行pointer_cast(%c180224)得memref<64x1xf32>，其值来自第469行@enablevc_reduce_sum_ar_float的输出，故分母是FP32行归约结果，逐行一元素、64元素连续布局。"
+    },
+    {
+      "path": "ir/target.hivm.mlir",
+      "category": "source_ir",
+      "role": "UB地址与生存期核对（决定VREC目的地址与VMUL临时区）",
+      "finding": "AIV侧UB占用为：0起8192xf32归约临时；32768起64x256xbf16；65536起64x128xf16；81920起64x128xf32累加器（止于114688）；114688起64x256xf32概率P（止于180224）；180224起64x1xf32分母。现有vdiv临时区已落在114688起512xf32，即编译器本身把P区在归约之后当作死区复用。故把倒数目的放到114688起64xf32、把广播乘法临时区放到114944起512xf32，可完整落在P区内的已证死区，累加器81920..114688与分母180224..180480逐字节不动，UB峰值占用与现有版本一致。第485行collapse_shape_40仍读%58同址，因此%58的类型保持memref<64x128xf32>。"
+    },
+    {
+      "path": "ir/target.hivm.mlir",
+      "category": "source_ir",
+      "role": "事件配对与跨核同步影响面",
+      "finding": "归一化组只包含PIPE_V向量指令，前后事件为第466行set_flag[PIPE_V,PIPE_MTE2,EVENT_ID0]、第472行pipe_barrier[PIPE_V]、第482行pipe_barrier[PIPE_V]与第487行set_flag[PIPE_V,PIPE_MTE3,EVENT_ID0]。改写只在两个既有PIPE_V屏障之间追加逐行倒数，事件、sync_block、跨核FFTS与函数ABI均不动；同址累加器沿用原vdiv的就地读写模式。"
+    },
+    {
+      "path": "compiled-readonly/_gqa_fwd_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "后端次级产物核对：二维除法是否已被后端消除",
+      "finding": "第132行保留%out_40 = arith.divf %acc_37, %out : tensor<128x128xf32>，其中%out是linalg.reduce(p)后经linalg.broadcast到128x128的FP32行和，分母来源与frozen.py第534行l_new = tl.sum(p,1)一致；bcmlir同文件无vdiv/vrec字样，说明该除法在HIVM阶段以库调用vdiv_2d_float落地。疑似冗余（整矩阵逐元素除法）在后端仍然存在，未在低层被折叠成倒数广播。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "热点：归一化位置与指令计数（core0.veccore0）",
+      "finding": "core0.veccore0的instruction_calls给出VECTOR/VDIV=26、VECTOR/BAR=120、VECTOR/VCONV=54；源码行552（out = acc / l_new[:, None]）对应的两条VECTOR BAR分别为13次调用、7.24us与7.07us累计指令时间，是归一化组在trace中的可见同步点。该区间的VECTOR泳道active_ratio=0.3436、productive_ratio=0.2812、wait_ratio=0.0632、idle_ratio=0.6564（456事件，捕获窗口0到1归一化），说明向量指令参与关键区但向量泳道大部分时间空闲。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "窗口资质与覆盖范围",
+      "finding": "core0.veccore0窗口start=126.5620、end=217.5440，unit=unassigned，作相对时间使用；clock_validation对23个PC给出median_ratio=1.00000003973643（unit=us）的相对时钟核验，application_completed与全调用完成度不在此窗口内。窗口内采样事件表含VECTOR的BAR/VCONV/MOVEMASK，未单列VDIV，故VDIV动态次数采用hotspots的指令计数26，不采用trace区间求和时间。"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "成对性能基线（参考侧，case 4）",
+      "finding": "参考侧mix算子Task Duration为122.662453us，Block Dim 19、Mix Block Dim 38，算术利用率表单核aic_time均值112.41us（19行），属于Roofline分组；本候选case 4正式成绩为146.0561us（context与feedback一致），当前最佳154.8871us已由063达成。总量口径只用于定位，归一化是否在关键路径上改由向量泳道与事件序判断。"
+    },
+    {
+      "path": "historical-059-native-vrec.mlir",
+      "category": "source_ir",
+      "role": "同形原生VREC库调用与ABI参考",
+      "finding": "第254行声明@vrec_1d_float(src,dst,tmp)三个memref<?xf32>参数，第429行以64元素分母%collapse_shape_38（180224同址64x1折叠）为源、114688起64xf32为目的调用，临时参数传0长度memref；随后expand_shape到64x1并由第440行@vmul_2d_float(acc 64x128, 倒数 64x1, 同址acc, 114944起512xf32临时)完成广播归一化。该库私有签名与本次要写入的调用逐参一致，可直接沿用。"
+    },
+    {
+      "path": "historical-059-native-vrec-result.json",
+      "category": "paired_profiling",
+      "role": "同机制历史收益与验收结论",
+      "finding": "059同环境条件ABBA中A块中位数161.2564us、B块159.7261us，两个候选块均快于基线，latency_reduction_pct=0.9489545841281255，四项原checker全部通过，post_status=complete；该增益幅度未推进当时的154.8871us历史最佳，说明机制真实但增量在1%量级。"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "本轮正式成绩与四项精度余量",
+      "finding": "063正式结果四个case为case1 107.1206us、case2 102.5076us、case4 146.0561us、case7 95.9006us，官方checker全通过；checker内部mare分别为0.00096993（阈值0.0009765625）、0.00096618、0.00781249375（阈值0.0078125）、0.00781249375，bf16两个case的mare已贴住阈值，任何归一化舍入变化都要以原阈值重新判定。"
+    },
+    {
+      "path": "capability-readonly/installed-ascendc-reciprocal.txt",
+      "category": "source_ir",
+      "role": "原生倒数能力与数据类型",
+      "finding": "CANN 9.0.0 dav_c220的ReciprocalIntrinsicsImpl对float/half静态断言并通过vrec(dst,src,repeat,blkStride,repStride)直接下发，Level2按count设置mask后一次repeat调用；hivm-reciprocal-op-strings.txt同时确认bishengir-opt与hivmc含vrec符号。故FP32逐元素倒数在本机有直接指令与库入口。"
+    },
+    {
+      "path": "frozen.py",
+      "category": "source_ir",
+      "role": "被保持冻结的语义与既有约束",
+      "finding": "第552行out = acc / l_new[:, None]，分母l_new=第534行tl.sum(p,1)为FP32行和；第546-547行注释明确保留FP32分母求和与FP32逐元素除法本身，本轮由IR控制点改写倒数形式，源码逐字节保持。累加器acc在第532行已经由tl.dot(p_bf,v)舍入到FP16再扩回FP32，归一化输入值域有界（|acc|<=l_new，合同内l_new典型约1.5e2）。"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "source_ir",
+      "role": "宿主候选方向与约束（Codex分析贡献）",
+      "finding": "Codex指出当前063后端仍有vdiv_2d_float、每Vector核VDIV计数26，给出分母180224起64x1xf32、归一化acc/output 81920起64x128xf32、原VDIV临时区114688起512f32与死概率区重用的布局，并给出两条实现路线（分母原地VREC或复用该死区保存64个倒数）与不引入Newton、不改scale/阈值/种子/归一化外数学的边界；本次实现选择其第二条路线。"
+    }
+  ],
+  "hypothesis": "063的逐元素二维除法在Vector核上以vdiv_2d_float落地，每个分块迭代对64x128共8192个元素做FP32除法，而分母只有64个不同的行值。把这一步改为对64行分母做一次原生FP32 VREC（64元素、单次repeat），再用一次2D广播VMUL把倒数乘回FP32累加器，可把128个repeat的除法单元工作换成1个repeat的倒数加128个repeat的乘法，缩短归一化在PIPE_V上的占用；由于累加器、分母、输出地址与事件全部沿用，后端次级产物显示的整矩阵除法冗余被就地消除，而FP32行归约、Cube、host与ABI保持不变。",
+  "alternatives": [
+    "保留vdiv_2d_float、只在VCONV/VMULS上找收益：与本轮指定的归一化机制无关，留给独立调用。",
+    "分母原地VREC（源目的同为180224起的64x1）再广播VMUL：省去114688倒数缓冲，但会让分母缓冲在归约后立即被覆盖，后续若再需要l_new（例如FP16交接路径比较）就要重算；本次选择独立目的缓冲，与059已验收形态逐参一致。",
+    "VREC后加Newton精化（vrecpe/vrecps）恢复接近精确除法：多一次乘加与一次屏障，本轮按指令暂不加入，沿原四项精度验收。",
+    "在源码层写tl.math.reciprocal或1.0/l_new：源码已冻结，且installed-triton接口的reciprocal当前落到VDIV，收益路径仍在IR侧。"
+  ],
+  "change": "在ir/target.hivm.mlir的_gqa_fwd_kernel_mix_aiv归一化组内做单机制替换：删除对@vdiv_2d_float(64x128 acc, 64x1分母, 64x128同址, 512xf32临时@114688)的调用，改为（1）把%56分母由memref<64x1xf32>折叠成memref<64xf32>，(2)调用@vrec_1d_float(分母64xf32@180224, 倒数64xf32@114688, 0长度临时)，(3)pipe_barrier[PIPE_V]后把倒数expand_shape回64x1，(4)调用@vmul_2d_float(acc 64x128@81920, 倒数64x1, 输出同址@81920, 临时512xf32@114944)。同时在私有声明区加入@vrec_1d_float与@vmul_2d_float两条库私有声明（签名与059已编译形态一致），在AIV常量区加入%c114944_i64 = 114944。累加器、分母、P区、事件、sync_block、函数签名、host函数与Cube侧逐字节保持，vdiv_2d_float声明保留（059同样存在未被调用的库声明）。",
+  "expected": [
+    "指令：core0.veccore0/veccore1的VECTOR/VDIV计数由26降为0；新增VECTOR/VREC=26与VECTOR/VMUL=26，VECTOR/BAR由120增至133（每次内层迭代多一条PIPE_V屏障）。",
+    "动态轮次：网格、PART_TILES分组、外层%14..%17与内层%22..%26循环trip count、每核26次归一化轮次全部保持；单轮工作量由128个repeat的除法变为1个repeat的倒数加128个repeat的广播乘法。",
+    "等待：源码行552归属的两条VECTOR BAR（13次调用、7.24us与7.07us累计）保持原位；新增屏障只承接VREC到VMUL的短依赖，预期VECTOR wait_ratio在0.0632附近小幅上升，MTE2/MTE3/FIX/CUBE侧的wait_flag与sync_block计数保持。",
+    "资源：GM<->L1与L0C->GM字节量保持不变（归一化只在UB内），UB峰值占用保持180480字节以内，倒数缓冲与乘法临时区落在114688..116992的已死P区，L1/L0C/工作区尺寸与host infer_workspace_shape_function返回值229376保持。",
+    "数值：输出由acc/l_new变为acc*vrec(l_new)，FP32行归约顺序、FP16 acc交接与最终BF16/F16截断全部保持；预期checker的MERE相对063略升，mare在case1/case2保持0.00097量级、case4/case7保持0.0078125量级，四项仍以不变阈值判定，bf16两例余量极薄是本项的主要风险点。",
+    "端到端：以063正式146.0561us（case4）为比较起点，按059同机制0.949%的实测幅度预期归一化区向量占用下降、case4全调用降至约144.7-145.6us区间；因VECTOR泳道idle_ratio=0.6564，若除法原本被其它流水掩盖，则收益可能落入批次噪声内，需按正式三批trials判定。"
+  ],
+  "validation": "宿主用hivmc对新的ir/target.hivm.mlir独立续编译，核对反汇编或指令计数中新二进制VDIV归零、VREC与VMUL出现，且函数ABI、参数元数据、公开符号与事件配对与063一致；随后用原四项官方checker与golden（阈值、seed 1733、warmup 5/trials 3/iterations 20不变）判定精度，其中case4/case7的bf16 mare余量按0.0078125阈值单独比对；性能侧先跑正式三批trials与063的146.0561us（case4）对比，若落入噪声窗口则触发条件ABBA；同时复核L0C与GM搬出字节保持、UB占用保持、VDIV计数归零这三项预测，未兑现的项逐条记录偏差。",
+  "layer_reason": "Triton表达能力：本轮改动对象是归一化除法的指令选择（FP32逐元素除法→逐元素倒数+广播乘法）与UB缓冲复用，Triton的fdiv没有可移植的倒数广播表达，cann后端的tl.math.reciprocal当前落到VDIV，源码层写出的倒数重写仍会被降回除法，因此机制只能在编译后IR表达。固定源码实验目的：063源码与QK前瞻已冻结并作为当前最佳，本轮要单独度量归一化倒数化在既有流水上的增量，保持源码逐字节一致才能把性能差归因到IR层指令与屏障变化，源码重写会同时改变LLVM内联、地址分配与调度，失去可比性。IR控制点：HIVM阶段vdiv_2d_float已成为命名库调用，分母与累加器的UB地址、事件与屏障都显式可见，可以在保持ABI、事件配对与地址不变的前提下只替换这一个库调用序列，这是本机制的唯一切入点；同类意图若将来允许源码表达，替代方向是在frozen.py的out = acc / l_new[:, None]处写成逆元广播并按同样四项阈值验收。",
+  "simulator_incremental_judgment": "hotspots给出每Vector核VDIV=26的确定指令计数，且源码行552对应两条13次调用的VECTOR BAR，证明归一化组在trace中确有独立可见的执行段；向量泳道productive_ratio=0.2812、idle_ratio=0.6564，说明该段与其它流水存在重叠，因此把VDIV换成VREC+VMUL的收益上限约为归一化段在关键路径上的占比，即1%量级，与059实测0.949%一致。timeline窗口126.5620..217.5440us为相对资质、未含全调用完成度，绝对时钟只在同PC相对核验（median_ratio 1.0000000397364）下使用，因此本项预测以指令形态与计数为一级判据、以端到端三批trials为二级判据；热点排名只用于定位归一化段，设备波次与带宽结论保持063原有材料口径。",
+  "unknown": [
+    "原生vrec在FP32下的实际舍入误差量级：四项checker的bf16两例mare已贴住0.0078125阈值，若vrec误差显著大于FP32 ulp，case4/case7的先验余量可能被吃穿；此项只能由宿主正式checker判定。",
+    "新增一条PIPE_V屏障的边际代价与VDIV节省的净差：0.55us/次的BAR累计观测属于部分窗口内可重叠等待，边际成本需真机确认。",
+    "VREC与VMUL之间省去屏障是否安全：本次按063既有就地向量链的编译器习惯保留屏障，若宿主指令级复核认定同流水序内RAW由硬件保证，可另建调用再省一条屏障。"
+  ]
+}

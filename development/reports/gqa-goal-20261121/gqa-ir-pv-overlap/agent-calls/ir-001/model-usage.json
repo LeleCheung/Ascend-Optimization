@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 58,
+    "duration_ms": 222908,
+    "usage": {
+      "input_tokens": 92155,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 3094016,
+      "output_tokens": 33784,
+      "output_tokens_details": {
+        "thinking_tokens": 19098
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 92155,
+        "outputTokens": 33784,
+        "cacheReadInputTokens": 3094016,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 2.852383,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 19098,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 2.852383,
+    "result": "已提交，状态 `awaiting_ir_review`。本轮文件保持现状（`ir/target.hivm.mlir` 为唯一改动，`diagnosis.json` 已在 decision 记录后定格）。\n\n## 本轮机制\n\n导出的 AIV 内核在 PART_TILES 单组 tile 循环里，把与 PV 结果无数据依赖的分母归约排在跨核等待之后：\n\n- 第 421–422 行：P（UB131072 的 64x256xf16）经 MTE3 写入 workspace，随后 `sync_block_set[<VECTOR>,<PIPE_MTE3>] flag=0` 通知 Cube；\n- 第 449 行：`sync_block_wait[<VECTOR>,<PIPE_FIX>] flag=1` 阻塞等 PV；\n- 第 457 行：GM→UB0..32767 载入 64x128xf32 PV 结果，第 459 行 `sync_block_set flag=4`；\n- 原第 443 行才执行 `enablevc_reduce_sum_ar_float`（输入 UB32768 的 p、输出 UB164352、scratch UB98304..131071），其后的 `l_safe` 守卫与 `vdiv` 更靠后。\n\n改动为纯语句迁移：把归约、`set_flag[<PIPE_V>,<PIPE_MTE2>,<EVENT_ID1>]`、两次 `pipe_barrier[<PIPE_V>]`、`vcmp_gt` 与 `vsel` 共 12 条语句整体前移到第 422 行之后、PV 等待之前。指令、地址、dtype、算术与圆整逐字保留；AIC 函数、函数 ABI、flag 编号与配对数量全部不变；`expand_shape`、`vdiv`、输出 guard 与写回留在 PV 载入之后。文件仍为 716 行，`enablevc_reduce_sum_ar_float` 仍 1 处调用，全部 `sync_block_set/wait` 的 set 与 wait 一一对应。\n\n## 支撑观察\n\n- 地址互斥核对：P 用 131072..163839，PV 载入用 0..32767，归约 scratch 复用 98304..131071（QK f16 暂存区，最后一次读取在第 369 行 vcast 之前完成），归约输出 164352..164607。四段两两不相交，UB 峰值 181120 不变。\n- 跨迭代守护：归约是 scratch 98304 的最后读者，`set_flag[<PIPE_V>,<PIPE_MTE2>,<EVENT_ID1>]` 与之保持相邻，其唯一消费者是下一轮 QK 重新载入前的 359 行 wait，保护关系原样保留；窗口内该 ID1 没有其它消费者。\n- hotspots.json（与 timeline.json 逐字节相同）热点排名：cube0 首位 `WAIT_FLAG_DEVI` 86.84us/10 次，`source_stack` 指向 candidate.py:279 的 `acc = tl.dot(p16, v16)`（Cube 等 P）；veccore0 首位 `WAIT_FLAG_DEVI` 67.83us/10 次指向 candidate.py:284 的 `out = acc / l_safe`（Vector 等 PV），次位 22.5us 指向 QK。流水累计：CUBE productive 13.03%/wait_only 29.23%/idle 57.75%，VECTOR 24.24%/11.51%/64.26%。\n- 层序核对：bcmlir 第 105 行 PV matmul 已在第 106 行 `linalg.reduce` 之前，ttir 第 106–116 行同构，说明 038 的源码语句序已经生效，剩余缺陷出在 HIVM 把跨核等待线性化到独立归约之前。\n- 低层清单：本工作区没有 lowered-inventory.json；`compiled-readonly/manifest.json` 登记 ttadapter、mlirbc、npubin，目录中实有文件只有 `.bcmlir` 与 `.ttir`，低层核对止于这两层。\n\n## 模拟器时钟资质与覆盖\n\n时间轴为 `window_fraction`，`capture_start=0`、`capture_end=1`、`capture_duration=1`，`capture_scope` 记为逐核首个到末个可见事件、`application_completed=false`、`instruction_summary_timeline` 为 unsupported。捕获到 10–11 次交界，而 case4 每 worker 约 26 个 tile，动态总次数与全调用完成量都未被覆盖，前后窗口比例按各核各自归一化。codex-brief.json 转述的 P 发送 161.107–163.166us、sum 166.014–166.605us 在本工作区无对应绝对时钟材料，保持为待宿主复核的观察；未报告的泳道（veccore0 的 FIXP/CACHEMISS、cube0 未列路径）保持未知。\n\n## 预测与待验证项\n\n预计 VECTOR 与 CUBE 的 wait_only 同时下降（归约与守卫在 Cube 计算 PV 时并行完成，P 提前到达使 Cube 少等），指令条数、tile 轮次、P 发送次数、L0C 与 GM 字节持平，四 case `full_call_us` 低于 91.247/87.131/128.949/99.503us。归约与 PV 链的单次时长在材料中只有窗口比例，重叠收益上界留待重放测量；case1/2/7 走各自特化，本轮估计零影响但尚未观测。\n\nCodex 的分析贡献已记入本轮证据链（P 发送与 PV 等待的先后、scratch 与 P/PV 地址互斥、把独立归约前移的候选方向），具体实现与地址、事件、生存期复核由本次 IR 编辑完成。"
+  }
+}

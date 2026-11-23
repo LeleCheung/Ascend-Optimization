@@ -1,0 +1,61 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "247091f353b9877d40603d725176b8b1d2418e828d4129da85c413e7f533f524",
+  "evidence": [
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "mechanism",
+      "finding": "例4（bf16，BM64/BN128，每KV 2次迭代）Cube核：CUBE productive_ratio=5.19%，FLOWCTRL wait_only=83.51%；FIXP/FIX_L0C_TO_DST 共7次，其中绑定源码第112行（两次PV dot）的FIX_L0C_TO_DST calls=2、SET_FLAG calls=2；FLOWCTRL/WAIT_FLAG_DEVI 在112行 running_time_us=13.3、calls=2，为Cube窗口最大单指令。说明两次PV dot各自产生独立L0C搬出与同步标志。"
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "trigger",
+      "finding": "例4 Vector核：VECTOR productive_ratio=29.17%、wait_only=22.87%、idle=47.96%；FLOWCTRL wait_only=66.4%，MTE2 productive=15.2%。Vector侧在两次PV结果搬回、累加与L0C→UB往返上形成可观测等待，与Cube的FLOWCTRL等待互补，指向PV累加交接为cube↔vector串行链。窗口为三个核的部分公共时钟，application_completed=false，全调用completion缺失，仅作相对诊断。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "第149行第一个PV：tt.dot %p_hi,%v,%acc_91，其中acc_91=acc*alpha（已用acc作L0C初值）；第150行第二个PV：tt.dot %p_lo,%v,%cst_5 从零累加器起步；第151-152行再 arith.mulf 乘 cst_0=2^-11 后 arith.addf 合并。即第二个残差dot未复用前一个L0C累加器，另起搬出与fp32全块乘加。"
+    },
+    {
+      "path": "workspace/context-brief.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "当前例4全调用784.63765μs（kernel 791.99585μs，独立采集），BM64/BN128、1024个Cube与2048个Vector任务；已知因果BM64 BN128需231488B超196608B预算，非因果可用。目标在固定四项合同下真实下降。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "既有四项：例1 179.09665μs、例2 181.33365μs、例4 784.63765μs、例7 181.49265μs。例1 fp16 official mare=0.0009699、threshold=0.0009765，余量仅约0.7%；两项概率分解承担精度要求，fp16数值路径不可冒险改动。"
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "background",
+      "finding": "例4候选kernel Task Duration=791.99585μs、Block Dim=1024；参考FusedInferAttentionScore=121.302429μs、Block Dim=19。候选cube利用率低、每program仅少量小矩阵乘却付整条交接链，符合减少中间累加搬运的方向。"
+    }
+  ],
+  "hypothesis": "两次PV tl.dot被分别降到两个独立L0C累加器：首个dot以acc*alpha为初值，第二个残差dot从零起算后搬出、在vector里乘2^-11再与前值相加，因而每个KV迭代多一次L0C→UB搬出、一次FIXP SET/WAIT_FLAG往返和一次64x128的fp32全块乘加。若把精确的2^-11（2的幂）在dot之前折进残差概率块，并让第二个PV通过tl.dot的acc参数累积进同一L0C累加器，则每个迭代的中间累加只搬出一次，交接频率下降，而数值与现路径等价（2的幂缩放精确、累加顺序不变）。",
+  "alternatives": [
+    "将p_hi/p_lo与v拼接为一个更宽的MMAD（tl.join+reshape，PV 2→1）收益更大，但tl.join在Ascend后端降级与UB峰值未验证，风险高，留待后续。",
+    "BLOCK_N=128→256令例4单迭代，但k/v/qk/p/p_hi/p_lo缓冲近似翻倍，超UB预算，不可行。",
+    "增大BLOCK_M摊销交接，但acc/q/qk随M增长超UB；因果分支已因掩码临时量受限。",
+    "对fp16也做残差预缩放+累加链：p<2^-13时残差在fp16下溢，可能触及例1极薄余量，故仅对bf16启用，fp16保持原双dot路径。"
+  ],
+  "discriminating_observation": "若机制成立，新编译IR中第二个PV应变为对前一累加结果的tt.dot链（无独立%cst_5零初值与随后mul/add），Cube的FIX_L0C_TO_DST与WAIT_FLAG_DEVI每迭代减少一次；例4/例7（bf16）kernel与全调用时间下降，而例1/例2（fp16）与改动前逐位一致。若例4不降反升，则该交接不在关键路径，下一目标转向K/V跨Nq重复装入与M/N所有权。",
+  "change": "在_gqa_fwd_kernel内新增constexpr开关CHAIN_LO（host按query.dtype是否为bf16传入）。bf16路径：p_lo由(r1*2^-11)在fp32计算后转dot dtype（2的幂缩放精确），首个PV以acc*alpha作tl.dot第三参数，第二个PV用 tl.dot(p_lo, v, acc) 累积进同一累加器，删除独立的乘2^-11与全块相加。fp16路径完全保留原两次独立dot的fp32表达与相加顺序，精度路径不变。公共入口run及tensor/stride/dtype/原地别名/stream均不变。",
+  "expected": "例4（bf16）每个KV迭代省去一次PV L0C→UB搬出、一次FIXP标志往返与一次64x128 fp32全块乘加，交接串行链缩短，kernel与全调用时间低于784.63765μs；例7（bf16）同向受益；例1/例2（fp16）路径不变、数值逐位一致；四项官方checker全部通过。",
+  "validation": "先preflight --source candidate.py；收到awaiting_source_review后保持字节，交由宿主只读审查与完整四项真机评测及修改后重放。核对新编译IR为单累加器链、bf16与改动前数值一致、例1/例2 mare不变、四项官方checker与计时合同。",
+  "selected_layer": "triton_device_source",
+  "layer_reason": "该机制可由Triton的tl.dot累加参数与constexpr dtype特化直接表达，位于Cube/Vector间PV累加交接的设备关键路径；当前IR为Triton正常生成，未发现需generator修复的明确缺陷，故在源码层实现。",
+  "simulator_incremental_judgment": "热点证据（绑定第112行的FIX_L0C_TO_DST与13.3μs WAIT_FLAG_DEVI）定位问题在两次PV dot的累加搬出/同步；流水证据（Cube productive 5.19%而对FLOWCTRL等待83.51%，Vector productive 29.17%/wait 22.87%/idle 47.96%）表明该搬出把cube↔vector串行化。本机制相对上一轮“提高BLOCK_N减少迭代次数”的判断增量在于：它不改变迭代数与分块，而是专门消除每个迭代内第二个PV的独立L0C搬出与vector全块乘加，因此可独立区分为“中间累加搬运”贡献。模拟器窗口为部分窗口、每核归一化，application_completed=false，全调用completion缺失，绝对时钟与真实耗时仍以完整四项评测为准，不将指令时间相加当作性能归因。",
+  "unknown": [
+    "Ascend后端是否将带acc的第二个tl.dot真正保留在同一L0C累加器而不再插入额外搬出。",
+    "bf16预缩放残差在极小数p下是否出现fp32次正规/上溢（预期远低于容差）。",
+    "DMA/并发的实际收益幅度需完整评测确认。"
+  ]
+}

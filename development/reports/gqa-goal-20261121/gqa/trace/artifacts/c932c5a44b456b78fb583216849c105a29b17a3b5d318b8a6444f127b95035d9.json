@@ -1,0 +1,63 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113",
+  "evidence": [
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "background",
+      "finding": "当前源码 SHA=2a98e3e0...，即 019 保留父版。非因果 bf16 走 PERSIST_KV 分支：每 (b,kvh,headgroup) 一程序、每程序 HG*NB_M 个 query tile，每个 tile 内部依次做 QK dot -> Vector softmax -> PV dot -> 归一化写回，同一 program 内 Cube 与 Vector 交替，即每 tile 一条混合核交接链。"
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4 候选 kernel 257.645us（128 个 program，Block Dim 128），CANN 参考 127.143us。每 program：aic_cube_time 5.173us、vector aiv_vec_time 12.636us、vector aiv_scalar_wait_time 11.514us、GM_to_L1 512KiB、L0C_to_GM 768KiB。算术时间远小于等待与搬运份额。"
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "trigger",
+      "finding": "三个核的部分窗口、各自归一化：Cube productive 10.36%/wait 21.90%/idle 67.74%，veccore0 productive 25.25%/wait 18.62%/idle 56.12%，veccore1 同量级；热点指令为 WAIT_FLAG_DEVI（Cube 37.27us/4 次，Vector 17.27+16.37us/各 4 次）、FIX_L0C_TO_DST（10.7us）与 MOV_OUT_TO_L1_MULTI_ND2NZ（4.58us）。application_completed=false，全调用 completion 缺失。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "TTIR 显示持久体内 128x256 fp32 qk 张量、f16 概率、单次 PV dot 与 acc/l 的 fp32 除法后 store；L0C 搬出与 cross-core flag 在 IR 中可与每 tile 交替结构对应，确认交接链来自程序内 Cube->Vector->Cube 组织而非算术。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "保留最佳 case4 full_call=262.27775us（trials 262.2967/261.98475/262.27775），native 128.9496us；四项官方 checker 通过、阈值不变（bf16 0.0078125、fp16 0.0009765625）。case7 同属非因果 bf16 D128 SKV256 域。"
+    },
+    {
+      "path": "workspace/contract.json",
+      "category": "other",
+      "role": "disambiguation",
+      "finding": "合同固定 case1/2/4/7、原 golden/checker（sha256 固定）、输入输出 dtype、warmup5/trials3/iterations20；性能目标为 case4 full_call，其余三项真实变化同时保存。"
+    }
+  ],
+  "hypothesis": "case4 墙钟由每个 query tile 的混合核交接链主导（Cube 大量 WAIT_FLAG_DEVI 等 Vector，Vector 又等 Cube 的 QK 结果），而不是算术或总搬入量。把 attention 拆成三个独立纯 Triton 启动：纯 Cube 的原始 QK（M128×SKV256，无 scale/向量 epilogue）-> 纯 Vector 的 fp32 scale/max/exp2/sum 与受保护 1/sum 归一化（写 fp16 P，并在同一启动内用互不重叠的尾部程序做连续平坦 bf16 V->fp16）-> 纯 Cube 的 fp16 P×fp16 V、fp32 累加、直接转 out dtype 写回，则每个阶段内部只有同向程序，程序内不再出现逐 tile 的 Cube/Vector 交替握手，交接被替换为阶段间全局依赖。",
+  "alternatives": [
+    "保持单启动，仅重排持久程序或 headgroup 划分：不改程序内交替结构，无法区分交接链假设",
+    "只把 softmax 拆出（两启动，保留 QK/PV 同核）：少一次全局往返，但 PV 仍需等待 Vector 概率，交接只减一半",
+    "P scratch 用 fp32（省一次转换）：流量由 2B/元素升到 4B/元素，与假设要检验的流量代价混淆",
+    "已排除：按 case_id 或输入值选路、输出缓存、外部后端计算、改动 checker/计时合同"
+  ],
+  "discriminating_observation": "若瓶颈确为每 tile 混合核握手，则新路径三个启动内不再有程序内 Cube-Vector 交替等待，且 case4 全调用下降到 262.27775us 以下；若真正瓶颈是 HBM 流量与启动固定开销，则新增约 192MiB 的 scores/P 写读与两次额外 launch 会使全调用持平或上升。两者由原四项官方 checker 加完整 full_call 计时区分。",
+  "change": "candidate.py 新增三个 @triton.jit 并保持公共入口 run 不变：(1) _gqa_qk_stage_kernel 按 (S/128, B*NQ) 程序输出原始 fp32 scores（tl.dot bf16，无 scale、无掩码）；(2) _gqa_softmax_vcast_kernel 单启动双分支，pid<N_SOFT 的 64x256 Vector 程序做 fp32 scale/max/exp2/sum、受保护的 1/sum 归一化并写 fp16 P，pid>=N_SOFT 的尾部程序按 8192 元素连续块把 bf16 V 唯一所有权地转成 fp16（无重叠写）；(3) 名为 _gqa_fwd_kernel 的最终 PV：fp16 P×fp16 V、fp32 累加、直接转 out dtype 存回 BSND。run() 仅在【非因果、Q/K/V 均为 bf16、D==128、SKV==256、S%128==0、V 连续、NQ%NKV==0】时走三启动；其余路径调用原单内核（仅重命名为 _gqa_fused_kernel，函数体逐字不变，含原 FP16 两项 PV 与因果/非 bf16 分块）。scores/P/V16 与输出 y 每调用 torch.empty 新建，无输出缓存、无计时外工作。",
+  "expected": "移除每 tile 混合核交接后，若假设成立，case4 full_call 从 262.27775us 下降，Cube/Vector 的 WAIT_FLAG_DEVI 份额应显著减少；明确代价为额外全局中间量（case4：scores 64MiB fp32、P 32MiB fp16、V16 2MiB，输出 16MiB 不变）、约 192MiB 的额外写读、2 次额外 launch 与 3 次分配。case7 同属元数据域也会走新路径（S=128 为单 tile），case1（因果）/case2（fp16）逐字走原路径。收益或退步均由真机完整调用判定。",
+  "validation": "原完整四项 checker（阈值、golden、checker 身份不变）验正确性；每 case warmup5/trials3/iterations20 的 full_call 计时比较 case4 是否 < 262.27775us，并同时保存 case1/2/4/7 的真实变化；观察时保留最终 PV JIT 名 _gqa_fwd_kernel，辅助 kernel 与全调用分开记录。",
+  "numerical_risk": "唯一数值差异是概率归一化时机：原路径 dot(p_fp16, v16) 后做 fp32 acc/l；新路径在 fp32 内先做 (p * (1/l)) 再舍入到 fp16 后做 PV。两者对权重的相对误差同为 2^-11；新增的 1/l 舍入为 2^-24 量级可忽略；归一化后权重 <=1，fp16 次正规仅影响 <2^-14 的尾权重（绝对误差 <=3e-8），与原路径同阶。适用输入范围：bf16 非因果 D128 SKV256、S 为 128 的整数倍、V 连续；|v|>65504 会溢出 fp16，超出本合同 [-1,1] 输入域，仅记录为范围限制。最终以原 checker 判定。",
+  "applicable_range": "仅元数据命中：非因果、query/key/value 均 bf16、D==128、SKV==256、S%128==0、value 连续、NQ 整除 NKV；不读输入值、不看 case_id。",
+  "selected_layer": "源码层：内核组织与启动分阶段（block/布局/计算组织），不做编译选项或单算子 IR 行打包。",
+  "layer_reason": "证据把问题定位在程序内 Cube/Vector 交替握手与同步等待，而非算术或分块效率；Triton 可表达的最小改动是把三个计算阶段拆成独立启动，用全局中间量替换每 tile 握手。编译选项与 IR 行打包属于另一层实验，本轮不混入。",
+  "simulator_incremental_judgment": "模拟器新增判断：热点（WAIT_FLAG_DEVI、FIX_L0C_TO_DST、MOV_OUT_TO_L1）与流水（Cube wait+idle 约 89.6%、Vector wait+idle 约 74.7%）共同指向跨核交接与同步，productive 比例（Cube 10.36%、Vector 25.25%）给出算术份额上界；但窗口为部分片段、Cube 与 Vector 各自归一化、application_completed=false 且缺少全调用 completion，故不能量化三启动路径的收益，也不能把窗口比例相加成关键路径。它对“问题在握手”有定位作用，对“拆阶段是否更快”无区分力，仍需完整真机计时。",
+  "unknown": [
+    "三启动的 launch/分配固定开销与新增 192MiB HBM 往返是否超过握手节省，需真机判定",
+    "kernel B 的 64x256 fp32 Vector tile 与尾部 V 转换分支合并后的实际 UB 峰值（预检编译验证）",
+    "case7（S=128 单 tile）在拆阶段后是否出现固定开销主导的退步"
+  ]
+}

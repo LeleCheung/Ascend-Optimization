@@ -1,0 +1,42 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4 候选 kernel 257.645142us vs CANN 参考 127.142540us；每 program vector aiv_vec_time 12.635757us（sum 1617.38us）、aiv_scalar_wait 11.51us，cube aic_cube_time 仅 5.17us，L0C_to_GM 768KB/program。墙钟由跨核交接+向量后处理主导，PV 之后的 128x128 fp32 归一化是向量段的固定组成部分。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "持久体尾段生成 %out = tt.expand_dims(l_safe_46) 128x1 -> %out_47 = tt.broadcast 128x1->128x128 -> %out_48 = arith.divf %acc_45, %out_47 : tensor<128x128xf32>，即每 program 对 16384 个 fp32 元素按广播分母做秩2除法；l_safe 的 where 与随后 out 的 l_new>0 掩码、store 地址完整保留。"
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "%broadcasted_8 = linalg.broadcast ins(%50:128xf32) outs(128x128xf32) 后紧跟 %51 = arith.divf %48, %broadcasted_8 : tensor<128x128xf32>；倒数未在 rank1 上先行计算，除法以逐元素形式出现，确认改进点应落在该广播除法的标量/向量组织而非 PV 本身。"
+    }
+  ],
+  "hypothesis": "当前 PV 后归一化把 128 行倒数广播成 128x128 后再做秩2 fp32 除法（元素级除法成本高于乘法）。在保持「未归一化 p 的 FP16 PV」与「归一化位置在 PV 之后」完全不变的前提下，先在 rank1 上求 inv_l = 1.0/l_safe（fp32 [BLOCK_M]），再 out = acc*inv_l[:,None] 广播乘，可把每 program 的 16384 次除法降为 128 次倒数 + 16384 次乘法，减少向量流水除法成本，同时不改变交接链条数、输出流量与写出次序。",
+  "alternatives": [
+    "保持 arith.divf 原样：无向量除法成本下降，作为对照。",
+    "把归一化前移到 PV 之前（p/l 再 PV）：会改变 PV 位置与跨核交叠次序，属已观测无收益的 021 机制，本轮明确不采用。",
+    "在 rank2 上求倒数再乘：仍按元素取倒数，未减少除法元素数。",
+    "降低 PV 或输出中间精度以省流量：触及数值与输出 dtype 合同，不采用。"
+  ],
+  "discriminating_observation": "TTIR 的 arith.divf tensor<128x128xf32> 与 BCMLIR 的 broadcast+divf 已直接暴露秩2除法。若改为 rank1 倒数+broadcast 乘，IR 应变为 tensor<128xf32> 的 divf/rcp 加 tensor<128x128xf32> 的 mulf；据此可在实际 IR 复核改动是否落到除法组织上，而 profiling 的 vector 段与 kernel 墙钟可区分它是否在关键路径上有真实收益（预期非负、目标 case4 < 262.27775us）。",
+  "change": "仅编辑 _gqa_persist_kv_body 的 PV 后归一化两行：l_safe = tl.where(l_new>0, l_new, 1.0) 保持不变；新增 inv_l = 1.0 / l_safe（fp32 行向量），把 out = acc / l_safe[:, None] 改为 out = acc * inv_l[:, None]；保留 out = tl.where(l_new[:,None]>0, out, 0.0) 与写出掩码/地址。非持久路径、HG=2 持久拆分、K/V 复用、M128/N256、宿主机分配与连续 BSND 返回、编译选项及其余算术全部不变。",
+  "expected": "case4 与 case7（同为 bf16 非因果 SINGLE_KV 持久分支）的 PV 后向量段除法元素数由 BLOCK_M*BLOCK_D 降到 BLOCK_M；case4 kernel 与全调用耗时不高于 262.27775us 保留最佳，理想略降；case1/2 不进入持久分支，源码不变且真实变化应可忽略。精度上多出一次 fp32 倒数舍入（相对 ~2^-24），随后输出再截断到 bf16（~2^-8），由原四项官方 checker 判定是否仍在阈值内。",
+  "validation": "1) 桥 preflight --source candidate.py 编译；2) 复核新实际 IR 中应为 tensor<128xf32> 倒数 + tensor<128x128xf32> mulf，division 不再是 rank2；3) 原完整四项 checker/golden、输入输出 dtype 与计时合同下真机评测 case1/2/4/7；4) 修改后成对 profiling 与模拟器重放，确认向量段/墙钟真实变化，不把正向预测当结果。",
+  "selected_layer": "source_triton_epilogue_vector_expr",
+  "layer_reason": "该归一化完全由 Triton 源码表达，倒数与广播乘属于可表达的分块内计算组织；无需改分块、布局、K/V 复用或跨核交接结构，也不涉及单算子生成缺陷交接，故优先改源码而非提出 IR 侧建议。",
+  "simulator_incremental_judgment": "当前剩余歧义：divf 在目标向量单元上是硬件除法还是倒数序列、rank1 倒数是否真的降低向量指令数并落在关键路径。本轮已有成对 profiling（每 program vector 时间与 kernel 墙钟）与实际 TTIR/BCMLIR（秩2广播除法形状）足以提出并区分这一源码级改动，无需新增模拟器输入；改动后的模拟器重放用于核查该除法是否在向量关键路径上产生真实收益。证据仅引用本轮实际提供并读取的材料。",
+  "unknown": [
+    "目标向量单元对 fp32 除法的实际降级实现（硬件除法 vs 倒数逼近）未由当前材料直接给出。",
+    "rank1 倒数+broadcast 乘在编译器 IR 中是否会被重新融合回秩2除法，需改后实际 IR 复核。"
+  ]
+}

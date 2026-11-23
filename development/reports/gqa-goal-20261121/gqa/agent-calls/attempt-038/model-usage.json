@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 22,
+    "duration_ms": 53175,
+    "usage": {
+      "input_tokens": 49412,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 642816,
+      "output_tokens": 7375,
+      "output_tokens_details": {
+        "thinking_tokens": 1600
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 49412,
+        "outputTokens": 7375,
+        "cacheReadInputTokens": 642816,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 0.7528429999999999,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 1600,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 0.7528429999999999,
+    "result": "已完成本轮强制单实验的修改与交接，候选字节保持不变。\n\n## 本轮机制\nPART_TILES 体内**仅调整语句序**：`p = exp2(qk - SM_OFFSET)` → `p16 = p.to(fp16)` → `acc = tl.dot(p16, v16)` → `l_new = tl.sum(p, 1)`（仍从原 **FP32 p** 求分母）。\n\n## 证据与判断\n- **source_ir（disambiguation）**：`actual-ir/0-...bcmlir` 第 103–110 行 `math.exp2` → `linalg.reduce` → `truncf f16` → `matmul`；`actual-ir/2-...ttir` 第 105 行 `tt.reduce` 先于第 110/111 行 `truncf`+`tt.dot`，但两者**无数据依赖**，串行只由源码语句序引入。\n- **simulator（trigger）**：033 绑定窗口 VEXP 149.907–150.234us、sum 150.241–150.791us、P VCONV 150.792–150.881us、P MTE3 send 150.882–152.146us——sum 夹在 exp 与 P 发送之间。\n- **simulator（background）**：三核部分窗口各自归一化，veccore0 VECTOR productive 21.64%/idle 68.14%、MTE3 productive 42.49%，头部为 WAIT_FLAG_DEVI 88.5us；`application_completed=false`，全调用 completion 缺失，仅用于定位机制。\n- **evaluation（background）**：兄弟 034 已证 P 发送可提前（127.471–130.019us），但其 sum 仍在 PV 返回后（132.830–133.380us），完全重叠未达成——本轮 discriminating observation 正是检验 sum 是否仍阻断发送。\n- **paired_profiling（background）**：cube 662.19us≈参考 673.86us、L0C 65536KB<98304KB，而 aiv_vec 1287.59us vs 1121.42us、aiv_scalar_wait 1082.34us vs 27.70us，指向 Vector 交接链而非算术。\n\n## 变更边界（逐字保留）\nQK FP16 交接、FP32 PV 累加、exp2/公共偏移、输出 guard、20 worker 连续分区、元数据与全部 fallback 分支（通用二维 grid、SINGLE_KV 两项分解、`acc*alpha`）未动；**未**加入 PV 结果 FP16 截断（独立 037），未改 exp 与精度；不按 case_id/输入值选路。\n\n## 已登记与状态\n- decision 已登记：`decision_id 1576eef078a643fab03899b4be323e2f`，绑定父源码 `99e77cb8…`。\n- preflight：`awaiting_source_review`，候选 SHA **c7de9e3207733ddffca530e3a1650576d5dd940caa608fdab4af1ef53736fba4**（diagnosis `2b48e4f9…`），字节保持不动。\n\n## 预期与未决\n预期 case4 每 tile P 发送前移约 0.5–0.65us，若 sum 与 Cube PV 部分重叠则 kernel 降 1–3%（2–6us），全调用目标 < 205.28415us；若不可重叠则落在噪声内并如实记录。未决：编译器重排后是否真正重叠、后端缓冲/flag 复用是否改变链间隐藏能力、三核绝对单位仍未独立核验。case1/2/7 不进入 PART_TILES，应以逐字不变作为回归校验。\n\n请宿主继续只读路径与地址边界审查并做完整四项真机评测与同源重放，结果与重放窗口反馈后我再据此提出下一机制。"
+  }
+}

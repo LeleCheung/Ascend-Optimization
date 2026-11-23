@@ -1,0 +1,74 @@
+{
+  "source_sha256": "98c755709dd428d0955bfc11a666b679f5afdc412ecb441e1c094568a3805661",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "ir/target.hivm.mlir",
+      "category": "source_ir",
+      "role": "当前导出HIVM，定位待移动块与依赖",
+      "finding": "在 @_gqa_fwd_kernel_mix_aiv 的 tile 循环体中，第 389 行 sync_block_wait[<VECTOR>,<PIPE_FIX>,<PIPE_S>] flag=0 等待 PV 返回；第 406–411 行是 FP32 分母归约 enablevc_reduce_sum_ar_float：%56=pointer_cast(180224) 64x1xf32 输出、%57=pointer_cast(0) 8192xf32 工作区、%cast_32/%cast_33/%cast_34 分别指向 UB[114688,180224) 的 64x256 f32 概率、输出 %56 与工作区 %57，init 为 0.0；第 412 行 set_flag[<PIPE_V>,<PIPE_MTE2>,<EVENT_ID0>] 紧随归约，作为 QK scratch UB[0,32768) 跨迭代复用的完成事件；Psend 路径为第 370 行 bf16 转换、第 382 行 store_ubuf_to_gm_1d_bfloat16_t、第 384 行 sync_block_set[<VECTOR>,<PIPE_MTE3>,<PIPE_S>] flag=1。归约只读取概率 f32 缓冲，输出 64x1 分母与 0 基址工作区，与 PV 结果缓冲 UB[65536,81920) 及 PV f32 缓冲 UB[81920,114688) 的地址区间互不重叠。"
+    },
+    {
+      "path": "denominator-schedule.json",
+      "category": "simulator",
+      "role": "源绑定仿真窗口，量化归约与等待的相对位置",
+      "finding": "core0.veccore0 报告 window 113.984–212.704us，clock_validation=verified，单位 us，23 个 PC 中位比值 0.99999998。PV 返回等待 pc 0x10d11ac0 的 WAIT_FLAG_DEVI 首窗口 120.349–126.106us，共 12 次；QK FIX 等待 pc 0x10d119f0 首窗口 114.511–120.324us，下一次自 126.579us 起。归约窗口为 pc 0x10d11b30 VADD 126.548–126.638us、0x10d11b38 VADD 126.549–126.716us、0x10d11b4c VADD 126.717–126.805us、0x10d11b54 VCADD 126.805–127.098us，source_stack 指向 candidate.py:480 的 l_new = tl.sum(p, 1)，每个 tile 连续 4 条，12 次调用。PV 后段 VCONV 126.436us 起、归约 126.548–127.098us、SET_FLAG 127.098us、后续 VCONV 127.379us。首迭代中概率路径 VECTOR 工作在约 123.7us 前结束，PV 数据 126.1us 到达，期间 VECTOR 空闲约 2.7us。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "每流水活跃/等待/空闲并集，支持空闲窗口判断",
+      "finding": "core0.veccore0：FLOWCTRL active_ratio 0.907，全部为 wait，wait_ratio 0.907；VECTOR event_count 422，active_ratio 0.343，productive_ratio 0.240，wait_ratio 0.104，idle_ratio 0.657；MTE3 active_ratio 0.585，wait_ratio 0.191。各流水区间取并集且可重叠，VECTOR 的 0.657 空闲与 FLOWCTRL 的 0.907 等待共同定位了等待 PV 期间可填充的向量执行窗口。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "paired_profiling",
+      "role": "源码区域热点与等待累计，确认候选机制所在区域",
+      "finding": "core0.veccore0 的 source_conditional 区域（candidate.py 536–549）含 230 条指令，累计 instruction_time_sum_us 332.95，最大单条 58.31us，wait_instruction_time_sum_us 194.77；interpretation 明确该累计时间为关注度排序，跨流水可重叠。该区域覆盖内循环主体，归约与 PV 等待均落入其中，适合作为单算子 IR 调度候选。"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "候选与参考算子时长身份",
+      "finding": "candidate 侧 Op Name=_gqa_fwd_kernel_mix_aic，Task Duration(us)=159.603195；reference 侧 FusedInferAttentionScore mix Task Duration=137.402740；spec 的 source_sha256 为 98c755709dd428d0955bfc11a666b679f5afdc412ecb441e1c094568a3805661，与 context 一致。"
+    },
+    {
+      "path": "compiled-readonly/_gqa_fwd_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "核对后端是否已消除疑似冗余归约",
+      "finding": "ttadapter 中仅有一次 %l_new_34 = linalg.reduce ins(%p : tensor<128x256xf32>) outs(%l_new_33 : tensor<128xf32>) dimensions = [1]，对应 candidate.py:480 的分母求和；HIVM 中同样只有一处 enablevc_reduce_sum_ar_float 调用。该归约在源/前端与导出 HIVM 中各出现一次，未发现可删除的重复归约，候选改法限定为同一调用的位置移动。"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "simulator",
+      "role": "宿主证据分析与候选方向贡献",
+      "finding": "Codex 依据当前059实测 154.8871us、独立 kernel 159.603195us，指出编译阶段 63 的 sum 仍在 PV 之后，并给出 UB 区间：归约输入 UB[114688,180224)、scratch UB[0,32768)、输出 UB[180224,180480)；P 发送读 [32768,65536)，PV 读入 [65536,81920)，PV 转换输出 [81920,114688)。其请求限定为把独立 FP32 分母归约连同指针/转换操作数移到 Psend 通知之后、PV 返回等待之前，保留 QK scratch 的 EVENT_ID0 完成位置，不新增 MTE3 事件对，并提示旧038 同类重排无确认收益。本轮据此核对了实际导出 HIVM 的缓冲区间与事件结构。"
+    }
+  ],
+  "hypothesis": "当前059导出 HIVM 把 FP32 分母归约 enablevc_reduce_sum_ar_float 排在 PV 返回等待与 PV 结果转换之后。该归约只依赖概率张量 UB[114688,180224) 与自身的输出/工作区指针，与 PV 结果无关。把该调用连同其指针与转换操作数原样移到 Psend 通知（sync_block_set VECTOR/MTE3/PIPE_S flag=1）之后、PV 返回等待（sync_block_wait VECTOR/PIPE_FIX/PIPE_S flag=0）之前，可让 3×VADD 与 1×VCADD 填入等待 PV 期间的 VECTOR 空闲窗，缩短 PV 到达后的向量尾部，同时保持 QK scratch 复用事件、跨核事件与全部算术不变。",
+  "alternatives": [
+    "保持 IR 原样并登记判断：本候选属于调度位置调整，收益受 QK 等待松弛约束，保持原样可作为零收益基线。",
+    "在源码层把 tl.sum 提前或用 tl.dot 之外的方式表达：会改变冻结源码身份，本轮固定源码实验只允许 HIVM 调度点调整。",
+    "新增 MTE3 完成事件对来强制归约等待 P 发送完成：旧038 的该变体在完整调用对比中变慢，本轮不重复。",
+    "把第 412 行 set_flag[<PIPE_V>,<PIPE_MTE2>,<EVENT_ID0>] 随归约一起前移：会改变 QK scratch 释放时机，增加跨迭代别名风险；本轮保留原位。",
+    "替换归约为其他数学形式或合并 VADD/VCADD：会改变浮点加法树与数值结果，超出本轮机制范围。"
+  ],
+  "change": "在 ir/target.hivm.mlir 的 @_gqa_fwd_kernel_mix_aiv 内层 tile 循环中，把现有 6 条语句块（%56 = pointer_cast(180224) 64x1xf32、%57 = pointer_cast(0) 8192xf32、%cast_32、%cast_33、%cast_34 与 func.call @enablevc_reduce_sum_ar_float，当前位于 406–411 行）逐字移动到第 388 行 %view_23 = memref.view ... 之后、第 389 行 hivm.hir.sync_block_wait[<VECTOR>,<PIPE_FIX>,<PIPE_S>] flag = 0 之前。操作数 %45、%56、%57 的缓冲地址、memref 形状与 SSA 类型保持原样，init 仍为 %cst=0.0。第 412 行 hivm.hir.set_flag[<PIPE_V>,<PIPE_MTE2>,<EVENT_ID0>] 保留原位，继续在归约之后置位 QK scratch 完成事件。Psend 的 store 与 sync_block_set flag=1、PV 的 sync_block_wait flag=0、flags 2/3/4、AIC 函数、函数 ABI、源码与其他特化均保持不变；不新增事件对，不增加屏障。依赖审查结论：归约写 %56 与工作区 UB[0,32768)，读概率 UB[114688,180224)；此前 PIPE_V 屏障（350/358/367 行）已覆盖 QK scratch 先读后写与概率缓冲先写后读，后续第 415 行 PIPE_V 屏障仍覆盖归约写分母到 vdiv 读分母，因此仅位置移动即可，无需额外栅栏。",
+  "expected": [
+    "指令种类与动态次数：每个 tile 仍为 2×pointer_cast、3×memref.cast、1×enablevc_reduce_sum_ar_float，VE 展开仍为 3×VADD 加 1×VCADD；SET_FLAG、WAIT_FLAG、SET_CROSS_CORE、BAR 的静态与动态数量保持不变。",
+    "调度位置：仿真器中 pc 0x10d11b30/0x10d11b38/0x10d11b4c 的 VADD 与 0x10d11b54 的 VCADD 区间从当前每迭代 126.548–127.098us 一类 PV 后位置，前移到 Psend 通知之后、PV 等待结束之前的 VECTOR 空闲段（首迭代预期约 123.7–124.3us 一带），12 次归约调用整体前移。",
+    "等待与空闲：PV WAIT_FLAG_DEVI 由 Cube 侧时序决定，预期保持 12 次、首窗口仍约 120.349–126.106us；VECTOR 在 PV 等待段内的空闲并集预期减少约 0.5us/迭代；FLOWCTRL 等待比例保持同量级。",
+    "资源与同步：QK FIX 等待 pc 0x10d119f0 保持 13 次；QK scratch 释放事件仍在归约完成后置位，下一次 QK load 的 WAIT_FLAG 依赖保持一致；MTE3 事件对数量不变。",
+    "端到端：若 PV 后向量尾部进入循环节拍关键路径，预期单迭代缩短约 0.4–0.6us；当前窗口显示下一次 QK FIX 等待自 126.579us 至 129.413us，仍有约 1.9us 松弛，实测 kernel 变化可能落在 0 到约 0.5% 区间，由宿主 AB 对比分辨。",
+    "数值：归约输入缓冲、init=0.0、输出位置与浮点加法树保持原样，预期输出逐比特一致，由宿主 KGS 与官方 checker 核对。"
+  ],
+  "validation": "宿主编译后先核对 IR diff 仅包含该 6 语句块移动且其余字节一致；再检查导出二进制中 VADD/VCADD 相对 PV 等待的位置、事件与屏障数量；随后跑固定四 case 官方正确性与 golden，确认特殊值、边界、别名与浮点精度语义；最后在 154.8871us 基线上做同覆盖 AB 实测，并检查仿真中归约窗口是否按预测前移、PV/QK 等待窗口是否保持；若窗口未前移或出现等待异常，记录偏差并复核 intra-Vector 依赖与 QK scratch 生存期。",
+  "layer_reason": "Triton 表达能力：源码已用 l_new = tl.sum(p, 1) 表达分母归约，语言层对跨核 flag 的显式插入位置控制有限，Psend 通知与 PV 等待之间的插入点属于后端 HIVM 调度对象；源码层改写会改变冻结源码身份。固定源码实验目的：本轮保持 frozen.py 与源 sha 不变，只检验同一数学语义下 HIVM 指令次序对 PV 等待重叠的影响，使收益或零收益可单独归因于 IR 调度。IR 控制点：target.hivm.mlir 的 AIV 内循环用 sync_block_set/sync_block_wait 与 set_flag/wait_flag 显式给出跨核与流水同步，归约调用连同指针/转换操作数构成可独立移动的最小块，移动边界与需要复核的别名关系均可逐项审查。同类意图若要在源码表达，替代方向是调整 kernel 内 tl.sum 的书写位置；本轮固定源码要求该方向留给独立调用。",
+  "simulator_incremental_judgment": "绝对时钟资质：denominator-schedule.json 对 core0.veccore0 的 clock_validation 为 verified，单位 us，23 个 PC 对照的中位比值为 0.99999998，时间轴采用工具报告区间，缓存缺失等辅助泳道单独标注。观测范围：veccore0 window 为 113.984–212.704us 的部分捕获，含 13 次 QK FIX 等待、12 次 PV WAIT_FLAG_DEVI 与 12 次归约调用，覆盖 12 个 tile 的完整归约序列；前后窗口按同一覆盖核对动态总次数，绝对值与全调用 154.8871us 分开记录。流水累计语义：timeline 的 VECTOR active 0.343、productive 0.240、wait 0.104、idle 0.657 与 FLOWCTRL wait 0.907 均为区间并集，跨流水可重叠，用于定位候选机制与空闲窗口，属于关注度证据；关键路径、设备波次与带宽结论由宿主引用独立材料复核。未报告泳道：仿真清单只含与 tl.load/tl.dot/tl.store/tl.sum 关联的 PC，VMUL、VEXP、VDIV 等 VECTOR 指令未给出区间，其时间保持未知；归约前移的核对对象限定为已报告的 VADD/VCADD 与等待区间。本窗口为部分捕获与单核数据，收益预测作为待验证假设，由宿主完整评测裁决。",
+  "unknown": [
+    "VMUL、VEXP、VDIV 在源绑定仿真清单中没有区间，归约前移与这些指令的 VECTOR 串行关系保持未知。",
+    "下一次 QK FIX 等待约 1.9us 的松弛是否完全吸收归约前移带来的尾部缩短，保持未知，需要实测判定。",
+    "未报告泳道与另一 veccore1 的空闲分布保持未知，本判断只覆盖 core0.veccore0 的部分窗口。",
+    "归约调用内部微操作对工作区 UB[0,32768) 的精确写范围由函数实现决定，本 IR 只确认 8192xf32 的声明范围；更细粒度别名由宿主二进制审查确认。"
+  ]
+}

@@ -1,0 +1,64 @@
+--- 
++++ 
+@@ -13,7 +13,23 @@
+ KV heads are never materialised to N_q heads: each program indexes the shared
+ K/V head hq // G directly.
+ 
+-Compile-time geometry specialisation (this round's mechanism): shape, stride,
++Query-row reuse (this round's mechanism, non-causal only): BLOCK_M stays 64 for
++the causal path and rises to 128 otherwise, so a program keeps the loaded K/V
++tiles for 128 query rows instead of 64.  The paired profiling of case4 showed
++1.09us of aic_cube_time against 9.15us of aic_scalar_wait_id1 per program over
++1024 programs of 64x128 tiles, and the simulator windows put Cube at 7.90%
++productive / 33.27% wait / 58.83% idle with the top instructions being
++WAIT_FLAG and MOV_OUT_TO_L1: the wall clock follows the number of cross-core
++handoff chains, whose per-chain K/V load (2x32KiB) and fixed handoff cost are
++independent of the row count.  Doubling BLOCK_M halves the program and chain
++counts (case4: 1024->512 programs, 2048->1024 chains) and halves total K/V
++traffic, at the cost of doubling the M-scaled per-program buffers (estimated
++peak near the 196608B budget).  The mask, expression and precision paths are
++untouched; only tl.dot's M tiling and the program count change, so every output
++row still accumulates the same KV blocks in the same j order with the same
++two-term probability split.
++
++Compile-time geometry specialisation (earlier, retained mechanism): shape, stride,
+ head counts, scale and the causal offset are passed as tl.constexpr, because
+ they are legal input *metadata*, never input values.  The actual TTIR showed
+ those quantities surviving as runtime scalars, so every KV iteration rebuilt
+@@ -189,14 +205,30 @@
+     # 并行度不变；非因果三个 case 的分块与性能路径不变。
+     # 两项概率分解的表达式与相加顺序保持不变，仅 KV 轴划分与重缩放次数变化。
+     #
+-    # 本轮改动只在编译期几何特化与可证冗余掩码消除上，分块与上面记录的
+-    # 因果/非因果分流保持不变，故四项 case 的分块、迭代数、grid 与
+-    # L0C 交接结构均与上一候选相同；收益或代价都必须由完整四项真机评测
+-    # 判定，本注释不据此改写分块。因果路径删除越界掩码后，UB 峰值可能
+-    # 已有余量，是否放宽 BLOCK_N 留待独立机制单独验证。
++    # 上一轮（已验收，774.8852us）改动只在编译期几何特化与可证冗余掩码消除上；
++    # 本轮在此之上只改非因果的 BLOCK_M（64->128），见下方说明。因果/非因果
++    # BLOCK_N 分流、两项概率分解表达式与相加顺序均保持不变。
++    # 收益或代价都必须由完整四项真机评测判定，本注释不据此改写结论。
++    # 数值风险说明：BLOCK_M 只改变 tl.dot 的 M 维铺排与程序数，每行输出仍按同一
++    # j 顺序累加同一组 KV 块、同一 alpha 重缩放与同一两项分解，QK 归约维仍是
++    # D=BLOCK_D、PV 归约维仍是每块 BLOCK_N 列，故累加序列不变，预计精度不变。
+     BLOCK_D = max(16, triton.next_power_of_2(D))
+     if BLOCK_D <= 128:
+-        BLOCK_M = 64
++        # 本轮机制：非因果沿 query 行方向由 64 提到 128。
++        # 成对 profiling（case4，1024 program，kernel 763.155us）显示每 program
++        # 墙钟约 15us 中 aic_cube_time 仅 1.09us，而 aic_scalar_wait_id1 9.15us；
++        # 模拟器窗口中位 Cube productive 7.90%/wait 33.27%/idle 58.83%、Vector
++        # productive 25.14%/wait 17.13%/idle 57.73%，热点全是 WAIT_FLAG 与
++        # MOV_OUT_TO_L1 这类同步/搬运指令。即墙钟由「每 program 每轮 KV 的跨核
++        # 交接链」数量主导：每链的 K/V 装载量（2×32KiB）与交接固定成本不随行数
++        # 变化，而每链算术只有 64x128x128 + 2×(64x128x128)。
++        # BLOCK_M 提到 128 后：program 数与链数减半（case4 1024->512 程序、
++        # 2048->1024 链），总 K/V 搬运减半（每 program 208KiB->约 136KiB GM->L1），
++        # 每链在 M 方向复用 128 行。代价：per-program 峰值缓冲按 M 维翻倍，
++        # 估算约 192KB、逼近 196608B 预算，故非因果才用；因果分支若回到
++        # BLOCK_N=128 会重新引入 BLOCK_N 线性相关的索引临时量，实测峰值曾达
++        # 231488B，故因果仍取 64/64，其编译与数值路径不变。
++        BLOCK_M = 64 if is_causal else 128
+         BLOCK_N = 64 if is_causal else 128
+     elif BLOCK_D <= 256:
+         BLOCK_M, BLOCK_N = 32, 32

@@ -1,0 +1,6 @@
+{
+  "source_sha256": "2ffb6f6125d0b2ea3a06593661b9bba034a3df04040ec4610de4b0a982aaab9f",
+  "author": "Codex",
+  "analysis": "029原四项通过232.23705us，后取证验收中；硬件kernel226.164520us、20个Cube/40Vector。每Cube算术33.109us，Vector每核算术79.394us，Cube对Vector的wait_id0每程序约207.318us；这些流水时间可重叠，聚合数字只支持研究跨tile交叠机会，具体关键路径仍待当前模拟器定位。当前源每个tile严格QK→softmax→PV→output，再开始下个tile，没有预先计算后继tile。CANN同case的L0C总量也为96MiB、Cube累计算术与候选接近，仍能约127us，继续减少全局字节已缺少决定性依据。建议在同一KV组内对相邻两querytile做QK前瞻：先计算两份原始FP32 QK，再按原表达依次完成tile0、tile1的scale/softmax/PV/归一化/store，给Cube提前计算QK1而Vector处理tile0的机会。此机制可用Triton表达；具体是否被编译器保留、是否增加UB/GM工作区、是否真正重叠，均需实际IR、编译和设备结果。",
+  "requested_mechanism": "从029当前完整四项通过且后采集进行的明确分支继续；性能目标仍超过验收最佳。仅在20worker内层、同一KV组的相交tile区间，以2个querytile为一组实现原始QK前瞻：先q0/k dot得到rawscore0，再q1/k dot得到rawscore1，然后依次使用原来的FP32scale/max/safeguard/exp2/sum、单次FP16PV、PV后除法、guard和BSNDstore处理0和1。rawscore1的Vector scale/softmax留在tile0完成之后；保护奇数尾tile，尾tile执行原单tile路径。K/V仍按组加载一次，P=20、tile分区、BM128/BN256、原FP16 fallback保持，不引入三阶段scratch或scores压缩。由你选择合法源码/helper实现，只用Edit落盘，先记录buffer生命周期和编译风险，不预设重叠或收益。实际完整原四项与后profiling/模拟器验证。修改前读取当前029profiling和相关TTIR/BCMLIR；当前无需为该调度实验新增前置模拟器，宿主保留历史交接知识，后续实际观察分别归因。"
+}

@@ -59,3 +59,5 @@
 2026-11-11 已完成三部分目录迁移与不含 development 的公开运行验证：log10_ 完整 36/36、双参考各 66/66、特殊值 15/15，并完成成对采集与上下文回填。详见[迁移报告](reports/three-part-migration-20261111.md)。
 
 历史报告和原始JSON仍可能包含旧路径。按[迁移映射](manifests/three-part-migration-20261111.json)定位，原始请求和源码不做全文替换。新的集成调用使用公共runtime入口；旧控制器不恢复为默认操作入口。
+
+指标与规格 Excel 维护入口：[data/README.md](data/README.md)。

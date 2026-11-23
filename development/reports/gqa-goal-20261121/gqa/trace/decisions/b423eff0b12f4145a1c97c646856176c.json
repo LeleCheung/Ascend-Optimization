@@ -1,0 +1,81 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "b423eff0b12f4145a1c97c646856176c",
+  "recorded_at": "2026-11-21T11:04:42.437643+00:00",
+  "round_id": "attempt-025",
+  "input_source": {
+    "path": "trace/sources/2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113.py",
+    "sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/a51d25c213334998df0121dd713006da21f4ee8898816ebf51f3d117d64f7415.json",
+        "sha256": "a51d25c213334998df0121dd713006da21f4ee8898816ebf51f3d117d64f7415"
+      },
+      "original": {
+        "path": "workspace/current-profiling.json",
+        "sha256": "a51d25c213334998df0121dd713006da21f4ee8898816ebf51f3d117d64f7415"
+      },
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "保留019父版(candidate=2a98e3e0)每program Cube time 5.173us、Vector time 12.636us、aiv_scalar_wait 11.514/11.546us；Block Dim 128、kernel任务时长257.645us，参考FusedInferAttentionScore为127.143us。等待占主导，说明每program内QK dot与softmax/PV之间的跨核(Cube/Vector)交接未重叠，是本次编译选项目标的串行环节。",
+      "source_sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/3872e0b7e8321c12da290bbec07142d727dcd444fefc9d5afd78f81e606dd8b8.ttir",
+        "sha256": "3872e0b7e8321c12da290bbec07142d727dcd444fefc9d5afd78f81e606dd8b8"
+      },
+      "original": {
+        "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+        "sha256": "3872e0b7e8321c12da290bbec07142d727dcd444fefc9d5afd78f81e606dd8b8"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "实际TTIR(K/V整段在scf.for外载入，PERSIST_KV)循环体为 %qk=tt.dot -> reduce/max/exp2 -> truncf f32->f16 -> %acc=tt.dot(%p_f16, v_f16) -> div -> store。两次dot与向量softmax在同一循环内严格顺序依赖，跨核交接链每迭代一条，当前无编译器级跨核流水重叠。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/3f0752b87549d3622671e660efcd63cee0d4e7286e342001b1b25900e878f4a7.bcmlir",
+        "sha256": "3f0752b87549d3622671e660efcd63cee0d4e7286e342001b1b25900e878f4a7"
+      },
+      "original": {
+        "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+        "sha256": "3f0752b87549d3622671e660efcd63cee0d4e7286e342001b1b25900e878f4a7"
+      },
+      "category": "source_ir",
+      "role": "background",
+      "finding": "ttir_to_linalg后的BCMLIR为linalg.fill/softmax+dot形式，func属性mix_mode=mix、global_kernel=local；这是add_dynamic_cv_pipeline之前的下沉形态，未包含该pass引入的调度/同步信息，故其效果需要真机编译后观测。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/e5d3336ed12ccbcf07630643ef95eaabea69bfc137b4d6b63b277f54a802b040.txt",
+        "sha256": "e5d3336ed12ccbcf07630643ef95eaabea69bfc137b4d6b63b277f54a802b040"
+      },
+      "original": {
+        "path": "workspace/compiler-pipeline-evidence.txt",
+        "sha256": "e5d3336ed12ccbcf07630643ef95eaabea69bfc137b4d6b63b277f54a802b040"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "实际安装的Ascend backend compiler.py(sha256 62ddbfbd...)在ttir_to_linalg里 if metadata['enable_dynamic_cv_pipeline']: ascend.passes.ttir.add_dynamic_cv_pipeline(pm, compile_on_910_95)；options dataclass中enable_dynamic_cv_pipeline默认False，独立于num_stages/auto multi-buffer。",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "父版PERSIST_KV路径每program循环内QK dot(Cube)与softmax/PV(Vector)严格串行，跨核交接等待(aiv_scalar_wait≈11.5us)是主要墙钟成分。真实backend在ttir_to_linalg阶段提供的add_dynamic_cv_pipeline可把循环内Cube/Vector交接改为动态流水调度，在保持全部算术与分块不变的前提下压缩每迭代交接等待，从而降低case4总时。",
+  "change": "仅修改run()的kernel启动：向_gqa_fwd_kernel[grid]调用新增关键字 enable_dynamic_cv_pipeline=PERSIST_KV。使PERSIST_KV=True路径启用真实backend关键字(True)，其余元数据路径取默认False。不改JIT AST/数学/守卫、HG=2、grid128、BLOCK_M128/BLOCK_N256、连续输出分配、num_stages=1、num_warps=1及其他编译选项。",
+  "expected": "目标case4总时低于保留最佳262.27775us；若pass适用则主要来自每program跨核交接等待下降。case1/2(非PERSIST_KV)应与此前逐项一致(默认False)；case7同为PERSIST_KV路径，随pass适用而变化。任何收益以完整四项真机与后双profiling为准。",
+  "validation": "改动后preflight --source candidate.py；awaiting_source_review后交由宿主只读审查并跑原四项官方checker/full-call与修改后成对profiling及模拟器重放。精度阈值不变，输出dtype/连续布局不变。若编译失败或退步，保留记录并回退为源码不变。",
+  "alternatives": [
+    "该pass对当前IR无匹配模式而无变换(等价)，性能不变。",
+    "该pass插入流水后增加同步/资源，反而轻微变慢或超资源。",
+    "该pass在带PERSIST_KV循环的TTIR上编译失败。",
+    "收益实际来自非编译器因素(测量波动)，需靠完整四项与近零门限区分。"
+  ],
+  "discriminating_observation": "case4(及非因果PERSIST_KV的case7)在仅新增enable_dynamic_cv_pipeline=True后，若完整评测时延下降且后双profiling显示aiv_scalar_wait/aic scalar wait下降而算术与搬运量基本不变，则支持跨核交接动态流水机制；若编译失败或时延不变/上升，则否证。case1/2为默认路径，应保持编译选项与性能一致。",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

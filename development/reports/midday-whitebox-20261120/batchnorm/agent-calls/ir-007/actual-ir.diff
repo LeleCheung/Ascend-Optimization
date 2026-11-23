@@ -1,0 +1,157 @@
+--- retained8x256
++++ ir007
+@@ -44,6 +44,91 @@
+     %n_num_steps_5 = arith.addi %spatial_dim, %n_num_steps : i32 loc(#loc143)
+     %n_num_steps_6 = arith.divsi %n_num_steps_5, %c128_i32 : i32 loc(#loc143)
+     %tile_lane = tt.make_range {end = 128 : i32, start = 0 : i32} : tensor<128xi32> loc(#loc146)
++    %final_mean_11 = arith.muli %batch_dim, %spatial_dim : i32 loc(#loc183)
++    %final_mean_12 = arith.sitofp %final_mean_11 : i32 to f32 loc(#loc184)
++    %c511_i32 = arith.constant 511 : i32
++    %c512_i32 = arith.constant 512 : i32
++    %stats_rem = arith.remsi %spatial_dim, %c512_i32 : i32
++    %stats_wide = arith.cmpi eq, %stats_rem, %c0_i32 : i32
++    %stat_mean, %stat_is, %stat_var = scf.if %stats_wide -> (f32, f32, f32) {
++      %w_cnt = arith.constant dense<0> : tensor<8x512xi32>
++      %w_zero = arith.constant dense<0.000000e+00> : tensor<8x512xf32>
++      %w_one = arith.constant dense<1> : tensor<8x512xi32>
++      %w_steps0 = arith.addi %spatial_dim, %c511_i32 : i32
++      %w_steps = arith.divsi %w_steps0, %c512_i32 : i32
++      %w_lane = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32>
++      %w_acc:3 = scf.for %w_m = %c0_i32 to %m_num_steps_4 step %c1_i32 iter_args(%w_mean = %w_zero, %w_var = %w_zero, %w_cntv = %w_cnt) -> (tensor<8x512xf32>, tensor<8x512xf32>, tensor<8x512xi32>)  : i32 {
++        %w_bofs = arith.muli %w_m, %c8_i32 : i32
++        %w_blane = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32>
++        %w_bsplat = tt.splat %w_bofs : i32 -> tensor<8xi32>
++        %w_boff = arith.addi %w_bsplat, %w_blane : tensor<8xi32>
++        %w_foff = arith.muli %input_feat_stride, %feat_pid : i32
++        %w_base = tt.addptr %input_pointer, %w_foff : !tt.ptr<f32>, i32
++        %w_boffe = tt.expand_dims %w_boff {axis = 1 : i32} : tensor<8xi32> -> tensor<8x1xi32>
++        %w_bstr = tt.splat %input_batch_stride : i32 -> tensor<8x1xi32>
++        %w_roff = arith.muli %w_bstr, %w_boffe : tensor<8x1xi32>
++        %w_bases = tt.splat %w_base : !tt.ptr<f32> -> tensor<8x1x!tt.ptr<f32>>
++        %w_rptr = tt.addptr %w_bases, %w_roff : tensor<8x1x!tt.ptr<f32>>, tensor<8x1xi32>
++        %w_lanee = tt.expand_dims %w_lane {axis = 0 : i32} : tensor<512xi32> -> tensor<1x512xi32>
++        %w_ptrb = tt.broadcast %w_rptr : tensor<8x1x!tt.ptr<f32>> -> tensor<8x512x!tt.ptr<f32>>
++        %w_laneb = tt.broadcast %w_lanee : tensor<1x512xi32> -> tensor<8x512xi32>
++        %w_ptr = tt.addptr %w_ptrb, %w_laneb : tensor<8x512x!tt.ptr<f32>>, tensor<8x512xi32>
++        %w_cur = tt.load %w_ptr : tensor<8x512x!tt.ptr<f32>>
++        %w_inner:4 = scf.for %w_n = %c0_i32 to %w_steps step %c1_i32 iter_args(%w_mean2 = %w_mean, %w_var2 = %w_var, %w_cnt2 = %w_cntv, %w_cur2 = %w_cur) -> (tensor<8x512xf32>, tensor<8x512xf32>, tensor<8x512xi32>, tensor<8x512xf32>)  : i32 {
++          %w_step = arith.muli %w_m, %w_steps : i32
++          %w_step1 = arith.addi %w_step, %w_n : i32
++          %w_step2 = arith.addi %w_step1, %c1_i32 : i32
++          %w_istep = arith.sitofp %w_step2 : i32 to f32
++          %w_inv = arith.divf %cst_2, %w_istep : f32
++          %w_nx1 = arith.addi %w_n, %c1_i32 : i32
++          %w_nx2 = arith.subi %w_steps, %c1_i32 : i32
++          %w_nx3 = arith.minsi %w_nx1, %w_nx2 : i32
++          %w_nx4 = arith.muli %w_nx3, %c512_i32 : i32
++          %w_nx5 = tt.splat %w_nx4 : i32 -> tensor<512xi32>
++          %w_nx6 = arith.addi %w_nx5, %w_lane : tensor<512xi32>
++          %w_nxe = tt.expand_dims %w_nx6 {axis = 0 : i32} : tensor<512xi32> -> tensor<1x512xi32>
++          %w_nxb = tt.broadcast %w_nxe : tensor<1x512xi32> -> tensor<8x512xi32>
++          %w_nxp = tt.addptr %w_ptrb, %w_nxb : tensor<8x512x!tt.ptr<f32>>, tensor<8x512xi32>
++          %w_nxt = tt.load %w_nxp : tensor<8x512x!tt.ptr<f32>>
++          %w_d = arith.subf %w_cur2, %w_mean2 : tensor<8x512xf32>
++          %w_c = arith.addi %w_cnt2, %w_one : tensor<8x512xi32>
++          %w_is = tt.splat %w_inv : f32 -> tensor<8x512xf32>
++          %w_md = arith.mulf %w_d, %w_is : tensor<8x512xf32>
++          %w_mn = arith.addf %w_mean2, %w_md : tensor<8x512xf32>
++          %w_dd = arith.mulf %w_d, %w_d : tensor<8x512xf32>
++          %w_om = arith.subf %cst_2, %w_inv : f32
++          %w_oms = tt.splat %w_om : f32 -> tensor<8x512xf32>
++          %w_vv = arith.mulf %w_dd, %w_oms : tensor<8x512xf32>
++          %w_vn = arith.addf %w_var2, %w_vv : tensor<8x512xf32>
++          scf.yield %w_mn, %w_vn, %w_c, %w_nxt : tensor<8x512xf32>, tensor<8x512xf32>, tensor<8x512xi32>, tensor<8x512xf32>
++        }
++        scf.yield %w_inner#0, %w_inner#1, %w_inner#2 : tensor<8x512xf32>, tensor<8x512xf32>, tensor<8x512xi32>
++      }
++      %w_cf = arith.sitofp %w_acc#2 : tensor<8x512xi32> to tensor<8x512xf32>
++      %w_cm = arith.mulf %w_acc#0, %w_cf : tensor<8x512xf32>
++      %w_rs = tt.reshape %w_cm allow_reorder : tensor<8x512xf32> -> tensor<4096xf32>
++      %w_sum = "tt.reduce"(%w_rs) <{axis = 0 : i32}> ({
++      ^bb0(%w_r0: f32, %w_r1: f32):
++        %w_r2 = arith.addf %w_r0, %w_r1 : f32
++        tt.reduce.return %w_r2 : f32
++      }) : (tensor<4096xf32>) -> f32
++      %w_mean_all = arith.divf %w_sum, %final_mean_12 : f32
++      %w_bcast = tt.splat %w_mean_all : f32 -> tensor<8x512xf32>
++      %w_dm = arith.subf %w_acc#0, %w_bcast : tensor<8x512xf32>
++      %w_cdm = arith.mulf %w_cf, %w_dm : tensor<8x512xf32>
++      %w_cdm2 = arith.mulf %w_cdm, %w_dm : tensor<8x512xf32>
++      %w_vin = arith.addf %w_acc#1, %w_cdm2 : tensor<8x512xf32>
++      %w_vr = tt.reshape %w_vin allow_reorder : tensor<8x512xf32> -> tensor<4096xf32>
++      %w_vsum = "tt.reduce"(%w_vr) <{axis = 0 : i32}> ({
++      ^bb0(%w_v0: f32, %w_v1: f32):
++        %w_v2 = arith.addf %w_v0, %w_v1 : f32
++        tt.reduce.return %w_v2 : f32
++      }) : (tensor<4096xf32>) -> f32
++      %w_var_all = arith.divf %w_vsum, %final_mean_12 : f32
++      %w_isq = arith.addf %w_var_all, %eps : f32
++      %w_isv = math.rsqrt %w_isq : f32
++      scf.yield %w_mean_all, %w_isv, %w_var_all : f32, f32, f32
++    } else {
+     %cnt_7:3 = scf.for %m_step = %c0_i32 to %m_num_steps_4 step %c1_i32 iter_args(%mean = %cst, %var_33 = %cst, %cnt_34 = %cnt) -> (tensor<8x128xf32>, tensor<8x128xf32>, tensor<8x128xi32>)  : i32 {
+       %batch_offset = arith.muli %m_step, %c8_i32 : i32 loc(#loc148)
+       %batch_offset_35 = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32> loc(#loc149)
+@@ -99,8 +184,6 @@
+       %final_mean_35 = arith.addf %final_mean_33, %final_mean_34 : f32 loc(#loc255)
+       tt.reduce.return %final_mean_35 : f32 loc(#loc246)
+     }) : (tensor<1024xf32>) -> f32 loc(#loc246)
+-    %final_mean_11 = arith.muli %batch_dim, %spatial_dim : i32 loc(#loc183)
+-    %final_mean_12 = arith.sitofp %final_mean_11 : i32 to f32 loc(#loc184)
+     %final_mean_13 = arith.divf %final_mean_10, %final_mean_12 : f32 loc(#loc184)
+     %var = tt.splat %final_mean_13 : f32 -> tensor<8x128xf32> loc(#loc185)
+     %var_14 = arith.subf %cnt_7#0, %var : tensor<8x128xf32> loc(#loc185)
+@@ -116,20 +199,22 @@
+     %var_20 = arith.divf %var_19, %final_mean_12 : f32 loc(#loc190)
+     %inv_std = arith.addf %var_20, %eps : f32 loc(#loc191)
+     %inv_std_21 = math.rsqrt %inv_std : f32 loc(#loc192)
++    scf.yield %final_mean_13, %inv_std_21, %var_20 : f32, f32, f32
++    }
+     %0 = tt.addptr %mean_pointer, %feat_pid : !tt.ptr<f32>, i32 loc(#loc58)
+-    tt.store %0, %final_mean_13 : !tt.ptr<f32> loc(#loc59)
++    tt.store %0, %stat_mean : !tt.ptr<f32> loc(#loc59)
+     %1 = tt.addptr %inv_std_pointer, %feat_pid : !tt.ptr<f32>, i32 loc(#loc60)
+-    tt.store %1, %inv_std_21 : !tt.ptr<f32> loc(#loc61)
++    tt.store %1, %stat_is : !tt.ptr<f32> loc(#loc61)
+     %running_mean_in = tt.addptr %running_mean_in_pointer, %feat_pid : !tt.ptr<f32>, i32 loc(#loc193)
+     %running_mean_in_22 = tt.load %running_mean_in : !tt.ptr<f32> loc(#loc194)
+     %running_var_in = tt.addptr %running_var_in_pointer, %feat_pid : !tt.ptr<f32>, i32 loc(#loc195)
+     %running_var_in_23 = tt.load %running_var_in : !tt.ptr<f32> loc(#loc196)
+     %new_running_mean = arith.subf %cst_2, %momentum : f32 loc(#loc197)
+     %new_running_mean_24 = arith.mulf %new_running_mean, %running_mean_in_22 : f32 loc(#loc198)
+-    %new_running_mean_25 = arith.mulf %momentum, %final_mean_13 : f32 loc(#loc199)
++    %new_running_mean_25 = arith.mulf %momentum, %stat_mean : f32 loc(#loc199)
+     %new_running_mean_26 = arith.addf %new_running_mean_24, %new_running_mean_25 : f32 loc(#loc200)
+     %new_running_var = arith.mulf %new_running_mean, %running_var_in_23 : f32 loc(#loc201)
+-    %new_running_var_27 = arith.mulf %momentum, %var_20 : f32 loc(#loc202)
++    %new_running_var_27 = arith.mulf %momentum, %stat_var : f32 loc(#loc202)
+     %new_running_var_28 = arith.mulf %new_running_var_27, %final_mean_12 : f32 loc(#loc203)
+     %new_running_var_29 = arith.subi %final_mean_11, %c1_i32 : i32 loc(#loc204)
+     %new_running_var_30 = arith.sitofp %new_running_var_29 : i32 to f32 loc(#loc205)
+@@ -165,7 +250,7 @@
+     %n_num_steps_w = arith.divsi %n_num_steps_w0, %c256_i32 : i32
+     %tile_lane_w = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32>
+     scf.if %spatial_wide {
+-      %var_w = tt.splat %final_mean_13 : f32 -> tensor<8x256xf32>
++      %var_w = tt.splat %stat_mean : f32 -> tensor<8x256xf32>
+       scf.for %m_step_w = %c0_i32 to %m_num_steps_4 step %c1_i32  : i32 {
+         %batch_offset_w = arith.muli %m_step_w, %c8_i32 : i32
+         %batch_lane_w = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32>
+@@ -206,7 +291,7 @@
+           %out_v_w = arith.subf %carry_in_w, %var_w : tensor<8x256xf32>
+           %w_b_w = tt.splat %6 : f32 -> tensor<8x256xf32>
+           %out_m1_w = arith.mulf %w_b_w, %out_v_w : tensor<8x256xf32>
+-          %is_b_w = tt.splat %inv_std_21 : f32 -> tensor<8x256xf32>
++          %is_b_w = tt.splat %stat_is : f32 -> tensor<8x256xf32>
+           %out_m2_w = arith.mulf %out_m1_w, %is_b_w : tensor<8x256xf32>
+           %b_b_w = tt.splat %9 : f32 -> tensor<8x256xf32>
+           %out_add_w = arith.addf %out_m2_w, %b_b_w : tensor<8x256xf32>
+@@ -259,7 +344,7 @@
+         %output = arith.subf %curr_input_53, %var : tensor<8x128xf32> loc(#loc239)
+         %output_64 = tt.splat %6 : f32 -> tensor<8x128xf32> loc(#loc240)
+         %output_65 = arith.mulf %output_64, %output : tensor<8x128xf32> loc(#loc240)
+-        %output_66 = tt.splat %inv_std_21 : f32 -> tensor<8x128xf32> loc(#loc241)
++        %output_66 = tt.splat %stat_is : f32 -> tensor<8x128xf32> loc(#loc241)
+         %output_67 = arith.mulf %output_65, %output_66 : tensor<8x128xf32> loc(#loc241)
+         %output_68 = tt.splat %9 : f32 -> tensor<8x128xf32> loc(#loc242)
+         %output_69 = arith.addf %output_67, %output_68 : tensor<8x128xf32> loc(#loc242)

@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 27,
+    "duration_ms": 56657,
+    "usage": {
+      "input_tokens": 29935,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 455168,
+      "output_tokens": 8335,
+      "output_tokens_details": {
+        "thinking_tokens": 2642
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 29935,
+        "outputTokens": 8335,
+        "cacheReadInputTokens": 455168,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 0.5856340000000001,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 2642,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 0.5856340000000001,
+    "result": "候选已生成并进入审查边界。摘要：\n\n**本轮机制（单一）**：仅在原持久化 helper `_gqa_persist_kv_body` 的 PV 后归一化处，把秩 2 除法改为「rank1 倒数 + 广播乘」：\n- `l_safe = tl.where(l_new>0, l_new, 1.0)` 原样保留；\n- 新增 `inv_l = 1.0 / l_safe`（fp32 行向量，仅 BLOCK_M 次除法）；\n- `out = acc / l_safe[:,None]` → `out = acc * inv_l[:,None]`；\n- `out = tl.where(l_new[:,None]>0, out, 0.0)` 与 store 掩码/地址一字未改。\n\n**证据（本轮实际读取）**\n- `workspace/current-profiling.json`：case4 kernel 257.645us、vector 12.636us/program、scalar_wait 11.51us、cube 5.17us → 向量后处理在墙钟关键路径。\n- `workspace/actual-ir/2-…ttir`：`tt.broadcast 128x1→128x128` 后 `arith.divf : tensor<128x128xf32>`。\n- `workspace/actual-ir/0-…bcmlir`：`linalg.broadcast ins(128xf32)` + `arith.divf 128x128`，倒数未在 rank1 提升。\n\n**改动范围与数值风险**：未归一化 p 的 FP16 PV、归一化位置、HG2/K-V 复用、M128/N256、宿主分配/返回、编译选项及其余算术全部不变；非持久路径 `acc / l_safe[:,None]` 保持原样。case4/case7 走持久分支，case1/2 不进入该分支。数值上是 `a/b` → `a*(1/b)` 多一次 fp32 倒数舍入（~2^-24），输出再截断 bf16（~2^-8），由原四项官方 checker 在保持阈值下验收。\n\n**决策与预检记录**\n- 决策已登记：`decision_id 53e2367fbba04020921268e904d65a4e`，绑定改前源码 SHA `2a98e3e0…`。\n- `preflight --source candidate.py` 返回 `awaiting_source_review`，新源码 SHA `82b6bb25be7bcf49dc67abd9fe53d12c4e1a7427abc93d1b69c4c520058bfe98`。\n\n已保持候选字节不变，交接宿主做只读路径/地址边界审查，随后进行完整四项真机评测（case1/2/4/7）与改动后成对 profiling 及模拟器重放。预期 case4 < 262.27775us 仅为假设，实际收益以反馈为准。"
+  }
+}

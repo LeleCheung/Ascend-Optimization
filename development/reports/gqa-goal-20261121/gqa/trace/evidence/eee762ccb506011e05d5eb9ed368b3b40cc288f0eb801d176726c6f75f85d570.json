@@ -1,0 +1,93 @@
+{
+  "id": "selu-compiled-launch-path",
+  "operators": [
+    "selu_"
+  ],
+  "types": [
+    "pointwise",
+    "fused_pointwise",
+    "indexed_pointwise"
+  ],
+  "transferable_by_type": true,
+  "status": "historically_observed",
+  "signal": "多个小输入完整调用均约80–85微秒，CANN约13微秒；大输入与小输入的性能损失不同",
+  "mechanism": "历史实现缓存编译启动器、函数句柄、packed metadata与元数据，并按当前指针和stream直接启动Triton产物；新生成版采用普通JIT调度，未保留该路径。两份完整实现的对照尚非单变量因果证明",
+  "action": "按几何平均损失覆盖小输入与最大输入；核验当前启动器ABI及constexpr槽位，缓存编译句柄和宿主元数据。JIT已命中而小输入仍有固定平台时，依照当前宿主栈减少热路径的Python层级和重复元数据查询：已确认连续的平坦路径可按dtype、numel、实际对齐类、device缓存，不每次构造完整shape和stride；非连续路径保留完整布局身份。按本机后端合同动态查询当前raw stream与地址，保留条件不满足时的普通Triton回退",
+  "constraints": [
+    "每次读取当前stream并核对设备、dtype、numel、stride、指针对齐；不能缓存张量结果或旧stream",
+    "首调用仅执行一次原地计算；未对齐、非连续、尾块与profiling模式需正确处理",
+    "启动器ABI以当前生成产物为准；Python或C++宿主桥不得执行目标设备计算",
+    "历史相对CANN1.039292与普通调度0.210037仅为两份实现观察，新候选需完整评测，不能继承历史加速比",
+    "普通调用时间、设备事件跨度和真机任务耗时分别报告；不将事件跨度直接视作设备本体时间",
+    "查询函数对象可以缓存，当前device、stream和输入指针的动态返回值不能缓存",
+    "快速表只接纳已排除compile-only、debug和采集专用模式的编译产物；不同模式产物不得串用。判定频率依据实际生命周期：当前NPULauncher把compile_only、tensor注册和metadata在创建时固定，活动HookChain回调则在运行时可变",
+    "不共享可变发射参数数组；不在设备发射异常后回退重发原地计算",
+    "NoWait的适用性依据当前Triton后端的队列合同与stream测试，不从接口名称推断正确性",
+    "编译产物缓存键必须包含设备身份。当前stream和当前指针动态查询，不能将第一张设备的编译句柄无条件用于另一张设备",
+    "冷调用时缓存容器可能尚未存在；不能只比较旧字典的键差集来识别新产物。按当前JIT调用返回值和编译产物接口登记实际使用的对象，并在诊断中核对缓存能否真正命中",
+    "调试与采集钩子的模块位置必须依据当前API事实核验。接口导入失败导致永久普通调度时应显式报告，不得仅凭源码存在缓存结构就声称快路径已经生效",
+    "直接调用编译启动器必须保留当前生成器定义的完整参数槽位；constexpr虽不进入设备侧实参，仍可能在Python启动ABI中保留PyObject占位。不能仅按动态参数列表拼接ABI，也不能把TypeError后永远普通调度误认为快路径有效",
+    "调试钩子可能是始终存在的HookChain容器；对象非None不等于存在活动回调。按当前类的空链语义区分空容器和真实采集钩子，存在真实钩子时仍须尊重回调。可用冷热调用的JIT计数和缓存大小核验快路径，不以缓存结构存在替代实际命中证据",
+    "JIT计数已为零但完整调用仍慢时，先采样候选的热调用宿主栈，检查布局合并、特化字符串、后端策略注册器和Python启动包装。cProfile累计时间包含子函数且有采样开销，不能相加或作为正式性能；以固定KGS合同确认实际收益",
+    "连续输入的常见路径可先检查连续性，再查询不可变布局／网格／完整ABI元数据缓存，避免每次合并所有维度和重新构造字符串。缓存键覆盖dtype、设备、numel、实际对齐与编译特化类别；不缓存张量、指针或stream的动态值。非连续与未对齐输入保留正确通用路径",
+    "核验当前NPULauncher的__call__与其原生launch入口；只有已排除compile-only、张量注册、调试隐藏参数及活动钩子的普通产物才能使用轻量入口。查询函数对象和不变元数据可缓存，当前设备、指针及raw stream须动态读取；减少后端策略分发层不等于省略stream正确性",
+    "原地算子的冷启动若通过普通JIT调用登记编译产物，该调用已执行计算，返回后不能再次执行计划。暖启动与冷启动分别验证恰好一次目标计算；活动钩子分支必须真实进入普通JIT，不能仅调用名为慢速的函数却仍然直发原生入口",
+    "缓存计划遵守当前产物的编译／调试生命周期：创建时排除非普通启动器，运行时尊重活动回调；新的模式产物单独登记，不绕过调试隐藏参数。不额外假定普通JIT会对既有实例逐次重读环境变量；torch_npu可能包装environ.get，重复查询本身会成为宿主开销。多操作原地计划不能在部分发射后把整个计划重发",
+    "原生启动器仍慢时检查当前生成器的getPointer：本环境对Tensor调用data_ptr后逐次执行aclrtPointerGetAttributes，整数地址分支则直接解析指针。已验证设备身份、dtype、布局、实际指针对齐和编译特化的普通热路径，可使用本次输入动态查询的整数地址；编译／普通JIT仍保留Tensor以正确特化。CPU或设备不匹配输入不可盲目走整数地址分支，不缓存地址，不绕过活动调试或采集路径。这是宿主参数解析优化，设备计算仍为同一Triton产物；收益以完整评测确认",
+    "log10_源码69699663的宿主采样反例：50次小输入调用中_plan_key累计0.000204970秒，即每次约4.10微秒的采样累计时间；run和_run_one自耗时合计每次约9.71微秒。不能把它误读为Python侧合计约1微秒，也不能当正式性能。该源码每次读取完整shape和stride，连续平坦路径的轻量N键仍是可独立验证的方法。随后只改数学dtype的8600ce070318已在同一正式合同超过0.8；达到目标后先保留原字节并冻结复现，不为补齐所有可能方法继续修改候选"
+  ],
+  "source": "development/experiments/operators/selu_/candidate.py",
+  "source_sha256": "8764018cfb2cab9444a34caf7a171f7eac7395656631698ce491e676557462f0",
+  "evidence_checkpoint": "d33cd2b55dd51d8bab732025409f52f916976370",
+  "evidence": [
+    "development/experiments/regressions/20261109/fixed-25/operators/selu_/evaluation/result.json",
+    "development/experiments/skill-validation/20261109-selu/formal-3cec1212c3b7/operators/selu_/evaluation/result.json",
+    "development/experiments/skill-validation/20261109-selu-recovery/formal-5e9e4d482620/operators/selu_/evaluation/result.json",
+    "development/experiments/skill-validation/20261109-selu-recovery/formal-5e9e4d482620/audit-final.json"
+  ],
+  "current_validation": {
+    "date": "2026-11-09",
+    "source": {
+      "path": "development/experiments/skill-validation/20261109-selu-recovery/formal-5e9e4d482620/operators/selu_/candidate.py",
+      "sha256": "5e9e4d4826207ea03e70d01e871c71220e40f9097ad0a0f87da977f793573115"
+    },
+    "formal_result": {
+      "path": "development/experiments/skill-validation/20261109-selu-recovery/formal-5e9e4d482620/operators/selu_/evaluation/result.json",
+      "sha256": "e3a00612be5e3ef603875444734eeeb5ad45c29e908b474c23a1b2ba635e91f2"
+    },
+    "audit": {
+      "path": "development/experiments/skill-validation/20261109-selu-recovery/formal-5e9e4d482620/audit-final.json",
+      "sha256": "68e93d77e1b29ddf618870704889a0fb49f3aa86a6bfce79366affc5009c0eb2"
+    },
+    "summary": {
+      "path": "development/experiments/skill-validation/20261109-selu-recovery/summary.json",
+      "sha256": "b5a7cfca07a34210ec005a290937f2ffcfd41f44e088fd83c4b264a776c6d96a"
+    },
+    "cann_score": 0.8870103232338551,
+    "formal_cases": 36,
+    "supplementary_each": 42,
+    "offset_checks": 9,
+    "runtime_checks": 24,
+    "accepted": true,
+    "historical_best_retained": true,
+    "findings": [
+      "大输入分块调整后约45.5/83.2/82.5微秒；小输入由普通调度约80微秒恢复至约13–15微秒",
+      "高层stream对象构造、同步型查询与重复宿主检查分别需要排查；空队列查询微基准不代表交替发射成本"
+    ],
+    "diagnostics": [
+      {
+        "path": "development/experiments/skill-validation/20261109-selu-recovery/host-probe-c625.json",
+        "sha256": "c0cb790c2e28ca019107c0b1587501565b32979b06ce4a54a4dba780ea784756"
+      },
+      {
+        "path": "development/experiments/skill-validation/20261109-selu-recovery/host-probe-0fed8d43398d.json",
+        "sha256": "f65c9c1962044da7a4299ab824420e12cd74fa0f2e51d0ca7bf15901aac3c5ed"
+      },
+      {
+        "path": "development/experiments/skill-validation/20261109-selu-recovery/runtime-abi-provenance.json",
+        "sha256": "f9c484a629437d9b8c95fd529101274863e5f9b90dcded058c8ad262654198d8"
+      }
+    ],
+    "attribution": "CC/DeepSeek生成源码，Codex提供历史方法、诊断和实现指导，并完成审查及正式评测"
+  }
+}

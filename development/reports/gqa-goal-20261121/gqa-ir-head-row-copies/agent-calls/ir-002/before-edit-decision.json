@@ -1,0 +1,189 @@
+{
+  "timestamp": "2026-11-21T15:35:56.332268+00:00",
+  "diagnosis": {
+    "source_sha256": "fd25f875c334f929efa8d0fab381344dfcdb901989c12b113e6ede30e537eda3",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "context.json",
+        "category": "evaluation",
+        "role": "本轮版本与验收起点",
+        "finding": "source_sha256=fd25f875...（attempt-049 源码，逐字节冻结），parent_invocation=ir-001，evidence_mode=compile-repair，editable_ir_stage=bcmlir；保留最佳为 attempt-047（源码 3c34fdfb...，四案例合格，历史 187.2302us，case4 目标 175.5726us，四案例几何均值降幅 43.27%）。IR001 未被保留，其两份 bcmlir 即该分支真实编译产物。"
+      },
+      {
+        "path": "feedback.json",
+        "category": "evaluation",
+        "role": "当前 IR 的正式编译与数值结果",
+        "finding": "status=target_compile_failed。case4 原始 049 bcmlir（sha d4e49444...）在 bishengir-compile（--enable-auto-multi-buffer=False 等 reference047 选项）下报 ub overflow：requires 1576960 bits while 1572864 bits available（超出 4096 bits=512B），case7 原始（sha 113a7ad9...）给出同样的 UB 报文。ir001_cpu_results 中两份 output bcmlir（sha b42ec852...、4a277f39...）解析通过，两条特化均停在 candidate.py:435:37/472:30 的 failed to legalize operation 'linalg.generic' that was explicitly marked illegal，故两条分支都无目标设备时延与 UB 容量结论。"
+      },
+      {
+        "path": "codex-brief.json",
+        "category": "evaluation",
+        "role": "宿主证据分析与候选机制（Codex 贡献）",
+        "finding": "Codex 指出：本批 bishengir-compile 后端明确拒绝输出端标量 region 的 linalg.generic；原始 049 与保留 047 的 BCMLIR 使用张量形式 arith.divf/arith.truncf 并通过合法化，linalg.broadcast 在 047 实际 BCMLIR 中出现且被后端接受。其建议以 linalg.broadcast（dimensions=[1]）+ 张量 arith.divf + 张量 arith.truncf 替换该 generic，保留 IR001 的分组 Q 拷贝、分组输出地址、形状、步长与其余 IR，并提示可能多出 Gx128 FP32 广播/除法临时量、需以 CPU 编译实测 UB。我核对 ir/target 与 ir/case7 两份 bcmlir，确认唯一依赖非法 generic 的正是输出端归一化表达式，方案与代码事实一致，采纳该机制。"
+      },
+      {
+        "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "case4（G=8，bfloat16，B4S256Nq64Nkv8D128）实际待改 IR",
+        "finding": "第 132-137 行：scf.for %arg14 = 0 to 128 step 8（16 次动态轮次）内，%o_slice=tensor<8x128xf32>（%49 的 extract_slice，DiscreteMemAccess）、%o_den=tensor<8xf32>（%reduced 的 extract_slice）、%o_empty=tensor<8x128xbf16>；唯一 linalg.generic 以 affine_map (d0,d1)->(d0,d1)/(d0)/(d0,d1) 做标量 arith.divf 后 arith.truncf 并 yield，结果经 bufferization.materialize_in_destination 写入 %o_view（memref<8x128xbf16, strided<[128,1], offset:?>>）。该表达式对应 frozen.py 第 425 行 out = acc / l_new[:, None] 加 .to(Out.dtype.element_ty) 的逐元素含义。"
+      },
+      {
+        "path": "ir/case7/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "case7（G=4，bfloat16，cross B2Sq128Skv256Nq32Nkv8D128）实际待改 IR",
+        "finding": "第 132-137 行同一模式，规模为 tensor<4x128xf32> / tensor<4xf32> / tensor<4x128xbf16>，scf.for %arg14 = 0 to 128 step 4（32 次动态轮次），输出地址以 %c4_i32 与 %c4096_i32 计算，%o_view 为 memref<4x128xbf16, strided<[128,1], offset:?>>；除行数常量外与 case4 特化同构。"
+      },
+      {
+        "path": "compiled-readonly/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "049 原始（未分组）BCMLIR 的命名算子先例",
+        "finding": "第 127-134 行逐行处理：%extracted_slice=tensor<1x128xf32>、%extracted 为标量分母、linalg.fill 生成 tensor<1x128xf32>、张量 arith.divf、arith.truncf 到 tensor<1x128xbf16>、materialize_in_destination。说明该后端路径上的张量 divf/truncf 可通过合法化，049 的失败点落在 UB 容量（1576960>1572864 bits），与 linalg.generic 非法化属两类独立缺陷。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "历史 047（源码 3c34fdfb...）case4 的资源与占时口径",
+        "finding": "历史材料。候选侧 aiv_mte3_time(us) 19 行有效、均值 30.60us（min 25.67，max 35.12，sum 581.46），aiv_mte2_time 均值 36.58us，aiv_vec_ratio 均值 0.496；aiv_time 参考侧均值 111.73us、候选侧 165.05us（行数 19 对 20），该差异源于两侧 program 数不同，按文件 scope 只作逐 block 分布，不作全任务关键路径结论。048/049 分支无设备数据，这些数值用于定位存储与向量侧候选机制。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "paired_profiling",
+        "role": "历史 047 指令级热点（MTE3 存储与 VECTOR 归一化时序）",
+        "finding": "历史材料，source_sha256=3c34fdfb...。pc 0x10d11c64 的 MTE3/MOV_SRC_TO_DST_ALIGN calls=8、cycles=42246、running_time_us=25.6，detail 为 Src:UB,Dst:OUT,Dtype:B16，来源 tl.store（candidate.py:409,446）；同段 instruction_calls 记录 MTE3/MOV_SRC_TO_DST_ALIGN 18、VECTOR/VDIV 18、VECTOR/VCONV 29、MTE3/SET_FLAG 20、MTE3/WAIT_FLAG 19。这些计数属于单个记录窗口内的动态次数，跨窗口累加需先核对执行覆盖。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "历史 047 模拟器窗口的时钟资质与观测范围",
+        "finding": "历史材料（historical=true）。raw_clock_window 为 128.958-228.979（100us 长，unit=unassigned），clock_qualification=relative_only、absolute_time_qualified=false；absolute_unit_validation 以 22 个同 pc 对照给出 us 量级 median_ratio≈1.0；interpretation 明确占用率只描述观察窗口、activity_includes_wait=false、outside_events=20、idle 区间 251 个。当前 IR 无任何模拟器窗口，本轮的编译修复不产生模拟器增量结论。"
+      },
+      {
+        "path": "gqa-head-row-language-evidence.txt",
+        "category": "source_ir",
+        "role": "当前后端表示能力边界",
+        "finding": "049 源码把 Q 载入与输出存储落实为 128 条单行拷贝且目标 UB 197120B>196608B，两个 BF16 案例失败；050 的标量/静态地址分解被后端以非单位 batch 的 memref.collapse_shape 拒绝并要求 327680B；020 的显式 reshape 亦失败。这些是当前 CANN 9.0.0 后端的表示限制，Triton 语言层仍可表达同一数学。IR001 以分组行拷贝绕开单行拷贝次数，本轮沿用其分组与地址。"
+      }
+    ],
+    "hypothesis": "两份特化的编译失败由输出端 linalg.generic 的非法化直接触发；该 generic 的语义是逐行同一 FP32 分母的逐元素除法加 BF16 截断，后端已有可合法化的等价命名/张量算子路径（本文件历史先例为 linalg.fill 加张量 arith.divf/arith.truncf；Codex 提供 linalg.broadcast 在 047 实际 BCMLIR 被接受）。用 linalg.broadcast（dimensions=[1]，tensor<Gxf32>→tensor<Gx128xf32>）加张量 arith.divf 与张量 arith.truncf 替换该 generic 后，逐行 FP32 除法与 BF16 截断原样保留，模块得以进入后续 UB 判定；若命名算子路径仍报 UB 溢出，则说明分组行拷贝加归一化的总 UB 需求在本后端下超出预算，溢出量由 CPU 编译器报告量化。",
+    "alternatives": [
+      "保持 IR001 原样（含非法 linalg.generic）交回：已知会在两条特化上重复 failed to legalize，信息增量为零，仅作回退。",
+      "回到 049 原始逐行 1x128 形式（compiled-readonly 中的 linalg.fill 加张量 divf/truncf）：语义等价且算子合法，但实测 UB 197120B>196608B 与反馈的 1576960>1572864 bits 一致表明容量不足，属已知失败。",
+      "用 linalg.fill 把分母扩展为 Gx128：fill 输入为标量，无法一次传播 G 个不同分母，需拆回 G 次逐行填充，等价于旧形式。",
+      "保持秩不变的 tensor.expand_shape 到 tensor<Gx1xf32> 再 linalg.broadcast dimensions=[1]：语义等价，可作为后端拒绝秩提升式 broadcast 时的独立后续候选；050 的 collapse_shape 被拒属另一方向，需单独验证。",
+      "把除法折叠进 matmul 后处理或改 3D reshape：改变本轮机制边界（brief 明确排除 reshape 与别名），留给独立调用。",
+      "改源码或编译选项：源码逐字节冻结，编译选项变化也属独立研究身份，本轮不做。"
+    ],
+    "change": "仅编辑 ir/target/_gqa_fwd_kernel.bcmlir 与 ir/case7/_gqa_fwd_kernel.bcmlir 输出循环体内的一处表达式：删除 %o_empty 的 tensor.empty、linalg.generic 及其标量 region、以及指向 %o_out 的 materialize；替换为 (1) tensor.empty 生成 tensor<Gx128xf32> 广播目标，(2) linalg.broadcast ins(%o_den : tensor<Gxf32>) outs(该空张量 : tensor<Gx128xf32>) dimensions = [1]，(3) arith.divf %o_slice 与广播结果 : tensor<Gx128xf32>，(4) arith.truncf 该商 : tensor<Gx128xf32> to tensor<Gx128xbf16>，(5) bufferization.materialize_in_destination 截断结果 in writable %o_view。case4 的 G=8，case7 的 G=4；%o_slice、%o_den、%o_view 的来源、形状、步长、loc 与全部其余 IR（分组 Q 拷贝、分组输出地址、matmul、reduce、scf.for 步长与边界、函数 ABI）逐字保持不变。",
+    "expected": [
+      "编译：两份特化在相同 bishengir-compile 选项下通过 linalg.generic 合法化，反馈中的 failed to legalize operation linalg.generic 消失，模块整体进入 UB 判定阶段。",
+      "IR 形态：编辑后两个文件各含 0 个 linalg.generic，新增 1 个 linalg.broadcast、1 个张量 arith.divf、1 个张量 arith.truncf，均位于同一 scf.for 体内。",
+      "动态轮次：输出循环迭代次数保持 case4 16 次、case7 32 次（边界与步长未动）；每次迭代处理元素数由 G 条 1x128 变为单个 Gx128（case4 1024、case7 512 个），每 block 处理的元素总量保持不变。",
+      "指令：后端按分组整体下发时，每 block 的 VDIV/VCONV 调用次数相对逐行形式按 G 倍下降（case4 8 比 1 量级、case7 4 比 1 量级，除数受硬件向量长度切分影响），历史 047 窗口中 MTE3/MOV_SRC_TO_DST_ALIGN 8 次、25.6us 一类存储热点不因本改动增加。",
+      "等待：每 block 输出阶段 VECTOR 与 MTE3 之间的 SET_FLAG/WAIT_FLAG 配对数随下发次数下降而减少；具体周期数不作预测。",
+      "资源：新增 Gx128 FP32 广播临时量与 Gx128 FP32 商临时量（case4 各 4096B、case7 各 2048B），BF16 结果临时量 Gx128（2048B/1024B）；编译器把除法融合进截断写回时实际新增低于该上界。UB 判定的可观测预测是总需求与 1572864 bits 阈值之差被报出：编译通过表示分组形式在预算内，仍溢出则溢出量可读出并用于下一步取舍。",
+      "性能：本轮给出设备时延结论的条件为 CPU 编译与宿主评审通过后才进入四项官方评测，与保留最佳 047（case4 175.5726us）的对比在评测阶段进行。"
+    ],
+    "validation": "宿主按反馈中的同一 bishengir-compile 命令与选项（--target=Ascend910B4-1、--enable-auto-multi-buffer=False、--enable-auto-bind-sub-block=True、--link-aicore-bitcode=.../libdevice.10.bc、--enable-hfusion-compile/hivm-compile/triton-kernel-compile=true）分别编译两份修改后 bcmlir，核对返回码、错误文本中 linalg.generic 非法化是否消失、UB 报文的需求位数与阈值；语义评审通过后运行官方固定四项 case1/2/4/7 的正确性检查（contract_sha256=30323415...，阈值不变）与全调用时延，逐项对照 expected 的兑现与偏差，并与保留最佳 047 的 187.2302us 与 case4 175.5726us 比较。",
+    "layer_reason": "Triton 表达层面：frozen.py 的 out = acc / l_new[:, None] 与 .to(Out.dtype.element_ty) 本身可表达，049 的降级把逐行输出落实为 128 条单行拷贝（UB 197120B>196608B），050 的地址分解被后端 collapse_shape 拒绝（327680B），020 的显式 reshape 亦失败，当前后端的表示能力卡在拷贝粒度与内存形式，语言语义层面仍完整。固定源码实验目的：源码 sha 必须逐字节保持 fd25f875...，本轮只检验分组输出地址加命名算子归一化这一表示形式能否编译并保住数学，因此改动只能落在编译产物层，源码方向（如以 tl.reshape/broadcast 显式表达同一分组归一化）登记为可表达时的替代实验。IR 控制点：唯一控制点是输出 scf.for 体内的表达式实现，用后端已接受的 linalg.broadcast 与张量 arith.divf/arith.truncf 取代被标为非法的 linalg.generic，同时保持分组 Q 拷贝、分组输出地址、形状、步长与其余算子不变，使编译修复的因果可单独归因。",
+    "simulator_incremental_judgment": "本轮无当前 IR 的设备或模拟器观测：profiling.json、hotspots.json、timeline.json 全部标注历史并绑定源码 3c34fdfb...（保留最佳 047），只用于定位存储与归一化候选机制，当前候选的收益证据待新窗口。前窗口（历史 047）：profiling 各指标 19 行有效（候选侧 20 行），归一化范围为逐 block 均值；timeline 窗口 128.958-228.979us、时钟资质 relative_only、绝对时间资格为否、20 个窗口外事件与 251 个空闲区间，该窗口覆盖一部分执行。后窗口（当前 IR）：无编译成功产物，覆盖量为零，全部设备指标记为未知。动态总次数比较须先核对执行覆盖：hotspots 中 MTE3/MOV_SRC_TO_DST_ALIGN 的 8 次调用属于单记录窗口片段，跨窗口求和需要新的同源码窗口。",
+    "unknown": [
+      "本后端是否接受秩提升形式的 linalg.broadcast（tensor<Gxf32> → tensor<Gx128xf32>, dimensions=[1]），以及它是否整体下发为一次向量操作。",
+      "替换后分组归一化的总 UB 需求是否落在 1572864 bits 以内，多出的 Gx128 FP32 临时量是否被融合消去。",
+      "输出端分组后每 block 的实际 VDIV/VCONV/MTE3 调用次数与等待配对数，需新窗口测量。",
+      "两项特化编译通过后四项官方正确性（含 BF16 阈值 0.0078125）与全调用时延，以及相对保留最佳 047 的差异。"
+    ]
+  },
+  "diagnosis_sha256": "f0184d071e1f57f7dfeab78586aaa9a3e381437ab07274522dfcc641a53100cc",
+  "evidence": [
+    {
+      "path": "context.json",
+      "category": "evaluation",
+      "role": "本轮版本与验收起点",
+      "finding": "source_sha256=fd25f875...（attempt-049 源码，逐字节冻结），parent_invocation=ir-001，evidence_mode=compile-repair，editable_ir_stage=bcmlir；保留最佳为 attempt-047（源码 3c34fdfb...，四案例合格，历史 187.2302us，case4 目标 175.5726us，四案例几何均值降幅 43.27%）。IR001 未被保留，其两份 bcmlir 即该分支真实编译产物。",
+      "sha256": "d38c79b4f832b7eb442f3f446a180a8e10862e45a8bd70786ec39a5e7050e3ec"
+    },
+    {
+      "path": "feedback.json",
+      "category": "evaluation",
+      "role": "当前 IR 的正式编译与数值结果",
+      "finding": "status=target_compile_failed。case4 原始 049 bcmlir（sha d4e49444...）在 bishengir-compile（--enable-auto-multi-buffer=False 等 reference047 选项）下报 ub overflow：requires 1576960 bits while 1572864 bits available（超出 4096 bits=512B），case7 原始（sha 113a7ad9...）给出同样的 UB 报文。ir001_cpu_results 中两份 output bcmlir（sha b42ec852...、4a277f39...）解析通过，两条特化均停在 candidate.py:435:37/472:30 的 failed to legalize operation 'linalg.generic' that was explicitly marked illegal，故两条分支都无目标设备时延与 UB 容量结论。",
+      "sha256": "445dbc9abd46ca01f31683a3552e1bbdad75375bf32a4b895148bee620a1f090"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "evaluation",
+      "role": "宿主证据分析与候选机制（Codex 贡献）",
+      "finding": "Codex 指出：本批 bishengir-compile 后端明确拒绝输出端标量 region 的 linalg.generic；原始 049 与保留 047 的 BCMLIR 使用张量形式 arith.divf/arith.truncf 并通过合法化，linalg.broadcast 在 047 实际 BCMLIR 中出现且被后端接受。其建议以 linalg.broadcast（dimensions=[1]）+ 张量 arith.divf + 张量 arith.truncf 替换该 generic，保留 IR001 的分组 Q 拷贝、分组输出地址、形状、步长与其余 IR，并提示可能多出 Gx128 FP32 广播/除法临时量、需以 CPU 编译实测 UB。我核对 ir/target 与 ir/case7 两份 bcmlir，确认唯一依赖非法 generic 的正是输出端归一化表达式，方案与代码事实一致，采纳该机制。",
+      "sha256": "3e70732da4b6e740c9351a6c2f90d142a1db9bb58602cd63a68960572978162f"
+    },
+    {
+      "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "case4（G=8，bfloat16，B4S256Nq64Nkv8D128）实际待改 IR",
+      "finding": "第 132-137 行：scf.for %arg14 = 0 to 128 step 8（16 次动态轮次）内，%o_slice=tensor<8x128xf32>（%49 的 extract_slice，DiscreteMemAccess）、%o_den=tensor<8xf32>（%reduced 的 extract_slice）、%o_empty=tensor<8x128xbf16>；唯一 linalg.generic 以 affine_map (d0,d1)->(d0,d1)/(d0)/(d0,d1) 做标量 arith.divf 后 arith.truncf 并 yield，结果经 bufferization.materialize_in_destination 写入 %o_view（memref<8x128xbf16, strided<[128,1], offset:?>>）。该表达式对应 frozen.py 第 425 行 out = acc / l_new[:, None] 加 .to(Out.dtype.element_ty) 的逐元素含义。",
+      "sha256": "b42ec852fc5d5fec74c8e4e4cf077c306827cfabca7612186bf662b9b5bcecd6"
+    },
+    {
+      "path": "ir/case7/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "case7（G=4，bfloat16，cross B2Sq128Skv256Nq32Nkv8D128）实际待改 IR",
+      "finding": "第 132-137 行同一模式，规模为 tensor<4x128xf32> / tensor<4xf32> / tensor<4x128xbf16>，scf.for %arg14 = 0 to 128 step 4（32 次动态轮次），输出地址以 %c4_i32 与 %c4096_i32 计算，%o_view 为 memref<4x128xbf16, strided<[128,1], offset:?>>；除行数常量外与 case4 特化同构。",
+      "sha256": "4a277f398d68f6e0daa7281f883a05a5820740146a7ec742902f294223d258bd"
+    },
+    {
+      "path": "compiled-readonly/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "049 原始（未分组）BCMLIR 的命名算子先例",
+      "finding": "第 127-134 行逐行处理：%extracted_slice=tensor<1x128xf32>、%extracted 为标量分母、linalg.fill 生成 tensor<1x128xf32>、张量 arith.divf、arith.truncf 到 tensor<1x128xbf16>、materialize_in_destination。说明该后端路径上的张量 divf/truncf 可通过合法化，049 的失败点落在 UB 容量（1576960>1572864 bits），与 linalg.generic 非法化属两类独立缺陷。",
+      "sha256": "d4e494444fd707cd0e7a6ce95932d90e172e5f43867c64091738f48420ee667b"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "历史 047（源码 3c34fdfb...）case4 的资源与占时口径",
+      "finding": "历史材料。候选侧 aiv_mte3_time(us) 19 行有效、均值 30.60us（min 25.67，max 35.12，sum 581.46），aiv_mte2_time 均值 36.58us，aiv_vec_ratio 均值 0.496；aiv_time 参考侧均值 111.73us、候选侧 165.05us（行数 19 对 20），该差异源于两侧 program 数不同，按文件 scope 只作逐 block 分布，不作全任务关键路径结论。048/049 分支无设备数据，这些数值用于定位存储与向量侧候选机制。",
+      "sha256": "cecc4a2287dbb4318d6be3f240c5c7d37a4fa7bb9deeca2da7bc41c4d720b2ca"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "paired_profiling",
+      "role": "历史 047 指令级热点（MTE3 存储与 VECTOR 归一化时序）",
+      "finding": "历史材料，source_sha256=3c34fdfb...。pc 0x10d11c64 的 MTE3/MOV_SRC_TO_DST_ALIGN calls=8、cycles=42246、running_time_us=25.6，detail 为 Src:UB,Dst:OUT,Dtype:B16，来源 tl.store（candidate.py:409,446）；同段 instruction_calls 记录 MTE3/MOV_SRC_TO_DST_ALIGN 18、VECTOR/VDIV 18、VECTOR/VCONV 29、MTE3/SET_FLAG 20、MTE3/WAIT_FLAG 19。这些计数属于单个记录窗口内的动态次数，跨窗口累加需先核对执行覆盖。",
+      "sha256": "efbb0d7cc1cb231169af2f8dd9107c6b401a53bf0090ffbbdab60bab75c8d80b"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "历史 047 模拟器窗口的时钟资质与观测范围",
+      "finding": "历史材料（historical=true）。raw_clock_window 为 128.958-228.979（100us 长，unit=unassigned），clock_qualification=relative_only、absolute_time_qualified=false；absolute_unit_validation 以 22 个同 pc 对照给出 us 量级 median_ratio≈1.0；interpretation 明确占用率只描述观察窗口、activity_includes_wait=false、outside_events=20、idle 区间 251 个。当前 IR 无任何模拟器窗口，本轮的编译修复不产生模拟器增量结论。",
+      "sha256": "0f7146ec83e0916d404e7b62042bc2421d322e1bd0e67a3fa96f623682e22f3a"
+    },
+    {
+      "path": "gqa-head-row-language-evidence.txt",
+      "category": "source_ir",
+      "role": "当前后端表示能力边界",
+      "finding": "049 源码把 Q 载入与输出存储落实为 128 条单行拷贝且目标 UB 197120B>196608B，两个 BF16 案例失败；050 的标量/静态地址分解被后端以非单位 batch 的 memref.collapse_shape 拒绝并要求 327680B；020 的显式 reshape 亦失败。这些是当前 CANN 9.0.0 后端的表示限制，Triton 语言层仍可表达同一数学。IR001 以分组行拷贝绕开单行拷贝次数，本轮沿用其分组与地址。",
+      "sha256": "da1fecda802f6fed0e6e8f2e1d78ce5b5c47b8d9587ea5dd5eb55897180bdcf1"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "fd25f875c334f929efa8d0fab381344dfcdb901989c12b113e6ede30e537eda3",
+    "contract.json": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858",
+    "ir-inventory.json": "d6ff5d62d6c3a0fdae6c8b34ac7c938ce279064103bf067de1ae047800f25dda",
+    "feedback.json": "445dbc9abd46ca01f31683a3552e1bbdad75375bf32a4b895148bee620a1f090",
+    "profiling.json": "cecc4a2287dbb4318d6be3f240c5c7d37a4fa7bb9deeca2da7bc41c4d720b2ca",
+    "hotspots.json": "efbb0d7cc1cb231169af2f8dd9107c6b401a53bf0090ffbbdab60bab75c8d80b",
+    "timeline.json": "0f7146ec83e0916d404e7b62042bc2421d322e1bd0e67a3fa96f623682e22f3a",
+    "gqa-head-row-language-evidence.txt": "da1fecda802f6fed0e6e8f2e1d78ce5b5c47b8d9587ea5dd5eb55897180bdcf1",
+    "context.json": "d38c79b4f832b7eb442f3f446a180a8e10862e45a8bd70786ec39a5e7050e3ec",
+    "diagnosis.json": "d38ae0290ed2cc547d031033ffc806fce9c0e5eed19ed79604b15995b7e5de38",
+    "codex-brief.json": "3e70732da4b6e740c9351a6c2f90d142a1db9bb58602cd63a68960572978162f",
+    "ir/target/_gqa_fwd_kernel.bcmlir": "b42ec852fc5d5fec74c8e4e4cf077c306827cfabca7612186bf662b9b5bcecd6",
+    "ir/case7/_gqa_fwd_kernel.bcmlir": "4a277f398d68f6e0daa7281f883a05a5820740146a7ec742902f294223d258bd",
+    "compiled-readonly/_gqa_fwd_kernel.ttir": "b940405368885e9fd449e76edd25e733822dc859e2f4933c63d2a0f6ff939edb",
+    "compiled-readonly/_gqa_fwd_kernel.ttadapter": "0dfa3181c57625c4ef4f3894f9b5cc35eba95f5df1e1cd30695f0a09f502c9fe",
+    "compiled-readonly/_gqa_fwd_kernel.bcmlir": "d4e494444fd707cd0e7a6ce95932d90e172e5f43867c64091738f48420ee667b"
+  },
+  "decision_tool_sha256": "2ba55ebab8be5b8a2363da657d6ee81799d4cabcdfb8e1494846aecfd1fde624"
+}

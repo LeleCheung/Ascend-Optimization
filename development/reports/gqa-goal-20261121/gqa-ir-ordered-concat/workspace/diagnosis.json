@@ -1,0 +1,110 @@
+{
+  "source_sha256": "e643746721391d655d976c1b1f19cbb7cde254ff7a7864aa08aaa03edb3286cc",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "feedback.json",
+      "category": "evaluation",
+      "role": "编译可行性正式结果（当前候选唯一测量）",
+      "finding": "ir-002 的 bishengir-compile 返回码 1，stderr 为 loc(\"/tmp/tmp26hqzh7k/kernel.mlir\":50:8): error: expected '=' after SSA name，解析在数值 SSA 标识 14 之后接字母 h 处停止；该轮资源与时延结论全部缺失，validation_scope 只覆盖编译可行性。"
+    },
+    {
+      "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "本轮待修 BCMLIR 实际内容",
+      "finding": "第 50 行 `%14h = arith.addi %14, %c1048576 : index` 定义该名，%14h 仅在第 55 行 q1 的 memref.reinterpret_cast offset 与第 144 行 o1 的 reinterpret_cast offset 各引用一次，全文件共 3 处；逐 token 扫描确认这是全文件中唯一的数字起始且带字母后缀的 SSA 名，其余名要么以字母开头（%cst、%q1re、%k_lo、%acc1f），要么为纯数字（%3、%14）走 MLIR 数值标识规则。"
+    },
+    {
+      "path": "compiled-readonly/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "冻结的低层参照产物（后端已产出的可编译版本）",
+      "finding": "冻结参照的第 47 与 103 行以 `%reinterpret_cast` 形式表达同一 q/out 偏移，全文件同样没有数字起始带字母的 SSA 名；这说明命名冲突来自本分支把 256 宽块拆成 q0/q1 与 k_lo/k_hi 两段后手写偏移时新造的标识，后端对该冗余并无消除动作，需要修正命名。"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "evaluation",
+      "role": "宿主（Codex）证据分析与候选方向",
+      "finding": "Codex 给出同一根因判断：MLIR 把数字起始 SSA 名按纯数字标识解析，14 后接 h 无效；建议只改 %14h 的定义与引用命名，其余计算 IR、分块、常量与 ABI 逐字保持，并注明历史 UB 与 profiling 独立保留、当前最佳 006 为 328.4468μs。"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "历史版本性能材料（source_sha256=aec8e90…，case4，历史标签）",
+      "finding": "case4 的 19 个 AIC 核累计 aic_total_cycles 均值 177973.26（min 157268，max 188438），aic_cube_ratio 均值 0.3005；该窗口绑定历史源码 aec8e90，与本轮 e643746 源码之间隔着后续改动，因此这些数字只作关注度参照，其中 cube 占比三成提示后续存在提升空间。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "历史流水窗口（source_sha256=aec8e90…，historical=true）",
+      "finding": "各流水条目中 wait_ratio 达到 0.6264（idle_ratio 0.3735），另有流水 idle_ratio 达 0.99994、largest_idle 0.7680，wait_union 与 productive_union 为重叠累计量，材料自带说明限定为关注度排序而非关键路径结论；本轮据其确认等待与空闲是后续机制候选，修复本身预期对这些数值零影响。"
+    },
+    {
+      "path": "contract.json",
+      "category": "evaluation",
+      "role": "验收范围（固定四例）",
+      "finding": "固定 case 1/2/4/7，warmup 5、trials 3、iterations 20，官方 checker 12180ce7 与 golden sha256 固定；语义校验要求完整保留因果掩码、scaleValue 与 bf16/fp16 精度路径。"
+    }
+  ],
+  "hypothesis": "当前 BCMLIR 的唯一编译失败点是第 50 行 `%14h` 这个非法 SSA 名：MLIR 对 `%` 后纯数字按数值标识解析，14 之后的字母 h 让解析器返回 expected '=' after SSA name。把该标识改为字母开头的合法名（%h14）可以解除解析失败，并让后续 bishengir-compile 阶段能够在同样的计算图与同样的分块结构上继续执行；整张计算图语义、类型、loc、分块与 ABI 保持逐字一致，因此本轮的编译修复在指令、动态轮次、等待与资源四个维度预期兑现为零变化。",
+  "alternatives": [
+    {
+      "option": "把 %14h 改名为 %h14（本轮选择）",
+      "reason": "影响面精确限定在 3 处标识符，addi 的常量、操作数、index 类型与 loc 全部保留，解析语义与后端可用性同时满足。"
+    },
+    {
+      "option": "把偏移常量 %c1048576 改为在 Python 侧生成、由前端 builder 分配命名",
+      "reason": "本轮源码逐字节冻结，源码改动属于另一研究身份；当前工作区只允许编辑清单列出的 BCMLIR。"
+    },
+    {
+      "option": "保持 IR 原样并交接 no-change",
+      "reason": "反馈已给出确定性编译失败，保持原样会让该分支停在无测量状态，无法进入四例验收。"
+    },
+    {
+      "option": "在编译修复同一轮顺带调整分块（例如合并 q0/q1 为 256 宽加载）",
+      "reason": "该改动改变动态加载轮次与 UB 占用，与编译修复的可验证机制混在一条交接里；按调用约定一次只落一个可独立验证的机制。"
+    }
+  ],
+  "change": "仅编辑 ir/target/_gqa_fwd_kernel.bcmlir：把第 50 行定义的 `%14h` 以及第 55、144 行对它的两处引用统一改名为 `%h14`。三个位置的其余字符（arith.addi 的 %14 与 %c1048576、两个 memref.reinterpret_cast 的 sizes [128, 128]、strides [8192, 1]、类型串、loc(#loc51)/#loc65/#loc84) 逐字保持。frozen.py、ir-inventory.json、context.json、contract.json、compiled-readonly/ 内产物与全部证据文件保持冻结。",
+  "expected": [
+    {
+      "item": "SSA 定义与引用改名",
+      "prediction": "第 50 行定义、第 55 与 144 行引用全部变为 %h14，文件内 %14h 出现次数归零，IR 的词法解析越过第 50 行并完整读入 module。"
+    },
+    {
+      "item": "编译返回码",
+      "prediction": "bishengir-compile 在 Ascend910B4-1、相同选项下越过解析阶段；宿主记录的新返回码与 stderr 决定本项兑现情况。"
+    },
+    {
+      "item": "指令",
+      "prediction": "标量 arith.addi 一条、index_cast 与 memref.reinterpret_cast 的数量与操作数保持，机器指令条数预期与父 IR 完全一致；q0/q1 各 128x128 的 memref.copy、k_lo/k_hi 的 128x256 加载、pv0/pv1 两次 matmul 与 out 的 materialize_in_destination 保持原样。"
+    },
+    {
+      "item": "动态轮次",
+      "prediction": "静态 IR 的分块结构逐字保留（acc0/acc1 两路、k 的两段 128 宽），每进程动态循环轮次预期与父版本一致，宿主四例重放可用于核对。"
+    },
+    {
+      "item": "等待",
+      "prediction": "本轮改动落在编译期命名，预期设备等待量变化为 0；历史 timeline 中 0.626 的 wait_ratio 属于 aec8e90 版本窗口，本轮只把它保留为后续机制假设。"
+    },
+    {
+      "item": "资源",
+      "prediction": "UB 与 L0C 的 alloc 形状、tensor.empty/fill 的 128x128 与 128x256 张量逐字保持，预期 UB 峰值与历史 UB262144B 观测同量级，分配字节数变化为 0。"
+    },
+    {
+      "item": "时延（同源码 IR 收益）",
+      "prediction": "同源码 IR 收益预期为 0 量级，因为算法与布局均保持；四例 official 时延用于确认编译修复之后候选恢复到可测状态，收益对照与保留最佳 328.4468μs 的比较作为独立验收项。"
+    }
+  ],
+  "validation": "宿主先执行 CPU 侧 bishengir-compile，核对返回码与 stderr，再对固定 case 1/2/4/7 做官方正确性检查（causal、scaleValue=-1.0、bf16/fp16 精度路径保持），随后按 warmup 5、trials 3、iterations 20 采集完整调用时延。逐条核对：%14h 出现次数为 0；解析推进过第 50 行；四例 official_passed 全真；指令与资源维度的偏差记录；同源码 IR 收益与保留最佳 328.4468μs 的比较分别登记。",
+  "layer_reason": {
+    "triton_expressiveness": "SSA 名由 Triton 前端在 lowering 时由 builder 自动分配，源码层写 tl.load/tl.store 无法控制生成名的形态；本分支把 256 宽块拆成 q0/q1 与 k_lo/k_hi 时产生了手写偏移，该偏移表达式落到 IR 后由后端命名，因此命名冲突的修复点位于 BCMLIR 层。",
+    "fixed_source_experiment_purpose": "本轮源码 e643746 逐字节冻结，目的是让这条源码分支恢复可编译并取得可测结果，从而把编译修复收益与同源码 IR 性能收益分开验收；若在源码侧回避，可以把两段加载改回单一 256 宽块，那属于另一研究身份并由后续调用登记。",
+    "ir_control_point": "控制点是第 50 行 arith.addi 定义的 SSA 名及其在第 55、144 行的两次引用；改动范围限定为标识符字符串，算术、类型、loc 与函数 ABI（11 个参数的顺序、属性与 SyncBlockLockArgIdx/WorkspaceArgIdx）逐字保留，因此该编辑可以独立验证且预期零性能影响。"
+  },
+  "simulator_incremental_judgment": "现有 profiling/hotspots/timeline 全部绑定 source_sha256=aec8e90 的历史窗口，case4、19 个 AIC 核，含 0.626 的 wait_ratio 与 0.99994 的 idle_ratio，属于保留最佳之前源码版本的观测。本轮候选由 e643746 源码编译出的 BCMLIR 产生，模拟器尚未对该版本产出窗口，因此本轮的模拟器增量判断为：修复只改命名，预期设备侧流水活动量、波次分布与空窗位置与父 IR 相同，等待与空闲数值保持历史量级；这些均登记为待验证假设，等宿主完成编译与四例重放后用新窗口覆盖，未报告的泳道继续保持未知。",
+  "unknown": [
+    "编译修复后后端剩余阶段（fusion、hivm）是否会暴露新的报错，当前材料未观测。",
+    "e643746 源码版本在 case1/2/7 上的时延相对保留最佳 006 的位置，需宿主重放后确认。",
+    "历史 0.626 wait_ratio 的流水与 cube 占比三成是否在 e643746 版本延续，待新窗口验证。"
+  ]
+}

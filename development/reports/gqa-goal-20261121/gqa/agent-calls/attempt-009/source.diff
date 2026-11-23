@@ -1,0 +1,115 @@
+--- 
++++ 
+@@ -72,6 +72,21 @@
+ dot operand pair are larger than the previous 128/128 tiling, so the compile may
+ hit the UB/L0C budget; the causal path keeps 64/64 and is untouched.
+ 
++PV 前的 V 预取（本轮机制，仅 SINGLE_KV 且 PV_SINGLE_F16）：当前实际 TTIR 把 V 的
++GM->UB 载入（%v = tt.load，256x128 bf16）与 bf16->fp16 的 extf/truncf 排在两次
++tt.reduce（softmax 的 max/sum）之后、PV dot 之前；同一源码的三核部分窗口里，该
++载入（Vector0 MTE2 1.66us，映射 v = tl.load(v_ptrs)）紧邻 PV 位置的 VECTOR
++WAIT_FLAG 1.66us 与 BAR 2.34us，而 Cube 在该 PV 位置另有 9.59us 的
++WAIT_FLAG_DEVI，Cube/Vector 的有效占比分别只有 11.21%/19.56%。因此把同一条载入
++和同一条双重舍入转换（bf16->fp32->fp16）提前到 QK 点积与 softmax 之前，使其与
++Cube 的 QK matmul、向量 softmax 重叠，PV dot 直接复用该 fp16 tile。PV 的点积
++表达式、操作数位型、tile 形状、零累加初值与输出归一化都不变，FP16 两项分解和
++因果路径编译期不进入该分支，故这是执行顺序实验，不是分块或精度改动。代价是
++256x128 fp16（64KiB）tile 在 QK/softmax 期间保持存活，UB 峰值上移，可能编译
++资源失败；编译器是否尊重该顺序、收益多少，由修改后的实际 IR、三核逐 PC 窗口
++与完整四项真机评测判定。窗口为各核独立归一化的部分窗口，全调用 completion
++缺失，指令时间不可相加为该 kernel 占比。
++
+ Compile-time geometry specialisation (earlier, retained mechanism): shape, stride,
+ head counts, scale and the causal offset are passed as tl.constexpr, because
+ they are legal input *metadata*, never input values.  The actual TTIR showed
+@@ -115,6 +130,7 @@
+     MASK_KV: tl.constexpr,
+     PV_SINGLE_F16: tl.constexpr,
+     SINGLE_KV: tl.constexpr,
++    PREFETCH_V: tl.constexpr,
+ ):
+     pid_m = tl.program_id(0)
+     pid_bh = tl.program_id(1)
+@@ -148,6 +164,29 @@
+         hi = tl.minimum(SKV, pid_m * BLOCK_M + BLOCK_M + delta)
+     else:
+         hi = SKV
++
++    # 本轮机制（PV 前的 V 预取，仅 SINGLE_KV 且 PV_SINGLE_F16）：当前实际 TTIR
++    # 把 V 的 GM->UB 载入（%v = tt.load，256x128 bf16）与 bf16->fp16 的
++    # extf/truncf 排在两次 tt.reduce（softmax 的 max/sum）之后、PV dot 之前；
++    # 同源码模拟器部分窗口里，该载入（Vector0 MTE2 1.66us，映射循环内的
++    # v = tl.load(v_ptrs)）紧邻
++    # PV 位置的 VECTOR WAIT_FLAG 1.66us 与 BAR 2.34us。此处把同一条载入与同一
++    # 条双重舍入转换（bf16->fp32->fp16）提前到 QK 点积与 softmax 之前，使其与
++    # Cube 的 QK matmul 及随后的向量 softmax 重叠，PV dot 直接复用该 fp16 tile。
++    # 点积操作数、tile 形状、累加初值、精度路径与输出归一化都不变，因此这是执行
++    # 顺序实验而非精度或分块改动；FP16 两项分解与因果路径编译期不进入本分支。
++    # 代价：256x128 fp16（64KiB）tile 在 QK/softmax 期间保持存活，UB 峰值上移，
++    # 存在编译资源失败风险；编译器是否尊重该顺序、收益多少，均由修改后的实际
++    # IR、三核逐 PC 窗口和完整四项真机评测判定。
++    if PREFETCH_V:
++        offs_n_pf = tl.arange(0, BLOCK_N)
++        v_ptrs_pf = v_base + offs_n_pf[:, None] * v_ss + offs_d[None, :] * v_sd
++        if MASK_KV:
++            v16_pf = tl.load(v_ptrs_pf,
++                             mask=(offs_n_pf[:, None] < SKV) & (offs_d[None, :] < D),
++                             other=0.0).to(tl.float16)
++        else:
++            v16_pf = tl.load(v_ptrs_pf).to(tl.float16)
+ 
+     for n0 in range(0, hi, BLOCK_N):
+         offs_n = n0 + tl.arange(0, BLOCK_N)
+@@ -191,11 +230,15 @@
+             p = tl.exp2(qk - m_safe[:, None])
+             l_new = l_i * alpha + tl.sum(p, 1)
+ 
+-        v_ptrs = v_base + offs_n[:, None] * v_ss + offs_d[None, :] * v_sd
+-        if MASK_KV:
+-            v = tl.load(v_ptrs, mask=kv_mask, other=0.0)
+-        else:
+-            v = tl.load(v_ptrs)
++        if PREFETCH_V:
++            # 复用循环前已载入并转换成 fp16 的 V tile；等价于此处 v.to(tl.float16)。
++            v16 = v16_pf
++        else:
++            v_ptrs = v_base + offs_n[:, None] * v_ss + offs_d[None, :] * v_sd
++            if MASK_KV:
++                v = tl.load(v_ptrs, mask=kv_mask, other=0.0)
++            else:
++                v = tl.load(v_ptrs)
+ 
+         # Precision-first PV with a two-term split of the fp32 probabilities.
+         # Rounding p directly to v.dtype injects an absolute error of
+@@ -235,7 +278,8 @@
+         # (d1+d2)+acc*alpha 这种改变舍入的分组）。
+         if SINGLE_KV:
+             if PV_SINGLE_F16:
+-                acc = tl.dot(p.to(tl.float16), v.to(tl.float16))
++                # 点积表达式不变，仅操作数来源改为循环前预取并转换好的同一 tile。
++                acc = tl.dot(p.to(tl.float16), v16)
+             else:
+                 p_hi = p.to(v.dtype)
+                 r1 = (p - p_hi.to(tl.float32)) * 2048.0
+@@ -356,6 +400,13 @@
+     # SKV==BLOCK_N 的既有形状（如 case2）该路径与原来的 alpha=0 算术逐项等价。
+     SINGLE_KV = (not is_causal) and (BLOCK_N == SKV)
+ 
++    # 本轮机制的可编译期开关：仅当整段 KV 单块（一轮迭代）且 V 为 bf16 走单次
++    # fp16 PV 时，才把循环内 V 的载入与 fp16 转换提前到 QK/softmax 之前复用。
++    # 判据只含合法元数据（分块整除性、V dtype），不读输入值、不看 case_id。
++    # 命中者为 case4/case7（SKV=256、bf16）；case2（fp16 两项分解）与 case1
++    # （因果）编译期不进入该分支，源码路径与其算术逐字不变。
++    PREFETCH_V = SINGLE_KV and PV_SINGLE_F16
++
+     grid = (triton.cdiv(S, BLOCK_M), B * NQ)
+     _gqa_fwd_kernel[grid](
+         query, key, value, y,
+@@ -370,6 +421,7 @@
+         MASK_MD=MASK_MD, MASK_KV=MASK_KV,
+         PV_SINGLE_F16=PV_SINGLE_F16,
+         SINGLE_KV=SINGLE_KV,
++        PREFETCH_V=PREFETCH_V,
+         num_warps=1, num_stages=1,
+     )
+     return y

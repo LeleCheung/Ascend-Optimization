@@ -1,0 +1,70 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "beeb2335d99a34262701b9023d62b816f7621381eaada3500506d6dde805f9f4",
+  "scope": "固定case1/2/4/7、原官方checker与golden、输入输出dtype与计时合同不变；父版本概率结构（QK→FP32 softmax→单次FP16 PV）逐字保留，仅改持久分支内 Q/输出的二维行打包。",
+  "evidence": [
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "保留的持久分支（PERSIST_KV，grid=(B*NKV)=32）每 tile 以 q_ss=8192 元素行跨、q_sd=1 列跨载入 128x128 Q，输出以同样布局 store；每 program 走 G*NB_M=16 个 tile。同一序列位置下 G 个共享 query 头的通道在 BSND 中连续（q_sh=128、q_sd=1），是打包的结构前提。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "trigger",
+      "finding": "实际 TTIR 中 Q 载入为 tensor<128x128x!tt.ptr<bf16>>，行乘数常量 cst_6=8192（元素）、列跨 1；输出 store 复用同一 q_ptrs_30/offs_d。即每次 GM/UB 搬运是 128 段 256B、行距 16KB 的二维 copy，而非按 G 个连续头合并的长段。"
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "trigger",
+      "finding": "case4 三核部分窗口（各核自归一化，application_completed=false）：veccore0/1 的 MTE3/MOV_SRC_TO_DST_ALIGN（Src:UB,Dst:OUT,Dtype:B16）各 16 次调用达 37.11/37.15us，另有 15.58/14.96us 一组，是该核最大的非等待搬出；同核 WAIT_FLAG_DEVI 为 71.45+51.55us。Cube 侧 FIX_L0C_TO_DST 47.47us、WAIT_FLAG_DEVI 158.63us，CUBE idle 66.3%、VEC idle 59.8%、MTE3 productive 29.5%。"
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "background",
+      "finding": "候选整 kernel 256.825us、32 block；每 program aic_mte2 35 条/GM_to_L1 1664KB、aiv_mte2 100 条/1568KB、aiv_mte3 34 条/UB_to_GM 800KB；aiv_scalar_wait_time 47.87us 而参考仅 0.96us，L0C_to_GM 98304KB 与参考持平（单次 fp16 PV 的收益已兑现）。搬运指令条数与等待量级说明当前限制在搬运/同步链。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "父版本为保留最佳：case4 268.77180us，官方四项 checker 通过；最后一例（case7 形状 B2Sq128Skv256Nq32Nkv8）候选 178.68615us。本轮任何改动都须由原四项完整 checker 与完整调用计时重新判定。"
+    },
+    {
+      "path": "workspace/context-brief.json",
+      "category": "other",
+      "role": "disambiguation",
+      "finding": "宿主指定本轮为独立实验：仅在同一持久路径、实际D==128、G 为 2 的幂且整除 128、S 可被 SL=128/G 整除、Q/Out 为连续头-通道布局时启用纯二维 [SL, G*128] 打包；t 循环覆盖 S/SL=G*NB_M 个 tile。历史 attempt-003 用的是三维 [SL,G,D] 载入+reshape，且不在当前持久算术之上；本记录按调用说明陈述差异（003 源码与失败文本不在本 workspace，failed-ir 仅有 attempt-001/014）。"
+    }
+  ],
+  "hypothesis": "每 tile 的 Q 载入与输出 store 被切成 128 段 256B（行距 16KB）。同一序列位置的 G 个共享头通道连续，把 (SL 序列位置 x G 共享头) 组织为纯二维 [SL, G*128]（列偏移跨头连续，G=8 时每行 2048B），每 tile 的搬运段数由 128 降到 SL=16，段开销按段数缩放，故 GM→L1/GM→UB 与 UB→GM 时间下降、整 kernel 变短；每行算术（QK、FP32 softmax、单次 FP16 PV、归一化）与总字节数、matmul 次数、L0C 搬出、程序数均不变。",
+  "alternatives": [
+    "仅合并 KV 或再调 BLOCK_M/BLOCK_N：上一轮已把链数降到 1，继续加大 M 会超 UB 预算且不改变 Q/输出的段数结构。",
+    "三维 [SL,G,D] 载入后 reshape（历史 attempt-003）：引入三维 tile 与布局变换，且不在当前持久算术之上；本轮改为纯二维 [SL, G*128] + 行主序有序 reshape，避免三维 join/transpose。",
+    "只把输出 store 二维化而输入保持 128 行：收益减半且需一次额外布局变换，读写不对称。",
+    "把 G 个头折进 K 维或改归约顺序：会改变每行归约结构与数值路径，超出本轮允许范围。",
+    "用 offsets 求余/整除逐行构造 [128,128] 指针：逻辑行仍是非连续段，不改变 DMA 段数，等于原状。"
+  ],
+  "discriminating_observation": "若收益来自段数而非算术，则修改后 aic_mte2/aiv_mte3 的指令条数与 MTE 时间下降、aiv_mte2/mte3_time 下降，而 aic_cube_time、aiv_vec_time、matmul 次数与 L0C_to_GM 总量基本不变；实际 IR 应出现单个 [SL, G*128] 二维 copy（行跨仍 8192 元素、列跨 1）并由 tt.reshape 转成 [128,128]，无按行标量化的 gather。反之，若 MTE 时间不降、或出现额外 VBRCB/VMOV 布局转换导致 vec_time 上升、或 UB 峰值越过 196608B 编译失败，则本假设被否。",
+  "change": "candidate.py：(1) _gqa_persist_kv_body 增加 constexpr Q_PACK2D/SL/QC，在原 K/V 循环外载入与 v16 转换之后、原逐 tile 循环之前插入打包分支——Q 以 [SL, QC=G*BLOCK_D] 纯二维指针载入（列偏移连续跨头），tl.reshape 为 [BLOCK_M, BLOCK_D]；随后 QK、FP32 softmax、单次 FP16 PV、归一化与原式逐字相同；输出按逆序 reshape 回 [SL, QC] 用同一二维布局 store，分支末尾 return；(2) 原逐 tile 循环与非持久回退逐字保留；(3) run() 仅用元数据（PERSIST_KV、实际D==128、G 为 2 的幂且整除 128、S%SL==0、S%BLOCK_M==0、q_sd/o_sd==1、q_sh/o_sh==BLOCK_D）构造判据；grid 仍 (B*NKV,)=32、num_stages=1、M128/N256 与公共入口不变。",
+  "expected": "case4（G=8, SL=16）每 program 16 个 tile 的 Q/输出搬运段数 128→16、段长 256B→2048B，MTE2/MTE3 时间与整调用下降（估计 3~12us，量级依赖段开销占比）；case7（G=4, SL=32，段长 1024B）同向受益；case1（因果 64/64）与 case2（G=12 非 2 的幂且非 SINGLE_KV）不命中判据，应保持原值。总 GM 字节数、matmul 次数、L0C 搬出、grid 程序数不变。风险：reshape 可能引入一次布局转换（UB 峰值 +32KB，逼近 196608B 预算）或后端不支持该 reshape；届时以编译/资源结果与实际 IR 为准。",
+  "validation": "1) preflight --source candidate.py → 宿主只读审查（掩码恒真、写出所有权唯一、IR 可行性）；2) 原四项完整 checker + 完整调用计时（compare 与保留最佳 268.77180us）；3) 修改后实际 IR：确认 [SL, QC] 二维连续段 copy、无标量 gather、无多余三维张量；4) 修改后模拟器重放，对比 MTE3/MOV_SRC_TO_DST_ALIGN、FIX_L0C_TO_DST 与各流水占比；5) 不新增测试用例，只保留原四项。",
+  "selected_layer": "kernel/持久分支的访存布局（DMA 分段），不改算术层",
+  "layer_reason": "模拟器把最大非等待成本放在 veccore 的 UB→OUT store（16 次 37.11us 窗口）与 Cube 的 FIX_L0C_TO_DST，profiling 中 aiv_scalar_wait 远高于参考而 cube 时间已很小；说明瓶颈在每 tile 的搬运/同步结构而非算术。DMA 段数由逻辑 2D tile 的行宽决定，只有改变 Q/输出 tile 的行组织（打包共享头）才能在 Triton 源码层减少段数；改变 BLOCK_M/N、dtype 或归约顺序都不能触及该结构，且已在上轮收益见底。",
+  "simulator_incremental_judgment": "热点证据的增量：在既有“交接链条数”判断之上，新增定位到 UB→OUT 的 MTE3 copy 本体（37.11/37.15us，16 次）与 MTE2 对称搬入，指出段数/段长可作为独立杠杆。流水证据的增量：VEC idle 59.8%、MTE3 productive 29.5%、CUBE idle 66.3%、大量 WAIT_FLAG_DEVI 说明核在等搬运而非等算术，支持“减少段开销”而不支持“减少 matmul”。保留的缺失：窗口为三核各自归一化的部分区间、跨核不可相加、application_completed=false、无全调用 completion，故仅作为方向证据，收益与正确性由完整四项真机判定。",
+  "unknown": [
+    "attempt-003 的源码与失败文本不在本 workspace（failed-ir 仅 attempt-001/014），其三维载入的具体报错无法复核，差异按调用说明陈述。",
+    "本 Triton(Ascend) 前端对二维有序 reshape 的下降方式未知：可能为零成本重解释、也可能产生一次布局转换；需实际 IR 判定。",
+    "打包后 UB 峰值是否仍低于 196608B 未知（reshape 可能多出一份 32KB 的 [SL,QC] bf16 缓冲）。"
+  ],
+  "post_record_status": {
+    "decision_id": "28f3bbe4ef7f430f97df2ad2076b9a77",
+    "decision_source_sha256": "beeb2335d99a34262701b9023d62b816f7621381eaada3500506d6dde805f9f4",
+    "edited_source_sha256": "bbafe94f9f4e781cc5f8b4235c628ecf103009e4c34b6828752f4f0c405969be",
+    "preflight": "awaiting_source_review（字节保持，等待宿主只读路径/地址边界审查与完整四项真机评测）",
+    "pending": "尚无编译、资源、正确性或性能结果；Q_PACK2D 的收益、reshape 下降方式、UB 峰值与修改后 IR 的连续段形态均待实测反馈。"
+  }
+}

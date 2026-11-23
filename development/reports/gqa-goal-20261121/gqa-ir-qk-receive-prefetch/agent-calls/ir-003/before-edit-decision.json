@@ -1,0 +1,195 @@
+{
+  "timestamp": "2026-11-21T19:20:41.677494+00:00",
+  "diagnosis": {
+    "source_sha256": "19f7fb238946cb9006286d4d222425d07c4ea9fc38a7d4ff85c71c72c49c584a",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "成对性能输入与合格基线",
+        "finding": "保留最佳为 ir-001 全调用 145.9246us、历史源码最佳 146.0561us、CANN 参考 130.3856us，四项官方 checker 通过。候选实测全调用 152.443054us，其中 Cube aic_scalar_wait_id2 均值 103.735us、aic_scalar_wait_id1 均值 32.291us，Vector 每核 aiv_scalar_wait 均值约 9.0us，Vector aiv_mte2 均值约 15us。Cube 计算累计 33.109/21.725us 已低于参考，墙钟余量集中在跨核等待与接收方向。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "simulator",
+        "role": "热点排序与等待占比定位",
+        "finding": "Cube 归一化窗口 CUBE 流水 active_ratio 0.5497、wait_ratio 0.3640、productive_ratio 0.1857；Vector 源码邻域 593-600 累计指令时间 389.55us、其中 wait_instruction_time_sum 250.17us。材料明确说明累计时间可重叠、仅作关注度排序，故本诊断只用它定位候选机制，也就是 QK 接收与 PV 交换处的等待。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "绝对时钟资质与观测范围",
+        "finding": "同 PC 非 Scalar 非同步指令 trace 区间与 CSV 运行时间对照 30 个 PC，median_ratio 0.99949、expected_ratio 1，时钟单位资质成立；观测窗口 32.5989990234375..138.76100268564187us，属于部分窗口，未报告泳道保持未知。"
+      },
+      {
+        "path": "ir/target.hivm.mlir",
+        "category": "source_ir",
+        "role": "本轮可编辑的实际 HIVM 候选结构",
+        "finding": "AIV 组入口在 376 行等待 CUBE FIX flag0，随后 382 行才在 UB0 发出 QK GM→UB 接收（wait V→MTE2 EVENT0），449-457 行从 GM f16 workSpace 接收 PV raw，458/462 行用 MTE2→V EVENT0 交回向量，472 行在分母 sum 后 set V→MTE2 EVENT0 释放 UB0；AIC 的 nextQK MMAD/fixpipe 在 218-249 行由 flag2 与 FIX EVENT1 串行保护，fixpipe 完成后只有原 PV 通道 set flag0。AIV 的 PV 结果等待在 450 行（sync_block_wait FIX flag0），QK 接收因此晚于该等待。UB 实际指令地址：p 在 114688、PVraw 65536、acc 81920、分母 180224、PBF16 32768、QK 接收 UB0，最高活跃终点 180480B。"
+      },
+      {
+        "path": "reviewed-prefetch-draft.mlir",
+        "category": "source_ir",
+        "role": "上一调用已审查的预取草案（只读模型参考）",
+        "finding": "草案与恢复后的父 IR 相差 99 行：AIC nextQK fixpipe 后新增 CUBE FIX flag4；AIV 组入口新增首块预取到 UB0（MTE2→V EVENT1、VECTOR MTE2 flag2），P 发送与 flag1 之后、PV flag0 等待之前新增 UB32768 预取（MTE3→MTE2 EVENT0 保护 PBF16 复用、VECTOR FIX flag4 等待、MTE2→V EVENT1、flag2），删除逐 tile sum 后的 V→MTE2 EVENT0 set 并改为组级 set/wait；数学、ABI、块大小、其余缓冲地址逐字保持。"
+      },
+      {
+        "path": "frozen.py",
+        "category": "source_ir",
+        "role": "固定源码身份与 PART_TILES 前瞻语义",
+        "finding": "PART_TILES 体 368-426 行已在 Triton 源中表达组内一深度 QK 前瞻（预取首块 raw_next，迭代中先发 t+1 的 dot 再做本 tile 的 exp/PV），而 448-534 行说明数学、FP16 QK 交接、BF16 单次 PV、FP16 acc 交接与分母/输出顺序。源码层面的前瞻已经存在，实际 IR 仍把 QK 的 fixpipe 与 GM→UB 接收串行到 P/PV 等待之后，故本轮控制点在 IR 的接收时刻与跨核事件，源码保持逐字节一致。"
+      },
+      {
+        "path": "codex-brief.json",
+        "category": "simulator",
+        "role": "Codex 的分析贡献与候选机制边界",
+        "finding": "Codex 依据成对 profiling 与模拟器给出方向：Cube 与 Vector 累计量都低于参考而墙钟更大，说明差异在重叠/依赖方向；并给出事件计划（首块 prefill 到 UB0、其余预取到 32768..65536、Cube nextQK FIX 后发 flag4、专用 MTE2→V EVENT1、V→MTE2 EVENT0 改组级配对）、UB 单位核对（196608B 容量、当前峰值 180480B、32768..65536 可复用）与 MTE3_MTE2 能力核对。本轮采纳该机制，具体实现按实际 IR 逐项复核。"
+      },
+      {
+        "path": "event-capability-readonly/sources.json",
+        "category": "source_ir",
+        "role": "跨核/流水事件能力证据",
+        "finding": "CANN 9.0.0 matmul_impl.h 74-76 行直接使用 FetchEventID/SetFlag/WaitFlag<HardEvent::MTE3_MTE2>，batch_copy_cube_in_using_ub.h 146-147 行同形；MTE3→MTE2 硬件事件存在，具体 hivm.hir.set_flag 的 lowering 交由 CPU 编译核验。"
+      },
+      {
+        "path": "feedback.json",
+        "category": "paired_profiling",
+        "role": "正式结果与前一机制否定证据",
+        "finding": "保留 ir-001 的正式结果 145.9246us、conditional 147.2544→146.5569us 0.4737% 与四项通过保持有效。上轮 barrier 删除实验 formal 144.40065us 更快，但硬件 kernel 154.82309us 更慢、conditional 145.3794→145.56115us 为 -0.1250%，判定无确认收益并保留 ir-001；该否定证据说明单纯删同步点属于独立机制且已排除，本轮聚焦 QK 接收前移。"
+      }
+    ],
+    "hypothesis": "当前 AIV 把每个 tile 的 QK GM→UB 接收放在 PV 结果 flag0 等待之后（IR 450 行等待之后才在下一迭代 382 行接收上一轮 Cube 已 fixpipe 的 QK）。Cube 的 nextQK MMAD/fixpipe 实际已在 PV 之前完成并由 flag2 保护（218-249 行）。在 P 发送与 flag1 之后、PV flag0 等待之前，把下一块 QK 预取到复用的 UB32768..65536，并让 Cube 在 nextQK fixpipe 后发独立 ready flag4、首块 prefill 到 UB0、专用 MTE2→V EVENT1 交接、V→MTE2 EVENT0 改组级配对，可让 QK 接收 MTE2 与 Cube 的 PV 计算及 AIV 的 P 发送/acc 接收重叠，降低每 tile 的 scalar 等待与跨核依赖，墙钟下降且数学与地址集合不变。",
+    "alternatives": [
+      "保持 IR 原样：依赖现有后端调度把 QK 接收前移；当前 IR 的等待链显示该前移尚未发生，本轮登记为待验证对照。",
+      "仅删跨核同步点或 barrier：反馈中已独立评测为硬件侧变慢（conditional -0.1250%），作为独立机制留在宿主另建调用。",
+      "把 PV flag0 等待整体改为更粗的组级同步：会扩大 PV 结果与输出的重叠风险，且缺少与 QK 接收分离的证据，本轮排除。",
+      "修改源码前瞻或块大小：源码与函数 ABI 冻结，块大小变更改变数学分工与资源，本轮排除。"
+    ],
+    "change": "在 ir/target.hivm.mlir（符号 _gqa_fwd_kernel_mix_aic）内按已审查草案复现同一机制：AIC 在 nextQK fixpipe 之后新增 sync_block_set[CUBE, PIPE_FIX] flag=4；AIV 组入口在 flag0 等待后新增首块 prefill：等待 V→MTE2 EVENT0、从 view[%5,0][64,256] 载入 QK 到 UB0、set MTE2→V EVENT1、sync_block_set[VECTOR, PIPE_MTE2] flag=2；删除逐 tile 迭代开头的 QK 载入与逐 tile V→MTE2 EVENT0 释放，改为组级 set/wait；迭代内 vcast 源按 t==首块选择 UB0 或 UB32768，等待 MTE2→V EVENT1；在 P store 与 flag1 之后、PV flag0 等待之前插入 scf.if 下一块预取：set MTE3→MTE2 EVENT0、sync_block_wait[VECTOR, PIPE_FIX] flag=4、等待 MTE3→MTE2 EVENT0、从 %37[%5,0][64,256] 载入 QK 到 UB32768、set MTE2→V EVENT1、sync_block_set[VECTOR, PIPE_MTE2] flag=2；内层循环结束后补 set V→MTE2 EVENT0 与既有组外等待配对。其余指令、表达式、地址、ABI 与块大小保持逐字一致。",
+    "expected": "1) 指令集合：AIC 新增每有效 next 一次 sync_block_set FIX flag4；AIV 新增组入口一次 QK prefill 载入、每次非尾块一次 UB32768 预取载入与三次新增等待/释放（flag4、MTE3→MTE2、EVENT1）及一次 flag2 set；删除每 tile 的 UB0 载入、每 tile 的 MTE2→V EVENT0 set/wait 与每 tile 的 V→MTE2 EVENT0 set。2) 动态轮次：QK GM→UB 载入总量保持每 worker 区间 tile 数不变（全调用 512 次），不新增或删除 QK 块；MTE2→V EVENT1 set/wait 各为每组 T 次；flag4 set/wait 与 MTE3→MTE2 set/wait 各为每组 T-1 次；V→MTE2 EVENT0 set/wait 改为每组 1 次加一次初始/final 配对。3) 等待与重叠：Cube PV 计算与 AIV 的 QK 接收可重叠，Cube aic_scalar_wait_id2 与 Vector aiv_scalar_wait 预期下降，QK 接收不再排在 PV flag0 之后；新增跨核等待仅覆盖 Cube nextQK fixpipe 已完成的 ready 与 P 发送完成，属于必要保护。4) 资源：UB 峰值保持 180480B，低于 196608B，QK 预取复用 32768..65536，PBF16 目的缓冲位置与 acc/p/PVraw/分母地址逐字不变；L0C、GM 字节、matmul 数与输出舍入路径不变。5) 性能：case4 目标低于当前最佳 145.9246us（对照历史 146.0561us），四项官方 checker 精度阈值不变。",
+    "validation": "先在宿主侧对编辑后的 HIVM 做 IR 解析与 CPU 后端编译（与 backend-binding.json 相同工具链参数），确认事件 set/wait 成对、UB 地址不越界、函数 ABI 与符号一致；随后在设备上运行原四项官方 checker 与 case4 计时，记录 formal 与 conditional 稳定性，并核对实际新生指令与动态轮次是否符合 expected 各项；若编译失败、事件校验失败或精度阈值不通过，则回退本机制并保留 ir-001。",
+    "layer_reason": "Triton 表达能力：frozen.py 已用 raw_next 表达组内一深度 QK 前瞻，但 Triton 无法指定 QK 结果在 UB 中的接收地址、接收时刻以及跨核 flag 编号与流水事件配对；这些属于后端生成调度，只有 HIVM 层能直接表达。固定源码实验目的：本轮保持 frozen.py 逐字节一致，用于判定 QK 接收前移这一 IR 控制点的独立收益，源码重写与编译选项变更各有独立研究身份。IR 控制点：实际 HIVM 的显式 buffer 地址（UB0、32768、65536、81920、114688、180224）、跨核 sync_block flag（0/1/2/3 已用，新增 4）、流水事件（MTE2→V EVENT1、MTE3→MTE2 EVENT0、V→MTE2 EVENT0 组级）与组入口/迭代内语句位置共同决定接收时机；本次只改这些控制点。",
+    "simulator_incremental_judgment": "相对上一调用，本轮新增的判断是：现有模拟器材料把 Cube CUBE wait_ratio 0.3640 与 Vector 源码邻域累计等待 250.17us 定位到跨核交接，而实际 IR 显示 QK 接收排在 PV flag0 等待之后、Cube nextQK fixpipe 已由 flag2 保护；因此预取的增量依据是接收时刻而非新增数据量。模拟器窗口为 32.599..138.761us 的部分窗口、各核分别归一化、application_completed=false，只支持机制排序，绝对收益由修改后重放与完整四项真机评测判定；未报告泳道保持未知。",
+    "unknown": [
+      "CPU 后端对新增 MTE3→MTE2 EVENT0 与 flag4 的具体 lowering 结果待编译确认。",
+      "预取带来的新增同步是否被 QK 接收前移的收益抵消，需真机重放确认。",
+      "模拟器部分窗口未覆盖的流水方向保持未知，等待下降幅度属于待测预测。"
+    ]
+  },
+  "diagnosis_sha256": "3b58aa4d5ae6a4f6dc0768b66000c20095eefef04ba932f12e2f8aec50814cb0",
+  "evidence": [
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "成对性能输入与合格基线",
+      "finding": "保留最佳为 ir-001 全调用 145.9246us、历史源码最佳 146.0561us、CANN 参考 130.3856us，四项官方 checker 通过。候选实测全调用 152.443054us，其中 Cube aic_scalar_wait_id2 均值 103.735us、aic_scalar_wait_id1 均值 32.291us，Vector 每核 aiv_scalar_wait 均值约 9.0us，Vector aiv_mte2 均值约 15us。Cube 计算累计 33.109/21.725us 已低于参考，墙钟余量集中在跨核等待与接收方向。",
+      "sha256": "87d9d43b187f3e5a10ddf982aa9072aa1cbc4a11cfb04b42147837d0b2ee4114"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "热点排序与等待占比定位",
+      "finding": "Cube 归一化窗口 CUBE 流水 active_ratio 0.5497、wait_ratio 0.3640、productive_ratio 0.1857；Vector 源码邻域 593-600 累计指令时间 389.55us、其中 wait_instruction_time_sum 250.17us。材料明确说明累计时间可重叠、仅作关注度排序，故本诊断只用它定位候选机制，也就是 QK 接收与 PV 交换处的等待。",
+      "sha256": "fab4a43a804049e8360ebddd13981960ced79eae2411369196eaee5f21b4102e"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "绝对时钟资质与观测范围",
+      "finding": "同 PC 非 Scalar 非同步指令 trace 区间与 CSV 运行时间对照 30 个 PC，median_ratio 0.99949、expected_ratio 1，时钟单位资质成立；观测窗口 32.5989990234375..138.76100268564187us，属于部分窗口，未报告泳道保持未知。",
+      "sha256": "8baf0f369e2093736b061505138ad3ea04561fbfa81ac91ba29c67460db1a58d"
+    },
+    {
+      "path": "ir/target.hivm.mlir",
+      "category": "source_ir",
+      "role": "本轮可编辑的实际 HIVM 候选结构",
+      "finding": "AIV 组入口在 376 行等待 CUBE FIX flag0，随后 382 行才在 UB0 发出 QK GM→UB 接收（wait V→MTE2 EVENT0），449-457 行从 GM f16 workSpace 接收 PV raw，458/462 行用 MTE2→V EVENT0 交回向量，472 行在分母 sum 后 set V→MTE2 EVENT0 释放 UB0；AIC 的 nextQK MMAD/fixpipe 在 218-249 行由 flag2 与 FIX EVENT1 串行保护，fixpipe 完成后只有原 PV 通道 set flag0。AIV 的 PV 结果等待在 450 行（sync_block_wait FIX flag0），QK 接收因此晚于该等待。UB 实际指令地址：p 在 114688、PVraw 65536、acc 81920、分母 180224、PBF16 32768、QK 接收 UB0，最高活跃终点 180480B。",
+      "sha256": "a28d48359241880dcb0890268a3695a1d8118c9327156c07081b0b079a5d1e7b"
+    },
+    {
+      "path": "reviewed-prefetch-draft.mlir",
+      "category": "source_ir",
+      "role": "上一调用已审查的预取草案（只读模型参考）",
+      "finding": "草案与恢复后的父 IR 相差 99 行：AIC nextQK fixpipe 后新增 CUBE FIX flag4；AIV 组入口新增首块预取到 UB0（MTE2→V EVENT1、VECTOR MTE2 flag2），P 发送与 flag1 之后、PV flag0 等待之前新增 UB32768 预取（MTE3→MTE2 EVENT0 保护 PBF16 复用、VECTOR FIX flag4 等待、MTE2→V EVENT1、flag2），删除逐 tile sum 后的 V→MTE2 EVENT0 set 并改为组级 set/wait；数学、ABI、块大小、其余缓冲地址逐字保持。",
+      "sha256": "c3bfa79252997697a999f80291af3e0e38b678d5c4339fa22c603d3b9406fa1a"
+    },
+    {
+      "path": "frozen.py",
+      "category": "source_ir",
+      "role": "固定源码身份与 PART_TILES 前瞻语义",
+      "finding": "PART_TILES 体 368-426 行已在 Triton 源中表达组内一深度 QK 前瞻（预取首块 raw_next，迭代中先发 t+1 的 dot 再做本 tile 的 exp/PV），而 448-534 行说明数学、FP16 QK 交接、BF16 单次 PV、FP16 acc 交接与分母/输出顺序。源码层面的前瞻已经存在，实际 IR 仍把 QK 的 fixpipe 与 GM→UB 接收串行到 P/PV 等待之后，故本轮控制点在 IR 的接收时刻与跨核事件，源码保持逐字节一致。",
+      "sha256": "19f7fb238946cb9006286d4d222425d07c4ea9fc38a7d4ff85c71c72c49c584a"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "simulator",
+      "role": "Codex 的分析贡献与候选机制边界",
+      "finding": "Codex 依据成对 profiling 与模拟器给出方向：Cube 与 Vector 累计量都低于参考而墙钟更大，说明差异在重叠/依赖方向；并给出事件计划（首块 prefill 到 UB0、其余预取到 32768..65536、Cube nextQK FIX 后发 flag4、专用 MTE2→V EVENT1、V→MTE2 EVENT0 改组级配对）、UB 单位核对（196608B 容量、当前峰值 180480B、32768..65536 可复用）与 MTE3_MTE2 能力核对。本轮采纳该机制，具体实现按实际 IR 逐项复核。",
+      "sha256": "d7450ee6504c17177b9b338763f7d024121f6574a6fdb0a35f52c25838daec91"
+    },
+    {
+      "path": "event-capability-readonly/sources.json",
+      "category": "source_ir",
+      "role": "跨核/流水事件能力证据",
+      "finding": "CANN 9.0.0 matmul_impl.h 74-76 行直接使用 FetchEventID/SetFlag/WaitFlag<HardEvent::MTE3_MTE2>，batch_copy_cube_in_using_ub.h 146-147 行同形；MTE3→MTE2 硬件事件存在，具体 hivm.hir.set_flag 的 lowering 交由 CPU 编译核验。",
+      "sha256": "d059674ef7d37536dd2716e61721acacc52d7853f9d792c92b1dec38e52b7858"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "正式结果与前一机制否定证据",
+      "finding": "保留 ir-001 的正式结果 145.9246us、conditional 147.2544→146.5569us 0.4737% 与四项通过保持有效。上轮 barrier 删除实验 formal 144.40065us 更快，但硬件 kernel 154.82309us 更慢、conditional 145.3794→145.56115us 为 -0.1250%，判定无确认收益并保留 ir-001；该否定证据说明单纯删同步点属于独立机制且已排除，本轮聚焦 QK 接收前移。",
+      "sha256": "844b7bbafaed885a152737f1a179e3d2609a5847ac2763115264f0bd4ed7ed24"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "19f7fb238946cb9006286d4d222425d07c4ea9fc38a7d4ff85c71c72c49c584a",
+    "contract.json": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858",
+    "ir-inventory.json": "1ef2f72980502efaeb10dec242feaf039d981c36d6f119938b7edd435ce3b53c",
+    "profiling.json": "87d9d43b187f3e5a10ddf982aa9072aa1cbc4a11cfb04b42147837d0b2ee4114",
+    "hotspots.json": "fab4a43a804049e8360ebddd13981960ced79eae2411369196eaee5f21b4102e",
+    "timeline.json": "8baf0f369e2093736b061505138ad3ea04561fbfa81ac91ba29c67460db1a58d",
+    "historical-059-native-vrec.mlir": "be4f69f4d9a2f1f8999dfa8fc0548b9f4a06bc1271e837b8a3a6424469923015",
+    "historical-059-native-vrec-result.json": "5e5654a383ad9e6331ecc1276a02961f2e91f61373267c8f54d6288ef603bb56",
+    "context.json": "d585913e19d425fd950f6a12cf9f1af5e26f1108faaea970148b0c5b608ea707",
+    "feedback.json": "844b7bbafaed885a152737f1a179e3d2609a5847ac2763115264f0bd4ed7ed24",
+    "diagnosis.json": "a8d77dee8ac32ec8c6bc494d90b9794368bfc486a25c3682fe7fce1604d859ae",
+    "codex-brief.json": "d7450ee6504c17177b9b338763f7d024121f6574a6fdb0a35f52c25838daec91",
+    "backend-binding.json": "037ff0b2558304288330a3f53e59a9c8e26e7fbe37d5133337922ae1eaf37421",
+    "reviewed-prefetch-draft.mlir": "c3bfa79252997697a999f80291af3e0e38b678d5c4339fa22c603d3b9406fa1a",
+    "profiling-full.json": "1bb6ba3828d583e97ba52778d88b9f6cf17897a70c8f74b0b4a12f8e3ad2b507",
+    "ir/target.hivm.mlir": "a28d48359241880dcb0890268a3695a1d8118c9327156c07081b0b079a5d1e7b",
+    "compiled-readonly/_gqa_fwd_kernel.source": "e0dac92dbebfe6df5fbab3f1f2fcd64471f3068401d34a58efe87bd56a1ea632",
+    "compiled-readonly/_gqa_fwd_kernel.ttir": "5d66bbc4930f03ec142fde1f7aae8d01b71d5cfaa8527500198c810c2e49205b",
+    "compiled-readonly/_gqa_fwd_kernel.ttadapter": "e394963e0d7c4428865cf5c22f53a394855520a1c3549062432a73a8424a7f38",
+    "compiled-readonly/_gqa_fwd_kernel.mlirbc": "cb1d2dc9af307221254b1f408feb5ea9cd287f9701af273383ea35726f85562b",
+    "compiled-readonly/_gqa_fwd_kernel.bcmlir": "b39e0b3c3b69599dce8713f580ba48a934e262babd4652b4d7605252d95ac120",
+    "compiled-readonly/_gqa_fwd_kernel.npubin": "3972cdc5bef4ebdc816b6dccaf3405946f390cc04b21fa3e56ca7de85c11832f",
+    "compiled-readonly/manifest.json": "19c40de6d67b0eb7c4f6fd09b8f4b73638d6a54ace33d807b0d98ef39dea274f",
+    "public-source/EltWise1D.cpp": "adeefa4bb642711ecc76df257f8217fd91398e52453426e4f8736c5a973fa773",
+    "public-source/EltWise2D.cpp": "84f63673a9662d96e0ecd6f8dd78467dfe5e6e1daa529e50163d1d9ae74a312e",
+    "public-source/hivm-op-decompose.mlir": "104b8f583e8a163892c2ce0ad9785237eb7ba43eb201feedd5ef2fd6f11c951a",
+    "public-source/HIVMDecomposeOp.cpp": "2fd26ffb92eb0fc6c8dfd6e424b5874be32582773b28063cb49adec68dc9bbb0",
+    "public-source/HIVMToStandard.cpp": "8c8654126e129d88cc0d73c8c28f9886bade5f67ce1619e9d3cc2a9038fd4d60",
+    "public-source/sources.json": "4728abc28bb9507dba602d6292a5768e0117ba2b5f5f782d3b799a9aa643045f",
+    "public-source/tree-query.json": "27bab0976fa7ab2ae66ac9914488cba4bb4f22c8efbe6618f8a7e8d0e6bfdb6d",
+    "capability-readonly/installed-ascendc-reciprocal.txt": "f6ccc6d3049f02dfd43a768a8641bae22f4a7bab17642eb1cdd2757277ea1522",
+    "capability-readonly/status.json": "e60a92c022225d2918cdc8ea0809425a31be157bd646169adb063ea62255ce05",
+    "capability-readonly/llvm-inspection-request.json": "cd9c71f3a6d51cd91d3740a2bd11a88e7b5778e861a0e0e793f09f9160ab70fb",
+    "capability-readonly/llvm-inspection.log": "724f5e1d2db24f96c23f6ccfb23e8af7fc0b48aea72381fa3475f0b086bd16af",
+    "capability-readonly/llvm-reciprocal-symbols.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "capability-readonly/hivm-reciprocal-op-strings.txt": "04e9dcea5624136ca9d4a89ade7791efcbfcf61f306b7eb7e26827579bedef4a",
+    "capability-readonly/meta-llvm-inspection-request.json": "f005c9f012bd620b263c18e74d4e8060292735e88c86ee0984d02ae93a0c27f0",
+    "capability-readonly/meta-llvm-inspection.log": "6c7c789f8d222083719eaa60295241589e6f55c806f952dbf1a253e5624711f4",
+    "capability-readonly/meta-llvm-reciprocal-symbols.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "capability-readonly/backend-reciprocal-strings.txt": "09cfc26956265595950f4edfb22d02435f6461d07e96bbf9ad8717463a38bd47",
+    "capability-readonly/installed-triton-reciprocal-interface.txt": "494d3cf3c528779aa21a6f91b02c2d69da69d1f75827fec1344a6007f1b1f05e",
+    "capability-readonly/installed-reciprocal-evidence.txt": "86370a5c6ff93e03b7b04a6e15de4a927a6922ec8322dc0f972502524b6bcf10",
+    "capability-readonly/bishengir-hidden-help.txt": "ef3c382886a08314b6d3a11ffcc89e7e1ee06ea0e33a19f350fbbc04d11644d6",
+    "event-capability-readonly/0-matmul_impl.h": "8059d160027333ea3fbf497476fff4b85e69d8d4deef16b723533634acfb65a9",
+    "event-capability-readonly/1-batch_copy_cube_in_using_ub.h": "956a83361ae0ea91ce1c27ead07e19f7b879576aa0326167b0836321a743bd78",
+    "event-capability-readonly/sources.json": "d059674ef7d37536dd2716e61721acacc52d7853f9d792c92b1dec38e52b7858"
+  },
+  "decision_tool_sha256": "2ba55ebab8be5b8a2363da657d6ee81799d4cabcdfb8e1494846aecfd1fde624"
+}

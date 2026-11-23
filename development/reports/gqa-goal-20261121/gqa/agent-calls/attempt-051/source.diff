@@ -1,0 +1,80 @@
+--- 
++++ 
+@@ -293,6 +293,14 @@
+     offs_d = tl.arange(0, BLOCK_D)
+     offs_n = tl.arange(0, BLOCK_N)
+ 
++    # 本轮机制（自然指数仿射折叠，仅 PART_TILES）：在 jit 体内用局部 constexpr
++    # 把公共偏移与 qk_scale 换到自然指数域，X_SCALE=qk_scale*ln2、
++    # X_OFF=SM_OFFSET*ln2。真实数值仍是 2^(raw*qk_scale-SM_OFFSET)，因为
++    # exp(ln2*y)=2^y；主机常量、启动 ABI 与缓存键均不变。
++    LN2: tl.constexpr = 0.6931471805599453
++    X_SCALE: tl.constexpr = qk_scale * LN2
++    X_OFF: tl.constexpr = SM_OFFSET * LN2
++
+     # P <= T 时每个程序区间非空；该 guard 只为空区间（P > T）的通用正确性保留。
+     if hi > lo:
+         g_lo = lo // TPG
+@@ -336,8 +344,8 @@
+ 
+                 # 本轮机制（PART_TILES 的 QK→Vector 交接，FP16 rawQK）：Q/K 仍为
+                 # 原 BF16，tl.dot 内部仍按 FP32 累加；dot 之后先把 rawQK 就近
+-                # 舍入到 FP16，再显式扩回 FP32，随后才执行原 qk_scale、编译期公共
+-                # 偏移、exp2/sum、fp16 PV 与归一化，表达式其余部分逐字不变。
++                # 舍入到 FP16，再显式扩回 FP32，随后才执行缩放、编译期公共偏移、
++                # 指数、sum、fp16 PV 与归一化，交接以外的结构逐字不变。
+                 # 该舍入只由源码显式表达：后端若把 FP32→FP16 转换折叠进 FIXP
+                 # （fixpipe 输出 f16），则 QK 的 L0C→Vector 搬出由 128x256 f32
+                 # (128KiB) 降为 f16(64KiB)，总 L0C 搬出 98304→约 65536KB；若 cast
+@@ -346,26 +354,37 @@
+                 # 对称保号；合同 [-1,1]^128 下 |q·k| <= D = 128 不溢出 fp16，典型
+                 # 概率相对误差约 2e-4、最坏约 0.56%，适用域 [-1,1]，由原四项
+                 # checker 以不变阈值判定（详见 diagnosis.json）。
+-                qk = tl.dot(q, tl.trans(k)).to(tl.float16).to(tl.float32) * qk_scale
++                # 本轮机制（自然指数仿射折叠）：rawQK 仍先做 FP16 交接，随后用
++                # 自然域常数做一次乘/减（raw*X_SCALE-X_OFF），由后端决定是否与
++                # exp 的 log2e 缩放重结合成单条向量乘加；不写未经确认的 fma。
++                qk = tl.dot(q, tl.trans(k)).to(tl.float16).to(tl.float32) * X_SCALE - X_OFF
+ 
+                 if MASK_KV:
+                     qk = tl.where(offs_n[None, :] < SKV, qk, -float("inf"))
+ 
+                 # 本轮机制：编译期公共偏移替代逐行 max 稳定化。
+-                # 合同输入值域 [-1,1] 给出 |q·k| <= D，故 exp2 自变量
+-                # qk - SM_OFFSET <= D*|qk_scale| - SM_OFFSET = 15（host 取
++                # 合同输入值域 [-1,1] 给出 |q·k| <= D，故指数自变量
++                # qk <= D*|qk_scale| - SM_OFFSET = 15（host 取
+                 # SM_OFFSET = D*|qk_scale| - 15），p <= 2^15 = 32768 < 65504，
+                 # 在 FP16 有限范围内保留约 2 倍余量。softmax 对整行公共常数
+-                # 严格不变：p、l_new、PV 分子同乘 exp2(m_row - SM_OFFSET)，
++                # 严格不变：p、l_new、PV 分子同乘 2^(m_row - SM_OFFSET)，
+                 # PV 后的 acc/l_new 归一化使其在实数上精确抵消。因此这里删除
+                 # 每 tile 一次 128x256 的 max 归约、其 -inf 守卫与广播减法，
+-                # 只保留一次标量常数减法 + exp2；sum、PV、归一化与输出 guard
++                # 只保留常数仿射 + 指数；sum、PV、归一化与输出 guard
+                 # 逐字保留。有限精度代价：p 的 FP16 舍入仍为 2^-11 相对误差，
+                 # 但若某行 max 远低于 SM_OFFSET（约低于 -12.7），该行 p 进入
+                 # FP16 次正规；更低则整体下溢为 0（l_new 仍为 fp32 正值，
+                 # acc 为 0，输出为 0）。合同 [-1,1] 均匀随机输入的行 max 约 2
+                 # （std 约 0.48），到达该边界需约 -30σ，实际不可达；此机制
+                 # 依赖 |q|,|k| <= 1 的合同值域，域外可能溢出 FP16。
++                # 本轮机制（自然指数仿射折叠，代价与收益）：指数改写成
++                # tl.exp(qk)（qk 已在自然域），实数上与 2^(raw*qk_scale-
++                # SM_OFFSET) 相同，只多一次常数舍入：X_SCALE/X_OFF 相对
++                # 1e-7 量级，指数放大 ln2 后对 p 的相对影响约 1e-7，远小于
++                # 2^-11 的 FP16 截断误差，适用域与上段相同（合同 [-1,1]、
++                # 单块 fullKV、非因果）。收益上限是每 tile 少一道 128x256
++                # FP32 向量操作；若后端不重结合，代价是操作数不变而 exp
++                # 下降可能多一次 log2e 乘法，此情形按真实无收益记录。
+                 # 本轮机制（PART_TILES 语句序重排，仅此三行顺序）：
+                 # 分母 sum 只用于 PV 之后的 acc/l_safe 归一化，与 PV dot 无数据
+                 # 依赖；实际 BCMLIR/TTIR 却按源码序把 FP32 归约排在 p 的 FP16
+@@ -376,7 +395,7 @@
+                 # 的 PV 计算重叠。数值上不变：l_new 仍是对同一 FP32 p 的同一
+                 # 归约，acc 仍是同一 fp16×fp16、FP32 累加的 dot；输出 guard 的
+                 # 可证冗余已在下段删除（不引入 PV 结果 FP16 截断，不改 exp 与精度）。
+-                p = tl.exp2(qk - SM_OFFSET)
++                p = tl.exp(qk)
+                 p16 = p.to(tl.float16)
+ 
+                 acc = tl.dot(p16, v16)

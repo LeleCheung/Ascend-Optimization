@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 34,
+    "duration_ms": 62192,
+    "usage": {
+      "input_tokens": 29687,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 446592,
+      "output_tokens": 9710,
+      "output_tokens_details": {
+        "thinking_tokens": 2946
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 29687,
+        "outputTokens": 9710,
+        "cacheReadInputTokens": 446592,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 0.6144809999999999,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 2946,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 0.6144809999999999,
+    "result": "已完成本轮独立实验，源码保持为 preflight 返回的字节，等待宿主只读审查与完整四项真机评测。\n\n## 本轮机制（仅 PART_TILES：删除可证冗余分母守卫）\n\n**修改前决策已登记**：`decision_id=e92843ffaeab4081882bd374b4c2db12`，source_sha256 `4e592db9…`（与 starter-provenance 一致）。\n\n**证据**\n- `workspace/actual-ir/2-_gqa_fwd_kernel.ttir:112-120`、`workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir:111-120`：原守卫被落实为 `l_new` 的 `cmpf/select(128)`、expand+broadcast 成 `128x128 i1`、以及一次整矩阵 `arith.select`；FP32 `divf` 夹在其间。\n- `workspace/candidate.py:379-388`：`p=exp2(qk-SM_OFFSET)`、FP16 PV、`l_new=tl.sum(p,1)`、两处 `where` 守卫。\n- `workspace/current-profiling.json`：Vector 侧（vector0+vector1 `aiv_vec_time` 约 1588us vs 参考约 1121us）为主要开销，守卫尾段即在该链上。\n\n**数值界（由实际源码推导）**：`qk_scale=(1/√128)·log₂e≈0.12752`，`SM_OFFSET=128·0.12752−15≈1.322`；rawQK 截断 FP16、`|q·k|≤D=128` ⇒ 缩放后 `qk∈[-16.322,16.322]`，`qk−SM_OFFSET∈[-17.645,15]`，`p∈[2^-17.645,2^15]` 全为正；SKV=256 个 FP32 正项和 `l_new∈[≈1.25e-3,≈8.4e6]`，严格正且有限。故 `l_safe=where(l_new>0,l_new,1)` 与 `out=where(l_new>0,out,0)` 在冻结合同内恒为无操作。\n\n**改动**：仅将三行替换为 `out = acc / l_new[:, None]`。保留 FP32 分母求和与 FP32 逐元素除法本身（无倒数重写）、其他路径、host 缓存、算术分组、类型转换与发射逐字不变；无数据依赖选路、未改测试与阈值。\n\n**域限说明（已写入源码注释与 diagnosis）**：仅合同值域与 fullKV 无全掩码行成立；越界的极端有限行可使 `p` 在 FP32 下溢、`l_new=0`，此时原守卫输出 0、删守卫后为 NaN。此差异仅出现在越界输入。\n\n**验证与交接**\n- `preflight` → `awaiting_source_review`，source_sha256 `3c34fdfb6ef2aacc3b0ae8cbd0683bd22d7610ffcb388c6ef2da50d0a72c04ee`。\n- 保持该字节不变，交宿主只读路径/地址边界审查，并以原官方 checker、golden 与不变阈值完整评测 case1/2/4/7；同时采集修改后实际 IR 与成对 profiling，并开展模拟器重放。\n- 剩余歧义：守卫消除后 Vector 尾段真实缩短幅度及是否被调度隐藏——本轮冗余性由源码界+profiling 即可判定，无需新增模拟器输入，未虚构模拟器指导。\n\n修改后重放与完整结果请反馈，以便继续在真实反馈上迭代。"
+  }
+}

@@ -1,0 +1,27 @@
+--- 
++++ 
+@@ -727,10 +727,20 @@
+             # 数值风险：分块只改变 tl.dot 的 M 维铺排与程序数，不改变任何
+             # 表达式、相加顺序或精度路径；代价是单 tile 活跃内存翻倍，可能
+             # 触及 UB 预算，故在复用体中仅对 M256 提前分母归约（见下）。
+-            if (value.dtype == torch.bfloat16 and BLOCK_M == 128
+-                    and BLOCK_N == 256 and SKV == BLOCK_N
+-                    and BLOCK_D == 128 and S % 256 == 0):
+-                BLOCK_M = 256
++            # 本轮修复（撤回 M256，沿 attempt-053 失败源码接续）：实际失败 IR
++            # （failed-ir/attempt-053/0-_gqa_fwd_kernel.bcmlir）显示 case4 的
++            # QK 为 linalg.matmul outs tensor<256x256xf32> = 262144B =
++            # 2097152 bits，而 cc 只有 1048576 bits(128KiB)，单个 M256xN256
++            # 的 FP32 cube 累加器就是 2 倍硬超限；该约束与 p/分母的 liveness
++            # 无关，把分母归约提前或改为 PV 前归一化都不能缩小 QK 输出 tile。
++            # 同一候选的 M128 几何 outs tensor<128x256xf32> 恰为 128KiB，
++            # 且 case7 在本次四项评测中已成功编译并通过 checker。故不再把
++            # BLOCK_M 抬到 256，case4 保持在 M128 x N256 的 SINGLE_KV
++            # PART_TILES 路径；BLOCK_N、P=20 分区、表达式、数值路径与
++            # case1/2/7 的全部字节逐字不变。M256 从未编译成功，撤回不引入
++            # 实测性能回退，但每 worker 链数由预期的 12/13 回到 25/26。
++            # 下方 BLOCK_M>=256 的提前分母分支因此对本合同不可达，保留为
++            # 历史记录，不做超出修复所需的改动。
+     elif BLOCK_D <= 256:
+         BLOCK_M, BLOCK_N = 32, 32
+     else:

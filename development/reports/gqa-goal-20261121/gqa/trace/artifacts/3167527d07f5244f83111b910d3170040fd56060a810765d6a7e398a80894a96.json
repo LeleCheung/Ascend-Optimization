@@ -1,0 +1,60 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "f6de167c4402867362f0d2561d290767511da8e7ffeb7764d07ae479d4325a94",
+  "evidence": [
+    {
+      "path": "workspace/starter-provenance.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "父版本为 attempt-061 保留父（SHA f6de…5a94）；观察父 164.61260us，当前保留最佳 059 为 154.88710us，本实验以 case4 低于 154.88710us 为目标。"
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4 候选 kernel 152.983063us；Cube 侧 aic_cube_time 33.11us/核、FIXP 20.92us/核，Vector 侧 aiv_vec_time 约 49.2~59.0us/核、MTE3 33.9us/核，墙钟不由单一计算流水占满。"
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "mechanism",
+      "finding": "三核部分窗口各自归一化、application_completed=false：cube0 CUBE productive 16.4%/idle 56.3%、MTE2 idle 82.0%；veccore VECTOR productive 24.2%/idle 65.5%、MTE3 wait 26.6%；头部指令为 WAIT_FLAG_DEVI 81.9us/58.7us 与 FIX_L0C_TO_DST 22.3us，指向跨核交接与搬运延迟而非算力饱和。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "PART_TILES 分支为外层 scf.for(grp) 内嵌 scf.for(t)：外层每组载入一次 K/V，内层每 tile 载 Q 后执行两个 tt.dot、exp、reduce 与 store；内层迭代相互独立，具备软件流水条件。"
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "BCMLIR 保留同样嵌套 scf.for；Out 按 BNSD 物理步长写回（S 维步长 D=128、hq 步长 32768），确认 061 empty_strided 输出布局已在当前编译产物中。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "disambiguation",
+      "finding": "case4 上一轮官方 checker 通过（mere 0.001409、mare 0.003891，阈值 0.0078125）；本轮不改 dtype 与数学表达式，精度预期逐位保持。"
+    }
+  ],
+  "hypothesis": "仅在 PART_TILES 分支把 num_stages 由 1 改为 2，让 Ascend 后端对 grp/t 两层循环做软件流水（K/V 与 Q 双缓冲），把下一组/下一 tile 的 GM→L1 载入与上一迭代的 Cube/Vector 交接重叠，压低 WAIT_FLAG_DEVI 与 MTE2 空闲；非 PART_TILES 分支保持 num_stages=1，不影响 case1/2 与通用路径。",
+  "alternatives": [
+    "保持 num_stages=1：维持现状，但不减少已观测的流水空闲；",
+    "只对内层 t 循环流水：需改写循环结构，超出本轮仅改 num_stages 的授权；",
+    "手写 K/V 组级双缓冲预取：表达受限且会改动内核 AST，本轮禁止。"
+  ],
+  "discriminating_observation": "若收益来自跨迭代载入隐藏，修改后重放中 MTE2 空闲与 WAIT_FLAG_DEVI 相对占比应下降、CUBE/VECTOR productive 上升且 case4 完整调用耗时下降；若编译选项未生效或被缓冲预算拒绝，则 IR 循环不变、耗时不降（或编译失败）。",
+  "change": "仅改 candidate.py 的 JIT 启动参数：num_stages=1 改为 num_stages=2 if PART_TILES else 1；保持 061 empty_strided 输出布局、全部 @triton.jit 内核 AST/数学/worker grid 与 host 快路径缓存不变。num_stages 的两个取值由已进入 fkey 与 constexpr 的 PART_TILES 唯一决定，缓存键无需新增字段。",
+  "expected": "PART_TILES（case4/7）流水加深，预期 case4 完整调用接近并争取低于 154.88710us；case1/2 因走 num_stages=1 预期不变。代价：双缓冲可能增加 UB/L1 占用（当前 BLOCK_N=256 已接近 196608B 预算），可能编译失败或回退；输出仍为非连续 BNSD，消费方 .contiguous() 的拷贝成本不计入内核计时，需单独报告。",
+  "validation": "preflight 后交宿主只读审查与完整四项真机评测（case1/2/4/7，原 checker/golden 与阈值不变）；随后做修改后重放，并与当前最佳 059（154.88710us）逐项对比，单独报告输出非连续性成本。",
+  "selected_layer": "host_launch",
+  "layer_reason": "唯一被授权且最小可区分的改动是启动期 num_stages 选项；它由已有元数据 PART_TILES 决定，不改内核 AST、分块、布局与计算顺序，可直接检验「软件流水隐藏跨核交接/载入延迟」这一机制。",
+  "simulator_incremental_judgment": "本次成功读取当前模拟器（三核部分窗口，Cube 与 Vector 各自归一化，application_completed=false，全调用 completion 缺失）。增量判断：热点侧头部为 WAIT_FLAG_DEVI（58.7~81.9us）与 FIXP FIX_L0C_TO_DST（22.3us），等待集中在跨核交接而非单条计算；流水侧 CUBE productive 16.4%/idle 56.3%、MTE2 idle 82.0%、VECTOR idle 65.5%、MTE3 wait 26.6%，空闲足以容纳更深流水。两者共同支持「用 num_stages=2 预取下一迭代并重叠载入与交接」；但窗口为部分归一化，不能据此断言因果或预测幅度，收益须由完整重放与四项真机评测确认。",
+  "unknown": [
+    "Ascend Triton 编译管线是否对 PART_TILES 的嵌套循环实际应用 num_stages=2，以及能否在 196608B 预算内双缓冲；",
+    "061 BNSD 写回与 059 流水组合是否存在未被单独观测的交互（写回跨距与 MTE3 调度）；",
+    "完整四项中 case7 是否同样受流水影响。"
+  ]
+}

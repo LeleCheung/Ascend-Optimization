@@ -1,0 +1,97 @@
+{
+  "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+  "selected_layer": "single_operator_ir",
+  "round": "ir-004",
+  "parent": "本阶段保留的完整合格最佳：夜间ir-004输出8x256 IR（正式timing-7 0.039261 ms），源码b8d4d4a2…逐字节冻结；本阶段8x512探索(36.648us，稳定性确认未通过)与三轮ABBA只作对照身份，不进入本轮机制",
+  "codex_contribution": "Codex在codex-brief.json中给出三条方向：核对统计循环64次同步/搬运热点、核对输出循环weight/inv_std/bias重复broadcast与实际linalg.fill并评估外提或重用（同时提示QKV曾有外提负结果、收益须按本算子实测）、以及允许提出其他有成本的机制。本轮采纳其第二条：先在冻结的实际低层产物上核对，确认三处广播在内层循环里仍是每迭代一次的linalg.fill，且与循环不变均值瓦片共用同一UB临时张量；据此选定广播外提作为本轮唯一机制。其第一条（统计通道加宽）因历史1.31MB UB溢出保留为独立分支，其第三条并入alternatives记录。",
+  "evidence": [
+    {
+      "path": "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "在实际后端产物上核对疑似冗余（重复广播）是否已被消除",
+      "finding": "宽输出内层循环scf.for %arg27（对应TTIR第192行）的循环体第236/238/240行连续出现三个linalg.fill：ins(%2=weight)、ins(%extracted_8=inv_std)、ins(%48=bias)，三者outs全是同一个%53（tensor.empty的8x256临时张量）；紧接着是与%11（循环外只做一次的mean广播fill）的subf。同一文件第205行的%54=fill(final_mean)位于m循环之前，证明后端会保留已外提的广播，却不会自行把循环体内这三处循环不变广播提出去。窄回退分支（第250-289行，运行期对目标形状不执行）结构相同：第280/282/284行三次fill共用%4（该%4同时是Welford零初值%5的来源缓冲）；疑似冗余未被后端消除：循环不变广播仍以每迭代一次的全瓦片fill物化，且与循环不变的mean瓦片共用一个UB临时缓冲。"
+    },
+    {
+      "path": "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "交叉核对同一层的算子直方图与循环边界（ttadapter与bcmlir是否同阶段）",
+      "finding": "与ttadapter逐项一致：全文件16个linalg.fill；宽输出内层循环（第223行起）第236/238/240行三次fill同缓冲；每迭代仍是一次memref.alloc+memref.copy的lookahead搬运（第232-233行）与一次materialize_in_destination写回（第245行）；无任何标量×张量的广播乘法记法，说明本阶段把tt.splat固定lower成linalg.fill，循环不变性只能由IR中的定义位置决定；两份冻结产物同阶段，可据此判定外提位置决定真实设备工作量的唯一控制点就是TTIR里splat的定义位置。"
+    },
+    {
+      "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+      "category": "source_ir",
+      "role": "定位可外提的循环不变广播及其支配关系",
+      "finding": "宽分支中%var_w=tt.splat %final_mean_13（第168行）已在m循环之外；而%w_b_w=tt.splat %6（第207行）、%is_b_w=tt.splat %inv_std_21（第209行）、%b_b_w=tt.splat %9（第211行）写在内层n_step循环体里，其操作数%6/%inv_std_21/%9均由循环外的scf.if与math.rsqrt定义（第118/144-159行），完全循环不变。窄回退分支同样在循环体内有%output_64(第260行)/%output_66(第262行)/%output_68(第264行)。函数签名、常量映射(8/128/true)、ABI与两处tt.reduce均不涉及；三处（每个输出特化）是可安全外提、且外提后数值完全不变的遗漏LICM目标。"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "量化当前最佳每程序成本与向量时间，给外提机制定上界",
+      "finding": "保留候选（64 block，1650MHz）：Task Duration 39.880798us；aiv_time均值19.289365us=31827.45 cycles；aiv_vec_time 9.515303us（aiv_vec_ratio 0.496787）；aiv_mte2_time 12.758428us、aiv_mte2_instructions 121、aiv_mte2_ratio 0.665150；aiv_mte3_time 2.902784us、aiv_mte3_instructions 21；aiv_scalar_time 4.645445us、aiv_scalar_vector_stall 9.125492us；read_main_memory_datas 268.875KB/block。按每程序向量元素量估算（统计趟32步约19.6万元素、输出趟16步约19.7万元素，其中输出趟的3次广播fill占98304元素≈25%），fill材料化约占aiv_vec_time的四分之一；向量时间有约1/4被循环不变广播填充占用，移除后aiv_vec_time与aiv_time应有可测下降，而MTE2/MTE3计数不变可作为机制隔离对照。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "热点排序用于定位候选机制（不作绝对耗时）",
+      "finding": "core0.veccore0的8个pc_neighborhood区域全部unmapped：instruction_time_sum_us依次42.71/41.49/38.92/38.33/35.99/30.70/28.11/27.21，最大单项14.27-18.49us，其中区域282141568-282141631与282141696-282141759的wait占比最高（24.98/28.59us），且wait_instruction_time_sum与instruction_time_sum接近，说明热点以等待/同步为主。这些区域落在0x10D11344-0x10D126BC地址段，与mte3搬运(0x10D12440)和END(0x10D126CC)同段，即覆盖统计与输出两趟循环体；输出趟循环体位于热点段内且以等待为主，去掉每迭代3次fill及其缓冲WAR是减少该段等待/同步的候选机制；排名本身不换算为墙钟。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "同核前后窗口的覆盖量、归一化范围与流水占用",
+      "finding": "窗口raw_clock_window 185.792999-224.198006（跨度38.405us，单位按独立校验为us），time_unit=fraction、首末可见事件间归一化，ALL(END)事件2个、outside_events 4。流水：MTE2 active 0.877423/wait 0.236680、VECTOR active 0.906128/productive 0.517701/wait_only 0.388427、MTE3 active 0.402138、SCALAR active 0.083995、SCALARLDST active 0.184939；FLOWCTRL与CACHEMISS为auxiliary_trace_lane（active 0.001299）。clock_qualification=relative_only，但同文件absolute_unit_validation为verified（33/33 PC，median_ratio 1.000548），Scalar口径另有17/18量化差异保留；观测窗口只覆盖单核约2个program（2次END），fraction按本窗口归一化，前后窗口覆盖量不同不可直接比绝对时间；可用增量判据是窗口内VECTOR productive/wait与同步事件数的相对变化。"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "当前最佳身份、已发生的机制变化与噪声尺度",
+      "finding": "本阶段8x512输出候选完整27/27、双方各36/36通过，正式timing-7 36.647637us，但预登记的稳定性条件（两次确认中B块均低于全部A块）未满足；三轮ABBA中A(原IR)中位40.62/41.91/36.59/37.89us、B(候选)36.52/41.16/37.67/33.40us，单块波动达±2-4us。当前保留最佳为夜间ir-004（输出8x256），本阶段29项…正式复核timing-7 39.458217us、ABBA中位39.261332us。profiling配对显示8x512后MTE2指令121→97、MTE3指令21→13、aiv_time 19.289→17.940、scalar_vector_stall 9.125→9.200（未降）；本轮判据必须同时看机制是否兑现（产物中循环体内fill消失、aiv_vec_time下降）与是否超过39.261us；单次墙钟差异小于噪声时不能当作收益。"
+    },
+    {
+      "path": "prior-explorations.json",
+      "category": "paired_profiling",
+      "role": "避免重复已证伪或无保留收益的机制",
+      "finding": "已尝试并记录：cnt向量的标量化（通过但无保留收益，VADDS非关键）；统计通道加宽到8x512并Chan合并（需1.31MB UB，超出）；输出通道加宽到8x512（正式有收益但稳定性确认未通过）；统计内层预取深度2（lowering解析失败后修复，未保留）；8x256输出预取深度2（正式timing-7 0.039318 ms，与保留版39.261us同级，中性）；每个m_step末尾钳位重复读最后一块被判为收益过小（约3%搬运量）；这些方向均已占用，本轮不能与它们混同；广播外提在TTIR+实际低层产物上均未被消除，是尚未尝试的独立机制。"
+    },
+    {
+      "path": "ir-inventory.json",
+      "category": "source_ir",
+      "role": "可编辑边界与特化身份",
+      "finding": "清单仅一个条目：ast_sha256=5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508、symbol=batch_norm_with_update_kernel、filename=batch_norm_with_update_kernel.ttir，保留IR sha256=574eddcb…；常量映射(14→1,17→1,20→8,21→128,22→true)即BLOCK_M=8/BLOCK_N=128/EVEN=true；lowered-inventory.json的三份ttadapter/bcmlir/npubin列出ast_sha256=5c1607c0…与实时npubin sha256=41483d74…，保持冻结；编辑面仅限该TTIR的循环体结构，不触碰ABI、常量映射与冻结低层产物。"
+    }
+  ],
+  "hypothesis": "当前最佳IR归一化/输出通道存在一个未被后端消除的编译缺陷：weight、inv_std、bias 三个循环不变标量的瓦片广播（tt.splat）被写在n_step循环体内部，lowering把它们在每个迭代都物化为一次全瓦片linalg.fill。冻结的ttadapter证据显示这三个fill的outs都指向同一个tensor.empty临时张量（宽分支%53），而该缓冲同时承载循环外只做一次的mean广播fill(%54)的被消费值，于是每迭代除白白写入3×2048个元素外，还形成对承载循环不变均值瓦片的同一UB缓冲的RAW/WAR序列（fill→mulf→fill→mulf→fill→addf六步顺次依赖），使每轮的向量乘加被三次填充串行化并额外触发缓冲搬移/同步。目标形状（input[8,64,64,64]→batch=8、feat=64、spatial=4096，m_num_steps=1）下输出趟宽分支执行16个n_step，即每程序48次冗余fill（98304个f32元素，约合输出趟向量元素的25%）。把这三处splat外提到scf.if真分支的m循环之前（窄回退分支同样外提），只改变广播材料化的位置与数量，不改变任何操作数取值、fp32乘加结合顺序（subf→mulf(weight)→mulf(inv_std)→addf(bias)）、写回地址与循环轮次，因此数值逐位不变、GM流量不变，而每程序省去48次全瓦片fill并解除同一临时缓冲上的串行依赖。",
+  "alternatives": [
+    {
+      "idea": "统计通道加宽到8x256（Codex方向一：削减统计循环32轮的同步/搬运热点）",
+      "why_not_selected": "与前几轮一致：统计通道携带mean/var/cnt三张累加器并要改两处reshape/tt.reduce的形状；历史上带reshape与Welford合并的统计加宽曾需求1.31MB UB（超6.67倍）。它会同时改变归约分组（浮点求和顺序）与特化常量身份，无法与广播外提在同一轮内独立归因，保留为后续独立分支。"
+    },
+    {
+      "idea": "把weight×inv_std预合并为单一标量并按(x-mean)*scale+bias计算",
+      "why_not_selected": "会改变fp32乘法的结合顺序与舍入（现为((x-mean)*weight)*inv_std+bias），违反保留完整浮点精度要求，即使测试容差可能通过也不接受。"
+    },
+    {
+      "idea": "把外提同样应用到统计内层循环的splat",
+      "why_not_selected": "核对TTIR后确认统计内层的%mean_66(1/step)与%var_71(1-1/step)随步数变化，不是循环不变量；能动的只有输出通道，因此本轮机制只覆盖输出通道（含其两个特化）。"
+    },
+    {
+      "idea": "去掉每个m_step末尾被minsi钳位而对最后一块的重复读",
+      "why_not_selected": "每趟只多读1块（约1/32搬运量），此前已判定收益小于编辑风险；且它与本轮广播外提不是同一机制，混入会破坏归因。"
+    },
+    {
+      "idea": "沿用8x512输出加宽或输出预取深度2",
+      "why_not_selected": "8x512已有正式收益但稳定性确认未通过；8x256深度2为39.318us与保留版同级（中性）。两者都改变搬运时序而非消除冗余材料化，本轮不重复。"
+    }
+  ],
+  "change": "只编辑ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir的归一化/输出通道；(1) 在scf.if %spatial_wide真分支内、m_step_w循环之前（现第168行%var_w之后）新增三个循环不变广播 %w_tile_w=tt.splat %6 : f32->tensor<8x256xf32>、%is_tile_w=tt.splat %inv_std_21 : f32->tensor<8x256xf32>、%b_tile_w=tt.splat %9 : f32->tensor<8x256xf32>；(2) 删除内层n_step_w循环体中原第207/209/211行的三个同名splat定义，其后的mulf/addf改用新增的外提值（运算次序、操作数、结果类型全部不变）；(3) 对else分支（EVEN=false回退路径）做同一机制的编辑：在该分支m_step循环之前（现第221行else块内、第222行scf.for之前）新增%w_tile_n/%is_tile_n/%b_tile_n三个tensor<8x128xf32>广播，删除其内层循环原第260/262/264行定义并改引用。其余一律不动：函数签名与ABI、常量映射8/128/true、统计Welford通道、两处tt.reduce与final_mean/inv_std、running_mean/var更新、weight/bias空指针scf.if、指针算术与所有tt.load/tt.store地址、循环上界与minsi钳位。",
+  "expected": "逐项可测预测（宿主后重放分别核对兑现与偏差）：1) 指令/产物：重新编译后bcmlir与ttadapter中，宽输出内层scf.for体内linalg.fill数量由3降为0，三个fill上移到m循环之前各只执行一次；窄回退分支同样（目标形状不执行）；全文件fill总数仍为16但位置改变；2) 动态轮次：n_step轮次不变（统计32、输出宽分支16，m_num_steps=1），aiv_mte2_instructions保持121、aiv_mte3_instructions保持21、read_main_memory_datas保持约268.9KB/block——作为机制隔离的阴性对照；3) 等待与依赖：每迭代在共享UB临时张量上的三组fill/消费串行依赖消失，旧缓冲同时承载循环不变mean瓦片的WAR消失，模拟器中输出段VECTOR wait_only与同步(BAR/WAIT_FLAG)事件数应下降，VECTOR productive占比上升；4) 资源：输出阶段UB活跃缓冲增加3×8KB=24KB（另加窄分支3×4KB=12KB但两支互斥），预测峰值UB活跃仍<96KB、不触发超限或额外spill；若编译报UB不足或出现spill/拷贝阶跃，则本机制在该实现下证伪；5) 时间：aiv_vec_time 9.515us→8.6-7.1us（fill占输出趟向量元素约25%），aiv_time 19.289us→17.0-18.4us，Task Duration 39.88us→37.3-38.7us；正式timing-7延迟预测0.0370-0.0387ms，须低于保留最佳0.039261ms；6) 数值：与保留版逐位一致（同一操作数与同一fp32结合顺序，无新增特殊值/边界/别名行为），27/27与双方36/36须全过。",
+  "validation": "宿主审查后执行：TTIR需可解析并成功lower（失败或UB溢出即判定本实现不可行并回退为保留IR）；在新的bcmlir/ttadapter核对(1)输入内层循环fill数、上移位置与缓冲是否各自独立，作为机制兑现的一手证据；再执行完整KGS与正式评测：correctness 27/27、supplementary 36/36、cann_supplementary 36/36，atol=rtol=1e-4、required_matched_ratio=1.0、equal_nan，逐元素须全匹配（预测逐位一致）；profiling复测aiv_vec_time/aiv_time下降、MTE2与MTE3指令数不变；性能判据为timing-7低于0.039261ms；因上一轮出现过2-4us级块间波动，稳定性须按预登记的ABBA条件复核后再谈保留；如果aiv_vec_time未见下降但产物中fill确实已外提，则说明填充不是关键路径，结论记录为已兑现的机制但无墙钟收益；如果产物中fill仍在内层循环，则判定为本机制不可行并保留IR原样交接。本轮文档、预检与建议都不作为收益结论。",
+  "layer_reason": "Triton表达能力：源码第151行已经写成weight*(curr_input-mean)*inv_std+bias，其中weight/inv_std/bias是标量加载的循环不变量；源码层无法表达“把这个标量只广播一次并复用该瓦片”，因为tl.splat与张量形状一致化由编译器在lowering中插入，源码没有可写的对应控制点（把scale预合并进标量会改变fp32结合顺序，属语义变更而非表达替代）。因此该冗余只能在IR层通过splat的定义位置决定。固定源码实验目的：frozen.py逐字节冻结，用于把“同一数学在设备上被如何材料化”作为唯一自变量，排除API/形状/启发式变化。IR控制点：TTIR里splat的位置直接决定bcmlir/ttadapter中linalg.fill落在循环内还是循环外（已用冻结产物中循环外%54与循环内%33/%35/%37对照证实），且不触及ABI、常量映射、归约与地址算术，属最小可验证的single_operator_ir机制。",
+  "simulator_incremental_judgment": "时钟资质：timeline自身标注clock_qualification=relative_only、absolute_time_qualified=false，但同文件absolute_unit_validation为verified（非Scalar非同步PC 33/33匹配，median_ratio 1.000548），因此本报告只用独立校验过的us单位做同PC并集时长，不把instruction_time_sum当作墙钟；Scalar侧另有1项量化差异（18中17匹配）保留未用于校准。覆盖量与前窗区别：观测为单核首末可见事件窗口185.793-224.198（38.405us跨度），内含2个END事件（约2个program）、outside_events 4，不是全核也不含全设备波次；fraction按各自窗口归一化，前后窗口覆盖量不同，故跨窗口只比较同口径比例与同一PC事件，不做动态总次数的直接相减；动态轮次的比较以执行覆盖核对为前提（本窗口只覆盖输出+统计两趟循环体，未覆盖启动段）。未报告泳道：FLOWCTRL与CACHEMISS在材料中标为auxiliary_trace_lane（active 0.0013），其余未报告泳道按未知处理，不据此推断空闲或瓶颈。增量判断：窗口内VECTOR productive 0.5177、wait_only 0.3884，MTE2 active 0.8774，SCALAR仅0.0840，说明向量单元约四成时间在等，而本轮移除的是向量单元自身每迭代3次全瓦片fill及其在同一UB缓冲上的串行依赖，故增量上界是输出趟向量时间的约1/4，对应aiv_vec_time下降0.9-2.4us；MTE2/MTE3字节与指令预期不变，若模拟器显示MTE2等待显著变化则说明另有机制。设备波次与全核关键路径仍需独立材料，本轮不作结论。",
+  "unknown": [
+    "linalg.fill在外提后是否按一次8KB广播写实现，或后端会转成标量×张量形式，只有重编译后的低层产物可确认。",
+    "同一tensor.empty临时张量%53在最终bufferization中是否已导致额外的均值瓦片搬移（bcmlir处在bufferization之后、同步插入之前），实际设备同步代价只能由新产物/模拟器判断。",
+    "输出段占单核周期的准确比例未知（窗口只覆盖部分program），端到端幅度不能由本窗口换算。",
+    "fill与mulf/addf是否存在未在产物中显现的融合（disable_fma=false、enable_fp_fusion=true），若已在下游融合，则本改动的收益会小于预测。"
+  ]
+}

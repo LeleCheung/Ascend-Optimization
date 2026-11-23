@@ -1,0 +1,83 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "99e77cb819ea900a6ca6cebfacb26777879a756d7256abb7d15f736334445031",
+  "parent_observation_us": 216.79415,
+  "retained_best_us": 196.15815,
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4 候选 20 个常驻程序，Task Duration 191.023819us。每程序中位数：aic_cube_time 均值 33.109us、aic_fixpipe_time 25.621us、aic_mte1 25.329us、aic_mte2 28.854us；vector 侧 aiv_vec_time 均值 64.380us 而 aiv_scalar_wait_time 均值 54.117us（vector1 同量级 64.380/54.784）。即每个程序约 64.4us 的向量计算被约 54.1us 的显式等待伴随，Cube 的 MMA 只有 33.1us（Task Duration 的 17%），说明墙钟由每 tile 的跨核交接串行链决定而非算术量。L0C_to_GM 合计 65536KB、GM_to_L1 合计 55296KB（20 程序）。"
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "mechanism",
+      "finding": "case4 三核部分窗口（各自归一化，application_completed=false，全调用 completion 缺失）。Cube 窗口热点：FLOWCTRL/WAIT_FLAG_DEVI 147.810us/15 次（0x10d11588，等 Vector 交出 P）、FIXP/FIX_L0C_TO_DST 36.850us/15（QK 128x256 f32 搬出）、FIXP/FIX_L0C_TO_DST 29.130us/15（PV 搬出）、CUBE/WAIT_FLAG 29.340us/16、MTE1/WAIT_FLAG 29.170us/16；两个 Vector 窗口热点：FLOWCTRL/WAIT_FLAG_DEVI 88.500us/15（等 QK）、MTE3/MOV_SRC_TO_DST_ALIGN 42.520us/14 与 28.470us/15（输出写回）、VECTOR/BAR 22.050us/15。流水：CUBE productive 11.74%/wait 27.35%/idle 60.91%，MTE1 productive 8.96%/idle 60.89%，VECTOR productive 21.64%/wait 10.23%/idle 68.14%，FLOWCTRL productive 0%/wait 90.41%。判断：Cube 与 Vector 交替互等，Cube 端有大量可被向量计算覆盖的空闲。"
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "PART_TILES 内层 scf.for %arg13（tile 维）单次迭代的指令次序固定为：linalg.matmul(Q,K)->outs(fill 0) 128x256f32 → truncf/extf → mulf/subf → math.exp2 → linalg.reduce(sum) → truncf(p) → linalg.matmul(p16,v16)->outs(fill 0) 128x128f32 → divf/select → materialize_in_destination 写回。循环不携带任何张量（只有归纳变量），因此当前 tile 的 QK MMA 与它自己的 softmax/PV 在同一迭代内串行，编译器没有跨迭代可前移的独立 Cube 工作；这就是 Cube/Vector 交替互等的直接结构原因。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "background",
+      "finding": "TTIR 层面 qk = tt.dot(%q,%trans_k)->truncf(f16)->extf(f32)->mulf(qk_scale)->subf(SM_OFFSET)->math.exp2->tt.reduce(sum)->truncf(f16)->tt.dot(p16,v16)。scf.for 无 iter_args 张量。K 在组循环外只载入一次（tensor<256x128xbf16>），V 转 f16 一次，故同一组内所有 tile 共用同一 K/V，任何某 tile 的 QK 都不依赖前一 tile 的 softmax/PV，具备前移条件。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "父版本（sha 99e77cb…）四项 checker 均通过；case1 官方 checker passed=true（mismatch 2/1048576，threshold 不变）；case1 完整调用 201.71765us。宿主绑定 case4 父版本 216.79415us、保留最佳 196.15815us，故 case4 需下降约 9.5% 才超过保留最佳。"
+    },
+    {
+      "path": "workspace/knowledge.json",
+      "category": "knowledge",
+      "role": "background",
+      "finding": "records 为空（retrieval.empty 为真），本轮没有可检索的专项经验；下述机制完全由当前源码、实际 IR 与成对/模拟器证据推导。"
+    },
+    {
+      "path": "workspace/starter-provenance.json",
+      "category": "other",
+      "role": "background",
+      "finding": "父版本身份 99e77cb819ea900a6ca6cebfacb26777879a756d7256abb7d15f736334445031，来自 attempt-033 retained-parent，与 current-profiling/simulator 的 source_sha256 一致，证据与本轮起点同源。"
+    }
+  ],
+  "hypothesis": "PART_TILES 内层 tile 循环里，当前 tile 的 QK MMA 与它自己的 softmax/PV 在同一迭代内串行；若把「下一 tile 的 QK」提前到当前 tile 的 softmax 之前，Cube 就有一段与当前 softmax 无依赖的独立工作，可与 Vector 的 exp2/sum/归一化重叠，从而吃掉 Cube 侧 147.81us/15 次（模拟器窗口）与 Vector 侧 54.12us/程序（成对 profiling）的交替等待。Q/K 都是同组循环不变量或纯地址元数据派生的独立载入，不依赖前一 tile 的 p/acc。",
+  "alternatives": [
+    "pair0/pair1 两 tile 批量预取（030 在 029 前驱上实测 234.3571us vs 232.23705us，负向，且额外常驻两份 FP32 scores）——不采用。",
+    "把 P 经 GM 中转以缩短 PV 依赖：改变数据通路与搬运字节，超出本调用范围。",
+    "PV 窄化、rowinverse、naturalexp、布局/分块调整：本调用明确禁止。",
+    "无条件发下一个 QK（把 nt 夹到 t1-1 以省掉条件块）：每 KV 组多付一次 QK，仅作为条件块不被后端接受时的退路。",
+    "若源码顺序无法让后端把 QK MMA 前移，改走单算子 IR 交接（见 simulator_incremental_judgment 之外的 IR 建议），不在源码里虚构收益。",
+    "缩小每 tile 的向量计算（现已删除逐行 max，仅剩 scale/offset/exp2/sum）以降低瓶颈侧成本：本轮不改数值结构，留作后续独立机制。"
+  ],
+  "discriminating_observation": "修改后重采集的 BCMLIR 内层循环应出现两次独立的 matmul→truncf(f16)（QK 累加器各一），且 QK MMA 位于 exp2 之前的独立基本块、truncf 结果作为循环携带值（scf.for iter_args / f16 128x256 UB 缓冲）；真机上 aiv_scalar_wait_time（父 54.12us/程序）与 Cube FLOWCTRL/WAIT_FLAG_DEVI（父 147.81us/15 次窗口）同时下降、Task Duration 与完整调用耗时下降。若 QK 仍被排到 softmax 之后、或等待时间不降，则源码顺序无法表达该异步降级，改交接 IR 建议。",
+  "change": "仅 _gqa_tile_part_body 的 tile 循环改为「一深度 QK 前瞻」：每个非空 KV 组交集 [t0,t1) 在循环前对 t0 预取一次 raw QK（tl.dot(q(t0), trans(k)) 后立即 .to(tl.float16)）；循环体内先令 raw = raw_next（当前 tile 的 FP16 raw 分数），再在 t+1 < t1 的条件块里载入 t+1 的 q 并发下一个 raw_next = tl.dot(q(t+1), trans(k)).to(tl.float16)，随后才执行与父版本逐字相同的 raw.to(f32) * qk_scale、MASK_KV 守卫、exp2(qk - SM_OFFSET)、sum、p.to(f16) 与 tl.dot(p16, v16) 的 FP32 PV、原归一化/guard/写出。Q/K 输入仍为 BF16，dot 仍 FP32 累加并在其后 FP16 舍入；qk_scale/公共偏移/exp2/求和的表达式与相加顺序不变；20 worker 连续分区、P、TPG、T、NB_M、host 派发与全部元数据参数、通用二维 grid 与因果 64/64 路径、FP16 两项分解路径都不动。循环不变量：进入第 t 次迭代时 raw_next 恒等于 dot(q(t), K_group) 的 FP16 舍入值（归纳：t0 由预取给出；第 t 次迭代在 t+1<t1 时把它改写为 t+1 的值，否则不再使用）。尾部与组正确性：t=t1-1 不发 QK，故每组 QK 总数恰为 1+(t1-t0-1)=t1-t0，与父版本相同、无越界读；t+1<t1<=TPG 保证下一 tile 仍属同一 (b,kvh) 组，使用同一份已载入的 K/V。缓冲寿命：raw_next 是循环携带的 128x256 f16 张量（64KiB），在下一迭代开头被杀掉；k/v16 仍是组级循环不变量。",
+  "expected": "若后端按源码顺序把下一 tile 的 QK MMA 前移，则每 tile 的 Cube MMA（约 33.1us/26≈1.27us）与部分 FIXP 搬出可与 Vector 的约 2.48us/tile 计算重叠，每 tile 期望省 1.3~2.1us，case4 由 216.79415us 降到约 165~190us，目标是低于保留最佳 196.15815us；其他三项 case 走非 PART_TILES 路径应完全不变（源码不变、编译产物应逐字一致）。代价与风险：多一个 64KiB 常驻 f16 缓冲、t+1 的 q 提前载入（+32KiB），UB 峰值可能超过 196608B 而编译失败；QK 累加器 128x256 f32（128KiB L0C）与当前 tile 的 PV 累加器 128x128 f32（64KiB）可能同时活跃，超出 L0C 容量时后端会把两者重新串行化，此时无收益但不改变结果；若 t+1<t1 的条件块使 mmad 落入 scf.if 而不被接受，则以夹持索引的无条件版本为退路。",
+  "validation": "1) 桥 preflight --source candidate.py，确认严格 Triton 与编译通过（含资源上限）；2) 宿主完整四项真机评测（case1/2/4/7，原 checker、golden、输入输出 dtype 与计时合同不变，warmup5/trials3/iterations20），四项全过且 case4 完整调用 < 196.15815us 才算收益；3) 收集修改后实际 IR：内层循环是否出现两个独立 QK 累加器、QK MMA 是否在 exp2 之前、raw_next 是否作为 f16 循环携带值；4) 收集修改后成对 profiling 与模拟器窗口，比较 aiv_scalar_wait_time、Cube WAIT_FLAG_DEVI、L0C_to_GM 与 aic_cube_time；5) 若编译失败/回退/无收益，保留该候选源码与证据并在本诊断更新观测与未决问题。",
+  "selected_layer": "triton_source_scheduling:PART_TILES 内层 tile 循环的一深度 QK 前瞻（软件流水）",
+  "layer_reason": "证据把等待定位在跨核交接的串行链而非算术或带宽：Cube 只有 33.1us MMA 却等 147.81us 的 P，Vector 算 64.4us 却等 54.1us 的 QK。该机制只重排同一组算子的发射顺序，不新增/删除任何算术、不改归约顺序与精度路径，Triton 用「循环携带 f16 张量 + 受保护条件块」即可表达，不需要后端专有特性；若后端不按其顺序降级，则最快暴露为等待时间不降，便于判别。",
+  "simulator_incremental_judgment": "热点证据的增量判断：模拟器三核窗口把最大热点定位在 Cube 的 FLOWCTRL/WAIT_FLAG_DEVI（147.81us/15 次，等 P），其次是两处 FIXP L0C→DST（QK 36.85us/15、PV 29.13us/15）与 Vector 的 WAIT_FLAG_DEVI（88.50us/15，等 QK）；这支持「交替互等」而不是「某条指令本身慢」。流水证据的增量判断：CUBE productive 仅 11.74%、idle 60.91%，MTE1 productive 8.96%，VECTOR productive 21.64%/idle 68.14%，FLOWCTRL 全部等待，说明 Cube 端有大量可被向量计算覆盖的空闲，与「把下一 tile 的 QK 塞进当前 softmax 窗口」的方向一致。两项证据都是部分窗口（各核独立归一化、application_completed=false、全调用 completion 缺失），只能作方向性判断，不与真机耗时相加；增益幅度与是否真发生重叠由完整四项真机评测与修改后同 PC 重放判定。",
+  "post_change_observation": {
+    "decision_id": "05d85afb56d14dedb869fb9579cb9571",
+    "changed_source_sha256": "89ddf96a0922c1f724e5ee07e7eecfe37aada52e35dd9625dd866e1b4635cb07",
+    "preflight": "桥 preflight 返回 awaiting_source_review（保持候选字节不变，设备操作前等待外部只读路径与地址边界审查）；尚未编译、未取新 IR、未真机评测，故本轮无收益结论。",
+    "unverified_claims": [
+      "条件块内 tl.dot 是否被 Ascend 后端接受（是否落到 scf.if 内的 mmad）",
+      "UB/L0C 峰值是否仍在 196608B/128KiB 之内",
+      "QK MMA 是否真被前移到当前 tile 的 exp2 之前（需修改后 BCMLIR 判定）",
+      "四项 checker 与 case1/2/4/7 完整调用是否保持（预期 case1/2/7 源码路径不变、编译产物应一致）"
+    ]
+  },
+  "unknown": [
+    "workspace/latest-preflight.json 记录的是另一 SHA（6249d2a0…）的 awaiting_source_review 状态；本轮按宿主 context-brief 绑定 99e77cb…（与 current-profiling/simulator/starter-provenance 一致）作为父版本，若宿主另有更早候选未回滚需澄清。",
+    "UB 峰值为估算：父版本已逼近 196608B，本轮多出的 f16 raw_next 与提前载入的 q_next 是否超限由编译判定。",
+    "后端是否会把 t+1<t1 条件块内的 tl.dot 前移到当前 softmax 之前（含 L0C 128KiB + 64KiB 同时活跃的分配可行性），只能由修改后 IR 与真机判定。",
+    "t+1<t1 条件块内的 mmad 是否被 Ascend 后端接受（退路：夹持索引的无条件预取，多付每组合一次 QK）。"
+  ]
+}

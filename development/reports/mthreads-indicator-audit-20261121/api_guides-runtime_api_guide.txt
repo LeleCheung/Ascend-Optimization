@@ -1,0 +1,62 @@
+编程指南 API 编程指南 MUSA Runtime API 开发者指南 文档版本 v5.2.0 最新 当前正在查看最新版本。 切换版本 选择文档版本 ✓ v5.2.0 最新 v5.1.0 v4.3.x v3.1.0 版本说明 版本说明 本页总览 MUSA Runtime API 指南 
+ 概述 ​ 
+ MUSA Runtime API 提供高层编程接口，用于设备管理、内存管理、内核启动、流与事件控制。 
+ 
+ 设计特点 ：自动初始化（首次调用时自动初始化）、隐式上下文（每个设备自动创建 primary context）、简化编程（相比 Driver API，用更少的代码完成常见任务） 
+ 适用场景 ：应用程序开发、快速原型开发 
+ 
+ Runtime API vs Driver API 对比 ： 
+ 特性 Runtime API (推荐) Driver API 初始化 隐式（首次调用自动初始化） 显式（需手动调用  muInit() ） 上下文管理 自动（系统自动管理） 手动（需显式创建/销毁 context） 代码量 少（几行即可完成常见操作） 多（需要更多样板代码） 学习成本 低 高 灵活性 中（满足大多数应用场景） 高（精细控制资源） 适用场景 应用程序、快速原型 多 GPU、多进程、库开发 
+ 
+ 💡  建议 ：大多数应用场景推荐使用 Runtime API，代码更简洁，开发效率更高。 
+ 
+ 详细对比 Driver API ：详见  Driver API 指南 
+ 
+ 设备管理 ​ 
+ 获取设备信息 ​ 
+ # include   <musa_runtime.h> // 获取设备数量 int  deviceCount ; musaGetDeviceCount ( & deviceCount ) ; printf ( "Available devices: %d\n" ,  deviceCount ) ; // 获取设备属性 musaDeviceProp_t  prop ; musaGetDeviceProperties ( & prop ,  deviceId ) ; printf ( "Device Name: %s\n" ,  prop . name ) ; printf ( "Total Global Memory: %zu MB\n" ,  prop . totalGlobalMem  /   1024   /   1024 ) ; printf ( "Compute Capability: %d.%d\n" ,  prop . major ,  prop . minor ) ; printf ( "Multiprocessor Count: %d\n" ,  prop . multiProcessorCount ) ; printf ( "Max Threads Per Block: %d\n" ,  prop . maxThreadsPerBlock ) ; printf ( "Warp Size: %d\n" ,  prop . warpSize ) ; 
+ 选择设备 ​ 
+ // 设置当前设备 musaSetDevice ( deviceId ) ; // 获取当前设备 int  currentDevice ; musaGetDevice ( & currentDevice ) ; printf ( "Current device: %d\n" ,  currentDevice ) ; // 重置当前设备（清理上下文） musaDeviceReset ( ) ; // 同步设备（等待所有操作完成） musaDeviceSynchronize ( ) ; 
+ 设备属性查询 ​ 
+ // 查询设备是否可以访问对等设备 int  canAccess ; musaDeviceCanAccessPeer ( & canAccess ,  device ,  peerDevice ) ; // 获取设备 PCI Bus ID char  pciBusId [ 16 ] ; musaDeviceGetPCIBusId ( pciBusId ,   sizeof ( pciBusId ) ,  device ) ; // 获取设备 UUID musaUuid_t  uuid ; musaDeviceGetUuid ( & uuid ,  device ) ; 
+ 
+ 内存管理 ​ 
+ 设备内存分配 ​ 
+ // 分配设备内存 void *  d_data ; musaMalloc ( & d_data ,  size ) ; // 分配 2D 数组（pitched 内存） void *  d_array ; size_t  pitch ; musaMallocPitch ( & d_array ,   & pitch ,  widthInBytes ,  height ) ; // 分配 3D 数组 musaPitchedPtr pitchedPtr ; musaExtent extent  =   make_musaExtent ( width ,  height ,  depth ) ; musaMalloc3D ( & pitchedPtr ,  extent ) ; // 分配纹理内存 musaArray_t  array ; musaChannelFormatDesc desc  =   musaCreateChannelDesc ( 1 ,   0 ,   0 ,   0 ,  musaChannelFormatKindFloat ) ; musaMallocArray ( & array ,   & desc ,  width ,  height ,   0 ) ; 
+ 主机内存分配 ​ 
+ // 分配主机内存（普通） void *  h_data ; h_data  =   malloc ( size ) ; // 分配主机 pinned 内存（页锁定） void *  h_pinned ; musaMallocHost ( & h_pinned ,  size ) ; // 分配写合并内存（更快写入，较慢读取） void *  h_wc ; musaHostAlloc ( & h_wc ,  size ,  musaHostAllocWriteCombined ) ; // 注册已存在的主机内存 void *  h_existing  =   . . . ; musaHostRegister ( h_existing ,  size ,  musaHostRegisterMapped ) ; 
+ 统一内存 ​ 
+ // 分配统一内存 void *  managed ; musaMallocManaged ( & managed ,  size ,  musaMemAttachGlobal ) ; // 统一内存附加到特定设备 musaMallocManaged ( & managed ,  size ,  musaMemAttachSingle ) ; // 内存预取（异步） musaMemPrefetchAsync ( managed ,  size ,  deviceId ,  stream ) ; // 建议内存访问模式 musaMemAdvise ( managed ,  size ,  musaMemAdviseSetPreferredLocation ,  deviceId ) ; 
+ 内存拷贝 ​ 
+ // Host → Device musaMemcpy ( d_dst ,  h_src ,  size ,  musaMemcpyHostToDevice ) ; // Device → Host musaMemcpy ( h_dst ,  d_src ,  size ,  musaMemcpyDeviceToHost ) ; // Device → Device musaMemcpy ( d_dst ,  d_src ,  size ,  musaMemcpyDeviceToDevice ) ; // Host → Host musaMemcpy ( h_dst ,  h_src ,  size ,  musaMemcpyHostToHost ) ; // 2D 内存拷贝 musaMemcpy2D ( d_dst ,  dstPitch ,  h_src ,  srcPitch ,  width ,  height ,  musaMemcpyHostToDevice ) ; // 3D 内存拷贝 musaMemcpy3DParms copyParams  =   { } ; copyParams . srcPtr  =   make_musaPitchedPtr ( h_src ,  srcPitch ,  width ,  height ) ; copyParams . dstPtr  =   make_musaPitchedPtr ( d_dst ,  dstPitch ,  width ,  height ) ; copyParams . extent  =   make_musaExtent ( width ,  height ,  depth ) ; copyParams . kind  =  musaMemcpyHostToDevice ; musaMemcpy3D ( & copyParams ) ; 
+ 异步内存拷贝 ​ 
+ // 异步内存拷贝 musaMemcpyAsync ( d_dst ,  h_src ,  size ,  musaMemcpyHostToDevice ,  stream ) ; // P2P 内存拷贝（设备到设备） musaMemcpyPeer ( d_dst ,  dstDevice ,  d_src ,  srcDevice ,  size ) ; // 异步 P2P 内存拷贝 musaMemcpyPeerAsync ( d_dst ,  dstDevice ,  d_src ,  srcDevice ,  size ,  stream ) ; 
+ 内存设置 ​ 
+ // 内存设置为常量值 musaMemset ( d_data ,  value ,  size ) ; // 2D 内存设置 musaMemset2D ( d_data ,  pitch ,  value ,  width ,  height ) ; // 设置为 0（常用） musaMemset ( d_data ,   0 ,  size ) ; 
+ 内存释放 ​ 
+ // 释放设备内存 musaFree ( d_data ) ; // 释放主机内存 musaFreeHost ( h_pinned ) ; // 解除主机内存注册 musaMemHostUnregister ( h_existing ) ; 
+ 指针查询 ​ 
+ // 获取指针属性 musaPointer_attribute attr ; void *  value ; musaPointerGetAttribute ( & value ,  attr ,  ptr ) ; // 获取指针类型 musaMemoryType memType ; musaPointerGetMemoryType ( & memType ,  ptr ) ; // 获取指针所在设备 int  device ; musaPointerGetDevice ( & device ,  ptr ) ; 
+ 
+ 流 ​ 
+ 流创建和销毁 ​ 
+ musaStream_t  stream ; // 创建默认流 musaStreamCreate ( & stream ) ; // 创建带优先级的流 int  minPriority ,  maxPriority ; musaDeviceGetStreamPriorityRange ( & minPriority ,   & maxPriority ) ; musaStreamCreateWithPriority ( & stream ,  musaStreamDefault ,  minPriority ) ; // 创建非阻塞流 musaStreamCreateWithPriority ( & stream ,  musaStreamNonBlocking ,   0 ) ; // 销毁流 musaStreamDestroy ( stream ) ; 
+ 流同步 ​ 
+ // 等待流完成 musaStreamSynchronize ( stream ) ; // 查询流是否完成 musaError_t  err  =   musaStreamQuery ( stream ) ; if   ( err  ==  musaSuccess )   {      // 流已完成 }   else   if   ( err  ==  musaErrorNotReady )   {      // 流仍在执行 } 
+ 流回调 ​ 
+ void  MUSART_CB  myCallback ( musaStream_t  stream ,   musaError_t  status ,   void *  userData )   {      printf ( "Stream completed, status: %d\n" ,  status ) ; } // 添加回调 musaStreamAddCallback ( stream ,  myCallback ,  userData ,   0 ) ; 
+ 流优先级 ​ 
+ // 获取优先级范围 int  minPriority ,  maxPriority ; musaDeviceGetStreamPriorityRange ( & minPriority ,   & maxPriority ) ; // 创建高优先级流（数值越小优先级越高） musaStreamCreateWithPriority ( & stream ,  musaStreamDefault ,  minPriority ) ; 
+ 传统流 ​ 
+ // 使用传统流（隐式流） musaStream_t  legacyStream  =   0 ;    // 或 NULL // 使用每个线程的流 musaStream_t  perThreadStream  =   ( musaStream_t ) - 1 ; 
+ 
+ 事件 ​ 
+ 事件创建和销毁 ​ 
+ musaEvent_t  event ; // 创建默认事件 musaEventCreate ( & event ) ; // 创建带标志的事件 musaEventCreateWithFlags ( & event ,  musaEventDisableTiming ) ; musaEventCreateWithFlags ( & event ,  musaEventBlockingSync ) ; // 创建进程间事件 musaEventCreateWithFlags ( & event ,  musaEventInterprocess  |  musaEventDisableTiming ) ; // 销毁事件 musaEventDestroy ( event ) ; 
+ 事件记录 ​ 
+ // 在当前流中记录事件 musaEventRecord ( event ,  stream ) ; // 记录外部事件 musaEventRecordWithFlags ( event ,  stream ,  musaEventRecordExternal ) ; 
+ 事件同步 ​ 
+ // 等待事件完成 musaEventSynchronize ( event ) ; // 查询事件状态 musaError_t  err  =   musaEventQuery ( event ) ; if   ( err  ==  musaSuccess )   {      // 事件已完成 }   else   if   ( err  ==  musaErrorNotReady )   {      // 事件尚未完成 } // 等待流等待事件 musaStreamWaitEvent ( stream ,  event ,   0 ) ; 
+ 事件计时 ​ 
+ musaEvent_t  start ,  stop ; musaEventCreate ( & start ) ; musaEventCreate ( & stop ) ; // 记录开始事件 musaEventRecord ( start ,  stream ) ; // 启动 Kernel kernel << < gridSize ,  blockSize ,   0 ,  stream >> > ( . . . ) ; // 记录结束事件 musaEventRecord ( stop ,  stream ) ; // 等待事件完成 musaEventSynchronize ( stop ) ; // 计算经过时间（毫秒） float  elapsedTime ; musaEventElapsedTime ( & elapsedTime ,  start ,  stop ) ; printf ( "Kernel execution time: %.3f ms\n" ,  elapsedTime ) ; // 清理 musaEventDestroy ( start ) ; musaEventDestroy ( stop ) ; 
+ 进程间事件

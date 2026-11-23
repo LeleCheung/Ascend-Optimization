@@ -1,0 +1,42 @@
+--- 
++++ 
+@@ -134,6 +134,15 @@
+ 合同均匀随机输入行 max 约 2、std 约 0.48，到达该边界需约 -30σ；值域外 |q|,|k|>1
+ 可能溢出 FP16。故该机制依赖合同值域，通用 FP16 路径与二维 grid 保持逐行 max。
+ 
++PV 累加器 FP16 交接（本轮机制，仅 PART_TILES，接在 FP16 rawQK 之后）：QK 的
++f16 折叠已使 L0C_to_GM 由 98304 降到 65536KB（每 tile 128KiB = QK 64 + PV 64），
++而模拟器里 Cube 核 FIXP 的第二大热点正是 PV 那条 128x128 f32 搬出（29.13us/15
++次）。故在 PV 的 tl.dot 输出处追加同样的 f16 就近舍入并扩回 fp32：折叠成功则
++PV 搬出 64→32KiB、每 tile L0C 128→96KiB；未折叠则字节不变、只多两次 VCONV，
++按真实无减少记录。数值上 acc 多一次 2^-11 相对舍入，低于 bf16 输出量化步长
++2^-8，合同 [-1,1] 均匀随机输入下 acc 量级约 3、离 f16 上限 65504 约 300 倍余量；
++分布外输入（如 p 全为 2^15）可能溢出，属适用范围限制，由原四项 checker 判定。
++
+ FP16 rawQK 交接（本轮机制，仅 PART_TILES）：模拟器把最大的 FIXP 热点定位在
+ QK→Vector 边界（FIX_L0C_TO_DST 83.49us/19 次对应 128x256 f32），而 PV 那条
+ 29.22us/18 次是另一处；实际 BCMLIR 中 rawQK 正以 128x256 f32 从 L0C 搬出后
+@@ -259,7 +268,22 @@
+                 p = tl.exp2(qk - SM_OFFSET)
+                 l_new = tl.sum(p, 1)
+ 
+-                acc = tl.dot(p.to(tl.float16), v16)
++                # 本轮机制（PART_TILES 的 PV→Vector 交接，FP16 acc）：模拟器把
++                # Cube 核 FIXP 上两条 FIX_L0C_TO_DST（36.85us/15 次与 29.13us/15
++                # 次）列为最大的 productive 项，二者同为 64KiB 搬出；成对
++                # profiling 的 L0C_to_GM 合计 65536KB（每 tile 128KiB）说明 QK 那条
++                # 已因 dot 输出处的 truncf/extf 被折叠成 f16（64KiB），而 PV 这条
++                # 仍是 128x128 f32（64KiB）。故在 PV 的 tl.dot 输出处作同样的
++                # f16 就近舍入再显式扩回 fp32，随后才执行原归一化与输出 guard：
++                # 若后端把该转换折叠进 FIXP，PV 搬出 64KiB→32KiB、每 tile 的 L0C
++                # 总量 128KiB→96KiB，交接链缩短；若只在 UB 发生则字节不变，按
++                # 真实无减少记录。数值风险：acc = sum_j p_j v_j 多一次 2^-11 相对
++                # 舍入，远小于 bf16 输出量化步长 2^-8，合同阈值 2^-7 不变；f16 上限
++                # 65504 要求 sum_j p_j|v_j| < 65504，均匀随机 [-1,1] 输入下 l=sum p
++                # 典型约 68、acc 量级约 3（余量约 300 倍），值域/分布外输入（如
++                # q 与全部 k 都全 1，使 p 全为 2^15）可能溢出，仅作为适用范围限制。
++                # exp2、sum、除法、输出 guard、地址与 20 worker 分区逐字不变。
++                acc = tl.dot(p.to(tl.float16), v16).to(tl.float16).to(tl.float32)
+ 
+                 l_safe = tl.where(l_new > 0.0, l_new, 1.0)
+                 out = acc / l_safe[:, None]

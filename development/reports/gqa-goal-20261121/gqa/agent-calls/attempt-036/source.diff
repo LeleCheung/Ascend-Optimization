@@ -1,0 +1,119 @@
+--- 
++++ 
+@@ -141,6 +141,12 @@
+ import triton
+ import triton.language as tl
+ 
++# 本轮机制（自然指数仿射，仅 PART_TILES）：优先显式单遍融合。
++# 只在 host 侧检查当前安装的 Triton 语言是否提供合法 fma，属编译期元数据判断，
++# 不读输入值、不按 case_id 选路。缺失时回落为等价的 raw*S+B 表达式（仍删去
++# exp2→exp 的额外 ln2 乘法），并在 diagnosis 中交接，不虚构 API。
++_HAS_MATH_FMA = hasattr(getattr(tl, "math", None), "fma")
++
+ 
+ @triton.jit
+ def _gqa_tile_part_body(
+@@ -152,6 +158,7 @@
+     S: tl.constexpr, SKV: tl.constexpr, D: tl.constexpr,
+     NQ: tl.constexpr, G: tl.constexpr, NKV: tl.constexpr,
+     qk_scale: tl.constexpr, delta: tl.constexpr, SM_OFFSET: tl.constexpr,
++    NAT_SCALE: tl.constexpr, NAT_BIAS: tl.constexpr, USE_FMA: tl.constexpr,
+     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+     MASK_MD: tl.constexpr, MASK_KV: tl.constexpr,
+     NB_M: tl.constexpr, TPG: tl.constexpr, T: tl.constexpr, P: tl.constexpr,
+@@ -214,27 +221,35 @@
+                 else:
+                     q = tl.load(q_ptrs)
+ 
+-                qk = tl.dot(q, tl.trans(k)) * qk_scale
++                # 本轮机制（自然指数仿射）：实数值上
++                # exp2(raw·qk_scale − SM_OFFSET)
++                #   = exp(raw·(qk_scale·ln2) + (−SM_OFFSET·ln2))。
++                # rawQK 仍是 BF16 输入经 tl.dot 的 FP32 累加；S=qk_scale·ln2 与
++                # B=−SM_OFFSET·ln2 都是 host 编译期常数。安装语言提供合法 fma
++                # 时用一次 fma(raw,S,B) 把「乘 scale + 减偏移」合成单遍向量变换，
++                # 再接自然指数 exp，从而删掉 exp2 下降时额外乘 ln2 的那一遍；
++                # 每 tile 前处理由 4 遍（VMULS/VADDS/VMULS/VEXP）降到 2 遍
++                # （VFMA/VEXP）。若语言无 fma，则回落 raw·S+B（3 遍），仍省下
++                # ln2 乘法，并在 diagnosis 交接，不虚构 API。
++                # 数值上非逐位等价：S、B 各取一次 f32 舍入，fma 只舍入一次，
++                # 指数自变量与父版本相差 O(1e−7·|raw·S|)，可能个别改变 P 的
++                # fp16 量化边界，由原四项 checker 判定。
++                # 值域沿用父版本：|q·k|<=D ⇒ 指数自变量 <= 15·ln2 ⇒ p<=2^15，
++                # 仍在 FP16 上限内；若某行 max 远低于 SM_OFFSET 仍可能进入
++                # FP16 次正规/下溢，适用输入范围与父版本相同（|q|,|k|<=1）。
++                # MASK_KV 在自然指数域保留原负无穷屏蔽：无效列于 fma 之后写
++                # −inf，exp(−inf)=0，与父版本 exp2(−inf)=0 精确一致。
++                raw_qk = tl.dot(q, tl.trans(k))
++                if USE_FMA:
++                    qk_exp = tl.math.fma(raw_qk, NAT_SCALE, NAT_BIAS)
++                else:
++                    qk_exp = raw_qk * NAT_SCALE + NAT_BIAS
+ 
+                 if MASK_KV:
+-                    qk = tl.where(offs_n[None, :] < SKV, qk, -float("inf"))
+-
+-                # 本轮机制：编译期公共偏移替代逐行 max 稳定化。
+-                # 合同输入值域 [-1,1] 给出 |q·k| <= D，故 exp2 自变量
+-                # qk - SM_OFFSET <= D*|qk_scale| - SM_OFFSET = 15（host 取
+-                # SM_OFFSET = D*|qk_scale| - 15），p <= 2^15 = 32768 < 65504，
+-                # 在 FP16 有限范围内保留约 2 倍余量。softmax 对整行公共常数
+-                # 严格不变：p、l_new、PV 分子同乘 exp2(m_row - SM_OFFSET)，
+-                # PV 后的 acc/l_new 归一化使其在实数上精确抵消。因此这里删除
+-                # 每 tile 一次 128x256 的 max 归约、其 -inf 守卫与广播减法，
+-                # 只保留一次标量常数减法 + exp2；sum、PV、归一化与输出 guard
+-                # 逐字保留。有限精度代价：p 的 FP16 舍入仍为 2^-11 相对误差，
+-                # 但若某行 max 远低于 SM_OFFSET（约低于 -12.7），该行 p 进入
+-                # FP16 次正规；更低则整体下溢为 0（l_new 仍为 fp32 正值，
+-                # acc 为 0，输出为 0）。合同 [-1,1] 均匀随机输入的行 max 约 2
+-                # （std 约 0.48），到达该边界需约 -30σ，实际不可达；此机制
+-                # 依赖 |q|,|k| <= 1 的合同值域，域外可能溢出 FP16。
+-                p = tl.exp2(qk - SM_OFFSET)
++                    qk_exp = tl.where(offs_n[None, :] < SKV, qk_exp, -float("inf"))
++
++                # sum、PV、归一化与输出 guard 逐字保留。
++                p = tl.exp(qk_exp)
+                 l_new = tl.sum(p, 1)
+ 
+                 acc = tl.dot(p.to(tl.float16), v16)
+@@ -261,6 +276,7 @@
+     S: tl.constexpr, SKV: tl.constexpr, D: tl.constexpr,
+     NQ: tl.constexpr, G: tl.constexpr, NKV: tl.constexpr,
+     qk_scale: tl.constexpr, delta: tl.constexpr, SM_OFFSET: tl.constexpr,
++    NAT_SCALE: tl.constexpr, NAT_BIAS: tl.constexpr, USE_FMA: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+     BLOCK_D: tl.constexpr,
+@@ -288,6 +304,7 @@
+             o_sb, o_ss, o_sh, o_sd,
+             S=S, SKV=SKV, D=D, NQ=NQ, G=G, NKV=NKV,
+             qk_scale=qk_scale, delta=delta, SM_OFFSET=SM_OFFSET,
++            NAT_SCALE=NAT_SCALE, NAT_BIAS=NAT_BIAS, USE_FMA=USE_FMA,
+             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+             MASK_MD=MASK_MD, MASK_KV=MASK_KV,
+             NB_M=NB_M, TPG=TPG, T=T, P=P,
+@@ -464,6 +481,16 @@
+     # 元数据决定，不读输入值、不按 case_id 选路。通用二维 grid 与 FP16
+     # 路径不使用该值，保留逐行 max 稳定化。
+     sm_offset = float(D) * abs(qk_scale) - 15.0
++
++    # 自然指数仿射常数（仅 PART_TILES 使用）：exp2(raw·qk_scale − SM_OFFSET)
++    # = exp(raw·(qk_scale·ln2) + (−SM_OFFSET·ln2))。S、B 在 host 以 double 计算，
++    # 作为 constexpr 传入后按 f32 参与一次 fma；仍完全由 shape/D/qk_scale 元数据
++    # 决定，不读输入值、不按 case_id 选路。USE_FMA 只探测当前 Triton 语言是否
++    # 提供 tl.math.fma，缺失时内核回落为 raw·S+B。
++    _LN2 = 0.6931471805599453
++    nat_scale = qk_scale * _LN2
++    nat_bias = -sm_offset * _LN2
++    use_fma = bool(_HAS_MATH_FMA)
+ 
+     y = torch.empty((B, S, NQ, D), dtype=query.dtype, device=query.device)
+ 
+@@ -578,6 +605,7 @@
+         y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+         S=S, SKV=SKV, D=D, NQ=NQ, G=G, NKV=NKV,
+         qk_scale=qk_scale, delta=SKV - S, SM_OFFSET=sm_offset,
++        NAT_SCALE=nat_scale, NAT_BIAS=nat_bias, USE_FMA=use_fma,
+         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+         IS_CAUSAL=bool(is_causal),
+         MASK_MD=MASK_MD, MASK_KV=MASK_KV,

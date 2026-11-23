@@ -1,0 +1,54 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "beeb2335d99a34262701b9023d62b816f7621381eaada3500506d6dde805f9f4",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4 内核 _gqa_fwd_kernel_mix_aic 耗时 256.825134us、Block Dim=32；cube 每程序 aic_cube_time 均值 20.693us（32 程序恒等），aic_mte2_time 17.892us（min 14.945 / max 21.210）。GM_to_L1 每程序 1664KB、合计 53248KB；L0C_to_GM 每程序 3072KB、合计 98304KB。32 个 program 各 16 次 query-tile 迭代，物理 20 个 Cube 核意味着 20+12 的两波分配，存在 12 程序的短尾波。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "持久体 TTIR：K/V 的 tt.load 位于 scf.for 之前（%k/%v），循环 0..16；循环内 gi=t/2、mb=t%2、hq=kvh*8+gi，program 只由 pid/8 与 pid%8 分解 b 与 kvh，确认当前每程序独占 1 个共享 KV 头的全部 G=8 个 query head。"
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "BCMLIR：整段 256x128 K 与 V 的 memref.copy 及 V 的 extf/truncf 到 f16 均提升到 scf.for(0..16) 之外，循环内只复用 %18/%21；因此增加 program 数会让每个 program 都重付一次整段 K/V 载入，K/V 交通随 program 数线性放大。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "当前保留父版本 case4 完整调用 candidate_timing.full_call_us=268.7718（trials 268.7718/268.1253/271.8438），CANN native_timing.full_call_us=128.65865，native_over_candidate=0.478691；官方四项 checker 全部 passed，bf16 threshold=0.0078125。"
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "PERSIST_KV 分支 grid=(B*NKV,)，_gqa_persist_kv_body 内 hq=kvh*G+gi、循环 G*NB_M；case4 B4/NKV8/G8/NB_M2 -> 32 program×16 迭代，case7 B2/NKV8/G4/NB_M1 -> 16 program×4 迭代。K/V 载入在循环外，单行 QK/softmax/PV/输出表达式与 guard 由 TXT 与 TTIR 一致确认。"
+    }
+  ],
+  "hypothesis": "当前 32 个持久 program 落在 20 个 Cube 核上形成 20+12 的不均衡两波，尾波与长程序（各 16 次迭代）共同拉长 case4 墙钟；per-program 的 cube 仅 20.69us，而墙钟远大于此，说明并行度/尾波而非纯算术是剩余损失之一。把每个共享 KV 头按 2 个 query head 一组拆成 G/2 个 headgroup，使 grid 变为 B*NKV*(G/2)=128（case4）、32（case7），每程序迭代降为 2head×NB_M=4（case4）/2（case7），可提高核间负载均衡并缩短单程序长链。K/V 仍在每程序循环外载入一次，因此总量随程序数上升（case4 约 4 倍 GM_to_L1，case7 约 2 倍），这是本轮明确的代价；只有真机完整评测能判定占用率收益是否超过 K/V 重复读取代价。",
+  "alternatives": [
+    "维持 32 program 只改循环内部：已无可删迭代，收益空间受尾波限制，不能检验占用率假设。",
+    "仅对 case4 的 G=8 拆分而保留 case7 原 G：会混淆跨形状结论，且宿主明确要求 G>=2 整除即拆分。",
+    "按 KV 头完全独立 program（不复用、每 head 全载 K/V）：交通更大且破坏当前每程序 2 head 复用，不是本实验。",
+    "调整 num_stages/其他编译选项或改 IR：本轮明确禁止，且父版本 num_stages=1 保持不变。"
+  ],
+  "discriminating_observation": "若 case4 完整调用低于 268.7718us，则占用率/尾波收益大于 K/V 重复载入代价；若回退或持平，则瓶颈在 MTE2/K/V 交通与固定交接链而非核间均衡。修改后成对 profiling 的 GM_to_L1 合计（预期 case4 约 4×53248KB）与 aic_mte2_time、以及四 case 完整调用可直接区分两种机制。",
+  "change": "只改 PERSIST_KV 调度所有权，不动算术：新增 constexpr HG=2（当 G%2==0 且 G>=2）否则 HG=G，NGRP=G//HG；grid=(B*NKV*NGRP,)。持久体由 pid 分解 ng=pid//NGRP、hg=pid%NGRP、b=ng//NKV、kvh=ng%NKV，循环 HG*NB_M，hq=kvh*G+hg*HG+gi。K/V 整段载入与 V→f16 转换仍位于循环之前、每程序一次；M128/N256、逐行 QK、softmax、单次 fp16 PV、输出表达式/guard/精度分支逐字不变。G 不能整除 2 时 HG=G、NGRP=1，行为与父版本一致，无尾部 head 掩码。所有非持久回退路径与启动参数（num_warps=1,num_stages=1）不变。",
+  "expected": "case4 grid 32→128、每程序 16→4 迭代；case7 grid 16→32、每程序 4→2 迭代；预计提升核间均衡、缩短长尾，目标 case4 full_call 低于 268.7718us。代价：K/V 载入次数 case4 约 4 倍（53248KB→约 212992KB GM_to_L1）、case7 约 2 倍；L0C_to_GM 与 Q/score/PV 全局算术量不变。case1（fp16 因果）与 case2（fp16）不满足 PERSIST_KV，源码路径与耗时预期不变。",
+  "validation": "保持原合同：固定 case1/2/4/7、官方 golden 与 checker（commit 12180ce7，checker_sha256 863f6862...）、输入输出 dtype、warmup 5 / trials 3 / iterations 20 计时合同与精度阈值全部不变，由原完整四项 checker 验收；随后比较四 case 完整调用并采集修改后成对 profiling，重点核对 case4 是否低于 268.7718us、case7 真实变化、case1/2 是否保持。",
+  "selected_layer": "Triton 源码层的 program 分解与 launch grid（持久 program 的 headgroup 所有权）",
+  "layer_reason": "该机制只涉及 program_id 分解、循环上界与 hq 映射，完全可在 Triton 源码表达；不改编译选项（num_stages 固定 1）、不手改 IR，且保持每程序 K/V 循环外复用与逐行算术表达式不变，是最小可区分实验。",
+  "simulator_incremental_judgment": "当前剩余歧义是「两波尾波/占用率损失」与「K/V 重复载入及 MTE2 交通」谁主导；父版本 profiling 已给出 cube 20.69us、mte2 17.89us、GM_to_L1 1664KB/程序的可分离数据，而本轮两种机制的唯一差异是 program 数与循环次数，可由修改后完整调用与成对 profiling 直接观测，不需要新增模拟器输入；若后续 profiling 显示 MTE2 占比显著上升再考虑针对搬运的模拟器分析。",
+  "unknown": [
+    "case4/case7 的 K/V 4×/2× 重复载入是否被占用率收益抵消，需真机完整评测判定。",
+    "G 不整除 2 的形状本轮不测试，仅保持 HG=G 的父版本等价路径。"
+  ]
+}

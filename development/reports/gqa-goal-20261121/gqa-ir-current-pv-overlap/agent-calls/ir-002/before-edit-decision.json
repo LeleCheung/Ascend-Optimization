@@ -1,0 +1,151 @@
+{
+  "timestamp": "2026-11-21T17:18:03.195753+00:00",
+  "diagnosis": {
+    "source_sha256": "98c755709dd428d0955bfc11a666b679f5afdc412ecb441e1c094568a3805661",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "硬件成对观测与验收起点",
+        "finding": "case4 候选内核 159.603195us、Block Dim 20/Mix Block Dim 40；CANN 参考 137.402740us、19/38；当前保留最佳 154.8871us 为验收比较起点。材料明示各流水可重叠、累计时间不相加为耗时分解，等待比例仅形成假设。"
+      },
+      {
+        "path": "denominator-schedule.json",
+        "category": "simulator",
+        "role": "源绑定模拟器逐指令窗口（时钟资质已核验，used as mechanism locator）",
+        "finding": "veccore0 窗口 113.984..212.704us、raw_trace 65cc4b35…；PV 返回 WAIT_FLAG_DEVI 120.349..126.106（12 次 58.31us，约 4.86us/次）；分母归约的 SET_FLAG/VADD/VADD/BAR/VADD/BAR/VCADD 区间 126.540..127.098（12 次约 12.7us，约 1.06us/次，源映射第 480 行 tl.sum）；QK 返回 WAIT_FLAG_DEVI 114.511..120.324 与 126.579..129.413。归约起点晚于 PV 返回等待结束，二者当前互不重叠。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "simulator",
+        "role": "模拟器派生热点排序（仅用于定位候选机制）",
+        "finding": "veccore0 头部为 0x10d11ac0 WAIT_FLAG_DEVI（第 478 行 PV）58.31us、0x10d119f0 WAIT_FLAG_DEVI（第 394 行 QK）31.24us、0x10d11c10 MOV_SRC_TO_DST_ALIGN（MTE3，第 505 行 Out）25.39us、0x10d11c24 SET_FLAG（MTE3→VEC flag1）25.38us、0x10d11aa8 WAIT_FLAG（VEC 等 MTE3 flag0，第 478 行）16.9us；第 480 行归约区域（VADD/VCADD/BAR）属纯 Vector 计算，可直接改序。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "泳道占用与空闲范围",
+        "finding": "veccore0 VECTOR active 34.27%/wait 10.36%/idle 65.73%/productive 23.98%（422 事件）；FLOWCTRL wait 90.70%、productive 0%；MTE3 active 58.52%/wait 19.06%/productive 40.78%。Vector 有约 66% 空闲区间可容纳被移入等待窗口的归约；未报告泳道保持未知。"
+      },
+      {
+        "path": "ir/target.hivm.mlir",
+        "category": "source_ir",
+        "role": "本轮实际候选（检查后待编辑的实际导出 HIVM）",
+        "finding": "AIV 每 tile 序为：p_bf 转换（370）→ set_flag[V→MTE3,E0]（371）→ sync_block_wait[VECTOR,MTE2,PS] flag=3（377，P 缓冲消费）→ wait_flag[V→MTE3,E0]（379）→ store_ubuf_to_gm_1d（382，P 发送）→ set_flag[MTE3→V,E0]（383）→ sync_block_set[VECTOR,MTE3,PS] flag=1（384，Psend 通知）→ sync_block_wait[VECTOR,PIPE_FIX,PS] flag=0（389，PV 返回）→ acc f16 装入（396）→ vcast（405）→ enablevc_reduce_sum_ar_float（411，操作数 %45 UB114688 64x256 f32、%56 UB180224 l_new、%57 UB0 8192xf32 暂存）→ set_flag[V→MTE2,E0]（412）→ vdiv（420）→ Out 转换与存储（429-435）。归约与 acc 无数据依赖，但被排在 PV 返回等待之后。"
+      },
+      {
+        "path": "compiled-readonly/_gqa_fwd_kernel.ttadapter",
+        "category": "source_ir",
+        "role": "后端已消除疑似冗余的核对材料（保持冻结）",
+        "finding": "第 94-96 行 PV matmul 后接 truncf/extf（f32→f16→f32），第 99 行 linalg.reduce ins(%p) 只消费 FP32 概率张量，第 105 行 arith.divf 同时消费 acc 与归约结果；确认两种精度窄化已落在 fixpipe 输出，归约独立于 PV 累加，可单独调度。"
+      },
+      {
+        "path": "codex-brief.json",
+        "category": "source_ir",
+        "role": "Codex 证据分析与机制边界的贡献记录",
+        "finding": "Codex 由源绑定模拟器与实际 HIVM 指出分母归约被 PV 返回阻塞，并限定本调用只移动该归约及其指针/转换操作数、不新增 MTE3 完成事件对、不替换数学、保持 AIC 与既有跨核事件；同时要求核对别名的跨迭代生存期、QK 暂存复用 EVENT_ID0 的完成置位位置，并把旧 038 无收益记为历史而非结论。"
+      }
+    ],
+    "hypothesis": "当前 059 导出 HIVM 的 AIV 在每个 tile 上把 FP32 分母归约 enablevc_reduce_sum_ar_float 排在 PV 返回跨核等待 sync_block_wait[<VECTOR>,<PIPE_FIX>,<PIPE_S>] flag=0 之后。该归约只读 UB[114688,180224) 的 FP32 p 并写 UB[180224,180480) 的 l_new（64x1 f32），与 PV 累加器（UB[65536,81920) f16 与 UB[81920,114688) f32）之间没有数据依赖。把归约本体及 5 个操作数定义原样移到 P 发送通知 sync_block_set[<VECTOR>,<PIPE_MTE3>,<PIPE_S>] flag=1 之后、PV 返回等待之前，就让这段 Vector 计算进入约 4.86us/次的 PV 返回等待窗口，缩短每个 tile 在 PV 返回之后仍需串行执行的 Vector 关键段。归约读 p 的正确性由同迭代更早的 V 管道程序序保证（第 347 行 vcast 与第 350/358 行 V 屏障），其对 UB[0,32768) 暂存的写入沿用原有 V→MTE2 EVENT_ID0 完成置位（位置不动）保护，故本轮只需一次纯顺序移动。",
+    "alternatives": [
+      "保持 IR 原样并按 no-change 交接：归约继续排在 PV 返回等待之后；若宿主认为部分捕获窗口的覆盖不足以支持重叠判断，可走此路径，其他机制留给独立调用。",
+      "把 set_flag[<PIPE_V>,<PIPE_MTE2>,<EVENT_ID0>]（QK 暂存复用完成置位）随归约一起前移：可让下一 tile 的 QK MTE2 装入更早放行，本轮按既有约束保留原位，登记为后续独立机制。",
+      "把归约移到 P 发送之前：p_bf 截断与 MTE3 读取的既有顺序会约束该位置，收益与本次重叠区间重合，且改变 P 发送时机，本轮不采用。",
+      "源码方向（本轮冻结源码，仅记录）：在 frozen.py 中把 l_new = tl.sum(p, 1) 移到 p_bf 截断与 PV 语句之前，由 Triton 自身导出该顺序，留待源码层调用评估。"
+    ],
+    "change": "把 ir/target.hivm.mlir 中 _gqa_fwd_kernel_mix_aiv 的 6 条语句（%56 = pointer_cast 180224、%57 = pointer_cast 0、%cast_32、%cast_33、%cast_34 与 func.call @enablevc_reduce_sum_ar_float(%cast_32,%cast_33,%cast_34,%cst)）从 PV 返回等待（sync_block_wait[<VECTOR>,<PIPE_FIX>,<PIPE_S>] flag=0，原第 389 行）之后的位置，原样搬到 P 发送通知（sync_block_set[<VECTOR>,<PIPE_MTE3>,<PIPE_S>] flag=1，第 384 行）之后、%51 = hivm.hir.get_block_idx（第 385 行）之前。同一区域的 set_flag[<PIPE_V>,<PIPE_MTE2>,<EVENT_ID0>]（第 412 行）保持原位；acc 的 MTE2 装入、vcast、vdiv、Out 转换与存储、全部 set_flag/wait_flag 与 sync_block_set/wait 配对、AIC 函数、指针常量与缓冲地址逐字保留；无新增事件对，无数学替换，函数 ABI 不变。",
+    "expected": [
+      "指令：AIV 函数内指令条数保持不变，仅 6 条语句的文本位置前移到 Psend 通知与 PV 返回等待之间；5 个操作数定义与其使用者仍相邻，loc(#loc159)/loc(#loc150)/loc(#loc155) 归属不变；AIC 函数逐字不变。",
+      "动态轮次：每 tile 一次归约；case4 共 512 个 tile、20 个常驻 worker，每 worker 25 或 26 次，归约动态总数保持 512，与 P 发送、PV 返回等待的动态次数一一对应，执行覆盖按 512 次核对。",
+      "等待：预测 veccore0 的 SET_FLAG/VADD/VADD/BAR/VADD/BAR/VCADD 区间（现 126.540..127.098 量级、约 1.06us/次）移入 FLOWCTRL 的 PV 返回 WAIT_FLAG_DEVI 窗口（现 120.349..126.106、58.31us/12 次、约 4.86us/次），即归约区间与该等待区间产生交集；PV 返回等待的结束时刻由 Cube 与 P 发送决定，预测总量保持同量级。",
+      "关键段：PV 返回之后到 Out 存储之前的 Vector 串行计算每 tile 减少约一次归约的时长（0.7~1.1us），对应每 worker 上限约 18~29us；整任务兑现程度取决于 Cube 侧链是否转为新的限制。",
+      "资源与缓冲：UB 地址与大小逐字不变（QK f16 0..32768、p_bf 32768..65536、acc f16 65536..81920、acc f32 81920..114688、p f32 114688..180224、l_new 180224..180480）；GM 与 L0C 字节、MMA 次数、sync_block 事件对数与事件 ID 全部不变。",
+      "代价：PV 结果已经先到的尾部 tile 上，归约前置会把 acc 的 vcast 推迟约 0.7~1.1us；下一 tile 的 QK MTE2 装入仍等待原 V→MTE2 EVENT_ID0 完成置位（第 412 行原位），预取深度与在飞信用数不变。",
+      "数值：归约仍对同一 FP32 p 按同一顺序累加、写入同一 l_new 缓冲，vdiv 的除数来源与除法形式不变，预测输出与改动前逐位一致。"
+    ],
+    "validation": [
+      "语义审查：移动块的全部操作数在新区块之前已有定义（%45 第 356 行、%c180224_i64/%c0_i64/%cst 顶部常量），全部使用点在移动之后；跨迭代的 p 与 l_new 生存期按 tile 边界对齐。",
+      "别名审查：归约只写 UB[0,32768) 暂存与 UB[180224,180480) l_new；同迭代 UB[0,32768) 的生产者是已完成的 QK MTE2 装入（第 339 行），其 Vector 消费者是同迭代 vcast（第 347 行）；UB[114688,180224) 的下一生产者是下一 tile 的 vcast，程序序位于归约之后；vdiv 以 UB[114688) 起始 512 个 f32 为临时缓冲，其使用点在归约之后。",
+      "事件配对：全部 set_flag/wait_flag 与 sync_block_set/sync_block_wait 保持成对且位置不变，其中 QK 暂存复用的完成置位 set_flag[<PIPE_V>,<PIPE_MTE2>,<EVENT_ID0>] 位置不动，prologue 初始信用（第 304 行）与 epilogue 汇合等待（第 438 行）不变。",
+      "编译与实测：宿主对修改后的 HIVM 续编译并确认模块可解析、AIC 产物与 UB 预算不变，再以完整四项官方 checker（不变阈值）与成对真机测量验收；本预测逐项对照修改后真实窗口与总时长，偏差按实测记录。"
+    ],
+    "unknown": [
+      "未报告泳道（其余 Vector 核与部分 Scalar/MTE 区间）保持未知；三核窗口为部分捕获、各自归一化，application completion 以材料记载为准。",
+      "Cube 侧链在 Vector 关键段缩短后是否成为新的限制，需修改后重放确认。",
+      "归约的 VADD/VCADD 与内部 BAR 在新区块中的指令级排布由后端重排，PC 地址会改变，比较采用源映射与等效覆盖。"
+    ],
+    "layer_reason": "Triton 表达能力：该归约在源码中写作 l_new = tl.sum(p, 1)（frozen.py 第 480 行），Triton 只约束数据依赖，语句在 Python 中的先后直接决定导出顺序，源码层面的同类意图就是把该行移到 PV 语句之前，属可表达的等价重排。固定源码实验目的：本轮冻结源码与发射 ABI，只在编译器实际导出的 HIVM 上检验「归约进入 PV 返回等待窗口」这一条调度假设，使测量对象与已验收的 059 源码保持同一身份，把源码改动与 IR 调度分开评估。IR 控制点：hivm 阶段已把 tl.sum 落实为 enablevc_reduce_sum_ar_float 调用，P 发送、PV 返回等待与 acc 装入都已展开为显式 flag 与 sync_block 指令，文本顺序即调度顺序，因此在 hivm 上移动该调用是改变 Vector 计算与跨核等待相对位置的最小控制点。",
+    "simulator_incremental_judgment": "源绑定模拟器增量判断：修改前 veccore0 窗口 113.984..212.704us 覆盖 12 次 tile 迭代，PV 返回等待 120.349..126.106 与归约 126.540..127.098 互不重叠。修改后预测同一窗口内归约区间进入 PV 返回等待区间，FLOWCTRL 的 wait 区间与 VECTOR 的 productive 区间产生交集；该窗口为部分捕获（12/13 次、三核各自归一化），动态总次数的比较以执行覆盖（case4 共 512 次 tile）为前提，未报告泳道保持未知。PC 地址随重排改变，比较采用源映射（第 480 行归约、第 478 行 PV、第 505 行 Out 存储）与等效覆盖，锚定固定 PC。旧 038 的源码级重排与额外 MTE3 完成事件对未确认收益，本轮输入、缓冲图与指令成本均已改变，故把 038 作为历史证据；本调用不新增事件对，单独检验当前 059 缓冲图下的一次顺序移动。"
+  },
+  "diagnosis_sha256": "7d853b9ae251d71f4848cbc3a6f6d8727fc54eff2a1a50e4ff884179ac78e1d3",
+  "evidence": [
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "硬件成对观测与验收起点",
+      "finding": "case4 候选内核 159.603195us、Block Dim 20/Mix Block Dim 40；CANN 参考 137.402740us、19/38；当前保留最佳 154.8871us 为验收比较起点。材料明示各流水可重叠、累计时间不相加为耗时分解，等待比例仅形成假设。",
+      "sha256": "053c9bd03c36afad321bbd76dedbfb7ed97e2f9acc3014f81e58b9b772d6a198"
+    },
+    {
+      "path": "denominator-schedule.json",
+      "category": "simulator",
+      "role": "源绑定模拟器逐指令窗口（时钟资质已核验，used as mechanism locator）",
+      "finding": "veccore0 窗口 113.984..212.704us、raw_trace 65cc4b35…；PV 返回 WAIT_FLAG_DEVI 120.349..126.106（12 次 58.31us，约 4.86us/次）；分母归约的 SET_FLAG/VADD/VADD/BAR/VADD/BAR/VCADD 区间 126.540..127.098（12 次约 12.7us，约 1.06us/次，源映射第 480 行 tl.sum）；QK 返回 WAIT_FLAG_DEVI 114.511..120.324 与 126.579..129.413。归约起点晚于 PV 返回等待结束，二者当前互不重叠。",
+      "sha256": "c544767663f68ef749e3ff20cada7fff2e37d6859c7d8558a002df16f665dd0b"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "模拟器派生热点排序（仅用于定位候选机制）",
+      "finding": "veccore0 头部为 0x10d11ac0 WAIT_FLAG_DEVI（第 478 行 PV）58.31us、0x10d119f0 WAIT_FLAG_DEVI（第 394 行 QK）31.24us、0x10d11c10 MOV_SRC_TO_DST_ALIGN（MTE3，第 505 行 Out）25.39us、0x10d11c24 SET_FLAG（MTE3→VEC flag1）25.38us、0x10d11aa8 WAIT_FLAG（VEC 等 MTE3 flag0，第 478 行）16.9us；第 480 行归约区域（VADD/VCADD/BAR）属纯 Vector 计算，可直接改序。",
+      "sha256": "2e902725a1789e13d443bcb667d5c53b20c00d315e9b7f150bbd62682fbe9ed0"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "泳道占用与空闲范围",
+      "finding": "veccore0 VECTOR active 34.27%/wait 10.36%/idle 65.73%/productive 23.98%（422 事件）；FLOWCTRL wait 90.70%、productive 0%；MTE3 active 58.52%/wait 19.06%/productive 40.78%。Vector 有约 66% 空闲区间可容纳被移入等待窗口的归约；未报告泳道保持未知。",
+      "sha256": "3590ffd0e50ca8cd92c8023ff24e613e2f6d64083592c6c4173ec53591e1dd1b"
+    },
+    {
+      "path": "ir/target.hivm.mlir",
+      "category": "source_ir",
+      "role": "本轮实际候选（检查后待编辑的实际导出 HIVM）",
+      "finding": "AIV 每 tile 序为：p_bf 转换（370）→ set_flag[V→MTE3,E0]（371）→ sync_block_wait[VECTOR,MTE2,PS] flag=3（377，P 缓冲消费）→ wait_flag[V→MTE3,E0]（379）→ store_ubuf_to_gm_1d（382，P 发送）→ set_flag[MTE3→V,E0]（383）→ sync_block_set[VECTOR,MTE3,PS] flag=1（384，Psend 通知）→ sync_block_wait[VECTOR,PIPE_FIX,PS] flag=0（389，PV 返回）→ acc f16 装入（396）→ vcast（405）→ enablevc_reduce_sum_ar_float（411，操作数 %45 UB114688 64x256 f32、%56 UB180224 l_new、%57 UB0 8192xf32 暂存）→ set_flag[V→MTE2,E0]（412）→ vdiv（420）→ Out 转换与存储（429-435）。归约与 acc 无数据依赖，但被排在 PV 返回等待之后。",
+      "sha256": "3505ee5ca32e1c8359f9f504a2a42d951a3103784f6153e10894027b68f664ee"
+    },
+    {
+      "path": "compiled-readonly/_gqa_fwd_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "后端已消除疑似冗余的核对材料（保持冻结）",
+      "finding": "第 94-96 行 PV matmul 后接 truncf/extf（f32→f16→f32），第 99 行 linalg.reduce ins(%p) 只消费 FP32 概率张量，第 105 行 arith.divf 同时消费 acc 与归约结果；确认两种精度窄化已落在 fixpipe 输出，归约独立于 PV 累加，可单独调度。",
+      "sha256": "7baa69025a03de424599dfef862da8caba4c1bc6ce472e86a2c25d9f15551e3f"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "source_ir",
+      "role": "Codex 证据分析与机制边界的贡献记录",
+      "finding": "Codex 由源绑定模拟器与实际 HIVM 指出分母归约被 PV 返回阻塞，并限定本调用只移动该归约及其指针/转换操作数、不新增 MTE3 完成事件对、不替换数学、保持 AIC 与既有跨核事件；同时要求核对别名的跨迭代生存期、QK 暂存复用 EVENT_ID0 的完成置位位置，并把旧 038 无收益记为历史而非结论。",
+      "sha256": "a70160dac4c14f76f18ffcdf6a84f21abde40d043ddf18ca2fde1baf855db8a0"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "98c755709dd428d0955bfc11a666b679f5afdc412ecb441e1c094568a3805661",
+    "contract.json": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858",
+    "original-resume-result.json": "41170598b5647a7d11952e0d96cc1cb57e76ce9accd6496298ee80621fe29d44",
+    "profiling.json": "053c9bd03c36afad321bbd76dedbfb7ed97e2f9acc3014f81e58b9b772d6a198",
+    "hotspots.json": "2e902725a1789e13d443bcb667d5c53b20c00d315e9b7f150bbd62682fbe9ed0",
+    "timeline.json": "3590ffd0e50ca8cd92c8023ff24e613e2f6d64083592c6c4173ec53591e1dd1b",
+    "denominator-schedule.json": "c544767663f68ef749e3ff20cada7fff2e37d6859c7d8558a002df16f665dd0b",
+    "context.json": "ae50adc24e92c18e51023bceb509de7810c8b3b554f801502862eb84500bea36",
+    "ir-inventory.json": "7c6c2616114d9beff2173adc8d8a40cb72b66d7c2aca374c6ef201238e498cf6",
+    "diagnosis.json": "68bbecd4d6ef8c386519dba4293940fde96547446100e8dd1cf436747b32122c",
+    "feedback.json": "c7676ec43278b23bbb9a23757a646253cbaa695b1e50768dfbe491d5761495bb",
+    "codex-brief.json": "a70160dac4c14f76f18ffcdf6a84f21abde40d043ddf18ca2fde1baf855db8a0",
+    "ir/target.hivm.mlir": "3505ee5ca32e1c8359f9f504a2a42d951a3103784f6153e10894027b68f664ee",
+    "compiled-readonly/_gqa_fwd_kernel.bcmlir": "810ba7cfb69fa55572bb2b331f3cb65c6bf8c4cbffba735601930c0ee8f652b8",
+    "compiled-readonly/_gqa_fwd_kernel.ttadapter": "7baa69025a03de424599dfef862da8caba4c1bc6ce472e86a2c25d9f15551e3f"
+  },
+  "decision_tool_sha256": "2ba55ebab8be5b8a2363da657d6ee81799d4cabcdfb8e1494846aecfd1fde624"
+}

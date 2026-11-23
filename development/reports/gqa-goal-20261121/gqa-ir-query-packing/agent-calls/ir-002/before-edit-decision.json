@@ -1,0 +1,171 @@
+{
+  "timestamp": "2026-11-21T11:03:40.193228+00:00",
+  "diagnosis": {
+    "source_sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "feedback.json",
+        "category": "evaluation",
+        "role": "正式结果与验收起点",
+        "finding": "019源码四项正式结果与条件补测均已记录，case4 候选 262.27775us、原版 472.46045us、CANN 参考 128.9496us；本轮目标为超过该保留值，编译修复、同源码 IR 收益与超过保留最佳分别验收。"
+      },
+      {
+        "path": "codex-brief.json",
+        "category": "evaluation",
+        "role": "宿主证据分析与候选机制",
+        "finding": "宿主指出 ir-001 的语义与 65536 行唯一所有权审查通过，CPU 解析在第85行报 expected = after SSA name；%39_s 与 %55_s 以数字开头且带后缀，违反 MLIR SSA 命名；建议只把这2个定义及全部引用改为 q_packed/out_packed，其余字节保持。"
+      },
+      {
+        "path": "frozen.py",
+        "category": "source_ir",
+        "role": "固定源码身份与语义",
+        "finding": "sha256 为 2a98e3e0…49113，与 context 一致；kernel 符号 _gqa_fwd_kernel，case4 每 program 处理 4 个 query tile，K/V 外提、FP32 max-exp2-sum 与后归一化顺序固定；本轮源码逐字节冻结。"
+      },
+      {
+        "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "待修复 BCMLIR",
+        "finding": "第85行定义 %39_s = bufferization.to_tensor %alloc_6，第86行以 %39_s 作 collapse_shape 输入；第120行定义 %55_s = tensor.expand_shape %55，第121行以 %55_s 作 materialize_in_destination 源。两处名称均以数字开头。Q/输出布局为 16x8x128、strided<[8192, 128, 1]>、偏移 %38；全文件已无 tensor.reshape。"
+      },
+      {
+        "path": "compiled-readonly/_gqa_fwd_kernel.ttadapter",
+        "category": "source_ir",
+        "role": "019 已编译低层对照",
+        "finding": "019 产物以 memref.reinterpret_cast + memref.copy 载入 Q，再 bufferization.to_tensor %q 进入 128x128 矩阵乘；输出经 bufferization.materialize_in_destination 直接写入 strided<[8192,1]>。该路径无 reshape 类算子，可作为静态布局对照，同时说明 019 基线采用 128 行整块搬运。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "paired_profiling",
+        "role": "019 热点、等待与空闲（历史材料）",
+        "finding": "绑定 019 二进制的 case4 观察：输出 store 与配套 SET_FLAG 各 4 次、各 7.26us；MTE3 wait_ratio 0.13750、CUBE wait_ratio 0.21895、FIXP wait_ratio 0.21100；K/V 载入 MTE2 2 次 4.58us。累计指令时间跨流水可重叠，仅用于关注度排序。编辑后的 IR 尚无二进制。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "019 吞吐与带宽量化（历史材料）",
+        "finding": "candidate Task Duration 257.645142us、Block Dim 128；aiv_mte3_ratio 均值 0.26871、aiv_mte2_ratio 均值 0.32586、write_main_memory_datas 均值 1732.32KB。该数据对应 019 已编译二进制。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "paired_profiling",
+        "role": "019 流覆盖率与时钟资质（历史材料）",
+        "finding": "candidate.py:227-240 区域 instruction_time_sum 147.38us、wait_instruction_time_sum 78.61us、largest_instruction_us 37.27；clock_qualification 为 relative_only、absolute_time_qualified 为 false，raw_clock_window 137.081-186.172 且 unit 标为 unassigned；窗口为首末可见硬件事件之间的部分捕获，未报告泳道保持未知。"
+      },
+      {
+        "path": "q-row-packing-language-evidence.txt",
+        "category": "source_ir",
+        "role": "020 源层失败背景",
+        "finding": "020 源层用二维连续段载入加有序 reshape，实际 tensor.reshape 在后端重写阶段触发 LLVM unexpected op；本轮改由 BCMLIR 的 collapse_shape/expand_shape 零拷贝视图表达同一有序布局。"
+      }
+    ],
+    "hypothesis": "把两个非法 SSA 名称改为字母开头后，BCMLIR 恢复 MLIR 语法合法性，CPU 解析通过并进入后续编译；编译产物应与 ir-001 设计一致：每 program 4 轮循环，每轮 16 序列 x 8 头 = 128 行，Q 与输出 DMA 每段 2048B 连续、每 tile 16 段，K/V 外提与全部浮点表达式保持不变。",
+    "alternatives": [
+      "保持 ir-001 原样：CPU 在第85行解析失败，编译修复目标无法推进。",
+      "回到 compiled-readonly 的 019 bcmlir：解析与编译成立，同时放弃本轮行打包实验。",
+      "改用 020 源层 tensor.reshape：已观测到后端重写阶段报 LLVM unexpected op。"
+    ],
+    "change": "仅把 ir/target/_gqa_fwd_kernel.bcmlir 中 %39_s 的定义与引用替换为 %q_packed，把 %55_s 的定义与引用替换为 %out_packed；其余字节、静态形状、跨度、ABI、循环与浮点表达式保持。",
+    "expected": [
+      "解析：两个数字开头的 SSA 名称改为字母开头后，MLIR 解析在第85行与第120行通过，CPU 编译不再报 expected = after SSA name。",
+      "指令：重命名仅改符号文本，算子、操作数、结果类型、loc 与内存布局逐字节等价；生成的指令集合与 ir-001 设计意图一致。",
+      "动态轮次：case4 下 128 个 program，每 program 4 轮 tile 迭代，共 512 次 tile 体，与 019 的循环次数一致。",
+      "搬运分段：Q 与输出每 tile 16 段 DMA，每段 2048B 连续、行跨度 8192 元素；相对 019 的每 tile 128 段、每段 256B，段数下降而字节总量保持。",
+      "等待：按 019 历史输出 store 4 次合计 7.26us 及 MTE3 wait_ratio 0.1375，预测输出侧 MTE3 分段开销与跨核等待下降，降幅由真机核对。",
+      "资源：Q 与输出每 tile 搬运 32KiB，总字节与 019 一致；L0C 总量约 96MiB 保持；片上缓冲仍为三个分配。",
+      "性能：以 262.27775us 为比较起点，预测 case4 在同源码条件下相对 019 取得收益；与 CANN 参考 128.9496us 的差距按实测记录。"
+    ],
+    "validation": "宿主先做 CPU 解析与编译修复检查，确认 SSA 语法报错消失；随后跑原四项官方 checker 与 full-call 计时，再按合同做 ABBA 补测；逐项核对 expected 中的指令、轮次、分段、等待与资源，并记录偏差。",
+    "layer_reason": "Triton 源层表达有序行打包需要二维连续段载入加 reshape，020 已观测到该路径触发 LLVM unexpected op；固定源码实验的目的在于单独考察行打包布局的收益，因此控制点落在 BCMLIR 的 collapse_shape/expand_shape 零拷贝视图上。IR 层能直接固定 16x8x128 的静态形状与 [8192, 128, 1] 跨度，并让 Q 载入与输出写回共用偏移 %38，语义与布局控制最直接。同类意图在源码层的替代方向是退化为多次 tl.load/tl.store 拼接，本轮保持源码冻结。",
+    "simulator_incremental_judgment": "profiling、hotspots、timeline 均绑定 019 已编译二进制：clock_qualification 为 relative_only、absolute_time_qualified 为 false，raw_clock_window 137.081-186.172 且 unit 标为 unassigned，覆盖范围为首末可见硬件事件之间的部分窗口，未报告泳道保持未知；绝对资质仅在单位层面由 absolute_unit_validation 支撑（22 个 PC 全部匹配、median_ratio 1.00113）。本轮只改 SSA 名称，编辑后的 IR 尚无对应二进制与模拟器窗口，模拟器增量为零，性能判断保留为待验证假设。",
+    "unknown": [
+      "重命名后 CPU 编译是否一次通过",
+      "行打包布局的实际等待下降幅度",
+      "原四项之外其他 case 的表现"
+    ]
+  },
+  "diagnosis_sha256": "45b9d56153df47acbe3d5391388ab154858509180da879b2a3f65131b8d99a71",
+  "evidence": [
+    {
+      "path": "feedback.json",
+      "category": "evaluation",
+      "role": "正式结果与验收起点",
+      "finding": "019源码四项正式结果与条件补测均已记录，case4 候选 262.27775us、原版 472.46045us、CANN 参考 128.9496us；本轮目标为超过该保留值，编译修复、同源码 IR 收益与超过保留最佳分别验收。",
+      "sha256": "2cb2ecf91ef5450c85a4d74336f4dff8c30cbc488de3d505ae7402a44af50d98"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "evaluation",
+      "role": "宿主证据分析与候选机制",
+      "finding": "宿主指出 ir-001 的语义与 65536 行唯一所有权审查通过，CPU 解析在第85行报 expected = after SSA name；%39_s 与 %55_s 以数字开头且带后缀，违反 MLIR SSA 命名；建议只把这2个定义及全部引用改为 q_packed/out_packed，其余字节保持。",
+      "sha256": "673864c459b46a91cc6cf9b4fc1efa4355c989604b429e6169e4532ed8d37a5a"
+    },
+    {
+      "path": "frozen.py",
+      "category": "source_ir",
+      "role": "固定源码身份与语义",
+      "finding": "sha256 为 2a98e3e0…49113，与 context 一致；kernel 符号 _gqa_fwd_kernel，case4 每 program 处理 4 个 query tile，K/V 外提、FP32 max-exp2-sum 与后归一化顺序固定；本轮源码逐字节冻结。",
+      "sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113"
+    },
+    {
+      "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "待修复 BCMLIR",
+      "finding": "第85行定义 %39_s = bufferization.to_tensor %alloc_6，第86行以 %39_s 作 collapse_shape 输入；第120行定义 %55_s = tensor.expand_shape %55，第121行以 %55_s 作 materialize_in_destination 源。两处名称均以数字开头。Q/输出布局为 16x8x128、strided<[8192, 128, 1]>、偏移 %38；全文件已无 tensor.reshape。",
+      "sha256": "a126283bf63776acef4428e0de9d25ca73e93370b9964dea7093771942228f7a"
+    },
+    {
+      "path": "compiled-readonly/_gqa_fwd_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "019 已编译低层对照",
+      "finding": "019 产物以 memref.reinterpret_cast + memref.copy 载入 Q，再 bufferization.to_tensor %q 进入 128x128 矩阵乘；输出经 bufferization.materialize_in_destination 直接写入 strided<[8192,1]>。该路径无 reshape 类算子，可作为静态布局对照，同时说明 019 基线采用 128 行整块搬运。",
+      "sha256": "cdcbbfad8ec97625f2e5743ec02932455f698bc4ffe8f09563a3abf9dc84c252"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "paired_profiling",
+      "role": "019 热点、等待与空闲（历史材料）",
+      "finding": "绑定 019 二进制的 case4 观察：输出 store 与配套 SET_FLAG 各 4 次、各 7.26us；MTE3 wait_ratio 0.13750、CUBE wait_ratio 0.21895、FIXP wait_ratio 0.21100；K/V 载入 MTE2 2 次 4.58us。累计指令时间跨流水可重叠，仅用于关注度排序。编辑后的 IR 尚无二进制。",
+      "sha256": "9c3c2cc35e4b0c64e5ffb863f9cded01f545a7aecbfa13667a466d3890d6f5aa"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "019 吞吐与带宽量化（历史材料）",
+      "finding": "candidate Task Duration 257.645142us、Block Dim 128；aiv_mte3_ratio 均值 0.26871、aiv_mte2_ratio 均值 0.32586、write_main_memory_datas 均值 1732.32KB。该数据对应 019 已编译二进制。",
+      "sha256": "69e5acb628d09675c4c333f008d651f0c49fc467975789ecf7283eacc16a1256"
+    },
+    {
+      "path": "timeline.json",
+      "category": "paired_profiling",
+      "role": "019 流覆盖率与时钟资质（历史材料）",
+      "finding": "candidate.py:227-240 区域 instruction_time_sum 147.38us、wait_instruction_time_sum 78.61us、largest_instruction_us 37.27；clock_qualification 为 relative_only、absolute_time_qualified 为 false，raw_clock_window 137.081-186.172 且 unit 标为 unassigned；窗口为首末可见硬件事件之间的部分捕获，未报告泳道保持未知。",
+      "sha256": "3e592e77d23a31278e191adec58dd4fc6c9e27e92e10bf03ad6917846dfc632e"
+    },
+    {
+      "path": "q-row-packing-language-evidence.txt",
+      "category": "source_ir",
+      "role": "020 源层失败背景",
+      "finding": "020 源层用二维连续段载入加有序 reshape，实际 tensor.reshape 在后端重写阶段触发 LLVM unexpected op；本轮改由 BCMLIR 的 collapse_shape/expand_shape 零拷贝视图表达同一有序布局。",
+      "sha256": "82883deef12a30274a873fcfbbdc042175339c0b7430f5d83b2352e647ee766d"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113",
+    "contract.json": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858",
+    "ir-inventory.json": "b890c63368cd39fb251bb86ffb4cefc87b1b4f3fd128d71c4a563db67142bf7a",
+    "feedback.json": "2cb2ecf91ef5450c85a4d74336f4dff8c30cbc488de3d505ae7402a44af50d98",
+    "profiling.json": "69e5acb628d09675c4c333f008d651f0c49fc467975789ecf7283eacc16a1256",
+    "hotspots.json": "9c3c2cc35e4b0c64e5ffb863f9cded01f545a7aecbfa13667a466d3890d6f5aa",
+    "timeline.json": "3e592e77d23a31278e191adec58dd4fc6c9e27e92e10bf03ad6917846dfc632e",
+    "q-row-packing-language-evidence.txt": "82883deef12a30274a873fcfbbdc042175339c0b7430f5d83b2352e647ee766d",
+    "context.json": "cdbcf58a14b92fc71e5a2cb093314436bb3849b092d428b54eab2b39135b51fd",
+    "diagnosis.json": "bff2c89a1c04ecada9fea1f9dd6213ed9717c5b0c405e8b5e120cdefc43cbff4",
+    "codex-brief.json": "673864c459b46a91cc6cf9b4fc1efa4355c989604b429e6169e4532ed8d37a5a",
+    "ir/target/_gqa_fwd_kernel.bcmlir": "a126283bf63776acef4428e0de9d25ca73e93370b9964dea7093771942228f7a",
+    "compiled-readonly/_gqa_fwd_kernel.ttir": "3872e0b7e8321c12da290bbec07142d727dcd444fefc9d5afd78f81e606dd8b8",
+    "compiled-readonly/_gqa_fwd_kernel.ttadapter": "cdcbbfad8ec97625f2e5743ec02932455f698bc4ffe8f09563a3abf9dc84c252",
+    "compiled-readonly/_gqa_fwd_kernel.bcmlir": "3f0752b87549d3622671e660efcd63cee0d4e7286e342001b1b25900e878f4a7"
+  },
+  "decision_tool_sha256": "5bef69abbe2d24d40092eade140c6c5d68f831185dbcc5e7930d535926348208"
+}

@@ -41,7 +41,8 @@ def partition_profile_tasks(tasks):
     compute=[];other=[]
     for task in tasks:
         kind=task.get('task_type','')
-        if kind.startswith('KERNEL_AI'):compute.append(task)
+        if kind.startswith('KERNEL_AI') or kind in {'KERNEL_MIX_AIV','KERNEL_MIX_AIC'}:
+            compute.append(task)
         elif kind=='SDMA_SQE':other.append(task)
         else:raise ValueError('Unclassified device task requires explicit profiling support: '+kind)
     if not compute:raise ValueError('No AI-core task available for metric collection')
@@ -52,6 +53,7 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--config',type=Path,required=True);p.add_argument('--source',type=Path,required=True)
     p.add_argument('--case',required=True);p.add_argument('--output',type=Path,required=True)
+    p.add_argument('--ir-manifest',type=Path,help='冻结IR计算资源，原算子源码仍按独立SHA标识')
     p.add_argument('--resume',action='store_true',help='只补齐已有采集，已完成侧不重复采集')
     a=p.parse_args()
     import fcntl
@@ -64,11 +66,26 @@ def main():
     spec=a.output/'spec.json'
     if a.resume:
         previous=read(spec);assert previous['source_sha256']==digest and previous['case']==case
+        if a.ir_manifest:
+            assert previous['ir_input']['original_manifest_sha256']==sha(a.ir_manifest),'IR resume input changed'
+        else:
+            assert not previous.get('ir_input'),'IR resume requires its manifest identity'
     else:
-        frozen=a.output/'candidate-source.py';shutil.copyfile(source,frozen)
+        ir_binding={}
+        if a.ir_manifest:
+            from hgkda.runtime.ir_input import freeze
+            frozen,binding=freeze(a.ir_manifest,a.output/'implementation',source,
+                runtime_path=c.get('ir_capture_runtime'))
+            ir_binding=dict(ir_input=binding)
+        else:
+            frozen=a.output/'candidate-source.py';shutil.copyfile(source,frozen)
+        if c.get('capture_debug_source'):
+            debug_source=Path(c['capture_debug_source']).resolve()
+            assert sha(debug_source)==digest,'Debug source differs from the frozen operator'
+            ir_binding['debug_source']=str(debug_source)
         save(spec,dict(operator=c['operator'],source=str(frozen),source_sha256=digest,leaf=str(leaf),case=case,
              reference_kind=c['job']['reference_kind'],entrypoint=c.get('capture_entrypoint','run'),
-             warmup_before_capture=c.get('capture_warmup',0),ir_directory=str(a.output/'actual-ir')))
+             warmup_before_capture=c.get('capture_warmup',0),ir_directory=str(a.output/'actual-ir'),**ir_binding))
     environment=dict(ASCEND_RT_VISIBLE_DEVICES=str(c['device']),OMP_NUM_THREADS='1',PYTHONDONTWRITEBYTECODE='1',
           PYTHONPATH=c.get('device_pythonpath', ''),TRITON_CACHE_DIR=str(a.output/'profile-triton-cache'))
     def device(label,arguments):

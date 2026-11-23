@@ -1,0 +1,61 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "99e77cb819ea900a6ca6cebfacb26777879a756d7256abb7d15f736334445031",
+  "evidence": [
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "PART_TILES 体内序号为：%59=math.exp2 → %reduced=linalg.reduce(dim=1, fp32) → %60=truncf(%59) f16 → %61=linalg.matmul(%60,%31)。即 FP32 分母归约按程序序排在 p 的 FP16 截断与 PV 矩阵乘之前，p 的 FIXP/MTE3 交接不可能早于 sum 完成。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "TTIR 第 105 行 tt.reduce(axis=1) 先于第 110 行 arith.truncf(%p f32→f16) 与第 111 行 tt.dot(%acc,%v16)；归约链只依赖 %p（即 exp2 输出），与 PV dot 无数据依赖，说明源码语句序是这条串行链的唯一来源，可仅在源码层调整。"
+    },
+    {
+      "path": "workspace/context-brief.json",
+      "category": "simulator",
+      "role": "trigger",
+      "finding": "033 源码绑定的 Vector0 窗口链为 VEXP 149.907-150.234us、sum 150.241-150.791us、P VCONV 150.792-150.881us、P MTE3 send 150.882-152.146us：sum 夹在 exp 与 P 发送之间，P 发出被推迟约 0.64us/tile。"
+    },
+    {
+      "path": "workspace/context-brief.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "兄弟实验034（自031 起，不含本轮 QK 收窄）把 PV 提到 sum 之前：全调用 200.33665us、kernel 183.883682us；其修改后窗口 P VCONV 127.381-127.470、P send 127.471-130.019 确实提前，但 sum 132.830-133.380 仍在 PV 返回后才开始，完全重叠未达成，属未决编译器调度问题。"
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "background",
+      "finding": "case4 三核部分窗口各自归一化：veccore0 VECTOR productive 21.64%/idle 68.14%、MTE3 productive 42.49%，头部指令为 WAIT_FLAG_DEVI 88.5us 与 MOV_SRC_TO_DST_ALIGN 42.52us；cubecore0 CUBE productive 11.74%/wait 27.35%/idle 60.91%。application_completed=false，全调用 completion 缺失，故只用于定位机制、不作耗时结论。"
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "background",
+      "finding": "成对 profiling（kernel 191.024us / 20 程序）：候选 cube 662.19us vs 参考 673.86us、L0C_to_GM 65536KB vs 98304KB 已相当；vector0 aiv_vec_time 1287.59us vs 1121.42us（1.15 倍），而 aiv_scalar_wait_time 1082.34us vs 27.70us，说明候选墙钟主要由 Vector 侧等待/交接链而非算术决定。"
+    }
+  ],
+  "hypothesis": "PART_TILES 单块路径中，FP32 分母 sum 只用于最后的 acc/l_safe 归一化，与 PV dot 无数据依赖；现有源码把 tl.sum(p,1) 写在 PV dot 之前，编译器据此把 p 的 FP16 截断与 p→Cube 的交接排在归约之后。若把顺序改成「p FP16 截断 → PV dot → 从原 FP32 p 求分母」，P 的传输（VCONV+MTE3 send）可提前到 sum 之前，使 Vector 归约与 Cube 的 PV 计算在时间上重叠，缩短每 tile 的交接关键链。",
+  "alternatives": [
+    "保持语句序不变，改在 diagnosis 中交接编译器 IR 建议（把 tt.reduce 与 tt.dot 的调度顺序交换），本调用不允许改 IR，故只作为后续候选。",
+    "将分母 sum 改在 FP16 p 上求和（省 FP32 数据通路），但这改变精度与归约输入，违反本次「不做 PV 结果 FP16 噪声化、不改精度」的强制约束。",
+    "引入 tl.dot 的 PV 结果 FP16 输出（独立实验037），本次明确排除，避免与 037 混淆归因。",
+    "减少 exp2 元素（更激进的值域偏移）——属另一机制，与本轮语句重排不可叠加归因。"
+  ],
+  "discriminating_observation": "修改后若 p 传输真被提前，重放窗口应出现 P VCONV/MTE3 send 早于 sum 结束，且 kernel 时长下降；若 sum 仍阻断发送（如 034 所见，sum 只在 PV 返回后开始），则 P 发送提前有限而 kernel 基本不变，说明瓶颈在编译器的 flag/依赖串行化而非语句序，应转 IR 建议或其它机制。两种结果都可由同源重放窗口区分。",
+  "change": "仅改 candidate.py 中 _gqa_tile_part_body 的 PART_TILES 语句序：p=exp2(qk-SM_OFFSET) 之后，先 p16=p.to(tl.float16)、acc=tl.dot(p16, v16)，再 l_new=tl.sum(p,1)（仍从原 FP32 p 求和）；随后按原样 l_safe/out/guard/store。QK 的 FP16 交接、FP32 PV 累加、exp2/公共偏移、输出 guard、20 worker、tile 分区、元数据、通用二维 grid 与非 PART_TILES 的全部分支（含两项分解与 PV_SINGLE_F16 的 acc*alpha 形式）逐字不变；不增加 PV 结果 FP16 截断、不改 exp 与精度路径。",
+  "expected": "case4 kernel：每 tile P 发送起点前移约 0.5~0.65us（按 033 窗口 150.791→150.882），若 Vector sum 与 Cube PV 部分重叠，kernel 期望下降约 1~3%（约 2~6us），全调用目标低于保留最佳 205.28415us；若不可重叠则变化在噪声内（±1us），同样保留记录。其他三项（case1/2/7）不进入 PART_TILES，预期逐字不变，仅作为回归校验。",
+  "validation": "原完整四项 checker（sha256 863f68…、commit 12180ce7）与 golden（sha256 c86aaa…）在不变阈值下验收；case1/2/4/7 计时合同 warmup5/trials3/iterations20 不变；比较 case4 全调用与 kernel 时长对保留最佳 205.28415us；另需重放以检查 sum 与 P 发送的新窗口次序。",
+  "selected_layer": "triton_source_statement_order",
+  "layer_reason": "BCMLIR/TTIR 表明归约与 PV dot 无数据依赖，串行只由源码语句序引入；Triton 源层重排是最小、可编译可验证的改动，不需要改 IR、布局或分块，也不触碰精度表达式。",
+  "simulator_incremental_judgment": "模拟器本轮新增判断：三核部分窗口（各自归一化、application_completed=false）给出 Vector0 上 sum 位于 exp 与 P 发送之间的具体区间，与 MTE3 productive 42.49%/VECTOR idle 68.14% 一起把「P 交接被归约推迟」列为可检验机制；但绝对耗时与全调用 completion 仍缺失，重叠能否发生必须由修改后的重放与真机完整评测确认，模拟器不单独主张因果收益。",
+  "unknown": [
+    "编译器是否会在重排后把 sum 与 PV dot 真正重叠（034 经验显示 sum 仍可能等到 PV 返回）。",
+    "重排是否改变后端缓冲复用/flag 编号，从而改变每 worker 链间隐藏能力。",
+    "全调用完成状态下三核时间轴的绝对单位仍未独立核验。"
+  ]
+}

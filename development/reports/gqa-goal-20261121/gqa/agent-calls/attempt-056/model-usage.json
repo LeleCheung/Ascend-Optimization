@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 23,
+    "duration_ms": 63903,
+    "usage": {
+      "input_tokens": 61496,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 695040,
+      "output_tokens": 9804,
+      "output_tokens_details": {
+        "thinking_tokens": 3580
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 61496,
+        "outputTokens": 9804,
+        "cacheReadInputTokens": 695040,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 0.9000999999999999,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 3580,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 0.9000999999999999,
+    "result": "机制已实现并通过预检登记，进入验收边界。\n\n**修改前决策（已登记）**\n- `diagnosis --record` → `6f595ac6fe7946168e6de5559c30048e`，绑定父源码 `83dfdf25…312d`（attempt-055 保留版，172.10760μs）。\n\n**证据链**\n- TTIR 第 95–96 行：QK 已有 `truncf f32→f16` + `extf`；第 101/109 行：PV `tt.dot` 输出 128×128 f32 直接进 `arith.divf`，中间无窄化（BCMLIR 第 97/106 行同形）。\n- 成对 profiling：`L0C_to_GM` 合计 65536KB = 512 tile ×（QK 64KiB **f16** + PV 64KiB **f32**）——即 QK 的 cast **实测已被折叠**为 fixpipe 的 f16 搬出，PV 的 64KiB/tile 是唯一未窄化的大额搬出（参考实现 98304KB）。\n- 模拟器：veccore 头部 `WAIT_FLAG_DEVI` 75.04μs（PV 结果侧）对 39.67μs（QK 侧）；三核部分窗口各自归一化、`application_completed=false`、全调用 completion 缺失，仅用于热点评级，不作收益预测。\n\n**改动（仅 `_gqa_tile_part_body` 的 PART_TILES 路径，一处表达式）**\n```python\nacc = tl.dot(p_bf, v).to(tl.float16).to(tl.float32)\nl_new = tl.sum(p, 1)          # 原样\nout = acc / l_new[:, None]    # 原样 FP32 分母除法\n```\nP/V dot 操作数仍 BF16、累加仍 FP32；自然指数、`SM_OFFSET`、语句序、地址、host 发射缓存、grid=20、128×256 分块与全部非 PART 分支逐字不变。\n\n**预期与判别**\n- 若 cast 像 QK 一样折叠进 FIXP：PV 搬出 64→32KiB，总 L0C 65536→49152KB（-25%），case4 目标低于 172.10760μs。\n- 若只落在 UB：字节不变、净多一次 128×128 扩展，按真实无收益/退步记录。\n- 数值：acc 上 2^-11 相对舍入（输出典型约 5e-4）；`|acc| ≤ l_new`，合同 [-1,1] 下 l_new 典型约 1.5e2，远低于 FP16 上限 65504；理论上界 8.4e6 属越界值域限制并已在 diagnosis/docstring 中写明。case1/2/7 不进入 PART_TILES，须以真实评测给出变化而非假定不变。\n\n**预检**：`status = awaiting_source_review`，源码 SHA `1aad532b54b1f9c08d4603a5b02f53dfda42115020742a374f88242eaa5771f2`。候选字节自此刻起保持不变，交接宿主做只读路径/地址边界审查与完整四项真机评测（原 checker、golden、阈值与计时合同不变），并附修改后 IR/模拟器重放以核对 `L0C_to_GM` 与 PV 等待窗口。"
+  }
+}

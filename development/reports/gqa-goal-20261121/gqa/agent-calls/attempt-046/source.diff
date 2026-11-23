@@ -1,0 +1,147 @@
+--- 
++++ 
+@@ -150,6 +150,19 @@
+ PV dot，再从原 FP32 p 求分母，让 P 的传输有机会早发并与 Cube 的 PV 重叠。
+ 数值不变（同一 FP32 p 的同一归约、同一 fp32 累加 dot），是否真正重叠由修改后
+ 重放与完整四项真机评测判定；其他分支与精度路径逐字保留。
++
++PART_TILES 迟发一深度 QK 前瞻（本轮机制）：当前45模拟器的三核部分窗口
++（application_completed=false、各自归一化）给出 Cube productive 13.67%/
++wait 26.87%/idle 59.46%，Vector productive 25.43%/wait 11.11%/idle 63.47%；
++Cube 热点 WAIT_FLAG_DEVI 82.62us/10、FIX_L0C_TO_DST 20.18us/10，Vector 热点
++WAIT_FLAG_DEVI 61.66us/10 与 23.85us/10、MTE3 写回 20.36us/9。预计两侧存在
++可重叠窗口，故把组内下一 tile 的 QK 发射从 042/044 的「currentPV 之前」移到
++「currentPV dot 之后、当前分母/除法/写回之前」：组首预取一次 FP16 raw QK，
++循环携带 raw_next，当前 tile 先算 p 与 PV，再发 nextQK，最后完成原分母、
++除法、guard 与写出。每 tile 的 QK 次数、rawFP16 交接、exp2、PV 计算类型与
++归一化表达式逐字不变，预期输出逐位不变；代价是循环携带 128x256 f16 与
++q_next 载入带来的 UB/L0C 压力，若后端串行化则无收益但不改结果。收益与代价
++均由完整四项真机评测判定。
+ """
+ 
+ import math
+@@ -322,65 +335,80 @@
+             # 本 worker 与本组相交的 tile 子区间（组内局部序号）。
+             t0 = tl.maximum(lo, grp * TPG) - grp * TPG
+             t1 = tl.minimum(hi, (grp + 1) * TPG) - grp * TPG
++            # 本轮机制（late one-tile QK lookahead，仅 PART_TILES）：组内各 tile
++            # 的 Q 与前一 tile 的 softmax/PV 无依赖，而本组 K 已在组循环外整段
++            # 载入。先为区间首 tile t0 预取一次 FP16 raw QK；此后每个 tile 在
++            # 当前 PV dot 之后、当前分母/除法/写回之前发出「下一 tile」的 QK，
++            # 让 nextQK 的 Cube MMA 填入当前 tile 的 Vector 尾段，而不再像
++            # 042/044 那样排在 currentPV 之前与 PV 争用 Cube/FIXP 窗口。
++            # 不变量：进入下标 t 的迭代时 raw_next = round_f16(q(t)·K_group)，
++            # 归纳基础由预取给出；仅当 t+1 < t1 才改写为 t+1 的值，故每组 QK
++            # 次数仍恰为 t1-t0，尾部不发 QK、不越组读取。raw 分数仍只做一次
++            # .to(f32)*qk_scale、一次 exp2、一次 sum、一次 FP16 PV 与归一化，
++            # 表达式和相加顺序与父版本逐字相同，预期输出逐位不变。
++            # 代价：raw_next 是循环携带的 128x256 f16（64KiB），q_next 提前
++            # 载入（32KiB），UB 峰值可能上升；QK 累加器（128x256 f32，128KiB
++            # L0C）与 PV 累加器（128x128 f32，64KiB）可能同时活跃，若后端因
++            # 容量重新串行化则无收益但不改结果。收益与代价均由完整四项真机
++            # 评测判定。
++            gi = t0 // NB_M
++            mb = t0 % NB_M
++            hq = kvh * G + gi
++            offs_m = mb * BLOCK_M + tl.arange(0, BLOCK_M)
++            q_ptrs = Q + b * q_sb + hq * q_sh + offs_m[:, None] * q_ss + offs_d[None, :] * q_sd
++            if MASK_MD:
++                q = tl.load(q_ptrs, mask=(offs_m[:, None] < S) & (offs_d[None, :] < D), other=0.0)
++            else:
++                q = tl.load(q_ptrs)
++            # 继承父版本的 QK→Vector 交接：Q/K 仍为原 BF16，tl.dot 仍按 FP32
++            # 累加，dot 之后立刻就近舍入到 FP16 作为循环携带 raw 分数。数值风险
++            # 与父版本相同：合同 [-1,1]^128 下 |q·k| <= D = 128 不溢出 fp16，
++            # 典型概率相对误差约 2e-4、最坏约 0.56%，由原四项 checker 判定。
++            raw_next = tl.dot(q, tl.trans(k)).to(tl.float16)
++
+             for t in range(t0, t1):
++                # 当前 tile 的 FP16 raw QK 来自上一迭代（首 tile 来自预取）。
++                raw = raw_next
++
+                 gi = t // NB_M
+                 mb = t % NB_M
+                 hq = kvh * G + gi
+                 offs_m = mb * BLOCK_M + tl.arange(0, BLOCK_M)
+ 
+-                q_ptrs = Q + b * q_sb + hq * q_sh + offs_m[:, None] * q_ss + offs_d[None, :] * q_sd
+-                if MASK_MD:
+-                    q = tl.load(q_ptrs, mask=(offs_m[:, None] < S) & (offs_d[None, :] < D), other=0.0)
+-                else:
+-                    q = tl.load(q_ptrs)
+-
+-                # 本轮机制（PART_TILES 的 QK→Vector 交接，FP16 rawQK）：Q/K 仍为
+-                # 原 BF16，tl.dot 内部仍按 FP32 累加；dot 之后先把 rawQK 就近
+-                # 舍入到 FP16，再显式扩回 FP32，随后才执行原 qk_scale、编译期公共
+-                # 偏移、exp2/sum、fp16 PV 与归一化，表达式其余部分逐字不变。
+-                # 该舍入只由源码显式表达：后端若把 FP32→FP16 转换折叠进 FIXP
+-                # （fixpipe 输出 f16），则 QK 的 L0C→Vector 搬出由 128x256 f32
+-                # (128KiB) 降为 f16(64KiB)，总 L0C 搬出 98304→约 65536KB；若 cast
+-                # 只落在 UB，则搬出字节与热点时间不变，属真实无减少，由修改后
+-                # BCMLIR/二进制/profiling 判定。数值风险：rawQK 有符号、就近舍入
+-                # 对称保号；合同 [-1,1]^128 下 |q·k| <= D = 128 不溢出 fp16，典型
+-                # 概率相对误差约 2e-4、最坏约 0.56%，适用域 [-1,1]，由原四项
+-                # checker 以不变阈值判定（详见 diagnosis.json）。
+-                qk = tl.dot(q, tl.trans(k)).to(tl.float16).to(tl.float32) * qk_scale
++                # 与父版本逐字相同的分数缩放与公共偏移：rawQK 显式扩回 FP32
++                # 后乘 qk_scale；编译期 SM_OFFSET 只做整行公共常数减法，softmax
++                # 在实数上不变，有限精度适用域与父版本一致（见文件头说明）。
++                qk = raw.to(tl.float32) * qk_scale
+ 
+                 if MASK_KV:
+                     qk = tl.where(offs_n[None, :] < SKV, qk, -float("inf"))
+ 
+-                # 本轮机制：编译期公共偏移替代逐行 max 稳定化。
+-                # 合同输入值域 [-1,1] 给出 |q·k| <= D，故 exp2 自变量
+-                # qk - SM_OFFSET <= D*|qk_scale| - SM_OFFSET = 15（host 取
+-                # SM_OFFSET = D*|qk_scale| - 15），p <= 2^15 = 32768 < 65504，
+-                # 在 FP16 有限范围内保留约 2 倍余量。softmax 对整行公共常数
+-                # 严格不变：p、l_new、PV 分子同乘 exp2(m_row - SM_OFFSET)，
+-                # PV 后的 acc/l_new 归一化使其在实数上精确抵消。因此这里删除
+-                # 每 tile 一次 128x256 的 max 归约、其 -inf 守卫与广播减法，
+-                # 只保留一次标量常数减法 + exp2；sum、PV、归一化与输出 guard
+-                # 逐字保留。有限精度代价：p 的 FP16 舍入仍为 2^-11 相对误差，
+-                # 但若某行 max 远低于 SM_OFFSET（约低于 -12.7），该行 p 进入
+-                # FP16 次正规；更低则整体下溢为 0（l_new 仍为 fp32 正值，
+-                # acc 为 0，输出为 0）。合同 [-1,1] 均匀随机输入的行 max 约 2
+-                # （std 约 0.48），到达该边界需约 -30σ，实际不可达；此机制
+-                # 依赖 |q|,|k| <= 1 的合同值域，域外可能溢出 FP16。
+-                # 本轮机制（PART_TILES 语句序重排，仅此三行顺序）：
+-                # 分母 sum 只用于 PV 之后的 acc/l_safe 归一化，与 PV dot 无数据
+-                # 依赖；实际 BCMLIR/TTIR 却按源码序把 FP32 归约排在 p 的 FP16
+-                # 截断与 PV 矩阵乘之前（bcmlir 第 103-110 行、ttir 第 105-111 行），
+-                # 模拟器 033 窗口也显示 sum(150.241-150.791us) 夹在 exp 与
+-                # P VCONV/MTE3 send(150.792-152.146us) 之间。故先做 FP16 截断与
+-                # PV dot，再对原 FP32 p 求分母，使 P 的传输有机会提前并与 Cube
+-                # 的 PV 计算重叠。数值上不变：l_new 仍是对同一 FP32 p 的同一
+-                # 归约，acc 仍是同一 fp16×fp16、FP32 累加的 dot，输出归一化与
+-                # guard 逐字保留（不引入 PV 结果 FP16 截断，不改 exp 与精度）。
+                 p = tl.exp2(qk - SM_OFFSET)
+                 p16 = p.to(tl.float16)
+ 
++                # 当前 PV 先发射；随后才插入下一 tile 的 QK。
+                 acc = tl.dot(p16, v16)
+ 
++                # 本轮机制：nextQK 放在 currentPV 之后、分母/除法/写回之前。
++                # 它只依赖下一 tile 的 q 与已载入的本组 K，与本 tile 的
++                # exp2/sum/PV 无数据依赖；尾部 t+1 == t1 时不发 QK。
++                if t + 1 < t1:
++                    nt = t + 1
++                    gi_n = nt // NB_M
++                    mb_n = nt % NB_M
++                    hq_n = kvh * G + gi_n
++                    offs_m_n = mb_n * BLOCK_M + tl.arange(0, BLOCK_M)
++                    q_ptrs_n = (Q + b * q_sb + hq_n * q_sh
++                                + offs_m_n[:, None] * q_ss + offs_d[None, :] * q_sd)
++                    if MASK_MD:
++                        q_n = tl.load(q_ptrs_n,
++                                      mask=(offs_m_n[:, None] < S) & (offs_d[None, :] < D),
++                                      other=0.0)
++                    else:
++                        q_n = tl.load(q_ptrs_n)
++                    raw_next = tl.dot(q_n, tl.trans(k)).to(tl.float16)
++
++                # 以下分母/除法/guard/写出与父版本逐字相同。
+                 l_new = tl.sum(p, 1)
+ 
+                 l_safe = tl.where(l_new > 0.0, l_new, 1.0)

@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 27,
+    "duration_ms": 102151,
+    "usage": {
+      "input_tokens": 37746,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 569728,
+      "output_tokens": 17417,
+      "output_tokens_details": {
+        "thinking_tokens": 9092
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 37746,
+        "outputTokens": 17417,
+        "cacheReadInputTokens": 569728,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 0.9090190000000001,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 9092,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 0.9090190000000001,
+    "result": "已完成本轮独立实验的实现与决策登记，并按 `awaiting_source_review` 边界保持候选字节不变。\n\n## 本轮机制\n在 `candidate.py` 中新增 **每 (batch, 共享 KV 头) 一程序的持久化 query-tile 复用** 分支：\n\n- 判据（纯元数据，不看 `case_id`/输入值）：`not is_causal and PV_SINGLE_F16 and SINGLE_KV and BLOCK_M==128 and BLOCK_N==256 and BLOCK_D==128`。\n- 命中时 grid 由 `(cdiv(S,128), B*NQ)` 改为 `(B*NKV,)`：case4 = 4×8 = **32 程序**，每程序 8 个 query head × 2 个行块 = **16 个 query tile**。\n- 循环外一次性载入 K、一次性把 V 转 fp16（`v16`）；循环内按显式 `hq = kvh*G + gi`、`mb = t % NB_M` 逐 tile 做 Q load → QK dot → FP32 max/exp2/sum → 单次 fp16 PV → `acc/l_safe` 写出。所有权唯一（每个 `(b,hq,行块)` 恰好一次）。\n- 非命中元数据走**原 kernel 路径与 grid 逐字不变**；主符号仍为 `_gqa_fwd_kernel`（新增 `_gqa_persist_kv_body` 辅助）。\n\n## 证据与预期\n- `current-profiling.json`：case4 512 程序、每程序 GM_to_L1 224 KiB、总 114688 KiB；aic_cube 1.293 µs vs scalar_wait 7.710 µs → 同 kvh 的 K/V 被 G×行块重复搬运。\n- `actual-ir/2.ttir`：单迭代 K/V `tt.load 256x128xbf16`、V 经 extf→truncf 转 f16，512 程序各自重做。\n- `actual-ir/0.bcmlir`：K/V 的 `memref.copy` 与 V 转换张量不依赖 query head，可提升。\n- 预期 case4 K/V GM→L1 总量约 64 MiB→4 MiB、V 转换 16× 减少；QK/softmax/PV 总算术与 Q/写回总量不变，数值表达式逐字保持。case7 同为 bf16 非因果 SINGLE_KV，也按元数据命中共用。\n\n## 诚实代价与风险\n- 32 程序对 20 Cube 仅约 1.6 波，占用率可能低于 512 程序；单程序串行链变长可能抵消搬运收益。\n- K/V 跨 16 迭代存活拉长 UB 生命周期：可能超 196608B 编译失败，或后端重物化导致收益归零。这些需由实际 IR 与完整评测区分。\n\n## 交接状态\n- 决策已登记：`decision_id f9b2b79052284dab86d2b377d6d07c2a`（修改前 SHA `aec8e90…`）。\n- 候选 SHA：`beeb2335d99a34262701b9023d62b816f7621381eaada3500506d6dde805f9f4`。\n- `preflight` 返回 `awaiting_source_review`（源审查边界，未编译），无新实际 IR/计时。候选字节保持不变，交宿主只读审查与完整四项真机评测；随后据结果核对 K/V 是否被提升到循环外、UB 是否超限及 32 程序占用表现。"
+  }
+}

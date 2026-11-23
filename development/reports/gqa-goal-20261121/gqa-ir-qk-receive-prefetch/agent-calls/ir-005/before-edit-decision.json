@@ -1,0 +1,220 @@
+{
+  "timestamp": "2026-11-21T19:52:06.808314+00:00",
+  "diagnosis": {
+    "source_sha256": "19f7fb238946cb9006286d4d222425d07c4ea9fc38a7d4ff85c71c72c49c584a",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "context.json",
+        "category": "source_ir",
+        "role": "输入身份与比较起点",
+        "finding": "source_sha256=19f7fb23...c584a；当前父IR为ir-004（orig c0dcca3e...e842ab），已验收最佳target 133.3206us、独立kernel 136.642731us、二进制6e1877f8...bd16c3；本轮编辑对象仅ir/target.hivm.mlir中符号_gqa_fwd_kernel_mix_aiv的函数体。"
+      },
+      {
+        "path": "feedback.json",
+        "category": "paired_profiling",
+        "role": "正式与补测结果",
+        "finding": "ir-004正式四例通过且全部checker指标与父版本一致，target 133.3206us（三批132.75815/133.3206/133.32910），条件ABBA未触发；scope明确sum与VREC的浮点运算与地址前移发生在跨核等待之前，部分重放与继承范围限制保留。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "候选与父版本的流水累计量对照",
+        "finding": "候选vector0：aiv_vec_time均值47.0228us（sum 940.456，20块有效）、mte2 14.5820us、mte3 22.6502us，标量等待id0均值78.9065us、id4均值5.6821us、mte2/mte3_stall为0；父版本vector0相应vec 59.0302us、mte2 41.6300us、mte3 34.5324us、scalar_vector_stall 28.2926us。V与MTE2累计时间已下降，剩余标量等待id0对应PV结果侧交接。"
+      },
+      {
+        "path": "sum-reciprocal-mechanism.json",
+        "category": "simulator",
+        "role": "可复用间隙与当前概率准备的落点",
+        "finding": "core0.veccore0部分窗口：nextQK receive 45.003–45.485us，PV ready wait 45.005–46.412us，间隙0.927us；后续示例51.112→52.594us（1.482us）与57.810→59.057us（1.247us）；下一tile的half→float 47.049–47.330us与exp 47.508–47.835us仍落在PV receive之后。三核时钟校验30/30、28/28、28/28，application_completed=false、窗口为同核部分区间。"
+      },
+      {
+        "path": "prefetch-mechanism.json",
+        "category": "simulator",
+        "role": "QK预取与跨核flag的既有语义",
+        "finding": "QK预取在MTE2完成后置M2V事件并由消费侧等待；next QK MTE2 receive与当前PV ready wait在同核窗口重叠；flag1 P发送、flag3 QK缓冲、flag4 next PV就绪、flag2 QK已消费、flag0 PV就绪各自成对，动态窗口计数仅覆盖部分窗口。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "窗口覆盖量与归一化范围",
+        "finding": "veccore0窗口33.718–147.110（跨度113.392us，内核136.642731us），30/30 PC时钟校验通过；各核绝对原点独立、重复PC与重叠指令逐条保留，本材料用于同核内前後顺序比较。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "simulator",
+        "role": "本核热点排序与映射覆盖",
+        "finding": "core0.veccore0仅一条大归并区域（源码593–600，累计473.01us，其中等待240.87us），其余PC邻域累计合计低于1.4us且多为unmapped；本核热点只提供总量级排序，细粒度时序依据取自单PC时间线的PV等待与概率区间。"
+      },
+      {
+        "path": "ir/target.hivm.mlir",
+        "category": "source_ir",
+        "role": "实际UB地址、别名与语句顺序",
+        "finding": "AIV函数内UB布局：0..32768（qk_lo f16，兼reduce scratch 8192xf32）、32768..65536（qk_hi f16，兼P的bf16区）、65536..81920（V f16）、81920..114688（acc f32，兼out bf16）、114688..180224（概率FP32缓冲64x256）、180224..180480（l 64x1 f32）；vrec目标写114688（64xf32，256B）、vmul临时区写114944（512xf32，2048B），二者占用概率缓冲起始区，使下一块FP32p无法跨当前归一化存活。预取块在473–486行，当前PV标量等待flag0在491行。180480..182784在该函数内无任何pointer_cast引用。"
+      },
+      {
+        "path": "frozen.py",
+        "category": "source_ir",
+        "role": "数学语义与精度约束",
+        "finding": "529–534行：p=tl.exp(qk)，p_bf=p.to(bfloat16)，acc=tl.dot(p_bf,v).to(float16).to(float32)，l_new=tl.sum(p,1)，552行out=acc/l_new[:,None]；IR中缩放常量为0.0883883461的FP32逐元素乘、VEXP与FP32求和树，本轮保持这些运算、操作数与舍入。"
+      },
+      {
+        "path": "codex-brief.json",
+        "category": "simulator",
+        "role": "宿主证据分析与候选方向（Codex贡献）",
+        "finding": "Codex给出0.927us窗口与后续1.482/1.247us示例，指出VREC输出114688与VMUL scratch 114944阻断跨迭代FP32p，建议reciprocal迁180480、VMUL scratch迁180736（32B对齐、小于196608），并要求首块与每次prefetch各恰好一次M2V等待、P的bf16转换与发送留在原位置。该方向由本轮独立核对实际IR地址与事件配对后选用，实现细节由本轮确定。"
+      }
+    ],
+    "hypothesis": "把下一块的half→float转换、同一FP32缩放与VEXP放到nextQK预取完成之后、当前PV标量等待之前，可让每tile约0.6–0.7us的V计算填入PV等待窗口（同核观测间隙0.927–1.482us），从而缩短PV标量等待并压缩每tile的顺序关键路径；前提是把vrec目标与vmul临时区移出114688..180224，使已缩放的下一块FP32p跨当前归一化存活。",
+    "alternatives": [
+      "保持IR原样：不改任何指令，仅登记本机制，把收益问题留给后续独立调用。",
+      "只迁移vrec/vmul地址而不提前概率：别名消除后仍无任何时序收益，仅作为其它机制的铺垫。",
+      "把下一块概率放在当前reduce之后、P的bf16转换之前：此时当前p仍需供P转换与FP32求和读取，写入会破坏当前tile的l_new与P发送。",
+      "把P的bf16转换与MTE3发送一并提前到nextQK到达之后：会提前下一tile的P发送与flag1配对，把第二条流水机制混入同一轮，纳入否定项。",
+      "把概率前瞻放到PV的V载入与PV的V→F32转换之后：可用窗口被PV自身V工作挤占，收益更小，保留为失败后可选变体。",
+      "在Triton源码中把exp提前一个tile：需要循环携带概率张量与跨迭代活跃区间，源码语义结构改变，且frozen.py必须逐字节一致。"
+    ],
+    "change": "只编辑ir/target.hivm.mlir中_gqa_fwd_kernel_mix_aiv的函数体，AIC函数、私有函数声明与主机函数逐字节保持。具体：(1)新增常量180480与180736；(2)vrec目标由114688改为180480（memref<64xf32>），vmul_2d临时区由114944改为180736（memref<512xf32>），原l缓冲180224..180480保持不动；(3)删除每次迭代入口的MTE2→V EVENT1等待，把该等待移入%is_first分支，并在该分支内完成vcast(qk_lo→114688)、vmuls、vexp，非首块直接消费上一轮准备的FP32p；(4)在预取块内sync_block_set flag2之后、当前PV的sync_block_wait flag0之前，插入MTE2→V EVENT1等待、PIPE_V屏障、vcast(qk_hi→114688)、PIPE_V屏障、vmuls(同一常量0.0883883461)、PIPE_V屏障、vexp，全部位于scf.if(arg11+1<块尾)守卫内。每组首个tile的准备次数为1，尾部tile跳过，总准备次数等于tile数。",
+    "expected": [
+      "指令：vcast_half_to_float_1d_with_mode、vmuls_vs_1d_float、vexp_1d_float的调用总数在每tile保持各1次，仅发射位置由PV receive之后移到PV标量等待之前；新增每tile至多3条PIPE_V屏障与1条MTE2→V EVENT1等待，块尾tile跳过这些新增指令。",
+      "动态轮次：512个tile的准备分布为首tile在is_first分支1次、其余464次由带守卫的预取分支各1次，逐tile恰好一次half转换、一次缩放、一次exp，后续循环内无重复计算。",
+      "等待：MTE2→V EVENT1的set与wait配对数保持每块prefill一次对一次、每次prefetch一次对一次；V侧等待nextQK在预取后立即消费，正常情况下等待时长为0；PV标量等待id0的累计时长预测下降，单tile约0.3–0.65us，20块×约26tile的聚合上限约8–16us。",
+      "资源与地址：UB新增180480..180736（reciprocal）与180736..182784（VMUL scratch），函数内最高UB地址由180480变为182784，概率缓冲114688..180224在跨迭代存活期间被vrec/vmul完全让出；GM读写字节、L0C搬出、dot次数、P的bf16转换与MTE3发送字节保持。",
+      "跨核与ABI：AIC函数与全部mma/fixpipe/nd2nz调用逐字节保持，flag0/1/2/3/4的set/wait配对与次数保持，函数ABI与参数列表保持不变。",
+      "数值：每tile的概率由同一f16源、同一vcast模式、同一FP32常量乘、同一VEXP得到，FP32求和树、vrec、vmul与out转换的操作数与舍入保持一致，输出逐位可比对。"
+    ],
+    "validation": "宿主先做语义与ABI审查，再连同冻结源码重新编译，用原四项官方case与不变阈值的checker核对数值；随后跑独立kernel与全调用，并用同一PC重放逐项核对：概率区间是否从47.049–47.835us的PV返回后位置移入PV ready wait窗口、PV标量等待id0是否相应缩短、MTE2→V EVENT1的set/wait是否保持每块配对、vrec/vmul是否落在180480/180736、概率缓冲在归一化期间是否被改写。动态次数比较按已覆盖窗口与520个tile的守卫结构说明，全量总量用profile totals的cube指令数、GM/L0C字节核对不变。前后窗口各自记录覆盖量与归一化范围，V与MTE2等流水累计时间按可重叠处理。",
+    "layer_reason": "Triton表达能力：该机制要求循环携带一个FP32概率缓冲并在下一个tile的exp处复用，同时改写VREC/VMUL的UB地址；Triton源码层把p=tl.exp(qk)紧跟p_bf与dot写成单一表达式链，跨迭代复用上一轮概率需要改变源码语义结构与中间值生命周期，无法在不改源码的前提下表达。固定源码实验目的：frozen.py逐字节一致，使收益归因于同一算术的发射时序与缓冲地址，而非算法或精度变化，便于把VEXP位置作为可独立核对的观测点。IR控制点：具体控制点为概率FP32缓冲基址114688与180224上界、vrec目标114688与vmul临时区114944的别名、每次迭代入口的MTE2→V EVENT1等待、预取块473–486行与当前PV的flag0等待491行之间的0.927–1.482us间隙；替代方向为在源码层用循环携带p张量表达同一意图，属于独立研究身份。",
+    "simulator_incremental_judgment": "同核部分窗口显示nextQK receive结束45.485us、PV ready wait结束46.412us，当前概率准备的转换47.049–47.330us与exp 47.508–47.835us合计约0.65us恰好可以移入该间隙，另外两个示例间隙1.482us与1.247us更宽；标量等待与已排队的V工作并行，故前瞻V时间可以藏在PV等待内。增量上限按每tile约0.65us计，20块×约26tile的聚合约16us，实际兑现取决于PV等待是否仍在关键路径与V队列的占用；窗口为部分区间、application_completed=false，绝对时钟仅在同核内比较，动态区间计数只覆盖该窗口。",
+    "unknown": [
+      "PV标量等待中可被V工作吸收的比例，以及V队列在新增0.65us后是否出现新的排队延迟。",
+      "编译后新增PIPE_V屏障是否被后端合并或保留，从而影响每tile的实际V指令数。",
+      "块尾tile与跨arg10外层的准备次数在实际二进制中的计数，需用宿主动态计数核对。"
+    ]
+  },
+  "diagnosis_sha256": "dcc8d350dc139bd4e505c8caf027229a00d1c7562468db0959740ef7201c258f",
+  "evidence": [
+    {
+      "path": "context.json",
+      "category": "source_ir",
+      "role": "输入身份与比较起点",
+      "finding": "source_sha256=19f7fb23...c584a；当前父IR为ir-004（orig c0dcca3e...e842ab），已验收最佳target 133.3206us、独立kernel 136.642731us、二进制6e1877f8...bd16c3；本轮编辑对象仅ir/target.hivm.mlir中符号_gqa_fwd_kernel_mix_aiv的函数体。",
+      "sha256": "a3e206953a2e892324ca4a87fb99397802945c36d09f7b584c992f44c08d59f6"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "正式与补测结果",
+      "finding": "ir-004正式四例通过且全部checker指标与父版本一致，target 133.3206us（三批132.75815/133.3206/133.32910），条件ABBA未触发；scope明确sum与VREC的浮点运算与地址前移发生在跨核等待之前，部分重放与继承范围限制保留。",
+      "sha256": "0a19e69b19b1c6655871c2ed5533a6455b93e7154235ccd92b0cbe995c6058fb"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "候选与父版本的流水累计量对照",
+      "finding": "候选vector0：aiv_vec_time均值47.0228us（sum 940.456，20块有效）、mte2 14.5820us、mte3 22.6502us，标量等待id0均值78.9065us、id4均值5.6821us、mte2/mte3_stall为0；父版本vector0相应vec 59.0302us、mte2 41.6300us、mte3 34.5324us、scalar_vector_stall 28.2926us。V与MTE2累计时间已下降，剩余标量等待id0对应PV结果侧交接。",
+      "sha256": "83eabd6cf19779250ec173a9ceffa0bbba00b48848017e3a40b2b4297fa929a0"
+    },
+    {
+      "path": "sum-reciprocal-mechanism.json",
+      "category": "simulator",
+      "role": "可复用间隙与当前概率准备的落点",
+      "finding": "core0.veccore0部分窗口：nextQK receive 45.003–45.485us，PV ready wait 45.005–46.412us，间隙0.927us；后续示例51.112→52.594us（1.482us）与57.810→59.057us（1.247us）；下一tile的half→float 47.049–47.330us与exp 47.508–47.835us仍落在PV receive之后。三核时钟校验30/30、28/28、28/28，application_completed=false、窗口为同核部分区间。",
+      "sha256": "e29ca4433536841528a0d0d08c3b18716c38e55759b8c4ca640d8a74d43e43c4"
+    },
+    {
+      "path": "prefetch-mechanism.json",
+      "category": "simulator",
+      "role": "QK预取与跨核flag的既有语义",
+      "finding": "QK预取在MTE2完成后置M2V事件并由消费侧等待；next QK MTE2 receive与当前PV ready wait在同核窗口重叠；flag1 P发送、flag3 QK缓冲、flag4 next PV就绪、flag2 QK已消费、flag0 PV就绪各自成对，动态窗口计数仅覆盖部分窗口。",
+      "sha256": "ad72c3592102ecb4e43f8a2262fa595f3572468e3d75b4200d5475f452bcd925"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "窗口覆盖量与归一化范围",
+      "finding": "veccore0窗口33.718–147.110（跨度113.392us，内核136.642731us），30/30 PC时钟校验通过；各核绝对原点独立、重复PC与重叠指令逐条保留，本材料用于同核内前後顺序比较。",
+      "sha256": "2a106f2901976366b1697f66204753b5e2e040c900edc1b59748a989324c640c"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "本核热点排序与映射覆盖",
+      "finding": "core0.veccore0仅一条大归并区域（源码593–600，累计473.01us，其中等待240.87us），其余PC邻域累计合计低于1.4us且多为unmapped；本核热点只提供总量级排序，细粒度时序依据取自单PC时间线的PV等待与概率区间。",
+      "sha256": "7742110a3bfbf746d82f805d0631d4b8bbdec079974b5ae272b1ce32fca8a8a0"
+    },
+    {
+      "path": "ir/target.hivm.mlir",
+      "category": "source_ir",
+      "role": "实际UB地址、别名与语句顺序",
+      "finding": "AIV函数内UB布局：0..32768（qk_lo f16，兼reduce scratch 8192xf32）、32768..65536（qk_hi f16，兼P的bf16区）、65536..81920（V f16）、81920..114688（acc f32，兼out bf16）、114688..180224（概率FP32缓冲64x256）、180224..180480（l 64x1 f32）；vrec目标写114688（64xf32，256B）、vmul临时区写114944（512xf32，2048B），二者占用概率缓冲起始区，使下一块FP32p无法跨当前归一化存活。预取块在473–486行，当前PV标量等待flag0在491行。180480..182784在该函数内无任何pointer_cast引用。",
+      "sha256": "c0dcca3e64078a91ee596c693946689fd08444f385a2cb1e3831f09b19e842ab"
+    },
+    {
+      "path": "frozen.py",
+      "category": "source_ir",
+      "role": "数学语义与精度约束",
+      "finding": "529–534行：p=tl.exp(qk)，p_bf=p.to(bfloat16)，acc=tl.dot(p_bf,v).to(float16).to(float32)，l_new=tl.sum(p,1)，552行out=acc/l_new[:,None]；IR中缩放常量为0.0883883461的FP32逐元素乘、VEXP与FP32求和树，本轮保持这些运算、操作数与舍入。",
+      "sha256": "19f7fb238946cb9006286d4d222425d07c4ea9fc38a7d4ff85c71c72c49c584a"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "simulator",
+      "role": "宿主证据分析与候选方向（Codex贡献）",
+      "finding": "Codex给出0.927us窗口与后续1.482/1.247us示例，指出VREC输出114688与VMUL scratch 114944阻断跨迭代FP32p，建议reciprocal迁180480、VMUL scratch迁180736（32B对齐、小于196608），并要求首块与每次prefetch各恰好一次M2V等待、P的bf16转换与发送留在原位置。该方向由本轮独立核对实际IR地址与事件配对后选用，实现细节由本轮确定。",
+      "sha256": "57fbc22c5d4da84305381b91d69eaedf691c33c2cde27ef19bba5f8551c362c7"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "19f7fb238946cb9006286d4d222425d07c4ea9fc38a7d4ff85c71c72c49c584a",
+    "contract.json": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858",
+    "ir-inventory.json": "465fb7a3c67601cc32263f348e418b12d8cc5b897db4ceac955a462d92b108f0",
+    "profiling.json": "83eabd6cf19779250ec173a9ceffa0bbba00b48848017e3a40b2b4297fa929a0",
+    "hotspots.json": "7742110a3bfbf746d82f805d0631d4b8bbdec079974b5ae272b1ce32fca8a8a0",
+    "timeline.json": "2a106f2901976366b1697f66204753b5e2e040c900edc1b59748a989324c640c",
+    "historical-059-native-vrec.mlir": "be4f69f4d9a2f1f8999dfa8fc0548b9f4a06bc1271e837b8a3a6424469923015",
+    "historical-059-native-vrec-result.json": "5e5654a383ad9e6331ecc1276a02961f2e91f61373267c8f54d6288ef603bb56",
+    "context.json": "a3e206953a2e892324ca4a87fb99397802945c36d09f7b584c992f44c08d59f6",
+    "feedback.json": "0a19e69b19b1c6655871c2ed5533a6455b93e7154235ccd92b0cbe995c6058fb",
+    "diagnosis.json": "a8d77dee8ac32ec8c6bc494d90b9794368bfc486a25c3682fe7fce1604d859ae",
+    "codex-brief.json": "57fbc22c5d4da84305381b91d69eaedf691c33c2cde27ef19bba5f8551c362c7",
+    "backend-binding.json": "037ff0b2558304288330a3f53e59a9c8e26e7fbe37d5133337922ae1eaf37421",
+    "reviewed-prefetch-draft.mlir": "c3bfa79252997697a999f80291af3e0e38b678d5c4339fa22c603d3b9406fa1a",
+    "profiling-full.json": "d3619a996d57bdce13bb52dd2e16e6e6a05f5dabc5c411f07f6f07bcd8d2bffc",
+    "prefetch-mechanism.json": "ad72c3592102ecb4e43f8a2262fa595f3572468e3d75b4200d5475f452bcd925",
+    "historical-sum059-negative.json": "a5231ec3cd4834a088f82fa9d65118510d2e1af454c18b08ae45b79e6cb0f4f1",
+    "sum-reciprocal-mechanism.json": "e29ca4433536841528a0d0d08c3b18716c38e55759b8c4ca640d8a74d43e43c4",
+    "ir/target.hivm.mlir": "c0dcca3e64078a91ee596c693946689fd08444f385a2cb1e3831f09b19e842ab",
+    "compiled-readonly/_gqa_fwd_kernel.source": "e0dac92dbebfe6df5fbab3f1f2fcd64471f3068401d34a58efe87bd56a1ea632",
+    "compiled-readonly/_gqa_fwd_kernel.ttir": "5d66bbc4930f03ec142fde1f7aae8d01b71d5cfaa8527500198c810c2e49205b",
+    "compiled-readonly/_gqa_fwd_kernel.ttadapter": "e394963e0d7c4428865cf5c22f53a394855520a1c3549062432a73a8424a7f38",
+    "compiled-readonly/_gqa_fwd_kernel.mlirbc": "cb1d2dc9af307221254b1f408feb5ea9cd287f9701af273383ea35726f85562b",
+    "compiled-readonly/_gqa_fwd_kernel.bcmlir": "b39e0b3c3b69599dce8713f580ba48a934e262babd4652b4d7605252d95ac120",
+    "compiled-readonly/_gqa_fwd_kernel.npubin": "3972cdc5bef4ebdc816b6dccaf3405946f390cc04b21fa3e56ca7de85c11832f",
+    "compiled-readonly/manifest.json": "19c40de6d67b0eb7c4f6fd09b8f4b73638d6a54ace33d807b0d98ef39dea274f",
+    "public-source/EltWise1D.cpp": "adeefa4bb642711ecc76df257f8217fd91398e52453426e4f8736c5a973fa773",
+    "public-source/EltWise2D.cpp": "84f63673a9662d96e0ecd6f8dd78467dfe5e6e1daa529e50163d1d9ae74a312e",
+    "public-source/hivm-op-decompose.mlir": "104b8f583e8a163892c2ce0ad9785237eb7ba43eb201feedd5ef2fd6f11c951a",
+    "public-source/HIVMDecomposeOp.cpp": "2fd26ffb92eb0fc6c8dfd6e424b5874be32582773b28063cb49adec68dc9bbb0",
+    "public-source/HIVMToStandard.cpp": "8c8654126e129d88cc0d73c8c28f9886bade5f67ce1619e9d3cc2a9038fd4d60",
+    "public-source/sources.json": "4728abc28bb9507dba602d6292a5768e0117ba2b5f5f782d3b799a9aa643045f",
+    "public-source/tree-query.json": "27bab0976fa7ab2ae66ac9914488cba4bb4f22c8efbe6618f8a7e8d0e6bfdb6d",
+    "capability-readonly/installed-ascendc-reciprocal.txt": "f6ccc6d3049f02dfd43a768a8641bae22f4a7bab17642eb1cdd2757277ea1522",
+    "capability-readonly/status.json": "e60a92c022225d2918cdc8ea0809425a31be157bd646169adb063ea62255ce05",
+    "capability-readonly/llvm-inspection-request.json": "cd9c71f3a6d51cd91d3740a2bd11a88e7b5778e861a0e0e793f09f9160ab70fb",
+    "capability-readonly/llvm-inspection.log": "724f5e1d2db24f96c23f6ccfb23e8af7fc0b48aea72381fa3475f0b086bd16af",
+    "capability-readonly/llvm-reciprocal-symbols.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "capability-readonly/hivm-reciprocal-op-strings.txt": "04e9dcea5624136ca9d4a89ade7791efcbfcf61f306b7eb7e26827579bedef4a",
+    "capability-readonly/meta-llvm-inspection-request.json": "f005c9f012bd620b263c18e74d4e8060292735e88c86ee0984d02ae93a0c27f0",
+    "capability-readonly/meta-llvm-inspection.log": "6c7c789f8d222083719eaa60295241589e6f55c806f952dbf1a253e5624711f4",
+    "capability-readonly/meta-llvm-reciprocal-symbols.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "capability-readonly/backend-reciprocal-strings.txt": "09cfc26956265595950f4edfb22d02435f6461d07e96bbf9ad8717463a38bd47",
+    "capability-readonly/installed-triton-reciprocal-interface.txt": "494d3cf3c528779aa21a6f91b02c2d69da69d1f75827fec1344a6007f1b1f05e",
+    "capability-readonly/installed-reciprocal-evidence.txt": "86370a5c6ff93e03b7b04a6e15de4a927a6922ec8322dc0f972502524b6bcf10",
+    "capability-readonly/bishengir-hidden-help.txt": "ef3c382886a08314b6d3a11ffcc89e7e1ee06ea0e33a19f350fbbc04d11644d6",
+    "event-capability-readonly/0-matmul_impl.h": "8059d160027333ea3fbf497476fff4b85e69d8d4deef16b723533634acfb65a9",
+    "event-capability-readonly/1-batch_copy_cube_in_using_ub.h": "956a83361ae0ea91ce1c27ead07e19f7b879576aa0326167b0836321a743bd78",
+    "event-capability-readonly/sources.json": "d059674ef7d37536dd2716e61721acacc52d7853f9d792c92b1dec38e52b7858"
+  },
+  "decision_tool_sha256": "2ba55ebab8be5b8a2363da657d6ee81799d4cabcdfb8e1494846aecfd1fde624"
+}

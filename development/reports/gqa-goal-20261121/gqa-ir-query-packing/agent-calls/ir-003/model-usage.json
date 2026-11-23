@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 54,
+    "duration_ms": 328241,
+    "usage": {
+      "input_tokens": 78383,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 3537920,
+      "output_tokens": 48714,
+      "output_tokens_details": {
+        "thinking_tokens": 36667
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 78383,
+        "outputTokens": 48714,
+        "cacheReadInputTokens": 3537920,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 3.3787249999999998,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 36667,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 3.3787249999999998,
+    "result": "已返回 `awaiting_ir_review`，文件保持本次交接时的状态。\n\n## 本轮研究结论（ir-003，编译修复）\n\n**当前状态**：IR-002 在真实后端失败两处——`ub overflow requires 2105344 bits while 1572864 bits available`（263168B 对 196608B，超 66560B），以及 `callsite q(candidate.py:173)` 处 `memref.collapse_shape` 在 infer data layout 阶段被拒（只允许折叠首维为 1 的 batch 维）。源码与保留最佳 019（case4 262.27775µs）保持冻结。\n\n**选择的机制**：保留已审查的 8 共享头×64 序列行打包与全部坐标数学，只替换承载它的形状表达方式——用二维 `memref.reinterpret_cast` 零拷贝视图取代三维形状变换，并让 tensor↔matmul、tensor↔store 的边界继续走 019 已验证的 identity `memref.alloc`：\n\n- Q 载入：`memref<16x1024, strided<[8192,1]>>` GM 视图 → 本地 `128x128xbf16` alloc 的 `[16,1024]/[1024,1]` 视图上 `memref.copy` → `to_tensor` 直供原 matmul。\n- 写出：`truncf` 结果经 `materialize_in_destination` 落入本地 32KB 连续缓冲 → 以 `[16,1024]/[1024,1]` 视图 `to_tensor` → 单条 `materialize_in_destination` 写入 `memref<16x1024, strided<[8192,1]>>` 的 Out 视图。\n\n预测每个 tile 的 Q 载入与 Out 写出突发均由 128 段 256B 变为 16 段 2048B，字节数、循环 4 次、grid 128、K/V 外提与逐行浮点序列全部不变。\n\n## 新增观察\n\n1. **后端口径的不对称是这次修复的关键约束**：已编译的 019 产物中载入一律走 `memref.copy`（GM 条带→UB 连续），写出一律走 `materialize_in_destination`（tensor→strided GM），全文件没有三维张量与非常量 `collapse/expand`。IR-002 越过了这两条约定。\n2. **写出带宽证据支持突发假设**：019 逐 block `aiv_mte3_active_bw` 72.55GB/s，低于载入侧 `aiv_mte2_active_bw` 103.51GB/s；热点中 UB→OUT 的 `MOV_SRC_TO_DST_ALIGN` 为 4 次调用 7.26µs、单次 32768B、B16。`aiv_mte3_time` 3.02µs 与 `aiv_mte2_time` 3.97µs 相对 `aic_time` 35.39µs 属可测但非主导项，因此预期收益需与 `aiv_vec_time` 12.64µs、`aiv_scalar_time` 12.79µs 的噪声区分。\n3. **窗口资质**：两核窗口均为 `relative_only`、`absolute_time_qualified=false`，归一化区间为各自可见跨度的 [0,1]，原始窗口 49.09µs（AIC）与 49.37µs（AIV），相对 case4 的 257.645µs 属部分覆盖，未报告泳道保持未知；因此不据此推断整核关键路径。\n4. **主要待验证风险**：本地写出暂存的 `materialize_in_destination` 若未与 `truncf` 结果的缓冲合流，会引入一次 32KB UB 内拷贝（预测最多 +0.9µs/block，可由 `aiv_vec_time` 上升识别）；本地连续 alloc 的 `reinterpret_cast` 视图在布局推断中的接受度与 16 段突发能否被合并为单条 DMA，留给宿主 CPU 编译与真机核对。"
+  }
+}

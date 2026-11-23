@@ -1,0 +1,68 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "83dfdf2582a20e8ac5055afdf1d70fdec2bb51c871cb2a544a57d47fbf6c312d",
+  "evidence": [
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "trigger",
+      "finding": "PART_TILES 体内 tt.dot(q,k) 之后已有 arith.truncf f32->f16 再 arith.extf 回 f32（第 95-96 行），而 PV 的 tt.dot(p_bf,v) 输出 128x128 f32（第 101 行）直接进入 arith.divf acc/l_new（第 109 行），中间没有任何窄化：即 QK 交接已走 f16，PV 交接仍是 f32。"
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "第 90-92 行 linalg.matmul(QK) -> truncf f16 -> extf f32；第 97 行 linalg.matmul(PV, outs=%5 f32) 后第 106 行 arith.divf，PV 累加器全程 f32。证明窄化点若写在 dot 之后，与 QK 已被后端折叠的写法同形。"
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "mechanism",
+      "finding": "候选 163.403275us / Block Dim 20，参考 127.482552us / Block Dim 19；候选 L0C_to_GM 合计 65536KB（512 tile x (QK 64KiB f16 + PV 64KiB f32)），参考 98304KB。QK 侧 f16 折叠已被实测确认（若未折叠应为 512x(128+64)=98304KB），故 PV 的 64KiB/tile 是当前唯一未被窄化的 L0C 搬出。"
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "background",
+      "finding": "aic_cube_time 合计 662.187us、aic_fixpipe_time 524.596us、aic_scalar_wait_id1 2924.526us；vector0/1 aiv_vec_time 各 1009.585us。算术不是瓶颈，墙钟由跨核交接链与 FIXP 搬出量主导。"
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "disambiguation",
+      "finding": "veccore0/1 头部热点为 WAIT_FLAG_DEVI 75.040001us(11 次) 与 39.669998us(12 次)，结合 context-brief 的映射，前者对应 PV 结果 acc/l_new 的等待，后者对应 QK 等待；MTE3 MOV_SRC_TO_DST_ALIGN 31.1us 为输出写回。窗口为三核部分窗口、各自归一化，application_completed=false，全调用 completion 缺失，故只用于排序而非相加。"
+    },
+    {
+      "path": "workspace/context-brief.json",
+      "category": "other",
+      "role": "background",
+      "finding": "宿主指定的独立实验：仅 PART_TILES，保留 BF16 P/V 点乘操作数与 FP32 累加，但立即把 PV 累加器转 FP16 再转 FP32，然后进行逐字不变的 FP32 分母除法；host、grid20、128x256 分块、其他分支与输入合同不变。并记录 037/040 在更早 FP16-PV 源上测过 PV 窄化且 040 未确认相对 038 的收益，本轮 055 是不同的 BF16-PV+自然指数组合，不得混淆。"
+    },
+    {
+      "path": "workspace/starter-provenance.json",
+      "category": "other",
+      "role": "background",
+      "finding": "父版本身份为 attempt-055 保留版本，source_sha256=83dfdf25...312d，与当前 candidate.py 绑定，保留最佳 172.10760us。"
+    }
+  ],
+  "hypothesis": "PART_TILES 中 PV 的 128x128 FP32 累加器经 FIXP 以 64KiB/tile 搬出，是 QK 已窄化后剩下的唯一大额 L0C 搬出与 Vector 侧等待来源；在 dot 之后立即 truncf 到 FP16 再 extf 回 FP32，后端可像 QK 那样把该转换折叠进 fixpipe 输出类型，使 PV 搬出 64KiB->32KiB、L0C_to_GM 65536->49152KB，从而缩短 Vector 侧 PV 结果等待（模拟器 75.04us 窗口热点）。",
+  "alternatives": [
+    "把分母除法改成先算倒数再乘（会改变 FP32 除法语义，且未被要求，暂不做）。",
+    "把输出直接以 FP16 相除或让 FIXP 直接产出 BF16（改变分母除法与存储精度路径，超出本实验边界）。",
+    "减少 tile 数或改 grid（本次明确要求保持 host/grid20/分块不变）。",
+    "对 QK 一侧继续做更激进窄化（QK 已折叠为 f16，无进一步字节收益证据）。"
+  ],
+  "discriminating_observation": "修改后实际 IR 是否把 acc 的 truncf/extf 折叠为 FIXP 的 f16 输出：若 L0C_to_GM 合计由 65536KB 降到约 49152KB，并伴随 vec 侧 PV 相关 WAIT_FLAG_DEVI 窗口下降，则机制成立；若 L0C 字节不变（转换仅落在 UB），则仅多一次 128x128 VCONV 与一次除法前的扩展，按真实无收益或退步记录。",
+  "change": "仅 _gqa_tile_part_body 的 PART_TILES 路径：acc = tl.dot(p_bf, v) 之后立即 .to(tl.float16).to(tl.float32)，再执行原样的 l_new = tl.sum(p, 1) 与 out = acc / l_new[:, None]。P/V 的 dot 操作数（BF16）与 FP32 累加、自然指数、公共偏移 SM_OFFSET、语句序、地址、host 发射缓存、grid=20、BLOCK_M=128/BLOCK_N=256 以及全部非 PART 分支逐字不变。",
+  "expected": "若窄化被折叠：case4 的 L0C_to_GM 由 65536KB 降至约 49152KB（-25%），PV 侧 FIXP/Vector 等待下降，case4 真机耗时低于保留最佳 172.10760us；代价是多一次 128x128 FP16->FP32 向量扩展，且在未折叠时该代价净增。case1/2/7 不进入 PART_TILES，预期逐字不变（case2 走非 PART SINGLE_KV 通用分支）。",
+  "validation": "原完整四项 checker 与 golden（身份不变、阈值不变）验收 case1/2/4/7；随后取修改后实际 BCMLIR/TTIR 确认 truncf/extf 位置与是否折叠，并重放模拟器/成对 profiling 核对 L0C_to_GM 与 PV 等待窗口；其他三项须给出真实变化量而非假定不变。",
+  "selected_layer": "source",
+  "layer_reason": "机制是可被 Triton 直接表达的「dot 输出窄化」语句，且同形写法在 QK 上已被实测折叠为 f16 搬出；布局、分块与调度保持不变，因此只改源码，不需要交接 IR 建议。",
+  "simulator_incremental_judgment": "模拟器把热点从 QK 侧区分到 PV 结果侧（75.04us 对 39.67us），这是本轮选择 PV 累加器而非 QK 的直接增量判断；但模拟器是三个核的部分窗口且各自归一化、application_completed=false，全调用 completion 缺失，故其数值不作为收益预测，只作为优先级。流水证据显示 MTE2/VECTOR 大量空闲、MTS3 与 FLOWCTRL 等待占比高，与「减少一次大额 L0C->UB 交接」的方向一致但不足以单独证明因果。",
+  "unknown": [
+    "acc 的 truncf/extf 是否像 QK 一样被折叠进 FIXP 输出类型，还是仅落在 UB。",
+    "FP16 表示 acc 的数值风险：acc = sum_j p_j v_j，|acc| <= sum_j p_j = l_new；理论上界 l_new <= 256*2^15 = 8.4e6 超过 FP16 上限 65504，但合同均匀 [-1,1] 输入下 log 域行和典型约 145，需 l_new > 65504 才溢出，属合同内不可达的极端域；若真溢出则输出为 inf/NaN。",
+    "FP16 相对误差 2^-11 作用在 acc 上，输出相对误差约 5e-4（典型），对消主导行可能放大，需原 checker 判定。",
+    "037/040 曾在更早 FP16-PV 源上测过 PV 窄化，本轮组合不同，历史结论不能直接外推。"
+  ]
+}

@@ -1,0 +1,174 @@
+{
+  "timestamp": "2026-11-21T09:50:16.860949+00:00",
+  "diagnosis": {
+    "source_sha256": "e643746721391d655d976c1b1f19cbb7cde254ff7a7864aa08aaa03edb3286cc",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "feedback.json",
+        "category": "evaluation",
+        "role": "本轮真实正式结果与编译失败的触发证据",
+        "finding": "status=target_compile_failed_other_three_passed。目标 case4（bf16/B4S256Nq64Nkv8D128）candidate_error 为 BiShengHIR pipeline 报 'ub overflow, requires 25168128 bits while 1572864 bits available'，同一报错在日志中重复 6 次。case1/2/7 实测 full_call 174.7047us、172.05215us、298.13530us，对应原始 165.96015us、154.94560us、156.68215us。该失败分支因此没有任何目标延迟成绩。"
+      },
+      {
+        "path": "feedback.json",
+        "category": "evaluation",
+        "role": "三项通过用例显示失败被限制在 SPLIT_QK 几何",
+        "finding": "case1（causal，BLOCK_M=64/BLOCK_N=64）、case2（fp16，SKV=128）、case7（bf16，S=128、SKV=256）都完成编译并在官方 checker 下 passed，official_checker.mismatch_count=0。只有唯一命中 SPLIT_QK 的 case4（D==128、SKV==256、S%256==0、bf16、非因果）编译失败，说明缺陷局限在该分支引入的拼接表达式，公共的 QK/PV/softmax 主体可编译。"
+      },
+      {
+        "path": "context.json",
+        "category": "evaluation",
+        "role": "验收比较起点与版本身份",
+        "finding": "parent_invocation=attempt-015，retained_best=attempt-006（source aec8e907，case4 328.4468us，四项 geomean 降幅 5.179488593351744%，target_cann 126.1381us）。当前 source e6437467 标注未保留探索版，scope 明确要求先完成编译修复，再把同源码 IR 性能收益与超过保留最佳分别验收。"
+      },
+      {
+        "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "可编辑 IR 中的实际缺陷位置",
+        "finding": "第 73-77 行把两条 256x128xf32 的 qk 结果做成 tensor<256x128x2xf32>（偏移 [0,0,0]/[0,0,1]，stride [1,1,2] 交错），再 linalg.transpose permutation=[0,2,1] 到 tensor<256x2x128xf32>，再 tensor.reshape 成 tensor<256x256xf32>。随后 rowmax reduce、broadcast、subf、exp2、rowsum、truncf 全部在这块 256x256xf32（262144B）上运行。两个 QK matmul 各自 outs(%1: tensor<256x128xf32>) 为 131072B，符合单块 L0C 容量。"
+      },
+      {
+        "path": "compiled-readonly/_gqa_fwd_kernel.ttadapter",
+        "category": "source_ir",
+        "role": "冻结低层产物核对失败阶段",
+        "finding": "第 73-77 行与可编辑 BCMLIR 同构（%qk_32/%qk_33 两条交错 insert_slice、%qk_35 transpose、%qk_36 reshape），说明 TTAdapter 与 BCMLIR 阶段均已通过，失败发生在其后的 BiShengHIR tiling/allocate 阶段；成功编译的同类区域没有 rank-3 拼接与 reshape。"
+      },
+      {
+        "path": "ordered-concat-language-evidence.txt",
+        "category": "source_ir",
+        "role": "源码层已无可用的有序二维拼接表达",
+        "finding": "language.semantic.cat 断言 can_reorder 为真且 assert len(lhs.shape)==1，只支持 rank1 且必须允许重排；join 只能产生末尾长度 2 的新维度，并需 reshape(can_reorder=False)。因此源码层的有序二维拼接由 join+permute+reshape 唯一表达，改为直接插入列区间只能在 BCMLIR 层完成。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "paired_profiling",
+        "role": "保留最佳 006 的历史热点背景（归属 aec8e907，非本轮源码）",
+        "finding": "source_sha256=aec8e907…，kernel=_gqa_fwd_kernel_mix_aic，core0.cubecore0。top_instructions：WAIT_FLAG_DEVI 9.59us（源码行 238，PV tl.dot(p.to(f16), v.to(f16))）、FIXP WAIT_FLAG 5.94us（行 163 QK dot）、CUBE WAIT_FLAG 4.69us、MOV_OUT_TO_L1_MULTI_ND2NZ 4.36us（行 155 K 载入）。source_loop 153-253 行累计指令时间 54.34us，其中 wait_instruction_time_sum 30.17us。这些累计时间可重叠，仅用于给候选机制排序。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "保留最佳 006 的成对硬件计时背景",
+        "finding": "candidate.basic：Op Name=_gqa_fwd_kernel_mix_aic、Task Duration 329.446594us、Block Dim 512、Mix Block Dim 1024；reference（CANN FusedInferAttentionScore）118.682373us、Block Dim 19。该材料绑定 aec8e907，属 006 的历史版本，本轮 SPLIT_QK 分支没有任何设备计时。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "模拟器窗口的时钟资质与覆盖范围",
+        "finding": "timeline.core=core0.cubecore0，capture_start=0.0、capture_end=1.0、capture_scope 为 '首末可见硬件事件'，clock_qualification=relative_only、absolute_time_qualified=false，raw_clock_window 153.532–170.559us 且 unit=unassigned，outside_events=20；absolute_unit_validation 用 21 个 PC 与热点指令时间互校通过（median_ratio 1.0007）。ALL 流水在窗口内 idle_ratio 0.99994 只反映可见事件之间的空档，未报告泳道保持未知。"
+      }
+    ],
+    "hypothesis": "当前 BCMLIR 的编译缺陷来自 SPLIT_QK 分支的有序拼接写法：为了在 key 轴保持顺序，IR 先用 stride [1,1,2] 把两块 256x128xf32 交错写进 rank-3 张量，再做 permutation=[0,2,1] 的 rank-3 转置，最后 tensor.reshape 成 256x256xf32。rank-3 交错缓冲、rank-3 转置与跨 layout reshape 让 BiShengHIR 的 tiling/allocation 无法把它们拆成可放进 196608B 的块，只能整块物化，需求累积到 25168128 bits（3146016B）而超限。若改为直接向 tensor<256x256xf32> 的两个列区间写入（列 0-127 放 qk_lo，列 128-255 放 qk_hi），rank-3 交错、转置与 reshape 三项整体消失，剩余算子是成功编译的兄弟用例里已有的 matmul/elementwise/reduce/broadcast/truncf 组合，可按 M 方向分块，编译需求回落到分块量级。该改法产生的列顺序与原写法逐列一致（低 128 列在前、高 128 列在后），每个 fp32 值、softmax 归约顺序、p 的转换与 PV 累加顺序都不变。",
+    "alternatives": [
+      "把 softmax 拆成两个 256x128 半块（rowmax 取两块最大值、rowsum 两块相加），并把 PV 拆成两条 k=128 的 dot 后相加，从根上消掉 256x256xf32。该法改变归约与累加分组，浮点舍入与父版本不同，作为本条修复后仍编译失败时的后续候选。",
+      "保持 IR 原样，只登记编译失败。该法放弃本轮编译修复目标。",
+      "在源码层把 BLOCK_M 由 256 降回 128 以回到 006 的分块。该法需要编辑 frozen.py，而本轮源码逐字节冻结，故不可行。",
+      "改用 language.semantic.cat 表达拼接。该接口只支持 rank1 且要求 can_reorder 为真，表达不了保持 key 顺序的二维拼接。",
+      "只在 BCMLIR 里调整编译属性或 pipeline 选项。该法回避了实际超限的 rank-3 拼接，与缺陷位置不符。"
+    ],
+    "change": "仅编辑 ir/target/_gqa_fwd_kernel.bcmlir 中 SPLIT_QK 的拼接段：把 %29 的类型由 tensor<256x128x2xf32> 改为 tensor<256x256xf32>；两条交错 insert_slice（偏移 [0,0,0] 与 [0,0,1]，sizes [256,128,1]，strides [1,1,2]）改为列区间 insert_slice（%25 写入 [0,0] sizes [256,128] strides [1,1]，%28 写入 [0,128] sizes [256,128] strides [1,1]）；删除 tensor.empty 的 tensor<256x2x128xf32>、linalg.transpose permutation=[0,2,1] 与 tensor.reshape 三项；下游 linalg.reduce 与 arith.subf 的输入由 %reshape 改为拼接结果。函数签名、参数、属性、两个 QK matmul、softmax、PV、输出写回全部保持不变，源码逐字节冻结。",
+    "expected": [
+      "编译：BiShengHIR 不再报 ub overflow，case4 产出二进制（这是本轮首要判据）。",
+      "指令：每个程序删除一次 rank-3 转置与一次跨 layout reshape 所需的整块数据搬运（原写法要额外物化 256x128x2 与 256x2x128 各 262144B）；新增两条列区间 insert_slice，按 M 分块后每块为 128x128 读 + 128x128 写的 UB 内拷贝，QK/PV/softmax 指令序列不变。",
+      "动态轮次：不变。该分支仍是 SINGLE_KV 单轮 KV（BLOCK_N=256==SKV），程序数仍由 S/BLOCK_M × B×NQ 决定（case4 为 1×4×64=256 个程序、512 个 mix 块），QK dot 仍为 2 条、PV dot 仍为 1 条。",
+      "资源：峰值 UB 需求由 3146016B 回落到按 M 分块的可容纳量级（目标 ≤196608B/tiling block）；L0C 保持两片 256x128xf32 累加器（各 131072B）加 PV 输出 256x128xf32，与父版本同量级，不新增 L0C 缓冲。",
+      "等待：跨核交接链条数不变（每程序 QK 两条搬出 + 1 条 p 搬入/p 搬出链），预期不新增 WAIT_FLAG 与 BAR；矩阵搬运减少应体现在向量侧搬移指令下降。",
+      "数值：低 128 列对应 key 0-127、高 128 列对应 key 128-255；每个 fp32 值、rowmax、subf、exp2、rowsum、truncf、PV 累加顺序与父版本逐项相同，预期输出位型与父版本一致，官方 checker 的 mismatch_count 保持 0。",
+      "墙钟：case4 将首次获得该分支的设备成绩；相对 006 的 328.4468us 的方向取决于 M256 与两片 QK 的实际代价，本轮不作定量承诺，交由完整四项评测判定。"
+    ],
+    "validation": "宿主依次执行：(1) CPU 上 BiShengHIR 编译 case4，确认无 ub overflow 并产出二进制；(2) 官方 checker 跑 case1/2/4/7，要求 mismatch_count=0 且 small/cancel/normal 分段全部 passed；(3) 与父版本做逐元素位型比对，覆盖因果/非因果与三种 dtype 分支；(4) case1/2/7 的 full_call 保持本次反馈的 174.7047/172.05215/298.13530us 量级，确认修改只作用于 SPLIT_QK 区域；(5) 只有完成 (1)-(4) 后才以完整四项结果与 retained006（328.4468us、geomean 5.1795%）比较，并单独记录同源码 IR 收益。",
+    "layer_reason": "Triton 表达能力：源码层的 tl.cat 断言 can_reorder 为真且只接受 rank1，tl.join 只能追加长度 2 的末维并要求 can_reorder=False 的 reshape，因此“保持 key 顺序的二维拼接”在源码里只有 join+permute+reshape 一种写法，改成直接写入列区间无法用当前 Triton 语义表达，只能在 BCMLIR 用 tensor.insert_slice 落到列区间上。固定源码实验目的：frozen.py 逐字节冻结，本轮研究身份是编译修复，与源码重写、单纯调整编译选项区别验收；修改限定在 BCMLIR 使三条已测用例的分块与数值路径原样保留。IR 控制点：缺陷实体是 rank-3 交错 insert_slice、rank-3 transpose 与 tensor.reshape 三个算子，它们正是 tiling 无法分块的对象；把它们替换为两条二维列区间 insert_slice 是此处唯一同时保持列顺序和值不变的 IR 级改动。",
+    "simulator_incremental_judgment": "本轮分支没有任何设备计时，timeline 与 hotspots 都绑定保留最佳 006 的 source aec8e907，属历史背景材料，不作为本轮收益证据。可用的信息是：窗口为 relative_only、绝对时钟未资质（raw_clock_window 153.532-170.559us，unit=unassigned，outside_events=20），因此不能把窗口内的 idle 比例或泳道占用换算成本轮 kernel 时间；未报告泳道保持未知。历史热点只用于支撑“墙钟由每程序跨核交接链条数主导”这一机制阅读（WAIT_FLAG_DEVI 9.59us 在 PV dot、FIXP WAIT_FLAG 5.94us 在 QK dot），本轮改动保留交接链条数不变、只删拼接搬运，故不预期等待时间变化，也不据此提出定量等待预测。宿主的增量判断应把编译成功与完整四项绝对时间作为独立观测，与本诊断的“交接链不变、向量搬移下降”预期分别核对，偏差单独记录。",
+    "unknown": [
+      "BiShengHIR 的 3146016B 需求由多少个同时活跃缓冲组成，删除 rank-3 三项后是否足以回到 196608B 以内，需要真实编译确认。",
+      "两条列区间 insert_slice 是否被 bufferization 融合成就地写入而无额外整块拷贝。",
+      "M256 下 256x256xf32 的 softmax 会被切成多少个 M 分块，及其对向量侧动态轮次的影响。",
+      "该分支三项已测用例（174.70/172.05/298.14us）高于原始值的原因，与本轮拼接修改是否相关，需完整四项评测分离。"
+    ]
+  },
+  "diagnosis_sha256": "a8578f590b60d578f4d5abfd8bca389dafad35482ecc3b1f2565b141e6f17469",
+  "evidence": [
+    {
+      "path": "feedback.json",
+      "category": "evaluation",
+      "role": "本轮真实正式结果与编译失败的触发证据",
+      "finding": "status=target_compile_failed_other_three_passed。目标 case4（bf16/B4S256Nq64Nkv8D128）candidate_error 为 BiShengHIR pipeline 报 'ub overflow, requires 25168128 bits while 1572864 bits available'，同一报错在日志中重复 6 次。case1/2/7 实测 full_call 174.7047us、172.05215us、298.13530us，对应原始 165.96015us、154.94560us、156.68215us。该失败分支因此没有任何目标延迟成绩。",
+      "sha256": "51fda2fb8720da2f0264a3ceff447176e71747758df1d58c1e3e7793147ec55d"
+    },
+    {
+      "path": "feedback.json",
+      "category": "evaluation",
+      "role": "三项通过用例显示失败被限制在 SPLIT_QK 几何",
+      "finding": "case1（causal，BLOCK_M=64/BLOCK_N=64）、case2（fp16，SKV=128）、case7（bf16，S=128、SKV=256）都完成编译并在官方 checker 下 passed，official_checker.mismatch_count=0。只有唯一命中 SPLIT_QK 的 case4（D==128、SKV==256、S%256==0、bf16、非因果）编译失败，说明缺陷局限在该分支引入的拼接表达式，公共的 QK/PV/softmax 主体可编译。",
+      "sha256": "51fda2fb8720da2f0264a3ceff447176e71747758df1d58c1e3e7793147ec55d"
+    },
+    {
+      "path": "context.json",
+      "category": "evaluation",
+      "role": "验收比较起点与版本身份",
+      "finding": "parent_invocation=attempt-015，retained_best=attempt-006（source aec8e907，case4 328.4468us，四项 geomean 降幅 5.179488593351744%，target_cann 126.1381us）。当前 source e6437467 标注未保留探索版，scope 明确要求先完成编译修复，再把同源码 IR 性能收益与超过保留最佳分别验收。",
+      "sha256": "157f12fcf2ebe6fdfb988d28fe817d0301dc9bd475b187cf123ab70b96aa2cf4"
+    },
+    {
+      "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "可编辑 IR 中的实际缺陷位置",
+      "finding": "第 73-77 行把两条 256x128xf32 的 qk 结果做成 tensor<256x128x2xf32>（偏移 [0,0,0]/[0,0,1]，stride [1,1,2] 交错），再 linalg.transpose permutation=[0,2,1] 到 tensor<256x2x128xf32>，再 tensor.reshape 成 tensor<256x256xf32>。随后 rowmax reduce、broadcast、subf、exp2、rowsum、truncf 全部在这块 256x256xf32（262144B）上运行。两个 QK matmul 各自 outs(%1: tensor<256x128xf32>) 为 131072B，符合单块 L0C 容量。",
+      "sha256": "c600a44e243605234639bedec93510a5363054b7653428c0eb3308ace231a885"
+    },
+    {
+      "path": "compiled-readonly/_gqa_fwd_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "冻结低层产物核对失败阶段",
+      "finding": "第 73-77 行与可编辑 BCMLIR 同构（%qk_32/%qk_33 两条交错 insert_slice、%qk_35 transpose、%qk_36 reshape），说明 TTAdapter 与 BCMLIR 阶段均已通过，失败发生在其后的 BiShengHIR tiling/allocate 阶段；成功编译的同类区域没有 rank-3 拼接与 reshape。",
+      "sha256": "e5aa274f95965c4eb6fde1023641c239a698699d9ef3c4d306581a8761b2c44b"
+    },
+    {
+      "path": "ordered-concat-language-evidence.txt",
+      "category": "source_ir",
+      "role": "源码层已无可用的有序二维拼接表达",
+      "finding": "language.semantic.cat 断言 can_reorder 为真且 assert len(lhs.shape)==1，只支持 rank1 且必须允许重排；join 只能产生末尾长度 2 的新维度，并需 reshape(can_reorder=False)。因此源码层的有序二维拼接由 join+permute+reshape 唯一表达，改为直接插入列区间只能在 BCMLIR 层完成。",
+      "sha256": "e137358ecf15767ca9ca496e5ce7493061eb06243d968b0a0d3a6a6ab61c98c1"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "paired_profiling",
+      "role": "保留最佳 006 的历史热点背景（归属 aec8e907，非本轮源码）",
+      "finding": "source_sha256=aec8e907…，kernel=_gqa_fwd_kernel_mix_aic，core0.cubecore0。top_instructions：WAIT_FLAG_DEVI 9.59us（源码行 238，PV tl.dot(p.to(f16), v.to(f16))）、FIXP WAIT_FLAG 5.94us（行 163 QK dot）、CUBE WAIT_FLAG 4.69us、MOV_OUT_TO_L1_MULTI_ND2NZ 4.36us（行 155 K 载入）。source_loop 153-253 行累计指令时间 54.34us，其中 wait_instruction_time_sum 30.17us。这些累计时间可重叠，仅用于给候选机制排序。",
+      "sha256": "a577cd8f8242ef23604f213012c26f656d5c52ac3408b2d8f49abc602ff0ee6d"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "保留最佳 006 的成对硬件计时背景",
+      "finding": "candidate.basic：Op Name=_gqa_fwd_kernel_mix_aic、Task Duration 329.446594us、Block Dim 512、Mix Block Dim 1024；reference（CANN FusedInferAttentionScore）118.682373us、Block Dim 19。该材料绑定 aec8e907，属 006 的历史版本，本轮 SPLIT_QK 分支没有任何设备计时。",
+      "sha256": "17c4fab3181db964119b841d5267029511cc4df2d9b6d8458918407cccb64f6e"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "模拟器窗口的时钟资质与覆盖范围",
+      "finding": "timeline.core=core0.cubecore0，capture_start=0.0、capture_end=1.0、capture_scope 为 '首末可见硬件事件'，clock_qualification=relative_only、absolute_time_qualified=false，raw_clock_window 153.532–170.559us 且 unit=unassigned，outside_events=20；absolute_unit_validation 用 21 个 PC 与热点指令时间互校通过（median_ratio 1.0007）。ALL 流水在窗口内 idle_ratio 0.99994 只反映可见事件之间的空档，未报告泳道保持未知。",
+      "sha256": "5fa47e887230d945be36f951e74c9ba7a5161a8e89a82b9a39e36589738e8a80"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "e643746721391d655d976c1b1f19cbb7cde254ff7a7864aa08aaa03edb3286cc",
+    "contract.json": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858",
+    "ir-inventory.json": "5a56d7aa23d98297ed885ff2829941e0f92dd69bb391eafb4ae9601b610ad8e6",
+    "feedback.json": "51fda2fb8720da2f0264a3ceff447176e71747758df1d58c1e3e7793147ec55d",
+    "profiling.json": "17c4fab3181db964119b841d5267029511cc4df2d9b6d8458918407cccb64f6e",
+    "hotspots.json": "a577cd8f8242ef23604f213012c26f656d5c52ac3408b2d8f49abc602ff0ee6d",
+    "timeline.json": "5fa47e887230d945be36f951e74c9ba7a5161a8e89a82b9a39e36589738e8a80",
+    "ordered-concat-language-evidence.txt": "e137358ecf15767ca9ca496e5ce7493061eb06243d968b0a0d3a6a6ab61c98c1",
+    "context.json": "157f12fcf2ebe6fdfb988d28fe817d0301dc9bd475b187cf123ab70b96aa2cf4",
+    "diagnosis.json": "e934218c7cbb0b87d5a2f7cf90dce5acc08fb023b89a77fcea7a04d3ef1895b6",
+    "codex-brief.json": "2558a33a72e7ec860aeba95bbb4f7ca9d45901f56c4114e37ae93a4299e2950c",
+    "ir/target/_gqa_fwd_kernel.bcmlir": "c600a44e243605234639bedec93510a5363054b7653428c0eb3308ace231a885",
+    "compiled-readonly/_gqa_fwd_kernel.ttir": "9ae6294f90921670d8f28e7b26cc63bf0e1ecf01615f836db9dcb7ebaed65bd2",
+    "compiled-readonly/_gqa_fwd_kernel.ttadapter": "e5aa274f95965c4eb6fde1023641c239a698699d9ef3c4d306581a8761b2c44b",
+    "compiled-readonly/_gqa_fwd_kernel.bcmlir": "c600a44e243605234639bedec93510a5363054b7653428c0eb3308ace231a885"
+  },
+  "decision_tool_sha256": "5bef69abbe2d24d40092eade140c6c5d68f831185dbcc5e7930d535926348208"
+}

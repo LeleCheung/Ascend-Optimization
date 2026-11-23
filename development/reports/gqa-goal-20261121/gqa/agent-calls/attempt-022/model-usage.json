@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 27,
+    "duration_ms": 69174,
+    "usage": {
+      "input_tokens": 38295,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 631680,
+      "output_tokens": 9123,
+      "output_tokens_details": {
+        "thinking_tokens": 2729
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 38295,
+        "outputTokens": 9123,
+        "cacheReadInputTokens": 631680,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 0.7353900000000001,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 2729,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 0.7353900000000001,
+    "result": "已完成本轮单机制修改并交接。\n\n## 本轮记录\n\n**读取的实际材料**\n- `skills/hgkda/SKILL.md`、`task.json`、`contract.json`、`context-brief.json`、`prompt.md`、`agent-config.json`\n- `current-profiling.json`（case4：283.745667μs，128 程序；每程序 `aiv_vec_time` 14.055152μs > `aic_cube_time` 5.173333μs；`L0C_to_GM` 640KB/程序，021 的搬运削减已兑现）\n- 实际 IR：`actual-ir/2-_gqa_fwd_kernel.ttir` 第 110–111 行确认 `broadcast 128x1→128x256` 后 `arith.divf tensor<128x256xf32>`；`actual-ir/0-_gqa_fwd_kernel.bcmlir` 第 112 行同一矩阵型 `divf` 存活到后端\n- `previous-result.json`：父版 021 case4 291.8388μs、四项 checker 通过；保留比较基准 019 262.27775μs\n\n**机制（宿主指定，单一）**\n仅改 `_gqa_persist_kv_body` 的归一化表达：\n- 原：`p_norm = tl.where(l_new[:,None] > 0.0, p / l_safe[:,None], 0.0)`\n- 新：`inv_l = 1.0 / l_safe`（FP32 行向量），`p_norm = tl.where(l_new[:,None] > 0.0, p * inv_l[:,None], 0.0)`\n\n每 tile 除法 32768 次 → 128 次 + 32768 次广播乘。保留 p/max/sum/l_safe 守卫、HG=2 headgroup、FP16 cast 前的零行 where、单次 PV dot、直接输出与所有回退路径。\n\n**数值风险（已写入决策）**：单次除法舍入变为“倒数舍入 + 乘法舍入”两次 FP32 舍入，相对上界约 2⁻²³；合同内 `l_new >= 1`，倒数不溢出、不放大，远小于 FP16 转换的 2⁻¹¹；适用范围与原合同一致，由原四项 checker 原阈值验收。\n\n**流程**\n- `decision --record diagnosis.json` → 已登记，decision_id `0dcc0544c91e4d83befbeb4f2cfaf54b`（绑定修改前 SHA `0631c795…`）\n- 源码 SHA 变为 `cd8f0800…`，`diagnosis.json` 已回填 post_change_status\n- `preflight --source candidate.py` → `awaiting_source_review`\n\n当前候选字节保持不变，交接宿主只读路径/地址边界审查与完整四项真机评测；修改后的实际 TTIR/BCMLIR（验证 rank-1 倒数+广播乘是否取代 128×256 divf）、成对 profiling 和模拟器重放结果待反馈后回填。本轮不对完整调用做正向断言。"
+  }
+}

@@ -1,0 +1,88 @@
+--- 
++++ 
+@@ -114,6 +114,14 @@
+ 是按组遍历的运行时边界循环，K/V 缓冲需在循环内复用（形状与 019 相同，不新增
+ 张量，峰值由同一批 128x256/128x128 张量决定）。FP16 与其他 dtype 的通用二维
+ grid 路径、因果 64/64 分块、两项分解表达式与相加顺序全部保持原样。
++
++Q/输出行归属改为查询头最快平坦映射（本轮机制，仅 PART_TILES）：组内 TPG 个 tile
++的划分与序号公式不变，只把 tile 内的 128 行从「单查询头的连续 128 个序列位置」
++改为组内平坦行区间（seq_row = e//G、gi_row = e%G，e = t*BLOCK_M + arange）。
++BSND 中同一序列的 G 个查询头连续，故每 tile 的跨步搬运由 128 个 256B 段变为
++NB_M 个 G*D 元素的连续段（case4 G=8 为 16 个 2KB 段）；QK/PV 逐行独立、归约轴
++与表达式不变，逐行结果与父版本一致。代价是行基址不再是行号的一次函数，若后端
++不能识别行内连续则可能退化为逐元素搬运，届时按失败记录。
+ 
+ 单块 softmax 的编译期公共偏移（本轮机制，仅 PART_TILES）：成对 profiling 显示
+ 候选 Cube 累计时间已与 CANN 参考相当（662.187us vs 673.090us、L0C_to_GM 同为
+@@ -283,8 +291,9 @@
+     只对与自己区间相交的组载入一次整段 K 并一次性把 V 转 fp16，然后在该组的
+     相交子区间内逐 tile 执行原表达式。区间由 floor 划分给出，对 pid 单调且相邻
+     区间首尾相接，故 0 <= lo < hi <= T 且全部 T 个 tile 被唯一覆盖、每个
+-    (b,hq,行块) 只写出一次；组内坐标 gi = t // NB_M、mb = t % NB_M 把 tile 序号
+-    映回 hq = kvh*G + gi 与行偏移 mb*BLOCK_M。
++    (b, kvh, 平坦行) 只写出一次；组内坐标把 tile 序号映成「查询头最快」的平坦
++    行区间 [t*BLOCK_M, t*BLOCK_M+BLOCK_M)：seq_row = e // G、gi_row = e % G，
++    其中 e = t*BLOCK_M + arange(BLOCK_M)，组内平铺顺序为 (seq, kvh*G+gi)。
+     """
+     pid = tl.program_id(0)
+     lo = (pid * T) // P
+@@ -292,6 +301,7 @@
+ 
+     offs_d = tl.arange(0, BLOCK_D)
+     offs_n = tl.arange(0, BLOCK_N)
++    offs_e = tl.arange(0, BLOCK_M)
+ 
+     # P <= T 时每个程序区间非空；该 guard 只为空区间（P > T）的通用正确性保留。
+     if hi > lo:
+@@ -323,14 +333,27 @@
+             t0 = tl.maximum(lo, grp * TPG) - grp * TPG
+             t1 = tl.minimum(hi, (grp + 1) * TPG) - grp * TPG
+             for t in range(t0, t1):
+-                gi = t // NB_M
+-                mb = t % NB_M
+-                hq = kvh * G + gi
+-                offs_m = mb * BLOCK_M + tl.arange(0, BLOCK_M)
+-
+-                q_ptrs = Q + b * q_sb + hq * q_sh + offs_m[:, None] * q_ss + offs_d[None, :] * q_sd
++                # 本轮机制（仅 PART_TILES 的 Q/输出行归属）：组内查询头最快（query-head-fast）
++                # 平坦行映射。此前每个 tile 的 128 行只覆盖单个查询头的连续 128 个序列位置，
++                # BSND 下这些行地址相差 q_ss = NQ*D 个元素（case4 为 16KB），Q 载入与 O 写回
++                # 各为 128 个 256B 小段跨步进行（实际 TTIR 行基址 = 标量 hq*q_sh + offs_m*q_ss）。
++                # 现令 tile t 覆盖该 KV 组的平坦行区间 [t*BLOCK_M, t*BLOCK_M+BLOCK_M)，行号
++                # e = t*BLOCK_M + arange(BLOCK_M)，seq_row = e // G、gi_row = e % G；同一序列的
++                # G 个查询头在 BSND 内本就连续，故相邻 G 行拼成 G*D 个连续元素（G=8 时 2KB），
++                # 每 tile 的 128 个 256B 段变为 16 个 2KB 段，搬运突发数与描述符/寻址开销下降。
++                # 代价：行基址不再是行号的一次函数，后端若不能识别行内 128 元素连续，可能
++                # 退化为逐元素 scatter/gather（届时由修改后 simulator 与 profiling 判定失败）。
++                # 数学不变：QK 归约轴（整段 SKV=256）、FP16 rawQK 舍入、公共偏移 exp2、分母
++                # FP32 求和与 PV 内积顺序均按行独立，仅 M 维铺排与行地址变化，逐行结果一致；
++                # 适用范围内 G>0、BLOCK_M%G==0（本合同的 G=8/4 与 BLOCK_M=128 都满足），
++                # TPG/T/P/grid 与组内 tile 覆盖总数不变（组内平坦行数 = S*G，tile 数 = NB_M*G）。
++                e_row = t * BLOCK_M + offs_e
++                seq_row = e_row // G
++                gi_row = e_row % G
++                row_q = seq_row * q_ss + gi_row * q_sh
++                q_ptrs = Q + b * q_sb + kvh * G * q_sh + row_q[:, None] + offs_d[None, :] * q_sd
+                 if MASK_MD:
+-                    q = tl.load(q_ptrs, mask=(offs_m[:, None] < S) & (offs_d[None, :] < D), other=0.0)
++                    q = tl.load(q_ptrs, mask=(seq_row[:, None] < S) & (offs_d[None, :] < D), other=0.0)
+                 else:
+                     q = tl.load(q_ptrs)
+ 
+@@ -401,10 +424,13 @@
+                 # 依赖选路，不改测试与阈值。
+                 out = acc / l_new[:, None]
+ 
+-                o_ptrs = Out + b * o_sb + hq * o_sh + offs_m[:, None] * o_ss + offs_d[None, :] * o_sd
++                # 输出沿用同一平坦行归属：行偏移按 o_ss/o_sh 重算（与 Q 同构但独立），
++                # 写回地址仍散回原 BSND 坐标，每行只写一次、无重叠。
++                row_o = seq_row * o_ss + gi_row * o_sh
++                o_ptrs = Out + b * o_sb + kvh * G * o_sh + row_o[:, None] + offs_d[None, :] * o_sd
+                 if MASK_MD:
+                     tl.store(o_ptrs, out.to(Out.dtype.element_ty),
+-                             mask=(offs_m[:, None] < S) & (offs_d[None, :] < D))
++                             mask=(seq_row[:, None] < S) & (offs_d[None, :] < D))
+                 else:
+                     tl.store(o_ptrs, out.to(Out.dtype.element_ty))
+ 

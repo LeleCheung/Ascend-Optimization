@@ -1,0 +1,82 @@
+{
+  "source_sha256": "aaf74e7b4c22ef3941480023b67c16a52ec81f9b5071151832cc492d985d532e",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "候选内核 _vsrb_inner1_kernel 的完整核心计数、流水时间与写带宽",
+      "finding": "Task Duration(us) 151.863037，Block Dim 512；write_main_memory_datas 合计 262144 KB，恰为 8192x8192 fp32 整张输出，写入字节与语义所需相等；read_main_memory_datas 合计 2111.875 KB；aiv_time 均值 11.434 us/程序，aiv_mte3_time 8.615 us（ratio 0.7406）、aiv_vec_time 6.866 us（ratio 0.636）、aiv_mte2_time 4.057 us（ratio 0.338）、aiv_scalar_wait_time 9.196 us；aiv_mte3_instructions 合计 8704（约 17/程序），aiv_mte2_instructions 合计 41471（约 81/程序）；aiv_mte3_active_bw 均值 65.9 GB/s（最小 35.6，最大 111.4）；UB_to_GM_bw_usage_rate 均值 24.23%，据此单核存储通道标称能力约 187 GB/s。"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "聚合写带宽与存储流水空档",
+      "finding": "262144 KB 除以 151.863 us 得聚合写带宽约 1.726 TB/s，属于纯连续输出写；aiv_mte3_ratio 均值 0.741、最小 0.413，说明存储流水在每个程序内有约 26% 时间处于空闲，空闲来源为逐行向量依赖与逐次描述符和标志发射。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "paired_profiling",
+      "role": "逐指令热点排序与每轮固定开销构成（core0.veccore0 局部窗口，source_loop 141 条指令）",
+      "finding": "top_instructions 显示 MOV_SRC_TO_DST_ALIGN（MTE3，tl.store 第 64 行）calls 139、cycles 150770，单次约 1084 cycles 约 0.657 us，对应一次 32KB 连续写；SET_FLAG（MTE3 触发 VEC）calls 139、cycles 150631；BAR（MTE3）calls 140、cycles 125636；WAIT_FLAG（SCALAR 等 VEC flag7）calls 141、cycles 85191，单次约 0.366 us；BAR（VECTOR）calls 141、cycles 84909；WAIT_FLAG（VEC 等 MTE3 flag1）calls 141、cycles 54496；WAIT_FLAG（SCALAR 等 MTE2 flag0）calls 141、cycles 49266；WAIT_FLAG（VEC 等 MTE2 flag0）calls 141、cycles 47754；MTE2 的 MOV_SRC_TO_DST_ALIGN 两次单元素搬运各 47205 与 47090 cycles；VCMPV calls 141、cycles 40467；VSEL calls 141、cycles 25058。累计指令时间仅用于关注度排序，各流水可重叠。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "同核归一化窗口的流水活跃与等待（前窗口基线）",
+      "finding": "core0.veccore0 首末可见事件窗口内：MTE3 event_count 585、active_ratio 0.9031、wait_ratio 0.1563；VECTOR event_count 3540、active_ratio 0.9485、wait_ratio 0.3798；SCALAR active_ratio 0.8202、wait_ratio 0.7922；MTE2 active_ratio 0.3080、wait_ratio 0.0120；SCALARLDST event_count 10256。单位为窗口分数，覆盖范围为首末可见事件区间，绝对时钟资质与未报告泳道按材料原样保留。"
+    },
+    {
+      "path": "ir/893449211de307c7344961e7520d98aa287afd9d2ccaf2b6a671214aad91f6de/_vsrb_inner1_kernel.ttir",
+      "category": "source_ir",
+      "role": "实际 TTIR 循环体与行映射",
+      "finding": "scf.for 每轮依次执行：expand_dims 后 broadcast g 至 1x8192 fp32、broadcast v 至 1x8192 i32、arith.cmpi eq 8192 元、arith.select 8192 元，再 tt.store 整行 1x8192；零常量 1x8192 位于循环外。行循环为 t 从 pid 起以 nprog 为步长，故同一程序的 16 行在输出中彼此相隔 512 行，单轮存储上限固定为一行 32KB。"
+    },
+    {
+      "path": "compiled-readonly/893449211de307c7344961e7520d98aa287afd9d2ccaf2b6a671214aad91f6de/e0d769342f059e04c39cbbe7b342e9598cc782df35d7ecbe8f459b34046200e8/_vsrb_inner1_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "后端低层产物核对疑似冗余",
+      "finding": "循环体仍保留 linalg.broadcast(g)、linalg.broadcast(v)、arith.cmpi、arith.select 与 materialize_in_destination 整行写；每轮另有 memref.alloc 加 memref.copy 各搬运单个 i64 与单个 f32；零常量 linalg.fill 已提到循环外。密集选择与单元素搬运在后端原样保留，属于具有执行成本的编译缺陷。"
+    },
+    {
+      "path": "compiled-readonly/893449211de307c7344961e7520d98aa287afd9d2ccaf2b6a671214aad91f6de/e0d769342f059e04c39cbbe7b342e9598cc782df35d7ecbe8f459b34046200e8/_vsrb_inner1_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "低层张量适配层第二份独立核对",
+      "finding": "ttadapter 与 bcmlir 结构一致：循环内 1x8192 的 broadcast、cmpi、select 之后整行写出，且单元素 i64 与 f32 各经一次 memref.copy；两份产物共同支持密集选择与逐行 32KB 写形态在低层保持原样。"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "已登记候选的实际正式与补测结果及测量噪声",
+      "finding": "ir-002（逐行零存加守卫点存）正式 96/96、补测 96/96 通过，timing-14 由 187.771289 降至 183.792334 us（原/候选 1.021649）；49 个 AST 中 1 个变更、48 个二进制完全一致；全合同几何均值比 0.9974508，未变更二进制正式用例最大漂移 3.81%，且历史 timing-14 为 184.022 us，故该 2.12% 目标增益中约 2.0% 属于二进制变更外的波动。"
+    }
+  ],
+  "hypothesis": "该特化每行只写 32KB，且写发射被三层逐轮开销夹住：一是每行的向量结果（VCMPV 与 VSEL 合计约 6.9 us/程序），二是每行一次 32KB 描述符加 SET_FLAG/BAR/WAIT_FLAG 序列（core0 窗口内 MTE3 空闲约 10%、程序内 mte3_ratio 均值 0.741），三是每程序 81 条 MTE2 指令只搬运约 4KB 有效数据（32 次单元素搬运，含 WAIT_FLAG SCALAR 等 MTE2 flag0 约 0.35 us/轮）。行映射 t=pid+k*nprog 使同一程序的 16 行在输出中相隔 512 行，这是存储粒度固定在 32KB 的结构原因。若把行映射改为连续块 base=pid*16（rpp=NT/nprog=16），同一程序的 16 行在输出中连续成 512KB，则可把写侧重构为：循环外一次常量零块常驻，循环内 8 次 16384 元（64KB 连续）零存覆盖整块，随后 1 次 16 元带掩码散点存写入 16 个选中值。每程序 MTE3 指令由约 17 降至约 9、MTE2 指令由约 81 降至约 6、循环内向量工作降为零，逐轮依赖链相应缩短，存储流水占空比提高。ir-002 已验证删除密集选择本身约值 2%，本机制在其基础上再削减描述符数量与单元素搬运，故其增量收益应来自存储发射结构；若写通道已由聚合带宽约束，则增量主要体现为等待与空档的减少。",
+  "alternatives": [
+    "保持 IR 原样并记录写屋顶结论：写入字节与语义所需完全相等、聚合 1.726 TB/s 接近通道能力，且 ir-002 已量化删除密集选择的价值约 2%，本条保留为对照基线。",
+    "逐行零存加逐行守卫点存（ir-002 机制）：已登记为待定竞争候选，正式 96/96 与补测 96/96 通过、timing-14 183.792 us；重复该机制缺乏独立研究身份，本轮以其为待超越对象。",
+    "4 行合并为 128KB 单次零存：UB 需 128KB 常量块，配合多缓冲后约 256KB 超出 216KB 共享上限，资源可行性不足，留作后续假设。",
+    "仅调大 num_stages 或多缓冲以掩盖逐轮依赖：属编译选项身份，本轮固定源码实验不并入。",
+    "把两行合并放进 2x8192 二维形状并在源码侧改写：属源码重写身份；本轮在 TTIR 内以 1-D 16384 元连续写表达同一意图，UB 需求 64KB，资源余量充足。",
+    "按 GM 局部性把并发程序分配改为连续大块（当前为每程序跨 16MB 步进）：本轮行映射改动已附带该效应该方向，单列会改变覆盖身份，留作后续假设。"
+  ],
+  "change": "仅编辑 ir/893449211de307c7344961e7520d98aa287afd9d2ccaf2b6a671214aad91f6de/_vsrb_inner1_kernel.ttir 的函数体，三指针 ABI、constexpr 几何、模块属性与 loc 保持原样：1) 循环外保留常量零张量，并新增 16384 元零块常量与 16 元 index 张量；2) 用 %c8192_i32 与 tt.get_num_programs 计算 rpp=8192/nprog 与 base=pid*rpp；3) 删除每轮 expand_dims/broadcast(g)、broadcast(v)、arith.cmpi、arith.select；4) 新增 scf.for 对 8 个行对循环，每轮以 row0+arange(16384) 构造连续指针张量执行一次 16384 元零块 tt.store，并以 row0+2 不大于 8192 且 2j+2 不大于 rpp 的标量守卫保护；5) 在行对循环之后执行一次 16 元散点存：连续加载 base 起 16 个 i64 索引并 trunci 到 i32、连续加载 16 个 fp32 值，以 row*8192+v 构造元素偏移，掩码为 0 不大于 v 且 v 小于 8192 且 k 小于 rpp，保证越界索引不写。",
+  "expected": [
+    "指令：每程序 MTE3 指令由约 17 降至约 9（8 次零块存加 1 次 16 元散点存），每次存储数据量由 32KB 升为 64KB；每程序 MTE2 指令由约 81 降至约 6（1 次 128B i64 连续取、1 次 64B f32 连续取，外加簿记）；循环内向量指令由 broadcast+VCMPV+VSEL 降为仅循环外常量填充。",
+    "动态轮次：行覆盖保持 512 程序各 16 行、共 8192 行，每处输出恰好写一次；执行轮次核对项为由每程序 16 轮（每轮 1 行）变为 8 轮（每轮 2 行）加 1 次散点存。",
+    "等待：aiv_scalar_wait_time 预期由约 9.20 us/程序下降，WAIT_FLAG（SCALAR 等 VEC flag7）与 WAIT_FLAG（VEC 等 MTE3 flag1）逐轮序列消失；mte3_wait_ratio 预期由 0.214 与窗口 0.156 下降。",
+    "资源：aiv_vec_time 预期由 6.866 us 降至 0.6 us 以下（vec_ratio 由 0.636 降至 0.1 以下）；aiv_mte2_time 预期由 4.057 us 降至 0.5 us 以下；UB 需求由循环外 64KB 零块加 16 元小张量构成，低于 216KB 共享上限；write_main_memory_datas 保持 262144 KB（散点存重复写 16 个位置，属语义所需的原位更新）。",
+    "墙钟：每程序 aiv_time 预期由 11.434 us 降至 8.8 至 10.6 us；timing-14 正式延迟预期由 187.771 us 降至 178 至 184 us（约减 2% 至 5%），该预测以存储发射结构而非聚合带宽为当前约束；若 1.726 TB/s 已等于写通道能力，则兑现值收敛到 185 至 188 us 区间。",
+    "协同观察：kernel Task Duration 预期由 151.863 us 降至 143 至 149 us，且单核 MTE3 active_ratio 预期由 0.903 上升、wait_ratio 由 0.156 下降。"
+  ],
+  "validation": "复用固定完整合同 96 例与既有两套 96 例补测，逐例核对 matched_ratio 1.0 与 atol/rtol 1e-4；针对本机制登记两项具体风险各做一次定向检查：其一为行映射由跨步改为连续块后的覆盖完整性，核对 8192 行各写一次且 16 个散点位置未被同程序零块存覆盖，覆盖含索引为 0、8191 与越界值；其二为零块存先于散点存的同地址次序，核对选中位置取到原 grad 位型。逐位语义包含有符号零、NaN、Inf 与 i64 到 i32 截断；改动前后各做一次模拟器重放并分别记录覆盖量与归一化范围；timing-14 增益落在 3.81% 未变更二进制漂移量级时触发 ABBA。",
+  "layer_reason": "Triton 表达能力：连续块行映射、64KB 连续零块存与 16 元带掩码散点存在 Triton 语言层均可表达，源码侧可用 BO=2 的规整行块与一次 tl.store 掩码散点实现同一意图，因此该机制也可回到源码层表达，本轮在固定源码下隔离验证。固定源码实验目的：源码、ABI、启动方式与 512 程序网格全部不变，只改变存储形状、行到程序的映射与值写路径，从而把收益归因到编译缺陷，而避免混入启动或几何变化。IR 控制点：具体控制点为本特化 TTIR 的 scf.for 循环体，即行映射表达式、tt.store 的元数与形状、以及 broadcast/cmpi/select 序列；改动这些点依旧保留三指针 ABI 与 constexpr 几何，可直接检验后端对 16384 元连续存与 16 元掩码散点存的降级路径与描述符合并效果。",
+  "simulator_incremental_judgment": "模拟器各泳道为单核归一化窗口分数，前窗口覆盖 core0.veccore0 首末可见硬件事件区间、归一化范围为 0 到 1，事件计数 MTE3 585、VECTOR 3540、SCALAR 1370、MTE2 996、SCALARLDST 10256；绝对时钟资质与未报告泳道保持未知，窗口为局部捕获，故不把窗口比例外推到全部 512 程序。后窗口将按同一规则重放并分别记录覆盖量与归一化范围，逐项核对 MTE3 active_ratio 上升与 wait_ratio 下降、VECTOR 活跃回落、SCALAR wait 回落，并核对动态总次数（每程序 8 次零块存加 1 次散点存、80 行覆盖）与执行覆盖一致后再比较。累计指令时间、热点等待与流水服务时间只用于候选定位，各流水可重叠，关键路径结论以后窗口的独立观测为准。",
+  "unknown": [
+    "1.726 TB/s 聚合写带宽与写通道能力的关系：若已处于通道能力上限，本机制兑现值收敛到 185 至 188 us，收益主要留在等待与占空比指标。",
+    "16384 元连续存在后端是否按 64KB 单描述符发射，或仍拆成 32 个 2KB 突发；若拆分，描述符合并收益小于预测。",
+    "行映射改为每程序 512KB 连续块后，并发程序写流由地址相邻改为相隔 512KB 的 40 条顺序流，DRAM 行缓冲与 L2 行为的净影响方向待测。",
+    "16 元散点存在后端是否降级为 16 次独立小事务；若降级，其开销相当于 ir-002 的点存路径。",
+    "零块存与散点存同地址次序在硬件与编译同步上的保证强度，需由定向检查确认选中位置未被零块覆盖。"
+  ]
+}

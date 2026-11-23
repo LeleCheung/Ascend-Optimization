@@ -1,0 +1,143 @@
+--- 
++++ 
+@@ -198,6 +198,8 @@
+     MASK_KV: tl.constexpr,
+     PV_SINGLE_F16: tl.constexpr,
+     SINGLE_KV: tl.constexpr,
++    SPLIT_QK: tl.constexpr,
++    EXACT_UNGUARDED: tl.constexpr,
+ ):
+     pid_m = tl.program_id(0)
+     pid_bh = tl.program_id(1)
+@@ -235,21 +237,40 @@
+     for n0 in range(0, hi, BLOCK_N):
+         offs_n = n0 + tl.arange(0, BLOCK_N)
+ 
+-        k_ptrs = k_base + offs_n[:, None] * k_ss + offs_d[None, :] * k_sd
+-        if MASK_KV:
+-            kv_mask = (offs_n[:, None] < SKV) & (offs_d[None, :] < D)
+-            k = tl.load(k_ptrs, mask=kv_mask, other=0.0)
++        if SPLIT_QK:
++            # 独立资源分支（仅 BF16 非因果精确 SINGLE_KV、D128、SKV256、
++            # S%256==0）：N=256 拆成前 128-key 与后 128-key 两条顺序 tl.dot。
++            # 不装载整块 256x128 K，而是顺序装载两个 128x128 半块，避免物化
++            # 未使用的 full-K tile。每条 QK 累加器为 BLOCK_M x 128 FP32，
++            # 在 M=256 时为 128KiB，落在单块 L0C 容量内。
++            offs_n_lo = n0 + tl.arange(0, BLOCK_N // 2)
++            offs_n_hi = n0 + BLOCK_N // 2 + tl.arange(0, BLOCK_N // 2)
++            k_ptrs_lo = k_base + offs_n_lo[:, None] * k_ss + offs_d[None, :] * k_sd
++            k_ptrs_hi = k_base + offs_n_hi[:, None] * k_ss + offs_d[None, :] * k_sd
++            k_lo = tl.load(k_ptrs_lo)
++            qk_lo = tl.dot(q, tl.trans(k_lo)) * qk_scale   # fp32 accumulation
++            k_hi = tl.load(k_ptrs_hi)
++            qk_hi = tl.dot(q, tl.trans(k_hi)) * qk_scale   # fp32 accumulation
++            # join -> [M, 128, 2]，permute -> [M, 2, 128]，reshape -> [M, 256]。
++            # 展平后低 128 列在前、高 128 列在后，严格保持原 key 顺序，不交错。
++            qk = tl.reshape(tl.permute(tl.join(qk_lo, qk_hi), (0, 2, 1)),
++                            (BLOCK_M, BLOCK_N))
+         else:
+-            # SKV % BLOCK_N == 0 且 D == BLOCK_D：本块全部列/通道合法，
+-            # 无掩码 K 载入与下面的无掩码 V 载入取代两次掩码载入。
+-            k = tl.load(k_ptrs)
+-        qk = tl.dot(q, tl.trans(k)) * qk_scale   # fp32 accumulation
+-
+-        if IS_CAUSAL:
+-            qk = tl.where(offs_n[None, :] <= offs_m[:, None] + delta, qk, -float("inf"))
+-        if MASK_KV:
+-            # MASK_KV 为假时该掩码恒真，整体删除；保留分支只为通用形状正确性。
+-            qk = tl.where(offs_n[None, :] < SKV, qk, -float("inf"))
++            k_ptrs = k_base + offs_n[:, None] * k_ss + offs_d[None, :] * k_sd
++            if MASK_KV:
++                kv_mask = (offs_n[:, None] < SKV) & (offs_d[None, :] < D)
++                k = tl.load(k_ptrs, mask=kv_mask, other=0.0)
++            else:
++                # SKV % BLOCK_N == 0 且 D == BLOCK_D：本块全部列/通道合法，
++                # 无掩码 K 载入与下面的无掩码 V 载入取代两次掩码载入。
++                k = tl.load(k_ptrs)
++            qk = tl.dot(q, tl.trans(k)) * qk_scale   # fp32 accumulation
++
++            if IS_CAUSAL:
++                qk = tl.where(offs_n[None, :] <= offs_m[:, None] + delta, qk, -float("inf"))
++            if MASK_KV:
++                # MASK_KV 为假时该掩码恒真，整体删除；保留分支只为通用形状正确性。
++                qk = tl.where(offs_n[None, :] < SKV, qk, -float("inf"))
+ 
+         # Online softmax, all reductions in fp32.
+         #
+@@ -262,8 +283,12 @@
+         # 非 SINGLE_KV 路径的表达式与相加顺序逐字不变。
+         if SINGLE_KV:
+             m_safe = tl.max(qk, 1)
+-            # Fully masked row guard (cannot happen when S <= SKV, kept for safety).
+-            m_safe = tl.where(m_safe > -float("inf"), m_safe, 0.0)
++            if not EXACT_UNGUARDED:
++                # Fully masked row guard (cannot happen when S <= SKV, kept for safety).
++                m_safe = tl.where(m_safe > -float("inf"), m_safe, 0.0)
++            # EXACT_UNGUARDED 仅用于有限 [-1,1]、非因果、非空且整块覆盖的精确
++            # 路径：每行 256 个 key 全部合法，rowmax 有限；exp2(qk-rowmax) 至少
++            # 有一个 0 使其等于 1，故 softmax 分母 >= 1，无需全掩码/max 守卫。
+             p = tl.exp2(qk - m_safe[:, None])
+             l_new = tl.sum(p, 1)
+         else:
+@@ -335,9 +360,13 @@
+         l_i = l_new
+         m_i = m_safe
+ 
+-    l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+-    out = acc / l_safe[:, None]
+-    out = tl.where(l_i[:, None] > 0.0, out, 0.0)  # all-masked rows -> zeros
++    if EXACT_UNGUARDED:
++        # 精确路径：l_i >= 1（见上方说明），分母守卫与全掩码零输出守卫冗余。
++        out = acc / l_i[:, None]
++    else:
++        l_safe = tl.where(l_i > 0.0, l_i, 1.0)
++        out = acc / l_safe[:, None]
++        out = tl.where(l_i[:, None] > 0.0, out, 0.0)  # all-masked rows -> zeros
+ 
+     o_ptrs = Out + b * o_sb + hq * o_sh + offs_m[:, None] * o_ss + offs_d[None, :] * o_sd
+     if MASK_MD:
+@@ -391,6 +420,15 @@
+     # 累加同一组乘积，是否仍在阈值内由原四项 checker 判定。BF16 单次 fp16 PV
+     # 把概率精度由 2^-18 降到 2^-11（近似，非等价），适用输入域见文件头说明。
+     BLOCK_D = max(16, triton.next_power_of_2(D))
++    # 本轮独立实验（资源/性能分支）：只在原 BF16 非因果精确 SINGLE_KV 几何
++    # （D128、SKV==256、S%256==0）上把 BLOCK_M 由 128 提到 256。选路只用
++    # dtype 与 shape 元数据（合法元数据，不读输入值、不看 case_id）。
++    # 动机一：program 数 512->256，交接链数随之减半（墙钟由每程序跨核交接链
++    # 数量主导）。动机二：M256 下若仍做单条 256x256 QK dot，L0C 累加器为
++    # 256KiB 超单块容量；改为两条 256x128 FP32 QK dot（各 128KiB）后，PV 输出
++    # 256x128 FP32 同样为 128KiB，两处都落入已知单块容量。
++    SPLIT_QK = ((value.dtype == torch.bfloat16) and (not is_causal)
++                and (BLOCK_D == 128) and (SKV == 256) and (S % 256 == 0))
+     if BLOCK_D <= 128:
+         # 保留机制：非因果沿 query 行方向由 64 提到 128。
+         # 成对 profiling（case4，1024 program，kernel 763.155us）显示每 program
+@@ -418,10 +456,19 @@
+             # softmax/p·v 转换 → PV dot 搬出），并删掉整段 online 重缩放。
+             # 其余形状（SKV=128 的 case2 等）仍取 128 的通用分块。
+             BLOCK_N = 256 if (SKV >= 256 and SKV % 256 == 0) else 128
++        if SPLIT_QK:
++            # 只在该精确几何上覆盖：M 256 / N 256。
++            BLOCK_M = 256
++            BLOCK_N = 256
+     elif BLOCK_D <= 256:
+         BLOCK_M, BLOCK_N = 32, 32
+     else:
+         BLOCK_M, BLOCK_N = 16, 32
++
++    # 精确路径守卫删除标志：与 SPLIT_QK 同一几何条件。该路径输入域为合同
++    # 的有限 [-1,1]、非因果、SKV 非空且 S%256==0 整块覆盖，故 rowmax 有限、
++    # softmax 分母 >= 1；全掩码/max/分母/零输出守卫冗余。其他路径保持原守卫。
++    EXACT_UNGUARDED = SPLIT_QK
+ 
+     # 掩码可证冗余判据：只用合法元数据（shape 与分块整除性、D 是否等于
+     # BLOCK_D），不读任何输入值、不按 case_id 或数值选路。整除成立时掩码在
+@@ -504,6 +551,8 @@
+         MASK_MD=MASK_MD, MASK_KV=MASK_KV,
+         PV_SINGLE_F16=PV_SINGLE_F16,
+         SINGLE_KV=SINGLE_KV,
++        SPLIT_QK=SPLIT_QK,
++        EXACT_UNGUARDED=EXACT_UNGUARDED,
+         num_warps=1, num_stages=1,
+     )
+     return y

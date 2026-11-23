@@ -1,0 +1,88 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "9ab93d440c2cb22141b5c11aa84ac34fb46633fa7808f65735084f3fbd47652c",
+  "phase": "explicit_unretained_repair",
+  "selected_layer": "kernel_address_mapping: stage-3 final PV (_gqa_fwd_kernel) V16 index interpretation, plus the comments that state its layout",
+  "layer_reason": "The failure is not an arithmetic, tiling or precision choice: every staged stage except stage 3 addresses the right bytes.  Stage 2 copies value as an identity flat cast (candidate.py:509-513) so v16 keeps the input BSND element order.  Stage 3 then indexes it with v_base=(b*NKV+kvh)*(SKV*D), row stride D (candidate.py:545-546), i.e. BNSD.  For BSND the same (b,n,kvh,d) element lives at b*SKV*NKV*D + n*NKV*D + kvh*D + d, so the two maps agree only at kvh==0,n==0 (case4: kvh*32640 == n*896 has no nonzero integer solution) and every other element silently reads a different V value with no out-of-bounds fault.  Because the defect is a wrong base/stride on one operand, the smallest correct repair is at the address layer of that kernel; touching tiling, precision, stage split or launch geometry would not address the cause and would confound the measurement.  Host repair analysis bounds the repair the same way.",
+  "host_suggestion": "host-repair-analysis.json: preserve the flat contiguous V conversion and its BSND ordering; fix only the stage-3 PV V16 address interpretation and the matching comments to read the original BSND stride NKV*D; keep all three stage mechanics, the original FP16 fallback and scratch ownership; no new tests.",
+  "my_repair": "Change only _gqa_fwd_kernel's V16 addressing to the BSND map: base = b*(SKV*NKV*D) + kvh*D, row stride NKV*D, channel stride 1 (the passed fp16 buffer stays a flat identity copy of the contiguous bf16 value, so no conversion, allocation or ownership changes), and rewrite the three comments/docstring that declare V16 as [B*NKV, SKV, D] so they state [B, SKV, NKV, D].  Stage 1 (QK), stage 2 (softmax + V cast partition), the STAGED metadata predicate, the fused fallback, scratch sizes, launch counts and dtype/precision paths are left byte-identical.",
+  "evidence": [
+    {
+      "path": "workspace/repair-feedback.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "source_review_repair_required on this exact source_sha256 (9ab93d44...): 'Flat V conversion preserves BSND storage but final PV addresses it as BNSD with v_base=(b*NKV+kvh)*(SKV*D) and rowstride D. For original contiguous V the same (b,kvh,n,d) element instead has sequence stride NKV*D. This changes the mathematical input V. No device evaluation has started.' device_evaluation_started=false, required_ir_evidence=[] — the current source was never compiled or replayed."
+    },
+    {
+      "path": "workspace/host-repair-analysis.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "Host analysis on the same sha256 repeats the address diagnosis and scopes the repair: keep the flat contiguous conversion and BSND ordering, fix only the final PV V16 interpretation and matching comments to read BSND stride NKV*D, keep all three stages, the original FP16 fallback and scratch ownership."
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Stage 2 writes v16[offs] = value_flat[offs] for offs over B*NKV*SKV*D (lines 509-513), an order-preserving cast of the contiguous BSND value; stage 3 reads V16 + (b*NKV+kvh)*(SKV*D) + offs_n*D + offs_d (lines 545-546).  Derived flat index of the same logical element under the BSND copy is b*(SKV*NKV*D) + n*(NKV*D) + kvh*D + d.  Equality requires kvh*D*(SKV-1) == n*(NKV-1)*D, i.e. for case4 (NKV=8, SKV=256) kvh*32640 == n*896, satisfied only at kvh=n=0; all other programs multiply P by another head's/row's V rows while staying inside the 2MiB buffer, so the error is silent."
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "background",
+      "finding": "This IR's loc headers point at attempt-019/workspace/candidate.py, i.e. the retained parent (2a98e3e0...), not the current sha256, so it is background only and is not a compile record of the current staged source.  It shows how the parent maps the same contiguous BSND V: v_base = V + b*262144 + kvh*128 and row advance offs_n*1024, i.e. base=b*SKV*NKV*D, head offset=kvh*D, row stride=NKV*D — the stride semantics the repaired stage 3 must reproduce, and the confirmation that the parent's own V path was never the broken one."
+    },
+    {
+      "path": "workspace/context-brief.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "phase=explicit_unretained_repair, actual_failed_ir=[], current_profiling=null, current_simulator=null, preserved_best_source_sha256=2a98e3e0... ; current-profiling.json / simulator-evidence.json remain bound to the earlier source and are historical background only."
+    },
+    {
+      "path": "workspace/contract.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "Fixed cases 1,2,4,7 with unchanged official checker 12180ce7 and golden; case4/case7 use bf16 with SKV=256, NKV=8, G=8, V shape [B,SKV,NKV,D] contiguous, which is the concrete geometry the stride arithmetic above is evaluated on."
+    }
+  ],
+  "hypothesis": "The staged path's only semantic defect is the stage-3 V16 address map: the buffer content is correct BSND (identity flat cast in stage 2) but is consumed as BNSD, so PV multiplies probabilities by the wrong V rows for every (b,kvh) except kvh=0,n=0.  Once stage 3 reads base=b*(SKV*NKV*D)+kvh*D with row stride NKV*D and channel stride 1, the staged pipeline computes the same products as the fused parent over the same j order; nothing else in the staged path needs to change for the mathematical input V to be identical.",
+  "alternatives": [
+    "Alternative A: write v16 in BNSD order inside stage 2 (strided/gather cast) and keep stage 3 contiguous.  Also correct, but it moves the strided access to the cast and rewrites stage-2 ownership/indexing; host explicitly asked to preserve the flat contiguous BSND conversion, so it is not adopted in this repair.",
+    "Alternative B: drop the staged path and return to the fused kernel.  Discarded: the staged mechanism is this round's experiment and its cost/benefit has not been measured at all; reverting would delete an untested candidate instead of repairing a proven address bug.",
+    "Alternative C: keep BNSD addressing and instead make v16 real BNSD by host-side permute/contiguous.  Discarded: host-side data movement violates the 'host only allocates/passes metadata' rule and adds a device copy outside Triton."
+  ],
+  "discriminating_observation": "The index-equality algebra on the actual constants of this contract (NKV=8, SKV=256, D=128): BNSD reading base/stride matches BSND storage only at kvh=n=0, and the parent TTIR for the same contiguous tensor shows row stride 1024=NKV*D and head offset 128=D.  Both are static facts of the current source plus the parent IR, and they separate 'the content is wrong (conversion bug)' from 'the content is right but read through the wrong map (addressing bug)': stage 2's store and load use the same flat offsets, so content is a faithful BSND copy.",
+  "change": "In _gqa_fwd_kernel replace v_base=(b*NKV+kvh)*(SKV*D) / offs_n*D with the BSND map b*(SKV*NKV*D)+kvh*D and offs_n*(NKV*D), and update the docstring/comments (kernel docstring, file-header staged-path paragraph, and the run() scratch comment) so V16 is described as [B, SKV, NKV, D] in original BSND element order.  No other line of computational code changes: STAGED predicate, stage 1, stage 2, the fused/persist/PV-select path, scratch allocation sizes, num_warps/num_stages and launch counts stay as they are.",
+  "tradeoffs": {
+    "precision": "Unchanged.  The same fp32 scores, fp32 scale/max/exp2/sum, fp32 row-reciprocal normalisation and the same fp16 P/qk and fp16 V operand widths are used; the repair only changes which V row is read.  Remaining approximation, already accepted for this candidate and to be arbitrated by the official checker, is P rounded to fp16 (2^-11 relative, |p|<=1 after normalisation) plus the pre-PV normalisation point; V from bf16 is exact for |v|>=2^-14.",
+    "active_buffers": "Unchanged.  Still scores 64MiB fp32 + P 32MiB fp16 + V16 2MiB fp16 for case4, same three allocations per call, same 128x256 score tile and 256x128 V tile in stage 3; the V tile's address arithmetic changes, its byte footprint does not.",
+    "handoffs": "Unchanged.  Still three launches; stage 3 keeps exactly one tt.dot and one L0C movout per program, and stage 2 still does no cube work for V (it stores fp16 from vector registers).  The one measurable risk is inside the stage-3 V load: the 256 rows of the V tile are now 256 contiguous 256B segments with stride 2048B instead of one 64KiB contiguous run, so the mov-in may cost more descriptor/row entries at the same byte count.",
+    "parallelism": "Unchanged.  Grids remain (S/128, B*NQ) for stages 1 and 3 and (B*NQ*S/64 + cdiv(B*NKV*SKV*D,8192)) for stage 2; per-program ownership of P, scores and out rows is untouched, and v16 rows are read-only shared across the G query heads of a KV head (same sharing the fused path had)."
+  },
+  "expected": "Correctness: for every staged case, stage 3 now reads exactly the (b, n, kvh, :) V rows that stage 2 cast, i.e. the same tensor elements the fused parent reads, so the staged output should match the parent up to the documented fp16-P approximation instead of being a permutation-contaminated product.  Performance: no change in launch count, bytes moved or arithmetic; stage-3 time should move only through the strided V mov-in (predicted small, direction unknown, bytes constant).  Neither the staged path's net win nor per-case latency is claimed before device measurement: this source has never been compiled or replayed, and preflight previously returned awaiting_source_review.",
+  "validation": "1) bridge preflight on the repaired source (expect awaits source review again, since the harness requires review before device ops); 2) on review pass, full four formal cases (1,2,4,7) plus 4 supplementary with the unchanged official checker/golden and unchanged full-call timing; 3) confirm staged-path cases (4,7) numerically pass and compare per-case latency against the retained parent 2a98e3e0...; 4) confirm non-staged cases (1 causal fp16, 2 SKV=128 fp16) are bit-for-bit on the untouched fused path.",
+  "unknown": [
+    "Whether the repaired staged path passes the official checker at all: the fp16-P pre-PV normalisation is an approximation never device-validated.",
+    "Whether the staged path beats the retained parent; it has no measurement, and it adds ~192MiB of intermediate traffic and two launches.",
+    "Size of the strided-V mov-in penalty in stage 3 (256 rows x 256B, 2048B stride); if it is large, the deferred alternative is to emit v16 in BNSD order inside stage 2, which needs a measured reason and a fresh decision.",
+    "Whether a 128x256 fp16 dot with num_warps=1 compiles inside the UB/L0C budget of this target; no compile of the staged source has run.",
+    "Whether per-program ownership inside stage 2 (soft pids and V-cast pids in one launch) keeps the vector cores balanced; needs paired profiling of the repaired candidate."
+  ],
+  "post_change_observation": {
+    "decision_id": "3ef0e9ec459e414e809ad30f12ea87d7",
+    "pre_edit_source_sha256": "9ab93d440c2cb22141b5c11aa84ac34fb46633fa7808f65735084f3fbd47652c",
+    "post_edit_source_sha256": "fcde9630ecbc238b76066bd6421d1aec8b9bc73d3e73ba9475f58aa4375b643b",
+    "edits": [
+      "_gqa_fwd_kernel: v_base=(b*NKV+kvh)*(SKV*D) -> b*(SKV*NKV*D)+kvh*D; row stride D -> NKV*D (the only computational change)",
+      "_gqa_fwd_kernel docstring: V16 declared as [B, SKV, NKV, D] flat BSND copy instead of [B*NKV, SKV, D]",
+      "staged-path header block and run() scratch comment: state the BSND ordering and that the stage-3 read now uses it",
+      "file header: new short paragraph recording the address-mode repair and that stage mechanics / fp16 fallback / scratch ownership are unchanged"
+    ],
+    "preflight": "awaiting_source_review for fcde9630 at this stage; no compile and no device run has happened for the repaired source, so no compilation or on-device gain is claimed.",
+    "pending": [
+      "external source review of the repaired addressing",
+      "full four formal cases + 4 supplementary under the unchanged checker/golden once review passes",
+      "paired profiling of the repaired candidate to size the strided V mov-in in stage 3"
+    ]
+  },
+  "simulator_incremental_judgment": "No simulator run was made for this candidate and none is used as evidence: simulator-evidence.json / current-profiling.json keep their original attempt-019 binding and are historical background only, not observations of the current source.  The decision therefore rests on the current source text and the parent TTIR's stride semantics; no incremental simulator judgment is claimed, and the repair is not credited with any causal contribution from simulator material."
+}

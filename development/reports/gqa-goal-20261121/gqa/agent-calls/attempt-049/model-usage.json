@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 44,
+    "duration_ms": 130875,
+    "usage": {
+      "input_tokens": 49624,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1580672,
+      "output_tokens": 19883,
+      "output_tokens_details": {
+        "thinking_tokens": 7085
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 49624,
+        "outputTokens": 19883,
+        "cacheReadInputTokens": 1580672,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.5355310000000004,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 7085,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.5355310000000004,
+    "result": "本调用完成一次独立实验并已按验收边界交接。\n\n## 本次改动（唯一机制：PART_TILES 的 Q/输出行归属）\n\n- **改前决策已登记**：`decision 89192c65…`，绑定源码 `3c34fdfb…`（= 保留最佳/父版本），已成功读取 `workspace/simulator-evidence.json` 后登记。\n- **源码改动**（`candidate.py`，新 SHA `fd25f875…`，仅 `_gqa_tile_part_body` 的 PART_TILES 体内行归属 + 注释/文档串）：\n  - `e_row = t*BLOCK_M + arange(BLOCK_M)`，`seq_row = e_row // G`，`gi_row = e_row % G`；\n  - 直接二维指针：`Q + b*q_sb + kvh*G*q_sh + (seq_row*q_ss + gi_row*q_sh)[:,None] + offs_d[None,:]*q_sd`，输出同构地用 `o_ss/o_sh` 重算；\n  - 掩码分支由 `offs_m < S` 改为 `seq_row < S`。\n  - 无 reshape/join/transpose/gather、无额外 kernel、无 host 分配/缓存/发射键改动、无按 case_id 或输入值选路；K/V 组载入、TPG/T/P/grid、SM_OFFSET、FP16 rawQK、PV 语句序、删守卫归一化全部逐字保留。\n\n## 机制与证据判断\n\n- 热点（新增）：simulator 把 veccore 头部搬运热点定位到 MTE3 `MOV_SRC_TO_DST_ALIGN` 25.6μs/8 次 与 17.41μs/9 次（即 `tl.store` 写回），cube 头部为 `WAIT_FLAG_DEVI` 84.32μs/9 次 + `FIX_L0C_TO_DST` 23.07μs/9 次。\n- 流水（新增）：每程序 `aiv_mte3_time` 20.78μs、`aiv_mte2_time` 21.86μs，而写回字节仅 1305KB/程序、`aiv_mte3_instructions` 仅 54.6 次 —— 搬运时间与字节/指令数不成比例。\n- 机制：TTIR 显示行基址是 `hq*q_sh + offs_m*q_ss`（case4 q_ss=16KB），每 tile 128 行 = 128 个 256B 段跨步；改平坦映射后同一序列内 G 个查询头连续 → 每 tile 为 16 个 2KB 段。\n- 不新增的判断：不据此声明全局带宽瓶颈，也不把三核部分窗口时间相加（`application_completed=false`，全调用 completion 仍缺失）。\n- 数值：QK 归约轴、FP16 舍入、公共偏移 exp2、分母 FP32 求和、PV 内积顺序均按行独立，仅 M 维铺排/行地址变化，逐行结果与父版本一致；适用域 G>0、BLOCK_M%G==0（本实验 G=8/4、BLOCK_M=128），其他分支不变。\n\n## 交接状态\n\n- `preflight --source candidate.py` 返回 `awaiting_source_review`，源码 SHA `fd25f875c334f929efa8d0fab381344dfcdb901989c12b113e6ede30e537eda3`；字节已保持不动，等待宿主只读路径/地址边界审查与原完整四项（case1/2/4/7）真机评测。\n- 验收判据：原 checker `12180ce7` 与原 golden、原 dtype/计时合同不变，四项均需 passed；**case4 full call 需低于 175.57260μs**，case1/2/4/7 结果与修改后 simulator 重放一并回传。\n- 若后端把非仿射行基址降级为逐元素搬运，则按“编译失败/退步的失败实验”记录，不替换为其他机制。"
+  }
+}

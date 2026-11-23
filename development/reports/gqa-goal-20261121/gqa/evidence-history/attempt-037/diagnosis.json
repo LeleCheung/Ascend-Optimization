@@ -1,0 +1,54 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "e7fad4d8519526ea1731371e47d7ddb1417300145d28d14f4dca49bffbabee9b",
+  "evidence": [
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "trigger",
+      "finding": "case4 部分窗口 veccore0 指令计数：VMULS 38 次、VADDS 19 次、VEXP 19 次（每个观测 tile 恰好 2 次 VMULS）。上下文记录的实际顺序为 VMULS(raw·qk_scale)→VADDS(−SM_OFFSET)→VMULS(exp2 转自然指数，×ln2)→VEXP，即每个 tile 在 VEXP 前串了 4 遍向量变换。三核部分窗口各自归一化，application_completed=false，全调用 completion 缺失；BAR CSV 累计不入队相加。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "第 100–102 行：qk=arith.mulf(raw, qk_scale)、a=arith.subf(qk, SM_OFFSET)、math.exp2(a)。两处标量为独立 op，且 exp2 在 Ascend 下降为额外一次乘 ln2 的自然指数。raw 由 tl.dot 给出 fp32（Q/K 的 bf16 输入与 FP32 累加路径不变）。"
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "background",
+      "finding": "case4 已测量 full_call=205.28415us；Vector 侧 aiv_vec_time 约 59us/核、Cube 累计与参考相当。本轮只针对 PART_TILES 的向量前处理，不改 QK/PV matmul、搬运与 20 worker 分区。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "父版本四项 checker 全部通过：case1 190.58315us、case2 189.22615us、case4 205.28415us、case7 178.30565us。保留最佳为 case4=205.28415us，本轮目标要求 case4 真实低于该值，其余三项真实变化一并保存。"
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "PART_TILES 主体第 217–237 行只在每个 tile 内做 qk=dot·qk_scale、MASK_KV 的 −inf 屏蔽、p=exp2(qk−SM_OFFSET)。SM_OFFSET 与 qk_scale 均为编译期标量常数；通用二维 grid 与 FP16 两项分解路径不使用该段。"
+    }
+  ],
+  "hypothesis": "在 PART_TILES 内保持 rawQK 为 bf16 输入、tl.dot 为 FP32 累加，只把 softmax 前处理改写为编译期自然指数仿射 a = raw·S + B（S=qk_scale·ln2、B=−SM_OFFSET·ln2），再 p=exp(a)。实数上 exp2(qk−SM_OFFSET)=exp(raw·S+B) 逐行等价；若安装语言提供合法 Triton fma，则 a 用一次 fma(raw,S,B) 单遍融合，把每 tile 的 4 遍向量变换（VMULS/VADDS/VMULS/VEXP）压到 2 遍（VFMA/VEXP）；即使无 fma，用 raw·S+B 也删去 exp2→exp 的那次 ln2 乘法，降为 3 遍。matmul、sum、fp16 PV、归一化、guard、地址、grid 与 20 worker 分区不变。",
+  "alternatives": [
+    "保持 exp2 原样：无收益，仅作基线对照。",
+    "只删 exp2 的 ln2 乘法而保留独立 VMULS+VADDS：可确定省 1 遍向量变换，但放弃 fma 融合，收益上限较低。",
+    "用 raw·S+B 单表达式依赖编译器自动收缩为 fma：Triton arith 默认不带 contract 标志，可能不生成 VFMA；因此优先显式合法 fma，缺失时回落到该表达式。"
+  ],
+  "discriminating_observation": "改后实际 IR 应把 arith.mulf+arith.subf+math.exp2 变为一次 fma/乘加与 math.exp；模拟器同一部分窗口应出现 VFMA 计数≈每 tile 1 次，VMULS 由 38 降到 0（或仅回落后端所需 0 次）、VADDS 由 19 降到 0，VEXP 保持 19。若计数不变，则说明前处理未被融合或 exp2 未走自然指数，机制未生效。最终以 case4 完整 full_call < 205.28415us 且四项 checker 通过为准。",
+  "change": "仅改 candidate.py：在 PART_TILES 主体把 qk=dot·qk_scale; p=exp2(qk−SM_OFFSET) 改为 raw=dot; a=fma(raw,NAT_SCALE,NAT_BIAS)（无 fma 时 a=raw·NAT_SCALE+NAT_BIAS）；MASK_KV 分支在自然指数域对无效列写 −inf；p=exp(a)。host 由 qk_scale 与 sm_offset 编译期算 NAT_SCALE=qk_scale*ln2、NAT_BIAS=−sm_offset*ln2，并以 constexpr 传入；USE_FMA 由 hasattr(tl.math,'fma') 元数据判定（不读输入值、不按 case_id 选路）。输入输出 dtype、公共偏移范围、分块、launch 次数、host 入口、20 worker、KV 复用、输出布局/fallback 全部保持。",
+  "expected": "case4、case7（PART_TILES 生效）Vector 前处理每 tile 由 4 遍减到 2–3 遍，全调用耗时应下降；case1/case2 走原通用路径与两项分解，不受影响（仅同源噪声）。四项 checker 以原阈值通过。若 fma 未被后端支持或未生成 VFMA，收益仅来自删去 exp2 的 ln2 乘法。",
+  "validation": "先落 decision 记录，再 preflight --source candidate.py；随后原完整四项 checker 真机评测；再取实际 IR 与模拟器部分窗口，核对 VMULS/VADDS/VFMA 计数与顺序。编译失败、无收益或回退均保留源码与证据。",
+  "selected_layer": "设备端 PART_TILES 单块 softmax 的向量前处理（exp 前仿射），不改 matmul/搬运/调度层。",
+  "layer_reason": "模拟器部分窗口显示这几次标量向量变换在 VEXP 前串行，属可被 Triton 源码直接表达的逐元素融合；Cube/L0C 已与参考相当，改计算组织比改搬运/程序数风险更低，且不引入额外 launch。",
+  "simulator_incremental_judgment": "相对父版本 profiling 新增的判断：同一 Vector 部分窗口把 raw·qk_scale、减 SM_OFFSET、exp2→exp 的 ×ln2、VEXP 作为 4 条独立指令串在 exp 之前；代数上三者可合为 raw·(qk_scale·ln2)+(−SM_OFFSET·ln2) 再 exp，故可检验 fma 融合是否缩短前处理。浮点风险：NAT_SCALE/NAT_BIAS 在 host double 下计算后取 f32，常数舍入由两处变为两处、fma 只做一次舍入，指数自变量与父版本相差 O(1e−7·|raw·S|)，不改变实数 softmax，但改变舍入最后一位，P 的 bf16/fp16 量化边界可能个别翻位；|q|,|k|≤1 合同值域下 p≤2^15 的 FP16 余量保持，MASK_KV 的 −inf 在自然指数域仍精确得 0。证据仅覆盖三核部分窗口、Cube 与 Vector 各自归一化，不能把局部指令差当作全调用因果收益；BAR 累计不入队相加。",
+  "unknown": [
+    "生成后候选 source_sha256=14fc8b9ac30aa8c3effbd850e5e28d964a15a4eb0069e0438a2c3bc09015c620，preflight 返回 awaiting_source_review；等宿主只读审查与完整四项真机评测，尚未取得新的成对 profiling/IR。",
+    "当前安装的 Triton 语言是否真的提供可编译的 tl.math.fma、且 Ascend 后端能把它下降为单条 VFMA 尚未由预检验证；若 _HAS_MATH_FMA 为假则走 raw·S+B 回落（仍省 ln2 乘法），若为真但后端不支持下述计数不会出现 VFMA，需按实际 IR 判定并保留失败记录。",
+    "预期收益仅作用于 PART_TILES（case4/case7 的 BF16 非因果单块路径）；case1/case2 走原通用路径。case4 是否真正低于 205.28415us 以及另三项真实变化仍需完整四条评测反馈。"
+  ]
+}

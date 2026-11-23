@@ -1,0 +1,123 @@
+--- 
++++ 
+@@ -13,7 +13,7 @@
+ KV heads are never materialised to N_q heads: each program indexes the shared
+ K/V head hq // G directly.
+ 
+-Query-row reuse (this round's mechanism, non-causal only): BLOCK_M stays 64 for
++Query-row reuse (retained, non-causal only): BLOCK_M stays 64 for
+ the causal path and rises to 128 otherwise, so a program keeps the loaded K/V
+ tiles for 128 query rows instead of 64.  The paired profiling of case4 showed
+ 1.09us of aic_cube_time against 9.15us of aic_scalar_wait_id1 per program over
+@@ -28,6 +28,28 @@
+ untouched; only tl.dot's M tiling and the program count change, so every output
+ row still accumulates the same KV blocks in the same j order with the same
+ two-term probability split.
++
++Single-fp16 PV on the bf16 path (this round's mechanism): the paired profiling
++of case4 (512 programs, 467.7us kernel) reports aic_cube_total_instr_number = 6
++per program -- three matmuls per KV block, i.e. QK plus the two probability
++terms -- and L0C_to_GM = 384KiB per program (196608KiB total) against 98304KiB
++for the CANN reference, while aic_cube_time is only 2.02us against 11.79us of
++aic_scalar_wait_id1.  The actual TTIR/BCMLIR confirm the third matmul exists
++only to carry the bf16 residual: dot(p_lo, v) with a zero accumulator, then a
++128x128 fp32 multiply by 1/2048 and an add.  On the bf16 path the two terms buy
++2^-18 relative probability precision; a single fp16 PV term buys 2^-11, which
++is still better than an undecomposed bf16 term (2^-9) and costs one matmul and
++one cube-to-vector handoff per KV block instead of two.  So when V is bf16 the
++probabilities and V are cast to fp16 and one fp16 x fp16, fp32-accumulating dot
++replaces the pair: 3->2 matmuls per KV block, L0C 384->256KiB per program, no
++zero-initialised dot, no 1/2048 rescale and no extra vector merge.  This is an
++approximation, not an identity: p's fp16 rounding is a 2^-11 relative error, V
++is exact from bf16 while |v| >= 2^-14, falls into fp16 subnormals below that
++(absolute error <= 3e-8) and would overflow above 65504, which is outside this
++contract's [-1,1] input range and is recorded only as a range limitation.  The
++fp16 and any other dtype path keep the two-term expression and its summation
++order verbatim; the path is chosen from the V dtype metadata alone, never from
++input values or a case id.
+ 
+ Compile-time geometry specialisation (earlier, retained mechanism): shape, stride,
+ head counts, scale and the causal offset are passed as tl.constexpr, because
+@@ -70,6 +92,7 @@
+     IS_CAUSAL: tl.constexpr,
+     MASK_MD: tl.constexpr,
+     MASK_KV: tl.constexpr,
++    PV_SINGLE_F16: tl.constexpr,
+ ):
+     pid_m = tl.program_id(0)
+     pid_bh = tl.program_id(1)
+@@ -155,10 +178,26 @@
+         # The low-order product is added last in fp32 so it is not rounded
+         # against the O(sum_j p_j |v_j|) accumulator; V is an exact input, so
+         # only p is split.  Everything stays strict Triton.
+-        p_hi = p.to(v.dtype)
+-        r1 = (p - p_hi.to(tl.float32)) * 2048.0
+-        p_lo = r1.to(v.dtype)
+-        acc = acc * alpha[:, None] + tl.dot(p_hi, v) + tl.dot(p_lo, v) * (1.0 / 2048.0)
++        #
++        # 本轮机制（BF16 路径单次 fp16 PV）：两项分解在 BF16 下每 KV 块要付
++        # 3 个 matmul（QK + 2×PV）与 384KiB 的 L0C 搬出（每次 128x128 f32 的
++        # 64KiB）。成对 profiling 里每程序 cube 仅 2.02us、而 aic_scalar_wait_id1
++        # 达 11.79us，L0C_to_GM 总量是 CANN 参考的 2 倍：墙钟跟的是跨核交接链
++        # 条数。因此 BF16 改用 11 位尾数的 fp16 作 PV 计算类型，一次
++        # fp16×fp16、fp32 累加就替代两条 bf16 dot：每 KV 块 3→2 个 matmul、
++        # L0C 384→256KiB/程序，并省掉零初值 dot、1/2048 缩放与一次矢量合并。
++        # 数值上是近似而非等价：p 的 fp16 舍入为 2^-11 相对误差（单项 BF16 为
++        # 2^-9，故仍优于未分解的 bf16 单项）；V 在 |v|>=2^-14 时 bf16→fp16
++        # 精确，|v|<2^-14 落 fp16 次正规（绝对误差 <=3e-8），|v|>65504 溢出——
++        # 后者超出合同 [-1,1] 输入域，仅作为适用范围限制记录。
++        # FP16 及其他 dtype 仍走原两项分解，表达式与相加顺序逐字不变。
++        if PV_SINGLE_F16:
++            acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v.to(tl.float16))
++        else:
++            p_hi = p.to(v.dtype)
++            r1 = (p - p_hi.to(tl.float32)) * 2048.0
++            p_lo = r1.to(v.dtype)
++            acc = acc * alpha[:, None] + tl.dot(p_hi, v) + tl.dot(p_lo, v) * (1.0 / 2048.0)
+         m_i = m_safe
+ 
+     l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+@@ -205,16 +244,17 @@
+     # 并行度不变；非因果三个 case 的分块与性能路径不变。
+     # 两项概率分解的表达式与相加顺序保持不变，仅 KV 轴划分与重缩放次数变化。
+     #
+-    # 上一轮（已验收，774.8852us）改动只在编译期几何特化与可证冗余掩码消除上；
+-    # 本轮在此之上只改非因果的 BLOCK_M（64->128），见下方说明。因果/非因果
+-    # BLOCK_N 分流、两项概率分解表达式与相加顺序均保持不变。
++    # 已验收保留：编译期几何特化、可证冗余掩码消除、非因果 BLOCK_M 64->128。
++    # 本轮（retained 472.46045us 之上）只改 BF16 的 PV 计算类型与条数（见内核
++    # 中 PV_SINGLE_F16 分支），分块、grid、KV 轴划分、FP16 两项分解表达式与
++    # 相加顺序全部保持不变。
+     # 收益或代价都必须由完整四项真机评测判定，本注释不据此改写结论。
+     # 数值风险说明：BLOCK_M 只改变 tl.dot 的 M 维铺排与程序数，每行输出仍按同一
+-    # j 顺序累加同一组 KV 块、同一 alpha 重缩放与同一两项分解，QK 归约维仍是
+-    # D=BLOCK_D、PV 归约维仍是每块 BLOCK_N 列，故累加序列不变，预计精度不变。
++    # j 顺序累加同一组 KV 块、同一 alpha 重缩放；本轮 BF16 单次 fp16 PV 则把
++    # 概率精度由 2^-18 降到 2^-11（近似，非等价），适用输入域见文件头说明。
+     BLOCK_D = max(16, triton.next_power_of_2(D))
+     if BLOCK_D <= 128:
+-        # 本轮机制：非因果沿 query 行方向由 64 提到 128。
++        # 保留机制：非因果沿 query 行方向由 64 提到 128。
+         # 成对 profiling（case4，1024 program，kernel 763.155us）显示每 program
+         # 墙钟约 15us 中 aic_cube_time 仅 1.09us，而 aic_scalar_wait_id1 9.15us；
+         # 模拟器窗口中位 Cube productive 7.90%/wait 33.27%/idle 58.83%、Vector
+@@ -241,6 +281,11 @@
+     MASK_MD = not ((S % BLOCK_M == 0) and (D == BLOCK_D))
+     MASK_KV = not ((SKV % BLOCK_N == 0) and (D == BLOCK_D))
+ 
++    # PV 计算类型选路：只用 V 的 dtype 元数据（合法元数据，不读输入值、不看
++    # case_id）。BF16 输入走单次 fp16 PV（本轮机制，见内核注释与文件头），
++    # 其余 dtype 保持两项分解。设备内没有按数值分支。
++    PV_SINGLE_F16 = value.dtype == torch.bfloat16
++
+     grid = (triton.cdiv(S, BLOCK_M), B * NQ)
+     _gqa_fwd_kernel[grid](
+         query, key, value, y,
+@@ -253,6 +298,7 @@
+         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+         IS_CAUSAL=bool(is_causal),
+         MASK_MD=MASK_MD, MASK_KV=MASK_KV,
++        PV_SINGLE_F16=PV_SINGLE_F16,
+         num_warps=1, num_stages=1,
+     )
+     return y

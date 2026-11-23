@@ -1,0 +1,50 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "aec8e907f907a8d647f70a343ba0fd38d3d848636a586276f96084e30930895d",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4 候选 kernel 329.446594us、Block Dim 512、Mix Block Dim 1024；每程序 GM_to_L1 均值 224KiB、总和 114688KiB(112MiB)，L0C_to_GM 均值 192KiB；每程序 aic_cube_time 1.293us、aic_scalar_wait_id1 7.710us、aiv_vec_time 3.424us、aic_mte2_time 2.517us。参考 FusedInferAttentionScore 为 118.682373us。说明每程序都重读同一 (b,kvh) 的 K/V，K/V 搬运量随程序数线性放大。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "实际 TTIR 已是 SINGLE_KV 单迭代无循环：%k = tt.load tensor<256x128xbf16>，%v = tt.load tensor<256x128xbf16>，%acc_40/41 先 extf 到 f32 再 truncf 为 f16 才进入 PV dot；%q 载入为 tensor<128x128xbf16>。K/V 的载入与 V 的 f16 转换对同一 kvh 的 G=8 个 query head 完全相同，但 512 个 program 各自重复一次。"
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "background",
+      "finding": "BCMLIR 中 K、V 均以 memref.alloc()+memref.copy 搬入 UB（256x128 bf16 各 64KiB），V 经 extf/truncf 得到 256x128 f16 后再做 128x256xf16 * 256x128xf16 的 PV matmul。这些 K/V 相关张量结构不依赖 query head，是可在 query-tile 循环外提升的不变项。"
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "_gqa_fwd_kernel 当前 pid_bh=b*NQ+hq、kvh=hq//G，grid=(cdiv(S,128), B*NQ)，case4 即 2×256=512 程序；每个程序只处理一个 query head 的一个 128 行块。改成每 (b,kvh) 一程序后，hq=kvh*G+gi、行块 mb，共 G*cdiv(S,128)=16 个 query tile，覆盖对 (b,hq,row-block) 的所有权仍唯一。"
+    }
+  ],
+  "hypothesis": "在 BF16、非因果、SINGLE_KV、D128、原 BLOCK_M=128/BLOCK_N=256 的路径上，把程序映射由 (query-row-block, b×hq) 改为 (b, kvh) 一程序负责 G 个 query head × cdiv(S,128) 个行块，并在 query-tile 循环外一次性载入 K、一次性把 V 转成 f16，可消除同一 kvh 的 K/V 载入与 V 转换在各 query head 间的重复（case4 理论 16×），同时每个 query tile 的 QK、FP32 softmax、单次 fp16 PV、归一化与写出表达式逐字不变。风险是 K/V 张量跨 16 次迭代存活会拉长 UB 生命周期，编译器可能重物化/重拷贝（收益归零）或峰值超 196608B（编译失败）；32 程序对 20 Cube 只有约 1.6 波，占用率可能低于 512 程序。"
+  ,
+  "alternatives": [
+    "保持 512 程序 grid、只优化 softmax/搬运链：不触及 K/V 重复读，理论收益上限小。",
+    "用全局 scratch 缓存 f16 V 再起 kernel：引入新全局缓冲与额外启动，违反本实验约束，已排除。",
+    "继续增大 BLOCK_M（M256）：015 已因 3D concat 降为 UB 3146016B 编译失败，暂不重复。"
+  ],
+  "discriminating_observation": "编译后实际 TTIR 中 K/V 的 tt.load 与 V 的 extf/truncf 是否落在 query-tile scf.for 之外（真提升），循环体是否只有 q load/QK/softmax/PV/store；以及程序数是否变为 32。若编译报 UB 超限或 IR 把 K/V 搬入循环体，即判定该机制在当前后端不可用并保留负结果。新 profiling 的每程序 GM_to_L1 与总搬运量可进一步区分。",
+  "change": "在 candidate.py 中新增 constexpr 分支 PERSIST_KV：仅当 (not is_causal) and PV_SINGLE_F16 and SINGLE_KV and BLOCK_M==128 and BLOCK_N==256 and BLOCK_D==128 时为真。为真时 grid 改为 (B*NKV,)，程序 pid 解出 b=pid//NKV、kvh=pid%NKV，先载入 K 并计算 v16=V.to(float16) 于循环外，再用单层扁平循环 t in range(0, G*NB_M) 遍历 query tile，显式 hq=kvh*G+(t//NB_M)、mb=t%NB_M，逐 tile 载入 Q、做 QK dot、FP32 max/exp2/sum、单次 fp16 PV、acc/l_safe 与写出；掩码判据与数值表达式逐字沿用。为假时保留原 kernel 路径与 grid 不变。主符号仍为 _gqa_fwd_kernel。",
+  "expected": "case4：程序数 512→32，K/V 载入与 V 转换由每 (b,kvh) 的 G=8 个 query head × 2 行块各做一次降为一次，K/V 的 GM→L1 总量理论约 64MiB→4MiB；Q 与 PV 写回总量不变，QK/softmax/PV 总算术不变。若 K/V 成功提升且 UB 可容纳，交接链与搬运减少可能降低墙钟；若 32 程序占用不足或编译器重物化，则可能退步或编译失败。case1/2/7 的既有路径与算术保持（case7 同为 bf16 非因果 SINGLE_KV，也走持久化分支，属元数据选路而非 case_id）。",
+  "validation": "先 preflight --source candidate.py 观察编译与 UB，读取实际 TTIR/BCMLIR 确认 K/V 位于 query-tile 循环之外且程序数为 32；随后交宿主用原四项 checker、官方 golden、原输入输出 dtype 与计时合同完整评测 case1/2/4/7，精度阈值不变。其它路径核对 grid 与算术未变。",
+  "selected_layer": "source（Triton kernel 的 program 映射与循环组织）",
+  "layer_reason": "K/V 跨 query head 的重复载入/转换可由源码中的 program 映射与循环层次直接表达（每 (b,kvh) 一程序、循环外提升 K/V），无需新增全局缓冲或启动；当前无证据指向单算子生成缺陷，故先改源码。",
+  "simulator_incremental_judgment": "本轮无需新增模拟器输入：现有成对 profiling、实际 TTIR/BCMLIR 与源码已足以提出“K/V 按 kvh 持久复用”的具体机制；剩余歧义是后端是否把 K/V 提升到循环外、长生命周期 UB 是否超预算以及 32 程序占用是否足够，这些由编译后的实际 IR 与完整真机评测直接区分，不是新增模拟器输入能回答的。宿主保留此前模拟器知识，候选生成后仍开展模拟器重放作为后续核对。",
+  "unknown": [
+    "K/V 跨 16 次 query-tile 迭代存活的 UB 峰值是否超过 196608B。",
+    "后端是否会把 K/V 载入/V 转换重物化进 query-tile 循环，使复用失效。",
+    "32 程序（约 1.6 波于 20 Cube）占用率是否足以覆盖单程序更长串行链带来的延迟。"
+  ],
+  "post_change_observation": "候选已实现每 (b,kvh) 一程序的持久复用分支，source_sha256=beeb2335d99a34262701b9023d62b816f7621381eaada3500506d6dde805f9f4。preflight 返回 awaiting_source_review（源审查边界，工具桥未编译），故尚无实际 IR/计时；候选字节保持不变，交宿主只读审查后做完整四项真机评测，再据结果核对 K/V 是否提升、UB 是否超限与 32 程序占用。"
+}

@@ -1,0 +1,109 @@
+--- 
++++ 
+@@ -105,8 +105,8 @@
+ 当前硬件 Cube 核数这一调度参数（纯元数据，由 shape 与常量决定，不读输入值）。
+ 每个 worker 的区间按 KV 组组织：tile 序号 = (b*NKV + kvh)*G*NB_M + g*NB_M + mb，
+ 故同一 (b, kvh) 组内 TPG = G*NB_M 个 tile 连续；worker 只对与其区间相交的组
+-载入一次 K/V 并一次性把 V 转 fp16，再对该组内的 tile 子区间逐 tile 执行与
+-019 逐字相同的 QK、fp32 softmax、单次 fp16 PV、PV 后归一化与 BSND 写出。
++载入一次 K/V（V 保持 BF16 原样，不转 fp16），再对该组内的 tile 子区间逐 tile
++执行与 019 逐字相同的 QK、fp32 softmax、单次 BF16 PV、PV 后归一化与 BSND 写出。
+ 收益：程序数 128->20（约 7 个波次合成单波次、每 worker 25/26 tile 近乎均分），
+ K/V 组载入次数 128->约 51，GM_to_L1 总量约 65536KB->6.5MB 量级；每 tile 的
+ matmul 数、L0C 搬出量与浮点表达式、相加顺序全部不变（无跨 tile 归约）。
+@@ -126,7 +126,7 @@
+ host 由纯元数据取上界 Bq = D*|qk_scale| 并令 SM_OFFSET = Bq - 15，使
+ p = exp2(qk - SM_OFFSET) <= 2^15 = 32768 < 65504（约 2 倍余量），同时使典型行
+ 的 p 处于 FP16 正规区。这样每 tile 删除一次 128x256 max 归约、其守卫与广播减法，
+-只保留标量常数减法 + exp2；sum、fp16 PV、PV 后归一化、全部地址与 20 worker
++只保留标量常数减法 + exp2；sum、单次 PV（本轮为 BF16）、PV 后归一化、全部地址与 20 worker
+ 连续分区逐字保留（输出 guard 的处置见下段「删除可证冗余分母守卫」）。数值上是实数等价而非逐位等价：每行 p、l_new 与 PV
+ 分子同乘一个公共 2 的幂次因子并精确抵消；p 的 FP16 舍入仍为 2^-11 相对误差量级。
+ 风险是为节省归约而放弃逐行对齐：若某行 max 远低于 SM_OFFSET（约 -12.7 以下）该行
+@@ -150,6 +150,16 @@
+ PV dot，再从原 FP32 p 求分母，让 P 的传输有机会早发并与 Cube 的 PV 重叠。
+ 数值不变（同一 FP32 p 的同一归约、同一 fp32 累加 dot），是否真正重叠由修改后
+ 重放与完整四项真机评测判定；其他分支与精度路径逐字保留。
++
++PART_TILES 单次 BF16 PV（本轮机制，仅 PART_TILES）：实际 TTIR/BCMLIR 显示
++V 载入后先 extf 到 f32 再 truncf 到 f16，PV 才以 f16×f16 matmul 执行；该转换
++是每组一次、对 256x128 元素的全量 Vector 改写，却只为让 PV 使用 f16 操作数。
++合同 V 输入即 BF16，原生 BF16 MMA 可直接使用，故本轮删除 V→FP16 转换，p 由
++截断 f16 改为截断 BF16，PV 仍为单次 matmul。收益：删除 V 的 extf+truncf 与
++f16 操作数准备，GM/L0C 字节与 matmul 数不变；代价：概率舍入由 2^-11 降为
++2^-9 相对误差（V 不再二次舍入），适用域仍为合同 [-1,1]、D=128、非因果 fullKV，
++是否通过由原四项 checker 以不变阈值判定。非 PART 路径、其它 dtype 与 host
++缓存路径逐字不变。
+ """
+ 
+ import math
+@@ -280,7 +290,7 @@
+ 
+     每个程序先取连续区间 [lo, hi) = [floor(pid*T/P), floor((pid+1)*T/P))，
+     再按 KV 组推进：组 grp = b*NKV + kvh 拥有 TPG = G*NB_M 个连续 tile，程序
+-    只对与自己区间相交的组载入一次整段 K 并一次性把 V 转 fp16，然后在该组的
++    只对与自己区间相交的组载入一次整段 K 与 V（V 保持 BF16 原样），然后在该组的
+     相交子区间内逐 tile 执行原表达式。区间由 floor 划分给出，对 pid 单调且相邻
+     区间首尾相接，故 0 <= lo < hi <= T 且全部 T 个 tile 被唯一覆盖、每个
+     (b,hq,行块) 只写出一次；组内坐标 gi = t // NB_M、mb = t % NB_M 把 tile 序号
+@@ -312,7 +322,8 @@
+             k_base = K + b * k_sb + kvh * k_sh
+             v_base = V + b * v_sb + kvh * v_sh
+ 
+-            # 每 (程序, 相交组) 一次：整段 K 载入 + 整段 V 载入并转 fp16。
++            # 每 (程序, 相交组) 一次：整段 K 载入 + 整段 V 载入（BF16 原样，
++            # 本轮删除了此处的 V→FP16 转换，见下方 PV 段说明）。
+             k_ptrs = k_base + offs_n[:, None] * k_ss + offs_d[None, :] * k_sd
+             if MASK_KV:
+                 kv_mask = (offs_n[:, None] < SKV) & (offs_d[None, :] < D)
+@@ -325,7 +336,6 @@
+                 v = tl.load(v_ptrs, mask=kv_mask, other=0.0)
+             else:
+                 v = tl.load(v_ptrs)
+-            v16 = v.to(tl.float16)
+ 
+             # 本 worker 与本组相交的 tile 子区间（组内局部序号）。
+             t0 = tl.maximum(lo, grp * TPG) - grp * TPG
+@@ -345,7 +355,7 @@
+                 # 本轮机制（PART_TILES 的 QK→Vector 交接，FP16 rawQK）：Q/K 仍为
+                 # 原 BF16，tl.dot 内部仍按 FP32 累加；dot 之后先把 rawQK 就近
+                 # 舍入到 FP16，再显式扩回 FP32，随后才执行缩放、编译期公共偏移、
+-                # 指数、sum、fp16 PV 与归一化，交接以外的结构逐字不变。
++                # 指数、sum、单次 PV 与归一化，交接以外的结构逐字不变。
+                 # 该舍入只由源码显式表达：后端若把 FP32→FP16 转换折叠进 FIXP
+                 # （fixpipe 输出 f16），则 QK 的 L0C→Vector 搬出由 128x256 f32
+                 # (128KiB) 降为 f16(64KiB)，总 L0C 搬出 98304→约 65536KB；若 cast
+@@ -393,12 +403,29 @@
+                 # P VCONV/MTE3 send(150.792-152.146us) 之间。故先做 FP16 截断与
+                 # PV dot，再对原 FP32 p 求分母，使 P 的传输有机会提前并与 Cube
+                 # 的 PV 计算重叠。数值上不变：l_new 仍是对同一 FP32 p 的同一
+-                # 归约，acc 仍是同一 fp16×fp16、FP32 累加的 dot；输出 guard 的
++                # 归约，acc 仍是同一单次、FP32 累加的 dot（本轮起为 BF16×BF16，
++                # 原为 fp16×fp16）；输出 guard 的
+                 # 可证冗余已在下段删除（不引入 PV 结果 FP16 截断，不改 exp 与精度）。
++                # 本轮机制（PART_TILES 单次 BF16 PV：p 截断 BF16、V 不转换）：
++                # 实际 TTIR 第 66-67 行把每 (程序, 相交组) 载入的 BF16 V 先 extf
++                # 到 f32 再 truncf 到 f16（BCMLIR 第 63-64 行同形），随后 PV 的
++                # matmul 才以 f16×f16 执行；该转换是对整块 256x128 元素的一次
++                # Vector 侧全量改写，且每组都要付一次。合同输入 V 本身即 BF16，
++                # 原生 BF16 MMA 无需该准备，故此处直接令 p 截断为 BF16、V 保持
++                # 载入时的 BF16 做一次 PV tl.dot：删除 V 的 extf+truncf 与 f16
++                # 操作数准备，PV 仍只有一个 matmul、L0C 搬出量与 GM 字节不变，
++                # 语句序（p→截断→PV→分母 sum）与其余表达式、归约顺序、地址、
++                # host 缓存和 nonPART 路径逐字保留。
++                # 数值风险与适用域：p 的舍入由 FP16 的 2^-11 相对误差降为 BF16
++                # 的 2^-9（单项精度仍是父版本 FP16 PV 的一半尾数），V 反而不再
++                # 经 f16 二次舍入而精确等于 BF16 输入；p <= 2^15 在 BF16 指数域
++                # 内不溢出。适用域为合同均匀 [-1,1]、D=128、非因果 fullKV
++                # （SKV=256）的 PART_TILES 分支；域外输入与其它 dtype 不受影响，
++                # 是否达标由原四项官方 checker 以不变阈值判定。
+                 p = tl.exp(qk)
+-                p16 = p.to(tl.float16)
+-
+-                acc = tl.dot(p16, v16)
++                p_bf = p.to(tl.bfloat16)
++
++                acc = tl.dot(p_bf, v)
+ 
+                 l_new = tl.sum(p, 1)
+ 

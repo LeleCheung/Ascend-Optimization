@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 33,
+    "duration_ms": 87970,
+    "usage": {
+      "input_tokens": 55328,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 830848,
+      "output_tokens": 16079,
+      "output_tokens_details": {
+        "thinking_tokens": 7036
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 55328,
+        "outputTokens": 16079,
+        "cacheReadInputTokens": 830848,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.0940389999999998,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 7036,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.0940389999999998,
+    "result": "已按指定实验完成修改前决策与源码实现，现处于宿主审查/验收边界，字节保持不变。\n\n## 本轮机制\n**PART_TILES 组内一深度 QK 前瞻（单 query tile 一步）**，仅改 `_gqa_tile_part_body` 的 PART_TILES 内层：\n\n- 进入组内 tile 循环前，为区间首 tile `t0` 预取一次 `raw_next = tl.dot(q(t0), trans(K)).to(fp16)`；\n- 循环携带 FP16 raw 分数，每轮先 `raw = raw_next`，再在 `t+1 < t1` 时载入 `q(t+1)` 并把 `raw_next` 改写为其 QK（仍 FP32 累加、FP16 就近舍入），**放在本 tile 的 exp/sum/PV 之前**；\n- 尾部 `t+1 == t1` 不发 dot，故每组 QK 数恰为 `t1-t0`，无多余 tail dot；\n- 当前 NoOff/natural-exp、`p_bf=bf16`、单次 BF16 PV、`dot(...).to(fp16).to(fp32)` 交接、FP32 分母 sum、FP32 除法与 store 逐字未动；组边界、tile 归属、`MASK_MD/MASK_KV` 通用分支、地址、host 缓存、分配、`num_stages=2`、20 worker 与四项合同全部保持。\n\n## 关键证据（见 diagnosis.json）\n- 成对 profiling：case4 kernel 159.603195us；Cube 每程序 `aic_cube_time` 33.11us 但 `aic_scalar_wait_id1` 140.77us，Vector `aiv_vec_time` 49.19us——墙钟由交替交接链主导。\n- 模拟器（三核部分窗口、各自归一化、application_completed=false）：cubecore productive 16.51%/wait 28.48%/idle 55.01%，veccore productive 23.98%/idle 65.73%，头部均为等对方的 `WAIT_FLAG_DEVI`。\n- 完整时间序列显示下一 QK MMAD(126.328..126.963us) 落在当前 PV FIX(125.096..126.102us) 之后，确认串行化窗口存在；但窗口不可相加为正式耗时。\n- 实际 TTIR/BCMLIR 显示单 tile 串行 `q load→dot→f16 交接→exp→bf16→PV→f16→sum→div`，当前无预取。\n- 保留负历史：旧 042 前瞻 190.8117us 未超 190.58165us，旧 030 亦为负；本轮仅为新缓冲/数学组合重测。\n\n## 风险（已写入注释与诊断）\n额外循环携带 128x256 FP16（64KiB）+ 提前载入 q_next（32KiB），并可能有两个 QK f32 L0C 累加器与 PV 累加器同时活跃；若超 UB/L0C 预算可能编译失败或后端重新串行化。此时如实记录，不静默改块大小/数学/选项。源码意图不保证编译发射顺序，需修改后 IR/模拟器重放核对。数值预期逐位不变，最终由原四项 checker 不变阈值判定。\n\n## 工具桥记录\n- `decision --record diagnosis.json` → `recorded`，decision_id `f9a2fbad5e46446d8812b2dbfca8a27d`（绑定修改前 SHA `98c755…5661`）\n- `preflight --source candidate.py` → `awaiting_source_review`，新 SHA `19f7fb238946cb9006286d4d222425d07c4ea9fc38a7d4ff85c71c72c49c584a`\n\n候选字节已保持，现交接宿主只读路径/地址边界审查与完整四项真机评测；完整结果与修改后重放反馈后再更新观测与未决问题。"
+  }
+}

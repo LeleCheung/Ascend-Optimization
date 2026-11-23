@@ -1,0 +1,63 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "2ffb6f6125d0b2ea3a06593661b9bba034a3df04040ec4610de4b0a982aaab9f",
+  "evidence": [
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "PART_TILES 复用体（_gqa_tile_part_body，203-213 行）在每个 128x128 tile 上执行：qk=dot*scale → tl.max(qk,1) 行最大值 → m_safe 守卫 → p=exp2(qk-m_safe[:,None]) → l_new=sum(p,1) → acc=dot(p.to(f16),v16) → out=acc/l_safe；该路径由 PART_TILES 限定为非因果、SINGLE_KV、BLOCK_M=128/BLOCK_N=256/BLOCK_D=128 且 PV_SINGLE_F16（BF16），因此没有 online 重缩放，逐行 max 只用于把 exp2 自变量压到 <=0，是唯一的行耦合稳定化步骤。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "第 105-115 行：对 tensor<128x256xf32> 做 axis=1 的 tt.reduce(maxnumf) 得到 128xf32，随后 cmpf/select 守卫、expand_dims+broadcast 成 128x256、arith.subf、math.exp2；第 116-120 行是 sum 归约，121 行 truncf 到 f16，122 行 PV dot，127 行 divf。可见 max 归约与其广播减法是与 sum/PV/归一化可分离的一段，删除它不需要改动地址、dot 或输出表达式。"
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4 成对 profiling：候选与 CANN 的 cube 累计时间接近（aic_cube_time 662.187us vs 673.090us），L0C_to_GM 完全相同（98304KB），而 Vector 累计 aiv_vec_time 1587.885us vs 1120.804us（约 1.42 倍），aiv_scalar_wait 1550.355us vs 30.072us；说明 Cube 算术已不比参考多，剩余可压缩的主要是 Vector 侧工作量，max 归约+广播减法属于此侧。"
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "background",
+      "finding": "case4、三核部分窗口各自归一化，application_completed=false（全调用 completion 缺失，保留）：Cube 核 CUBE productive 9.24%/wait 18.98%/idle 71.79%、FIXP productive 43.31%，头部指令为 WAIT_FLAG_DEVI 200.19us、FIX_L0C_TO_DST 71.80us、SET_FLAG 71.79us；Vector 核 VECTOR productive 21.78%/wait 11.79%/idle 66.43%、MTE3 productive 39.39%，头部为 WAIT_FLAG_DEVI 89.08us 与 76.06us、MOV_SRC_TO_DST_ALIGN 57.72us/29.40us、BAR 15.39us。热点与流水分别表明：可见墙钟主要落在跨核 flag/MOV 交接，Vector 仍有约 22% 生产占用但空闲 66%，逐行 max 归约不在头部指令榜（位于被合并的 Vector 区域），预计只能小幅影响 Vector 计算路径。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "保留最佳 case4 full_call_us=232.23705（trials 232.869/232.237/232.224），case1=80.22、case2=186.14、case7=81.90 量级；case4 原官方 checker 通过，阈值 0.0078125，nearest-representable 路径 mismatch=0，candidate 路径 mismatch=14021/8388608（0.167%）。改动必须仍由同一 checker/golden/阈值验收。"
+    },
+    {
+      "path": "workspace/contract.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "固定四项 case，输入值域 [-1,1]、D=128、scaleValue=-1（scale=1/sqrt(D)），dtype float16/float16/float16（case1/2）与 bfloat16（case4/7）；PART_TILES 由元数据命中 case4 与 case7（bf16、非因果、SKV=256），case1（因果 fp16）与 case2（fp16，SKV=128）走通用路径不变。"
+    }
+  ],
+  "hypothesis": "PART_TILES 的逐行 max 仅用于把 exp2 自变量上界压到 0 以适配 FP16 PV；在合同值域 [-1,1] 下 |q·k| <= D，编译期已知上界 Bq = D*|qk_scale|（exp2 自变量单位，D=128 时约 16.3244），任何公共常数偏移 C 都不改变 softmax 的实数结果。取 C = Bq - 15，则 p=exp2(qk-C) <= 2^15=32768 < 65504（保留约 2 倍 FP16 余量），逐行 max 归约、其守卫与广播减法可整段删除，而 sum、PV、PV 后归一化、输出 guard、地址与 20 worker 分区逐字保留。若 Vector 侧归约/广播在 case4 关键路径上有可观测占比，case4 墙钟应下降；若墙钟由 flag/MOV 交接链主导，则 case4 基本不变但 Vector 累计工作量下降。",
+  "alternatives": [
+    "保持逐行 max（现状）：实数最稳，但每 tile 付一次 128x256 的归约+广播。",
+    "公共偏移取 C=Bq（max p=1）：虽然实数正确且不会溢出，但典型行 max 约 2 时 p 落入 2^-14 附近，FP16 次正规/下溢使 PV 分子精度显著下降，有 checker 失败风险，故不采用。",
+    "公共偏移取 C=Bq-16 或更小：max p=2^16 已超过 FP16 65504，不安全。",
+    "用 fp32 probability 直接做 PV dot：改变 dot 计算类型与 Cube 代价，且与本轮 Vector 工作量假设不在同一层，不采用。",
+    "保留 max 但减少归约步数/换布局：Triton 源码层不可表达为更小的可评测改动，且不删除广播减法。"
+  ],
+  "discriminating_observation": "同一候选上对比 case4 的 kernel/full_call 时间与 Vector 累计 aiv_vec_time：若本机制有效，Vector 累计时间应下降（即使墙钟不变）；若 case4 full_call 同时低于 232.23705us 则说明该归约处在关键路径；若仅 Vector 累计下降而墙钟不变，则证明当前窗口由 WAIT_FLAG/MOV 交接主导，下一轮应转向交接链而非 softmax 计算。case1/case2 应完全不变，case7（同走 PART_TILES）应与 case4 同向变化。",
+  "change": "仅改 _gqa_tile_part_body（PART_TILES）：删除 tl.max(qk,1)、m_safe 的 -inf 守卫、其 expand/broadcast 与 qk-m_safe 减法，改为 p = tl.exp2(qk - SM_OFFSET)，其中 SM_OFFSET 由 host 用纯元数据计算：Bq = D*abs(qk_scale)（|q·k|<=D 的合同上界），SM_OFFSET = Bq - 15.0（保留 2^15 的 FP16 余量），作为 tl.constexpr 传入。sum(l_new)、p.to(f16) 的 PV、acc/l_safe 归一化、l_new>0 输出 guard、全部指针/地址、20 worker 连续 tile 分区、grid、BF16 单次 fp16 PV、FP16/通用二维 grid 路径与因果 64/64 路径逐字保留；不新增张量、不读输入值、不按 case_id 选路。",
+  "expected": "case4（bf16，PART_TILES）删除每 tile 一次 128x256 max 归约（8 级 maxnumf）、128 宽 cmp/select 与 128x256 广播减法，保留一次标量常数减法 + exp2 + sum；预计 Vector 累计 aiv_vec_time 下降，case4 full_call 小幅下降或持平（若交接主导）。case7 同向；case1/case2 走通用路径应保持不变。风险：偏移使 p 行最大值随行 max 变化，若某行所有 score 远低于偏移（约 m < C-14 ≈ -12.7，而合同随机输入行 max 约 2 且 std 约 0.48），该行 p 进入 FP16 次正规；更极端的行（m < C-24）p 全部下溢为 0，而 l_new 仍由 fp32 提供 >0，PV 分子为 0，输出退化为 0。此情形在合同 [-1,1] 的均匀随机输入下需要约 -30σ，实际不可达；但作为适用范围限制记录：本机制依赖 |q|,|k| <= 1 的合同值域，值域外可能溢出 FP16 或行内整体下溢。有限精度层面 p 的 FP16 舍入仍是 2^-11 相对误差（与父版本相同量级），l_new 仍为 fp32；消去风险（有符号 PV 求和）与父版本结构相同，仅量化网格因公共指数平移而不同。",
+  "validation": "先 preflight --source candidate.py，收到 awaiting_source_review 后保持字节，交宿主只读审查与完整四项真机评测；由原官方 checker/golden/阈值（case4 0.0078125 等）判定，四项结果与修改后重放一并保留。",
+  "selected_layer": "Triton 源码层：仅 PART_TILES 单块 softmax 的稳定化与归一化组织（算术表达式与归约删除），不改分块、dot、地址、grid、分区、host 分配与 kernel 边界。",
+  "layer_reason": "PART_TILES 已把整段 KV 放进单块，不需要 online 重缩放，逐行 max 的唯一作用是数值范围而非算法语义；合同值域与 D/qk_scale 元数据给出可证明的 exp2 上界，因此可以用编译期公共偏移在 Triton 源码内等价表达，且不增加任何搬入搬出或交接链。当前证据显示 Cube 算术已与参考相当、剩余可压缩项在 Vector 侧，而该层正是 Vector 侧的纯计算删减，风险与验证边界清晰。",
+  "simulator_incremental_judgment": "热点证据（增量判断）：模拟器头部指令是 WAIT_FLAG_DEVI、FIX_L0C_TO_DST/SET_FLAG、MOV_SRC_TO_DST_ALIGN、BAR，均为跨核交接/搬运，逐行 max 归约未进入头部榜，因此本机制不应被期待消除这些热点；它只减少 Vector 区域内部一次归约+广播。流水证据（增量判断）：Vector productive 21.78%/idle 66.43% 说明 Vector 仍有非零生产占比，删除归约可能提高 productive 占比或缩短 vec 占用，但 FLOWCTRL wait 73.34% 与 Cube idle 71.79% 说明墙钟主要被等待主导，故墙钟收益预期有限。三核窗口各自归一化且 application_completed=false（全调用 completion 缺失），模拟器只用于增量判断，不替代完整四项计时与 checker。",
+  "unknown": [
+    "修改后源码 SHA e7fad4d8519526ea1731371e47d7ddb1417300145d28d14f4dca49bffbabee9b 已通过 preflight 进入 awaiting_source_review；待宿主只读审查与完整四项真机评测反馈。",
+    "待验证：编译器是否真的删除 max 归约并保留标量常数减法（需看修改后实际 TTIR/BCMLIR）。",
+    "待验证：case4/case7 的 Vector 累计时间与 full_call 是否同向变化；case1/case2 是否严格不变。",
+    "待验证：原四项官方 checker（阈值不变）在公共指数平移下的 mismatch/消去指标是否仍通过，尤其 FP16 次正规概率项的贡献。"
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 73,
+    "duration_ms": 224975,
+    "usage": {
+      "input_tokens": 85308,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 3572608,
+      "output_tokens": 39382,
+      "output_tokens_details": {
+        "thinking_tokens": 22642
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 85308,
+        "outputTokens": 39382,
+        "cacheReadInputTokens": 3572608,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 3.1973940000000005,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 22642,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 3.1973940000000005,
+    "result": "已登记并落盘本轮机制，桥返回 `awaiting_ir_review`，IR 保持当前形态等待宿主审查。\n\n## 本轮实际改动（ir/target.hivm.mlir 三处小范围 Edit）\n\n1. 私有声明区新增 `@vrec_1d_float(src,dst,tmp)` 与 `@vmul_2d_float(A,B,C,tmp)`，签名取自 059 已编译模块的逐参形态；`@vdiv_2d_float` 声明保留（059 同样保留未调用的库声明）。\n2. AIV 函数常量区新增 `%c114944_i64`。\n3. `loc(#loc212)` 归一化组由「`vdiv_2d_float(acc 64x128@81920, 分母 64x1@180224, 同址输出, 临时 512xf32@114688)`」改为「分母 collapse 到 64 元素 → 原生 FP32 `vrec_1d_float` 写到 114688 起 64xf32（临时传 0 长度 memref）→ 屏障 → expand_shape 回 64x1 → `vmul_2d_float` 广播回 81920 同址累加器（临时 512f32@114944）」。累加器、分母、P 区、全部事件、sync_block、函数 ABI、host 函数逐字节保持。\n\n## 关键核对结论\n\n- 后端次级产物核对：`compiled-readonly/_gqa_fwd_kernel.ttadapter` 第 132 行仍是整矩阵 `arith.divf %acc_37, %out`（分母来自 `linalg.reduce(p)`），bcmlir 无 vdiv/vrec 字样；疑似冗余在后端仍然存在，HIVM 阶段以库调用 `vdiv_2d_float` 落地，因此存在可行改法。\n- 地址与生存期：UB 图上 P 区 114688..180224 在归约后是死区（现有 vdiv 临时区本身就复用该区前 512 个 f32），倒数目的 114688..114944 与乘法临时区 114944..116992 完整落在其中，UB 峰值与 063 一致；跨迭代只有下一轮 vcast 会写 114688，同属 PIPE_V 顺序覆盖。\n- 证据口径：VDIV 动态次数取 hotspots 指令计数（每 Vector 核 26），timeline 未单列 VDIV；timeline 窗口 126.5620–217.5440us 为相对资质（median_ratio 1.0000000397），不参与区间求和；向量泳道 active 0.3436 / productive 0.2812 / idle 0.6564 说明收益上限在 1% 量级，与 059 实测 0.949% 一致。\n- 精度风险已写入 expected/unknown：case4/case7 的 checker mare=0.00781249375 贴住 0.0078125，case1/2 为 0.00097/0.0009765625，本次倒数化按原阈值重新判定，未加 Newton。\n\n## Codex 分析贡献\n\ncodex-brief.json 给出 VDIV 计数、分母/累加器/死区布局、两条实现路线与「不改 scale/阈值/种子/归一化外数学」的边界；本次选其第二条（复用死概率区存放 64 个倒数），并按历史 059 IR 校正了库调用参数形态。\n\n## 新增观察\n\n- 063 的 `%59 = pointer_cast(114688): 512xf32` 临时区与 P 区首部重叠，说明编译器已把归约后的 P 区判为死区，为本次复用提供了同源依据。\n- 源码行 552（`out = acc / l_new[:, None]`）在 hotspots 中对应两条各 13 次调用的 VECTOR BAR（7.24us、7.07us 累计），是归一化组在 trace 中的唯一同步可见点，也是本次唯一新增屏障的对照基准。"
+  }
+}

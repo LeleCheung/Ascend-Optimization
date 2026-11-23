@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 33,
+    "duration_ms": 272880,
+    "usage": {
+      "input_tokens": 55751,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 985728,
+      "output_tokens": 40674,
+      "output_tokens_details": {
+        "thinking_tokens": 32698
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 55751,
+        "outputTokens": 40674,
+        "cacheReadInputTokens": 985728,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.788469,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 32698,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.788469,
+    "result": "已完成本轮机制的实现并交接。候选字节保持不变，源码 SHA 为 `2e698bac788a194c6772c5dcb7659e112b18815db53005a1b7fd462d8a38fc8f`。\n\n## 本轮做了什么\n\n**机制（分块与所有权划分，不改变精度路径）**\n- 非因果且 `BLOCK_D<=128`：`BLOCK_N = min(256, next_pow2(SKV))`，`BLOCK_M = 32`（当 `BLOCK_N>128` 时），否则 `64`。\n  - case4（SKV=256）：每 program 的 KV 轮次从 2 变为 1，L0C 搬出次数从 6 变为 3，`L0C_to_GM`、`GM_to_UB` 从 192KiB 变为约 64KiB，重缩放与两次 PV 的向量合并各减半。\n  - case2（SKV=128）：分块与原来一致，可作为不受该机制影响的对照组。\n  - case7（SKV=256）：变为 256 个 program 单轮执行。\n  - case1 因果分支仍为 64/64；`BLOCK_D>128` 两档、kernel 体、两项概率分解表达式、相加顺序、dtype、入口与 grid 公式均未改。\n\n**证据与判断（已写入 diagnosis.json 并经桥登记，decision `b88ba686…`）**\n- 配对 profiling：每 program 固定 6 次 L0C 搬出与 192KiB 双向往返，而 Cube 每 program 等待 10.08μs ≫ cube_time 1.09μs → 成本由“交接链 × 轮数”主导。\n- 模拟器（三核各自归一化的部分窗口，relative_only，application_completed=false）：热点侧 `WAIT_FLAG_DEVI`/`FIX_L0C_TO_DST` 精确绑定在 QK 搬出行与 `acc=dot+dot` 合并行；流水侧 Cube FLOWCTRL 等待 83.51%、Vector 空闲 47.96%，两条判断独立支持“减少轮次”，但不可相加为正式耗时。\n- 实际 TTIR 显示：`scf.for` 每 128 列一轮，`WorkspaceArgIdx=1`，即 L0C→workspace→UB 往返。\n- 早前“因果 64/128 因 231488B>196608B 失败”的实测把 `BLOCK_M` 同步减半，使 M×N 张量回到 8192 元素规模，作为 UB 安全依据。\n- 已排除：BM64/BN256（UB 外推超限，编译未验证）、BM128/BN64（L0C 搬出反而增至约 327MB）、单次 K=256 拼接 dot（依赖 cat/join 与累加顺序变更）、首块剥离（上一轮实测 825.24775μs 退步）。\n\n**数值风险与处置**：仍走 `p=p_hi+p_lo/2048` 与同一相加次序；唯一变化是在线 softmax 由“两段 128 列 + 两次重缩放”合并为“一段 256 列 + 一次重缩放”，max/sum 均为 fp32 归约，误差不增。完整四项 checker 会判据。\n\n## 交接给宿主\n\n1. 只读路径与地址边界审查（`awaiting_source_review` 状态，字节保持）。\n2. 通过后做**完整四项真机评测**：case1/2/4/7 官方 checker + 计时（case4 目标 < 784.63765μs），并重放 profiling/simulator，核对每 program 的 dot 数（3）、`L0C_to_GM`、`GM_to_UB`、`aic_mte1` 是否按预测减半。\n3. 若编译报 UB 超限，请把完整错误金额回传——32×256 布局的实测峰值可直接区分“回退 64/128”还是“继续减 BM”。\n\n**给宿主的 IR 侧观察（未改源码，建议记入后续诊断）**：TTIR/TTAdapter 显示所有 L0C 结果都经 GM workspace 中转（`FIX_L0C_TO_DST Dst:OUT` 后 `MTE2 Src:OUT,Dst:UB`），且循环携带的 fp32 `acc` 每次都写回 UB 再送回 L0C 作 dot 初值；若生成端可直接 L0C→UB 或让 dot 累计器留在 L0C，可省掉本机制仍保留的 3 次往返，这属于单算子生成缺陷层面的交接建议。"
+  }
+}

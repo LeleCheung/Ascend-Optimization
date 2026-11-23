@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 80,
+    "duration_ms": 339347,
+    "usage": {
+      "input_tokens": 91012,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 3645312,
+      "output_tokens": 49030,
+      "output_tokens_details": {
+        "thinking_tokens": 36851
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 91012,
+        "outputTokens": 49030,
+        "cacheReadInputTokens": 3645312,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 3.5034660000000004,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 36851,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 3.5034660000000004,
+    "result": "已按诊断→记录→实现→预检的顺序完成一个可评测机制，并停在验收边界。\n\n**证据与判断（事实，分别陈述）**\n- `current-profiling.json`（case4，1024 programs）：`aic_time` 13.84μs/程序而 `aic_cube_time` 仅 1.087μs、`aic_cube_ratio` 0.1375%；`aiv_time` 14.48μs（`vec` 6.78、`scalar` 7.52）；`aic_fixpipe_time` 1.956μs、`aic_mte2_time` 2.58μs。→ 逐程序**固定延迟链**受限，不是矩阵吞吐或搬运带宽受限。\n- `simulator-evidence.json`（三核部分窗口、各自归一化，不可相加）：Cube productive 5.19%、FLOWCTRL 仅等待 83.51%；Vector0 productive 29.17%、等待 22.87%、可观测空闲 47.96%。热点第 1 为 `WAIT_FLAG_DEVI` 13.3μs（2 次调用）落在 PV 累加行，紧随 `FIX_L0C_TO_DST`（同行为 acc 搬出、另一处为 QK 搬出）。→ 热点侧与流水侧一致指向 **acc 重缩放往返**，但模拟器无逐指令时间轴与绝对时钟，仅作定位假设。\n- `actual-ir/2-_gqa_fwd_kernel.ttir`：循环体确为 `%acc_91 = acc*alpha` → 作 `tt.dot` 初值，即 L0C→UB→L0C 往返；且 `%m_i` 初值是 `-inf`，故首块 `alpha = exp2(-inf-m) = 0` **数值恒为零**。\n- `previous-result.json` 基线：179.09665 / 181.33365 / **784.63765** / 181.49265μs，四项 checker 全过。`negative-attempt-001.json`：BF16 预缩放残差 + 串联累加 785.5762μs，无收益 → 本轮不动残差链。\n\n**选定机制（kernel_loop_structure）**：剥离首个 KV 块。首块直接用 `m_i=max(qk)`、`l_i=sum(p)`、`acc=dot(p_hi,v)+dot(p_lo,v)/2048`，不算 alpha、不乘 acc；其后循环从 `BLOCK_N` 起保持原在线 softmax。两项概率分解的表达式与相加顺序完全不变，剥离前后逐位等价（`0*x` 与少一次乘加在 fp32 下同值），因果分支沿用同一 `hi`/掩码。\n- 已排除：BLOCK_M=128（按已失败 IR 推算仍约 256KB > 196608B）、BLOCK_N=256（约 432KB）、两 PV 合一次矩阵操作（缺行拼接原语、搬出字节不变）、1/2048 折进 V（向量多一遍转换，与省下搬出抵消）。\n- 预期：case2（单迭代）在线重缩放整链消失，case4/7/1（两迭代）减半；case4 由 784.63765μs 向约 700–745μs，无精度变化，由完整四项合同判定。\n\n**交接状态**：`decision --record diagnosis.json` 已登记（decision_id `aa4538dd…`，绑定修改前 SHA `247091f3…`）；`preflight` 返回 `awaiting_source_review`，修改后源码 SHA 为 `33a749671962eadbd9ade13e5ae54c3e9acbf96421ef8af8027777fb9e8d684e`。自此 candidate.py 字节保持不变，等待宿主只读审查与完整四项真机评测；完整结果与修改后重放请回传，我将据实更新诊断并继续选下一个机制（掩码/标量步数方向已列为独立候选，未在本轮混入）。"
+  }
+}

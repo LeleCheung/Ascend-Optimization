@@ -1,0 +1,53 @@
+{
+  "source_sha256": "a0e1e0d687176b904af29fbac46b505a7ccd8fe76fc0ea6add1ccad350ab1110",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "候选侧真实设备计时与流水占比，用于确定瓶颈流水与可测量口径",
+      "finding": "候选任务 Task Duration(us)=162.183243（Block Dim 1024，Freq 1650）。逐block均值：aiv_time=6.1557us、aiv_vec_ratio=0.5235，说明 VECTOR 发射占用是主限制；aiv_vec_fp32_ratio=0.3376、fp16=0.0287、int32=0.00436、misc=0.1386，整数打包类操作只占向量发射的约0.44%，因此'去掉打包里的冗余整型掩码'一类改动缺乏执行成本。Memory 侧 GM_to_UB_datas 合计 36864KB，正好等于输入 4MB 的 9 倍（9 个偏移 stencil 行块），UB_to_GM_datas=16384KB 等于输出 16MB；但 GM_to_UB_bw_usage_rate 仅 2.549%、UB_to_GM 仅 1.335%，说明 9 倍读放大不是带宽受限项。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "单核窗口内各流水活动/等待与最热指令，用于判断可动的手术位点",
+      "finding": "core0.veccore0 窗口 127.3910-137.5820us（capture_duration 10.191us）：VECTOR active_union 6.267us（active_ratio 0.6150，其中 productive 3.768us、wait_only 2.499us=24.5%），MTE2 productive 3.632us（0.3564）、SCALARLDST 2851 events/3.191us、MTE3 active 1.181us。最热指令为 ml/pl 行拷贝的 MOV_SRC_TO_DST_ALIGN（每处 0.91/0.58us）及若干 BAR（0.54/0.51/0.45us 出现在 _pack_f16_words 行）；hotspot 报告明确 application_completed=false，属部分窗口，指令时间可重叠、非关键路径。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "绝对时钟与观测范围资质",
+      "finding": "时间单位为 us，capture_scope 仅覆盖本核首个到末个可见事件，不含启动前后未知空闲；ALL 泳道几乎全为 idle、FLOWCTRL 仅 1 个事件、CACHEMISS 为辅助 trace 泳道，均需单列解释；unit_validation 用 24 个 PC 对照 CSV，median_ratio=0.99718（期望 1），scalar 子集 7/7 吻合，故窗口内增量判断可用，但跨窗口绝对耗时不可与 162.183us 直接相加。"
+    },
+    {
+      "path": "ir/f85be7a40348b16a3bb9f96d42d0385a8950cc3aea4e930615c06704c5b53127/upsample_bilinear2d_2x_kernel.ttir",
+      "category": "source_ir",
+      "role": "当前最佳的真实 TTIR，定位具体可改写的算子序列",
+      "finding": "第 88-107 行先把 9 个 f16 load 立即 arith.extf 成 f32（%ml_50/%mc_53/%mr_56/%cl_60/%cc_62/%cr_64/%pl_101/%pc_103/%pr_105），第 108-111、170-171 行的 6 个边界钳位 arith.select 因此全部在 tensor<16x128xf32> 上执行；而被选中的两侧值本来就是同一批 f16 load（%ml_49/%mr_55/%cl_59/%cr_63/%pl_100/%pr_104 与 %mc_52/%cc_61/%pc_102）。即选择发生在扩展之后，属于 f32 域的 2048 lane 向量选择。"
+    },
+    {
+      "path": "compiled-readonly/f85be7a40348b16a3bb9f96d42d0385a8950cc3aea4e930615c06704c5b53127/701603f4b6c35707f115d4fd5713a02ae909607c67057c2a6af937d6976066f9/upsample_bilinear2d_2x_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "核对疑似冗余/域错位是否已在后端消除",
+      "finding": "后端未做任何域提升或选择下沉：%ml_45=arith.extf %ml_44 后才出现 %ml_99=arith.select %m_l, %ml_45, %mc_56（f32），%cl_102 同理；右侧钳位 %mr_101/%cr_104/%pr_141 被降成 tensor.extract_slice + insert_slice 到整块 f32 张量（每处 16x128xf32=8KB 的整块复制/写回）。另确认打包里的 arith.andi %extui,%65535 也未被折叠（%lo_bits_123/%lo_bits_155），但其向量占比仅 0.44%，不作为本轮机制。"
+    }
+  ],
+  "hypothesis": "边界钳位 select 与 f16→f32 的 extf 顺序被写反了：extf 是逐元素、单射、无舍入的精确映射，select 也是逐元素运算，二者可交换且结果位级相同。当前 IR 在 f32 域对 2048 lane 做 6 次选择（VECTOR 是最忙流水，active_ratio 0.6150），而选择本可在 f16 域完成，f16 向量指令每拍处理两倍元素；同时右侧三处钳位被后端降成对整块 f32 张量的 insert_slice（8KB/处），下沉到 f16 后该部分复制量减半。这是编译器不会自行做、却有真实向量发射与 UB 复制成本的域/顺序缺陷。",
+  "alternatives": [
+    "去掉打包中的 arith.andi 0xFFFF（extui 已零扩展，恒等）：位级安全，但 profiling 显示 int32 向量占用仅 0.436%，无执行成本，收益不可测，暂不作为本轮机制。",
+    "按 Codex 候选做彻底去打包（ptr_o 位转 f16 + join/interleave 连续写）：join+reshape 会引入带步长重排，源码注释与 ir-002 的行加载重写均给出负向证据，风险高于收益。",
+    "把 6 次钳位折叠成 4 次（把钳位移到插值结果上）：看似更省，但边界处 0.25*c+0.75*c 在 fp32 下未必位级等于 c，会改变特殊值附近的最后一位，破坏位级等价，拒绝。",
+    "减少 9 个偏移 stencil 行拷贝（例如仿射行加载）：ir-002 已试，正式 target 从 164.856us 退到 167.027us；且 9 倍读放大并非带宽瓶颈（GM_to_UB bw usage 2.5%）。"
+  ],
+  "change": "仅改 TTIR 的两处特化点（偶数输出行打包前、奇数输出行打包前），机制相同：把 6 个边界钳位 arith.select 下移到对应的 f16 load 结果上（张量类型改为 tensor<16x128xf16>，loc 仍用原 select 的 #loc208-#loc211、#loc256、#loc257），随后对 select 结果各做一次 arith.extf 得到原来同名的 f32 值（%ml_65/%mr_66/%cl_67/%cr_68、%pl_106/%pr_107），并删除不再被使用的 4 个直接 extf（%ml_50/%mr_56/%cl_60/%cr_64）与 2 个（%pl_101/%pr_105）。%mc_53/%cc_62/%pc_103 的 extf 保留且位置不变；所有 f32 乘加、truncf、打包与存储掩码、函数 ABI（ptr_o 仍为 *i32）逐字节保持原样，frozen.py 不变。",
+  "expected": "可测预测：单 block 向量指令数下降约 6×(16-8)=48 条（2048 lane 选择由 f32 16 条变 f16 8 条），三处右侧钳位的 insert_slice 目标从 8KB f32 降为 4KB f16；aiv_vec_ratio 从 0.5235 略降，aiv_time 均值 6.156us 应下降 0.5%-1.5%。若 VECTOR 仍是限制流水，target 延迟应从 164.856us 降到约 163.0-164.5us，跨过历史最佳 165.744us 与当前最佳 164.856us；若实际受 SCALAR/同步链限制，则可能出现小正值或落在噪声内（<0.3%），这种情形如实报告为无收益而非回退。",
+  "validation": "1) TTIR 可解析并保持同一 kernel 符号与签名（PACK16 分支、ptr_o *i32）。2) 位级等价论证：select(extf a, extf b) == extf(select(a,b))，因 extf 无舍入且逐元素，包含 f16 的 ±0、NaN 位型与次正规；逐项核对 24 个正式用例 + 30+30 补测的 matched_ratio 与 abs/rel 误差必须与当前最佳完全一致。3) 重新编译后检查 bcmlir/ttadapter：6 个 select 应位于 f16 张量上、extf 在其后，且不出现新的 layout 转换或额外 memref.copy。4) 性能：target 延迟需 < 164.856us，并与 unchanged_ir_target_us 同一口径；同时读 aiv_vec_ratio/aiv_time 及 VECTOR active/wait 比例确认变化来自预期位点。",
+  "layer_reason": "源码冻结且 source_edit_allowed=false；缺陷是 TTIR 中算子顺序/数据类型域的问题（select 在 extf 之后），编译器后端没有做该等价变换（ttadapter 已证），必须在 TTIR 层改写；同时不触及 ABI、不涉及编译选项或布局猜测。",
+  "simulator_incremental_judgment": "仅把模拟器窗口用作增量位点判断：绝对时钟资质为 unit_validation 24/24、median_ratio 0.997，窗口 127.391-137.582us 明确不含未知启动前后空闲；ALL/FLOWCTRL/CACHEMISS 属辅助 trace 泳道已单列，不计入关键路径。窗口内 VECTOR productive 3.768us 对 wait_only 2.499us，MTE2 productive 3.632us，MTE3 仅 0.358us productive，SCALARLDST 2851 events；结合 profiling 的 aiv_vec_ratio 0.5235 与 GM_to_UB/UB_to_GM 带宽占用 2.5%/1.3%，判定限制在 VECTOR 发射而非搬运，故本轮机制作用在正确流水。hotspot 标注 application_completed=false 且指令时间可重叠，因此不据此推断关键路径或总耗时，只预期 VECTOR 指令数与 UB 复制量下降；真实收益由宿主完整评测确认。",
+  "unknown": [
+    "后端是否会把 f16 域 select 与随后 extf 重新合并回 f32 选择（若合并则收益消失，需要看新 bcmlir 确认）",
+    "f16 与 f32 向量选择在 910B4 上的实际每拍元素比，本预测仅按 2 倍估计",
+    "hotspot 窗口为部分捕获且 profiling 的逐block均值不与总耗时相加，收益幅度只能在宿主完整评测中量化"
+  ]
+}

@@ -1,0 +1,135 @@
+编程指南 什么是 MUSA GPU 并行计算 文档版本 v5.2.0 最新 当前正在查看最新版本。 切换版本 选择文档版本 ✓ v5.2.0 最新 v5.1.0 v4.3.x v3.1.0 版本说明 版本说明 本页总览 GPU 并行计算 
+ 了解图形处理器并行计算的基本概念，包括 GPU 架构特点、并行计算模型以及元计算统一系统架构 MUSA 编程语言的核心抽象。 
+ 
+ GPU 概述 ​ 
+ 图形处理器 GPU（Graphics Processing Unit）是一种专为并行计算设计的处理器。GPU 最初用于加速计算机图形渲染，由于其高吞吐量的计算特性，现已广泛应用于通用并行计算 GPGPU（General-Purpose GPU Computing）领域。 
+ GPU 与 CPU 的架构差异 ​ 
+ 图形处理器 GPU 和中央处理器 CPU 采用不同的设计目标： 
+ 特性 CPU GPU 设计目标 低延迟，优化单线程性能 高吞吐量，优化并行处理能力 核数 较少（通常 4-64 核） 大量（数千个计算单元） 缓存设计 大容量缓存，复杂控制逻辑 较小缓存，更多计算单元 适用场景 串行任务、复杂分支逻辑 大规模数据并行计算 
+ GPU 和 CPU 硬件逻辑结构对比，如下图所示： 
+ 
+ 
+ CPU ：将更多晶体管用于缓存和复杂控制逻辑，通过大缓存和低延迟分支预测优化  单线程执行效率 。 
+ GPU ：将更多晶体管用于数据处理单元，通过  大规模并行计算  和  线程切换隐藏内存延迟  实现高吞吐量。 
+ 
+ 以 Intel Xeon 8280 和 MTT S5000 为例，具体型号对比如下所示： 
+ 指标 CPU (Intel Xeon 8280) GPU (MTT S5000) 核数 28 核 4,096 核 时钟频率 2.7 GHz 1.8 GHz 内存带宽 140 GB/s 448 GB/s 并发线程数 ~1,792 ~196,608 单精度浮点性能 4.8 TFLOPS 14.7 TFLOPS 
+ 应用场景 ​ 
+ GPU 并行计算适用于具有高并行度、高计算密度的应用场景。在智能驾驶、智能机器人、新材料发现、脑神经科学以及人工智能时代的科学研究中，GPU 已成为关键的计算基础设施。 
+ 应用领域 典型应用 科学计算 分子动力学模拟、气候建模、流体力学计算 人工智能 深度学习训练与推理、大语言模型 金融计算 蒙特卡洛模拟、期权定价、风险评估 医学影像 CT/MRI 图像重建、病理图像分析 自动驾驶 传感器数据融合、实时路径规划 
+ 
+ GPU 并行计算模型 ​ 
+ 异构计算架构 ​ 
+ MUSA 采用异构计算模型：CPU 作为主机（Host），GPU 作为设备（Device）。Host 和 Device 拥有独立的内存空间，通过 PCIe (高速外围组件互联)等总线进行数据传输。 
+ ┌─────────────────┐         ┌─────────────────┐ │     Host        │         │     Device      │ │      CPU        │         │      GPU        │ │  ┌───────────┐  │         │  ┌───────────┐  │ │  │ Host      │  │  PCIe   │  │ Device    │  │ │  │ Memory    │  │<------->│  │ Memory    │  │ │  └───── ──────┘  │  Bus    │  └───────────┘  │ └─────────────────┘         └─────────────────┘ 
+ 典型执行流程 ： 
+ 
+ 
+ 主机（CPU） ：负责顺序逻辑、内存管理、内核（Kernel）启动 
+ 设备（GPU） ：负责大规模并行计算 
+ 数据传输 ：通过  musaMemcpy()  等 API 在主机和设备间拷贝数据 
+ 
+ 线程层次结构 ​ 
+ MUSA 采用三层线程层次结构组织并行计算： 
+ 
+ Grid（网格） ：一次 Kernel 启动的所有线程 
+ Block（线程块） ：线程组，可独立调度执行 
+ Thread（线程） ：单个执行单元 
+ 
+ 
+ 线程层次结构 
+ Grid ├── Block (0, 0) │   ├── Thread (0, 0) │   ├── Thread (1, 0) │   └── ... ├── Block (1, 0) │   ├── Thread (0, 0) │   └── ... └── ... 
+ 每个线程通过内置变量获取其在层次结构中的位置： 
+ int  thread_id  =  blockIdx . x  *  blockDim . x  +  threadIdx . x ; 
+ 内置变量 说明 threadIdx 线程在 Block 内的索引 blockIdx Block 在 Grid 内的索引 blockDim Block 的维度大小 gridDim Grid 的维度大小 
+ 可扩展编程模型 ​ 
+ 多核 CPU 和众核 GPU 的出现意味着主流处理器芯片是并行系统。编程模型面临的挑战是如何开发应用软件，能够透明地扩展其并行性，充分利用不断增加的处理器内核。 
+ MUSA 并行编程模型通过三个核心抽象克服这一挑战： 
+ 抽象 说明 线程组的层次结构 Grid、Block、Thread 三层组织 共享内存 Block 内线程间数据交换 屏障同步 Block 内线程协作同步 
+ 这种设计实现 自动可扩展性 ： 
+ 
+ 线程块可独立调度，可在任意多处理器上执行 
+ 编译后的程序可在任意数量多处理器上运行 
+ 运行时系统自动适配物理多处理器数量 
+ 
+ 无需修改代码，程序即可在不同核心数的 GPU 上透明扩展。 
+ 为什么 Block 之间不能同步？ Block 可被调度到 GPU 上的任意 MP（MUSA Processor）执行，执行顺序不确定。如果允许跨 Block 同步，程序将依赖特定的执行顺序，导致无法在不同核心数的 GPU 之间移植。MUSA 编程模型要求 Block 可以按任意顺序、并行或串行执行，从而保证程序的可扩展性。 
+ SIMT 执行模型 ​ 
+ GPU 采用单指令多线程 SIMT（Single Instruction Multiple Threads）执行模型： 
+ 
+ 一组线程（Warp）同时执行同一条指令 
+ 每个线程具有独立的寄存器状态 
+ 当线程执行路径出现分支时，Warp 序列化执行各分支 
+ 
+ 
+ Warp 大小 ：不同 GPU 架构的 Warp 大小不同 
+ 
+ MTT M1000/S4000 ：Warp = 128 线程 
+ MTT S5000 ：Warp = 32 线程 
+ 
+ 选择 Block 大小时，建议使用 Warp 大小的倍数（如 128、256、512、1024）。 
+ 
+ 示例：SAXPY 运算（y = a*x + y） 
+ // CPU 串行版本 void   saxpy_serial ( int  n ,   float  a ,   float   * x ,   float   * y )   {      for   ( int  i  =   0 ;  i  <  n ;   ++ i )         y [ i ]   =  a  *  x [ i ]   +  y [ i ] ; } // GPU 并行版本——每个线程处理一个元素 __global__  void   saxpy_parallel ( int  n ,   float  a ,   float   * x ,   float   * y )   {      int  i  =  blockIdx . x  *  blockDim . x  +  threadIdx . x ;      if   ( i  <  n )         y [ i ]   =  a  *  x [ i ]   +  y [ i ] ; } // 启动：数千个线程同时执行 int  nblocks  =   ( n  +   255 )   /   256 ; saxpy_parallel << < nblocks ,   256 >> > ( n ,   2.0f ,  x ,  y ) ; 
+ 单指令多线程（SIMT）模型使程序员能够以标量线程方式编写并行代码，同时保持高执行效率。 
+ 
+ GPU 内存层次结构 ​ 
+ 内存类型 ​ 
+ GPU 内存系统包含多个层次，各层次在访问速度、容量和可见范围上存在差异： 
+ 内存类型 访问速度 容量 可见范围 寄存器（Register） 最快（1 周期） 每线程有限 线程私有 共享内存（Shared Memory） 快（1-2 周期） 每 Block 有限 Block 内共享 常量内存（Constant Memory） 中（缓存命中时快） 较小 全局可见 全局内存（Global Memory） 慢（100+ 周期） 大 全局可见 
+ 内存访问优化 ​ 
+ 高效的 GPU 程序需要合理分配数据到不同内存层次： 
+ 
+ 寄存器 ：存储线程局部变量，由编译器自动分配 
+ 共享内存 ：存储 Block 内线程共享的数据，需程序员显式声明 
+ 全局内存 ：存储主机与设备间传输的数据，需显式分配和拷贝 
+ 
+ 
+ MUSA 编程模型核心抽象 ​ 
+ Kernel 函数 ​ 
+ Kernel 是在 GPU 上执行的函数，使用  __global__  修饰符声明： 
+ __global__  void   vectorAdd ( const   float *  a ,   const   float *  b ,   float *  c ,   int  n )   {      int  idx  =  blockIdx . x  *  blockDim . x  +  threadIdx . x ;      if   ( idx  <  n )   {         c [ idx ]   =  a [ idx ]   +  b [ idx ] ;      } } 
+ Kernel 函数特点： 
+ 
+ 返回类型必须为  void 
+ 由 Host 调用，在 Device 上执行 
+ 通过执行配置语法  <<<grid, block>>>  指定线程数量 
+ 
+ Kernel 启动 ​ 
+ Kernel 启动需要指定执行 配置参数： 
+ int  blockSize  =   256 ; int  gridSize  =   ( n  +  blockSize  -   1 )   /  blockSize ; vectorAdd << < gridSize ,  blockSize >> > ( d_a ,  d_b ,  d_c ,  n ) ; 
+ 参数 说明 gridSize Grid 中 Block 的数量 blockSize 每个 Block 中的线程数量 sharedMemSize （可选）动态分配的共享内存大小 stream （可选）执行流标识符 
+ 内存管理 ​ 
+ MUSA 提供与 C 标准库类似的内存管理 API： 
+ API 说明 musaMalloc(&ptr, size) 分配设备内存 musaMemcpy(dst, src, size, kind) 在 Host 和 Device 间拷贝数据 musaFree(ptr) 释放设备内存 
+ 线程同步 ​ 
+ Block 内线程可通过屏障同步进行协作： 
+ __syncthreads ( ) ;    // 等待 Block 内所有线程到达此同步点 
+ 同步约束： 
+ 
+ 仅支持 Block 内同步 
+ 不支持跨 Block 同步（保证程序可移植性） 
+ 
+ 
+ GPU 程序执行流程 ​ 
+ 典型的 GPU 程序执行流程如下： 
+ 
+ 
+ Host 分配内存并初始化数据 
+ Host 分配 Device 内存 
+ Host 将数据拷贝到 Device 
+ Host 启动 Kernel，在 Device 上并行执行 
+ Device 完成计算 
+ Host 将结果拷贝回 Host 内存 
+ Host 验证结果并释放内存 
+ 
+ 完整代码示例,参见  快速入门 。 
+ 
+ 相关文档 ​ 
+ 
+ 快速入门 ：环境搭建与第一个 Kernel 
+ 编程模型 ：编程模型详解 
+ API 文档 ：API 参考 
+ MUSA 工具包 ：编译器与工具 
+ Musify ：迁移指南 
+ 标签： MUSA Introduction GPU Parallel Computing 这篇文章对您有帮助吗？ 有帮助 需改进 上一篇 :  什么是 MUSA 下一篇 :  MUSA 软件栈 版权所有 2024 摩尔线程，本文档受国际版权法保护。  摩尔线程和摩尔线程徽标是摩尔线程智能科技 (北京)有限责任公司的注册商标。 免责声明 本文档提供有关摩尔线程产品的信息。本文档并未授权任何知识产权的许可，并未以明示或暗示，或以禁止反言或其他方式授予任何知识产权许可。 GPU 概述

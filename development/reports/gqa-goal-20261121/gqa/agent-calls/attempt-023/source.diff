@@ -1,0 +1,55 @@
+--- 
++++ 
+@@ -98,6 +98,14 @@
+ （case4 约 4 倍、case7 约 2 倍），这是明确的交通代价；QK/softmax/PV/输出
+ 表达式、M128/N256 分块、guard 与精度路径逐字不变。G 不整除 2 时 HG=G、NGRP=1，
+ 与父版本所有权一致，不增加尾 head 掩码。
++
++输出布局（host 侧分配属性，本轮独立实验）：PERSIST_KV 分支的逻辑输出仍是
++(B, S, N_q, D)，但用 torch.empty_strided 按物理 BNSD 分配，stride 为
++(S*N_q*D, D, S*D, 1)。因此该分支返回的张量是**非连续**的（logical BSND，
++physical BNSD）；这是公开入口的明确接口性质。完整调用本身不做任何下游连续化
++转换，也不引入 permute/copy/额外分配——kernel 仍按传入的 o_ss/o_sh 直接写出。
++若后续消费者要求连续布局，须在本算子之外自行转换。其余元数据路径返回原连续
++张量，逻辑 shape、dtype、device 与数值结果均不受影响。
+ """
+ 
+ import math
+@@ -400,7 +408,8 @@
+     # exp2 based softmax keeps the scaling neutral in fp32.
+     qk_scale = scale * 1.4426950408889634
+ 
+-    y = torch.empty((B, S, NQ, D), dtype=query.dtype, device=query.device)
++    # 输出分配下移到 PERSIST_KV 判定之后（见下），每次调用恰好分配一次输出：
++    # 命中 PERSIST_KV 时用物理 BNSD 的 empty_strided，其余路径仍用原连续 empty。
+ 
+     # UB budget: acc is BLOCK_M x BLOCK_D fp32, plus q/k/v/p tiles.
+     # KV 方向分块取 128：每个 KV 块固定要付一次完整交接链（QK dot 搬出、
+@@ -501,6 +510,27 @@
+         grid = (B * NKV * NGRP,)
+     else:
+         grid = (triton.cdiv(S, BLOCK_M), B * NQ)
++
++    # 输出布局机制（本轮 host 侧独立实验）：逻辑 shape 恒为 (B,S,NQ,D)、dtype
++    # 与设备不变，仅 PERSIST_KV 分支把物理布局由 BSND 改为 BNSD——用
++    #   empty_strided(stride=(S*NQ*D, D, S*D, 1))  => o_ss=D、o_sh=S*D。
++    # kernel 本已按 o_sb/o_ss/o_sh/o_sd 寻址（JIT AST 逐字未改），故 128x128
++    # 输出 tile 由 128 段跨 16KB 的 256B 写变成连续 32KB 单块；总写出字节数完全
++    # 不变，仅搬运形状改变。数值表达式、相加顺序与写出所有权均不变：每个
++    # (b,hq,mb) 仍唯一写一次且物理区域互不重叠，故精度结构与输出 dtype 不受影响。
++    # 判据只用原 PERSIST_KV（dtype/causal/SINGLE_KV/分块元数据），不读任何输入
++    # 值、不看 case_id；其余元数据路径仍分配原连续 torch.empty。返回的是非连续
++    # 张量（BSND 逻辑、BNSD 物理）；本完整调用不做任何下游连续化转换，下游若需
++    # 连续布局须自行转换，本候选不新增 permute/copy/额外分配或编译选项。
++    if PERSIST_KV:
++        y = torch.empty_strided(
++            (B, S, NQ, D),
++            (S * NQ * D, D, S * D, 1),
++            dtype=query.dtype,
++            device=query.device,
++        )
++    else:
++        y = torch.empty((B, S, NQ, D), dtype=query.dtype, device=query.device)
+     _gqa_fwd_kernel[grid](
+         query, key, value, y,
+         query.stride(0), query.stride(1), query.stride(2), query.stride(3),

@@ -5,11 +5,12 @@ import os
 from pathlib import Path
 
 from .importer import read
+from .selection import remeasurement_indices
 
 INK, GREEN, BG = "#1b2434", "#168358", "#fff7e8"
 COLORS = dict(paired="#2368b1", sim="#c55a18", knowledge="#7852a6", probe="#2368b1", ir="#596170", unknown="#596170")
 EVIDENCE_LABELS = dict(paired="Profiling", sim="模拟器", knowledge="知识库", probe="Profiling", ir="代码分析", unknown="待核验")
-LOCATION_LABELS = dict(device="kernel 内", host="宿主启动", mixed="混合")
+LOCATION_LABELS = dict(device="kernel 内", host="宿主启动", mixed="混合", ir="IR层")
 
 
 def node_shape(x, y, location, size=11):
@@ -21,6 +22,8 @@ def node_shape(x, y, location, size=11):
         return f'<rect x="{x-size:.2f}" y="{y-size:.2f}" width="{size*2}" height="{size*2}" rx="1" {style}/>'
     if location == "mixed":
         return f'<path d="M {x:.2f} {y-size-3:.2f} L {x+size+3:.2f} {y:.2f} L {x:.2f} {y+size+3:.2f} L {x-size-3:.2f} {y:.2f} Z" {style}/>'
+    if location == "ir":
+        return f'<path class="ir-layer-node" d="M {x:.2f} {y-size-4:.2f} L {x+size+4:.2f} {y+size+2:.2f} L {x-size-4:.2f} {y+size+2:.2f} Z" {style}/>'
     raise ValueError(f"Unknown modification location: {location}")
 
 
@@ -30,7 +33,14 @@ def text(x, y, value, size=26, color=INK, anchor="start", weight=700):
 
 
 def draw(index, view):
-    points = [p for p in index["evaluations"] if p["session_id"] == view["session"]]
+    original = [p for p in index["evaluations"] if p["session_id"] == view["session"]]
+    hidden = remeasurement_indices(original)
+    numbers = {i + 1: number for number, i in enumerate(
+        (i for i in range(len(original)) if i not in hidden), 1)}
+    points = [p for i, p in enumerate(original) if i not in hidden]
+    view = dict(view, **{key: [dict(item, point=numbers[item['point']])
+        for item in view.get(key, []) if item['point'] in numbers]
+        for key in ('annotations', 'nodes')})
     session = next(s for s in index["sessions"] if s["id"] == view["session"])
     detail = any("observation" in p for p in points)
     top, bottom = (335, 535) if detail else (350, 745)
@@ -70,7 +80,10 @@ def draw(index, view):
         lx = start + 175 * i
         parts += [f'<line x1="{lx}" y1="140" x2="{lx+26}" y2="140" stroke="{COLORS[key]}" stroke-width="4"/>',
                   text(lx+36, 148, EVIDENCE_LABELS[key], 24, COLORS[key])]
-    for lx, key in zip((1015, 1195, 1390), LOCATION_LABELS):
+    locations = [key for key in LOCATION_LABELS
+                 if key != 'ir' or any(node.get('location') == 'ir' for node in view.get('nodes', []))]
+    positions = (845, 1035, 1225, 1415) if len(locations) == 4 else (1015, 1195, 1390)
+    for lx, key in zip(positions, locations):
         parts += [node_shape(lx, 191, key, size=8), text(lx+23, 199, LOCATION_LABELS[key], 24)]
     parts.append('</g>')
     if not detail:

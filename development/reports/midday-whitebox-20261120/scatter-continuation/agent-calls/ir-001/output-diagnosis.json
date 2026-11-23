@@ -1,0 +1,81 @@
+{
+  "source_sha256": "a27f40a227126c5ffbe4e6bc1fd6e93cbb7c06d9a417091e1351785b90f0429e",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "任务级耗时与流水占用分解（candidate, timing-8）",
+      "finding": "candidate runtime_tasks: _scatter_add_sort_key_kernel=782.5355us, _scatter_add_sort_out_kernel=464.1495us，两者之和1246.68us与已接受1243.0405us一致；sort_key逐block aiv_time 14.963us、vec 13.654us(vec_ratio 0.913)、mte2 0.690us、scalar 1.254us；sort_out逐block aiv_time 9.013us、vec 7.334us(vec_ratio 0.814)、mte2 0.999us、mte3 0.158us、scalar 1.405us、scalar_wait 7.141us。sort_out的mte2约等于24KB/XB向量搬运(≈1.04us)，说明已有标量探针几乎不占MTE2；向量流水为主要瓶颈。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "sort_out 指令与PC热点（核心输入，主要用于定位候选机制）",
+      "finding": "kernel=_scatter_add_sort_out_kernel；top_instructions前12项全部是VECTOR BAR(每次调用约3.07–5.63us，calls=3)，唯一VGATHER为pc0x10d124e0(4077cyc/2.47us)；另有SCALAR WAIT_FLAG 5.63us等待VEC。instruction_calls_by_pipeline: VECTOR 1351, SCALAR 3307, MTE2 43, MTE3 6。说明sort_out主要由gather+同步屏障链构成，gather/bar每减少一个即减少一段向量占用与对应BAR。单位校验: absolute_unit_validation verified, unit=us, 82/82 PC匹配, median_ratio 1.0000000149。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "部分窗口的流水占用/等待/空闲（未报告泳道保持未知）",
+      "finding": "仅一个报告(core0.veccore0, sort_out)；capture_start 0.0, capture_end 1.0, capture_duration 1.0(归一化窗口)，display_time_unit=window_fraction，capture_scope为'First to last visible hardware event'、partial边界保留；raw_clock_window 139.872–173.435(unit unassigned，约33.56us)且clock_qualification=relative_only。窗口内 VECTOR active_ratio 0.823 / productive 0.797 / wait_only 0.0269；SCALAR active 0.696 / wait_only 0.692(等VEC)；MTE2 active 0.086；ALL/aux泳道idle≈0.9999仅作辅助。覆盖率：该窗口只覆盖单核上sort_out的一段(约33.56us)，不代表464.15us全任务时长，也不包含sort_key；未采样核/泳道保持未知。"
+    },
+    {
+      "path": "ir/586fab365d9e315e3ad89eedcf6806290aa9406eeeb142d4583a8d657dabb861/_scatter_add_sort_out_kernel.ttir",
+      "category": "source_ir",
+      "role": "当前候选的实际TTIR数据流（可编辑对象）",
+      "finding": "下界搜索共12个探针：前2轮已标量化(keys[1024]、keys[512]/keys[1536]为全局标量load+splat+select)；第3轮 %go_24=tt.gather %keys_5[%mid_23]，而 %mid_23 的取值域由 %go_11、%go_17 完全决定，仅为{256,768,1280,1792}四个固定位置(256+512*(2a+b))；其后8个tt.gather为第4–11轮；第12轮由first_key标量load补齐尾部。再加上 %nxt、%after 两个数据相关gather，sort_out共11个generic gather。"
+    },
+    {
+      "path": "compiled-readonly/586fab365d9e315e3ad89eedcf6806290aa9406eeeb142d4583a8d657dabb861/_scatter_add_sort_out_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "后端实际低层产物核对（疑似冗余是否已消除）",
+      "finding": "后端未消除该小支撑gather：bcmlir中 triton_gather 与 triton_gather_0.._9 共11个gather调用保留，前两探针仍是对 %arg3(全局keys_ptr)在偏移1024/512/1536处的 memref.load(未从已暂存的UB张量%13读取)，first_key为keys[0]的标量load。说明'固定小支撑gather降级为通用VGATHER'在后端确实未被优化，属于IR层可暴露的编译缺陷。"
+    },
+    {
+      "path": "compiled-readonly/f9d15572f3b2d1abd9da76be0b6be12e3fe36dc97a489155b495a3bf417039a2/_scatter_add_sort_key_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "sort_key低层核对（用于排除该内核的进一步改动）",
+      "finding": "sort_key保留1个triton_sort与23个gather调用(22个分段扫描gather+1个取值gather)，后端未消除任何重复。任何22→11的等价改法(全局前缀+差分)会跨段污染inf/nan并引入大前缀相减的抵消误差，违反特殊值与精度要求，因此本轮不改sort_key。"
+    }
+  ],
+  "hypothesis": "sort_out 第3轮二分探针的可达下标只有4个固定值{256,768,1280,1792}（由前两轮比较位%go_11、%go_17决定），当前TTIR却用通用tt.gather取值，后端降级为VGATHER+同步屏障（hotspots显示VECTOR BAR/VGATHER为热点，profiling显示VECTOR占sort_out 81%）。把该gather改成4个固定偏移的标量load+splat，再用go_11/go_17做两级select重建同样的keys[mid]，保持数值完全一致，可去掉1个VGATHER及其屏障，标量load成本已在既有4个探针上被证明远低于gather（sort_out mte2≈1.0us几乎全为向量搬运）。",
+  "alternatives": [
+    {
+      "id": "A-selected",
+      "desc": "标量化第3轮探针：4个固定偏移标量load + 3个2048宽select重建 keys[mid_23]，替换 %go_24。",
+      "why": "支撑集固定为4、数值完全一致、改动最小，且复用已验收的'固定探针标量化'机制。"
+    },
+    {
+      "id": "B-rejected",
+      "desc": "sort_key 用全行前缀和+差分(P[end-1]-P[lo-1])替换分段扫描，把22个扫描gather降到11个。",
+      "why": "数学上等价但数值不安全：全局前缀会让一个段的inf/-inf污染其后所有段，且大前缀相减产生~1e-5量级抵消误差(大值输入会超过1e-4)，违反特殊值/精度要求；虽收益最大但被否决。"
+    },
+    {
+      "id": "C-rejected",
+      "desc": "去掉 %nxt/%after 两个gather 或 进一步标量化第4轮(8值支撑)。",
+      "why": "nxt/after是逆置换的最小代价，无法用更少gather精确表达；第4轮需8个标量load+7次select，标量/select成本预计超过1个gather的收益，按brief应拒绝。"
+    },
+    {
+      "id": "D-rejected",
+      "desc": "保持IR原样。",
+      "why": "后端已证实未消除该小支撑gather，存在明确可测的改动点，故不选no-change。"
+    }
+  ],
+  "change": "仅编辑 ir/586fab365d9e315e3ad89eedcf6806290aa9406eeeb142d4583a8d657dabb861/_scatter_add_sort_out_kernel.ttir（sort_out一个特化）：在已有key_1536探针后新增4个标量探针 keys[256]/keys[768]/keys[1280]/keys[1792]（各 arith.constant i32 + tt.addptr %keys + tt.load + tt.splat，地址基址与既有探针相同）；将第3轮 %go_24 = tt.gather %keys_5[%mid_23] 替换为 %probe = select(%go_11, select(%go_17, K1792_v, K1280_v), select(%go_17, K768_v, K256_v))，保留 %go_25 = cmpf olt %probe, %t1_10 及其后 lo/hi 更新。函数签名/ABI、常量ncols/B/LOG/EVEN、sort_key 与 frozen.py 均不变。",
+  "expected": [
+    "指令: sort_out 少1个 tt.gather→VGATHER（及其配套SCALAR WAIT_FLAG/VECTOR BAR），多4个全局标量load(4B)+4个splat+3个2048宽arith.select；sort_key 指令不变。",
+    "动态轮次: 程序数/launch次数不变(2048块/核按既有映射)，无循环轮数变化；只减少每块内一次gather+屏障的固定序列。",
+    "等待: timeline窗口内 SCALAR wait_only(0.692，主要等VEC)与 VECTOR wait/BAR 应小幅下降；SCALAR single/dual 因新增4个标量load小幅上升。",
+    "资源: sort_out VECTOR占用(active 0.823/product 0.797)小幅上升或持平，但每块aiv_time与vec_time预期下降；MTE2基本不变(标量load不占MB级搬运)，sort_out任务464.15us预期降至约452–460us，总时长1243.04us预期降至约1232–1240us。",
+    "后重放将分别核对：gather/Bar计数是否-1、标量op是否+4load+4splat+3select、sort_out与总时延的方向与幅度；若标量成本反超(总时延≥1243.04us)则该预测被证伪。"
+  ],
+  "validation": "复用固定完整合同：18个正式用例(9 correctness + 9 timing, 含scatter_add-correctness-8的dup路径与负索引)、dual 21/21补充检查与既有 segment_independence 3/3；不新增算子测试配方，不针对测试数据拟合。数值约束沿用 spec 的 atol=1e-4/rtol=1e-4/matched_ratio=1.0，本改动逐位重建同一 keys[mid] 值，理论上不改变任何算术与求和顺序。ABBA仅在出现与噪声相当的增益或测量矛盾时按 validation-policy 选用；SHA由工具自动记录。",
+  "layer_reason": "Triton表达能力: 标量load、splat与逐元素select均在TTIR可表达，本机制不需要Triton新原语，故可在IR层完成等价重写；若在源码表达，对应方向是把第3轮探针写成tl.load(keys+const)标量广播+tl.where级联(与既有前两轮标量化同构)。固定源码实验目的: 保持frozen.py逐字节一致，只改变sort_out的探针实现以独立验证'固定小支撑gather→标量'这一编译缺陷的收益，避免源码重写混入变量。IR控制点: 具体控制点是 %go_24 的通用tt.gather(支撑集4) 与首个固定偏移探针块，可局部替换并独立测量。",
+  "simulator_incremental_judgment": "模拟器窗口只覆盖单核sort_out的一段(归一化0–1，raw 139.872–173.435约33.56us，partial边界，relative_only时钟)，而任务总时464.15us、sort_key 782.54us不在该窗口内；因此窗口内VECTOR 0.823/SCALAR wait 0.692只能用于定位'gather+屏障+标量等待'机制，不能当作全任务耗时。绝对单位已用非同步PC 82/82验证为us(median 1.0000000149)，同步PC被排除，故本改动的增量方向(少1个gather/屏障、多4个标量load)可在同一us口径下前后重放核对；未报告核与泳道按未知处理，动态总次数比较以每块固定序列变化为准而非窗口累计。",
+  "unknown": [
+    "该后端4个额外全局标量load的实际每块成本(是否被调度提前而完全隐藏)未知。",
+    "4个标量load+3个select是否会被后端融合/重排，以及是否仍插入新的同步屏障，未知。",
+    "timeline为部分窗口且仅sort_out单核，无法据此推断sort_key或全任务等待的真实占比。"
+  ]
+}

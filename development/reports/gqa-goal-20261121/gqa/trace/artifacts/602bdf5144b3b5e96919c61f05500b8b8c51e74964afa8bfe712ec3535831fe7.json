@@ -1,0 +1,60 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "23d7322958578d08372dfd9f830f7dc251c4235aa34e7bacf8a3cacdcee90afc",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "mechanism",
+      "finding": "case4 候选 512 个 program、kernel 467.709us；每 program 只有 6 条 cube 指令、aic_cube_time 均值 2.018us，而 aic_scalar_wait_id1 均值 11.786us；GM_to_L1 均值 288KB、GM_to_UB 均值 192KB、UB_to_GM 均值 80KB。等待不随算术量增长，说明主成本在固定搬运/交接链，而非 cube 计算。"
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "background",
+      "finding": "参考 CANN 内核 Block Dim 仅 19，单 program 服务量远大于候选；候选 512 program 的粒度说明每 program 的固定服务成本被重复 512 次，仍有压缩空间。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Q 载入以 offs_m 乘 8192（%cst_6 = dense<8192>）构造 [128,128] 指针张量，因此一次 Q 载入是 128 段、每段 D=128 个 bf16（256B）；Out 的 o_ptrs 复用同一行 stride，写回同样 128 段×256B。这正是本轮要改善的访存组织。"
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "Q/Out 分别 lowering 为 memref.reinterpret_cast sizes:[128,128] strides:[8192,1] 的 memref.copy / materialize_in_destination；确认头维 D 连续、且 query 的 q_sh 等于 D，故同一 KV 头下相邻 G 个 query-head 在 BSND 中连续（G 个头拼成 1024 元素/2048B 的连续段）。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "当前候选四项官方 checker 全部通过，case1=165.96015us、case4=472.46045000000004us、case7=156.68215us；这是本轮真实续接的起点与目标基线，不得回退其他三项。"
+    },
+    {
+      "path": "workspace/contract.json",
+      "category": "other",
+      "role": "background",
+      "finding": "固定 case1/2/4/7、官方 checker/golden 身份、dtype 与计时合同（warmup 5、trials 3、iterations 20）；case4 为 bf16 B4 S256 Nq64 Nkv8 D128 G8 非因果。"
+    }
+  ],
+  "hypothesis": "非因果 case 的每个 program 只覆盖单一 query-head 的 128 个序列位置，Q/Out 每次搬运被拆成 128 段、每段仅 256B；而同一 KV 头下的 G 个 query-head 在 BSND 内存中相邻。若把一个 program 的 128 个逻辑 query 行重排为 (BLOCK_M/G) 个序列位置 × G 个共享 KV 头，则 Q 按 [序列子块, G, D] 连续头段载入并 reshape 为 dot 的 [128,D]，Out 反向 reshape 写回。这样 Q/Out 每段由 256B 扩大为 G*256B（case4 2048B，case2/7 1024B），段数由 128 降为 16/32，减少 DMA 描述符与 scalar/搬运等待；program 数、每个 program 覆盖的 128 个 query 行、三次数 dot、K/V 输入次数与两项 PV 精度路径均不变。",
+  "alternatives": [
+    "把 BLOCK_M 提到 256：acc 为 256x128 fp32(128KiB) 再叠加 qk(128KiB) 与 q，峰值远超 196608B UB 预算，不可编译。",
+    "在 program 内顺序复用同一 KV tile 处理多个 head：需同时驻留多份 acc，H 份 acc 超 UB；缩 BLOCK_M 又会改变并行度与链数。",
+    "提高 BLOCK_N 至 256：case4 已用 128，256 会使 k/v、qk/p 等 BLOCK_N 线性缓冲翻倍，触 UB 溢出。",
+    "仅改因果路径：case4 为非因果，与目标 case 无关。"
+  ],
+  "discriminating_observation": "若分段/描述符开销确为主导，修改后的实际 IR 中 Q/Out 的 strided copy 形状应由 [128,128]×stride[8192,1] 变成 [BLOCK_M/G, G*D]（或 [SL,G,D]），且在保持 512 program 的前提下 aic_mte2_time、aiv_mte2/mte3_time 与 scalar wait_time 下降、case4 墙钟低于 472.46045us；若 reshape 在 Ascend lowering 引入额外 layout 转换或搬入新 UB 缓冲，则会看到新增 copy/UB 占用、GM 数据量增加或墙钟不降甚至退步。",
+  "change": "在 candidate.py 增加纯元数据门控的打包路径：非因果、D==BLOCK_D、q/o 的末维 stride 为 1 且头 stride==D 时，令 BH=最大可整除 G 且整除 BLOCK_M 的 2 的幂（≤16）、SL=BLOCK_M//BH、NSG=G//BH；grid 改为 (S//SL, B*NKV*NSG)。核内按 pid 解出 b、kvh、头子组 hsub，Q 以 [SL,BH,D] 三维连续头段无掩码载入后 tl.reshape 到 [BLOCK_M,BLOCK_D]，输出先 cast 再 reshape 回 [SL,BH,D] 写回。K/V 基址、KV 循环、在线 softmax、两项概率分解表达式与相加顺序、三次数 dot、BLOCK_M/BLOCK_N/BLOCK_D 完全不变；其余情形（因果、非连续 stride、不整除）保留原单头 128 行路径。",
+  "expected": "case4 program 数保持 512（16 序列块×4batch×8KV头×1头子组），case2 保持 96，case7 保持 64；Q/Out 段数 case4 128→16、case2/7 128→32，GM 总字节不变。预期 case4 的搬运/scalar 等待下降、墙钟低于 472.46045us，case1/2/7 不退化；正确性因 reshape 仅重排独立行、每行 KV 累加顺序不变而应保持 bit 级一致。",
+  "validation": "先 preflight 编译；读取新生成 TTIR/BCMLIR 确认 Q/Out copy 形状与无额外 layout copy；再由宿主做完整四项真机评测（官方 checker、golden、dtype、计时合同）并重放模拟器核对 load/store 与等待变化。",
+  "selected_layer": "triton_source_memory_layout",
+  "layer_reason": "该机制只是 Triton 可表达的分块/布局与地址组织重组（3D 连续头段载入 + reshape），不引入新算子能力、不改变精度表达式；优先改源码而非请求单算子生成修复。",
+  "simulator_incremental_judgment": "剩余歧义是 tl.reshape([SL,BH,D]->[BM,D]) 在 Ascend lowering 是否为零拷贝视图，以及分段合并能否真实降低 DMA/等待。本轮无需新增模拟器输入：program 数、KV 链数、三次数 dot 与算术量均不变，改动只落在 Q/Out 访存组织，可直接由本轮实际 TTIR/BCMLIR 的 copy 形状与新成对 profiling 判定；宿主保留的历史模拟器知识继续用于修改后重放，若出现新增 layout copy 再补模拟器证据。",
+  "unknown": [
+    "打包后 tl.reshape 的具体 lowering 形状与是否产生额外 layout 转换，需由修改后实际 IR 确认。",
+    "case2 的 G=12 只能取 BH=4（SL=32），收益幅度可能小于 case4。"
+  ]
+}

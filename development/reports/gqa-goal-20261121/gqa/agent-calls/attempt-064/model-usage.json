@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 25,
+    "duration_ms": 53670,
+    "usage": {
+      "input_tokens": 52940,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 626304,
+      "output_tokens": 9852,
+      "output_tokens_details": {
+        "thinking_tokens": 3505
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 52940,
+        "outputTokens": 9852,
+        "cacheReadInputTokens": 626304,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 0.824152,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 3505,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 0.824152,
+    "result": "已完成本轮的诊断登记、单变量源码修改与预检，现保持候选字节不变并交接宿主只读审查及完整四项真机评测。\n\n## 证据与分析要点\n- **成对 profiling**（`current-profiling.json`）：父版本 kernel 150.383011us，20 程序，cube_time 均值 33.11us、MTE1 24.32us、fixpipe 21.47us；GM_to_L1 共 55296KB、L0C_to_GM 共 49152KB，总 MMAD 2048。墙钟跟每程序跨核交接链数量。\n- **模拟器**（`simulator-evidence.json`，已实际成功读取）：三核部分窗口、各自归一化、`application_completed=false`，全调用 completion 缺失。Cube productive 19.6%/wait 39.3%/idle 41.1%，FIXP productive 36.4%/wait 40.7%，MTE1 wait 43.1%，Vector idle 65.6%；热点与流水都指向跨核同步/交接，而非算术饱和，仅用于排序。\n- **实际 IR**：BLOCK_M 只改 dot 的 M 铺排、Q 行数与程序/行块划分，softmax/PV/归一化、FP16 交接、BF16 PV、FP32 分母与除法不变。\n- 旧 053 的 M256 UB 197120B 失败属早期 FP16-PV 输入/FP32-PV 结果结构，与当前（已删 V 转换、PV 结果窄化）资源图不同，仅作为风险而非结论。\n\n## 本轮机制（仅 run() 主机元数据）\n- 命中条件（纯元数据，不读输入值、不按 case_id）：非因果、`value.dtype==bfloat16`、`D==BLOCK_D==128`、`BLOCK_N==SKV==256`、`S%256==0` → `BLOCK_M=256`。\n- `PART_TILES` 准入由 `BLOCK_M==128` 放宽为 `BLOCK_M in (128,256)`。\n- 内核/helper AST、全部数学、FP16 交接、BF16 PV、FP32 sum/除法、NoOff 守卫、一深度 QK 前瞻、20 worker、`num_stages=2`、缓存键与输出分配均逐字不变。\n- 覆盖性：case4 NB_M 2→1、TPG 16→8、T 512→256，组数仍 32，每 worker 12~13 tile，tile 全覆盖且每 (b,hq) 只写一次，组内 QK 次数仍恰为 t1−t0（无额外 tail QK）；case7（S=128）、case2（fp16）、case1（causal）分别保持 128/128/64。\n- fkey/tail/打包元数据已含 `BLOCK_M/NB_M/TPG/T/P`，快路径身份唯一已审计。\n\n## 决策与预检\n- 修改前 `decision --record diagnosis.json` 已登记：`decision_id=141edf2b03cf4527a0f7fa536810692a`，绑定父源码 SHA `19f7fb23…584a`。\n- 修改后候选 SHA：`a9756361d5c9adae8f98c2d8b169b16ab1782fa48d96db4d1e3967d08b28002c`。\n- `preflight --source candidate.py` 返回 `awaiting_source_review`。\n\n## 交接\n保持候选字节不变，等待宿主只读路径/地址边界审查，随后进行完整四项 checker（阈值不变）与真机计时。待反馈：\n- 是否 case4 kernel 时间低于 150.383011us（总耗时目标 146.0561us）；\n- case1/2/4/7 的真实耗时与精度变化；\n- 实际编译的 UB/L0C 峰值是否超 196608B（`raw_next` 256×256 f16=128KiB、`acc` 256×128 f32=128KiB、Q 64KiB 叠加）。\n若编译失败或无收益，将如实记录，不引入回退或额外机制；M256 的 IR 修复列为另一独立分支。"
+  }
+}

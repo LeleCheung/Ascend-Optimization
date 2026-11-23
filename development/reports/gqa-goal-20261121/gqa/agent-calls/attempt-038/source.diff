@@ -1,0 +1,41 @@
+--- 
++++ 
+@@ -143,6 +143,13 @@
+ 若仅在 UB 发生则字节不变，按真实无减少记录并交接固定源码 IR 改法。数值上
+ rawQK 有符号就近舍入，|q·k| <= D = 128 不溢出 fp16，典型概率相对误差约 2e-4、
+ 最坏约 0.56%，合同值域 [-1,1]，由原四项 checker 以不变阈值判定。
++
++PART_TILES 分母 sum 与 PV 的语句序（本轮机制）：BCMLIR/TTIR 显示 FP32 分母
++归约排在 p 的 FP16 截断与 PV 矩阵乘之前，而两者并无数据依赖；033 的模拟器
++窗口也把 sum 夹在 exp2 与 P 的 VCONV/MTE3 发送之间。故先做 p 的 FP16 截断与
++PV dot，再从原 FP32 p 求分母，让 P 的传输有机会早发并与 Cube 的 PV 重叠。
++数值不变（同一 FP32 p 的同一归约、同一 fp32 累加 dot），是否真正重叠由修改后
++重放与完整四项真机评测判定；其他分支与精度路径逐字保留。
+ """
+ 
+ import math
+@@ -256,10 +263,22 @@
+                 # acc 为 0，输出为 0）。合同 [-1,1] 均匀随机输入的行 max 约 2
+                 # （std 约 0.48），到达该边界需约 -30σ，实际不可达；此机制
+                 # 依赖 |q|,|k| <= 1 的合同值域，域外可能溢出 FP16。
++                # 本轮机制（PART_TILES 语句序重排，仅此三行顺序）：
++                # 分母 sum 只用于 PV 之后的 acc/l_safe 归一化，与 PV dot 无数据
++                # 依赖；实际 BCMLIR/TTIR 却按源码序把 FP32 归约排在 p 的 FP16
++                # 截断与 PV 矩阵乘之前（bcmlir 第 103-110 行、ttir 第 105-111 行），
++                # 模拟器 033 窗口也显示 sum(150.241-150.791us) 夹在 exp 与
++                # P VCONV/MTE3 send(150.792-152.146us) 之间。故先做 FP16 截断与
++                # PV dot，再对原 FP32 p 求分母，使 P 的传输有机会提前并与 Cube
++                # 的 PV 计算重叠。数值上不变：l_new 仍是对同一 FP32 p 的同一
++                # 归约，acc 仍是同一 fp16×fp16、FP32 累加的 dot，输出归一化与
++                # guard 逐字保留（不引入 PV 结果 FP16 截断，不改 exp 与精度）。
+                 p = tl.exp2(qk - SM_OFFSET)
++                p16 = p.to(tl.float16)
++
++                acc = tl.dot(p16, v16)
++
+                 l_new = tl.sum(p, 1)
+-
+-                acc = tl.dot(p.to(tl.float16), v16)
+ 
+                 l_safe = tl.where(l_new > 0.0, l_new, 1.0)
+                 out = acc / l_safe[:, None]

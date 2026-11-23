@@ -1,0 +1,68 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "0631c7953544e4c5dab66f441ce2d1382288235bd6c03625ab57405b0126ce86",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4 候选（持久分支，128 程序）Task Duration 283.745667us；每程序 aiv_vec_time 14.055152us 高于 aic_cube_time 5.173333us 与 aic_fixpipe_time 4.974725us；aiv_scalar_wait_time 14.287955us。021 已把 L0C_to_GM 降到 640KB/程序、向量 GM->UB 288KB/程序、UB->GM 160KB/程序，说明搬出路径收益已经兑现，当前每程序向量指令流成为与交接等待同量级的部分。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "第 110-111 行：%p_norm_48 = tt.broadcast tensor<128x1xf32> -> tensor<128x256xf32>，随后 arith.divf %p_44, %p_norm_48 : tensor<128x256xf32>，即每个 query tile 对 32768 个 FP32 元素做逐元素除法；程序内 4 个 tile 共约 13 万次除法。"
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "第 112 行 arith.divf %46, %broadcasted_8 : tensor<128x256xf32> 在 BCMLIR 中仍是 128x256 的矩阵型除法，未被编译器改写成行倒数乘；可确认 rank-2 除法真实进入后端而非 TTIR 局部现象。"
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "background",
+      "finding": "持久分支 _gqa_persist_kv_body 中 l_safe = tl.where(l_new>0, l_new, 1.0)，p_norm = tl.where(l_new[:,None]>0, p/l_safe[:,None], 0.0)，随后 p_norm 转 FP16 做单次 PV dot 并直接写回 Out；HG=2 headgroup、直接 PV 输出与所有回退路径均沿用。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "父版本 021 case4 full_call 291.8388us（三次 291.84/291.54/291.87），官方四项 checker 通过（bf16 阈值 0.0078125，mismatch 14241/8388608，small_value/cancel/normal 全通过）；保留比较基准 019 case4 262.27775us。"
+    },
+    {
+      "path": "workspace/context-brief.json",
+      "category": "other",
+      "role": "background",
+      "finding": "宿主说明：021 已使搬运指标下降但完整调用回退，本轮须独立验证一个算术机制；宿主历史模拟器知识保留，本轮无需新增修改前模拟器输入。"
+    }
+  ],
+  "hypothesis": "持久分支每 query tile 的 128x256 FP32 逐元素除法（每程序约 13 万次）是当前 aiv_vec_time 14.06us/程序的主要可压缩部分：向量单元上浮点除法的指令序列显著长于乘法。把分母换成每行一次 FP32 倒数 inv_l = 1.0/l_safe（每 tile 仅 128 次除法），再用 p * inv_l[:,None] 广播乘（32768 次乘法），可在不改变数学定义的前提下压缩向量指令流；零行 where 仍作用在权重上，PV 与输出路径不变。",
+  "alternatives": [
+    "回退到 PV 之后对 128x128 累加器做行除法（父父版本路径）：改变归一化位置与 FP16 舍入对象，属于另一机制，且 021 已把搬出收益兑现，本调用不采用。",
+    "把归一化折叠进 exp2（p=exp2(qk-m-log2(l))）：增加一次 exp2 且改变求和顺序，数值风险与向量代价都更大，与宿主指定机制不符。",
+    "改用近似倒数内建：宿主明确禁止新增近似特殊内建，且会引入额外精度风险，排除。",
+    "仅加编译选项/输出布局/分块调整：宿主本轮禁止，且上一轮 profiling 已表明这些维度不是当前主要矛盾。"
+  ],
+  "discriminating_observation": "修改后实际 TTIR/BCMLIR 应出现 tensor<128xf32>（或 128x1）上的倒数除法，随后是 broadcast + arith.mulf(tensor<128x256xf32>)，而不再有 128x256 的 arith.divf；同时成对 profiling 的每程序 aiv_vec_time 应下降，而 cube 指令数、L0C_to_GM、GM->UB/UB->GM 与 V 转换计数基本不变。若编译器把乘倒数规范化回矩阵除法（IR 仍为 128x256 divf），则机制未生效，向量时间不应变化，可据此区分。",
+  "change": "仅改 _gqa_persist_kv_body：保留 l_safe = tl.where(l_new > 0.0, l_new, 1.0)，新增 inv_l = 1.0 / l_safe（FP32 行向量），并把 p_norm = tl.where(l_new[:, None] > 0.0, p / l_safe[:, None], 0.0) 改为 p_norm = tl.where(l_new[:, None] > 0.0, p * inv_l[:, None], 0.0)。p、m_safe、l_new、零行守卫、FP16 转换、单次 PV dot、直接输出、HG=2 headgroup、grid 与所有非持久回退路径逐字不变。数值风险：除法只舍入一次，改为「倒数舍入 + 乘法舍入」两次 FP32 舍入，理论相对偏差上界约 2^-23（有限正分母 l_new>=1，不产生溢出/放大；零行 l_safe=1 且由 where 置 0），远小于随后 FP16 转换的 2^-11；适用输入范围与原合同一致（[-1,1] 输入、bf16 非因果持久分支），由原四项官方 checker 以原阈值验收。",
+  "expected": "每程序向量指令流缩短，aiv_vec_time 相对 14.055152us/程序下降；GM/L0C 搬运与 cube 计数不变。完整调用 case4 相对父版本 291.8388us 是否改善需实测，且必须低于保留最佳 262.27775us 才有意义；因 021 搬运改善未转化为完整调用收益，本轮不对完整调用做正向断言。case1/2/7 走非持久路径应逐字不变，实际值需记录以确认无副作用。",
+  "validation": "1) preflight --source candidate.py 通过只读审查；2) 实际 TTIR/BCMLIR 检查 rank-1 倒数 + 广播乘是否取代 128x256 除法（编译器可能重构，按实际 IR 判定）；3) 原四项官方 checker 与原阈值全量验收；4) 完整调用计时（warmup 5、trials 3、iterations 20）对比父版本 291.8388us 与保留最佳 262.27775us，记录四项真实变化；5) 修改后模拟器重放由宿主侧后续反馈。",
+  "selected_layer": "source_arithmetic",
+  "layer_reason": "该机制完全落在 Triton 源码的逐元素算术组织上：只把一次矩阵型除法改写为行倒数 + 广播乘，不改分块、布局、编译选项、输出路径或回退，且无需新增缓冲区/scratch；这是当前唯一允许修改的层（candidate.py）内可直接表达且能由实际 IR 区分的机制。",
+  "simulator_incremental_judgment": "剩余歧义有二：向量单元浮点除法的低位下降序列究竟占 14.06us/程序的多大比例；编译器是否会把乘倒数规范化回矩阵除法。两者都无法由已有模拟器材料进一步区分，但都能由本轮修改后的实际 IR 与成对 profiling（aiv_vec_time 与指令计数）直接判定，故不新增修改前模拟器输入；宿主保留的历史模拟器知识用于后续重放对照，修改后重放按流程继续。",
+  "unknown": [
+    "编译器是否保留 rank-1 倒数乘，还是规范化为 128x256 除法。",
+    "向量除法低位序列对 aiv_vec_time 的实际占比。",
+    "完整调用收益是否足以低于 262.27775us。"
+  ],
+  "post_change_status": {
+    "decision_id": "0dcc0544c91e4d83befbeb4f2cfaf54b",
+    "recorded_source_sha256": "0631c7953544e4c5dab66f441ce2d1382288235bd6c03625ab57405b0126ce86",
+    "modified_source_sha256": "cd8f08006da549fb1edfdcbc669a9824a1603c27edd147a2f2954493f6cf5833",
+    "preflight": "awaiting_source_review",
+    "note": "已按本轮机制完成唯一源码修改（持久分支 inv_l 行倒数 + 广播乘），preflight 返回 awaiting_source_review，候选字节保持不变，交宿主只读审查与完整四项真机评测；修改后的实际 IR、成对 profiling 与模拟器重放结果待宿主反馈后回填观测与未决问题。"
+  }
+}

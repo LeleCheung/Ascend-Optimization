@@ -1,0 +1,49 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "762464829451fde7de4aee0bebf8e6a0ef4959e43e9a2b441a83d44e7ad0ac10",
+  "evidence": [
+    {
+      "path": "workspace/actual-ir/3-_gqa_v_cast_f16_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "输入端被降成两层 scf.for（16×1024）逐元素 memref.load：%reinterpret_cast_1 = memref.reinterpret_cast ... sizes:[1] strides:[1] 后 memref.load[%c0] 单元素 bf16 读，再 tensor.insert 回 16x1024。即每个 program 16K 次标量 GM 读，完全未向量化；输出端却是 16x1024 整块 extf/truncf + materialize_in_destination 连续写。"
+    },
+    {
+      "path": "workspace/actual-ir/5-_gqa_v_cast_f16_kernel.ttir",
+      "category": "source_ir",
+      "role": "trigger",
+      "finding": "源地址 = V + pid_b*v_sb + offs_j*v_ss + (offs_c//D)*v_sh + (offs_c%D)*v_sd，其中 arith.divsi/arith.remsi 对 offs_c_6 取 %cst(=128)。该地址对 offs_c 非仿射，后端无法证连续，故 BCMLIR 退化为逐元素标量 gather；mask 仍保留。"
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "background",
+      "finding": "本次成对采集的主算子 _gqa_fwd_kernel 在 case4 上 Task Duration 317.886353us（512 program，cube_time 均值 1.29us、scalar_wait_id1 均值 7.42us），与整调用 784.47us 相差约 466us；该差值落在主 kernel 之外，指向同一调用链里的 V 预处理阶段。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "011 父版本四项 checker 全过；case4 candidate full_call_us=784.47310（trials 839.56/784.47/780.54），而 profiled 主 kernel 317.886us。相对保留最佳 006 的 328.4468us，预转换阶段是待消除的主要非主-kernel 时间。"
+    },
+    {
+      "path": "workspace/context-brief.json",
+      "category": "other",
+      "role": "background",
+      "finding": "合同固定 case1/2/4/7、官方 checker 与 golden、输入输出 dtype 与计时口径；宿主明确限定本轮为独立实验：只隔离 V 预处理连续输入快路径，主 attention AST/M/N/dtype 路径与 launch 选项均保持。"
+    }
+  ],
+  "hypothesis": "V 预处理 kernel 的 GM 读之所以退化为 16K 次标量 load，是因为源地址用 (offs_c//D)*v_sh+(offs_c%D)*v_sd 表达二维 (NKV,D) 打包，对 offs_c 非仿射。当原 V 为连续张量时，(B,SKV,NKV,D) 的物理展平就是 (((b*SKV+j)*NKV+h)*D+d)，与连续 scratch 完全一一对应，可用一维 flat 线性索引 offs=pid*BLOCK+arange、只留边界 mask，使读端成为连续块 copy；这不改变每个元素 bf16→f32→f16 的两次舍入，scratch 形状/内容与主 kernel 输入完全相同。",
+  "alternatives": [
+    "保持二维打包但对 offs_c 用法化 arange 展开（仍可能因 div/mod 非仿射退化，且不保证向量化）。",
+    "在 host 用 torch 做 dtype 转换（被硬约束禁止，设备计算必须 Triton）。",
+    "不做预处理、回退到主 kernel 逐 program 转换（即父版本之前的形态，重复 G*S/BLOCK_M 次，已知更慢）。"
+  ],
+  "discriminating_observation": "若假设成立，新的 flat 连续预处理 kernel 的 BCMLIR 读端应从 memref<1xbf16> 逐元素 load 变为连续块 memref.copy/向量 load（或 TTIR 中出现无 divsi/remsi 的线性 offset），且 case4 整调用应显著低于 784.47us、逼近并有望低于 328.4468us；若整调用不降，则 466us 差值另有来源，假设被推翻。",
+  "change": "在 candidate.py 新增 _gqa_v_cast_f16_flat_kernel（一维连续 load→bf16→f32→f16→连续 store，唯一 offs 所有权与 N 边界 mask）。run() 中当 PV_SINGLE_F16 && SINGLE_KV 且 value.is_contiguous() 时走该 flat kernel，scratch 形状/内容不变，主 kernel 调用与实参完全不变；value 非连续时保留原二维 strided _gqa_v_cast_f16_kernel 回退。选路只看张量连续性元数据，不读输入值、不看 case_id。",
+  "expected": "case4 V 预处理从每元素标量 GM 读（约 1.05M 次/调用）变为连续块搬运，消除该阶段标量化开销；整调用耗时应明显下降并力争低于保留最佳 328.4468us。代价：多一个 kernel 变体与一次元数据分支，GM 字节量与主 attention/kernel AST 不变。",
+  "validation": "先 preflight --source candidate.py 做只读路径与地址边界审查；再由宿主完成完整四项真机 checker（数值阈值不变）与整调用计时，逐项比较 case1/2/4/7 与 006 基线；随后对新 IR 做模拟器重放，核对读端是否已连续块化。",
+  "selected_layer": "V 预处理 Triton kernel 的索引/布局表达（源码层），不改主 attention 计算。",
+  "layer_reason": "实际 BCMLIR 已把退化定位到预处理的地址生成：单一非仿射 (//D,%D) 迫使后端标量 gather，而该退化可在 Triton 源码用连续一维索引直接消除；主 kernel 的 M/N、dtype 路径与 launch 选项无此缺陷且已被合同冻结。",
+  "simulator_incremental_judgment": "当前剩余歧义是预处理 kernel 在设备上的实际标量化成本占比（profiling 只覆盖主 kernel 317.886us，466us 差值为整调用与主 kernel 之差，未单独采集 cv 阶段）。本轮无需新增模拟器输入：假设由实际 BCMLIR/TTIR 的地址非仿射与逐元素 load 直接支撑，且可由修改后源码 IR 是否连续块化、以及整调用计时是否下降来判别；既有 006/009 模拟器知识保留，011 后独立重放继续。"
+}

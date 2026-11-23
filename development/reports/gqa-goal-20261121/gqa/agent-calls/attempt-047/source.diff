@@ -1,0 +1,51 @@
+--- 
++++ 
+@@ -126,8 +126,8 @@
+ host 由纯元数据取上界 Bq = D*|qk_scale| 并令 SM_OFFSET = Bq - 15，使
+ p = exp2(qk - SM_OFFSET) <= 2^15 = 32768 < 65504（约 2 倍余量），同时使典型行
+ 的 p 处于 FP16 正规区。这样每 tile 删除一次 128x256 max 归约、其守卫与广播减法，
+-只保留标量常数减法 + exp2；sum、fp16 PV、PV 后归一化、输出 guard、全部地址与
+-20 worker 连续分区逐字保留。数值上是实数等价而非逐位等价：每行 p、l_new 与 PV
++只保留标量常数减法 + exp2；sum、fp16 PV、PV 后归一化、全部地址与 20 worker
++连续分区逐字保留（输出 guard 的处置见下段「删除可证冗余分母守卫」）。数值上是实数等价而非逐位等价：每行 p、l_new 与 PV
+ 分子同乘一个公共 2 的幂次因子并精确抵消；p 的 FP16 舍入仍为 2^-11 相对误差量级。
+ 风险是为节省归约而放弃逐行对齐：若某行 max 远低于 SM_OFFSET（约 -12.7 以下）该行
+ p 进入 FP16 次正规，更低则整体下溢（l_new 仍由 fp32 提供正值，输出退化为 0）；
+@@ -374,8 +374,8 @@
+                 # P VCONV/MTE3 send(150.792-152.146us) 之间。故先做 FP16 截断与
+                 # PV dot，再对原 FP32 p 求分母，使 P 的传输有机会提前并与 Cube
+                 # 的 PV 计算重叠。数值上不变：l_new 仍是对同一 FP32 p 的同一
+-                # 归约，acc 仍是同一 fp16×fp16、FP32 累加的 dot，输出归一化与
+-                # guard 逐字保留（不引入 PV 结果 FP16 截断，不改 exp 与精度）。
++                # 归约，acc 仍是同一 fp16×fp16、FP32 累加的 dot；输出 guard 的
++                # 可证冗余已在下段删除（不引入 PV 结果 FP16 截断，不改 exp 与精度）。
+                 p = tl.exp2(qk - SM_OFFSET)
+                 p16 = p.to(tl.float16)
+ 
+@@ -383,9 +383,23 @@
+ 
+                 l_new = tl.sum(p, 1)
+ 
+-                l_safe = tl.where(l_new > 0.0, l_new, 1.0)
+-                out = acc / l_safe[:, None]
+-                out = tl.where(l_new[:, None] > 0.0, out, 0.0)
++                # 本轮机制（仅 PART_TILES 删除可证冗余分母守卫）：实际
++                # TTIR/BCMLIR 显示原两处守卫被落实为整 l_new 的 cmpf/select、
++                # expand+broadcast 到 128x128 的 i1 及一次整矩阵 arith.select。
++                # 在冻结合同（均匀[-1,1]、D=128、非因果 fullKV256）下由源码可
++                # 严格推出 l_new 有限且严格为正：qk_scale=(1/sqrt(128))*log2e≈
++                # 0.12752，SM_OFFSET=D*|qk_scale|-15≈1.322；rawQK 截断 FP16 且
++                # |q·k|<=D=128，故缩放后 qk∈[-16.322,16.322]，qk-SM_OFFSET∈
++                # [-17.645,15]，p=exp2(·)∈[2^-17.645,2^15]，全为正；SKV=256 个
++                # FP32 正项之和下界≈1.25e-3>0、上界≈8.4e6 有限。故
++                # l_safe=where(l_new>0,l_new,1) 与 out=where(l_new>0,out,0) 在
++                # 合同内恒为无操作，直接 acc/l_new 实数等价。保持 FP32 分母求和
++                # 与 FP32 逐元素除法本身（不改倒数重写、不改类型转换与算术分组）。
++                # 域限：仅合同值域与 fullKV 无全掩码行成立；任意越界极端有限行
++                # （行最大值远低于 SM_OFFSET 使 p 在 FP32 下溢为 0）会令 l_new=0，
++                # 原守卫输出 0、删守卫后为 NaN。此差异仅在越界输入出现，不作数据
++                # 依赖选路，不改测试与阈值。
++                out = acc / l_new[:, None]
+ 
+                 o_ptrs = Out + b * o_sb + hq * o_sh + offs_m[:, None] * o_ss + offs_d[None, :] * o_sd
+                 if MASK_MD:

@@ -1,0 +1,50 @@
+{
+  "source_sha256": "19f7fb238946cb9006286d4d222425d07c4ea9fc38a7d4ff85c71c72c49c584a",
+  "author": "Codex",
+  "requested_mechanism": "先完成mandatory_read_order。保持原目标与ir-002草案同一机制：复用UB32768..65536，在P发送/flag1后、PVflag0等待前预取；Cube nextQK FIX后发ready flag4；首块prefillUB0、专用MTE2→V EVENT1，V→MTE2 EVENT0改为组级配对。以reviewed-prefetch-draft.mlir为你上一调用已实现草案，只用Edit复现到恢复后的ir/target.hivm.mlir，保持数学、ABI、事件证明和UB界限。禁止额外机制、额外缓冲、改数字或降低读取要求。",
+  "analysis": "成对063profiling：CANN kernel122.662453us，各Cube均值计算35.469/MTE1 29.604/MTE2 52.222/FIX58.440us；候选150.383011us，各33.109/24.324/33.360/21.468us。Vector CANN计算59.014/MTE2 40.257/MTE3 35.650us；候选49.041/14.479/19.509us。总量更小但墙钟更大，仅提示重叠/依赖方向，不能把计数当关键路径。当前nativeIR001模拟器同Vector核：前一轮归约44.964..45.257，VREC45.258..45.271，VMUL45.287..45.468，下一QK GM→UB45.259..45.739，输出MTE3 45.596..46.498。因此已有读取与归一化/输出重叠，不能宣称靠移到归一化前实现首次重叠。实际IR QK读取UB0复用sum临时区，V→MTE2 EVENT0在sum后释放，所以当前接收下界是sum完成。更早接收可考虑复用P发送完成后的UB32768..65536，此时当前FP32p在114688..180224、PVraw65536..81920、acc81920..114688、分母180224..180480均不冲突。下一QK数学与GM写入在当前PV前，当前Cube却仅在PV FIX后发flag0；需在有效nextQK FIX后新增独立ready信号，Vector据此读，保持原PVflag0语义。",
+  "proposed_event_plan": [
+    "每KV组先做首块QK接收到UB0；其余块在上一轮末的P发送后接收到UB32768。首轮读0，后续读32768，之后转换到原FP32p缓冲再覆盖PBF16目的。",
+    "对有效next条件，在Cube nextQK FIX之后发目前未用跨核flag4；Vector已先发Pready flag1，再等待P的MTE3发送完成以及nextQKready flag4，然后MTE2读下一QK到32768；新增MTE3→MTE2事件必须确认端口/ID未占用。",
+    "预取完成后用专用MTE2→V事件（如EVENT1）保护下一轮raw转换，原PV读仍用MTE2→V EVENT0。nextGM读完后发原VECTOR MTE2 crossflag2，供Cube下一轮覆盖同GM区；总每tile恰一次flag2，首块在prefill发。",
+    "当前V→MTE2 EVENT0是保护UB0归约临时与后续QK读；改用32768接收后，需重新平衡此通道：可改成每组prefill前V→MTE2成对set/wait，确保上一组Vector完成后才写UB0；去掉逐tile sum后set及旧最终drain。此为提案，模型必须按真实IR逐项审查，严禁留下未配对事件。",
+    "PBF16原MTE3→V EVENT0等待及输出EVENT1继续保持；预取写32768前等待当前P搬运完成，下一轮读32768完成后才重新写PBF16。所有归约和原生倒数数值顺序保持。",
+    "非空组交集T个tile：QKprefill1+next(T-1)，新flag4 set/wait T-1，raw就绪事件set/wait T，crossflag2各T。尾块无next操作；跨组显式prefill0并完成上一组缓冲保护。"
+  ],
+  "risks": [
+    "新增同步可能抵消隐藏的约0.48us/tile接收成本，真实收益待测。",
+    "前移scalar wait必须在P发送及Pready信号之后，避免Cube等待P而Vector等待nextQK的死锁；同核程序序不等于跨流水完成。",
+    "显式地址复用和事件调整属于生成调度控制点；本调用只改IR且保持宿主/源码冻结。",
+    "所有源与IR评论/模型摘要以实际diff为准。若需要改变数学/类型/更多容量，停止该方案而不缩小目标或偷偷回退。"
+  ],
+  "repair_feedback": {
+    "status": "ir_review_repair_required",
+    "source_sha256": "19f7fb238946cb9006286d4d222425d07c4ea9fc38a7d4ff85c71c72c49c584a",
+    "changed_ir_sha256": "d41c565f13d97e2794c010ab1473d4603a29f030ae298fd80c4b2d79f03f9387",
+    "cpu_compiled": false,
+    "device_evaluated": false,
+    "reasons": [
+      "Explicitnewbuffer[180480,213248)exceedsUBcapacity196608bytesby16640. Modelcomparedbytesagainst1572864bits. UBfree16128bytesissmallerthan32768required.",
+      "RegisteredprefetchafterPVsyncflag0andaccMTE2loadcannotoverlapthePVwaitthatprecedesit. ItdoesnotimplementrequestedearlierPV-overlapmechanism.",
+      "Modelclaimedaddedper-tileloadbutreplacefirst/nonfirstmustcounttotal512unchanged. Partialwindowexposureisnotaguaranteedkernelgain.",
+      "Submitcommandsusedincorrectconstructedpathsandwererejectedbyallowed-commandchecking. Originaldecisionusedvalidexactabsolutecommand; noapprovalrequestneeded. No submission fabricated."
+    ],
+    "next_action": "RestoreacceptedIR001andregenerateoriginalboundedbuffermechanismwithinstalledMTE3_MTE2evidence. Preserveall001artifacts."
+  },
+  "event_capability": "读取event-capability-readonly/sources.json及对应实际SDK头文件。CANN9.0.0 matmul_impl.h74-76直接FetchEventID/SetFlag/WaitFlag<HardEvent::MTE3_MTE2>，另batch_copy_cube_in_using_ub.h146-147同样使用。硬件API确实存在；本候选hivm.hir.set_flag[<PIPE_MTE3>,<PIPE_MTE2>,<EVENT_IDx>]的具体lowering由CPU编译验证。无需因旧工作区无该pipe示例就宣称能力缺失。",
+  "units": "UB容量1572864bits/8=196608B；当前最高活跃结束180480B，余16128B，不能再放32768B。目标复用32768..65536，已有P缓冲。不得扩大UB终点。",
+  "tool_paths": "使用本轮prompt给出的精确绝对桥命令完成decision和submit；旧001模型自造run/hgkda-release-venv或run/controller-tools路径被拒绝。真实Python=/data/hanle/ascend-optimization/runtime/hgkda-release-venv/bin/python，真实工具=/data/hanle/ascend-optimization/runs/gqa-goal-20261121/controller-tools/ir_model.py。",
+  "mandatory_read_order": "本次必须先用Read工具实际读取：context.json；frozen.py（至少PART_TILES helper与run元数据分支）；profiling.json（已缩成实际成对指标，可直接Read）；hotspots.json相关段；timeline.json相关段；ir/target.hivm.mlir；reviewed-prefetch-draft.mlir。不要用Python/Bash解析读取，前两次被工具允许列表拒绝；Read/Grep可用。完成成功读取后才Edit diagnosis、decision，然后用Edit把已恢复父IR改成已审查草案的同一机制。旧草案只读留存，不能把旧读取/旧decision冒充本轮。",
+  "previous_gate_failure": {
+    "status": "preedit_evidence_read_repair_required",
+    "source_sha256": "19f7fb238946cb9006286d4d222425d07c4ea9fc38a7d4ff85c71c72c49c584a",
+    "changed_ir_sha256": "c3bfa79252997697a999f80291af3e0e38b678d5c4339fa22c603d3b9406fa1a",
+    "cpu_compiled": false,
+    "device_evaluated": false,
+    "missing_successful_predecision_reads": [
+      "profiling.json",
+      "frozen.py"
+    ],
+    "scope": "Originalstrictmodelreadreviewpreserved. ModelactuallyreadcurrentIR/simulatorandregisteredbeforeedit; profilingPythonBashreadswereblockedandnofallbackRead, frozen.pyunread. No successfulreadfabricated. Restoreparentandhave modelreadcompactactualprofiling+frozen source before newdecision/edit. Staticboundsnowvalid180480B; actualdraftsavedforreusebyitsmodelauthor."
+  }
+}

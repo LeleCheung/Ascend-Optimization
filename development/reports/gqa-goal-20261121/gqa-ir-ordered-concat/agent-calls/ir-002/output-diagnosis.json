@@ -1,0 +1,103 @@
+{
+  "source_sha256": "e643746721391d655d976c1b1f19cbb7cde254ff7a7864aa08aaa03edb3286cc",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "feedback.json",
+      "category": "evaluation",
+      "role": "当前源码正式与补测结果边界",
+      "finding": "previous_source_feedback 记录案例1/2/7正式通过、候选全调用时间174.7047/172.05215/298.1353us；案例4在ConvertLinalgIRToBinary阶段报ub overflow，requires 25168128 bits而可用1572864 bits。当前源码分支因此没有案例4真机成绩，三例成绩作为独立历史测量保留。"
+    },
+    {
+      "path": "feedback.json",
+      "category": "evaluation",
+      "role": "IR001补编译的实际结论",
+      "finding": "ir_compile_result 状态compile_failed，returncode=1；stderr 报 requires 2097152 bits 对 1572864 bits，折算UB需求262144B高于196608B上限。scope 说明2D有序insert_slice把3D拼接的UB需求3146016B降到262144B，剩余瓶颈是单个256x256 FP32张量。"
+    },
+    {
+      "path": "ir-inventory.json",
+      "category": "source_ir",
+      "role": "可编辑清单与来源绑定",
+      "finding": "清单仅登记 ir/target/_gqa_fwd_kernel.bcmlir 一项，符号_gqa_fwd_kernel，stage=bcmlir，原始产物来自 attempt-015 parent-validation 缓存，original_sha256=c600a44...。本调用只允许修改该BCMLIR。"
+    },
+    {
+      "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "当前待修复IR的实际结构",
+      "finding": "函数为S=256、Nq=64的单一特化；Q按256x128 bf16一次搬运，K分两个128x128块转置，V按256x128 f16一次搬运；两次linalg.matmul生成256x128 FP32 score后经两次tensor.insert_slice合成tensor<256x256xf32>，随后rowmax、subf、exp2、rowsum与PVmatmul全部在256x256 FP32上执行。该256x256张量恰为262144B，与编译报错的2097152 bits一致。"
+    },
+    {
+      "path": "compiled-readonly/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "冻结低层产物对照",
+      "finding": "该原始bcmlir使用tensor<256x128x2xf32>两片insert、linalg.transpose到256x2x128再reshape为256x256，对应3146016B的三份整块缓冲；说明UB超标来自整块score物化，IR001删去3D中转后仍保留同一256x256物化。"
+    },
+    {
+      "path": "compiled-readonly/_gqa_fwd_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "后端是否已消除疑似冗余的核对",
+      "finding": "ttadapter 与 bcmlir 的matmul、transpose、reduce、broadcast 序列逐项对应，256x256 score物化在低层适配器中保持整体，后端未自动拆行；因此冗余需要在本层IR显式分块消除。"
+    },
+    {
+      "path": "ordered-concat-language-evidence.txt",
+      "category": "source_ir",
+      "role": "有序拼接的语言层依据",
+      "finding": "Ascend语义中cat仅接受1D张量且要求can_reorder；join在末维追加长度为2的维度并依赖reshape保持顺序。当前IR用2D insert_slice直接写入[0,0]与[0,128]，正是保持键序且避开1D限制的表达。"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "历史版本真机对照（attempt-006，source_sha256=aec8e907...）",
+      "finding": "candidate 侧 _gqa_fwd_kernel_mix_aic 的 Task Duration 为329.446594us，Block Dim 512；reference 侧 FusedInferAttentionScore 为118.682373us。该材料绑定保留最佳006源码aec8e907，与当前源码e6437467分属不同版本，本轮仅作机制参照。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "paired_profiling",
+      "role": "历史热点与等待结构（attempt-006，source_sha256=aec8e907...）",
+      "finding": "top_instructions 首项为PV dot（candidate.py:238）上的WAIT_FLAG_DEVI，9.59us；其次为qk dot（candidate.py:163）上的FIXP WAIT_FLAG 5.94us与CUBE WAIT_FLAG 4.69us；MTE2 的 MOV_OUT_TO_L1_MULTI_ND2NZ（K装载）4.36us。CUBE泳道wait_ratio约0.3165、idle_ratio约0.5714，MTE2 wait约0.3464、idle约0.5711，说明历史版本以同步等待和搬运停顿为主。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "仿真窗口资质与覆盖范围（历史attempt-006）",
+      "finding": "capture_start=0.0、capture_end=1.0、capture_duration=1.0，采用window_fraction归一化；capture_scope为core0.cubecore0首个到末个可见硬件事件；raw_clock_window为153.532-170.559us，clock_qualification=relative_only、absolute_time_qualified=false，outside_events=20。绝对单位校验对21个PC给出median_ratio 1.0007，说明可见事件区间约17.03us，整核时长与时序等待结论仍以真机材料为准。"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "evaluation",
+      "role": "Codex宿主证据分析与候选方向",
+      "finding": "Codex核对IR001的CPU编译结果（3146016B降至262144B、仍高于196608B），提出按M把向量阶段拆成两个128行块，逐块形成128x256有序score并独立执行同一rowmax/exp2/sum/PV，同时提示PV拆分增加节点的性能代价。本调用采纳该方向并选择保持每行256键单次reduce与k=256的PV结构。"
+    },
+    {
+      "path": "frozen.py",
+      "category": "source_ir",
+      "role": "冻结源码身份",
+      "finding": "workspace/frozen.py 对应 context.json 的 source_sha256=e6437467...，本轮保持逐字节不变；改法只落在 ir/target/_gqa_fwd_kernel.bcmlir。"
+    }
+  ],
+  "hypothesis": "编译失败的单一决定因素是整块256x256 FP32 score物化：它把fused向量阶段的UB需求推到262144B。把M=256切成两个128行阶段后，每阶段只形成128x256 FP32 score（131072B），每行的键序、全256键的rowmax、exp2、rowsum以及k=256的PVmatmul结构全部保留，因此逐元素算术与归约顺序和当前IR一致，UB需求降到196608B以下，从而解除BiShengHIR的ub overflow。",
+  "alternatives": [
+    "保持IR原样：IR001已把需求降到262144B并仍超限，后端在ttadapter层保留整块物化，原样交接会重复同一编译失败。",
+    "只改编译选项：自动多缓冲在报错命令中已是False，选项层面没有对应开关，且该路线属于独立研究身份。",
+    "在N方向再拆半：每块128x128更小，但rowmax与rowsum需要两段合并，行内求和结合顺序改变，收益与风险均高于M分块。",
+    "把Q/K/V搬运改成更小分块：这些缓冲单块不超过64KiB，对262144B的报错点没有作用，徒增搬运指令。",
+    "在源码层重写score构造：当前源码分支冻结且未保留，源码重写属于另一研究身份。"
+  ],
+  "change": "仅编辑 ir/target/_gqa_fwd_kernel.bcmlir：保留地址计算与K两片转置、V整块装载；把Q装载改为按行偏移%14与%14+1048576两次128x128 bf16搬运；对每个128行阶段分别执行两次qk matmul与scale、两次insert_slice合成tensor<128x256xf32>、rowmax/exp2/rowsum、truncf后与同一V整块做k=256的PV matmul、按行和归一化、truncf并在对应偏移写回128x128输出。函数ABI、参数次序与返回保持不变，最大同时物化张量由256x256 FP32降为128x256 FP32。",
+  "expected": [
+    "编译资源：CPU编译UB需求由262144B降到131072B，低于196608B上限，BiShengHIR流水线通过；若报错转移到其他缓冲，记录实际bits数值。",
+    "指令数量：qk matmul由2条变4条，PV matmul由1条变2条，Q搬运与输出写回各由1次变2次，insert_slice由2条变4条，rowmax/rowsum由各1条变各2条，broadcast、subf、exp2、divf按128行分成两段；FLOPs与搬运总字节持平。",
+    "动态轮次：每program仍处理一个256行tile，外层循环次数与grid不变；向量阶段处理的元素总量保持256x256，轮次总量按两段各半分配。",
+    "等待：新增两组qk与PV同步，CUBE/FIXP的WAIT事件次数上升；历史热点中PV处9.59us的WAIT_FLAG_DEVI按行半分摊为两次约半长等待，总等待时间可能小幅增加。",
+    "资源占用：UB最大单缓冲131072B，PV累加器为128x128 FP32（65536B），L0C与L1占用随M减半；K/V缓冲与总搬运字节不变。",
+    "性能：案例4获得可编译候选并与保留最佳006的328.4468us单独比较；案例1/2/7的既有回归由其他机制解释，本轮不宣称修复。"
+  ],
+  "validation": "宿主先做CPU编译与MLIR解析检查，再跑固定四例官方真机与完整调用计时；逐项核对编译UB数值、指令与同步次数、案例4候选时间及与006的差值，并按历史窗口资质解释仿真增量。",
+  "layer_reason": "Triton表达能力方面，源码以tl.cat/join加reshape表达有序拼接，Ascend语义的cat仅支持1D且要求可重排，整块256x256物化由语言层形状决定；在源码改写需要重组score构造，属于已冻结的分支改动。固定源码实验目的方面，本轮验证同源码下仅靠IR分块能否解除编译失败并带来收益，与源码重写、单纯改编译选项区分开。IR控制点方面，bcmlir能直接决定中间张量的形状与复用，把256x256拆成两个128x256即可控制最大同时物化，同时保持函数ABI与每行键序。",
+  "simulator_incremental_judgment": "历史仿真采用相对时钟，窗口覆盖core0.cubecore0首个到末个可见事件（0到1归一化，原始153.532-170.559us，约17.03us），absolute_time_qualified为false，outside_events=20，未报告泳道保持未知。本改动不改动窗口资质，增量体现在新增的qk/PV同步WAIT事件与按行分段的向量事件；绝对值与关键路径结论交由宿主真机与独立材料核对。",
+  "unknown": [
+    "两个128行阶段的额外matmul发射对案例4真机时间的净影响。",
+    "后端对128x256 score是否仍采用整块物化，以及实际UB数值的精确落点。",
+    "案例1/2/7在本源码分支的性能回归是否与有序拼接之外的机制相关。"
+  ]
+}

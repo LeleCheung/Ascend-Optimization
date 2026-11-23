@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 63,
+    "duration_ms": 433111,
+    "usage": {
+      "input_tokens": 88958,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 4580352,
+      "output_tokens": 65456,
+      "output_tokens_details": {
+        "thinking_tokens": 52569
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 88958,
+        "outputTokens": 65456,
+        "cacheReadInputTokens": 4580352,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 4.371366000000002,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 52569,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 4.371366000000002,
+    "result": "已登记并落盘，`submit` 返回 `awaiting_ir_review`，本轮文件保持不动，等待宿主逐项审查与完整评测。\n\n## 本轮读取与实际核对\n- `context.json`：输入为 `unretained_ir001_exploration`，父版本 attempt-038，源码哈希 `c7de9e32…`；038 与合格最佳 045（源码 `4e592db9…`）作为独立对照锚点。\n- `feedback.json`：IR001 条件 A/B 四块中位 190.78/193.63/186.24/191.36us，`both_candidate_blocks_faster=false`，未保留；`kernel_before 174.043488us → kernel_after 180.023605us`；同核重放 Psend 46.523–49.065us、sum 46.527–47.118us、PVwait 47.159–52.344us，038 与 IR001 的 Psend 中位 1.7545/1.8795us、周期 9.549/10.373us。\n- `codex-brief.json`：Codex 判断等待下降而周期上升，推断 Vector-reduce 与 P 发送共享 UB/发射资源，建议插入 MTE3→V 事件对让 sum 等发送完成。该分析是我定位机制的起点。\n- `profiling.json`：candidate 180.023605us / Block 20·Mix 40，reference FIA 128.082565us / 19·38，两侧 20 与 19 条执行组；表内注明各流水可重叠、等待比例只形成假设。\n- `hotspots.json`：veccore0 的 source 329–336 区域 504 条指令、累计 414.06us、等待 271.04us、最大单条 47.89us；cubecore0 同区域 314 条、累计 368.32us、等待 196.61us、最大 95.37us。\n- `timeline.json`：cube 最大单条为 pc `0x10d11588` 的 `WAIT_FLAG_DEVI` UIMM:0（flag0＝V→Cube 的 P 就绪）10 次 95.37us；vec 最大两条为 flag1 等待 47.89us 与 26.24us；veccore0 `VECTOR/VMULS 20`、`VECTOR/BAR 231`、`VEXP 10`、`VCONV 32`、`VCADD 10`；MTE3 的 P 发送 10 次 19.87us（XN:0x20000＝UB+131072）。时钟：两核 `absolute_time_qualified=false`、`relative_only`，绝对单位经同 PC 非同步区间对齐判为 us（median_ratio 1.0000000428 / 0.9999999776）；观测窗口 cube 36.285–147.210us、vec 36.286–147.543us，约占 180.02us 的 62%，`outside_events` 20、`application_completed=false`。\n- `compiled-readonly/`（无 lowered-inventory.json）：`_gqa_fwd_kernel.ttir` 第 99–104 行确认 `mulf → subf → exp2`，manifest 的 `.npubin` 哈希 `590ff99a…` 与本轮 A 侧二进制一致，即输入 IR 就是实测二进制的真实编译结果。低层产物未改动。\n\n## 诊断与改动（机制：常量换算折叠）\nHIVM 把 `p = exp2(qk*qk_scale − SM_OFFSET)` 展开成三趟 16384 元素 f32 原地运算加一趟 `vexp`：`vmuls(0.127517432) → vadds(−1.32223117) → vmuls(0.693147182) → vexp`。第三趟乘法只把 log2e 缩放的指数差换回自然底数，属后端 lowering 残留，可并入前两个常量：`0.088388349 = 0.127517432×0.693147182`、`−0.916500810 = −1.32223117×0.693147182`，数学上是同一个 exp2 表达式。\n\n只改 `ir/target.hivm.mlir` 三处：`cst_0`、`cst_4` 两个常量，删去 `loc165` 的 `pipe_barrier<PIPE_V>` 与 `%62/%cast_38/%cast_39/%cast_40` 及该 `vmuls` 调用；保留其后屏障保护 `vadds→vexp` 原地读写，`cst_2` 常量留存但不再引用。ABI、全部 buffer 地址与别名、事件对、跨核 flag、循环边界、AIC 侧指令未动，`frozen.py` 逐字节一致。\n\n## 预测（宿主将逐项核对）\n1. 指令：每 tile 少一条 16384 元素 f32 `vmuls` 与一条 `PIPE_V` 屏障；窗口内 `VECTOR/VMULS 20→10`、`VECTOR/BAR 231→221`，VEXP/VCONV/VCADD 与 MTE2/MTE3/FIXP 计数及字节不变。\n2. 动态轮次：Block 20/40、内外层步数、跨核 flag 次数不变。\n3. 等待：cube `0x10d11588` 的 flag0 等待下降、vec 两条 flag1 等待下降，重放周期 10.373us→约 10.1us 或更低，Psend 中位 ≤1.9us。\n4. 资源：VECTOR 侧 UB 读写各少 64KiB/tile（每核窗口约 640KiB），MTE3/FIXP 与 Memory.csv 的 MTE2 字节不变。\n5. 任务级：Task Duration 180.023605→178.0–179.7us，四例条件中位应低于 183.7017us；若周期不变或变长，则 Codex 的发送竞争方向（已登记为 alternatives 第 1 项，预估 ≤0.15us/tile）成为下一轮候选。\n\n## 未决与偏差风险\n- 一 Cube 核配两 Vector 子核，窗口内每条 PC 仅 10 次，整核到整任务的缩放未定；flag0 停顿按 tile 计，不换算总时长。\n- V 侧与 Cube 侧谁最终限速只由同核重放推断，需本轮 A/B 与重放复核；窗口外泳道与尾部瓦片保持未知。\n- 常量折叠引入 ≤2e-6 相对扰动的 fp32 末位差，理论上个别元素可能出现 1 ulp 的 f16/bf16 末位翻转，需四例官方 checker 复核（阈值不变）。"
+  }
+}

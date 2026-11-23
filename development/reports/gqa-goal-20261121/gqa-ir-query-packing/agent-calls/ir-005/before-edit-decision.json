@@ -1,0 +1,215 @@
+{
+  "timestamp": "2026-11-21T11:36:29.861417+00:00",
+  "diagnosis": {
+    "source_sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "context.json",
+        "category": "evaluation",
+        "role": "保留最佳、比较起点与证据模式",
+        "finding": "保留最佳为 attempt-019（source 2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113），case4 候选 262.27775us，四项几何均值降幅 4.381%，target_marker 为 strides: [8192, 1]；本轮 evidence_mode=compile_repair，本调用只提交 IR，CPU 编译与四项真机检查随后由宿主执行。"
+      },
+      {
+        "path": "feedback.json",
+        "category": "evaluation",
+        "role": "正式四项结果与 IR004 编译失败记录",
+        "finding": "case4 candidate 262.27775us（trials 262.2967/261.98475/262.27775），native 128.9496us；case1/2/7 分别 187.5727/181.0167/178.68615us；status=ir004_invalid_same_rank_collapse_expand，cpu_compile.returncode=1，compiler_stderr 指向 tensor.collapse_shape 期望 collapsed rank (2) 与 reassociation 组数 (1) 不一致。"
+      },
+      {
+        "path": "codex-brief.json",
+        "category": "source_ir",
+        "role": "宿主证据分析与候选方向（Codex 贡献）",
+        "finding": "Codex 指出 IR004 把 16x1024 折成同 rank 的 128x128、reassociation [[0,1]] 违反合法 rank 约束，expand 反向同样非法；IR002 的三维非单例 batch 折叠已被后端拒绝，IR003 的 L1/cbuf 本地 reinterpret 在 InferHIVMDataLayout 重写中崩溃；建议改为显式元素行重排并先做 CPU 编译，同时固定源码、ABI、grid128、loop4、逐行浮点计算与所有权。"
+      },
+      {
+        "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "本轮待修 IR（可编辑清单唯一项）",
+        "finding": "第86行 tensor.collapse_shape %q_t [[0, 1]] : tensor<16x1024xbf16> into tensor<128x128xbf16>，第120行 tensor.expand_shape %55 [[0, 1]] output_shape [16, 1024] : tensor<128x128xbf16> into tensor<16x1024xbf16>；两处 reassociation 组数为 1 而结果 rank 为 2。其余结构：scf.for 4 次迭代、每次 1 条 Q 载入（16 行，行距 8192）、两条 mmadL1（128x256x128、128x256x128）、1 条 fixpipe、K/V 整段载入与 bf16→f16 转换在循环外、Out 经 materialize_in_destination 写入 strides [8192, 1] 视图。"
+      },
+      {
+        "path": "ir003-last-pass.txt",
+        "category": "source_ir",
+        "role": "上一版失败证据（InferHIVMDataLayout 之前）",
+        "finding": "该转储中 Q 载入的目的缓冲是 memref<128x128xbf16, cbuf>，先经 memref.reinterpret 变为 memref<16x1024xbf16, strided<[1024,1]>> 再作为 hivm.hir.load 的 outs，随后报 LLVM ERROR: unexpected op in rewrite；该失败形态与手写 cbuf 本地 reinterpret 直接相关。"
+      },
+      {
+        "path": "compiled-readonly/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "同源码真实低层产物（冻结，sha 3f0752b8…，与 ir-inventory original 一致）",
+        "finding": "Q 与 Out 走 memref.reinterpret 的 128x128、strides [8192, 1] 直接 strided 拷贝，128 行、每行 256B 连续；同文件第113、116行已含合法 collapse_shape [[0, 1]] : tensor<128x1xi1> into tensor<128xi1> 与 expand_shape [[0, 1]] output_shape [128, 1]，说明本阶段流水线对合法 collapse/expand 有既有支持。"
+      },
+      {
+        "path": "frozen.py",
+        "category": "source_ir",
+        "role": "固定源码核对（逐字节冻结）",
+        "finding": "sha256 与 context.json 一致；源码内 Q 载入为 (BLOCK_M=128, BLOCK_D=128) 的逐 head 2D tile，全文无 reshape，因此 16x1024 打包属于 IR 层视图选择，源码层替代方向是改写 tl.load 的 tile 形状。"
+      },
+      {
+        "path": "ir-inventory.json",
+        "category": "source_ir",
+        "role": "可编辑范围",
+        "finding": "清单仅一项：ir/target/_gqa_fwd_kernel.bcmlir（stage=bcmlir，symbol=_gqa_fwd_kernel）；compiled-readonly 内 ttadapter 与 bcmlir 保持冻结，仅用于核对后端既有能力。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "历史性能材料（019 原始二进制，case4 B4S256Nq64Nkv8D128G8 bf16）",
+        "finding": "PipeUtilization.csv/cube0 的 19 行统计：aic_time 均值 116.419us，aic_mte2_time 均值 55.331us（ratio 0.436），aic_fixpipe_time 均值 59.992us（0.472），aic_cube_time 均值 35.476us（0.279），aic_mte1_time 均值 29.417us（0.232），aic_mte3_time 均值 2.485us（0.0196），aic_mte2_instructions 均值 83.8；MTE2 是 AIC 上累计时间最大的搬运流水。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "paired_profiling",
+        "role": "热点排名与占用（019 原始二进制，core0.cubecore0）",
+        "finding": "AIC 顶部指令为 WAIT_FLAG_DEVI 17.27us（4 calls）与 16.37us（4 calls），MTE3 的 MOV_SRC_TO_DST_ALIGN 7.26us（4 calls，Src:UB,Dst:OUT,B16）；占用比例 CUBE productive 10.36%／wait 21.90%／idle 67.74%，FIXP 32.90/21.10/46.00，MTE2 19.43/0.72/79.85；每程序 4 次重复印证 loop4 的 Q 搬入与 Out 搬出结构。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "绝对时钟窗口与泳道覆盖说明",
+        "finding": "core0.cubecore0 窗口以首末可见事件界定，capture_scope 记录为 partial capture，占用单位为窗口占比；指令集合与 hotspots 一致（WAIT_FLAG 14、SET_FLAG 9、WAIT_FLAG_DEVI 7、MOV_SRC_TO_DST_ALIGN 7 条记录），source_sha256 绑定 2a98e3…，用于定位同一条 Q 载入/Out 搬出的重复次数。"
+      }
+    ],
+    "hypothesis": "IR004 的打包视图语义正确、地址与逐行浮点表达式完整，唯一缺陷是用同 rank 的 collapse/expand 表达一次行主序重排。把同一重排改写为三维视图（16x8x128，strides [8192, 128, 1]）加合法 collapse/expand（reassociation [[0, 1], [2]]）后，线性地址、元素顺序、matmul 操作数形状与所有算术逐项保持，解析可直接通过；同时因为 8 个相邻 head 的 D 块在内存中连续，Q 载入与 Out 搬出从 128 行×256B 变为 16 行×2048B，MTE2 的突发长度提升，AIC 上累计时间最大的 MTE2 流水（55.33us）随之缩短，而 cube/fixpipe 指令数与同步链数保持不变。",
+    "alternatives": [
+      {
+        "option": "保留 IR004 的同 rank collapse/expand",
+        "rejected_because": "解析期即失败（feedback.json 的 compiler_stderr），本轮作为缺陷本身被替换。"
+      },
+      {
+        "option": "collapse 到 rank1（tensor<16384>）再 expand 到 128x128",
+        "rejected_because": "形式合法，代价是引入 rank-1 中间视图，布局推断需要额外重建 rank，折叠路径更长；相对三维折叠没有收益。"
+      },
+      {
+        "option": "Codex 建议的 linalg.generic 显式索引 (i,j)->(i floordiv 8, (i mod 8)*128+j)",
+        "rejected_because": "语义等价且合法，但会把重排降成 UB 内逐元素重排（每迭代 16384 元素读与写），在 AIV 上新增显式搬运指令；同一重排用连续维折叠表达时不产生额外元素级指令。该方案留作后续独立机制候选。"
+      },
+      {
+        "option": "手写 L1/cbuf 本地 reinterpret（IR003 形态）",
+        "rejected_because": "ir003-last-pass.txt 显示该形态在 InferHIVMDataLayout 触发 unexpected op in rewrite，属已观测崩溃路径。"
+      },
+      {
+        "option": "改动 K/V 载入、分块或流水线开关以绕开该缺陷",
+        "rejected_because": "这些改动面向另一研究身份，与本次解析缺陷无因果关系，且会破坏与保留最佳的可比性。"
+      }
+    ],
+    "change": "只编辑 ir/target/_gqa_fwd_kernel.bcmlir 中该重排机制的两处视图，共 6 行：Q 侧把 %q_view 的 reinterpret 目标改为 memref<16x8x128xbf16, strided<[8192, 128, 1], offset: ?>>（sizes [16, 8, 128]），%alloc_6 与 memref.copy 的目的类型同步改为 memref<16x8x128xbf16>，%q_t 的 to_tensor 类型同步改为 memref<16x8x128xbf16>，%39 改写成 tensor.collapse_shape %q_t [[0, 1], [2]] : tensor<16x8x128xbf16> into tensor<128x128xbf16>；Out 侧把 %o_view 同样改为三维视图，%o_packed 改写成 tensor.expand_shape %55 [[0, 1], [2]] output_shape [16, 8, 128] : tensor<128x128xbf16> into tensor<16x8x128xbf16>，materialize_in_destination 的类型同步。循环次数 4、grid128、索引算式、mmadL1、fixpipe、同步块、workspace 偏移与函数 ABI 全部保持原字节。",
+    "expected": [
+      "解析与 SSA 检查通过：collapse/expand 的 reassociation 组数为 2、源 rank 3 映到结果 rank 2，CPU 端 bishengir-compile 越过 IR004 的解析错误。",
+      "指令结构不变：每程序 4 次迭代、每次 2 条 mmadL1（128x256x128 与 128x256x128）、1 条 fixpipe、1 次 Q 载入与 1 次 Out 搬出；AIC/AIV 同步块（sync_block_wait/set 各 6 处）与 019 二进制对应位置逐项一致。",
+      "Q 载入形态变化：每次迭代一条 GM→L1 拷贝，源为 16 行、每行 2048B 连续、行距 8192，替代 128 行、每行 256B；预测 aic_mte2_time 从 55.33us 口径下降约 5–15us（占 aic_time 116.42us 的 4%–13%），MTE2 productive 19.43% 上升，MTE2 指令条数由 83.8 小幅下降。",
+      "Out 搬出形态变化：MTE3 每次迭代 16 行×2048B，预测 aic_mte3_time 由 2.49us 小幅下降或持平（占 aic_time 1.96%），MOV_SRC_TO_DST_ALIGN 的 4 calls 保持。",
+      "等待与关键路径：WAIT_FLAG_DEVI 的每程序 4 calls 保持；若 MTE2 缩短兑现，CUBE 在 L1 上的等待下降，full-call 时间低于 262.27775us。",
+      "动态总次数：case4 口径下 grid 128、loop 4、程序数 128、Q 总字节 4×32KiB/程序 全部保持，K/V 每程序一次的整段载入保持。",
+      "资源：UB/L1 占用保持 32KiB 的 Q 缓冲与既有两个 workspace 偏移（65536、196608、262144 不变）。"
+    ],
+    "validation": "宿主先做解析与 CPU bishengir-compile（AOT 命令与反馈中一致），通过后用 attempt-019 的 case4 元数据做四项真机检查：官方 checker 与阈值不变、golden 不变，计时沿用全新调用平均口径，比较起点固定 262.27775us；其余三案由保留源码的编译产物提供，本 IR 常量（S=256、B=4、NQ=64、G=8、grid 128、loop 4）与 case4 绑定，需在交接时明确。逐项核对 expected 中指令条数、动态轮次、等待、MTE2/MTE3 时间与占用，记录兑现与偏差；若编译停在其他 pass，按报错位置另立机制。",
+    "layer_reason": "Triton 表达能力：源码的 tl.load 只能表达 (BLOCK_M, BLOCK_D) 的二维 tile，跨 8 个相邻 head 的 (s, h, d) 打包重排需要额外 reshape 才写得出来，而该 reshape 落到本阶段后的 rank 形式由降低过程决定；固定源码实验目的：frozen.py 与 sha 逐字节冻结，本轮把编译修复与同源码 IR 收益分开验收，比较对象是同源码下的 IR 版本；IR 控制点：bcmlir 是 copy 形状、memref 视图与 dot 操作数的最终决定点，target_marker strides: [8192, 1] 只在这一层可见，因此重排的合法 rank 形式与突发长度选择只能在此层落地。同类意图若在源码表达，替代方向是把 q 载入写成三维偏移的 tl.load 组合，再由编译器重排。",
+    "simulator_incremental_judgment": "profiling/hotspots/timeline 全部绑定 019 原始二进制的 source_sha256，与本轮编辑后未编译的 IR 无对应关系；窗口以首末可见事件界定、占用按窗口占比归一，未报告泳道保持未知，累计流水时间可重叠，因此只把「MTE2 累计 55.33us 为 AIC 最大流水」与「每程序 4 次 Q 载入/4 次 Out 搬出」当作候选机制定位材料。本轮结论的范围限定为编译修复与结构等价；性能兑现、等待下降与是否超过 262.27775us 由宿主真机重放后判断，关键路径与带宽结论以宿主独立材料为准。",
+    "unknown": [
+      "后端对合法 collapse/expand 的处理方式（折叠为 L1 目的视图或生成显式 UB 拷贝）尚未观测，两种方式分别对应零成本与每迭代多一次 UB 数据移动。",
+      "三维 GM 视图在 MTE2 描述符层的展开形式未知，实际突发长度收益需在真机计数中确认。",
+      "case4 以外的三案由保留源码产物承担，其时间在本轮保持未测状态。"
+    ]
+  },
+  "diagnosis_sha256": "1bd8ae93dc5d69f83a70ecb32c30d9d1cc87bfe63192be3d3bddcca661661042",
+  "evidence": [
+    {
+      "path": "context.json",
+      "category": "evaluation",
+      "role": "保留最佳、比较起点与证据模式",
+      "finding": "保留最佳为 attempt-019（source 2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113），case4 候选 262.27775us，四项几何均值降幅 4.381%，target_marker 为 strides: [8192, 1]；本轮 evidence_mode=compile_repair，本调用只提交 IR，CPU 编译与四项真机检查随后由宿主执行。",
+      "sha256": "149883c374b59adbee6cfb35daa5e3ce461c35516b7572734abb21f707f6d907"
+    },
+    {
+      "path": "feedback.json",
+      "category": "evaluation",
+      "role": "正式四项结果与 IR004 编译失败记录",
+      "finding": "case4 candidate 262.27775us（trials 262.2967/261.98475/262.27775），native 128.9496us；case1/2/7 分别 187.5727/181.0167/178.68615us；status=ir004_invalid_same_rank_collapse_expand，cpu_compile.returncode=1，compiler_stderr 指向 tensor.collapse_shape 期望 collapsed rank (2) 与 reassociation 组数 (1) 不一致。",
+      "sha256": "e08248b3240845947c80caafd09228419a6f2cd7281a9334160cb63061296a10"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "source_ir",
+      "role": "宿主证据分析与候选方向（Codex 贡献）",
+      "finding": "Codex 指出 IR004 把 16x1024 折成同 rank 的 128x128、reassociation [[0,1]] 违反合法 rank 约束，expand 反向同样非法；IR002 的三维非单例 batch 折叠已被后端拒绝，IR003 的 L1/cbuf 本地 reinterpret 在 InferHIVMDataLayout 重写中崩溃；建议改为显式元素行重排并先做 CPU 编译，同时固定源码、ABI、grid128、loop4、逐行浮点计算与所有权。",
+      "sha256": "574dbf27ba50b70784071c3a85c9f3959269c554948b8e048cc82fd88327be90"
+    },
+    {
+      "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "本轮待修 IR（可编辑清单唯一项）",
+      "finding": "第86行 tensor.collapse_shape %q_t [[0, 1]] : tensor<16x1024xbf16> into tensor<128x128xbf16>，第120行 tensor.expand_shape %55 [[0, 1]] output_shape [16, 1024] : tensor<128x128xbf16> into tensor<16x1024xbf16>；两处 reassociation 组数为 1 而结果 rank 为 2。其余结构：scf.for 4 次迭代、每次 1 条 Q 载入（16 行，行距 8192）、两条 mmadL1（128x256x128、128x256x128）、1 条 fixpipe、K/V 整段载入与 bf16→f16 转换在循环外、Out 经 materialize_in_destination 写入 strides [8192, 1] 视图。",
+      "sha256": "5b42309116f8998a26c3120f585b103992e22adc5321fd7a42240ca26f1dc1cb"
+    },
+    {
+      "path": "ir003-last-pass.txt",
+      "category": "source_ir",
+      "role": "上一版失败证据（InferHIVMDataLayout 之前）",
+      "finding": "该转储中 Q 载入的目的缓冲是 memref<128x128xbf16, cbuf>，先经 memref.reinterpret 变为 memref<16x1024xbf16, strided<[1024,1]>> 再作为 hivm.hir.load 的 outs，随后报 LLVM ERROR: unexpected op in rewrite；该失败形态与手写 cbuf 本地 reinterpret 直接相关。",
+      "sha256": "c0aff26ed8060baab4ae99e1d402607d100821b19b5c81ffd38f6fec6784aacb"
+    },
+    {
+      "path": "compiled-readonly/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "同源码真实低层产物（冻结，sha 3f0752b8…，与 ir-inventory original 一致）",
+      "finding": "Q 与 Out 走 memref.reinterpret 的 128x128、strides [8192, 1] 直接 strided 拷贝，128 行、每行 256B 连续；同文件第113、116行已含合法 collapse_shape [[0, 1]] : tensor<128x1xi1> into tensor<128xi1> 与 expand_shape [[0, 1]] output_shape [128, 1]，说明本阶段流水线对合法 collapse/expand 有既有支持。",
+      "sha256": "3f0752b87549d3622671e660efcd63cee0d4e7286e342001b1b25900e878f4a7"
+    },
+    {
+      "path": "frozen.py",
+      "category": "source_ir",
+      "role": "固定源码核对（逐字节冻结）",
+      "finding": "sha256 与 context.json 一致；源码内 Q 载入为 (BLOCK_M=128, BLOCK_D=128) 的逐 head 2D tile，全文无 reshape，因此 16x1024 打包属于 IR 层视图选择，源码层替代方向是改写 tl.load 的 tile 形状。",
+      "sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113"
+    },
+    {
+      "path": "ir-inventory.json",
+      "category": "source_ir",
+      "role": "可编辑范围",
+      "finding": "清单仅一项：ir/target/_gqa_fwd_kernel.bcmlir（stage=bcmlir，symbol=_gqa_fwd_kernel）；compiled-readonly 内 ttadapter 与 bcmlir 保持冻结，仅用于核对后端既有能力。",
+      "sha256": "b890c63368cd39fb251bb86ffb4cefc87b1b4f3fd128d71c4a563db67142bf7a"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "历史性能材料（019 原始二进制，case4 B4S256Nq64Nkv8D128G8 bf16）",
+      "finding": "PipeUtilization.csv/cube0 的 19 行统计：aic_time 均值 116.419us，aic_mte2_time 均值 55.331us（ratio 0.436），aic_fixpipe_time 均值 59.992us（0.472），aic_cube_time 均值 35.476us（0.279），aic_mte1_time 均值 29.417us（0.232），aic_mte3_time 均值 2.485us（0.0196），aic_mte2_instructions 均值 83.8；MTE2 是 AIC 上累计时间最大的搬运流水。",
+      "sha256": "69e5acb628d09675c4c333f008d651f0c49fc467975789ecf7283eacc16a1256"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "paired_profiling",
+      "role": "热点排名与占用（019 原始二进制，core0.cubecore0）",
+      "finding": "AIC 顶部指令为 WAIT_FLAG_DEVI 17.27us（4 calls）与 16.37us（4 calls），MTE3 的 MOV_SRC_TO_DST_ALIGN 7.26us（4 calls，Src:UB,Dst:OUT,B16）；占用比例 CUBE productive 10.36%／wait 21.90%／idle 67.74%，FIXP 32.90/21.10/46.00，MTE2 19.43/0.72/79.85；每程序 4 次重复印证 loop4 的 Q 搬入与 Out 搬出结构。",
+      "sha256": "9c3c2cc35e4b0c64e5ffb863f9cded01f545a7aecbfa13667a466d3890d6f5aa"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "绝对时钟窗口与泳道覆盖说明",
+      "finding": "core0.cubecore0 窗口以首末可见事件界定，capture_scope 记录为 partial capture，占用单位为窗口占比；指令集合与 hotspots 一致（WAIT_FLAG 14、SET_FLAG 9、WAIT_FLAG_DEVI 7、MOV_SRC_TO_DST_ALIGN 7 条记录），source_sha256 绑定 2a98e3…，用于定位同一条 Q 载入/Out 搬出的重复次数。",
+      "sha256": "3e592e77d23a31278e191adec58dd4fc6c9e27e92e10bf03ad6917846dfc632e"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113",
+    "contract.json": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858",
+    "ir-inventory.json": "b890c63368cd39fb251bb86ffb4cefc87b1b4f3fd128d71c4a563db67142bf7a",
+    "feedback.json": "e08248b3240845947c80caafd09228419a6f2cd7281a9334160cb63061296a10",
+    "profiling.json": "69e5acb628d09675c4c333f008d651f0c49fc467975789ecf7283eacc16a1256",
+    "hotspots.json": "9c3c2cc35e4b0c64e5ffb863f9cded01f545a7aecbfa13667a466d3890d6f5aa",
+    "timeline.json": "3e592e77d23a31278e191adec58dd4fc6c9e27e92e10bf03ad6917846dfc632e",
+    "q-row-packing-language-evidence.txt": "82883deef12a30274a873fcfbbdc042175339c0b7430f5d83b2352e647ee766d",
+    "context.json": "149883c374b59adbee6cfb35daa5e3ce461c35516b7572734abb21f707f6d907",
+    "diagnosis.json": "bff2c89a1c04ecada9fea1f9dd6213ed9717c5b0c405e8b5e120cdefc43cbff4",
+    "codex-brief.json": "574dbf27ba50b70784071c3a85c9f3959269c554948b8e048cc82fd88327be90",
+    "ir003-last-pass.txt": "c0aff26ed8060baab4ae99e1d402607d100821b19b5c81ffd38f6fec6784aacb",
+    "ir/target/_gqa_fwd_kernel.bcmlir": "5b42309116f8998a26c3120f585b103992e22adc5321fd7a42240ca26f1dc1cb",
+    "compiled-readonly/_gqa_fwd_kernel.ttir": "3872e0b7e8321c12da290bbec07142d727dcd444fefc9d5afd78f81e606dd8b8",
+    "compiled-readonly/_gqa_fwd_kernel.ttadapter": "cdcbbfad8ec97625f2e5743ec02932455f698bc4ffe8f09563a3abf9dc84c252",
+    "compiled-readonly/_gqa_fwd_kernel.bcmlir": "3f0752b87549d3622671e660efcd63cee0d4e7286e342001b1b25900e878f4a7"
+  },
+  "decision_tool_sha256": "5bef69abbe2d24d40092eade140c6c5d68f831185dbcc5e7930d535926348208"
+}

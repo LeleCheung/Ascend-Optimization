@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 31,
+    "duration_ms": 153581,
+    "usage": {
+      "input_tokens": 35687,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 735232,
+      "output_tokens": 23954,
+      "output_tokens_details": {
+        "thinking_tokens": 16732
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 35687,
+        "outputTokens": 23954,
+        "cacheReadInputTokens": 735232,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.144901,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 16732,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.144901,
+    "result": "本轮已完成一个具体机制的修改前取证、决策登记、源码修改与预检交接。\n\n## 读取的实际材料\n- `skills/hgkda/SKILL.md`、`task.json`、`contract.json`、`context-brief.json`、`candidate.py`、`current-profiling.json`、`previous-result.json`、`starter-provenance.json`\n- 实际 IR：`actual-ir/2-_gqa_fwd_kernel.ttir`、`actual-ir/0-_gqa_fwd_kernel.bcmlir`（及其 ttadapter）\n- 源码 SHA 已核验：`23d7322958578d08372dfd9f830f7dc251c4235aa34e7bacf8a3cacdcee90afc`（与 profiling、IR 绑定一致）\n\n## 关键事实\n- case4 kernel 467.709us、512 program；每 program `aic_cube_time` 2.018us，而 `aic_scalar_wait_id1` 11.786us → 墙钟由每轮 KV 的跨核交接链主导。\n- 每 program `L0C_to_GM` 384KiB = 每轮 3 个 dot（QK + p_hi PV + p_lo PV）各 64KiB × 2 轮；TTIR/BCMLIR 确认每轮 3 个独立 `tt.dot`/`linalg.matmul`，低项 PV 还需向量侧 ×1/2048 与相加。\n\n## 机制（仅 bf16）\n在 PV 归约轴上把概率高低两项交错合并为**一次** `tl.dot`：\n- `p_cat = reshape(join(p_hi, p_lo), (BM, 2BN))` 按列交错；\n- `v_cat = reshape(broadcast(v[:,None,:], (BN,2,BD)), (2BN,BD))` 重复行（UB 内复制，不增加 GM 流量）；\n- bf16 直接取残差 `(p-p_hi).to(bf16)`，省去 ×2048 及整块 PV 的 ×(1/2048)。\n- **fp16 路径、因果分块、掩码、在线 softmax 表达式与顺序全部不变**；`MERGE_PV` 仅由 dtype 元数据设置，无 case_id/数值选路。\n\n数值风险已在源码与诊断中写明：高低项改为在同一 fp32 累加器内交错求和，差异为 `O(u_fp32·Σp|v|)`，远低于 2^-18 分裂误差，交由完整四项官方 checker 判定。预期 case4/7 每轮 dot 3→2、`L0C_to_GM` 384→256KiB（-33%），case1/2 路径不变。\n\n## 记录与状态\n- 修改前决策已登记：`decision_id = 90b024848c804022af8d3f60da096f8b`。\n- 修改后 `preflight` 返回 **`awaiting_source_review`**：未产生本轮编译 IR 或计时。\n- 候选字节已冻结（SHA `9c3488b743b2c953259e72c1f75ef3dc060f63cfd5362576bd227171aae0aa08`），`diagnosis.json` 已追加 `post_change_observation` 记录预检门状态。\n\n现在交接宿主进行只读路径/地址边界审查，并跑完整四项真机评测；随后请回填实际 matmul 数、`L0C_to_GM`、逐 case `full_call_us` 及修改后热点/流水重放，以便更新诊断与继续优化。"
+  }
+}

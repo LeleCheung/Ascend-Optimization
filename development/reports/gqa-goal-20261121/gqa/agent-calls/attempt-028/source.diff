@@ -1,0 +1,108 @@
+--- 
++++ 
+@@ -101,14 +101,15 @@
+ 
+ 分阶段 attention（本轮独立实验，仅元数据域命中）：非因果、Q/K/V 均为 bf16、
+ D==128、SKV==256、S%128==0、V 连续时，把单个混合核内核拆成三个纯 Triton 启动：
+-(1) 原始 fp32 QK scores（M128×SKV256，无 scale/向量 epilogue）；(2) 纯 Vector 的
+-fp32 scale/max/exp2/sum、受保护的行倒数归一化 -> fp16 P，并在同一启动的尾部程序
++(1) fp32 累加后写成 fp16 的 raw QK scores（M128×SKV256，无 scale/向量 epilogue）；
++(2) 纯 Vector 的 fp16 scores 显式转 FP32 后做 scale/max/exp2/sum、受保护的行倒数归一化 -> fp16 P，并在同一启动的尾部程序
+ 里以互不重叠的连续块做 bf16 V -> fp16；(3) fp16 P × fp16 V 的 fp32 累加、直接转
+ out dtype 写回（JIT 名保留 _gqa_fwd_kernel 作为观察口径的最终 PV）。证据是 019 的
+ Cube/Vector 窗口 productive 仅约 10%/25%、热点为 WAIT_FLAG_DEVI/FIX_L0C_TO_DST、
+ 每 program cube 算术 5.17us 对等待 11.5~37.3us：墙钟跟每 tile 的混合核交接链。
+-代价是额外的全局中间量（case4 约 scores 64MiB + P 32MiB + V16 2MiB、约 192MiB
+-额外写读）与两次额外启动及分配，全部计入原 full-call 计时。数值差异仅归一化时机：
++代价是额外的全局中间量（case4 约 scores 32MiB fp16 + P 32MiB fp16 + V16 2MiB）
++与两次额外启动及分配，全部计入原 full-call 计时；本轮把 raw QK scores scratch
++由 fp32 缩为 fp16，在阶段2读取后显式转回 FP32 再乘 scale，softmax 其余表达不变。数值差异仅归一化时机：
+ 由“PV 后 fp32 除法”改为“PV 前 fp32 归一化并舍入 fp16”，权重相对误差同为 2^-11，
+ 适用本合同 [-1,1] bf16 输入域；其余路径（因果、fp16、其他形状）仍走原单内核，
+ 函数体逐字不变（仅改名 _gqa_fused_kernel）。
+@@ -412,11 +413,12 @@
+ # 019 的成对 profiling 与模拟器窗口显示：case4 每 program 的 Cube 算术只有
+ # 5.17us，而 aic_scalar_wait / WAIT_FLAG_DEVI 达 11.5~37.3us，Cube/Vector
+ # 窗口的 productive 仅 10.4%/25.3%，热点是 WAIT_FLAG_DEVI、FIX_L0C_TO_DST、
+-# MOV_OUT_TO_L1。墙钟跟的是每个 query tile 的混合核交接链，而不是算术。
++# MOV_OUT_TO_L1。墙钟跟的是每个 query tile 的混合核交接链，算术量在这个口径下居次。
+ # 因此本路径把单个混合核内核拆成三个阶段，每阶段内部只有同向程序：
+-#   阶段1 _gqa_qk_stage_kernel   ：bf16 QK dot 直接写原始 fp32 scores，无 scale、
+-#                                  无掩码、无向量 epilogue（M128×SKV256 整块）。
+-#   阶段2 _gqa_softmax_vcast_kernel：纯 Vector；fp32 scale/max/exp2/sum 与受保护
++#   阶段1 _gqa_qk_stage_kernel   ：bf16 QK dot 的 fp32 累加结果写成 fp16 scores，
++#                                  无 scale、无掩码、无向量 epilogue（M128×SKV256 整块）。
++#   阶段2 _gqa_softmax_vcast_kernel：纯 Vector；先把 fp16 scores 显式转 FP32，再做
++#                                  fp32 scale/max/exp2/sum 与受保护
+ #                                  的行倒数归一化 -> fp16 P；同一启动的尾部程序
+ #                                  以互不重叠的连续块把 bf16 V 逐元素转成 fp16
+ #                                  （顺序不变，V16 仍是输入 BSND 的平坦副本）。
+@@ -426,8 +428,10 @@
+ #                                  b*(SKV*NKV*D) + n*(NKV*D) + kvh*D + d，与
+ #                                  阶段2 写入口径一致（此前按 BNSD 取址，会读到
+ #                                  别的 (n,kvh) 行，是本轮修复的对象）。
+-# 代价（如实记录）：额外全局中间量 case4 scores 64MiB fp32 + P 32MiB fp16 +
+-# V16 2MiB，约 192MiB 额外写读，3 次分配与 3 次 launch。收益或退步由完整
++# 代价（如实记录）：额外全局中间量 case4 scores 32MiB fp16（本轮由 64MiB fp32
++# 缩小）+ P 32MiB fp16 + V16 2MiB，3 次分配与 3 次 launch。raw QK scores 只在
++# 全局写读处新增一次 fp16 舍入（2^-11 相对误差，[-128,128] 范围内可表示），
++# 阶段2读取后立即转回 FP32，后续 softmax 精度结构不变。收益或退步由完整
+ # 四项真机评测判定，本注释不据此写结论。
+ # 数值风险：概率归一化时机由“PV 后除法”改为“PV 前归一化再舍入 fp16”，权重
+ # 相对误差同为 2^-11，1/l 的 fp32 舍入为 2^-24 量级；归一化后 |p|<=1，尾权重
+@@ -445,7 +449,7 @@
+     NQ: tl.constexpr, G: tl.constexpr,
+     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+ ):
+-    """阶段1：每 (query 行块, b×hq) 一程序，输出该 tile 的原始 fp32 scores。
++    """阶段1：每 (query 行块, b×hq) 一程序，输出该 tile 的 fp16 scratch scores。
+ 
+     S % BLOCK_M == 0、SKV == BLOCK_N、D == BLOCK_D 由 run() 的元数据判据保证，
+     故 Q/K 载入与 scores 写出都不需要掩码；scale 不在这里施加，留给阶段2，
+@@ -471,8 +475,10 @@
+     qk = tl.dot(q, tl.trans(k))  # bf16 × bf16 -> fp32 累加，无 epilogue
+ 
+     # scores 布局 [B*NQ, S, SKV] 连续：每程序只写自己的行块，所有权唯一。
++    # 本轮机制：scratch 存 fp16，把该中间量的全局写出减半（case4 64MiB->32MiB）；
++    # 舍入发生在 fp32 累加之后，QK 本身的 fp32 累加不变。
+     s_ptrs = Scores + pid_bh * (S * SKV) + offs_m[:, None] * SKV + offs_n[None, :]
+-    tl.store(s_ptrs, qk)
++    tl.store(s_ptrs, qk.to(tl.float16))
+ 
+ 
+ @triton.jit
+@@ -485,8 +491,9 @@
+ ):
+     """阶段2：纯 Vector 启动，软归一化与 V 转换互不重叠地分区。
+ 
+-    pid < N_SOFT 的程序做 softmax：读入 [BLOCK_M, SKV] 的 fp32 scores，施加
+-    qk_scale、行最大、exp2、行和，再用受保护的行倒数归一化并写 fp16 P。
++    pid < N_SOFT 的程序做 softmax：读入 [BLOCK_M, SKV] 的 fp16 scores，先显式
++    转 FP32 再施加 qk_scale、行最大、exp2、行和，再用受保护的行倒数归一化并写
++    fp16 P（max/exp2/sum/reciprocal 与 P 的表达保持原样）。
+     这些程序写 P 的 [pid_bh, 行块, :] 区域，所有权唯一。
+     pid >= N_SOFT 的程序做 V 的平坦 bf16->fp16 转换：每程序负责
+     [c*BLOCK_V, (c+1)*BLOCK_V) 一段连续元素，互不重叠，无重复或竞争写。
+@@ -502,7 +509,9 @@
+         base = bh * (S * SKV)
+ 
+         s_ptrs = Scores + base + offs_m[:, None] * SKV + offs_n[None, :]
+-        qk = tl.load(s_ptrs) * qk_scale  # fp32 scale，与原路径同一乘法
++        # 本轮机制：先把 fp16 scores 显式转回 FP32，再乘 qk_scale；此后的
++        # max/exp2/sum/倒数归一化与 P 的表达和原 fp32 scores 路径逐字一致。
++        qk = tl.load(s_ptrs).to(tl.float32) * qk_scale
+ 
+         m = tl.max(qk, 1)
+         p = tl.exp2(qk - m[:, None])
+@@ -612,8 +621,9 @@
+         num_v = B * NKV * SKV * D
+         n_vchunks = triton.cdiv(num_v, BLOCK_V_ST)
+ 
+-        # 中间量（case4）：scores 64MiB fp32、P 32MiB fp16、V16 2MiB fp16。
+-        scores = torch.empty(B * NQ * S * SKV, dtype=torch.float32, device=query.device)
++        # 中间量（case4）：scores 32MiB fp16（本轮由 fp32 缩小一半）、
++        # P 32MiB fp16、V16 2MiB fp16。
++        scores = torch.empty(B * NQ * S * SKV, dtype=torch.float16, device=query.device)
+         p16 = torch.empty(B * NQ * S * SKV, dtype=torch.float16, device=query.device)
+         v16 = torch.empty(num_v, dtype=torch.float16, device=query.device)
+         # V 连续由判据保证，内核把 value 的基址当作平坦数组使用；不做视图/拷贝，

@@ -1,0 +1,84 @@
+--- 
++++ 
+@@ -150,6 +150,19 @@
+ PV dot，再从原 FP32 p 求分母，让 P 的传输有机会早发并与 Cube 的 PV 重叠。
+ 数值不变（同一 FP32 p 的同一归约、同一 fp32 累加 dot），是否真正重叠由修改后
+ 重放与完整四项真机评测判定；其他分支与精度路径逐字保留。
++
++M256 PART_TILES 与仅 M256 的提前分母归约（本轮机制，独立实验）：PART_TILES
++的交接链数等于 tile 数 T=B*NKV*G*(S/BLOCK_M)，模拟器三核部分窗口的头部热点
++（Cube WAIT_FLAG_DEVI 84.32us/9、FIX_L0C_TO_DST 23.07us/9，Vector
++WAIT_FLAG_DEVI 62.07us/9，均按 tile 计次）指向逐链交接成本。故对非因果、
++V 为 BF16、BLOCK_N==256、BLOCK_D==128 且 S%256==0 的元数据把 BLOCK_M 由 128
++抬到 256：case4 的 T 由 512 降到 256、每 worker 链数 25/26->12/13，K/V 组
++载入次数与单链结构不变。代价是单 tile 的 p 由 128x256 变 256x256 FP32，峰值
++活跃内存翻倍；因此仅在该 M256 分支先做 FP32 分母 sum 再做 p16 截断与 PV dot，
++使 p 在 dot 前即可释放（M128 仍保留父版 acc->sum 顺序）。表达式、相加顺序、
++精度路径与 P/NB_M/TPG/T 的分区规则均不变，数值风险只来自 tl.dot 的 M 维铺排
++与程序数，由原始四项 checker 以不变阈值判定；M256 能否落在 UB/L0C 预算内须由
++预检与修改后 IR 确认，失败即如实记录，不以降低精度补救。
+ """
+ 
+ import math
+@@ -377,11 +390,23 @@
+                 # 归约，acc 仍是同一 fp16×fp16、FP32 累加的 dot；输出 guard 的
+                 # 可证冗余已在下段删除（不引入 PV 结果 FP16 截断，不改 exp 与精度）。
+                 p = tl.exp2(qk - SM_OFFSET)
+-                p16 = p.to(tl.float16)
+-
+-                acc = tl.dot(p16, v16)
+-
+-                l_new = tl.sum(p, 1)
++
++                if BLOCK_M >= 256:
++                    # 本轮机制（仅 M256）：提前求出 FP32 分母，再截断 p 并做
++                    # PV dot。p 是本 tile 最大的活跃缓冲（256x256 FP32），
++                    # 父版 acc→sum 的顺序要求它在整个 dot 期间保持活跃；
++                    # 先归约后 dot 可让 p 在 p16 生成后立即释放，降低峰值
++                    # 活跃量，为 M256 的 UB 预算留余量。算术完全不变：
++                    # l_new 仍是对同一 FP32 p 的同一归约，acc 仍是同一
++                    # fp16xfp16、FP32 累加的 dot，acc/l_new 归一化逐字相同。
++                    l_new = tl.sum(p, 1)
++                    p16 = p.to(tl.float16)
++                    acc = tl.dot(p16, v16)
++                else:
++                    # M128 保留父版顺序（先 PV dot 后分母归约）。
++                    p16 = p.to(tl.float16)
++                    acc = tl.dot(p16, v16)
++                    l_new = tl.sum(p, 1)
+ 
+                 # 本轮机制（仅 PART_TILES 删除可证冗余分母守卫）：实际
+                 # TTIR/BCMLIR 显示原两处守卫被落实为整 l_new 的 cmpf/select、
+@@ -681,6 +706,22 @@
+             # softmax/p·v 转换 → PV dot 搬出），并删掉整段 online 重缩放。
+             # 其余形状（SKV=128 的 case2 等）仍取 128 的通用分块。
+             BLOCK_N = 256 if (SKV >= 256 and SKV % 256 == 0) else 128
++
++            # 本轮机制（M256 PART_TILES，独立实验，仅 case4 形状命中）：
++            # 仅当非因果、V 为 BF16、整段 KV 单块（BLOCK_N==256）、D==128 且
++            # S 可被 256 整除时，把 query 行块再抬到 256。判据只读 dtype、
++            # shape 与分块这类合法元数据，不读输入值、不按 case_id 选路。
++            # 理由：PART_TILES 的交接链数等于 tile 数 T=B*NKV*G*(S/BLOCK_M)，
++            # 模拟器部分窗口头部（Cube WAIT_FLAG_DEVI 84.32us/9、
++            # FIX_L0C_TO_DST 23.07us/9；Vector WAIT_FLAG_DEVI 62.07us/9）按
++            # tile 计次；case4 由 M128 的 T=512 降为 T=256，每 worker 链数
++            # 25/26->12/13。K/V 组载入次数与单链结构不变，仅每链行数翻倍。
++            # 数值风险：分块只改变 tl.dot 的 M 维铺排与程序数，不改变任何
++            # 表达式、相加顺序或精度路径；代价是单 tile 活跃内存翻倍，可能
++            # 触及 UB 预算，故在复用体中仅对 M256 提前分母归约（见下）。
++            if (value.dtype == torch.bfloat16 and BLOCK_M == 128
++                    and BLOCK_N == 256 and BLOCK_D == 128 and S % 256 == 0):
++                BLOCK_M = 256
+     elif BLOCK_D <= 256:
+         BLOCK_M, BLOCK_N = 32, 32
+     else:
+@@ -721,7 +762,8 @@
+     TPG = G * NB_M
+     T = B * NKV * TPG
+     PART_TILES = ((not is_causal) and PV_SINGLE_F16 and SINGLE_KV
+-                  and BLOCK_M == 128 and BLOCK_N == 256 and BLOCK_D == 128)
++                  and (BLOCK_M == 128 or BLOCK_M == 256)
++                  and BLOCK_N == 256 and BLOCK_D == 128)
+     if PART_TILES:
+         P = 20 if T >= 20 else T
+         grid = (P,)

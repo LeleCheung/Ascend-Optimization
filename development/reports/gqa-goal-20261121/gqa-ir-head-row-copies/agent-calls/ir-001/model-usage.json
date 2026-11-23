@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 41,
+    "duration_ms": 222110,
+    "usage": {
+      "input_tokens": 52934,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1678720,
+      "output_tokens": 37428,
+      "output_tokens_details": {
+        "thinking_tokens": 22718
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 52934,
+        "outputTokens": 37428,
+        "cacheReadInputTokens": 1678720,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 2.03973,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 22718,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 2.03973,
+    "result": "本次交接已完成：`diagnosis.json` 登记后经 decision 桥通过（sha256 `6797e304…`），随后仅编辑清单内的两个 BCMLIR，submit 返回 `awaiting_ir_review`，文件保持现状不再变动。\n\n## 读取与核对结论\n- 失败根因材料：`feedback.json` 顶层 `status=target_compile_failed`，case4/case7 均为 `ConvertLinalgIRToBinary` 阶段 `ub overflow, requires 1576960 bits while 1572864 bits available`（需求 197120B、可用 196608B，超 512B）；同源 FP16 的 case1/case2 已 `measured`（102.53us/98.75us 对 native 101.34us/97.60us），说明行映射本身在该后端可编译，超限与 256 长度 K/V 工作集同现。\n- 后端低层产物核对：`compiled-readonly/_gqa_fwd_kernel.bcmlir` 与 `ir/target` 的 BCMLIR 逐字节同构（diff 为空），`ttadapter` 只是 `%arg2→%Q` 类重命名，`ttir` 为同一层级；三份产物仍保留 128 条单行 `memref.copy` 与逐行 `fill/divf/materialize`，**后端未消除单行拷贝冗余**。这些低层产物保持冻结。\n- 历史窗口：`timeline.json` 顶层 `historical=true`，`clock_qualification=relative_only`、`absolute_time_qualified=false`，窗口 128.9580–229.0818（unit unassigned）；同材料 `absolute_unit_validation` 为 verified/us、22/22 PC 匹配、median_ratio 0.99980 与 1.00016，仅用于校准单位。占用按窗口分数归一化，`idle_intervals_total` 98–251、`idle_union` 0.365–0.9976，未报告泳道保持未知。`hotspots.json` 中 047 的 MTE3 `MOV_SRC_TO_DST_ALIGN` 25.60us/8 calls（strided 输出，来源 `tl.store`）与 `FLOWCTRL/WAIT_FLAG_DEVI` 35.32us 只作机制定位。`profiling.json` 的 119.902397us（reference）与 174.563492us（047 候选）属另一采集批次。\n\n## 实际改动（同一机制，两特化分别实施）\n- `ir/target`（case4，G=8，NqD=8192）与 `ir/case7`（case7，G=4，NqD=4096）：新增一个 index 分组步长常量（`%c8`/`%c4`），Q 载入与输出写回循环由 `step 1` 改为 `step G`，用既有 2D 形状取 `memref<Gx128, strided<[128,1], offset:?>>`（语义等价于原来 G 条单行拷贝，组内地址差恒 128 元素、起点 256B 对齐）；输出侧把逐行 `fill(1x128 f32)+divf+truncf` 换成单个融合 `linalg.generic`（`(d0,d1)->(d0)` 广播分母、体内 `divf` 后 `truncf` 到 bf16），`materialize_in_destination` 写入 Gx128 目的视图。函数签名/ABI、运算集合与次序、f32 除法与 bf16 截断精度、地址集合均保持，未新增 GM 缓冲，未做 3D 折叠或 reshape。\n\n## 新增观察与待验证项\n- 单行拷贝在 128 行下的组织使每行各带一份 5 条标量寻址与一份 512B 级输出临时量，512B 超限量与逐行临时量的量级吻合；融合 generic 把输出侧 f32 广播整块临时量消掉，只留 Gx128 bf16（case4 2048B、case7 1024B）。\n- `codex-brief.json` 的分析贡献已记入证据：G 行在 BSND 中连续、可用既有 2D 视图覆盖同一批地址，并提示需先 CPU 编译再宣称修复。\n- 尚待宿主核定：①分组后 UB 需求能否落入 196608B（若仍溢出，本机制在此后端不成立，本轮不对应真机结论）；②融合 generic 的广播分母写法在本后端的向量化与 UB 分配行为；③若需缩小分组，则退到只分组 Q 载入的对照分支。"
+  }
+}

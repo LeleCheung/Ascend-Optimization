@@ -1,0 +1,181 @@
+{
+  "timestamp": "2026-11-20T04:33:56.088621+00:00",
+  "diagnosis": {
+    "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "feedback.json",
+        "category": "paired_profiling",
+        "role": "确认当前最佳身份、目标用例数值与本次调用（ir-001）的真实失败原因",
+        "finding": "父版（保留 ir-004，source_sha256=b8d4d4a2…）正式评测 27/27 PASSED、geo_mean 1.8522、min_speedup 0.6846（timing-8，46.082us），两套补测各 36/36；目标用例 timing-7 为 latency 39.2613us / reference 28.1645us / speedup 0.7174，故本轮必须超过该最佳。current_invocation=ir-001 状态为 CPU_parse_failed，compiler_log 精确指向 output-ir 第 204:9 'operation defines 2 results but was provided 1 to bind'，lowering.rows 里 candidate 直接 lowering_failed（RuntimeError: Parse MLIR file failed.），而 original 行 lowered_to_binary。host_instruction 要求只修复多结果 scf.for 的绑定语法、保留已登记的两块前瞻机制、并保持冻结源码与证据不变。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "确定用例形状、每 block 搬运总量与哪条硬件流水最忙，作为改进方向的定量锚点",
+        "finding": "用例为 batch_norm_with_update_functional-timing-7，输入 8x64x64x64 fp32、affine、seed=1736，容差 atol=rtol=1e-4、required_matched_ratio=1.0、equal_nan=true。候选侧（64 block、1650MHz）Task Duration 47.360947us，aiv_mte2_ratio 0.6187 为三条执行流水最高，aiv_vec_ratio 0.4473，aiv_mte3_ratio 0.2154；read_main_memory_datas 合计 16952KB，即每 block 约 264.9KB，恰为单片特征（8x4096x4B=128KB）遍历两趟的量。MTE2 与 VECTOR 占比相加≈1.07，说明两条流水在本核内近乎串行、且都未饱和——这是‘搬运与计算重叠不足’的量化入口。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "simulator",
+        "role": "指令级定位同步/等待热点，区分统计趟与输出趟的同步构成，并核对 8x256 输出 tile 的实际搬运形态",
+        "finding": "top_instructions 全部是同步与搬运项：64 次调用的一组为 VECTOR BAR 18.58/18.49/18.45/18.41/18.36us、MTE2 WAIT_FLAG(PIPE:VEC,TRIGGERPIPE:MTE2,FLAGID:1) 17.93us、MOV_SRC_TO_DST_ALIGN(Src:OUT,Dst:UB,XD:X22=0x2000≈8192B，即 8x256 的 8 行 1KB 突发) 16.42us、SET_FLAG(TRIGGERPIPE:VEC) 16.38us；32 次调用的一组为 MTE3 WAIT_FLAG(PIPE:VEC,TRIGGERPIPE:MTE3,FLAGID:0) 14.30us、VECTOR BAR 14.29/14.27/14.23/14.17us、MTE2 WAIT_FLAG 13.39us、VECTOR 上等 MTE3 的 WAIT_FLAG 10.71us、MTE3 MOV_SRC_TO_DST_ALIGN(Src:UB,Dst:OUT) 10.30us。按调用次数与 8x256 tile 尺寸对应，32 次一组即输出趟（16 次 8x256 迭代按 AIV 子块拆分后 32 次 store）。真正的 FP 向量算术未进榜，说明输出趟的成本主体是‘每次 tile 装载与计算之间的显式 WAIT/BAR 串接’，而非算术量；指令时间只作关注度排序（可重叠、非墙钟）。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "切分两趟的窗口占比、量化各流水 active/productive/等待，并说明时钟资质与观测范围",
+        "finding": "clock_qualification=relative_only、absolute_time_qualified=false，capture_scope 为‘首个至末个可见硬件事件’的部分窗口；但 absolute_unit_validation 以 33/33 个非同步 PC 对照运行时间中位比 1.00055 核验了单位 us，raw_clock_window 185.793→224.198 = 38.405us，与 timing-7 的 39.26us 同量级，故本窗口覆盖统计趟与输出趟两趟。MTE3 唯一大空闲为 [0,0.2908]，此后才持续写回，据此统计趟占窗口前 29.1%、输出趟占其后 70.9%（≈27.2us），输出趟是主要成本区。流水占用：VECTOR active 0.9061、productive 0.5177、wait_only 0.3884；MTE2 active 0.8774、productive 0.6414、wait_only 0.2360、idle 0.1226；MTE3 active 0.4021、productive 0.2896、wait_only 0.1126、idle 0.5979。即 MTE2 有 23.6% 在等缓冲区释放（WAR），VECTOR 有 38.8% 在等数据（WAIT_FLAG 触发源为 MTE2），两者几乎互相让路；MTE2 在输出趟 0.31→0.53 段内以 0.0121（≈0.46us）的规则周期出现小空隙，与输出趟 16 次迭代的节奏一致，末段 [0.5057,0.5315] 另有 0.0259 的较大空闲。"
+      },
+      {
+        "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+        "category": "source_ir",
+        "role": "定位可独立验证的编译缺陷（唯一实际报错点）与已登记的流水机制，确认改动面",
+        "finding": "全文只有 5 处 scf.for：第 47 行 %cnt_7:3、第 64 行 %curr_input_48:4、第 257 行 %curr_input_51（单结果，均带 :N 绑定或单结果）语法合法；第 204 行 `%carry_w = scf.for … iter_args(%cur_in_w = %curr_in_w, %pend_in_w = %pd_in_w) -> (tensor<8x256xf32>, tensor<8x256xf32>)` 定义 2 个结果却只绑定 1 个名字，正是 compiler_log 报的第 204:9 错误，也是本候选唯一无法解析的原因。该循环即输出趟（scf.if %spatial_wide 真分支，8x256 tile）的两块前瞻：序言先载 tile0，再用 minsi(1, N-1) 偏移载入 tile1；循环体用 min(n+2, N-1) 钳位载入 tile n+2，算术顺序为 subf → mulf(weight) → mulf(inv_std) → addf(bias) 后 store，回边 yield (%pend_in_w, %nx_in_w)；循环结果在循环外未被使用。统计趟（第 47/64 行）与 EVEN=false 回退分支（第 234 行）保持父版原样，未在本轮改动。"
+      },
+      {
+        "path": "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "在冻结的实际后端产物上核对缓冲数、拷贝形态与疑似冗余是否已被后端消除",
+        "finding": "该产物与同目录 ttadapter（sha bd1b88a7…/12c88ec8…，本次保持冻结）算子直方图一致：memref.alloc 共 6 个——4×memref<8x128xf32>（统计趟：当前 tile、前瞻 tile、均值/M2 累加器）与 2×memref<8x256xf32>（输出趟：当前 tile + 前瞻 tile），memref.copy 6 处、arith.mulf 15、arith.addf 10、arith.addi 19、linalg.reduce 2，且无任何显式同步指令。结论两点：(1) 输出趟在父版只有 2 个 8x256 tile 缓冲，回边上同时活跃的 tile 只有 1 个（当前+下一个），MTE2 必须等上一 tile 的缓冲被 VECTOR 释放才能起步，这与 timeline 中 MTE2 wait_only 0.236（等缓冲）和 VECTOR wait_only 0.388（等数据）互相印证，且与该阶段尚无显式同步、BAR/WAIT 完全由缓冲活性在下游插入的结构一致；(2) 疑似冗余的计数张量 tensor<8x128xi32> 在冻结产物中已不存在（无任何 xi32 memref/vector，19 个 arith.addi 全是标量/索引），即该冗余在后端已被消除，与 prior-explorations 中 ir-001 配对实测‘去掉 cnt 向量自增后 BAR/WAIT 结构基本不变、无收益’的结论吻合，故本轮对该点保持 IR 原样、不重复修改。"
+      },
+      {
+        "path": "frozen.py",
+        "category": "source_ir",
+        "role": "确认语义边界与源码已表达的流水意图，保证 IR 改动不跨越语义",
+        "finding": "第 52-54 行 mean/var/cnt 初始化；第 66 行 EVEN 分支无掩码装载 tile0；第 71-103 行统计内层循环：第 82 行 min(n_step+1, n_num_steps-1) 钳位前瞻、第 87-88 行 delta=curr-mean 与 cnt+=1、第 101-102 行 Welford 递推、第 103 行 curr_input=next_input；第 104-106 行两次 tl.sum 与 rsqrt；第 125-156 行输出趟：第 137-138 行注释明确写着‘Same one-tile lookahead as the statistics pass’，第 151 行 output=weight*(curr_input-mean)*inv_std+bias，第 153 行 store。即源码只表达深度 1 前瞻，输出趟的 tile 顺序、乘加结合顺序与写回位置都是语义约束：本轮 IR 的深度 2 前瞻只改变装载发起时机，不改变 tile 访问序列、算术结合顺序与舍入，EVEN 特化（batch%8==0、spatial%128==0）与全部特殊值路径（NaN/Inf、零方差、n=1、weight/bias 空指针分支）不受影响。"
+      },
+      {
+        "path": "prior-explorations.json",
+        "category": "paired_profiling",
+        "role": "保留此前负结果与已登记机制，避免重复已有研究身份",
+        "finding": "ir-001（cnt 标量化）正式 geo_mean 1.8269、timing-7 45.173us，低于父版、无收益；ir-002/ir-003（统计块加宽到 512 及配套合并）lowering_failed；ir-004（输出趟 8x256 加宽）geo_mean 1.8522、timing-7 39.261us，为当前最佳；ir-005（统计内层循环深度 2 前瞻，即本轮同机制）lowering_review_passed、候选 ttadapter 由 38781B 增至 40030B，但 result 为 null，尚无正式结果，且其 alternatives 明确把‘把同样的预取深度加1应用到输出归一化循环’留作同机制的后续一步。故本轮只在输出趟落同一机制，与统计趟分支互不重叠、可独立归因。"
+      },
+      {
+        "path": "lowered-inventory.json",
+        "category": "source_ir",
+        "role": "确认可编辑面与冻结面",
+        "finding": "清单登记 ast_sha256=5c1607c0… 的 ttadapter/bcmlir/npubin 三件套（bd1b88a7…/12c88ec8…/41483d74…）来自 ir-004 编译缓存并保持冻结，只允许编辑 ir-inventory.json 列出的 ir/5c1607c0…/batch_norm_with_update_kernel.ttir；因此本轮改动只能落在 TTIR 文本，低层产物仅用于读证。"
+      }
+    ],
+    "hypothesis": "当前候选的唯一编译缺陷是输出趟深度 2 前瞻循环的多结果 SCF 绑定语法（第 204 行少了 ':2'），它使整个候选在 IRSource 解析阶段即失败，成本为‘零收益 + 无法评测’，是必须先修的结构性缺陷；而它承载的机制本身有独立的执行成本支持：输出趟占窗口 70.9%（≈27.2us），冻结 bcmlir 中输出趟只有 2 个 memref<8x256xf32> tile 缓冲（当前+前瞻，回边仅活跃 1 个 tile），于是 MTE2 必须等 VECTOR 释放上一 tile 才能起步——这正好解释 timeline 中 MTE2 wait_only 0.2360（等缓冲释放）与 VECTOR wait_only 0.3884（WAIT_FLAG 触发源为 MTE2）近乎互相让路的近串行结构，以及 profiling 中 aiv_mte2_ratio 0.6187 与 aiv_vec_ratio 0.4473 相加≈1.07。把回边改为同时携带两块 tile（当前 + pending）并把前瞻偏移从 n+1 提到 n+2（仍用 minsi 钳到末块），编译期即可强制输出趟至少 3 个 tile 缓冲区，让第 n+2 块的 GM 装载与第 n 块的乘加/写回真正重叠，而 tile 访问顺序、每次的 subf→mulf(weight)→mulf(inv_std)→addf(bias) 结合顺序、store 地址与 EVEN 特化全部不变，因而数值逐位不变。",
+    "alternatives": [
+      {
+        "idea": "修复时顺手把该 scf.for 改成无结果形式（删掉两个 iter_args/yield），彻底消除未使用结果",
+        "why_not_selected": "会把回边携带值删光、前瞻被折叠成深度 1，等于放弃 host_instruction 要求保留的已登记机制，机制不可验证；且改动面大于单点语法修复。"
+      },
+      {
+        "idea": "同时对统计趟（第 64 行内层循环）套用同一深度 2 前瞻",
+        "why_not_selected": "同一机制在 ir-005 中已登记并 CPU lower 通过（候选 ttadapter 38781→40030B），但尚无正式结果；本轮若同时改两处，归因混淆，且统计趟只占窗口 29.1%，先在被更大的输出趟（70.9%）验证可独立归因，成功后再叠加。"
+      },
+      {
+        "idea": "把输出趟 tile 加宽到 8x512 或改 BLOCK_N",
+        "why_not_selected": "会改变特化常量身份（清单记录 8/128/EVEN=true）、连带 reshape/reduce 形状与 UB 预算；此前加宽统计分块已遇 UB 超限（ir-002/ir-003），风险与本轮‘单点可验证’要求不符；且 MTE2 已在小突发（1KB 行、1MB 跨步）上效率偏低，加宽未必改善突发效率。"
+      },
+      {
+        "idea": "把疑似冗余的 cnt 计数张量标量化（ir-001 身份）",
+        "why_not_selected": "冻结 bcmlir/ttadapter 中已无任何 i32 tile memref（该冗余在后端已消除），且 ir-001 已配对实测无收益（geo 1.8269 vs 父版 1.8522，timing-7 45.173us）；按‘后端已消除的疑似冗余保持 IR 原样’处理。"
+      },
+      {
+        "idea": "改编译选项（num_stages/multibuffer/disable_tightly_coupled_buffer_reuse 等）来加深流水",
+        "why_not_selected": "属独立的编译选项研究身份，且选项在 ir-inventory 的 compiler_options 中已记录、不在可编辑面内；本轮需保持 IR 身份可单独归因。"
+      }
+    ],
+    "change": "只做一处语法修复式编辑：把 ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir 第 204 行的 `%carry_w = scf.for` 改为 `%carry_w:2 = scf.for`，使该 scf.for 的两个结果（tensor<8x256xf32>, tensor<8x256xf32>）与 iter_args 正确绑定。其余全部字节保持不变，包括：输出趟 scf.if %spatial_wide 守卫与 8x256 tile、序言先载 tile0 再用 minsi(1, n_num_steps_w-1) 载入 tile1、循环体用 min(n_step_w+2, n_num_steps_w-1) 钳位的前瞻装载、算术顺序 subf→mulf(weight)→mulf(inv_std)→addf(bias)→tt.store、指针算术（input/output feat/batch stride 用法）、回边 yield (%pend_in_w, %nx_in_w)、统计趟与 EVEN=false 回退分支、两次 tt.reduce、running_mean/var 更新、weight/bias 空指针 scf.if、常量 8/128/EVEN=true，以及函数签名与 ABI。",
+    "expected": "编译：候选应通过 MLIR 解析并 lower 到二进制（当前唯一报错即该绑定；若仍失败则本机制作废）。结构（可先于性能核对）：输出趟回边上同时活跃的 8x256 tile 缓冲区应由 2 增至 ≥3，VECTOR 等 MTE2 的 WAIT_FLAG 与 MTE2 的 WAR 等待的分布应改变。数值：逐位一致——tile 访问序列与父版相同（迭代 n 计算 tile n，前瞻 tile n+2），每次乘加结合顺序与 store 位置不变；代价是每 m 趟末尾被钳位到同一末块的重复装载，本例 m_num_steps=1、n_num_steps_w=16，序言 2 次 + 循环 16 次装载（其中 2 次重复读末块且结果不被消费），即输出趟读流量 +16KB/块（128→144KB，+12.5%），不改变任何输出值。性能（待宿主真机验证的预测，非结论）：若输出趟如证据所示受‘缓冲可用性/重叠不足’限制，则 VECTOR wait_only（0.3884）与 MTE2 wait_only（0.2360）应下降，timing-7 的 39.2613us 预期向 33-36us 移动（speedup 0.7174 → 约 0.78-0.85），并经 geo_mean 体现；若真实上限是 1KB 行、1MB 跨步的 DMA 突发带宽（MTE2 productive 已 0.6414、VECTOR productive 0.5177 同时偏高），则本改动应接近中性甚至因 +12.5% 读流量略差——该情形下应记为该机制在此负载下无效，并转向 MTE3/store 侧（MTE3 idle 0.5979、productive 仅 0.2896）。",
+    "validation": "1) 宿主先做 CPU 解析与 lower：需通过并产出 npubin，函数签名/特化常量与清单一致；2) 与参考 KGS 组合按 atol=rtol=1e-4、required_matched_ratio=1.0、equal_nan 逐元素比对（预期逐位一致，含 NaN/Inf、零方差、n=1、weight/bias 空指针分支与 EVEN=false 非整除形状）；3) 在重编译产物中确认输出趟同时活跃 tile 缓冲由 2 增至 ≥3 且同步项位置变化，再谈时间；4) 完整正式 27 项 + 双方各 36 项补测 + ABBA 与后双分析，并与三条身份分开对比（保留父版 ir-004 geo 1.8522 / timing-7 39.261us、ir-001、ir-005）；5) profiling 复核 MTE2 event_count 应由每块 64 增至 66（+2 次 8KB 装载）级别、read_main_memory_datas 相应增加，作为机制隔离指标；6) 本文件、预检与建议均不作为收益证据，性能以宿主真机结果为准。",
+    "layer_reason": "缺陷位于单算子 IR 文本本身（多结果 SCF 绑定语法导致 IRSource 解析失败），且被承载的机制——回边上同时活跃的 tile 数量——决定下游缓冲复用与 FLAG/BAR 插入，属编译器流水结构，源码（frozen.py 只表达深度 1，且注释明示 one-tile lookahead）与编译选项都无法表达；可编辑面按 ir-inventory/lowered-inventory 只有 ir/*.ttir，冻结的 ttadapter/bcmlir/npubin 与源码保持原样，因此归入 single_operator_ir。",
+    "simulator_incremental_judgment": "时钟资质：timeline 明确 clock_qualification=relative_only、absolute_time_qualified=false，报告自述无全核关键路径归因；但 absolute_unit_validation 用 33/33 个非同步 PC 对照运行时间中位比 1.00055 核验出窗口单位为 us、窗口 38.405us 与 timing-7 时延 39.26us 同量级，故仅把窗口用于跨流水的相对比例与在窗口内的位置排序，不把 instruction_time_sum_us 当墙钟、不据此换算加速比。观测范围：capture_scope 为‘首个至末个可见事件’的部分窗口边界保留，MTE3 大空闲 [0,0.2908] 划出统计趟/输出趟边界，说明本次窗口比上轮（仅 9.372us、只覆盖统计趟）更完整，输出趟首次被覆盖正是本轮转向输出趟的理由。未报告/辅助泳道：ALL(2 事件)、FLOWCTRL(2)、CACHEMISS(68，active 0.0013) 均为 auxiliary_trace_lane，按辅助处理不作瓶颈；SCALAR active 0.0840、SCALARLDST 0.1849 属低占比辅助，不构成关键路径。增量判断：与父版相比本轮只改绑定语法（编译器文本层）与已登记的深度 2 前瞻，唯一增量来源是输出趟的缓冲深度；其理论增益上界为输出趟内 VECTOR wait_only 的份额（0.3884×0.709≈0.27 窗口），但其中一部分等待源自 MTE3 释放而非 MTE2 数据（VECTOR 等 MTE3 的 WAIT_FLAG 10.71us），故实际预期显著低于该上界；同时须扣除 +12.5% 输出趟读流量。因此只主张‘同步/等待结构应改变、延迟不高于当前最佳’，绝对值以宿主复测为准。",
+    "codex_contribution": "Codex 在 codex-brief.json 中的贡献被采纳并已核对实际 IR：(1) 要求‘当前热点中的 BAR 和 WAIT 须结合真实 IR 定位到统计或输出通道’——据此用 timeline 的 MTE3 写回起点把窗口切成统计趟 29.1% / 输出趟 70.9%，并把 32 次调用的同步组与 8x256 输出 tile（MTE2 MOV XD=0x2000、MTE3 MOV Src:UB,Dst:OUT）对上，确认此前的深度 2 前瞻只覆盖统计趟（ir-005），输出趟是同机制但未被处理的通道；(2) 要求‘在实际 BCMLIR 中确认成本’——在冻结 bcmlir/ttadapter 中确认输出趟只有 2 个 8x256 tile 缓冲、无显式同步、且已无 i32 计数张量（后者说明 ir-001 的疑似冗余已被后端消除，应保持原样）；(3) Codex 关于‘MTE2 与 VECTOR 近于串行’的判断被新窗口进一步支撑（MTE2 wait_only 0.2360 等缓冲、VECTOR wait_only 0.3884 等数据）。具体实现选择（只修绑定语法、保留两块前瞻、不合并统计趟改动、不动 cnt）由本人依据上述核对结果作出。",
+    "unknown": [
+      "下游同步插入与缓冲区复用不由这两份冻结产物决定，'输出趟仅 2 个 tile 缓冲导致串行' 是由 ttadapter/bcmlir 的 2×memref<8x256xf32> alloc、6 处 memref.copy 与 MTE2 wait_only 0.2360 推断，需在重编译产物中确认缓冲数由 2 增至 ≥3。",
+      "该 scf.for 的两个结果在循环外未被使用，前端 canonicalize 可能把 pend 直通参数折掉（yield 值等于对应区域参数），使前瞻退化为深度 1 而中性；需在产物中核对回边活跃 tile 数。",
+      "1KB 行、1MB 跨步的 DMA 突发带宽上限未知；若已接近该上限，加深前瞻只会中性并叠加 +12.5% 读流量。",
+      "ir-005（统计趟同机制）尚无正式结果，若其在本轮宿主复测中证实中性，则同机制在输出趟的有效性也需重新评估。"
+    ]
+  },
+  "evidence": [
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "确认当前最佳身份、目标用例数值与本次调用（ir-001）的真实失败原因",
+      "finding": "父版（保留 ir-004，source_sha256=b8d4d4a2…）正式评测 27/27 PASSED、geo_mean 1.8522、min_speedup 0.6846（timing-8，46.082us），两套补测各 36/36；目标用例 timing-7 为 latency 39.2613us / reference 28.1645us / speedup 0.7174，故本轮必须超过该最佳。current_invocation=ir-001 状态为 CPU_parse_failed，compiler_log 精确指向 output-ir 第 204:9 'operation defines 2 results but was provided 1 to bind'，lowering.rows 里 candidate 直接 lowering_failed（RuntimeError: Parse MLIR file failed.），而 original 行 lowered_to_binary。host_instruction 要求只修复多结果 scf.for 的绑定语法、保留已登记的两块前瞻机制、并保持冻结源码与证据不变。",
+      "sha256": "f6aa6077ec07e348e5381ac802c0b5314479940a009944b34e06bf76e0ca136a"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "确定用例形状、每 block 搬运总量与哪条硬件流水最忙，作为改进方向的定量锚点",
+      "finding": "用例为 batch_norm_with_update_functional-timing-7，输入 8x64x64x64 fp32、affine、seed=1736，容差 atol=rtol=1e-4、required_matched_ratio=1.0、equal_nan=true。候选侧（64 block、1650MHz）Task Duration 47.360947us，aiv_mte2_ratio 0.6187 为三条执行流水最高，aiv_vec_ratio 0.4473，aiv_mte3_ratio 0.2154；read_main_memory_datas 合计 16952KB，即每 block 约 264.9KB，恰为单片特征（8x4096x4B=128KB）遍历两趟的量。MTE2 与 VECTOR 占比相加≈1.07，说明两条流水在本核内近乎串行、且都未饱和——这是‘搬运与计算重叠不足’的量化入口。",
+      "sha256": "a4cf9f718f9c58cb50a2e038ef4328449c1188ce0296a733b3b7005b3d3d46d2"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "指令级定位同步/等待热点，区分统计趟与输出趟的同步构成，并核对 8x256 输出 tile 的实际搬运形态",
+      "finding": "top_instructions 全部是同步与搬运项：64 次调用的一组为 VECTOR BAR 18.58/18.49/18.45/18.41/18.36us、MTE2 WAIT_FLAG(PIPE:VEC,TRIGGERPIPE:MTE2,FLAGID:1) 17.93us、MOV_SRC_TO_DST_ALIGN(Src:OUT,Dst:UB,XD:X22=0x2000≈8192B，即 8x256 的 8 行 1KB 突发) 16.42us、SET_FLAG(TRIGGERPIPE:VEC) 16.38us；32 次调用的一组为 MTE3 WAIT_FLAG(PIPE:VEC,TRIGGERPIPE:MTE3,FLAGID:0) 14.30us、VECTOR BAR 14.29/14.27/14.23/14.17us、MTE2 WAIT_FLAG 13.39us、VECTOR 上等 MTE3 的 WAIT_FLAG 10.71us、MTE3 MOV_SRC_TO_DST_ALIGN(Src:UB,Dst:OUT) 10.30us。按调用次数与 8x256 tile 尺寸对应，32 次一组即输出趟（16 次 8x256 迭代按 AIV 子块拆分后 32 次 store）。真正的 FP 向量算术未进榜，说明输出趟的成本主体是‘每次 tile 装载与计算之间的显式 WAIT/BAR 串接’，而非算术量；指令时间只作关注度排序（可重叠、非墙钟）。",
+      "sha256": "f2005872cd677b8e5940668f313222bd29f882f510b3ad98c8f5add992d6b16c"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "切分两趟的窗口占比、量化各流水 active/productive/等待，并说明时钟资质与观测范围",
+      "finding": "clock_qualification=relative_only、absolute_time_qualified=false，capture_scope 为‘首个至末个可见硬件事件’的部分窗口；但 absolute_unit_validation 以 33/33 个非同步 PC 对照运行时间中位比 1.00055 核验了单位 us，raw_clock_window 185.793→224.198 = 38.405us，与 timing-7 的 39.26us 同量级，故本窗口覆盖统计趟与输出趟两趟。MTE3 唯一大空闲为 [0,0.2908]，此后才持续写回，据此统计趟占窗口前 29.1%、输出趟占其后 70.9%（≈27.2us），输出趟是主要成本区。流水占用：VECTOR active 0.9061、productive 0.5177、wait_only 0.3884；MTE2 active 0.8774、productive 0.6414、wait_only 0.2360、idle 0.1226；MTE3 active 0.4021、productive 0.2896、wait_only 0.1126、idle 0.5979。即 MTE2 有 23.6% 在等缓冲区释放（WAR），VECTOR 有 38.8% 在等数据（WAIT_FLAG 触发源为 MTE2），两者几乎互相让路；MTE2 在输出趟 0.31→0.53 段内以 0.0121（≈0.46us）的规则周期出现小空隙，与输出趟 16 次迭代的节奏一致，末段 [0.5057,0.5315] 另有 0.0259 的较大空闲。",
+      "sha256": "6777e8aaa5ec9a379af0b23450fe327545dea7a74a9803c25409d48f4798f263"
+    },
+    {
+      "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+      "category": "source_ir",
+      "role": "定位可独立验证的编译缺陷（唯一实际报错点）与已登记的流水机制，确认改动面",
+      "finding": "全文只有 5 处 scf.for：第 47 行 %cnt_7:3、第 64 行 %curr_input_48:4、第 257 行 %curr_input_51（单结果，均带 :N 绑定或单结果）语法合法；第 204 行 `%carry_w = scf.for … iter_args(%cur_in_w = %curr_in_w, %pend_in_w = %pd_in_w) -> (tensor<8x256xf32>, tensor<8x256xf32>)` 定义 2 个结果却只绑定 1 个名字，正是 compiler_log 报的第 204:9 错误，也是本候选唯一无法解析的原因。该循环即输出趟（scf.if %spatial_wide 真分支，8x256 tile）的两块前瞻：序言先载 tile0，再用 minsi(1, N-1) 偏移载入 tile1；循环体用 min(n+2, N-1) 钳位载入 tile n+2，算术顺序为 subf → mulf(weight) → mulf(inv_std) → addf(bias) 后 store，回边 yield (%pend_in_w, %nx_in_w)；循环结果在循环外未被使用。统计趟（第 47/64 行）与 EVEN=false 回退分支（第 234 行）保持父版原样，未在本轮改动。",
+      "sha256": "e21e1e258fd5ba94746817c090b36a69371189b9d59a382daadb602e1003b782"
+    },
+    {
+      "path": "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "在冻结的实际后端产物上核对缓冲数、拷贝形态与疑似冗余是否已被后端消除",
+      "finding": "该产物与同目录 ttadapter（sha bd1b88a7…/12c88ec8…，本次保持冻结）算子直方图一致：memref.alloc 共 6 个——4×memref<8x128xf32>（统计趟：当前 tile、前瞻 tile、均值/M2 累加器）与 2×memref<8x256xf32>（输出趟：当前 tile + 前瞻 tile），memref.copy 6 处、arith.mulf 15、arith.addf 10、arith.addi 19、linalg.reduce 2，且无任何显式同步指令。结论两点：(1) 输出趟在父版只有 2 个 8x256 tile 缓冲，回边上同时活跃的 tile 只有 1 个（当前+下一个），MTE2 必须等上一 tile 的缓冲被 VECTOR 释放才能起步，这与 timeline 中 MTE2 wait_only 0.236（等缓冲）和 VECTOR wait_only 0.388（等数据）互相印证，且与该阶段尚无显式同步、BAR/WAIT 完全由缓冲活性在下游插入的结构一致；(2) 疑似冗余的计数张量 tensor<8x128xi32> 在冻结产物中已不存在（无任何 xi32 memref/vector，19 个 arith.addi 全是标量/索引），即该冗余在后端已被消除，与 prior-explorations 中 ir-001 配对实测‘去掉 cnt 向量自增后 BAR/WAIT 结构基本不变、无收益’的结论吻合，故本轮对该点保持 IR 原样、不重复修改。",
+      "sha256": "12c88ec8a1907c3d149bbddc4e0a22c0a4528f8643463d0b92069123d570413c"
+    },
+    {
+      "path": "frozen.py",
+      "category": "source_ir",
+      "role": "确认语义边界与源码已表达的流水意图，保证 IR 改动不跨越语义",
+      "finding": "第 52-54 行 mean/var/cnt 初始化；第 66 行 EVEN 分支无掩码装载 tile0；第 71-103 行统计内层循环：第 82 行 min(n_step+1, n_num_steps-1) 钳位前瞻、第 87-88 行 delta=curr-mean 与 cnt+=1、第 101-102 行 Welford 递推、第 103 行 curr_input=next_input；第 104-106 行两次 tl.sum 与 rsqrt；第 125-156 行输出趟：第 137-138 行注释明确写着‘Same one-tile lookahead as the statistics pass’，第 151 行 output=weight*(curr_input-mean)*inv_std+bias，第 153 行 store。即源码只表达深度 1 前瞻，输出趟的 tile 顺序、乘加结合顺序与写回位置都是语义约束：本轮 IR 的深度 2 前瞻只改变装载发起时机，不改变 tile 访问序列、算术结合顺序与舍入，EVEN 特化（batch%8==0、spatial%128==0）与全部特殊值路径（NaN/Inf、零方差、n=1、weight/bias 空指针分支）不受影响。",
+      "sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56"
+    },
+    {
+      "path": "prior-explorations.json",
+      "category": "paired_profiling",
+      "role": "保留此前负结果与已登记机制，避免重复已有研究身份",
+      "finding": "ir-001（cnt 标量化）正式 geo_mean 1.8269、timing-7 45.173us，低于父版、无收益；ir-002/ir-003（统计块加宽到 512 及配套合并）lowering_failed；ir-004（输出趟 8x256 加宽）geo_mean 1.8522、timing-7 39.261us，为当前最佳；ir-005（统计内层循环深度 2 前瞻，即本轮同机制）lowering_review_passed、候选 ttadapter 由 38781B 增至 40030B，但 result 为 null，尚无正式结果，且其 alternatives 明确把‘把同样的预取深度加1应用到输出归一化循环’留作同机制的后续一步。故本轮只在输出趟落同一机制，与统计趟分支互不重叠、可独立归因。",
+      "sha256": "352ca0536a94943c677aa396fc0011d4d9560288fc30d370d769b39c6c3fa830"
+    },
+    {
+      "path": "lowered-inventory.json",
+      "category": "source_ir",
+      "role": "确认可编辑面与冻结面",
+      "finding": "清单登记 ast_sha256=5c1607c0… 的 ttadapter/bcmlir/npubin 三件套（bd1b88a7…/12c88ec8…/41483d74…）来自 ir-004 编译缓存并保持冻结，只允许编辑 ir-inventory.json 列出的 ir/5c1607c0…/batch_norm_with_update_kernel.ttir；因此本轮改动只能落在 TTIR 文本，低层产物仅用于读证。",
+      "sha256": "4945c33cae9b73c84e863e67c7d33e54cb8fdd74fa50003c86f71cc029944028"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+    "ir-inventory.json": "01565e88b83cbf813628c2653d351ee4c7b3845394b2b690b0c8351c0eef26e6",
+    "lowered-inventory.json": "4945c33cae9b73c84e863e67c7d33e54cb8fdd74fa50003c86f71cc029944028",
+    "profiling.json": "a4cf9f718f9c58cb50a2e038ef4328449c1188ce0296a733b3b7005b3d3d46d2",
+    "hotspots.json": "f2005872cd677b8e5940668f313222bd29f882f510b3ad98c8f5add992d6b16c",
+    "timeline.json": "6777e8aaa5ec9a379af0b23450fe327545dea7a74a9803c25409d48f4798f263",
+    "context.json": "315c5dc119a610d7bbcb9434e912f03c6502b87ab92aa3211dd64fd6ab7f9cec",
+    "diagnosis.json": "99f5358a90d0ab8981f4c7f62af16a4d3e1f772be34b48601510527e93507126",
+    "feedback.json": "f6aa6077ec07e348e5381ac802c0b5314479940a009944b34e06bf76e0ca136a",
+    "codex-brief.json": "596f87d61ae812e392c0fc03494e5802e5d651483bf8b3da02a8eeba59b8ead6",
+    "prior-explorations.json": "352ca0536a94943c677aa396fc0011d4d9560288fc30d370d769b39c6c3fa830",
+    "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir": "e21e1e258fd5ba94746817c090b36a69371189b9d59a382daadb602e1003b782",
+    "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttadapter": "bd1b88a7c7163074a7b0026087ee561101736a094dcfeeb4661df562285ee719",
+    "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.bcmlir": "12c88ec8a1907c3d149bbddc4e0a22c0a4528f8643463d0b92069123d570413c",
+    "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.npubin": "41483d746ba67cd3456434ea7d176386cbe6e987f3ab56d360d1baf5935be5fe"
+  },
+  "decision_tool_sha256": "8921af9e4e185c5bc42beee9f2483048a866002c48bc31e6c5129fda44362a28"
+}

@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 96,
+    "duration_ms": 394098,
+    "usage": {
+      "input_tokens": 103837,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 8212224,
+      "output_tokens": 61576,
+      "output_tokens_details": {
+        "thinking_tokens": 39763
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 103837,
+        "outputTokens": 61576,
+        "cacheReadInputTokens": 8212224,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 6.164697000000001,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 39763,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 6.164697000000001,
+    "result": "本轮交接完成（`awaiting_ir_review`，IR 已按登记机制落盘并保持不动）。\n\n## 读取与判断\n读取了 context.json、feedback.json、codex-brief.json、validation-policy.json、profiling.json、hotspots.json、timeline.json、ir-inventory.json、lowered-inventory.json、frozen.py，以及本工作区中实际 IR（TTIR d66fdf93，即 ir010 的 statistics256 机制，其 wide 分支按 `spatial_dim%256==0` 动态启用；target 用例 [8,64,64,64] 的 spatial=4096 正落在该分支）。Codex 的分析（公共原点＋残差均值经统计与归一化传递）与我的独立量化结论一致，实现由我选定并写入。\n\n**后端是否已消除该冗余：没有。** bcmlir 第 115 行 `mulf (%43#0, cnt)` 后紧跟 2048 元素 `linalg.reduce`，均值仍在绝对值量级上求和；第 328 行归一化仍是 `subf`→`mulf`→`mulf`→`addf`，无折叠/重结合。ttadapter 结构相同。所以只能在 TTIR 层修复。\n\n## 选定的单一机制\n以该 feature 切片首元素作公共原点 c（含非有限值保护：`math.absf`+`cmpf`+`select` 把 Inf/NaN 原点退化为 0，从而回落到原绝对计算），在 wide 分支：\n- 统计段：均值归约改为对残差 `(lane_mean − c)` 求和，得高精度残差均值 A（每 m_step 1 次 8×256 VSUB）；写出 `c+A` 作为绝对均值与 running 状态；`scf.if` 结果 3 元→4 元（绝对均值, A, var, inv_std）。\n- 归一化段：均值用 A，预取值各减一次 c，输出 `((x−c)−A)*w*inv_std+bias`——输出不再继承 fp32 绝对均值在半 ulp 上的表示极限，也不再被权重放大。\n- 窄 8×128 路径数值不变（只多 yield 一个标量残差），其继承的 offset4096 限制保留。\n函数 ABI、constexpr、编译选项、别名与非有限值语义不变；未使用任何针对测试形状/offset 的常量。\n\n## 预测（待宿主重放逐项核对）\nVECTOR/VSUB 32→约 50（+1 统计、+16 归一化 tile、+1 预取）；MTE2 拷贝描述符 68→69（4B 标量读）；DIV 58、VREDUCEV2 64、BAR 330、VMUL 38、VADD/VADDS 不变；动态轮次与归约规模不变；scalar wait 略升 ≤0.2us，VECTOR idle 0.172 略降，MTE2 idle 0.232 基本不变；timing-7 预测 36.3–37.3us（仍 < 39.2613us）；S256/offset128 输出误差 1.0824e-4 → ≤2e-5。\n\n## 本轮新增观察（请审查注意）\n1. 反馈里的 save_mean 误差 **1.52587890625e-5 恰好等于 128 的 1 ulp（2^-16）**，两版相同；我登记的 hypothesis 里写“≈30 ulp”偏大。结论方向不变（绝对值量级的归约误差），但由此可判定：失败输出主要是“均值相对参考差 1 ulp × 权重（≈7）”，因此本修复刻意让**输出不依赖绝对均值**，只依赖残差均值 A，这是能兑现的关键一步。\n2. 我保留了统计段 Welford 递推在绝对量级上运行（仅归约残差化）。对 S256/offset128（wide 只有 1 个 n_step，lane 均值即原值）这已是决定性修复；多 n_step 的 wide 形状（如 spatial4096）仍带约 1 ulp 量级的均值舍入，故登记中“offset4096 可能转通过”只能算待验证的附带假设，不作为验收依据。若宿主希望连这部分也消除，需要把原点减法下沉到统计段预取值（每 program 再 +17 VSUB，属于同机制但会偏离登记的 +18 预测），应另建调用登记。\n3. 预测偏差的判别口：若实测 VSUB 明显超过约 50（例如 ~66），说明新增减法被复制到预取与消费两端或未复用 `%sh_b_w`，需按此重新解释。\n4. VECTOR 是最忙泳道（active 0.828 / wait 0.342），新增向量工作直接记在最紧资源上；MTE2 空闲 0.23 足以吸收 +1 标量拷贝。窗口仍是 partial capture（VECTOR idle 0.172、child139 未报告），累计指令时间可重叠，不作全核关键路径/带宽结论。\n5. 流程观察：decision 桥要求每条 evidence 的 `path` 是**单一存在文件**（我最初把多文件写成一条被断言拒绝），已按单文件拆分。decision 记录 `fb5cb2ca...`，submit 后 diagnosis.json 与 IR 字节均已冻结，frozen.py 逐字节未变（b8d4d4a2…）。"
+  }
+}

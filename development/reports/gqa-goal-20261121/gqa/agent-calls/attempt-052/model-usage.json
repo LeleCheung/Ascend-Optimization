@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 33,
+    "duration_ms": 92904,
+    "usage": {
+      "input_tokens": 59512,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1102592,
+      "output_tokens": 14835,
+      "output_tokens_details": {
+        "thinking_tokens": 7161
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 59512,
+        "outputTokens": 14835,
+        "cacheReadInputTokens": 1102592,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.2197310000000001,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 7161,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.2197310000000001,
+    "result": "已完成本轮机制实现并交接。\n\n## 本轮机制：M256 PART_TILES + 仅 M256 的提前分母归约\n\n**修改前决策已登记**：`decision_id=72bf26d32b944e8a940c3b6c0a034961`，绑定父源码 sha `3c34fdfb…`，证据含成对 profiling、三核模拟器窗口、实际 TTIR（M128/N256、`tt.reduce` 在 PV dot 之后）、保留最佳 175.5726μs。\n\n**源码改动（candidate.py，新 sha `9d53bf02833dc781fa26abd94c4fa6122f2517e93dc062b12e8f60cf03538baf`）**\n1. `run()` 中新增元数据判据：非因果 + V 为 BF16 + `BLOCK_N==256` + `BLOCK_D==128` + `S%256==0` 时 `BLOCK_M` 128→256（仅 case4 命中；case7 S=128、case2 SKV=128、case1 因果均不命中，文本路径逐字未动）。\n2. `PART_TILES` 判据接受 `BLOCK_M==256`（其余条件不变）。\n3. `_gqa_tile_part_body` 中 `BLOCK_M>=256`（编译期常量）时先 `l_new=tl.sum(p,1)` 再 `p16` 截断与 PV dot，使 256×256 FP32 的 p 在 dot 前释放；M128 保留父版 `acc→sum` 顺序。表达式、相加顺序、精度路径、P/NB_M/TPG/T 分区规则均不变。\n\n**预期与风险**：case4 交接链 T=512→256、每 worker 25/26→12/13；数值无重排（同一 FP32 p 的同一 reduce、同一 fp16×fp16 FP32 累加 dot）。明确风险：单 tile p 翻倍到 256×256 FP32，可能触及 196608B UB 预算，需编译/IR 判定，失败即如实记录、不以降精度补救。\n\n**交接状态**：`preflight --source candidate.py` 返回 `awaiting_source_review`（sha `9d53bf02…`，未编译，故 M256 实际 TTIR 与 UB 余量仍为未知）。字节自预检后未变，现交宿主执行只读路径/地址边界审查、修改后 IR 与模拟器重放，以及原始完整四项 checker 和真机计时（case4 目标 <175.5726μs，case1/2/7 记录真实变化）。"
+  }
+}

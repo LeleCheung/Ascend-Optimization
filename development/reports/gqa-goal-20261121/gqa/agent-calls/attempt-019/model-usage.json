@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 33,
+    "duration_ms": 98177,
+    "usage": {
+      "input_tokens": 48853,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1167488,
+      "output_tokens": 15498,
+      "output_tokens_details": {
+        "thinking_tokens": 6364
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 48853,
+        "outputTokens": 15498,
+        "cacheReadInputTokens": 1167488,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.2154589999999998,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 6364,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.2154589999999998,
+    "result": "本轮独立实验已按指定机制实现并通过预检。以下是交接摘要。\n\n## 本轮机制（单一）\n持久程序 **headgroup 拆分**：在 `G` 可被 2 整除且 `G>=2` 时，每个共享 KV 头拆成 `G/2` 个 headgroup，每个持久程序只负责 2 个 query head；否则 `HG=G, NGRP=1`，与父版本所有权逐程序一致，不产生尾 head 掩码。\n\n- case4：grid `32 → 128`，每程序 `2 head × NB_M(=2) = 4` 次迭代（父版 16 次）。\n- case7：grid `16 → 32`，每程序 `2 head × NB_M(=1) = 2` 次迭代（父版 4 次）。\n- case1/2 不满足 `PERSIST_KV`（fp16/因果），源码路径与耗时预期不变。\n\n## 只改了所有权，未动算术\n- `_gqa_persist_kv_body`：`pid` 分解为 `ng=pid//NGRP, hg=pid%NGRP, b=ng//NKV, kvh=ng%NKV`；循环 `HG*NB_M`；`hq = kvh*G + hg*HG + gi`。\n- `run()`：新增 `HG/NGRP`，grid 改为 `B*NKV*NGRP`。\n- K/V 仍**每程序循环外整段载入一次**、V 仅转换一次；`M128/N256`、逐行 QK、softmax、单次 fp16 PV、输出表达式、guard 与精度路径**逐字不变**；`num_warps=1, num_stages=1` 未变，无额外 stage、无 IR 手改、无按 case_id/数值选路。\n\n## 证据与预期（已写入并登记）\n- 已实际读取 `current-profiling.json`、`actual-ir/2-...ttir`、`actual-ir/0-...bcmlir`、`previous-result.json`、`candidate.py`。\n- TTIR/BCMLIR 确认 K/V 载入与 f16 转换位于 `scf.for` 之外，32 program×16 迭代，`hq=kvh*8+gi`。\n- 明确的交通代价：K/V 整段载入次数 case4 约 **4×**（GM_to_L1 约 52MiB→209MiB）、case7 约 **2×**；L0C 搬出与全部算术量不变。是否被占用率/尾波收益抵消由真机判定。\n- 目标：case4 `full_call` 低于保留最佳 `268.7718μs`，并真实保存 case1/2/4/7 全部四项变化。\n\n## 工具记录\n- `decision --record diagnosis.json`：`decision_id=0e25c797c81f47cd91411326f0b36133`，绑定修改前源码 `beeb2335…`。\n- `preflight --source candidate.py`：`status=awaiting_source_review`，`source_sha256=2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113`。\n\n收到 `awaiting_source_review` 后候选字节保持不动，交宿主进行只读路径/地址边界审查与**完整四项真机评测**；完整结果与修改后模拟器重放随后反馈。"
+  }
+}

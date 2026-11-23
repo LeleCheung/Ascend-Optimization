@@ -1,0 +1,79 @@
+编程指南 MUSA 编程模型 L2 缓存管理 文档版本 v5.2.0 最新 当前正在查看最新版本。 切换版本 选择文档版本 ✓ v5.2.0 最新 v5.1.0 v4.3.x v3.1.0 版本说明 版本说明 本页总览 L2 缓存管理 
+ 当多个 Kernel 反复访问同一块全局内存数据时（如神经网络权重、查找表、配置参数），通过 L2 缓存持久化策略可显著提升带宽并降低访问延迟。 
+ 为什么需要 L2 缓存管理 ​ 
+ 流式访问与持久化访问（Streaming vs Persisting Accesses） ​ 
+ MT GPU 的 L2 缓存默认采用 标准替换策略 （类似 LRU），适合大多数访问模式。但某些场景下，这种策略效率较低： 
+ 访问类型 特征 缓存行为 流式访问（Streaming Accesses） 数据仅访问一次 cache lines 不太可能保留在 L2 中 持久化访问（Persisting Accesses） 数据被反复访问 cache lines 更可能持久保持在 L2 中 常规访问（Normal Accesses） 常规访问 标准替换策略 
+ 典型应用场景 ​ 
+ 深度学习推理是典型的持久化访问（Persisting Accesses）场景： 
+ ResNet-50 网络示例： - 2600 万个权重参数（约 100MB） - 正向传递中计算 1600 万次激活 - 权重被多个 layer 反复读取 问题：如果 L2 缓存效率低，每次读取权重都访问 DRAM，带宽瓶颈严重。 解决：将权重数据标记为 Persisting，使其在 L2 中驻留更久。 
+ L2 缓存属性查询 ​ 
+ 在设置 L2 缓存策略前，需查询设备属性： 
+ musaDeviceProp prop; musaGetDeviceProperties(&prop, device_id); // 三个关键属性 size_t l2CacheSize = prop.l2CacheSize;                    // GPU 总 L2 缓存大小 size_t maxPersistingSize = prop.persistingL2CacheMaxSize; // 可用 于持久化的最大 L2 大小 size_t maxWindowBytes = prop.accessPolicyMaxWindowSize;   // Access Policy Window 最大尺寸 
+ 典型值 （以 MUSA S5000 为例）： 
+ 
+ l2CacheSize : 4MB 
+ persistingL2CacheMaxSize : 3MB 
+ accessPolicyMaxWindowSize : 2MB 
+ 
+ 设置 L2 预留缓存大小 ​ 
+ 为持久化访问预留 L2 缓存： 
+ musaDeviceProp prop; musaGetDeviceProperties(&prop, 0); // 推荐配置：75% 的 L2 缓存用于持久化访问，或硬件允许的最大值 size_t persistingCacheSize = min(     static_cast<int>(prop.l2CacheSize * 0.75),     prop.persistingL2CacheMaxSize ); musaDeviceSetLimit(musaLimitPersistingL2CacheSize, persistingCacheSize); 
+ 注意事项： 
+ 
+ 此设置是全局的，影响该设备上所有流 
+ 必须在 Kernel 启动前设置 
+ 设置后不会自动恢复，程序退出前需手动重置 
+ 
+ 访问策略窗口（Access Policy Window） ​ 
+ 设置预留缓存大小后，需指定哪些数据享受持久化策略： 
+ API 参考 ​ 
+ musaStreamAttrValue stream_attribute; stream_attribute.accessPolicyWindow.base_ptr  = reinterpret_cast<void*>(data_ptr); // 全局内存指针 stream_attribute.accessPolicyWindow.num_bytes = window_size;                       // 窗口大小（字节） stream_attribute.accessPolicyWindow.hitRatio  = 0.6;                               // 命中比例提示 stream_attribute.accessPolicyWindow.hitProp   = musaAccessPropertyPersisting;      // 命中时的访问属性 stream_attribute.accessPolicyWindow.missProp  = musaAccessPropertyStreaming;       // 未命中时的访问属性 musaStreamSetAttribute(stream, musaStreamAttributeAccessPolicyWindow, &stream_attribute); 
+ 参数详解 ​ 
+ 参数 含义 建议值 base_ptr 全局内存数据起始地址 实际数据指针 num_bytes 窗口大小 min(数据大小，accessPolicyMaxWindowSize) hitRatio 提示：窗口内多少比例的访问是持久化的 0.6-1.0（根据实际访问模式） hitProp 命中的 cache line 采用什么策略 musaAccessPropertyPersisting missProp 未命中的 cache line 采用什么策略 musaAccessPropertyStreaming 
+ 实际持久化区域计算 ​ 
+ 实际持久化区域 = min(num_bytes * hitRatio, L2_set_aside_cache_size) 示例： - num_bytes = 2MB - hitRatio = 0.6 - L2_set_aside_cache_size = 3MB 实际持久化区域 = min(2MB * 0.6, 3MB) = 1.2MB 
+ 三种访问属性 ​ 
+ 属性 行为 使用场景 musaAccessPropertyStreaming cache lines 优先驱逐，不保留 一次性读取的数据 musaAccessPropertyPersisting cache lines 优先保留在 L2 预留区 反复读取的权重/参数 musaAccessPropertyNormal 强制重置为标准策略 清理不再需要的持久化区域 
+ 重要：使用  musaAccessPropertyNormal  可以释放持久化缓存，供后续内核使用： 
+ // 方法 1：设置 window 大小为 0（禁用策略窗口） stream_attribute.accessPolicyWindow.num_bytes = 0; musaStreamSetAttribute(stream, musaStreamAttributeAccessPolicyWindow, &stream_attribute); // 方法 2：重置整个 L2 缓存 musaCtxResetPersistingL2Cache(); // 方法 3：设置 Normal 属性覆盖持久化区域 stream_attribute.accessPolicyWindow.hitProp = musaAccessPropertyNormal; musaStreamSetAttribute(stream, musaStreamAttributeAccessPolicyWindow, &stream_attribute); 
+ 完整示例 ​ 
+ 多内核复用数据 ​ 
+ musaStream_t stream; musaStreamCreate(&stream); // 步骤 1: 查询设备属性 musaDeviceProp prop; musaGetDeviceProperties(&prop, 0); // 步骤 2: 设置 L2 预留缓存大小（75% 用于持久化  ） size_t persistingSize = min(     static_cast<int>(prop.l2CacheSize * 0.75),     prop.persistingL2CacheMaxSize ); musaDeviceSetLimit(musaLimitPersistingL2CacheSize, persistingSize); // 步骤 3: 分配设备内存 float* data1; musaMalloc(&data1, 1024 * 1024 * sizeof(float)); // 4MB 数据 // 步骤 4: 设置 Access Policy Window musaStreamAttrValue stream_attribute; size_t window_size = min(prop.accessPolicyMaxWindowSize, 1024 * 1024 * sizeof(float)); stream_attribute.accessPolicyWindow.base_ptr  = reinterpret_cast<void*>(data1); stream_attribute.accessPolicyWindow.num_bytes = window_size; stream_attribute.accessPolicyWindow.hitRatio  = 0.8; stream_attribute.accessPolicyWindow.hitProp   = musaAccessPropertyPersisting; stream_attribute.accessPolicyWindow.missProp  = musaAccessPropertyStreaming; musaStreamSetAttribute(stream, musaStreamAttributeAccessPolicyWindow, &stream_attribute); // 步骤 5: 多个 Kernel 反复使用 data1 for (int i = 0; i < 10; i++) {     kernelA<<<grid_size, block_size, 0, stream>>>(data1); } kernelB<<<grid_size, block_size, 0, stream>>>(data1); // 同一 stream 的后续 kernel 也能受益 // 步骤 6: 清理持久化设置（重要！） stream_attribute.accessPolicyWindow.num_bytes = 0; musaStreamSetAttribute(stream, musaStreamAttributeAccessPolicyWindow, &stream_attribute); musaCtxResetPersistingL2Cache(); // 步骤 7: 后续 kernel 使用其他数据（不受持久化影响） float* data2; musaMalloc(&data2, 512 * 1024 * sizeof(float)); kernelC<<<grid_size, block_size, 0, stream>>>(data2); musaStreamDestroy(stream); musaFree(data1); musaFree(data2); 
+ 神经网络推理场景 ​ 
+ // 假设：ResNet-50 权重 100MB，分 50 层，每层 2MB float* layer_weights[50]; // ... 分配权重内存并加载数据 ... // 设置 L2 持久化 musaDeviceProp prop; musaGetDeviceProperties(&prop, 0); musaDeviceSetLimit(musaLimitPersistingL2CacheSize, prop.persistingL2CacheMaxSize); musaStream_t inference_stream; musaStreamCreate(&inference_stream); // 对每层权重设置持久化窗口 for (int layer = 0; layer < 50; layer++) {     musaStreamAttrValue attr;     attr.accessPolicyWindow.base_ptr = layer_weights[layer];     attr.accessPolicyWindow.num_bytes = 2 * 1024 * 1024; // 2MB     attr.accessPolicyWindow.hitRatio = 1.0; // 权重会反复读取     attr.accessPolicyWindow.hitProp = musaAccessPropertyPersisting;     attr.accessPolicyWindow.missProp = musaAccessPropertyStreaming;          musaStreamSetAttribute(inference_stream, musaStreamAttributeAccessPolicyWindow, &attr);          // 执行该层计算（多次读取权重）     conv_forward<<<grid, block, 0, inference_stream>>>(layer_weights[layer], ...); } // 推理完成后清理 musaCtxResetPersistingL2Cache(); musaStreamDestroy(inference_stream); 
+ 多流并发注意事项 ​ 
+ L2 预留缓存是全局资源 ​ 
+ 警告：L2 set-aside cache 是设备全局资源，被所有流共享。 场景： - Stream A 设置 persisting window: [0x1000, 0x1000 + 2MB) - Stream B 设置 persisting window: [0x2000, 0x2000 + 2MB) - L2 set-aside size = 3MB 问题：如果两个窗口重叠超过 3MB，会出现冲突，性能反而下降。 
+ 避免冲突的建议 ​ 
+ 
+ 
+ 估算并发 Kernel 的总窗口大小 
+ // 确保：sum(window_size * hitRatio) <= L2_set_aside_size 
+ 
+ 
+ 按需设置，用完即清理 
+ // 使用完持久化窗口后，立即设置为 0 或调用 musaCtxResetPersistingL2Cache() 
+ 
+ 
+ 多流场景下的同步 
+ // 如果多个流需要共享同一份持久化数据，确保它们不会同时设置冲突的窗口 
+ 
+ 
+ 性能测试建议 ​ 
+ 使用 Moore Perf Compute（ mcu ）对比开启/关闭 L2 持久化的性能差异： 
+ # 方法 1: 使用 Moore Perf Compute (CLI) mcu  -o  l2_cache_on.mcu-rep ./your_app # 关闭 L2 持久化后重复一次 mcu  -o  l2_cache_off.mcu-rep ./your_app 
+ 方法 2：在代码中计时： 
+ musaEvent_t start, stop; musaEventCreate(&start); musaEventCreate(&stop); musaEventRecord(start, stream); // ... kernel 执行 ... musaEventRecord(stop, stream); musaEventSynchronize(stop); float elapsed_ms; musaEventElapsedTime(&elapsed_ms, start, stop); 
+ 收益： 
+ 
+ 对于权重复用场景：L2 命中率显著提升 
+ 对于推理延迟：整体性能提升 
+ 
+ 相关 API 参考 ​ 
+ API 作用 musaDeviceSetLimit(musaLimitPersistingL2CacheSize, size) 设置 L2 预留缓存大小 musaDeviceGetLimit(&size, musaLimitPersistingL2CacheSize) 查询 L2 预留缓存大小 musaStreamSetAttribute(stream, musaStreamAttributeAccessPolicyWindow, &attr) 设置流的访问策略窗口 musaCtxResetPersistingL2Cache() 重置整个 L2 缓存为标准策略 musaGetDeviceProperties(&prop, device) 查询设备属性（含 L2 相关属性） 
+ 相关文档 ​ 
+ 
+ 内存优化 ：了解更多内存优化技术（Shared Memory、合并访问等） 
+ 性能分析工具 ：使用性能工具分析 L2 缓存命中率 
+ 标签： MUSA L2 Cache Memory Optimization Performance 这篇文章对您有帮助吗？ 有帮助 需改进 上一篇 :  高级内存优化 下一篇 :  MUSA C++ 语法 版权所有 2024 摩尔线程，本文档受国际版权法保护。  摩尔线程和摩尔线程徽标是摩尔线程智能科技 (北京)有限责任公司的注册商标。 免责声明 本文档提供有关摩尔线程产品的信息。本文档并未授权任何知识产权的许可，并未以明示或暗示，或以禁止反言或其他方式授予任何知识产权许可。 为什么需要 L2 缓存管理 流式访问与持久化访问（Streaming vs Persisting Accesses） 典型应用场景 L2 缓存属性查询 设置 L2 预留缓存大小 访问策略窗口（Access Policy Window） API 参考 参数详解 实际持久化区域计算 三种访问属性 完整示例 多内核复用数据 神经网络推理场景 多流并发注意事项

@@ -1,0 +1,203 @@
+{
+  "timestamp": "2026-11-21T11:26:41.317830+00:00",
+  "diagnosis": {
+    "source_sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "context.json",
+        "category": "evaluation",
+        "role": "界定本轮验收起点、可编辑阶段与历史材料归属",
+        "finding": "evidence_mode=compile-repair，editable_ir_stage=bcmlir，target_marker 为 strides: [8192, 1]，parent_invocation=attempt-019、parent_ir_invocation=ir-002、repair_parent_invocation=ir-003；retained_best 为 attempt-019 源码（同 sha 2a98e3e0…），case4 保留最佳 262.27775us、历史值 268.7718us、目标 262.27775us，四例 candidate_us 依次 187.5727/181.0167/262.27775/178.68615。"
+      },
+      {
+        "path": "feedback.json",
+        "category": "evaluation",
+        "role": "记录当前探索分支的真实编译失败与四例正式结果，固定失败产物身份",
+        "finding": "cpu_compile.status=compile_failed、returncode=-6、stderr 首行为 LLVM ERROR: unexpected op in rewrite；cpu_compile.ir_sha256=7a2a6675…，与工作区 ir/target/_gqa_fwd_kernel.bcmlir 实测 sha 一致，确认失败产物就是本轮可编辑文件；status 字段为 ir003_backend_layout_alias_rewrite_failed；四例 candidate 均通过官方 checker，case1/2/7 分别比 original 慢（187.5727 对 165.96015、181.0167 对 154.9456、178.68615 对 156.68215），case4 为 262.27775 对 472.46045。"
+      },
+      {
+        "path": "ir003-last-pass.txt",
+        "category": "source_ir",
+        "role": "定位崩溃发生在哪个 pass 以及崩溃点上实际存在的结构",
+        "finding": "最后一次成功打印的 dump 是 Before InferHIVMDataLayout，函数 _gqa_fwd_kernel_mix_aic 中 %alloc_2 为 memref<128x128xbf16, cbuf>，%reinterpret_cast_3 把它重解释为 memref<16x1024xbf16, strided<[1024, 1]>, cbuf> 并直接作为 hivm.hir.load 的 outs，mmadL1 再直接读 %alloc_2；同一 dump 中 K/V/O 的 GM 侧 reinterpret 与 memref.alloc 目标的 load 结构均存在。崩溃点唯一区别于 019 可编译 IR 的结构就是 cbuf 缓冲区上的形状变换视图。"
+      },
+      {
+        "path": "q-row-packing-language-evidence.txt",
+        "category": "source_ir",
+        "role": "提供同源失败的源码级证据与待验证修复方向",
+        "finding": "attempt-020 源码（bbafe94f…）在 case4/7 编译时出现同一条 LLVM ERROR: unexpected op in rewrite，其目标 BCMLIR 摘要为 memref.copy 到 memref<16x1024xbf16> 后接 tensor.reshape(16x1024→128x128) 与反向 reshape；材料明确指出失败管线不指名具体操作，并把“用受支持的静态有序视图操作替换通用静态 reshape”列为需 CPU 编译验证的假设；该分支无性能基线，019 的 262.27775us 仍是比较起点。"
+      },
+      {
+        "path": "compiled-readonly/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "对照可编译基线（019 历史保留材料，sha 3f0752b8…，保持冻结）",
+        "finding": "基线在同一位置使用 GM 视图 memref<128x128xbf16, strided<[8192, 1]>> → memref.alloc(128x128) 的 memref.copy，Out 通过 bufferization.materialize_in_destination 直接写入 GM 视图；全文只有 GM 参数上的 reinterpret_cast，cbuf 缓冲区上没有任何形状变换视图；IR 内仍保留 tensor.expand_shape / tensor.collapse_shape 这类静态视图操作。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "提供 019 二进制的每程序资源与等待归一化基线（历史材料，绑定 source 2a98e3e0…）",
+        "finding": "case4 candidate：Task Duration 257.645142us、Block Dim 128；cube0 表 128 行，aic_time 均值 35.39026us/块、aic_cube_time 5.173333us（aic_cube_ratio 0.02013）、aic_cube_total_instr_number 16/块、aic_mte1_time 3.933395us、aic_mte2_time 6.025781us、aic_fixpipe_time 5.498537us、fixpipe_active_bw 133.61GB/s，aic_scalar_wait_id0_time 31.411662us、id4 2.810289us；reference 侧 Task Duration 127.14254us、19 块、aic_cube_time 35.4763us。各流水时间可重叠，按块均值使用而不相加。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "simulator",
+        "role": "定位候选机制在 Cube/MTE2/MTE1/FIXP 上的具体可测目标（019 绑定窗口）",
+        "finding": "core0.cubecore0 部分窗口内 CUBE productive 0.10364 / wait 0.21895 / idle 0.67741，FIXP productive 0.32899 / wait 0.21100 / idle 0.46000，MTE2 productive 0.19434 / wait 0.00717 / idle 0.79848，MTE1 productive 0.07911 / wait 0.21185；instruction_calls 含 CUBE/MMAD 16、MTE1/LOAD_2D 8、MTE2/MOV_OUT_TO_L1_MULTI_ND2NZ 11、FIXP/FIX_L0C_TO_DST 8、FIXP/SET_CROSS_CORE 8；材料自述累计指令时间仅作关注度排序、各流水可重叠、不重建动态循环次数或硬件关键路径。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "界定观测范围与时钟资质，区分相对比例与绝对时钟结论",
+        "finding": "三段按核报告（core0.cubecore0、core0.veccore0、core0.veccore1）的 clock_qualification=relative_only、absolute_time_qualified=false，raw_clock_window 为 137.081–186.172 且 unit=unassigned，absolute_unit_validation 以 22 个 PC、中位比 1.0011307 支持 us 解释；capture_scope 为首个到最后一个可见硬件事件的部分捕获，display_time_unit=window_fraction，空区间只描述所观测窗口，未报告泳道保持未知；向量核 MTE3 productive 0.22932 / wait 0.13750、MTE2 productive 0.16915、FLOWCTRL wait 0.68130（auxiliary_trace_lane）。"
+      },
+      {
+        "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "记录我实际读取的当前候选结构与被替换的具体行（sha 7a2a6675…）",
+        "finding": "函数只有一个 scf.for，四轮，每轮 16 个查询行；%q_view 为 GM 上的 memref<16x1024xbf16, strided<[8192, 1], offset: ?>>，其元素 (i, 128*h + c) 对应 Q 的偏移 base + i*8192 + h*128 + c，即 16 个查询行 × 与该 KV 头共享的 8 个查询头，128x128 展平后行号 (i,h) 正是 QK 的 M 维；Out 侧 %o_view 采用对称的 16x1024 视图，因此该 IR 的数学语义自洽；%alloc_6 以 reinterpret 视图承担 load 目标、%alloc_7 以 reinterpret 视图承担 128x128 暂存后再写 GM，这两处是 cbuf 上仅有的形状变换视图。"
+      },
+      {
+        "path": "ir-inventory.json",
+        "category": "source_ir",
+        "role": "确定唯一允许编辑的产物与冻结范围",
+        "finding": "清单唯一条目为 ir/target/_gqa_fwd_kernel.bcmlir（symbol _gqa_fwd_kernel，stage bcmlir，original_sha256 3f0752b8…）；工作区没有 lowered-inventory.json，compiled-readonly/ 内的 ttir/ttadapter/bcmlir 作为冻结低层产物只用于按符号核对 Q 载入结构；本次编辑只落在该 bcmlir。"
+      }
+    ],
+    "hypothesis": "当前 IR 的数学语义成立，编译缺陷出在 cbuf（L1）缓冲区上的形状变换视图：InferHIVMDataLayout 的 rewrite 只在 load 目标是分配本身、GM 源带 strides 的形式上建立布局（019 IR 正是这种形式），遇到“16x1024 视图落在 128x128 的 cbuf 分配上”或“16x1024 视图展平进 128x128 矩阵操作数”这一对关系时进入未覆盖分支并报 unexpected op in rewrite。把 cbuf 上的形状变换全部去掉，改由静态张量视图操作表达展平：Q 的 load 目标改成直接的 memref<16x1024xbf16> 分配（与已编译的 K/V load 同型），展平写成 tensor.collapse_shape 交给 QK 的 128x128 操作数；Out 侧把 128x128 结果用 tensor.expand_shape 展开成 16x1024 后直接写入 GM 视图，删除 32KiB 暂存与两次搬运。这样 16 个查询行 × 8 个共享 KV 头的打包语义、GM 上 2048B 行内连续访问、matmul 形状与 019 逐字一致的部分全部保留。",
+    "alternatives": [
+      {
+        "id": "A-revert-019-shape",
+        "描述": "把 Q/Out 恢复为 019 的 128x128 strided GM 视图直连 L1，编译概率最高，代价是放弃 16x1024 行打包，等价于回到保留最佳二进制，本轮无新增机制可验收。",
+        "未选原因": "它把本轮研究对象（行打包带来的 GM 访问粒度与暂存消除）整个删除，只剩编译通过。"
+      },
+      {
+        "id": "B-gm-roundtrip",
+        "描述": "Q 先 GM→GM 拷成 128x128 连续块，再从连续 GM 视图载入 128x128 到 L1，彻底避开 L1 视图。",
+        "未选原因": "每个 Q 块多出 32KiB 写加 32KiB 读的 GM 往返，与热点中 MTE2 每块 6.03us、FIXP 5.50us 的既有搬运量叠加，方向与降等待相反；保留为视图仍失败时的备选。"
+      },
+      {
+        "id": "C-3d-batch-matmul",
+        "描述": "把打包维显式化成 8x16x128（头 × 行 × 维）的 3D 张量，用 linalg.batch_matmul 广播 K/V，全程无任何形状变换。",
+        "未选原因": "把 QK/PV 从已验证的 2D 立方形状改成批量小 M 形状，MMAD 条数与 L0C 行为都会变，属于独立研究身份，需单独注册与测量。"
+      },
+      {
+        "id": "D-16x1024-as-mmad-operand",
+        "描述": "保留 16x1024 分配并直接把它作为 mmadL1 的 A 操作数，靠 m/k 索引参数表达 128x128。",
+        "未选原因": "依赖 mmadL1 跳过 A 形状校验，风险集中在语义正确性而非编译，与保留完整数学语义的要求冲突。"
+      }
+    ],
+    "change": "只改 ir/target/_gqa_fwd_kernel.bcmlir 的三处，全部属于同一机制（cbuf 视图改为静态张量视图）：1) 删除不再使用的 %c0_index 常量；2) Q 载入改为 %alloc_6 : memref<16x1024xbf16> 直接作为 memref.copy 目标，%q_t = bufferization.to_tensor，%39 = tensor.collapse_shape %q_t [[0, 1]] → tensor<128x128xbf16> 喂给原来的 linalg.matmul；3) Out 侧删除 %alloc_7、%o_buf、%o_t 与 128x128 暂存写入，改为 %o_packed = tensor.expand_shape %55 [[0, 1]] output_shape [16, 1024] → tensor<16x1024xbf16>，再 bufferization.materialize_in_destination %o_packed in writable %o_view。GM 视图 %q_view/%o_view 的尺寸、strides、offset 表达式，scf.for 四轮、16 行步长，两个 linalg.matmul 的形状与精度标注，softmax 表达式与 fp16 PV 路径全部逐字保留，函数 ABI 与参数列表不动。Codex 的 codex-brief.json 分析文本在本工作区以问号到达，可用锚点（InferHIVMDataLayout、16x1024、cbuf/L1、mmadL1、alias/rewrite、unexpected op、grid128、019 262.27775us）与我自己读到的事实一致，用于交叉确认失败位置；具体实现取舍由我在核对实际 IR 后确定。",
+    "expected": [
+      "编译结构：dump 中 cbuf 上的 memref.reinterpret_cast 归零，剩余视图只出现在 GM 参数；load 目标为分配本身，与 019 已编译的 K/V 载入同型。",
+      "指令（Q 路径）：每轮仍是 1 次 32KiB 的 GM→L1 搬运，但按 16 行 × 2048B 组织，替代 019 的 128 行 × 256B；Q 的 MTE2 语义条数每轮 1 条，字节不变，描述符迭代次数按行计从 128 降到 16。",
+      "指令（Out 路径）：删除 1 个 32KiB cbuf 暂存与 2 次搬运，每轮只剩 1 次 UB→GM 的 16x1024 直写；预计 FIXP 事件每程序由 8（FIX_L0C_TO_DST 8、SET_CROSS_CORE 8 的既视量）收敛到 4，UB 写流量每程序减少 128KiB 量级。",
+      "动态轮次：scf.for 仍为 4 轮/程序、程序数 128、K/V 各 1 次循环外载入保持不变，动态总搬运次数在 Q 路径持平、在 Out 路径下降。",
+      "等待：019 基线每块 aic_scalar_wait_id0 31.411662us、id4 2.810289us；预期待由搬运条数与暂存消除带动的 id0 与 FIXP 侧 SET_CROSS_CORE 等待下降，绝对幅度由宿主测量给出，若持平则说明墙钟由跨核交接而非搬运条数决定。",
+      "资源：L1 常驻 Q 缓冲仍 32KiB，UB 侧节省 32KiB 暂存；MMAD 条数维持 16/程序（QK 128x128x256 与 PV 128x256x128 未改），L0C 用量不变。",
+      "数值：Q 的 16384 个元素在 cbuf 内的地址与 019 展平顺序一致，Out 的 16384 个元素落到同一组 GM 地址，因此逐位结果与 019 二进制可比，官方 checker 阈值不变。",
+      "风险：若 tensor.collapse_shape 在该 pass 仍进入同一未覆盖分支，宿主会给出新的 last-pass 材料，下一轮按备选 B（GM 中转）或 C（3D 批量）推进。"
+    ],
+    "validation": "宿主以同一 bishengir-compile 命令与选项编译本文件，先用 infer-data-layout 之后的 dump 核对 cbuf 视图消失与 MMAD/搬运条数，再跑官方 case1/2/4/7 正确性与全调用计时（warmup 5、trials 3、iterations 20，阈值不变）。性能比较起点为保留最佳 019 的 case4 262.27775us 与四例 candidate 187.5727/181.0167/262.27775/178.68615us；本 IR 内固化 case4 几何（B4、S256、Sq256、Nq64、Nkv8、D128、G8、grid 128、每程序 4 轮 × 16 行），四例覆盖范围与绝对时钟资质按宿主新绑定材料分别记录，历史窗口只作归一化基线。",
+    "layer_reason": "Triton 表达能力：源码层把行打包写成 reshape 后，生成的目标 IR 里就是带运行时形状操作数的 tensor.reshape（attempt-020 已实测），源码层没有语法可以选择静态 collapse/expand 视图形式，因此“用受支持的静态有序视图操作替换通用 reshape”这一控制点只存在于 IR 层。固定源码实验目的：本轮 frozen.py 逐字节冻结（sha 2a98e3e0…），把“编译可行性”与“源码语义/性能”分离成可独立验收的两件事，任何需要在 Triton 里改写打包表达的方案都会改变被测源码身份，属于另一研究身份（对应备选 C 的源码侧等价写法：把 16x1024 打包改成 8x16x128 的显式批量形状并让 K/V 广播）。IR 控制点：崩溃点位于 InferHIVMDataLayout 对 cbuf 缓冲区的重写，只有 IR 能精确决定哪些形状变换出现在 L1 缓冲区上、哪些留在 GM 源或张量侧；同时 IR 能删除 Out 的 32KiB 暂存与两次搬运，这一冗余靠编译选项或源码微调都无法定向消除。",
+    "simulator_incremental_judgment": "现有 profiling/hotspots/timeline 都绑定 019 二进制（源码 sha 2a98e3e0…），与待编译的编辑后 IR 没有绑定关系，只作为每程序资源与等待的归一化基线与候选机制定位：cube0 每块 aic_time 35.39026us 内 cube 5.173333us、MTE1 3.933395us、MTE2 6.025781us、FIXP 5.498537us，等待侧 id0 31.411662us、id4 2.810289us，说明墙钟主要由交接等待构成而搬运条数是可控的小份额。窗口资质：三段时间轴均为 relative_only、absolute_time_qualified=false，raw_clock_window 137.081–186.172 单位未指派，单位校验中位比 1.0011307 只支持 us 量级解释；窗口为首个到最后一个可见事件的部分捕获（display_time_unit=window_fraction），CUBE productive 0.10364 / wait 0.21895 / idle 0.67741、FIXP productive 0.32899、MTE2 productive 0.19434 等比例只在本窗口内有效，各流水累计时间可重叠、不可相加为总耗时，未报告泳道保持未知。前后两次测量须分别记录窗口覆盖量与归一化范围，动态总搬运次数的比较以每程序 4 轮 × 128 程序这一执行覆盖核对；本轮预期增量（FIXP 事件 8→4、UB 写流量下降、id0 与交接等待的可能下降）是待验证假设，实际结论由宿主编译后新绑定的测量给出，更广的机制（3D 批量、GM 中转、多缓冲）保留为后续独立研究身份。",
+    "unknown": [
+      "InferHIVMDataLayout 的 rewrite 是否接受 memref.collapse_shape/expand_shape 生成的视图，只有 CPU 编译能判定。",
+      "该 IR 固化 case4 几何，case1/2/7 的数值与计时是否由同一产物覆盖，按宿主材料确认。",
+      "Out 直写 GM 视图是否触发与 019 相同的 fixpipe nz2nd 路径，需看新 dump 的 fixpipe dma_mode。"
+    ]
+  },
+  "diagnosis_sha256": "b80e665a67c036009eaf69ecd95ec4e8191cfeb8431bf6aa182ea2ef6461865d",
+  "evidence": [
+    {
+      "path": "context.json",
+      "category": "evaluation",
+      "role": "界定本轮验收起点、可编辑阶段与历史材料归属",
+      "finding": "evidence_mode=compile-repair，editable_ir_stage=bcmlir，target_marker 为 strides: [8192, 1]，parent_invocation=attempt-019、parent_ir_invocation=ir-002、repair_parent_invocation=ir-003；retained_best 为 attempt-019 源码（同 sha 2a98e3e0…），case4 保留最佳 262.27775us、历史值 268.7718us、目标 262.27775us，四例 candidate_us 依次 187.5727/181.0167/262.27775/178.68615。",
+      "sha256": "149883c374b59adbee6cfb35daa5e3ce461c35516b7572734abb21f707f6d907"
+    },
+    {
+      "path": "feedback.json",
+      "category": "evaluation",
+      "role": "记录当前探索分支的真实编译失败与四例正式结果，固定失败产物身份",
+      "finding": "cpu_compile.status=compile_failed、returncode=-6、stderr 首行为 LLVM ERROR: unexpected op in rewrite；cpu_compile.ir_sha256=7a2a6675…，与工作区 ir/target/_gqa_fwd_kernel.bcmlir 实测 sha 一致，确认失败产物就是本轮可编辑文件；status 字段为 ir003_backend_layout_alias_rewrite_failed；四例 candidate 均通过官方 checker，case1/2/7 分别比 original 慢（187.5727 对 165.96015、181.0167 对 154.9456、178.68615 对 156.68215），case4 为 262.27775 对 472.46045。",
+      "sha256": "cec786d388d4ceb63f54d73d1b4220bb36f6de388cd7f7d4ba0e2d2a1c00e205"
+    },
+    {
+      "path": "ir003-last-pass.txt",
+      "category": "source_ir",
+      "role": "定位崩溃发生在哪个 pass 以及崩溃点上实际存在的结构",
+      "finding": "最后一次成功打印的 dump 是 Before InferHIVMDataLayout，函数 _gqa_fwd_kernel_mix_aic 中 %alloc_2 为 memref<128x128xbf16, cbuf>，%reinterpret_cast_3 把它重解释为 memref<16x1024xbf16, strided<[1024, 1]>, cbuf> 并直接作为 hivm.hir.load 的 outs，mmadL1 再直接读 %alloc_2；同一 dump 中 K/V/O 的 GM 侧 reinterpret 与 memref.alloc 目标的 load 结构均存在。崩溃点唯一区别于 019 可编译 IR 的结构就是 cbuf 缓冲区上的形状变换视图。",
+      "sha256": "c0aff26ed8060baab4ae99e1d402607d100821b19b5c81ffd38f6fec6784aacb"
+    },
+    {
+      "path": "q-row-packing-language-evidence.txt",
+      "category": "source_ir",
+      "role": "提供同源失败的源码级证据与待验证修复方向",
+      "finding": "attempt-020 源码（bbafe94f…）在 case4/7 编译时出现同一条 LLVM ERROR: unexpected op in rewrite，其目标 BCMLIR 摘要为 memref.copy 到 memref<16x1024xbf16> 后接 tensor.reshape(16x1024→128x128) 与反向 reshape；材料明确指出失败管线不指名具体操作，并把“用受支持的静态有序视图操作替换通用静态 reshape”列为需 CPU 编译验证的假设；该分支无性能基线，019 的 262.27775us 仍是比较起点。",
+      "sha256": "82883deef12a30274a873fcfbbdc042175339c0b7430f5d83b2352e647ee766d"
+    },
+    {
+      "path": "compiled-readonly/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "对照可编译基线（019 历史保留材料，sha 3f0752b8…，保持冻结）",
+      "finding": "基线在同一位置使用 GM 视图 memref<128x128xbf16, strided<[8192, 1]>> → memref.alloc(128x128) 的 memref.copy，Out 通过 bufferization.materialize_in_destination 直接写入 GM 视图；全文只有 GM 参数上的 reinterpret_cast，cbuf 缓冲区上没有任何形状变换视图；IR 内仍保留 tensor.expand_shape / tensor.collapse_shape 这类静态视图操作。",
+      "sha256": "3f0752b87549d3622671e660efcd63cee0d4e7286e342001b1b25900e878f4a7"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "提供 019 二进制的每程序资源与等待归一化基线（历史材料，绑定 source 2a98e3e0…）",
+      "finding": "case4 candidate：Task Duration 257.645142us、Block Dim 128；cube0 表 128 行，aic_time 均值 35.39026us/块、aic_cube_time 5.173333us（aic_cube_ratio 0.02013）、aic_cube_total_instr_number 16/块、aic_mte1_time 3.933395us、aic_mte2_time 6.025781us、aic_fixpipe_time 5.498537us、fixpipe_active_bw 133.61GB/s，aic_scalar_wait_id0_time 31.411662us、id4 2.810289us；reference 侧 Task Duration 127.14254us、19 块、aic_cube_time 35.4763us。各流水时间可重叠，按块均值使用而不相加。",
+      "sha256": "69e5acb628d09675c4c333f008d651f0c49fc467975789ecf7283eacc16a1256"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "定位候选机制在 Cube/MTE2/MTE1/FIXP 上的具体可测目标（019 绑定窗口）",
+      "finding": "core0.cubecore0 部分窗口内 CUBE productive 0.10364 / wait 0.21895 / idle 0.67741，FIXP productive 0.32899 / wait 0.21100 / idle 0.46000，MTE2 productive 0.19434 / wait 0.00717 / idle 0.79848，MTE1 productive 0.07911 / wait 0.21185；instruction_calls 含 CUBE/MMAD 16、MTE1/LOAD_2D 8、MTE2/MOV_OUT_TO_L1_MULTI_ND2NZ 11、FIXP/FIX_L0C_TO_DST 8、FIXP/SET_CROSS_CORE 8；材料自述累计指令时间仅作关注度排序、各流水可重叠、不重建动态循环次数或硬件关键路径。",
+      "sha256": "9c3c2cc35e4b0c64e5ffb863f9cded01f545a7aecbfa13667a466d3890d6f5aa"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "界定观测范围与时钟资质，区分相对比例与绝对时钟结论",
+      "finding": "三段按核报告（core0.cubecore0、core0.veccore0、core0.veccore1）的 clock_qualification=relative_only、absolute_time_qualified=false，raw_clock_window 为 137.081–186.172 且 unit=unassigned，absolute_unit_validation 以 22 个 PC、中位比 1.0011307 支持 us 解释；capture_scope 为首个到最后一个可见硬件事件的部分捕获，display_time_unit=window_fraction，空区间只描述所观测窗口，未报告泳道保持未知；向量核 MTE3 productive 0.22932 / wait 0.13750、MTE2 productive 0.16915、FLOWCTRL wait 0.68130（auxiliary_trace_lane）。",
+      "sha256": "3e592e77d23a31278e191adec58dd4fc6c9e27e92e10bf03ad6917846dfc632e"
+    },
+    {
+      "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "记录我实际读取的当前候选结构与被替换的具体行（sha 7a2a6675…）",
+      "finding": "函数只有一个 scf.for，四轮，每轮 16 个查询行；%q_view 为 GM 上的 memref<16x1024xbf16, strided<[8192, 1], offset: ?>>，其元素 (i, 128*h + c) 对应 Q 的偏移 base + i*8192 + h*128 + c，即 16 个查询行 × 与该 KV 头共享的 8 个查询头，128x128 展平后行号 (i,h) 正是 QK 的 M 维；Out 侧 %o_view 采用对称的 16x1024 视图，因此该 IR 的数学语义自洽；%alloc_6 以 reinterpret 视图承担 load 目标、%alloc_7 以 reinterpret 视图承担 128x128 暂存后再写 GM，这两处是 cbuf 上仅有的形状变换视图。",
+      "sha256": "7a2a66755ff269f3cb6e3378feae3332d51331400a846957b3bd9d5d2ea89ee9"
+    },
+    {
+      "path": "ir-inventory.json",
+      "category": "source_ir",
+      "role": "确定唯一允许编辑的产物与冻结范围",
+      "finding": "清单唯一条目为 ir/target/_gqa_fwd_kernel.bcmlir（symbol _gqa_fwd_kernel，stage bcmlir，original_sha256 3f0752b8…）；工作区没有 lowered-inventory.json，compiled-readonly/ 内的 ttir/ttadapter/bcmlir 作为冻结低层产物只用于按符号核对 Q 载入结构；本次编辑只落在该 bcmlir。",
+      "sha256": "b890c63368cd39fb251bb86ffb4cefc87b1b4f3fd128d71c4a563db67142bf7a"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113",
+    "contract.json": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858",
+    "ir-inventory.json": "b890c63368cd39fb251bb86ffb4cefc87b1b4f3fd128d71c4a563db67142bf7a",
+    "feedback.json": "cec786d388d4ceb63f54d73d1b4220bb36f6de388cd7f7d4ba0e2d2a1c00e205",
+    "profiling.json": "69e5acb628d09675c4c333f008d651f0c49fc467975789ecf7283eacc16a1256",
+    "hotspots.json": "9c3c2cc35e4b0c64e5ffb863f9cded01f545a7aecbfa13667a466d3890d6f5aa",
+    "timeline.json": "3e592e77d23a31278e191adec58dd4fc6c9e27e92e10bf03ad6917846dfc632e",
+    "q-row-packing-language-evidence.txt": "82883deef12a30274a873fcfbbdc042175339c0b7430f5d83b2352e647ee766d",
+    "context.json": "149883c374b59adbee6cfb35daa5e3ce461c35516b7572734abb21f707f6d907",
+    "diagnosis.json": "bff2c89a1c04ecada9fea1f9dd6213ed9717c5b0c405e8b5e120cdefc43cbff4",
+    "codex-brief.json": "a92793e84eb60dccf8974038830f9619c758e335247961fdfd5b23bfdbf64885",
+    "ir003-last-pass.txt": "c0aff26ed8060baab4ae99e1d402607d100821b19b5c81ffd38f6fec6784aacb",
+    "ir/target/_gqa_fwd_kernel.bcmlir": "7a2a66755ff269f3cb6e3378feae3332d51331400a846957b3bd9d5d2ea89ee9",
+    "compiled-readonly/_gqa_fwd_kernel.ttir": "3872e0b7e8321c12da290bbec07142d727dcd444fefc9d5afd78f81e606dd8b8",
+    "compiled-readonly/_gqa_fwd_kernel.ttadapter": "cdcbbfad8ec97625f2e5743ec02932455f698bc4ffe8f09563a3abf9dc84c252",
+    "compiled-readonly/_gqa_fwd_kernel.bcmlir": "3f0752b87549d3622671e660efcd63cee0d4e7286e342001b1b25900e878f4a7"
+  },
+  "decision_tool_sha256": "5bef69abbe2d24d40092eade140c6c5d68f831185dbcc5e7930d535926348208"
+}

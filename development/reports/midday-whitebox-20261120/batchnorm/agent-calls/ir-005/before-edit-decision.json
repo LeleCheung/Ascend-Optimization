@@ -1,0 +1,146 @@
+{
+  "timestamp": "2026-11-20T06:46:54.600117+00:00",
+  "diagnosis": {
+    "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "成对profiling给出timing-7的实测侧与派生指标",
+        "finding": "candidate任务耗时为39.880798us，与context中reference 28.16us、speedup 0.717一致；candidate的aiv_vec_int32_ratio=0.03147而reference=0.0，aiv_vec_misc_ratio=0.1425对0.0405，aiv_time每block均值19.29us对18.43us。说明候选核存在参考实现没有的向量int32算子开销。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "simulator",
+        "role": "热点与流水活跃/等待/空闲用于定位候选机制",
+        "finding": "core0.veccore0上VECTOR active_ratio=0.906、wait_ratio=0.395、idle_ratio=0.094、productive_ratio=0.518；MTE2 productive_ratio=0.641。VECTOR是最忙流水。top_instructions为统计循环PC段0x10d113xx的BAR(calls=64)与WAIT_FLAG(calls=64)，累计指令时间可重叠，仅用于关注度排序。"
+      },
+      {
+        "path": "count-uniformity-probe.json",
+        "category": "simulator",
+        "role": "把保留IR的tensor计数与最终指令直接关联",
+        "finding": "0x10d1137c为VADDS、Dtype:S32、XM=0x1、calls=64、cycles=5184、running_time_us=3.14、UB地址0x4000；0x10d115e0为VCONV S32_F32R、calls=2；END calls=2。每程序32轮统计与两次END吻合。clock_validation为verified，33/33同PC中位比1.00055。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "窗口覆盖量与归一化范围",
+        "finding": "capture_start=0.0、capture_end=1.0、time_unit=fraction、display_time_unit=window_fraction，scope为first-to-last hardware event；VECTOR active 0.906/wait 0.395/idle 0.094。窗口按比例归一化，未报告泳道保持未知；累计时间可重叠，不据此线性相减。"
+      },
+      {
+        "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+        "category": "source_ir",
+        "role": "实际TTIR中计数携带结构与可编辑控制点",
+        "finding": "统计循环%cnt_7:3以iter_args %cnt_34=%cnt携带tensor<8x128xi32>，每轮%cnt_65=arith.addi %cnt_52,%cst_1(dense<1>)，循环后%final_mean=sitofp tensor<8x128xi32>->f32 tensor；EVEN特化下batch_dim%8==0且spatial_dim%128==0，无掩码，所有lane每轮计数增一，故计数在各lane恒等且等于m_num_steps*n_num_steps_6。"
+      },
+      {
+        "path": "lowered-inventory.json",
+        "category": "source_ir",
+        "role": "实际低层产物冻结身份与上一轮CPU对照结论",
+        "finding": "batch_norm_with_update_kernel的npubin sha256=41483d746ba67cd3456434ea7d176386cbe6e987f3ab56d360d1baf5935be5fe、8416字节；ttadapter/bcmlir随符号列出。feedback记录ir-004的六处广播外提后npubin逐字节相同，故本轮必须选择能改变最终执行代码的另一机制。"
+      },
+      {
+        "path": "feedback.json",
+        "category": "paired_profiling",
+        "role": "正式与补测结果、源码/IR身份与上轮交接结论",
+        "finding": "retained_result为PASSED、27/27、geo_mean=1.8320、min_speedup=0.6803、worst=timing-8；prior_qualified_8x512 geo_mean=1.8875；latest_cpu_only为not_retained_cpu_binary_unchanged，说明六处广播外提未改变机器码，本轮须以真实指令变化为前提。"
+      }
+    ],
+    "hypothesis": "在EVEN特化下统计循环的lane计数恒等于乘积累加的总轮数，当前IR却以tensor<8x128xi32>逐轮广播加一并在循环后整体sitofp。将循环携带的整数计数改成标量i32、循环后一次性sitofp并splat回tensor<8x128xf32>，可去掉每程序统计循环里重复的向量S32加法（探针显示calls=64、3.14us），同时保持下游mean*cnt与reduce的浮点运算次序与数值完全不变（标量值经splat后与各lane原值逐位相同）。Codex贡献：其new_observation给出0x10d1137c VADDS与0x10d115e0 VCONV的直接指令证据，并指出计数均匀化方向；本诊断据此核对EVEN整除条件、零迭代与i32边界后选定标量化。",
+    "alternatives": [
+      "保持IR原样：若后端已把均匀tensor计数消除，则无需改动；但探针在保留二进制中实测VADDS S32 calls=64，说明尚未消除，故排除。",
+      "把sum(mean*cnt)改写为scalar_cnt*sum(mean)：会改变浮点乘法/求和次序与舍入，破坏逐位一致，拒绝。",
+      "把整个统计循环加宽到8x256：改变循环结构与UB占用，收益不确定且与上一轮8x256输出路径叠加风险大，保留为后续独立假设。",
+      "用广播替代S32计数的源码表达：源码固定，且当前瓶颈是标量化的IR控制点，源码意图已在frozen.py的cnt+=1体现。"
+    ],
+    "change": "仅编辑ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir：把统计循环%cnt_7与内层%curr_input_48的第三个循环携带值由tensor<8x128xi32>改为i32标量（初值%cnt改为arith.constant 0:i32）；把%cnt_65=arith.addi tensor, dense<1>改为arith.addi %cnt_52,%c1_i32:i32；相应更新两处scf.yield类型；循环后%final_mean由sitofp tensor改为先arith.sitofp %cnt_7#2:i32->f32再tt.splat为tensor<8x128xf32>。其余操作、地址、循环边界、宽/窄输出分支与浮点次序不动。",
+    "expected": [
+      "指令：统计循环中每程序的向量S32加法（探针0x10d1137c VADDS、calls=64）消失；替换为每轮一条标量i32加法（SCALAR流水）。",
+      "转换：循环后S32_F32R转换由tensor<8x128xi32>(探针calls=2)改为一次标量sitofp加一次splat/广播。",
+      "动态轮次：统计外层m_num_steps与内层n_num_steps_6轮次不变（timing-7为1×32），输出循环与宽路径轮次不变；每程序总轮次不减少，改变的是每轮工作量。",
+      "等待与资源：VECTOR流水issue压力略降（profiling中aiv_vec_int32_ratio预计由0.0315趋近0）；因BAR/WAIT_FLAG主要来自MTE2双缓冲预取，预计不显著改变，二者保留为待验证；UB中8x128xi32=4KB计数缓冲可复用或释放，但不改变221184共享内存上限。",
+      "编译产物：npubin应与冻结41483d74…不同（否则该机制被后端消除，需回退登记并保持原样）。",
+      "性能：若VECTOR为关键路径，timing-7单核耗时应下降约1–3us量级；最终须27项与36项补测及稳定性整体超过当前geo_mean=1.832。"
+    ],
+    "validation": "先CPU以相同target/options编译核对npubin sha256相对冻结41483d74…确有变化并抽查S32 VADDS/VCONV指令差异；再跑完整27项KGS、双方36项补测、稳定性与后置profiling/重放。数值核对：标量计数经splat后与各lane原计数逐位相同，下游mean*cnt、reduce、var、running统计与rsqrt次序不变，故期望逐位一致；并覆盖零迭代(spatial或batch整除边界)与i32计数范围。任一项不达标即登记偏差并回退到冻结IR。",
+    "layer_reason": "Triton表达能力：源码以tl.zeros(...int32)张量cnt并cnt+=1表达计数，语言层天然是张量；均匀lane计数属可由数据流分析证明的IR性质，更自然的表达是循环携带标量，但固定源码把这一意图固化为张量，因此需在IR层显式改写。固定源码实验目的：frozen.py逐字节冻结，隔离单一编译变换以判定后端是否消除该计数加法。IR控制点：可直接改scf.for的iter_arg类型、arith.addi的tensor/dense<1>操作数以及循环后的sitofp/splat，且不影响函数ABI与其他特化；这些点在TTIR层精确可定位、可小范围验证。",
+    "simulator_incremental_judgment": "模拟器窗口绝对时钟资质已核对：clock_validation状态verified，33个同PC非Scalar/非同步指令中位比1.000548（期望1），Scalar子集18个PC中位比0.99886，故us口径可用于同PC比较。观测范围：仅core0.veccore0、单个kernel、2次END，capture为first-to-last事件并按window_fraction归一化；未报告泳道保持未知。流水累计时间可重叠（BAR/WAIT_FLAG各calls=64、VADDS 3.14us等），因此不作关键路径线性相减，仅用热点排名定位候选机制；带宽与设备波次结论须另引独立材料。本轮预测对应候选为scalarize-count单一机制，测量范围限定timing-7该特化；更广的机制（统计循环加宽、整核融合）保留为待验证假设。",
+    "unknown": [
+      "BAR/WAIT_FLAG是否随计数标量化而改变（预计主要源自MTE2预取，属待验证）。",
+      "BCMLIR/bufferization后计数缓冲的物理复用与RAW/WAR链精确形态。",
+      "标量化后是否引入新的splat广播指令与额外同步。"
+    ]
+  },
+  "diagnosis_sha256": "a19b6ba7ff24b13b1ef40802024174e48bd838e23150935a710eb842a16927e8",
+  "evidence": [
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "成对profiling给出timing-7的实测侧与派生指标",
+      "finding": "candidate任务耗时为39.880798us，与context中reference 28.16us、speedup 0.717一致；candidate的aiv_vec_int32_ratio=0.03147而reference=0.0，aiv_vec_misc_ratio=0.1425对0.0405，aiv_time每block均值19.29us对18.43us。说明候选核存在参考实现没有的向量int32算子开销。",
+      "sha256": "a4cf9f718f9c58cb50a2e038ef4328449c1188ce0296a733b3b7005b3d3d46d2"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "热点与流水活跃/等待/空闲用于定位候选机制",
+      "finding": "core0.veccore0上VECTOR active_ratio=0.906、wait_ratio=0.395、idle_ratio=0.094、productive_ratio=0.518；MTE2 productive_ratio=0.641。VECTOR是最忙流水。top_instructions为统计循环PC段0x10d113xx的BAR(calls=64)与WAIT_FLAG(calls=64)，累计指令时间可重叠，仅用于关注度排序。",
+      "sha256": "f2005872cd677b8e5940668f313222bd29f882f510b3ad98c8f5add992d6b16c"
+    },
+    {
+      "path": "count-uniformity-probe.json",
+      "category": "simulator",
+      "role": "把保留IR的tensor计数与最终指令直接关联",
+      "finding": "0x10d1137c为VADDS、Dtype:S32、XM=0x1、calls=64、cycles=5184、running_time_us=3.14、UB地址0x4000；0x10d115e0为VCONV S32_F32R、calls=2；END calls=2。每程序32轮统计与两次END吻合。clock_validation为verified，33/33同PC中位比1.00055。",
+      "sha256": "9b4c0d6c838a440bf98e0e526d6ad0324f25e33fd92d6c39052f57698701f34a"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "窗口覆盖量与归一化范围",
+      "finding": "capture_start=0.0、capture_end=1.0、time_unit=fraction、display_time_unit=window_fraction，scope为first-to-last hardware event；VECTOR active 0.906/wait 0.395/idle 0.094。窗口按比例归一化，未报告泳道保持未知；累计时间可重叠，不据此线性相减。",
+      "sha256": "6777e8aaa5ec9a379af0b23450fe327545dea7a74a9803c25409d48f4798f263"
+    },
+    {
+      "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+      "category": "source_ir",
+      "role": "实际TTIR中计数携带结构与可编辑控制点",
+      "finding": "统计循环%cnt_7:3以iter_args %cnt_34=%cnt携带tensor<8x128xi32>，每轮%cnt_65=arith.addi %cnt_52,%cst_1(dense<1>)，循环后%final_mean=sitofp tensor<8x128xi32>->f32 tensor；EVEN特化下batch_dim%8==0且spatial_dim%128==0，无掩码，所有lane每轮计数增一，故计数在各lane恒等且等于m_num_steps*n_num_steps_6。",
+      "sha256": "574eddcba7a8b920c211880d4332fb710465bcda4a944dc3f81ae74c066a17cc"
+    },
+    {
+      "path": "lowered-inventory.json",
+      "category": "source_ir",
+      "role": "实际低层产物冻结身份与上一轮CPU对照结论",
+      "finding": "batch_norm_with_update_kernel的npubin sha256=41483d746ba67cd3456434ea7d176386cbe6e987f3ab56d360d1baf5935be5fe、8416字节；ttadapter/bcmlir随符号列出。feedback记录ir-004的六处广播外提后npubin逐字节相同，故本轮必须选择能改变最终执行代码的另一机制。",
+      "sha256": "4945c33cae9b73c84e863e67c7d33e54cb8fdd74fa50003c86f71cc029944028"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "正式与补测结果、源码/IR身份与上轮交接结论",
+      "finding": "retained_result为PASSED、27/27、geo_mean=1.8320、min_speedup=0.6803、worst=timing-8；prior_qualified_8x512 geo_mean=1.8875；latest_cpu_only为not_retained_cpu_binary_unchanged，说明六处广播外提未改变机器码，本轮须以真实指令变化为前提。",
+      "sha256": "abf52e5c7670c8a92a8d5092839fadf9d4b3db6596a478e8db6948f6db947ffb"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+    "ir-inventory.json": "01565e88b83cbf813628c2653d351ee4c7b3845394b2b690b0c8351c0eef26e6",
+    "lowered-inventory.json": "4945c33cae9b73c84e863e67c7d33e54cb8fdd74fa50003c86f71cc029944028",
+    "profiling.json": "a4cf9f718f9c58cb50a2e038ef4328449c1188ce0296a733b3b7005b3d3d46d2",
+    "hotspots.json": "f2005872cd677b8e5940668f313222bd29f882f510b3ad98c8f5add992d6b16c",
+    "timeline.json": "6777e8aaa5ec9a379af0b23450fe327545dea7a74a9803c25409d48f4798f263",
+    "context.json": "315c5dc119a610d7bbcb9434e912f03c6502b87ab92aa3211dd64fd6ab7f9cec",
+    "diagnosis.json": "99f5358a90d0ab8981f4c7f62af16a4d3e1f772be34b48601510527e93507126",
+    "feedback.json": "abf52e5c7670c8a92a8d5092839fadf9d4b3db6596a478e8db6948f6db947ffb",
+    "codex-brief.json": "1e6ee65c6107926777d2a6670c67cb25efb342a06278f10e14014daf580c3176",
+    "prior-explorations.json": "1489e937f90923da4aa5b9a6a5afce721e927ea93207d7614fe4d3294644a701",
+    "count-uniformity-probe.json": "9b4c0d6c838a440bf98e0e526d6ad0324f25e33fd92d6c39052f57698701f34a",
+    "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir": "574eddcba7a8b920c211880d4332fb710465bcda4a944dc3f81ae74c066a17cc",
+    "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttadapter": "bd1b88a7c7163074a7b0026087ee561101736a094dcfeeb4661df562285ee719",
+    "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.bcmlir": "12c88ec8a1907c3d149bbddc4e0a22c0a4528f8643463d0b92069123d570413c",
+    "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.npubin": "41483d746ba67cd3456434ea7d176386cbe6e987f3ab56d360d1baf5935be5fe"
+  },
+  "decision_tool_sha256": "7aec090daf3f1657c751a165b382859745b7735db4acd9465970a4fadd3bf1ab"
+}

@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 44,
+    "duration_ms": 102398,
+    "usage": {
+      "input_tokens": 45832,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1075456,
+      "output_tokens": 16610,
+      "output_tokens_details": {
+        "thinking_tokens": 7212
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 45832,
+        "outputTokens": 16610,
+        "cacheReadInputTokens": 1075456,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.1821380000000001,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 7212,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.1821380000000001,
+    "result": "已完成修复决策与源码修改，并按桥接器要求保持 `awaiting_source_review` 状态交接。\n\n## 四项真实结果核对（repair-feedback.json）\n\n| case | dtype / 形状 | 编译 | 官方 checker | 备注 |\n|---|---|---|---|---|\n| 1 | f16, B2 S128 Nq32 Nkv8, causal | 通过 | passed (mere 9.36e-8, mare 9.70e-4) | 有真实计时 |\n| 2 | f16, B2 S128 Nq48 Nkv4 | 通过 | passed (mere 8.95e-8, mare 9.66e-4) | 有真实计时 |\n| 4 | bf16, B4 S256 Nq64 Nkv8 | **失败** | — | UB 294912B>196608B；CC 262144B>131072B |\n| 7 | bf16, B2 Sq128 Skv256 Nq32 | 通过 | passed (mare 7.81e-3) | 有真实计时 |\n\n## 实际失败 IR 结论\n\n`failed-ir/attempt-064/0-_gqa_fwd_kernel.bcmlir` 是 case4：\n- 含 `tensor<256x256xf32>`，单项 262144B，**恰好等于报错的 cc required**，是可用 131072B 的两倍；\n- 另有 256x256xf16 / 256x128 f32 acc / 256x128 bf16 q,k,v，UB 叠加超 196608B；\n- 对照 case7（文件 3）为 128x256xf32=131072B 恰好可容纳，causal/fp16 分别走 64x64、128x128，均无 256x256 tile。\n\n即根因是 **BLOCK_M=256 × BLOCK_N=256 的单块尺寸**，不是多缓冲。`num_stages` 只改变循环多缓冲，无法缩小单个 dot 的 f32 结果，因此宿主建议的 `num_stages=1` 单变量试验不能消除 cc 溢出；已在 diagnosis 中分别记录宿主建议与该判断。\n\n## 选定修复（已写入 diagnosis 并 record）\n\n- **selected_layer**：`host_metadata_tiling`（`run()` 的 BLOCK_M 选择与 PART_TILES 准入）。\n- **改法**：删除 `BLOCK_M=256` 覆盖分支，`PART_TILES` 准入恢复 `BLOCK_M == 128`；其余源码（QK 前瞻、单次 BF16 PV、FP16 交接、FP32 分母/除法、公共偏移/NoOff、20 worker、`num_stages=(2 if PART_TILES else 1)`、缓存与输出分配）逐字不变。diff 显示相对独立冻结的 063 仅剩注释差异。\n- **取舍**：\n  - 精度：完全回到 063 已验收路径，归约顺序与表达式不变；\n  - 活跃缓冲：case4 QK 262144B→131072B，M 相关 UB tile 减半；\n  - 交接次数：放弃未编译成功的 M256 理论减链，每 worker 回到约 25~26 条 tile 链（T=512, P=20）；\n  - 并行度：仍 `P=min(20,T)`，case4 T 512，覆盖与 worker 数不变。\n- **决策记录**：`decision_id f9b4ea8f96d549fda3bc5f96bbbe8e1b`（修改前源码 sha `a9756361…`）。\n\n## 当前状态\n\n- 修改后源码 sha256：`ce52d390b5b791b288d6efcf191ac67ff1fcf37bbb047099b450ea3cb1a3b9cd`\n- `preflight` 返回：`awaiting_source_review`（源码已保持字节不动，交宿主审查/完整评测）。\n- 未声称当前源码已通过编译或存在真机收益；上述均为基于实际 IR 的预测，待四项正式评测确认 case4 编译及 checker、资源与计时。"
+  }
+}

@@ -343,7 +343,11 @@ def method_label(event, known):
 
 
 def svg(row,known,all_history=False):
-    es=row['full_history'] if all_history else row['display_events']
+    from .selection import remeasurement_indices, contract_connections
+    original=row['full_history'] if all_history else row['display_events']
+    hidden=remeasurement_indices(original)
+    es=[event for i,event in enumerate(original) if i not in hidden]
+    row=dict(row,connections=contract_connections(original,row['connections'],es))
     n=len(es);w=max(1600,320+245*(n-1));height=1060
     left,right,top,bottom=180,w-125,355,735
     xs=[left+(right-left)*i/max(n-1,1) for i in range(n)]
@@ -358,7 +362,7 @@ def svg(row,known,all_history=False):
     ys=[y(e['score']) if e['score'] is not None and e['score']>0 else 785 for e in es]
     parts=[f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{height}" viewBox="0 0 {w} {height}">',
            f'<rect width="{w}" height="{height}" fill="{BG}"/>',
-           '<defs><marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#596170"/></marker></defs>',
+           '<defs>'+''.join(f'<marker id="method-{cat}" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0 0L6 3L0 6Z" fill="{color}"/></marker>' for cat,color in COLORS.items())+'<marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#596170"/></marker></defs>',
            '<g font-family="Microsoft YaHei,Noto Sans CJK SC,sans-serif">',
            text(52,62,row['operator'],min(42, (w-650)/(len(row['operator'])*.58))),
            text(52,112,('交付 ' if row.get('progress_view') else '')+f"{row['delivery']['cann_score']:.3f}× CANN",30,GREEN)]
@@ -367,7 +371,7 @@ def svg(row,known,all_history=False):
     for k,cat in enumerate(used):
         x=w-520+(k%2)*255;ly=55+(k//2)*40
         parts += [f'<line x1="{x}" y1="{ly}" x2="{x+23}" y2="{ly}" stroke="{COLORS[cat]}" stroke-width="3"/>',text(x+32,ly+8,names[cat],23,COLORS[cat])]
-    for k,label in enumerate(['设备kernel','宿主侧','两者都有','起点／复测']):
+    for k,label in enumerate(['设备kernel','宿主侧','两者都有','起点']):
         x=w-520+(k%2)*255;ly=145+(k//2)*40
         if k==0:mark=f'<circle cx="{x+10}" cy="{ly}" r="8" fill="{GREEN}"/>'
         elif k==1:mark=f'<rect x="{x+2}" y="{ly-8}" width="16" height="16" fill="{GREEN}"/>'
@@ -388,12 +392,18 @@ def svg(row,known,all_history=False):
         label=f'{tick:g}×' if log else f'{tick:.2f}×'
         parts += [f'<line x1="150" y1="{y(tick):.2f}" x2="{w-65}" y2="{y(tick):.2f}" stroke="#ded7c9"/>',text(125,y(tick)+9,label,25,anchor='end')]
     c_by_pair={(c['start'],c['end']):c for c in row['connections']}
-    transfer=row.get('method_transfer') if not all_history else None
+    transfer=row.get('method_transfer') if not all_history and not row.get('progress_view') else None
     transfer_targets=transfer.get('display_targets',[transfer['display_target_sha256']]) if transfer else []
     for i in range(n-1):
         a,b=es[i:i+2];conn=c_by_pair.get((a['id'],b['id']))
         same=a['source_key']==b['source_key']
-        confirmed=same or (conn and conn['kind'] in ('recorded_lineage','recorded_recovery')) or (row.get('progress_view') and conn and conn['kind']=='progress_summary')
+        confirmed=same or (conn and conn['kind'] in ('recorded_lineage','recorded_recovery','progress_summary'))
+        if row.get('progress_view') and conn and conn['kind']=='documented_method_switch':
+            # The presentation curve tracks measured performance progress.
+            # The recorded source branch remains a separate relation in details.
+            detail=html.escape(json.dumps(conn,ensure_ascii=False))
+            parts.append(f'<path class="connection" d="M{xs[i]:.2f} {ys[i]:.2f} L{xs[i+1]:.2f} {ys[i+1]:.2f}" stroke="{GREEN}" stroke-width="3.5" fill="none"><title>{detail}</title></path>')
+            continue
         refchange=a['reference']!=b['reference']
         color=GREEN if confirmed and not refchange else '#596170'
         dash='' if confirmed and not refchange else 'stroke-dasharray="8 8"'
@@ -446,7 +456,7 @@ def svg(row,known,all_history=False):
         parts.extend(text(tx,ty+j*33,line,28,color,anchor='middle') for j,line in enumerate(lines))
         start=ys[i]-45 if i%2 else ys[i]+50
         end=ys[i]-18 if i%2 else ys[i]+18
-        parts.append(f'<path d="M{xs[i]:.2f} {start:.2f}L{xs[i]:.2f} {end:.2f}" stroke="{color}" stroke-width="2" fill="none"/>')
+        parts.append(f'<path d="M{xs[i]:.2f} {start:.2f}L{xs[i]:.2f} {end:.2f}" stroke="{color}" stroke-width="2" fill="none" marker-end="url(#method-{m["color"]})"/>')
         if m.get('attribution'):parts.append('</g>')
     for i,e in enumerate(es):
         x,yy=xs[i],ys[i];m=method_label(e,known);loc=e.get('change_location',{}).get('location') or (m['location'] if m else None)

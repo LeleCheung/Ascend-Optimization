@@ -1,0 +1,92 @@
+{
+  "source_sha256": "aaf74e7b4c22ef3941480023b67c16a52ec81f9b5071151832cc492d985d532e",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "context.json",
+      "category": "source_ir",
+      "role": "本轮输入身份与修复分支",
+      "finding": "input_status 为 explicit_unretained_exploration_repair，父调用 ir-001，本轮为 ir-002；工作区 ir 文件当前 sha256 为 45fa5283…efeaf，即父探索提交体，合格基线仍是未改动的 05c7c8bd…7f98。goal 明确要求先修复保留的编译失败，再与合格未变 IR 比较，源码与 ABI 冻结。"
+    },
+    {
+      "path": "prior-ir-001-compiler-log.log",
+      "category": "source_ir",
+      "role": "精确编译诊断",
+      "finding": "唯一错误为 loc(\"/data/.../_vsrb_inner1_kernel.ttir\":36:54): error: expected operation name in quotes；npu_initialized 为 false，日志只有这一条解析错误，说明失败发生在文本解析阶段而非后续降级。"
+    },
+    {
+      "path": "prior-ir-001-lowering.json",
+      "category": "source_ir",
+      "role": "失败变体与基线变体的对照",
+      "finding": "candidate 行 status 为 lowering_failed，RuntimeError: Parse MLIR file failed，栈顶停在 IRSource.__init__ 的 parse_mlir_module；同一 options 下 original 行 status 为 lowered_to_binary，其 ttadapter/bcmlir sha256 与冻结件一致（8b112208…、3a62ba6c…）。失败因此定位在候选文本本身。"
+    },
+    {
+      "path": "ir/893449211de307c7344961e7520d98aa287afd9d2ccaf2b6a671214aad91f6de/_vsrb_inner1_kernel.ttir",
+      "category": "source_ir",
+      "role": "实际待修文本与方言写法样例",
+      "finding": "第 28 行是编译器原本生成的无掩码整行存：tt.store %zp, %cst : tensor<1x8192x!tt.ptr<f32>>，类型表只列 type($ptr)。第 36 行掩码单元素存写成 tt.store %sp, %g_4, %m : tensor<1x!tt.ptr<f32>>, tensor<1xi1>，多出的第二个类型前的逗号正处于第 54 列，与诊断列号逐字对齐。第 37-40 行循环收尾、tt.return 与模块收尾沿用原始结构。"
+    },
+    {
+      "path": "feedback.json",
+      "category": "source_ir",
+      "role": "宿主修复要求",
+      "finding": "status 为 compiler_repair_required，requested_action 要求读精确诊断与原始方言示例，在已登记机制内修语法，改动前重新登记；验证顺序为先 CPU 解析与降级，再走固定完整合同与既有补测，最后模拟器重放。"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "合格基线内核的完整计数与带宽",
+      "finding": "Task Duration(us) 151.863037，Block Dim 512；每 block 均值：aiv_time 11.434272、vec_time 6.865720（vec_ratio 0.636038）、mte2_time 4.057281（0.338424）、mte3_time 8.615326（0.740581）、scalar_wait_time 9.195734、mte3_active_bw 65.906769 GB/s；aiv_mte3_instructions 恒为 17（min=max），aiv_mte2_instructions 均值 80.998；write_main_memory_datas 每 block 512.0 KB、合计 262144 KB，read 4.1248 KB；ub_to_gm_bw 45.256109 GB/s、带宽使用率 24.227%，vec_bankgroup_cflt_ratio 0.174359、vec_total_cflt_ratio 0.239972。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "paired_profiling",
+      "role": "循环内指令与同步排序",
+      "finding": "source_loop 区域（源 50-69 行）含 141 条指令、累计指令时间 743.140003 us、等待累计 307.450001 us；单项最大为 MOV_SRC_TO_DST_ALIGN（Src:UB,Dst:OUT,B32）91.379997 us，随后 SET_FLAG PIPE:MTE3 TRIGGERPIPE:VEC FLAGID:1 91.290001 us、BAR PIPE:MTE3 76.139999 us、WAIT_FLAG PIPE:MTE3 TRIGGERPIPE:VEC 33.029999 us、VCMPV Dtype:S32 24.530001 us、VSEL Dtype:F32 15.19 us。这些累计量仅用于关注度排序。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "同核窗口的泳道活跃与等待",
+      "finding": "core0.veccore0 窗口内：VECTOR active_ratio 0.948519 且 wait_ratio 0.379755（3540 事件）、MTE3 active 0.903131 且 wait 0.156317（585 事件）、MTE2 active 0.307977（996 事件）、SCALAR active 0.820151 且 wait 0.792244（1370 事件）、SCALARLDST 10256 事件 active 0.121370；窗口为单核首末可见事件范围，raw_clock_window 115.0-218.192119，absolute_unit_validation 为 verified（29 个 PC 中 26 个匹配，median ratio 0.999336），outside_events 4，未报告泳道保持未知。"
+    },
+    {
+      "path": "compiled-readonly/893449211de307c7344961e7520d98aa287afd9d2ccaf2b6a671214aad91f6de/e0d769342f059e04c39cbbe7b342e9598cc782df35d7ecbe8f459b34046200e8/_vsrb_inner1_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "后端是否已消除密集选择",
+      "finding": "零填充 linalg.fill 被提到 scf.for 之外只算一次，但它仅作为 arith.select 的假分支存活；循环体仍保留 linalg.broadcast(%7=1xf32)、linalg.broadcast(%6=1xi32)、arith.cmpi eq 于 tensor<1x8192xi32>、arith.select 于 tensor<1x8192xf32> 以及 bufferization.materialize_in_destination 的整行写出；每轮另有 memref.alloc 与 memref.copy 各两次（单 i64 与单 f32）。密集选择在后端仍然存在。"
+    },
+    {
+      "path": "compiled-readonly/893449211de307c7344961e7520d98aa287afd9d2ccaf2b6a671214aad91f6de/e0d769342f059e04c39cbbe7b342e9598cc782df35d7ecbe8f459b34046200e8/_vsrb_inner1_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "低层适配层的第二份独立证据",
+      "finding": "ttadapter 的循环体给出与 bcmlir 相同的有效载荷结构：g2_7 广播、val_8 expand_shape、val_10 广播、val_11 cmpi、val_12 select 后由 materialize_in_destination 写整行；三指针参数、constexpr 标量与 memref 视图保持一致，确认冗余选择在两层低层产物中均存在。"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "paired_profiling",
+      "role": "Codex 的分析贡献与候选方向",
+      "finding": "Codex 汇总每程序 aiv 11.434272、vector 6.865720、mte2 4.057281、mte3 8.615326、scalar_wait 9.195734 us 与 512 程序、151.863037 us，direction 指向输出构造、循环组织与 MTE2/MTE3 同步，并指出实际 TTIR 为一行 1x8192 tile 加每轮 compare/broadcast/select 后整行存；constraints 要求保留 ABI、特殊值与固定合同，且带宽/波次/关键路径结论按假设处理。本诊断沿用其方向，机制选择与语法修复由本模型确认。"
+    }
+  ],
+  "hypothesis": "被保留的探索版本语义方向正确、文本有一处方言写法缺陷：该方言的 tt.store 组装格式只打印 type($ptr)（第 28 行由编译器生成的整行零存即为样例），因此第 36 行在指针类型后再列 tensor<1xi1> 会让该操作在第一个类型处提前结束，解析器随后在逗号处按“操作名”解析并报 expected operation name in quotes，整文件解析失败。删除这一个多余类型后，每轮结构恢复为：用循环外已常量的零张量做一次无掩码整行存，再用 pos=off+trunci(idx) 的 1 元动态指针做一次带 (0<=idx<8192) 守卫的单元素存。零存不再依赖向量比较结果，逐行的 SET_FLAG(MTE3←VEC)/WAIT_FLAG(MTE3←VEC) 与 VCMPV/VSEL 随之消失，vec_time 与 MTE3 等待应同时下降；整行写字节与逐位语义保持不变。",
+  "alternatives": [
+    "保持当前不可解析文本：编译在解析阶段即失败，零收益。",
+    "回退到合格基线 05c7c8（每轮密集 broadcast+cmpi+select 后整行存）：可编译，但保留 VCMPV/VSEL 与 VEC→MTE3 逐行同步，作为本轮验收起点而非候选。",
+    "改为无掩码存到钳位地址：越界 idx 会写入合法行位置，破坏全零语义，排除。",
+    "两段密集掩码存（零掩码 + 值掩码）：每行 MTE3 描述符与写字节近似翻倍，劣于当前方案。",
+    "保留密集 select 但把比较改成等价算术形式：仍有 8192 元密集运算与 VEC→MTE3 依赖，收益量级小，留作备选。",
+    "把两行合并为 2x8192 单块：UB 约 192 KB 逼近 216 KB 上限，风险高，留作后续假设。"
+  ],
+  "change": "仅编辑 ir/893449211de307c7344961e7520d98aa287afd9d2ccaf2b6a671214aad91f6de/_vsrb_inner1_kernel.ttir 的第 36 行，删除类型表中多出的 \", tensor<1xi1>\"，改为 tt.store %sp, %g_4, %m : tensor<1x!tt.ptr<f32>> loc(#loc20)。操作数、掩码、loc 别名、循环上界与步进、三指针 ABI、constexpr 几何、模块属性一字不动；机制身份与 ir-001 登记的单元素散点加整行零存一致，本轮只做语法修复。",
+  "expected": "①指令：每轮移除 1x8192 的 i32 广播、1x8192 的 fp32 广播、8192 元 cmpi（VCMPV）与 8192 元 select（VSEL）；每轮新增 1 条 1 元守卫存，aiv_mte3_instructions 由恒为 17 升至约 33（16 整行零存 + 16 单元素存 + 1），aiv_mte2_instructions 维持约 81。②动态轮次：512 程序 x 16 轮的循环上界、步进与行覆盖不变，8192 行各得到一次零存，非零元素存至多 16 次/程序，作为执行覆盖核对项。③等待：逐行 SET_FLAG(MTE3←VEC, FLAGID:1) 与 WAIT_FLAG(MTE3←VEC) 消失，MTE3 wait_ratio 由窗口 0.156317 下降，MTE3 active_ratio 由 0.903131 上升。④资源：vec_time 由 6.865720 us 降至约 1.5 us 以内、vec_ratio 由 0.636038 降至约 0.15 以内，vec_bankgroup_cflt_ratio 由 0.174359 明显下降；mte2_time 维持约 4.06 us；write_main_memory 维持 262144 KB 整张输出并增加至多约 32 KB 单元素写；mte3_active_bw 与 ub_to_gm_bw 随释放的向量空档上升。⑤墙钟：每程序 aiv 由 11.434272 us 预期降至 8.5-10.0 us，timing-14 任务由 151.863037 us 预期至 125-140 us（约 -8% 到 -18%）；若写带宽已在上限附近，则 MTE3 占比上升而墙钟基本持平，该情形本身构成屋顶证据。",
+  "validation": "先做 CPU 解析与降级确认原文件与候选文件均可解析；随后按固定完整合同 96 例与既有补测核对，源码、ABI、启动方式与并发几何保持原样。逐位核对 timing-14：选中位置取 grad 的原始位型（含 -0.0、NaN、Inf），未选中位置为 +0.0，越界或截断后的 idx 使整行为零，atol/rtol 1e-4 且 matched_ratio 1.0。结构核对：每行先零存后单元素存、同一程序内两处写按程序序生效、不同程序行区间互不重叠、每个输出位置净写恰好一次值。改动前后各做一次模拟器重放，分别记录覆盖量与归一化范围；增益接近观测噪声时触发 ABBA。",
+  "layer_reason": "Triton 表达能力：整行零存加单位置带守卫散点存属于 Triton 能表达的形式，源码侧用 tl.store 写一次 tl.zeros_like 结果、再用带范围掩码的 1 元 tl.store 写出选中 grad 即可表达同一意图；本轮固定源码，用 IR 隔离编译器路径。固定源码实验目的：源码、ABI、启动方式与 constexpr 几何保持冻结，才能把观测到的向量与 MTE3 变化单独归因于删除每轮密集选择这一编译变换，并把回退修复与基线测量分开。IR 控制点：具体控制点是该特化 TTIR 循环体的 broadcast/cmpi/select/整行 store 序列，以及本轮需要修好的掩码单元素存类型表；改动只落在这一处文本，既保留三指针 ABI，又直接检验后端对守卫散点存和两处 GM 写的降级与排序路径。",
+  "simulator_incremental_judgment": "模拟器各泳道为单核首末可见事件窗口内的归一化分数（窗口时长 103.19 单位，绝对单位核验为 us 类且中位比 0.999336），未报告泳道与窗口外事件（outside_events 4）保持未知；MTE3 wait_ratio 0.156317 与 VECTOR active_ratio 0.948519 说明窗口内两条流水都忙，故本轮把墙钟收益当作待验证假设，依赖前后重放分别核对：VECTOR 活跃占比与事件数下降、MTE3 活跃占比与事件数上升、SCALARLDST 计数变化，并同步核对动态总次数（每程序 16 轮、512 程序、8192 行）。累积指令时间与热点等待仅用于排序，流水之间可重叠，因果结论以改动前后同核对比为准。",
+  "unknown": [
+    "1 元带守卫散点存在后端的降级路径：可能落到逐元素标量 LDST 路径（窗口内 SCALARLDST 已有 10256 事件），其指令开销可能抵消向量节省。",
+    "同轮整行零存与其内单元素存在后端是否保持程序序，避免元素值被随后的零存覆盖；若被重排，语义核对会直接暴露。",
+    "HBM 写带宽在 1.77 TB/s 之上是否仍有可用余量；若已在写屋顶，墙钟下降幅度会显著小于预测。",
+    "VECTOR 窗口活跃占比已达 0.948519，删除密集运算后暴露出的新瓶颈位置（MTE3 发射或标量同步）尚待前后重放确认。"
+  ]
+}

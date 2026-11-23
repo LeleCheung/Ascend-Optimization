@@ -1,0 +1,41 @@
+--- 
++++ 
+@@ -112,6 +112,17 @@
+ 权重除法；若编译器把 PV 结果的转换与写出融合为 FIXP 直接输出，还可省去 PV
+ 结果的 GM→UB 与额外交接，该融合仅作为待检验预测，由实际 IR、profiling 与
+ 原四项 checker 判定。非持久回退内核（含 FP16 两项分解分支）逐字不变。
++
++本轮机制（行倒数替代矩阵除法，仅持久分支）：成对 profiling 显示 case4 每程序
++aiv_vec_time 14.055us 高于 aic_cube_time 5.173us，而实际 TTIR/BCMLIR 中归一化
++仍是对 128x256 FP32 张量的逐元素 arith.divf（每 tile 32768 次除法）。本轮保留
++p、m_safe、l_new、l_safe 与零行守卫，只把 p / l_safe[:, None] 改写为
++inv_l = 1.0 / l_safe 后再 p * inv_l[:, None]：每 tile 除法由 32768 次降为 128 次，
++其余为广播乘。数值上是近似而非等价：除法单次舍入变为倒数与乘法两次 FP32 舍入，
++相对偏差上界约 2^-23，远小于随后 FP16 转换的 2^-11；有限合同下 l_new >= 1，
++倒数不溢出、不放大，零行仍由 where 精确置 0。转 FP16、单次 PV dot、直接输出、
++headgroup 拆分与所有回退路径均不变；是否转化为完整调用收益由原四项 checker 与
++真机计时判定，本轮不作正向断言。
+ """
+ 
+ import math
+@@ -209,7 +220,19 @@
+         # 通用保护保留。编译器是否把 PV 结果的转换与写出融合进 FIXP 输出
+         # 路径属待检验预测，由实际 IR、profiling 与真机四项 checker 判定。
+         l_safe = tl.where(l_new > 0.0, l_new, 1.0)
+-        p_norm = tl.where(l_new[:, None] > 0.0, p / l_safe[:, None], 0.0)
++        # 本轮机制：把矩阵型 FP32 除法改为每行一次倒数再广播乘。实际 TTIR
++        # （arith.divf tensor<128x256xf32>）与 BCMLIR（第 112 行同类 divf）确认
++        # 父版本对每个 query tile 做 32768 个逐元素除法，程序内 4 个 tile 共约
++        # 13 万次；成对 profiling 中每程序 aiv_vec_time 14.055us 已高于
++        # aic_cube_time 5.173us。向量单元上浮点除法的下降序列明显长于乘法，
++        # 故先对 128 个行分母各求一次倒数 inv_l，再用 p * inv_l[:, None] 广播乘。
++        # 数值上：除法只舍入一次，改为「倒数舍入 + 乘法舍入」两次 FP32 舍入，
++        # 相对偏差上界约 2^-23；有限合同下 l_new >= 1，倒数不溢出也不放大，
++        # 远小于随后 FP16 转换的 2^-11。零行保护仍在权重上（无效行精确 0），
++        # PV 与直接输出路径不变；是否真的缩短向量时间与完整调用由实际 IR、
++        # profiling 与原四项 checker 判定，此处不作正向断言。
++        inv_l = 1.0 / l_safe
++        p_norm = tl.where(l_new[:, None] > 0.0, p * inv_l[:, None], 0.0)
+ 
+         acc = tl.dot(p_norm.to(tl.float16), v16)
+ 

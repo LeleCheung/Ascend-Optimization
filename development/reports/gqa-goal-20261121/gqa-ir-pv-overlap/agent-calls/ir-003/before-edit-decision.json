@@ -1,0 +1,198 @@
+{
+  "timestamp": "2026-11-21T14:42:55.799379+00:00",
+  "diagnosis": {
+    "source_sha256": "c7de9e3207733ddffca530e3a1650576d5dd940caa608fdab4af1ef53736fba4",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "ir/target.hivm.mlir",
+        "category": "source_ir",
+        "role": "当前实际输入HIVM（_gqa_fwd_kernel_mix_aiv）的IR001调度位置",
+        "finding": "sha256=a6740bc8363fbdccf6ce19530d6b7adc5b941acb8bd935e32b19c0ec1dec7d2b，与context.parent_ir_sha256一致，即未保留的IR001输入。行421为P16（64x256 f16，UB→workspace GM）的store_ubuf_to_gm_1d_half；行422为跨核Psend，即sync_block_set[<VECTOR>,<PIPE_MTE3>,<PIPE_S>] flag=0；行423至428为独立sum，enablevc_reduce_sum_ar_float读取%63的64x256 f32 acc；行449为PV结果wait，即sync_block_wait[<VECTOR>,<PIPE_FIX>,<PIPE_S>] flag=1。三者次序为Psend、sum、PVwait，正是IR001相对038的改动。"
+      },
+      {
+        "path": "ir/target.hivm.mlir",
+        "category": "source_ir",
+        "role": "AIV内全部同向事件对与生命周期盘点，用于挑选未占用的事件ID",
+        "finding": "MTE3→V方向已用两个ID：行279 set/行538 wait为EVENT_ID0的序言与尾部配对；行280 set/行539 wait为EVENT_ID1的序言与尾部配对；行327 set EVENT_ID0/行340 wait EVENT_ID0跨外层迭代；行530 set EVENT_ID1/行367 wait EVENT_ID1在内层迭代内配对。V→MTE3方向用EVENT_ID0（行315/323、410/418、525/526），V→MTE2用EVENT_ID0/1/2（行281-283、308、429、516与行295、359、454等），MTE2→V用EVENT_ID0。AIC函数使用MTE1/MTE2/FIX/M之间的EVENT_ID0/1/2，属另一核独立事件空间。全文件EVENT_ID3至EVENT_ID7出现次数为0，因此EVENT_ID3在MTE3→V方向以及整个模块中均为空闲资源。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "simulator",
+        "role": "veccore0（AIV）泳道占用与热点区域，作为争用机制的定位材料",
+        "finding": "窗口为0到1的捕获分数（capture_scope为首末可见事件，absolute_time_qualified=false，clock_qualification=relative_only）。veccore0：MTE3 active_ratio 0.5612418412615003、wait_ratio 0.15688487175363636；VECTOR active_ratio 0.3826751316848885、wait_ratio 0.1596073445650442、idle_ratio 0.6173248683151115；FLOWCTRL wait_ratio 0.666339901263786（10次WAIT_FLAG_DEVI）；SCALAR active 0.3120489108617476、wait 0.30978225624614186；MTE2 active 0.11902949594254035。排名首位的源码邻域区域candidate.py:329-336累计指令时间414.0600009999986us，其中wait口径271.0400010000002us，最大单指令47.889999us（WAIT_FLAG_DEVI，10次）。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "simulator",
+        "role": "AIV top_instructions中MTE3与VECTOR的实际指令、FLAGID与时长",
+        "finding": "MTE3的MOV_SRC_TO_DST_ALIGN（Src:UB,Dst:OUT,Dtype:B16,id:72）9次调用24.65us，紧随其后SET_FLAG（PIPE:MTE3,TRIGGERPIPE:VEC,FLAGID:1）9次调用24.639999us；另一条MOV_SRC_TO_DST_ALIGN（id:39）10次调用19.870001us，其前WAIT_FLAG（PIPE:VEC,TRIGGERPIPE:MTE3,FLAGID:0）10次调用19.870001us。跟踪中出现的FLAGID为0、1、7，其中7来自SCALAR→VEC（PIPE:VEC,TRIGGERPIPE:SCALAR,FLAGID:7）10次19.84us。这些记录显示MTE3的UB→GM搬运时间与VECTOR活动窗口在时间上并存，且EVENT_ID3在实际二进制跟踪中未出现。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "泳道时间线材料核对",
+        "finding": "timeline.json与hotspots.json逐字节相同（cmp无差异），内容为同一份per-core泳道占用、idle区间与top_instructions时间线。仅core0.cubecore0、core0.veccore0、core0.veccore1的FLOWCTRL/MTE2/MTE3/SCALAR/SCALARLDST/VECTOR/CACHEMISS泳道有报告，其余泳道与未捕获区间保持未知。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "simulator",
+        "role": "算子级时长与Roofline表，约束本次结果的测量范围",
+        "finding": "candidate侧basic为_gqa_fwd_kernel_mix_aic，Task Duration 180.023605us，Block Dim 20，Mix Block Dim 40，频率1650；reference侧为FusedInferAttentionScore，Task Duration 128.082565us。candidate的ArithmeticUtilization.csv/cube0共20行，aic_time均值167.0008782us（min 159.835144，max 176.3806），aic_cube_ratio均值0.18394100000000002，aic_cube_total_instr_number均值102.4。此采集对应当前IR001调度，属单case（case_id 4）单次捕获。"
+      },
+      {
+        "path": "feedback.json",
+        "category": "paired_profiling",
+        "role": "IR001的正式与补测结果，作为验收比较起点",
+        "finding": "conditional记录A块中位数190.78115/191.36165us、B块193.63065/186.23615us，original_median_us 191.07139999999998，candidate_median_us 189.9334，both_candidate_blocks_faster=false，latency_reduction_pct 0.5956。retention.status=qualified_gain_not_confirmed_keep_global_best，kernel_before_us 174.043488，kernel_after_us 180.023605。global_best为attempt-045，source_sha256=4e592db9f797c33f5db435852b3285b08361553b2baf91931d95d1a694666c6a，case4 candidate_us 187.2302。"
+      },
+      {
+        "path": "codex-brief.json",
+        "category": "paired_profiling",
+        "role": "宿主证据分析（Codex）给出的同核重放窗口与候选方向",
+        "finding": "Codex记录：同核重放中Psend窗口46.523至49.065us与sum窗口46.527至47.118us重叠，PVwait窗口47.159至52.344us；038的Psend中位数1.7545us、复现周期9.549us，IR001的Psend中位数1.8795us、周期10.373us，等待下降而总周期上升；假设为Vector归约与P存储共享UB或发射资源竞争，备选解释含采集波动与标量调度；建议保留IR001次序，在通知Cube的Psend之后、独立sum之前插入一个MTE3→V完成事件对，并在核对全部同向ID与循环生存期后选未占用ID。我的贡献是按该方向核对实际HIVM后选定EVENT_ID3并落盘两行插入。"
+      }
+    ],
+    "hypothesis": "IR001把独立sum放在Psend之后、PV结果wait之前，使P16的MTE3搬运（行421的16384个f16，即32768字节，从UB写入workspace GM，测量中9次调用合计24.65us）与VECTOR的acc归约（行428读取64x256 f32共65536字节UB）在同一时间窗内并发。两者共享UB读写端口与发射资源：MTE3在搬运期间持续占用UB读带宽，VECTOR的归约发射被推后或与搬运交错，使Psend后的关键段实际没有缩短（038周期9.549us相对IR001的10.373us）。在Psend之后插入一个匹配的MTE3→V完成事件对，让VECTOR在P16搬运完成后再启动归约，可以消除该段UB读写并发：归约仍然先于PV结果wait（与Cube的P加载和PV计算重叠），而P16搬运独占UB完成。该改动只增加定向同步，用于判定竞争机制是否真实存在，收益方向未知。",
+    "alternatives": [
+      {
+        "mechanism": "保持IR原样并交接（维持IR001的Psend、sum、PVwait次序）",
+        "reason": "若宿主判定新增事件对的串行化代价必然超过竞争收益，则本轮零改动交接，其他机制留给独立调用。"
+      },
+      {
+        "mechanism": "用pipe_barrier[<PIPE_V>]或PIPE_ALL屏障替代定向事件对",
+        "reason": "这两种屏障会串行化整条VECTOR流水，破坏sum先于PVwait的既定重叠，属于过强同步。"
+      },
+      {
+        "mechanism": "把sum移回PV结果wait之后（回退到038次序）",
+        "reason": "这是既有退步的回退研究身份，Codex已记录IR001合格但收益未确认，需独立调用登记。"
+      },
+      {
+        "mechanism": "缩短acc归约的UB占用（分段归约、affine折叠或exp改写）",
+        "reason": "属于另一机制族，且本轮限定检验事件对；affine折叠已在model002登记未上机，exp改写涉及数值路径。"
+      },
+      {
+        "mechanism": "把观测差异归因于采集波动与标量调度（SCALAR wait_ratio 0.30978225624614186）",
+        "reason": "作为保留的待验证假设；需要用同一二进制的重复A/B与独立计数材料判定。"
+      }
+    ],
+    "change": "仅编辑ir/target.hivm.mlir的_gqa_fwd_kernel_mix_aiv内核，插入一个匹配的MTE3→V完成事件对，事件ID取EVENT_ID3（全模块零占用）：(1) 在行422跨核Psend（sync_block_set[<VECTOR>,<PIPE_MTE3>,<PIPE_S>] flag=0）之后立即插入 hivm.hir.set_flag[<PIPE_MTE3>, <PIPE_V>, <EVENT_ID3>]；(2) 在行428 sum调用（enablevc_reduce_sum_ar_float）之前插入 hivm.hir.wait_flag[<PIPE_MTE3>, <PIPE_V>, <EVENT_ID3>]。两条指令都带loc(#loc124)，与所在P16存储段同源。事件配对为1:1同迭代：内层scf.for（行341至531）每次迭代各执行一次set与一次wait，最后一次迭代后无悬挂事件，无需尾部drain。其余字节保持不变：行421的P16存储、行422的跨核通知、行423至427的地址与指针、行428的归约及其常数%cst_5、行449的PV结果wait、全部buffer地址与别名、AIV/AIC函数ABI、AIC函数全部内容、pipe_barrier与sync_block事件均原样。改动总量为新增两行。",
+    "expected": [
+      {
+        "item": "指令数",
+        "prediction": "veccore0动态指令数新增2条类型：SET_FLAG（PIPE:MTE3,TRIGGERPIPE:VEC,FLAGID:3）与VECTOR侧事件等待（跟踪中表现为FLOWCTRL的WAIT_FLAG_DEVI）。按P16存储次数计，两者各出现9次，共新增18条动态指令，其余PC的调用次数保持不变。"
+      },
+      {
+        "item": "动态轮次",
+        "prediction": "外层8块迭代、内层KV迭代、MMA条数（cube侧aic_cube_total_instr_number均值102.4）、P16存储9次、O存储10次、MTE2加载次数全部保持不变；新事件对不改变循环上界与控制流。"
+      },
+      {
+        "item": "VECTOR等待",
+        "prediction": "VECTOR wait_union相对IR001的0.1596073445650442上升，上升量在零到每次P16搬运剩余完成时间之间；若Psend时P16已基本落地，则接近零。VECTOR active_ratio 0.3826751316848885的总量保持不变（归约计算本身未被修改），只是起点右移。"
+      },
+      {
+        "item": "MTE3等待与活动",
+        "prediction": "MTE3侧wait_ratio 0.15688487175363636与active_ratio 0.5612418412615003保持不变；新增SET_FLAG计入MTE3活动，单次开销为数十周期量级，相对24.65us的搬运可忽略。"
+      },
+      {
+        "item": "资源与并发",
+        "prediction": "空间上无新增buffer、无地址与别名变化，仅占用事件寄存器ID3。时间上P16搬运期间VECTOR在归约上的并发消失，UB读写并发窗口在Psend段被清除，sum起点推后至搬运完成之后，而sum结束仍早于PV结果wait（行449）之后开始的除l与输出段。"
+      },
+      {
+        "item": "端到端时长",
+        "prediction": "kernel时长变化方向待真机判定。竞争解释成立时，MTE3搬运不再与VECTOR抢UB，Psend段缩短，case4 kernel时长低于IR001的180.023605us并争取低于174.043488us与最佳187.2302us的对应比较起点；纯串行化情形下，每轮新增一次等待，总时长上升约等于9次迭代中搬运尾巴之和。"
+      },
+      {
+        "item": "数值",
+        "prediction": "输出逐元素与IR001完全一致：新增指令只做同步排序，参与运算的常数、buffer与归约实现均未修改。"
+      }
+    ],
+    "validation": "宿主执行：先确认ir/target.hivm.mlir可解析且续编译通过（若HIVM方言拒绝EVENT_ID3属性则本轮登记作废并回交），再用与IR001相同的固定源码（frozen.py逐字节一致，sha256 c7de9e3207733ddffca530e3a1650576d5dd940caa608fdab4af1ef53736fba4）编译出二进制并做真机配对A/B：A为IR001原二进制，B为本轮二进制，同一设备锁内交替，比较both_candidate_blocks_faster与case4中位数，同时核对四个固定case的官方checker结果逐项通过。逐项核对本诊断expected：新增两条指令的9次调用、循环与存储计数不变、VECTOR等待上升量、MTE3计数不变、无悬挂事件（每迭代1:1配对）。若B稳定快于A且官方检查通过，则本机制获得确认并可作为后续组合的候选；若B变慢或出现等到超时，则记录为串行化代价并回交，保留IR001次序作为比较起点。",
+    "layer_reason": "Triton表达能力：frozen.py的Triton源码只暴露张量级依赖，P16从UB到GM的搬运完成事件属于pipe级同步，语言层没有对应构造，源码里写不出“等MTE3搬完再算归约”；同理EVENT_ID选择与set/wait配对都是HIVM层概念。固定源码实验目的：本轮保持frozen.py逐字节一致，把变量限定在内核调度，使A/B差异只来自同步位置，避免源码重写引入新的身份。IR控制点：可编辑对象为_gqa_fwd_kernel_mix_aiv内行422与行428之间的插入点，grep到的set_flag/wait_flag写法与现有18组事件对完全同构，事件ID经全模块盘点后取空闲的EVENT_ID3，因此这是单算子IR層上一个具体、有执行成本、可独立验证的编译缺陷判定：编译器把P16搬运与归约发射排成并发，未表达搬运完成的本地约束。",
+    "simulator_incremental_judgment": "本次为资源争用诊断，模拟器的增量价值在定位而非计量。可用部分：veccore0的MTE3 active 0.5612418412615003与VECTOR active 0.3826751316848885在同一捕获窗内并存，MTE3搬运24.65us与等待19.870001us的相邻关系，以及FLOWCTRL wait 0.666339901263786说明AIV大量时间停在显式等待上，这些支持“Psend段存在UB或发射竞争”的候选机制。局限部分：绝对时钟资质为relative_only，raw_clock_window的unit为unassigned，absolute_unit_validation仅对22个非同步PC给出比值1.0000000428120048；窗口只覆盖首末可见事件的分数区间，未报告泳道保持未知；新增事件对带来的额外等待在模拟器上表现为VECTOR起点右移，而其对总时长的影响取决于未建模的队列细节，本轮不据此承诺收益。因此模拟器结论只用于机制定位，收益判定交给真机配对A/B与独立计数。",
+    "unknown": [
+      "MTE3→V方向EVENT_ID3在HIVM方言与后端事件分配中的接受度需由续编译确认；若后端把事件ID按物理寄存器全局共享，ID3的零占用同样避免冲突，此点由编译与真机行为判定。",
+      "Psend时刻P16搬运的实际剩余完成时间未知，决定VECTOR等待上升量的上界。",
+      "case4之外三个固定case是否呈现相同竞争，本轮保持未知。"
+    ]
+  },
+  "diagnosis_sha256": "4449f2603af41cd4f275a65e79c93441c74b7ac9340ee629a8dc3b1aa8a0d3e2",
+  "evidence": [
+    {
+      "path": "ir/target.hivm.mlir",
+      "category": "source_ir",
+      "role": "当前实际输入HIVM（_gqa_fwd_kernel_mix_aiv）的IR001调度位置",
+      "finding": "sha256=a6740bc8363fbdccf6ce19530d6b7adc5b941acb8bd935e32b19c0ec1dec7d2b，与context.parent_ir_sha256一致，即未保留的IR001输入。行421为P16（64x256 f16，UB→workspace GM）的store_ubuf_to_gm_1d_half；行422为跨核Psend，即sync_block_set[<VECTOR>,<PIPE_MTE3>,<PIPE_S>] flag=0；行423至428为独立sum，enablevc_reduce_sum_ar_float读取%63的64x256 f32 acc；行449为PV结果wait，即sync_block_wait[<VECTOR>,<PIPE_FIX>,<PIPE_S>] flag=1。三者次序为Psend、sum、PVwait，正是IR001相对038的改动。",
+      "sha256": "a6740bc8363fbdccf6ce19530d6b7adc5b941acb8bd935e32b19c0ec1dec7d2b"
+    },
+    {
+      "path": "ir/target.hivm.mlir",
+      "category": "source_ir",
+      "role": "AIV内全部同向事件对与生命周期盘点，用于挑选未占用的事件ID",
+      "finding": "MTE3→V方向已用两个ID：行279 set/行538 wait为EVENT_ID0的序言与尾部配对；行280 set/行539 wait为EVENT_ID1的序言与尾部配对；行327 set EVENT_ID0/行340 wait EVENT_ID0跨外层迭代；行530 set EVENT_ID1/行367 wait EVENT_ID1在内层迭代内配对。V→MTE3方向用EVENT_ID0（行315/323、410/418、525/526），V→MTE2用EVENT_ID0/1/2（行281-283、308、429、516与行295、359、454等），MTE2→V用EVENT_ID0。AIC函数使用MTE1/MTE2/FIX/M之间的EVENT_ID0/1/2，属另一核独立事件空间。全文件EVENT_ID3至EVENT_ID7出现次数为0，因此EVENT_ID3在MTE3→V方向以及整个模块中均为空闲资源。",
+      "sha256": "a6740bc8363fbdccf6ce19530d6b7adc5b941acb8bd935e32b19c0ec1dec7d2b"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "veccore0（AIV）泳道占用与热点区域，作为争用机制的定位材料",
+      "finding": "窗口为0到1的捕获分数（capture_scope为首末可见事件，absolute_time_qualified=false，clock_qualification=relative_only）。veccore0：MTE3 active_ratio 0.5612418412615003、wait_ratio 0.15688487175363636；VECTOR active_ratio 0.3826751316848885、wait_ratio 0.1596073445650442、idle_ratio 0.6173248683151115；FLOWCTRL wait_ratio 0.666339901263786（10次WAIT_FLAG_DEVI）；SCALAR active 0.3120489108617476、wait 0.30978225624614186；MTE2 active 0.11902949594254035。排名首位的源码邻域区域candidate.py:329-336累计指令时间414.0600009999986us，其中wait口径271.0400010000002us，最大单指令47.889999us（WAIT_FLAG_DEVI，10次）。",
+      "sha256": "c3d2675abaa870afe0b96c957d6bc28847bed42710a7246be0cb209eeecd1c67"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "AIV top_instructions中MTE3与VECTOR的实际指令、FLAGID与时长",
+      "finding": "MTE3的MOV_SRC_TO_DST_ALIGN（Src:UB,Dst:OUT,Dtype:B16,id:72）9次调用24.65us，紧随其后SET_FLAG（PIPE:MTE3,TRIGGERPIPE:VEC,FLAGID:1）9次调用24.639999us；另一条MOV_SRC_TO_DST_ALIGN（id:39）10次调用19.870001us，其前WAIT_FLAG（PIPE:VEC,TRIGGERPIPE:MTE3,FLAGID:0）10次调用19.870001us。跟踪中出现的FLAGID为0、1、7，其中7来自SCALAR→VEC（PIPE:VEC,TRIGGERPIPE:SCALAR,FLAGID:7）10次19.84us。这些记录显示MTE3的UB→GM搬运时间与VECTOR活动窗口在时间上并存，且EVENT_ID3在实际二进制跟踪中未出现。",
+      "sha256": "c3d2675abaa870afe0b96c957d6bc28847bed42710a7246be0cb209eeecd1c67"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "泳道时间线材料核对",
+      "finding": "timeline.json与hotspots.json逐字节相同（cmp无差异），内容为同一份per-core泳道占用、idle区间与top_instructions时间线。仅core0.cubecore0、core0.veccore0、core0.veccore1的FLOWCTRL/MTE2/MTE3/SCALAR/SCALARLDST/VECTOR/CACHEMISS泳道有报告，其余泳道与未捕获区间保持未知。",
+      "sha256": "c3d2675abaa870afe0b96c957d6bc28847bed42710a7246be0cb209eeecd1c67"
+    },
+    {
+      "path": "profiling.json",
+      "category": "simulator",
+      "role": "算子级时长与Roofline表，约束本次结果的测量范围",
+      "finding": "candidate侧basic为_gqa_fwd_kernel_mix_aic，Task Duration 180.023605us，Block Dim 20，Mix Block Dim 40，频率1650；reference侧为FusedInferAttentionScore，Task Duration 128.082565us。candidate的ArithmeticUtilization.csv/cube0共20行，aic_time均值167.0008782us（min 159.835144，max 176.3806），aic_cube_ratio均值0.18394100000000002，aic_cube_total_instr_number均值102.4。此采集对应当前IR001调度，属单case（case_id 4）单次捕获。",
+      "sha256": "f4c3d3ab927de54861773197bb56bd23fe10f76a088f5282db000354964c261d"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "IR001的正式与补测结果，作为验收比较起点",
+      "finding": "conditional记录A块中位数190.78115/191.36165us、B块193.63065/186.23615us，original_median_us 191.07139999999998，candidate_median_us 189.9334，both_candidate_blocks_faster=false，latency_reduction_pct 0.5956。retention.status=qualified_gain_not_confirmed_keep_global_best，kernel_before_us 174.043488，kernel_after_us 180.023605。global_best为attempt-045，source_sha256=4e592db9f797c33f5db435852b3285b08361553b2baf91931d95d1a694666c6a，case4 candidate_us 187.2302。",
+      "sha256": "20561e8b9128332cb02caf293e896346d8baf3c7d47d1c2edf11cf67c84b2f44"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "paired_profiling",
+      "role": "宿主证据分析（Codex）给出的同核重放窗口与候选方向",
+      "finding": "Codex记录：同核重放中Psend窗口46.523至49.065us与sum窗口46.527至47.118us重叠，PVwait窗口47.159至52.344us；038的Psend中位数1.7545us、复现周期9.549us，IR001的Psend中位数1.8795us、周期10.373us，等待下降而总周期上升；假设为Vector归约与P存储共享UB或发射资源竞争，备选解释含采集波动与标量调度；建议保留IR001次序，在通知Cube的Psend之后、独立sum之前插入一个MTE3→V完成事件对，并在核对全部同向ID与循环生存期后选未占用ID。我的贡献是按该方向核对实际HIVM后选定EVENT_ID3并落盘两行插入。",
+      "sha256": "783e70e149139ed2b391c53ab0431a068d3f2aa12a07abdb03ad6c80f445659f"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "c7de9e3207733ddffca530e3a1650576d5dd940caa608fdab4af1ef53736fba4",
+    "contract.json": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858",
+    "profiling.json": "f4c3d3ab927de54861773197bb56bd23fe10f76a088f5282db000354964c261d",
+    "hotspots.json": "c3d2675abaa870afe0b96c957d6bc28847bed42710a7246be0cb209eeecd1c67",
+    "timeline.json": "c3d2675abaa870afe0b96c957d6bc28847bed42710a7246be0cb209eeecd1c67",
+    "feedback.json": "20561e8b9128332cb02caf293e896346d8baf3c7d47d1c2edf11cf67c84b2f44",
+    "original-resume-result.json": "57ba44f8c2e869940df05552ee8d093d232e60abd033ca9ee1a2baaf073bbd64",
+    "context.json": "b2cac7c97b3a51ed46bb587064467e4c31e8e887e2b44fe3f8efba5cb821a023",
+    "ir-inventory.json": "9abf5271a6a659c35e5cf3ceb85e33b01c9e47e2ab30d04434ecef02ee25ce91",
+    "diagnosis.json": "86970cd4799e41d84bba9214545094b6b7bbe8a439a995aecf8576d236980a12",
+    "codex-brief.json": "783e70e149139ed2b391c53ab0431a068d3f2aa12a07abdb03ad6c80f445659f",
+    "denominator-schedule.json": "f31c6737c63806936f76711e2af7c2f152b1b0518e42e948961bc254f1415476",
+    "original-denominator-schedule.json": "89c18d3f6069472f851c3775f0905f58de604325a56dc64984d6be50a07d4244",
+    "ir/target.hivm.mlir": "a6740bc8363fbdccf6ce19530d6b7adc5b941acb8bd935e32b19c0ec1dec7d2b",
+    "compiled-readonly/_gqa_fwd_kernel.ttir": "bf34e92ee2781858868378f0bc1d6a30d68db797072e054f20a2e836f450fcc3",
+    "compiled-readonly/_gqa_fwd_kernel.bcmlir": "39a0f4e1fb516d7785ff1ca904c39621587fdd173bfed761add7083160940cc7",
+    "compiled-readonly/manifest.json": "ffbda168b127f472b63ff574a4b978f59b422d9f3c9f5bc0019142ee10bb0bd8"
+  },
+  "decision_tool_sha256": "2ba55ebab8be5b8a2363da657d6ee81799d4cabcdfb8e1494846aecfd1fde624"
+}

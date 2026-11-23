@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 37,
+    "duration_ms": 143407,
+    "usage": {
+      "input_tokens": 54292,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1535744,
+      "output_tokens": 23613,
+      "output_tokens_details": {
+        "thinking_tokens": 14453
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 54292,
+        "outputTokens": 23613,
+        "cacheReadInputTokens": 1535744,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.6296570000000004,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 14453,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.6296570000000004,
+    "result": "已完成本轮独立实验的机制落地并交接。摘要如下。\n\n## 读取与固定的事实\n- 父源码 `candidate.py` SHA `54938a18…3997f`（= `starter-provenance.json` 的 qualified012）。\n- 成对 profiling：case4 主 kernel `317.806366us`、512 programs；每程序 `aic_cube_time` 1.293us 而 `aic_scalar_wait_id1` 7.254us，`L0C_to_GM` 192KiB/程序、`GM_to_L1` 224KiB/程序 → 墙钟随每程序跨核交接链数增长。\n- 实际 TTIR：012 已是 M128/N256 单条 QK dot（128×256 FP32 累加器）＋单条 FP16 PV dot（输出 128×128 FP32）。\n- 实际 BCMLIR：q/k/v 分别为 `128x128bf16`/`256x128bf16`/`256x128f16`，qk/p 共用 `128x256xf32`，无现成 concat 降低样例。\n- 冻结合同：case1/2/4/7、原 checker/golden、输入输出 dtype、计时口径、精度阈值均不变；case4 为 BF16 非因果 SKV256/S256/D128、value_range[-1,1]；保留最佳 006 = 328.4468us。\n\n## 本轮机制（独立资源/性能分支）\n1. 仅 BF16 非因果精确 SINGLE_KV 几何（D128、SKV256、S%256==0）把 `BLOCK_M` 128→256，`BLOCK_N`=256：program/交接链 512→256。\n2. N 轴 QK 拆成前 128-key、后 128-key 两条顺序 `tl.dot`，各为 256×128 FP32（128KiB，落入单块 L0C）；不装载整块 256×128 K。\n3. 用 `join → permute(0,2,1) → reshape` 按原 key 顺序拼接为完整 256 宽 FP32 qk（低 128 列在前，不交错），随后沿用原 256 宽 FP32 softmax 与单次 FP16 PV（输出 256×128 FP32，128KiB）。\n4. 仅该精确路径依据“有限[-1,1]、非因果、非空整块覆盖 ⇒ rowmax 有限、分母≥1”删除全掩码/max/分母/零输出守卫；其余路径守卫与表达式逐字保持。\n5. 012 的 BSND V scratch 预处理/精度、其他路径、full-call 计时不变；选路只用 dtype/shape 元数据。\n\n诊断已写入 `diagnosis.json`（含两条资源动机、证据、风险与未决项），并登记为 decision `74d4d332c2e846e6a39ac1a29add5b02`。\n\n## 预检与交接\n`preflight --source candidate.py` 返回：\n- `status: awaiting_source_review`\n- `source_sha256: e0ddb970a886b85eac255e826b9ed2c515af92734c5a75e578ffa469c76b41b1`\n\n已按边界保持该字节不变，等待宿主只读路径/地址边界审查及完整四项真机评测。预期 case4 程序/交接链减半并低于 328.4468us；若列拼接被编译器物化为额外 256×256 FP32 UB 缓冲（UB>196608B 或 CC>131072B），请保留实际失败 IR，供后续定位 concat 降低与缓冲别名问题。修改后的模拟器重放待正式结果反馈后进行。"
+  }
+}

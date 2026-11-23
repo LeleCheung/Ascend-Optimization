@@ -1,0 +1,78 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "c7de9e3207733ddffca530e3a1650576d5dd940caa608fdab4af1ef53736fba4",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4 保留父版 190.58165us 全调用、kernel 174.043488us；Block Dim 20（PART_TILES 常驻分区），cube 指令 2048 条、L0C_to_GM 65536KB、Vector GM_to_UB 34304KB，与 038 身份一致，说明本轮只改编译/调度选项即可比较。"
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "trigger",
+      "finding": "Vector0 窗口（raw clock 151.476-254.478，relative_only）VECTOR 有效占比 0.242、显式等待 0.115、空闲 0.643；FLOWCTRL 等待占比 0.877，两条 WAIT_FLAG_DEVI 共 67.83+22.50us。热点显示大量显式等待，而非算力饱和。"
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "mechanism",
+      "finding": "同核公共时钟：P VCONV 161.016-161.105、P send 161.107-163.166 已提前，但 FP32 分母 VADD 到 166.014 才开始、VCADD 166.605 结束，即在 PV 从 Cube 返回后才做独立的分母归约；这三个核窗口分别归一化、application_completed 缺失，不能相加当总耗时。"
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "BCMLIR 第 103-110 行：linalg.matmul（PV）之后紧跟 linalg.reduce（分母 sum），源码语句序已按要求排成 dot→reduce，未手动改 IR；说明后端在源码/IR 层保留顺序，但机器调度仍把独立归约留到 PV 之后。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "background",
+      "finding": "TTIR 第 105-111 行：tt.dot(p16,v16) 先于 tt.reduce(p) 归约；qk 路径为 bf16→f16→f32，与父版精度结构一致，本轮不改任何计算语句。"
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "background",
+      "finding": "唯一启动点第 614 行 `_gqa_fwd_kernel[grid](..., num_warps=1, num_stages=1)`；PART_TILES 由纯元数据推导（非因果、PV_SINGLE_F16、SINGLE_KV、BLOCK_M/N/D 常量），grid=(20,)，其余分支 grid=(cdiv(S,BLOCK_M), B*NQ)。"
+    },
+    {
+      "path": "workspace/compiler-pipeline-evidence.txt",
+      "category": "knowledge",
+      "role": "mechanism",
+      "finding": "安装的 Ascend 后端编译器（sha256 62ddbfbd...）暴露独立调度元数据开关（ops_reorder→--enable-ops-reorder），与 num_stages/auto-multibuffer/CV balance 无关；本轮仅测该既有编译器重排能力，不手改 IR。"
+    }
+  ],
+  "hypothesis": "父版 PART_TILES 内核在 Vector 上存在大量显式等待（WAIT 占比 0.115、FLOWCTRL 等待 0.877），且与 PV 无数据依赖的 FP32 分母归约被排到 PV 返回之后；打开后端既有 ops_reorder 编译选项后，调度器有机会把独立计算移入等待区，缩短 case4 关键路径。机器码/IPC 可能不变，收益须由真机确认。",
+  "alternatives": [
+    "手工编辑 BCMLIR/TTIR 移动 linalg.reduce —— 本调用禁止，且已有源码语句序重排仍被后端排到 PV 之后，说明源序不是限制。",
+    "在源码中把 sum 完全移到 exp 之前（与 PV 无关的原始 p）—— 会改变可观测语句序但同样受后端调度支配，且需要重新验证数值与 IR，超出本次独立实验范围。",
+    "调整 num_stages 或 worker 数 —— 与 035/025 已测选项重叠，且会改变缓冲/分区，不是本实验。"
+  ],
+  "discriminating_observation": "若收益来自该编译器重排：PART_TILES（case4）真机耗时下降，且修改后 BCMLIR/TTIR 可出现 reduce 与 matmul 的相对次序变化或调度指令变化；case1/2/7 不传该选项，源码逐字节不变，耗时应基本持平（仅测量噪声）。若三个非目标 case 同步变化，则更可能是环境漂移而非选项效果。",
+  "change": "仅在 PART_TILES 为真的启动分支向 `_gqa_fwd_kernel[grid]` 追加 launch 关键字 ops_reorder=True；其余分支不传该关键字（保持后端默认 None）。内核函数体、Triton 语句序、num_warps=1/num_stages=1、grid 与其他所有参数逐字节不变；host 只由元数据计算该布尔值。",
+  "expected": "case4 全调用低于保留最佳 190.58165us（主要机会在 Vector 显式等待区间被独立分母归约/准备计算填充）；case1/2/4/7 精度以原四项 checker 不变阈值通过；若后端忽略该元数据，预期为持平且 IR/二进制不变，此时判定为无效机制。",
+  "validation": "先 preflight --source candidate.py 走编译/审查流程；随后宿主只读路径与地址边界审查并做完整四项真机评测（原 checker、golden、输入输出 dtype、计时合同不变，warmup=5/trials=3/iterations=20）；比较 case4 全调用与 kernel 时间，并对照 case1/2/7 判断是否为普遍漂移；修改后重放实际 BCMLIR/TTIR 检查 ops_reorder 是否产生可见调度差异，缺失信息保留为未决项。",
+  "selected_layer": "compiler_option",
+  "layer_reason": "源码语句序与 IR 已是 dot→reduce，热点证据指向机器调度把独立归约留在等待之后；后端已提供合法的重排开关，先试最小、不改源码语义的既有编译器能力，再考虑源码/IR 层改动。",
+  "simulator_incremental_judgment": "热点方面：Vector 显式等待与空闲高、有效计算占比低，说明瓶颈不在 Vector 算力饱和，而在等待窗口未被独立工作填充。流水方面：P 的 VCONV/MTE3 send 已提前到 161.0-163.2us，而 FP32 分母 VADD/VCADD 直到约 166.0-166.6us 才发生，独立工作未进入等待区是新增判断；三项核窗口分别归一化且 application_completed 缺失，只作相对先后证据，不折算为绝对收益。",
+  "manual_ir_edits": 0,
+  "post_change_observation": {
+    "candidate_source_sha256": "76b83aeff855fb3e3057dc8ed2ae1981374b6e3a6b8a1e9191187e7113799afd",
+    "decision_id": "8e8aeec2c76349d7823db76496000823",
+    "preflight": "awaiting_source_review：预检已登记候选身份，设备操作前等待宿主只读路径与地址边界审查；候选字节保持不动，尚无真机耗时或 checker 结果。",
+    "diff_scope": "仅第 617-626 行新增 _launch_opts 字典与 PART_TILES 条件 ops_reorder=True，第 641 行 num_warps/num_stages 改为 **_launch_opts；内核函数体、语句序、grid 与其他参数未改。",
+    "pending": [
+      "宿主审查与完整四项真机评测（原 checker/golden/dtype/计时合同不变）。",
+      "修改后重放实际 BCMLIR/TTIR，确认 ops_reorder 是否进入编译元数据并产生调度差异。",
+      "若后端不接受该关键字，按正常流程保留编译错误记录并回退到父版候选。"
+    ]
+  },
+  "unknown": [
+    "host 侧能否仅以 launch 关键字传递 ops_reorder，后端是否在编译元数据与二进制中体现该选项（若选项不被接受将按正常流程报告编译错误）。",
+    "ops_reorder 是否会同时改变数值结果或仅改变调度；由原四项 checker 以不变阈值判定。",
+    "模拟器各核窗口相互独立、绝对时钟未独立核验，无法从时间轴直接量化预期收益。"
+  ]
+}

@@ -1,0 +1,95 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "452dfc555869435e8ded80ca377b6c38",
+  "recorded_at": "2026-11-21T11:35:03.607360+00:00",
+  "round_id": "attempt-029",
+  "input_source": {
+    "path": "trace/sources/2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113.py",
+    "sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/a51d25c213334998df0121dd713006da21f4ee8898816ebf51f3d117d64f7415.json",
+        "sha256": "a51d25c213334998df0121dd713006da21f4ee8898816ebf51f3d117d64f7415"
+      },
+      "original": {
+        "path": "workspace/current-profiling.json",
+        "sha256": "a51d25c213334998df0121dd713006da21f4ee8898816ebf51f3d117d64f7415"
+      },
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "候选（019，Block Dim=128、Mix Block Dim=256）Task Duration 257.645142us，参考 FusedInferAttentionScore 为 127.142540us、Block Dim=19。候选每程序 L0C_to_GM 均值 768KB、GM_to_L1 均值 512KB（总量 98304KB / 65536KB），aic_cube_time 均值 5.173us、aic_mte2_time 6.026us、aic_fixpipe_time 5.499us；aiv_scalar_wait_time 均值 11.51us，vec_time 12.64us。参考侧 Block Dim=19 即 19 个持久程序、每程序 aic_cube_time 35.48us、L0C_to_GM 5173.9KB，说明同一份总算术（cube 指令总数两侧都是 2048）在 19~20 个常驻程序下即可完成，候选分成 128 个程序把 K/V 载入与程序开销重复了 6~7 倍。",
+      "source_sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/3872e0b7e8321c12da290bbec07142d727dcd444fefc9d5afd78f81e606dd8b8.ttir",
+        "sha256": "3872e0b7e8321c12da290bbec07142d727dcd444fefc9d5afd78f81e606dd8b8"
+      },
+      "original": {
+        "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+        "sha256": "3872e0b7e8321c12da290bbec07142d727dcd444fefc9d5afd78f81e606dd8b8"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "实际 TTIR（由本候选编译）显示：%pid 经 divsi/remsi 解出 (b,kvh,hg) 后，K/V 的 256x128 tt.load 在 scf.for 之外各一次，v16 = extf+truncf 一次性转换；程序体只有一个 scf.for t = 0..4（HG*NB_M = 2*2 = 4）的静态循环，循环体内按 tile 做 tt.dot(q, trans(k)) -> 128x256 f32、exp2 行 softmax、truncf 到 f16 后 tt.dot -> 128x128 f32、divf 归一化与 tt.store。即每程序的『组』只有一个 K/V 载入，而 tile 数固定为 4；全设备共 128 个程序的等价组载入被重复，程序数与 tile 数（512）之间缺少连续分区。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/3f0752b87549d3622671e660efcd63cee0d4e7286e342001b1b25900e878f4a7.bcmlir",
+        "sha256": "3f0752b87549d3622671e660efcd63cee0d4e7286e342001b1b25900e878f4a7"
+      },
+      "original": {
+        "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+        "sha256": "3f0752b87549d3622671e660efcd63cee0d4e7286e342001b1b25900e878f4a7"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "实际 BCMLIR 里 K/V 各占一个 memref.alloc 256x128xbf16（各 64KiB）位于 scf.for 之外，循环内每 tile 生成 128x128xbf16 的 Q memref.copy、linalg.transpose(256x128)、QK linalg.matmul（outs 为 128x256 f32，即 128KiB L0C）、PV linalg.matmul（outs 为 128x128 f32，即 64KiB L0C）与 128x128 bf16 输出写回。活跃缓冲上限由 K/V 各 64KiB + p/qk 128x256（f32 与 f16 两份）+ acc 128x128 f32 决定；把 K/V 载入放进『按 KV 组』的外层循环不新增任何张量形状，故 UB/L0C 峰值不变。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/5aae34a3b0afba00d77573c297f7ffd36b9b5acedbdda4a9ea8a2e0899c0f2e7.json",
+        "sha256": "5aae34a3b0afba00d77573c297f7ffd36b9b5acedbdda4a9ea8a2e0899c0f2e7"
+      },
+      "original": {
+        "path": "workspace/context-brief.json",
+        "sha256": "5aae34a3b0afba00d77573c297f7ffd36b9b5acedbdda4a9ea8a2e0899c0f2e7"
+      },
+      "category": "knowledge",
+      "role": "background",
+      "finding": "目标 case4 共 B*NKV*G*(S/BLOCK_M) = 4*8*8*2 = 512 个 querytile；当前 019 为 128 个程序、每程序 4 tile，分布在 20 个 Cube 核上形成约 7 个波次；017 为 32 程序、每程序 16 tile。宿主提出 20 个常驻程序按连续区间均分 512 tile（每程序 25/26 tile），并在所接触的 KV 组边界处重新载入 K/V。",
+      "source_sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858.json",
+        "sha256": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858"
+      },
+      "original": {
+        "path": "workspace/contract.json",
+        "sha256": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858"
+      },
+      "category": "knowledge",
+      "role": "background",
+      "finding": "固定 4 个正式 case：1（fp16 因果 S128 G4）、2（fp16 非因果 S128 SKV128 G12）、4（bf16 非因果 S256 SKV256 G8）、7（bf16 非因果 Sq128 Skv256 G4），全部 D=128、[-1,1]、warmup5/trials3/iterations20，golden 与 checker 身份不变。",
+      "source_sha256": null
+    }
+  ],
+  "hypothesis": "019 已把 K/V 载入与 V 的 fp16 转换提升到每程序的 tile 循环之外，但程序数仍按 headgroup 切分（case4 grid=128），因此全设备重复了 128 次整段 K/V 载入（GM_to_L1 总量 65536KB，参考仅 65840KB 但那是含 Q 的全量），且 128 个程序在 20 个 Cube 核上形成约 7 个波次。若把 512 个 tile 按 floor(pid*T/P)..floor((pid+1)*T/P) 连续区间分配给 P=20 个常驻 worker，每个 worker 只在其区间与某个 (b,kvh) KV 组相交时载入一次该组 K/V，则：程序数 128->20（单波次，末轮接近均分 25/26 tile），K/V 组载入次数 128->约 51（case4 每区间跨 16 tile 的组边界 2~3 次），每 worker 的算术、每 tile 的 matmul 数与 L0C 搬出量（每 tile 128+64KiB）完全不变。墙钟由『tile 交接链数（不变）+ K/V 重复载入与波次尾（下降）』组成，故预期下降。",
+  "change": "仅在既有非因果 BF16、BLOCK_D=128、SINGLE_KV、BLOCK_M=128/BLOCK_N=256 的持久分支内，把 headgroup 所有权改为 20 个常驻 worker 的连续 tile 分区：新增常量 T = B*NKV*G*NB_M、P = min(20, T)、TPG = G*NB_M（均为程序元数据、由 shape 决定，不读输入值）；内核按 lo=floor(pid*T/P)、hi=floor((pid+1)*T/P) 取区间，外层对 g in [lo//TPG, (hi-1)//TPG] 逐 KV 组载入并一次性转换 K/V（fp16），内层对该 worker 与组相交的 tile 子区间 [max(lo,g*TPG), min(hi,(g+1)*TPG)) 逐 tile 执行与 019 逐字相同的 QK→fp32 softmax→单次 fp16 PV→PV 后归一化→BSND 写回。FP16 与其他 dtype 的通用二维 grid 路径、因果 64/64 分块、两项分解表达式与相加顺序均保持不变。",
+  "expected": "case4 程序数 128->20、单波次且每 worker 25/26 tile；K/V 组载入 128->约 51、GM_to_L1 约 65536KB->6.5MB 量级；cube 指令总数与 L0C_to_GM 总量不变。预期 case4 全调用耗时下降（目标 <262.27775us）；case7（T=64）同为 20 worker、每 worker 3~4 tile，预期不劣并可能小幅改善；case1/2 不走该分支，应逐位不变（同一编译产物、同一 grid、同一表达式），真实变化照常记录。风险：每个 worker 串行 25~26 条 tile 交接链可能降低交叉隐藏；外层为运行时边界循环，编译可能无法展开并可能在循环内重新分配 K/V 缓冲。",
+  "validation": "先用工具桥 preflight --source candidate.py 编译校验（UB/L0C 预算、动态循环合法性），再由宿主只读审查后跑原完整四项真机评测：contract.json 固定 case1/2/4/7、官方 golden 与 checker(sha 863f6862…)、原阈值（fp16 2^-10 相对、bf16 2^-7）不放松，检查四项全部通过且记录逐 case 耗时；随后采集修改后成对 profiling，核对 Block Dim=20、GM_to_L1 下降与本轮假设一致/不一致。无新增测试、无按 case_id 或输入值选路。",
+  "alternatives": [
+    "只改 P（如 19/21/32）而保留 headgroup 均匀切分：程序数与 KV 组边界不对齐，组载入次数不可控，且仍以 headgroup 为所有权单位，无法保证单个程序内连续 tile 复用同一 K/V。",
+    "把 K/V 复制到 G 份再走原 (行块, b*hq) 二维 grid：增加 GM 交通与显存，且未减少程序数，违反不新增缓冲与不改变原表达式的约束。",
+    "三阶段/分数压缩（028 机制）或改变 PV 归约顺序：会改动浮点顺序，超出本轮『每 tile 原表达式不变』的范围，且需重新论证精度阈值。",
+    "依靠 num_warps/num_stages 或 auto scheduling 参数：不改变组载入与波次结构，属另一层实验。"
+  ],
+  "discriminating_observation": "若假设成立，修改后 case4 的 GM_to_L1 总量应从 65536KB 降到约 51*128KiB≈6528KB（每程序仅 2~3 个组的 64+64KiB K/V，加上每 tile 32KiB 的 Q），Block Dim 由 128 变为 20，而 cube 指令总数仍为 2048、L0C_to_GM 总量仍为 98304KB；同时 case4 全调用耗时低于 262.27775us。若耗时未下降而交通已下降，则说明墙钟由每 tile 的交接链串行化主导（每 worker 25~26 条链串行），本机制应让位给并行度方向。",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

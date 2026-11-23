@@ -1,0 +1,56 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "a9756361d5c9adae8f98c2d8b169b16ab1782fa48d96db4d1e3967d08b28002c",
+  "selected_layer": "host_metadata_tiling (run() 的 BLOCK_M 选择与 PART_TILES 准入)",
+  "layer_reason": "四项真实结果中只有 case4 失败，且是编译期资源错误而非数值错误；case1/2/7 已通过官方 checker。失败只出现在 run() 新加的 BLOCK_M=256 元数据分支，故修复层选在主机元数据的分块选择，不碰内核算术、dtype、golden/checker 或计时口径。",
+  "simulator_incremental_judgment": "not_used：本轮未读取或运行模拟器。原版 simulator-evidence.json 仅保留为历史背景，未作为当前候选观测，也不据此声明因果贡献。",
+  "host_suggestion": {
+    "source": "host-repair-analysis.json",
+    "summary": "宿主建议只改 host num_stages：M256 PART_TILES 取 1、M128 保持 2、其余 1，保留 064 的 M256 guard、内核/helper AST、lookahead、数学/dtype、20 worker、缓存/输出分配，作为单变量编译器多缓冲试验；若仍超限则保留真实错误。"
+  },
+  "selected_fix": {
+    "summary": "不采用 num_stages 单变量试验作为修复主体，而是移除 run() 中 BLOCK_M=256 的元数据覆盖并把 PART_TILES 准入恢复为 BLOCK_M==128；其余保留 063 已验收源码（num_stages=2 于 PART_TILES）逐字不变。",
+    "why_not_host_mechanism": "实际失败 IR 的 tensor<256x256xf32> 单独就是 262144B，恰好等于报错的 cc required 2097152 bits，是可用 1048576 bits 的两倍；UB 侧 256x256 f32 p、256x256 f16 raw_next、256x128 f32 acc 与 256x128 bf16 q/k/v 叠加也超过 196608B。num_stages 只影响循环多缓冲/流水，不能缩小单个 dot 的 256x256 f32 结果，因此 M256 下 cc 溢出与 stages 无关，num_stages=1 不能消除该根因。"
+  },
+  "evidence": [
+    {
+      "path": "workspace/repair-feedback.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "case1(f16,causal)、case2(f16)、case7(bf16) 均 error 为空且 official_checker.passed=true；case4(bf16,B4,S256,Nq64,Nkv8,D128,causal=false) 报 MLIRCompilationError：ub 需 2359296 bits/可用 1572864 bits（294912B > 196608B），cc 需 2097152 bits/可用 1048576 bits（262144B > 131072B）。四项无其它数值失败。"
+    },
+    {
+      "path": "workspace/failed-ir/attempt-064/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "该 IR 对应失败的 case4：存在 tensor<256x256xf32>（QK/累加器，262144B）、tensor<256x256xf16>、tensor<256x128xf32> acc、tensor<256x128xbf16> q/k/v。单个 256x256xf32 即为 cc 的 262144B 需求，等于可用 131072B 的两倍，说明溢出由 BLOCK_M=256×BLOCK_N=256 的单块尺寸决定，无需假设多缓冲。"
+    },
+    {
+      "path": "workspace/failed-ir/attempt-064/3-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "同批通过编译的 case7 IR 使用 128x256xf32 QK（131072B）与 256x128xbf16 K/V，恰好落在 L0C 131072B 内；文件 6 为 causal 64x64（case1）、文件 9 为 fp16 128x128（case2），均无 256x256 全 f32 tile。失败仅与 M256 几何相关。"
+    },
+    {
+      "path": "workspace/starter.py",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "独立冻结的 063 保留版与当前失败源码的差异仅为：run() 新增 BLOCK_M=256 覆盖分支，以及 PART_TILES 准入从 BLOCK_M==128 放宽为 BLOCK_M in (128,256)。063 的四项已验收路径（含 num_stages=2、lookahead、20 worker、精度表达式）别无差异，故移除该覆盖即恢复已验证几何。"
+    },
+    {
+      "path": "workspace/host-repair-analysis.json",
+      "category": "other",
+      "role": "background",
+      "finding": "宿主提出 num_stages=(2 if PART_TILES and BLOCK_M==128 else 1) 的单变量编译器多缓冲试验，并明确其前提是“错误提示自动多缓冲可增加需求”；本次 IR 表明 cc 的 2× 需求来自单个 256x256xf32 tile 而非多缓冲，故记录该建议但选择不同修复。"
+    }
+  ],
+  "hypothesis": "case4 的编译失败由宿主元数据把 BLOCK_M 提到 256 引起：M256×N256 的 QK 结果 256×256 fp32 需要 262144B，超过 L0C 131072B，且 M 维翻倍后的 p/raw_next/acc/Q 使 UB 超过 196608B。num_stages 只改变循环多缓冲，不改变单 tile 尺寸；恢复 BLOCK_M=128 即可回到 063 已通过编译与 checker 的几何。",
+  "change": "在 candidate.py 的 run() 中删除 BLOCK_M=256 覆盖分支，并把 PART_TILES 准入恢复为 BLOCK_M == 128；保留 063 的 BLOCK_M=64(causal)/128(non-causal)、BLOCK_N=64/256、num_stages=(2 if PART_TILES else 1)、QK 前瞻、单次 BF16 PV、FP16 交接、FP32 分母/除法、公共偏移/NoOff、20 worker 连续分区、缓存与输出分配逐字不变。取舍：精度上完全回到已验收路径（每行同一 j 顺序、同一断言表达式）；活跃缓冲上 case4 QK 262144B→131072B、UB 的 M 相关 tile 减半；交接次数从 M256 规划下每 worker 约 12~13 tile 链回到约 25~26 条（与 063 相同，放弃未编译成功的 M256 理论减链）；并行度仍为 P=min(20,T)，case4 T 256→512 全 worker 非空、覆盖不变。",
+  "expected": "case4 恢复可编译：cc 需求 131072B=可用上限，UB 回到 063 的 M128 峰值以内；case1/2/7 源码路径与数值逐字不变，仍通过原 checker/golden/dtype/计时口径。当前源码在修改前并未通过编译，本预测不作为已通过声明。",
+  "validation": "修改后用工具桥 preflight（awaiting_source_review 时保持字节并交接）；宿主后续对四项做完整正式评测，重点确认 case4 编译成功、ub/cc 不再超限、case1/2/4/7 official_checker 仍 passed，并对照 063 计时与资源。",
+  "unknown": [
+    "M128 下 case4 的最终 UB/L0C 实际峰值需由编译输出确认，不能仅凭估算宣称已通过。",
+    "移除 M256 后 case4 的真实性能回到 063 水平（未观察到 M256 收益，因为其从未编译成功）。",
+    "宿主 num_stages=1+M256 试验是否仍失败尚未实跑；本决策依据 IR tile 尺寸推断其不能消除 cc 溢出。"
+  ]
+}

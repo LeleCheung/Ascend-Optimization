@@ -1,0 +1,3347 @@
+[
+  {
+    "invocation": "ir-001",
+    "diagnosis": {
+      "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+      "selected_layer": "single_operator_ir",
+      "evidence": [
+        {
+          "path": "profiling.json",
+          "category": "paired_profiling",
+          "role": "目标用例与冻结基线定义",
+          "finding": "case b batch_norm_with_update_functional-timing-7, 输入 8x64x64x64 fp32 affine seed=1736, tolerance atol=rtol=1e-4 required_matched_ratio=1.0 equal_nan=true; 比较对象 source_sha256=b8d4d4a2..., target_latency_ms=0.0449129, target_speedup=0.62695; 对照 formal-b8d4d4a2c07d。"
+        },
+        {
+          "path": "hotspots.json",
+          "category": "simulator",
+          "role": "流水线占用与指令级热点排序",
+          "finding": "core0.veccore0 上 MTE2 active0.8855/productive0.7759/wait0.1104/idle0.1145，VECTOR active0.8969/productive0.6410/wait_only0.2639，SCALAR active0.0553，SCALARLDST active0.2400(1667事件)。top_instructions 以同步指令为主：BAR@src101 8.36us、BAR@src101 8.34us、BAR@src87 8.29us、BAR@src102 8.11us、WAIT_FLAG(MTE2,line83)7.98us、MOV_SRC_TO_DST_ALIGN(load,line83)7.23us、SET_FLAG(line83)7.21us、WAIT_FLAG(line71)2.93us；算术指令很小：VADDS 'cnt += 1'@src88 1.42us(calls=29)、VMUL@src102 1.41us、VSUB@src87 0.95us。Welford 区域(source_loop 71-103) instruction_time_sum=78.1us、largest=8.36us。说明：cnt 自增是一条真实执行的向量指令且未被后端消除(VADDS@88仍出现)；Welford 主要成本是每步对加载的同步等待(BAR/WAIT_FLAG)。"
+        },
+        {
+          "path": "timeline.json",
+          "category": "simulator",
+          "role": "窗口范围与等待/空闲结构",
+          "finding": "仅报告 core0.veccore0，capture_scope 为 partial(首末可见事件，应用未完成)，故绝对时钟不可比。MTE2 最大 idle 位于 [0.0,0.1041](启动/首载延迟)；此后每约0.031 出现一次小间隙；两遍加载在窗口内连续、pass1/pass2 之间无大间隙。VECTOR 最大 idle 区间在起始段(0.0016-0.0783 等)。支持“受加载延迟与同步约束”的判断，而非纯带宽饱和。"
+        },
+        {
+          "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "category": "source_ir",
+          "role": "实际编译 IR 结构与冗余定位",
+          "finding": "唯一 EVEN 特化。外层 scf.for(第47行)携带 (mean,var,cnt tensor<8x128xi32>)，内层 scf.for(第64行)再携带 cnt；第81行 cnt_65=addi(cnt_52,dense<1>) 每步对 8x128 i32 做向量加；第90行 yield cnt；第94行 final_mean=sitofp(cnt_7#2) 将 1024 元素整型转 f32；第95行 mean*cnt。EVEN 路径下两层循环均无掩码，每个 lane 每步恰好 +1，故 cnt 逐 lane 恒等且等于 m_num_steps*n_num_steps(本例 1*32=32)。cnt 作为循环携带张量属可标量化冗余。"
+        },
+        {
+          "path": "frozen.py",
+          "category": "source_ir",
+          "role": "语义与常量来源确认",
+          "finding": "第54行 cnt=tl.zeros((BLOCK_M,BLOCK_N))，第88/100行 cnt+=1 仅 EVEN 分支无条件累加；BLOCK_M=min(64,next_pow2(8))=8、BLOCK_N=min(4096,max(1,1024//8))=128，_bn_even 对 8x64x64x64 成立(batch%8==0, spatial%128==0) → EVEN=true，与 TTIR 无掩码一致。cnt 最终=32，sitofp(32)=32.0 精确。"
+        }
+      ],
+      "hypothesis": "EVEN 特化下计数量 cnt 在每 lane 恒等(等于 m_num_steps*n_num_steps=32)，却被保留为 8x128 i32 循环携带张量：每步执行一次 VADDS 向量加(profiling 证实@src88 仍执行)、占用一个4KB循环携带 buffer 参与寄存器/UB 轮转，并在结尾对 1024 元素做整型→f32 转换。将其标量化为 m_num_steps*n_num_steps，再以 tt.splat 参与 mean*cnt 与 cnt*(mean-final_mean)^2 的同一逐元素乘序，可去掉每步向量加与一个循环携带 tile，且因 cnt=32.0 可精确表示，输出逐位不变。",
+      "alternatives": [
+        "移除内层循环末次 tl.minimum 钳制导致的重复预取(每个 feature 每遍多 load 一次同 tile)：需条件分支/循环剥离，可能破坏单级软件流水，且仅约1/33的流量，风险大于收益，暂不选。",
+        "加深预取到2级以隐藏加载延迟：需改循环结构并依赖 num_stages(已冻结为1)，改动面大。",
+        "pass2 将 weight*(curr-mean)*inv_std+bias 预组合为 curr*scale+shift 单 FMA：减少每次3个向量运算，但改变浮点结合顺序，在 rtol=1e-4、required_matched_ratio=1.0 下可能失配，违反精度要求，不选。",
+        "仅依赖后端消除 cnt 冗余：profiling 显示 VADDS@src88 仍执行，说明后端未消除，需显式改写。"
+      ],
+      "change": "仅修改唯一 EVEN 特化 IR：将 cnt 从外层/内层 scf.for 的 iter_args 及其结果计数中移除(第47/64行)，删除第81行 cnt 向量加与第29行 cnt 常量；内层 yield(第90行)与外层 yield(第92行)去掉 cnt；在外层循环后新增标量 %cnt_scalar=muli(m_num_steps_4,n_num_steps_6)、%cnt_f=sitofp(i32->f32)、%final_mean=tt.splat 为 tensor<8x128xf32>，替代原第94行的整张量 sitofp；第95/106/109行改为对新 splat 张量及 %cnt_7#0/#1(现仅 mean,var 两个结果)运算。函数 ABI/签名、张量形状与数值运算顺序不变。",
+      "expected": "可测预测：(1) profiling 中 source line88 的 VADDS(cnt+=1) 指令消失，Welford 每步少一次 8x128 i32 向量加；(2) 循环携带 tile 由3(mean,var,cnt)降为2，减少4KB活跃 buffer/寄存器轮转压力，结尾整型→f32 由1024元素降为标量；(3) 输出与基线逐位一致(cnt=32.0 精确，mean*cnt 及 cnt*(mean-fm)^2 乘序不变)；(4) MTE2 事件数/流量不变(不改变 GM 访问)，可作为机制隔离；(5) 因 VECTOR 多为等待 MTE2(productive0.641/wait0.264)，端到端收益可能偏小或落于噪声，但若 UB/寄存器压力曾限制单级软件流水，相应 BAR/WAIT_FLAG 停顿应下降，延迟应不高于当前最佳。",
+      "validation": "宿主对该 TTIR 重新编译：需通过解析且函数签名/特化常量与原一致；与参考(KGS 组合)按 atol=rtol=1e-4、required_matched_ratio=1.0、equal_nan 逐元素比对须全部匹配(预期逐位一致)；profiling 复核 line88 VADDS 消失、MTE2 event_count 不变；对 timing-7 重复测量，比较延迟与 speedup 相对 source_sha256=b8d4d4a2 基线(0.0449129ms / 0.627)。若无可测改善，也应作为“该冗余非关键路径”的明确结论记录。",
+      "layer_reason": "该冗余源于源码显式构造的计数张量在 EVEN 特化下的逐 lane 统一性，属编译期即可判定的标量化，IR 层可在不改变 API、形状与浮点运算顺序的前提下、无副作用地消除；无需改源码或编译选项，机制单一可独立验证。",
+      "simulator_incremental_judgment": "模拟器窗口为 partial(应用未完成)，绝对时钟资质不可比，仅采用相对 active/wait/idle 与指令级证据：窗口内 MTE2 与 VECTOR 均约0.89 active 且 VECTOR wait_only 0.264、MTE2 最大 idle 在启动段，表明受加载延迟/同步约束。本次仅去掉不触及 GM 流量的向量冗余，增量应以 VECTOR 指令数与 BAR/WAIT_FLAG 变化判定，端到端收益须宿主重测确认；未报告泳道(CACHEMISS 等辅助 lane)按材料视为辅助、不构成关键路径。",
+      "codex_contribution": "Codex 在 codex-brief.json 指出 TTIR 中 tensor<8x128xi32> 计数张量可疑、并给出 MTE2 高占比/Vector-Scalar 与 Welford 同步焦点的方向；据此核对实际 IR 后确认 cnt 为 EVEN 下逐 lane 恒等且其向量加在 profile 中仍执行，从而选定标量化 cnt 作为本次单一机制。",
+      "unknown": []
+    },
+    "result": {
+      "api_version": "v6.2",
+      "reference_source": "primary",
+      "status": "PASSED",
+      "device": "npu:0",
+      "server_backend": "npu",
+      "is_hack": false,
+      "hack_reason": "",
+      "geo_mean": 1.8269043426872098,
+      "min_speedup": 0.6194994326440492,
+      "worst_workload_uuid": "batch_norm_with_update_functional-timing-7",
+      "latency_ms": 0.045173406809890425,
+      "abs_err": 0.001953125,
+      "rel_err": 0.005076142027974129,
+      "num_workloads": 27,
+      "num_passed": 27,
+      "timing_skipped": false,
+      "log": "",
+      "per_workload": [
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-0",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-1",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-2",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-3",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-4",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0001220703125,
+          "rel_err": 0.0008250824175775051,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-5",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-6",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-7",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-8",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-9",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-10",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.001953125,
+          "rel_err": 0.005076142027974129,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-11",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-12",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 1.1920928955078125e-07,
+          "rel_err": 1.0033335939851895e-07,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-13",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 2.384185791015625e-07,
+          "rel_err": 2.510349190743e-07,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-14",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 4.76837158203125e-07,
+          "rel_err": 0.00010376304999226704,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-15",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 2.384185791015625e-07,
+          "rel_err": 9.441356496608933e-07,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-16",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 1.430511474609375e-06,
+          "rel_err": 3.1727817258797586e-05,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-17",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 4.76837158203125e-07,
+          "rel_err": 0.00038382329512387514,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-0",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 6.608527190880884,
+          "latency_ms": 0.007621831002124588,
+          "reference_latency_ms": 0.050369077421839235,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-1",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.3423772372972798,
+          "latency_ms": 0.04045148684203331,
+          "reference_latency_ms": 0.05430115515157594,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-2",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.3916756894339377,
+          "latency_ms": 0.04242792183302663,
+          "reference_latency_ms": 0.05904590736822655,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-3",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 6.509809492930956,
+          "latency_ms": 0.007836095582903132,
+          "reference_latency_ms": 0.05101148941309714,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-4",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.327828177304687,
+          "latency_ms": 0.04113034855467113,
+          "reference_latency_ms": 0.054614035753255435,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-5",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.3632281494619019,
+          "latency_ms": 0.043474889901768364,
+          "reference_latency_ms": 0.05926619370884761,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-6",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 3.6804529914672925,
+          "latency_ms": 0.0074878914655178335,
+          "reference_latency_ms": 0.02755883254404752,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-7",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 0.6194994326440492,
+          "latency_ms": 0.045173406809890425,
+          "reference_latency_ms": 0.027984899889325943,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-8",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 0.6834458000231466,
+          "latency_ms": 0.0459941767857564,
+          "reference_latency_ms": 0.03143452694974732,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        }
+      ]
+    },
+    "lowering": null
+  },
+  {
+    "invocation": "ir-002",
+    "diagnosis": {
+      "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+      "selected_layer": "single_operator_ir",
+      "round": "ir-002",
+      "parent": "原始TTIR（ir-001后已按字节恢复为父本；ir-001的计数均匀化无保留收益）",
+      "codex_contribution": "codex-brief.json指出：计数均匀化（ir-001）通过但无保留收益，应寻找比循环携带整数计数更大的实测瓶颈；原始Welford为8x128车道、目标形状约32个空间步，每步伴随多次向量屏障与行拷贝，模拟器把代价绑定到源码Welford循环；建议核查更宽空间瓦片以减少重复屏障/拷贝，并要求对运行时形状加显式适用性守卫。本轮采纳其‘加宽空间瓦片+守卫’方向，但依据实际TTIR与profiling选择合适的宽度与合并方式（uniform count性质、3D reduce合并而非改ABI或改编译选项）。",
+      "evidence": [
+        {
+          "path": "profiling.json",
+          "category": "paired_profiling",
+          "role": "候选侧逐核内存/流水实测（msprof Roofline，64行=64个program=64个vector核，单波次）",
+          "finding": "aiv_time 均值23.181us（19.921~25.953），aiv_total_cycles 均值38248；aiv_mte2_ratio 0.619（0.545~0.703），aiv_mte2_instructions 恒为169；GM_to_UB_datas 264KB、UB_to_GM 128.5KB（=8x64x64x64x4B 的两读一写）；aiv_gm_to_ub_bw 10.9GB/s，GM_to_UB_bw_usage_rate 仅4.97%，即MTE2远未到带宽上限，时间花在描述符/指令效率上；aiv_vec_ratio 0.447（fp32 0.288、misc 0.131、int32 0.028），mte3_ratio 0.215；L2Cache 读命中率51.7%（两趟读各自约512 miss/547 hit）。结论：单核23us移动264KB仅约11GB/s，瓶颈是MTE2的小段(512B/行)搬运与同步，不是HBM带宽。"
+        },
+        {
+          "path": "hotspots.json",
+          "category": "simulator",
+          "role": "core0.veccore0 流水占比与top指令归因",
+          "finding": "窗口9.372us：MTE2 productive 0.776 / wait_only 0.110 / idle 0.114；VECTOR productive 0.641 / wait_only 0.256；SCALAR productive 0.055；SCALARLDST productive 0.240（1667事件）。top指令前六项为4条BAR(PIPE:VEC，各约8.3us累计，calls 28~29，源码行87/101/102)、1条MTE2 WAIT_FLAG 7.98us（源码行83，即预取load）、1条MOV_SRC_TO_DST_ALIGN(MTE2，7.23us，28次，XD=0x2000=每行512B的8行跨步拷贝)。即每轮Welford迭代存在4次向量屏障与一次512Bx8的小段DMA。"
+        },
+        {
+          "path": "timeline.json",
+          "category": "simulator",
+          "role": "同核相对时间轴观测范围与窗口资质",
+          "finding": "status=completed_relative_analysis，capture_scope为‘本核首个至末个可见硬件事件’，time_unit=fraction（相对窗口），非全核绝对时钟；CACHEMISS为auxiliary_trace_lane且idle 0.9985（不构成事件源）；MTE2 active 0.886/wait 0.110/idle 0.114（34个idle区间），VECTOR active 0.897/wait 0.264/idle 0.103。未报告泳道不得当作全kernel时间；因此本诊断只用同核相对占比与profiling的绝对aiv_time互证，不把局部窗口当总耗时。"
+        },
+        {
+          "path": "ir001-post-simulator.json",
+          "category": "simulator",
+          "role": "上一轮候选（计数均匀化）落盘后的同核补测，确认父本瓶颈未变",
+          "finding": "status=ir_bound_observation；MTE2 productive 0.803/wait_only 0.109，VECTOR productive 0.606/wait_only 0.314，即向量端仍有约31%窗口在等操作数，说明删除循环携带整数计数没有触动真正的执行成本；PC区域未映射，故只能作为同核相对证据，不能当性能结论。"
+        },
+        {
+          "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "category": "source_ir",
+          "role": "被编辑的实际TTIR（唯一清单条目，symbol=batch_norm_with_update_kernel，BLOCK_M=8/BLOCK_N=128/EVEN=true特化）",
+          "finding": "统计趟与归一化趟各为 scf.for %m_step(动态 cdiv(batch_dim,8)) { 预取tile0; scf.for %n_step(动态 cdiv(spatial_dim,128)=32) { 预取tile(n+1)(带minsi钳位); delta/mean/var更新 } }；载体瓦片为 tensor<8x128>，每轮一次 tensor<8x128> 的 tt.load 与（第二趟）tt.store，指针为 8x1 跨步广播（行距 input_batch_stride=262144）。每个n步的算术只有7个向量算子却夹了4条barrier（与hotspots的BAR行87/101/102对应）；tile宽128元素=512B/行是MTE2描述符长度的直接来源（169条MTE2指令/264KB）。归约只在末尾用8x128→1024 reshape + tt.reduce(axis=0)。"
+        },
+        {
+          "path": "feedback.json",
+          "category": "paired_profiling",
+          "role": "保留父本与轮次身份",
+          "finding": "correctness 27/27 与两个36/36通过；timing_us: source 45.318 / unchanged_ir 42.955 / ir001 45.173；selection=retain original IR；并明确source与no-op二进制完全一致但计时差约5.5%，因此本轮设置的最低可测门槛必须显著大于该噪声（约2.5us级），仅靠微调不计收益。"
+        },
+        {
+          "path": "codex-brief.json",
+          "category": "source_ir",
+          "role": "宿主证据分析与候选方向",
+          "finding": "要求保留源码字节一致、运行时ABI参数全动态、宽度加宽必须带运行时适用性守卫、每次调用只落一个机制；并指出原始Welford每步多次屏障/行拷贝是目标形状上的主要结构成本（与hotspots的BAR/MOV_SRC_TO_DST_ALIGN一致）。"
+        }
+      ],
+      "hypothesis": "该特化里真正有执行成本的结构缺陷是空间瓦片过窄（BLOCK_N=128，8x128=512B/行）：32个串行n步，每步一次小段跨步DMA(8x512B)加4条向量屏障，导致单核23.2us只搬运264KB（GM_to_UB带宽占用4.97%，MTE2指令169条，平均每条约85ns/1.6KB）。这是TTIR层面的形状/布局选择（常量与瓦片类型），属于编译器不会自动改写的编译缺陷：后端已把掩码、i1载体与计数选择全部消除（EVEN特化下无mask、无where、无select），却不会自行加宽循环瓦片，因为瓦片宽度由constexpr形状固定。加宽到8x512后，同一个特征切片的每行搬运变为2KB连续段、n步从32降为8，MTE2描述符数与屏障数按4倍下降，而每车道的Welford样本序列(1..8步, cnt=1/步)与数学定义完全不变。",
+      "alternatives": [
+        "把两趟(统计+归一化)融合为单趟：需要把整条特征切片(8x4096x4B=128KB)驻留UB或新增GM缓存，spatial_dim为动态，无法在TTIR内安全表达且UB预算紧张，放弃。",
+        "仅做4路展开但保持8x128瓦片：屏障与描述符数量不变，只改善重叠，与profiling的‘描述符效率’证据不匹配，预计收益小。",
+        "把BLOCK_N常量化到512而不加守卫：本特化会被batch%8==0且spatial%128==0的其它形状(如spatial=128/256/384)复用，无mask的加宽load/store会越界，语义不安全，拒绝。",
+        "修改编译选项(如num_stages/multibuffer)：被允许范围排除，且不是IR缺陷修复。",
+        "ir-001的计数均匀化：已实测无保留收益，作为已排除项。"
+      ],
+      "change": "单机制：在统计趟与归一化趟的n循环外加一层 scf.if 适用性守卫（%wide_ok = (cdiv(spatial_dim,512)*512 == spatial_dim)，只用文件内已有的divsi/muli/cmpi标量算子）。真分支为加宽路径：瓦片 tensor<8x512>（%tile_lane_w = make_range(0,512)，步长常量512、步数 cdiv(spatial_dim,512)），保留同样的单步预取(带minsi钳位)、同样的delta形式Welford与同样的输出乘加次序(fp32，weight*(x-mean)*inv_std+bias)；循环后把 8x512 累加器 reshape 为 8x4x128，用 tt.reduce(axis=1) 合并为原 8x128 累加器（均值取4子车道算术平均、计数取和、M2按 var_i + c_i*(mean_i-M)^2 求和——本特化EVEN无掩码，每车道样本数恒等，故该合并与未合并车道在代数上等价），从而与既有收尾归约/运行统计/store代码共享，m循环iter_args与函数ABI不变。假分支逐字节保留原n循环，覆盖spatial_dim不是512倍数的形状。不改pointer/标量参数签名，不改任何布局约定，输出写回同一地址与顺序。",
+      "expected": "可测预测：(1) aiv_mte2_instructions 从169降至约50~60（约4倍下降），GM_to_UB搬bytes不变仍约264KB但每段由512B变2KB；(2) 单核 aiv_time 由23.18us降到约14~17us，MTE2 busy占比由0.619下降，VECTOR占比上升并成为新限制（vec productive+wait约0.9窗口）；(3) 内核级耗时（profiling中该kernel的task duration）应下降≥15%，且明显超过feedback记录的约5.5%(≈2.5us)噪声；若只降<5%则判定该机制不成立。(4) 数值：每车道Welford步序不变、均值/方差的合并只改变求和分组，float32下与父本相对差异应在1e-6量级，远小于atol/rtol 1e-4；27/27与两个36/36须全过。",
+      "validation": "宿主执行完整KGS与正式评测：核对 source_sha256 不变、TTIR可解析并编译、correctness 27/27 与 36/36x2、tolerance atol=rtol=1e-4且required_matched_ratio=1.0；性能以同case正式计时对比父本42.955/45.318us，并回读profiling确认MTE2指令数与单核aiv_time两项预测；若编译失败或数值不符则回退为原始TTIR。",
+      "layer_reason": "所选缺陷完全位于单算子TTIR的瓦片形状与循环结构（常量步长、tensor形状、scf.for/scf.if），不涉及源码、调度、多算子融合或编译选项；frozen.py保持逐字节一致，且宿主已确认父本为完整合格最佳，故续接层为 single_operator_ir。",
+      "simulator_incremental_judgment": "模拟器窗口为单核相对时间轴（fraction，首末可见事件），绝对时钟无资质用于跨轮比较；CACHEMISS泳道idle 0.9985仅为辅助trace，不能计入空闲结论。可用的增量结论是：同核MTE2 productive 0.776/0.803、VECTOR wait_only 0.256/0.314，且top指令为每轮4条BAR与512Bx8的MOV_SRC_TO_DST_ALIGN，说明成本在‘每步小段搬运+每步屏障’，而非掩码/分支/标量；因此把瓦片加宽到8x512是本轮唯一选择的机制，加宽后应以profiling的MTE2指令数与aiv_time为准判定，不把部分窗口当总时间。",
+      "unknown": [
+        "scf.if 双分支同时存在时的UB(CAM)分配是否会让两条路径的buffer叠加，导致8x512路径UB越界或降级；若编译失败，下一步降为8x256。",
+        "tt.reduce(axis=1) 在3D张量上的后端lowering是否被Ascend后端完整支持（文件内既有reduce只有1D axis=0）；若失败改用8x256+pairs合并或全量复制收尾。",
+        "64核单波次下每核独立搬运小段，加宽后是否会把限制从MTE2转成向量发射或L2冲突。"
+      ]
+    },
+    "result": null,
+    "lowering": null
+  },
+  {
+    "invocation": "ir-003",
+    "diagnosis": {
+      "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+      "selected_layer": "single_operator_ir",
+      "evidence": [
+        {
+          "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "category": "source_ir",
+          "role": "当前待修复的单一特化TTIR（唯一清单条目，符号 batch_norm_with_update_kernel，AST 5c1607c0…）",
+          "finding": "统计段在 scf.for %m_step 内部用 scf.if %wide_ok 进入 8x512 宽瓦片分支（行73-137）。该分支每个 m 分块把 w_mean/w_var/w_cnt 重置为 0（行79-82），而步长标量用的是全局 %w_step = m_step*wide_num_steps + w_n + 1（行83-86）：一旦 m_num_steps>1，第 2 个及以后的分块以全局步数做从零开始的 Welford，均值/方差/计数全部错误。另 %wide_ok（行54）只校验 spatial_dim 能被 512 整除，未校验 batch 维度：batch_dim 不是 8 的倍数时 8x512 无掩码加载会读越界行，EVEN 路径的 batch 谓词在宽路径中缺失。归一化段的宽分支（行260-295）无跨分块携带状态，不受此递推缺陷影响。"
+        },
+        {
+          "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "category": "source_ir",
+          "role": "宽分支的组内合并数学",
+          "finding": "%w_m3/%w_v3/%w_c3 把 8x512 重排为 8x4x128 后沿轴1规约：由于 4 条子流样本数相等（各 wide_num_steps），%w_mmean=Σ均值/4 与 %w_vsum=Σ(M2_g + c_g·(m_g-m̄)²) 在单分块、行全有效时是标准的并行方差合并，代数正确；错误仅来自分块间重置与缺失的 batch 守卫，因此可用标准 Chan 合并把分块结果并入携带状态，无需重写组内递推。"
+        },
+        {
+          "path": "profiling.json",
+          "category": "paired_profiling",
+          "role": "正式配对实测：候选内核实测耗时与 AIV 指标（来源 paired-b8d4d4a2/comparison.json）",
+          "finding": "候选 batch_norm_with_update_kernel：Task Duration 47.360947 us，Block Dim 64（64 个 AIV 核），aiv_time 均值 23.181 us、均值周期 38249、aiv_vec_ratio 均值 0.447；参考侧为 3 个算子（BatchNormV3 21.72us + Add 1.12us + Rsqrt 1.52us）。候选侧掩码/宽分支均在该特化内（EVEN=1，BLOCK_M=8，BLOCK_N=128）。"
+        },
+        {
+          "path": "hotspots.json",
+          "category": "simulator",
+          "role": "模拟器热点区域排序（来源 simulator-b8d4d4a2/summary.json，core0.veccore0）",
+          "finding": "统计段 source_loop（源码行71-103）是该核最大热点：指令时间累计 78.1 us、其中 wait 累计 52.2 us，trace 区间并集 8.55 us，涉及 FLOWCTRL/MTE2/SCALAR/VECTOR 四条流水；外层 m 循环（58-103）仅 1.95 us，其余 PC 邻域均 <1.3 us。说明主要成本集中在“逐 128 列瓦片推进的串行 Welford 递推 + 每步载入”的循环体，而不是尾部规约或参数更新。"
+        },
+        {
+          "path": "timeline.json",
+          "category": "simulator",
+          "role": "相对时间线（来源 core0.veccore0-relative-timeline.json）",
+          "finding": "窗口为相对分数、非绝对时钟：MTE2 活跃 0.886（有效 0.776、等待 0.110、空闲 0.114，116 事件）；VECTOR 活跃 0.897（有效 0.641、等待 0.264、空闲 0.103，552 事件）；SCALARLDST 活跃 0.240（1667 事件）；SCALAR 活跃 0.055；CACHEMISS 活跃 0.0015、空闲 0.9985（未报告泳道/无可用于结论的缓存未命中信号）。即数据搬运几乎占满窗口，同时向量流水有 26% 时间在等待，符合“每轮 128 列载入 + 依赖串行的 Welford 步进”造成的停顿。"
+        },
+        {
+          "path": "feedback.json",
+          "category": "paired_profiling",
+          "role": "宿主对上一轮（ir-002）的正式评审结论",
+          "finding": "parent=ir-002，正式评测未提交（formal_evaluation: not submitted）；required 明确为“Read host review. Correct multi-batch recurrence before device execution.”；recommended 指出“单批次分块 + spatial 整除的运行时适用性守卫”可在不改 ABI、不针对基准数据特化的前提下保持加宽机制有效；other 指出四组 Welford 合并仅在单分块时代数有效，但改变了 FP32 分组，仍须满足完整容差。本轮必须先消除这一语义缺陷。"
+        },
+        {
+          "path": "codex-brief.json",
+          "category": "paired_profiling",
+          "role": "Codex 的宿主证据分析与候选方向（记录其贡献）",
+          "finding": "Codex 观察：均匀计数消除（ir-001）通过但无可保留收益，应寻找比“循环携带整数计数”更大的已测瓶颈；原 Welford 用 8x128 车道、目标形状下约 32 个 spatial 步，每步含多次向量屏障与行拷贝，模拟器把成本归于源码 Welford 循环。其候选方向为：在 IR 层加宽 spatial 瓦片以减少递推步数（需运行时守卫生效或回退），或保留逐元素浮点递推的小因子展开并预取。本轮采纳其“加宽 spatial 瓦片”方向，并把其要求的运行时守卫落到 batch 维度整除条件上；展开方向列为备选。"
+        },
+        {
+          "path": "baseline-result.json",
+          "category": "paired_profiling",
+          "role": "当前最佳正式基线与工作负载总览",
+          "finding": "当前最佳正式结果：geo_mean 1.8598，min_speedup 0.6204，27/27 通过，worst workload 为 batch_norm_with_update_functional-timing-7，latency 0.045318 ms（45.32 us），abs_err 0.00195、rel_err 0.00508。context.json 记录目标延迟 0.044913 ms、目标加速比 0.62695。本轮续接必须超过 45.32 us。"
+        },
+        {
+          "path": "ir001-post-profiling.json",
+          "category": "paired_profiling",
+          "role": "上一轮（ir-001）IR 的补测配对剖析",
+          "finding": "ir-001 候选核 Task Duration 46.640934 us（参考 BatchNormV3 21.280426 + Add 1.720034 + Rsqrt 2.560051），相对原始 47.360947 us 仅约 1.5%，与 feedback 的“无可保留收益”一致；说明计数消除/谓词简化不足以改变瓶颈，需要减少递推步数本身。"
+        },
+        {
+          "path": "ir-inventory.json",
+          "category": "source_ir",
+          "role": "可编辑清单与冻结边界",
+          "finding": "清单只含 1 个特化（batch_norm_with_update_kernel.ttir，original_sha256 fb0bdf35…，BLOCK_M=8/BLOCK_N=128/EVEN=true，8 个 constexpr 常量映射）。工作区不存在 lowered-inventory.json，也不存在 compiled-readonly/，因此没有可核对的 ttadapter/bcmlir 低层产物；本轮只改该 TTIR，源文件与清单冻结。"
+        }
+      ],
+      "hypothesis": "统计段宽分支（8x512）把每个 m 分块的 spatial 递推步数由 32 降到 8，直接削减热点统计循环的迭代固定开销与向量屏障次数，是模拟器证据指向的最大可改编译缺陷；但当前 IR 的实现在多批次分块时把累加器重置为 0 却沿用全局步数，并且 %wide_ok 缺少 batch 整除守卫，因此在 batch_dim>8 或非 8 倍数时语义错误，性能也不可信。若把分块结果用标准 Chan 合并并入携带的 (mean, var, cnt) 状态，并把守卫改为 (batch_dim % 8 == 0 && spatial_dim % 512 == 0)，则：单分块基准形状（batch=8, spatial=4096, m_num_steps=1）下合并退化为恒等（c_old=0 ⇒ mean=分块均值、var=分块 M2），生成的设备路径与当前宽分支完全一致；多分块形状得到与原逐元素 Welford 相同的全量均值/无偏方差语义。由此可测预测：统计循环每核迭代数 32→8，热点 wait 时间下降，内核耗时从 46.6-47.4 us 区间下降到 44 us 附近，正式延迟低于 45.32 us 的当前最佳。",
+      "alternatives": [
+        {
+          "name": "最小守卫方案（宿主推荐）：只在 %wide_ok 中加入 m_num_steps == 1 条件，宽分支保持分块内从零开始的合并",
+          "assessment": "能消除多分块错误且改动最小，但把加宽限制为 batch_dim 恰为 8（单分块且行全有效）的形状，对 batch_dim=16/24 等仍回退到 8x128 慢路径；机制适用面被基准形状绑定，泛化性差，故不选。"
+        },
+        {
+          "name": "把宽分支整体移出 m 循环，用扁平化 (m,n) 循环在 8x4x128 状态上做单一 Welford，末尾只合并一次",
+          "assessment": "FP 分组最接近原递推（每元素流只被切成 4 条子流），但需要重排外层循环结构与指针推导（每轮做整除/取余），IR 改动面大、编译风险高；收益预计与所选方案在基准形状上相同，留作后续候选。"
+        },
+        {
+          "name": "UB 内缓存第一遍输入，消除归一化段的第二次 GM 读取",
+          "assessment": "按 MTE2 有效占比 0.776、总流量约 24MB 估计，理论上可把搬运量降 1/3，是潜在更大的收益；但每个核的切片为 8x4096 fp32=128KB，叠加工作缓冲可能超出 UB 预算，且是独立机制，需单独评估并单独提交，本轮不做。"
+        },
+        {
+          "name": "Codex 备选：保留逐元素递推的小因子展开 + 预取",
+          "assessment": "统计递推是串行依赖，展开只减少循环控制开销，不减少屏障/载入次数；与加宽方向相比收益更小，本轮不选。"
+        },
+        {
+          "name": "仅修改编译选项或重写源码",
+          "assessment": "规则禁止；源码与 context 冻结，编译选项改动不属于单算子 IR 层研究身份。"
+        }
+      ],
+      "change": "在唯一特化 batch_norm_with_update_kernel.ttir 中做一处同机制的三点小编辑（不触碰函数 ABI、参数、常量映射与归一化段）：(1) 把 %wide_ok 扩展为 (wide_num_steps*512 == spatial_dim) && (m_num_steps*8 == batch_dim)，即新增 %wide_bspan/%wide_bok 并用 arith.andi 合成；(2) 宽统计循环内的步长标量改为分块本地计数 %w_step2 = w_n + 1（删除全局 m_step*wide_num_steps 偏移），使每个 m 分块的 4 条子流从零开始做标准 Welford；(3) 在宽分支 yield 之前用标准 Chan 合并把分块结果并入外层携带状态：c_new=c_old+w_csum，delta=w_mmean-mean，mean_new=mean+delta*(c_chunk/c_new)，var_new=var+w_vsum+delta²*(c_old*c_chunk/c_new)，yield 合并后的 (mean_new, var_new, c_new)。c_new 恒 >0，无 0 除；c_old=0 时退化为恒等。",
+      "expected": "语义：所有运行期形状保持完整数学语义——单分块（batch_dim=8）路径与修复前完全等价；多分块（batch_dim=16,24,…）得到正确全局均值与无偏方差，取代原先的错误重置；batch_dim 非 8 倍数或 spatial 非 512 倍数时宽路径不生效，回退到原有 8x128 掩码/无掩码路径，不越界、不改变输出顺序、别名与特殊值行为；计数恒等于有效样本数 (batch_dim*spatial_dim)。退化情形不新增特殊值行为：spatial_dim=0 或 batch_dim=0 时末尾均值/方差本就除以 0 得 NaN（与原实现一致，宽分支在 batch_dim=0 时 m 循环为空不会被进入）；非退化形状下合并分母 c_new=4*wide_num_steps ≥ 4，不存在 0 除。浮点：仅把分组方式从“单流 32 步”改为“4 条 8 步子流 + Chan 合并（单分块时仅一次组内合并）”，与原实现的分块一致性均属标准并行方差合并，仍满足 atol=rtol=1e-4、matched_ratio=1.0。性能预测（可测）：统计热点循环每核迭代次数由 32 降为 8，hotspots 中 source_loop(71-103) 的 wait 累计与 trace 并集应下降；timeline 中 VECTOR wait_ratio（0.264）应下降而 MTE2 有效占比基本不变（字节数不变）；内核 Task Duration 从 ir-001 实测 46.64 us 降至 44.0 us 附近（预测区间 42.5–45.0 us），正式 worst-case latency 应低于当前最佳 0.045318 ms 与目标 0.044913 ms。证伪条件：若正式评测 latency ≥ 0.045318 ms，或热点统计循环未见迭代/等待下降，则加宽机制在此目标上无效，应改用 UB 缓存第二遍读取方向。",
+      "validation": "宿主审查后执行：完整 KGS（27 个工作负载正确性 + 计时）与正式评测。重点核对 (a) correctness-* 全部 PASSED、abs/rel 误差在 1e-4 容差、matched_ratio=1.0；(b) 覆盖 batch_dim 非 8 倍数、spatial_dim 非 512 倍数、batch_dim>8（多分块）的补测形状，确认守卫与 Chan 合并；(c) timing-7 延迟与 baseline 0.045318 ms 对比；(d) 复测 profiling/hotspots，确认统计循环迭代数与 wait 下降。本轮文档与预检不作为收益结论。",
+      "layer_reason": "缺陷位于 TTIR 层的循环结构、跨迭代携带状态与运行时守卫，属于编译器/IR 可表达且可独立验证的机制；源码与 context 冻结，改动清单允许的唯一特化即可覆盖统计与归一化两段；不涉及 ABI、常量映射或编译选项，符合 single_operator_ir 研究身份。工作区无 lowered-inventory.json 与 compiled-readonly/，无法核对后端是否已消除该冗余，故直接在当前可编辑 TTIR 上修复，实测由宿主完成。",
+      "simulator_incremental_judgment": "模拟器取证为 core0.veccore0 的相对窗口（capture 0→1 为可见事件首末，display_time_unit=window_fraction），不具备绝对时钟资质，只用于同一窗口内的流水/等待/空闲对比与热点排序，不用于宣称真实耗时或因果；CACHEMISS 泳道 99.85% 空闲说明该核没有可用的缓存未命中信号，未报告泳道（如 AIC/cube、HBM 带宽计数器）不作推断。MTE2 有效 0.776 且几乎无空闲、VECTOR 等待 0.264，配合热点统计循环 52.2 us 等待累计，增量判断为：搬运量已接近饱和而向量侧因串行递推步进反复等待，减少递推步数（32→8）应主要降低 VECTOR 等待与循环控制开销，搬运量不变则 MTE2 占比基本不变；这与预期收益量级（数个百分点的内核时间）一致，若实测不符则说明瓶颈另在别处（下一步转向消除第二遍 GM 读取）。",
+      "unknown": [
+        "后端是否会把 8x512 宽瓦片拆成多指令并引入额外 UB 压力或寄存器/缓冲竞争；无 lowered-inventory.json 无法预判。",
+        "ir-002 的加宽路径从未在设备上运行，宽瓦片本身的实测收益只能由宿主评测确认。",
+        "显式 cache 相关泳道缺失，无法区分 HBM 与 UB 层级的实际瓶颈。"
+      ]
+    },
+    "result": null,
+    "lowering": {
+      "status": "lowering_review_failed",
+      "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+      "compiler_identity": {
+        "triton_version": "3.5.1",
+        "sources": {
+          "compiler/compiler.py": "ca9380e543d8ccf6b9b363f57ff6bc9674c32a4e0db16ea79e5688cff2da0264",
+          "backends/ascend/compiler.py": "62ddbfbd42914b234b9c392a91095e313536b855d0bf121729a83c81a07c13b6",
+          "runtime/cache.py": "0355c3e3452fa4500122244b8fff8864f22bc05c417a3d6f5dada9f2e92f8040",
+          "knobs.py": "4cab52a62325ab5ffc0d1eb963d78a2621d8e6a8f9c1505186c1ba7c4976d2ac"
+        },
+        "resolved_sources": {
+          "triton.compiler.compiler": {
+            "path": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/spec/ascend/compiler/compiler.py",
+            "sha256": "31ea8760a43db36ef59d8622d74761a147fbad1cf05e1a760ec341d8a374308b"
+          },
+          "triton.backends.ascend.compiler": {
+            "path": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/compiler.py",
+            "sha256": "62ddbfbd42914b234b9c392a91095e313536b855d0bf121729a83c81a07c13b6"
+          },
+          "triton.runtime.jit": {
+            "path": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/spec/ascend/runtime/jit.py",
+            "sha256": "d4b9f4cc94c7a5beeb06d8c9404442cdfa26aabc4a474697a090639deb72d2db"
+          },
+          "triton.runtime.cache": {
+            "path": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/runtime/cache.py",
+            "sha256": "0355c3e3452fa4500122244b8fff8864f22bc05c417a3d6f5dada9f2e92f8040"
+          }
+        },
+        "compiler_environment": {}
+      },
+      "rows": [
+        {
+          "variant": "original",
+          "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "input_ir_sha256": "70534ac7444e9f74c67d21a3738a64c43e0cb1dd1b3c0ab0797465759e927c05",
+          "target": {
+            "backend": "npu",
+            "arch": "Ascend910B4-1",
+            "warp_size": 0
+          },
+          "options": {
+            "add_auto_scheduling": false,
+            "allow_fp8e4nv": false,
+            "allowed_dot_input_precisions": {
+              "__tuple__": [
+                "ieee",
+                "hf32"
+              ]
+            },
+            "arch": "Ascend910B4-1",
+            "auto_blockify_size": 1,
+            "auto_tile_and_bind_subblock": true,
+            "auto_vectorize_v2_max_fused_ops_num": null,
+            "bisheng_options": "-cce-link-aicore-ll-module /usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/lib/libdevice.10.bc",
+            "cluster_dims": {
+              "__tuple__": [
+                1,
+                1,
+                1
+              ]
+            },
+            "compile_mode": "simd",
+            "compile_on_910_95": false,
+            "custom_pipeline": null,
+            "debug": false,
+            "default_dot_input_precision": "ieee",
+            "deprecated_fp8_dtypes": {
+              "__tuple__": []
+            },
+            "disable_auto_inject_block_sync": null,
+            "disable_fma": false,
+            "disable_size_align_for_cast": null,
+            "disable_tightly_coupled_buffer_reuse": false,
+            "enable_auto_bind_sub_block": null,
+            "enable_auto_blockify": null,
+            "enable_auto_vectorize_v2": null,
+            "enable_bishengir_simt_optimization": 0,
+            "enable_cce_vf_auto_sync": null,
+            "enable_cce_vf_remove_membar": null,
+            "enable_drop_unit_dims": null,
+            "enable_dynamic_cv_pipeline": false,
+            "enable_flatten": null,
+            "enable_fp_fusion": true,
+            "enable_hivm_auto_cv_balance": null,
+            "enable_mask_fallback_conversion": false,
+            "enable_mixed_cv": null,
+            "enable_nd2nz_on_vector": false,
+            "enable_persistent": false,
+            "enable_preload": null,
+            "enable_select_analysis": true,
+            "enable_simt_reorder_instruction": false,
+            "enable_sync_block_lock": false,
+            "enable_ubuf_saving": null,
+            "enable_vf_fusion": false,
+            "enable_warp_specialization": false,
+            "extern_libs": null,
+            "force_simt_only": false,
+            "force_simt_template": false,
+            "hfusion_enable_multiple_consumer_fusion": false,
+            "inject_barrier_all": null,
+            "inject_block_all": null,
+            "instrumentation_mode": "",
+            "kernel_name": "batch_norm_with_update_kernel",
+            "limit_auto_multi_buffer_of_local_buffer": null,
+            "limit_auto_multi_buffer_only_for_local_buffer": null,
+            "llvm_version": 15,
+            "max_num_imprecise_acc_default": 0,
+            "mix_mode": "aiv",
+            "multibuffer": true,
+            "num_buffers_warp_spec": 0,
+            "num_consumer_groups": 0,
+            "num_ctas": 1,
+            "num_stages": 1,
+            "num_warps": 2,
+            "optimize_dynamic_offset": false,
+            "optimize_epilogue": false,
+            "parallel_mode": "simd",
+            "prevec_max_fused_ops_num": null,
+            "reg_dec_producer": 0,
+            "reg_inc_consumer": 0,
+            "sanitize_overflow": true,
+            "set_workspace_multibuffer": null,
+            "shared_mem_dynamic_size": 221184,
+            "simt_stack_limit": null,
+            "stream": null,
+            "supported_fp8_dtypes": {
+              "__tuple__": [
+                "fp8e5",
+                "fp8e4b15",
+                "fp8e4nv",
+                "fp8e4b8",
+                "fp8e5b16"
+              ]
+            },
+            "sync_solver": null,
+            "tile_mix_cube_loop": null,
+            "tile_mix_vector_loop": null,
+            "unit_flag": null,
+            "use_bytecode": true,
+            "vf_merge_level": 1,
+            "warp_size": 32
+          },
+          "status": "lowering_failed",
+          "error": "MLIRCompilationError: \n///------------------[ERROR][Triton][BEG]------------------\n[ConvertLinalgIRToBinary] encounters error:\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: Failed to run BiShengHIR pipeline\n\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: ub overflow, requires 10485760 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: Failed to run BiShengHIR pipeline\n\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: ub overflow, requires 10485760 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: Failed to run BiShengHIR pipeline\n\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: ub overflow, requires 10485760 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: Failed to run BiShengHIR pipeline\n\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: ub overflow, requires 10485760 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: Failed to run BiShengHIR pipeline\n\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: ub overflow, requires 10485760 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\n[ERROR] Failed to run BiShengIR pipeline\n\n\n[INFO]: The compiled kernel cache is in /data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/agent-calls/ir-003/lowering-review/cache/PXWQMWONJDVSKUQW4CR3RQFH3BMIS56IJWOWDCQNI6DRSOTEQVUA\n\n///------------------[ERROR][Triton][END]------------------\n",
+          "traceback": "Traceback (most recent call last):\n  File \"/usr/local/python3.11.15/lib/python3.11/site-packages/triton/spec/ascend/compiler/compiler.py\", line 330, in compile\n    next_module = compile_ir(module, metadata)\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/compiler.py\", line 1136, in <lambda>\n    stages[\"npubin\"] = (lambda src, metadata: _compile_linalg_to_npu_bin(src, metadata, options))\n                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/compiler.py\", line 659, in _compile_linalg_to_npu_bin\n    return linalg_to_bin_enable_npu_compile_A2_A3(linalg, metadata, opt)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/compiler.py\", line 841, in linalg_to_bin_enable_npu_compile_A2_A3\n    ret = subprocess.run(cmd_list, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/python3.11.15/lib/python3.11/subprocess.py\", line 571, in run\n    raise CalledProcessError(retcode, process.args,\nsubprocess.CalledProcessError: Command '['/usr/local/Ascend/cann-9.0.0/bin/bishengir-compile', '/tmp/tmp2ytlvqbx/kernel.mlir', '--target=Ascend910B4-1', '--enable-auto-multi-buffer=False', '--enable-auto-bind-sub-block=True', '--link-aicore-bitcode=/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/lib/libdevice.10.bc', '--enable-hfusion-compile=true', '--enable-hivm-compile=true', '--enable-triton-kernel-compile=true', '-o', '/tmp/tmp2ytlvqbx/kernel']' returned non-zero exit status 1.\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/data/hanle/ascend-optimization/runs/ir-performance-20261119/tools/ir_lowering_review.py\", line 92, in main\n    kernel = compiler.compile(str(source), target=target, options=restore(entry['compiler_options']))\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/python3.11.15/lib/python3.11/site-packages/triton/spec/ascend/compiler/compiler.py\", line 351, in compile\n    raise MLIRCompilationError(stage_name, error_detail) from e\ntriton.compiler.errors.MLIRCompilationError: \n///------------------[ERROR][Triton][BEG]------------------\n[ConvertLinalgIRToBinary] encounters error:\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: Failed to run BiShengHIR pipeline\n\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: ub overflow, requires 10485760 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: Failed to run BiShengHIR pipeline\n\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: ub overflow, requires 10485760 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: Failed to run BiShengHIR pipeline\n\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: ub overflow, requires 10485760 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: Failed to run BiShengHIR pipeline\n\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: ub overflow, requires 10485760 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: Failed to run BiShengHIR pipeline\n\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: ub overflow, requires 10485760 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\n[ERROR] Failed to run BiShengIR pipeline\n\n\n[INFO]: The compiled kernel cache is in /data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/agent-calls/ir-003/lowering-review/cache/PXWQMWONJDVSKUQW4CR3RQFH3BMIS56IJWOWDCQNI6DRSOTEQVUA\n\n///------------------[ERROR][Triton][END]------------------\n\n"
+        },
+        {
+          "variant": "candidate",
+          "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "input_ir_sha256": "1aea98fbce63adb61a0440474ac67b6563a873125f54b0a170fbe1ea67fabb1e",
+          "target": {
+            "backend": "npu",
+            "arch": "Ascend910B4-1",
+            "warp_size": 0
+          },
+          "options": {
+            "add_auto_scheduling": false,
+            "allow_fp8e4nv": false,
+            "allowed_dot_input_precisions": {
+              "__tuple__": [
+                "ieee",
+                "hf32"
+              ]
+            },
+            "arch": "Ascend910B4-1",
+            "auto_blockify_size": 1,
+            "auto_tile_and_bind_subblock": true,
+            "auto_vectorize_v2_max_fused_ops_num": null,
+            "bisheng_options": "-cce-link-aicore-ll-module /usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/lib/libdevice.10.bc",
+            "cluster_dims": {
+              "__tuple__": [
+                1,
+                1,
+                1
+              ]
+            },
+            "compile_mode": "simd",
+            "compile_on_910_95": false,
+            "custom_pipeline": null,
+            "debug": false,
+            "default_dot_input_precision": "ieee",
+            "deprecated_fp8_dtypes": {
+              "__tuple__": []
+            },
+            "disable_auto_inject_block_sync": null,
+            "disable_fma": false,
+            "disable_size_align_for_cast": null,
+            "disable_tightly_coupled_buffer_reuse": false,
+            "enable_auto_bind_sub_block": null,
+            "enable_auto_blockify": null,
+            "enable_auto_vectorize_v2": null,
+            "enable_bishengir_simt_optimization": 0,
+            "enable_cce_vf_auto_sync": null,
+            "enable_cce_vf_remove_membar": null,
+            "enable_drop_unit_dims": null,
+            "enable_dynamic_cv_pipeline": false,
+            "enable_flatten": null,
+            "enable_fp_fusion": true,
+            "enable_hivm_auto_cv_balance": null,
+            "enable_mask_fallback_conversion": false,
+            "enable_mixed_cv": null,
+            "enable_nd2nz_on_vector": false,
+            "enable_persistent": false,
+            "enable_preload": null,
+            "enable_select_analysis": true,
+            "enable_simt_reorder_instruction": false,
+            "enable_sync_block_lock": false,
+            "enable_ubuf_saving": null,
+            "enable_vf_fusion": false,
+            "enable_warp_specialization": false,
+            "extern_libs": null,
+            "force_simt_only": false,
+            "force_simt_template": false,
+            "hfusion_enable_multiple_consumer_fusion": false,
+            "inject_barrier_all": null,
+            "inject_block_all": null,
+            "instrumentation_mode": "",
+            "kernel_name": "batch_norm_with_update_kernel",
+            "limit_auto_multi_buffer_of_local_buffer": null,
+            "limit_auto_multi_buffer_only_for_local_buffer": null,
+            "llvm_version": 15,
+            "max_num_imprecise_acc_default": 0,
+            "mix_mode": "aiv",
+            "multibuffer": true,
+            "num_buffers_warp_spec": 0,
+            "num_consumer_groups": 0,
+            "num_ctas": 1,
+            "num_stages": 1,
+            "num_warps": 2,
+            "optimize_dynamic_offset": false,
+            "optimize_epilogue": false,
+            "parallel_mode": "simd",
+            "prevec_max_fused_ops_num": null,
+            "reg_dec_producer": 0,
+            "reg_inc_consumer": 0,
+            "sanitize_overflow": true,
+            "set_workspace_multibuffer": null,
+            "shared_mem_dynamic_size": 221184,
+            "simt_stack_limit": null,
+            "stream": null,
+            "supported_fp8_dtypes": {
+              "__tuple__": [
+                "fp8e5",
+                "fp8e4b15",
+                "fp8e4nv",
+                "fp8e4b8",
+                "fp8e5b16"
+              ]
+            },
+            "sync_solver": null,
+            "tile_mix_cube_loop": null,
+            "tile_mix_vector_loop": null,
+            "unit_flag": null,
+            "use_bytecode": true,
+            "vf_merge_level": 1,
+            "warp_size": 32
+          },
+          "status": "lowering_failed",
+          "error": "MLIRCompilationError: \n///------------------[ERROR][Triton][BEG]------------------\n[ConvertLinalgIRToBinary] encounters error:\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: Failed to run BiShengHIR pipeline\n\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: ub overflow, requires 10485760 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: Failed to run BiShengHIR pipeline\n\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: ub overflow, requires 10485760 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: Failed to run BiShengHIR pipeline\n\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: ub overflow, requires 10485760 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: Failed to run BiShengHIR pipeline\n\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: ub overflow, requires 10485760 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: Failed to run BiShengHIR pipeline\n\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: ub overflow, requires 10485760 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\n[ERROR] Failed to run BiShengIR pipeline\n\n\n[INFO]: The compiled kernel cache is in /data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/agent-calls/ir-003/lowering-review/cache/6XHNTOVYGKA5LTULKP7SHYIT4SIPGZIKN4VO4PV6N2HECJP754QA\n\n///------------------[ERROR][Triton][END]------------------\n",
+          "traceback": "Traceback (most recent call last):\n  File \"/usr/local/python3.11.15/lib/python3.11/site-packages/triton/spec/ascend/compiler/compiler.py\", line 330, in compile\n    next_module = compile_ir(module, metadata)\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/compiler.py\", line 1136, in <lambda>\n    stages[\"npubin\"] = (lambda src, metadata: _compile_linalg_to_npu_bin(src, metadata, options))\n                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/compiler.py\", line 659, in _compile_linalg_to_npu_bin\n    return linalg_to_bin_enable_npu_compile_A2_A3(linalg, metadata, opt)\n           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/compiler.py\", line 841, in linalg_to_bin_enable_npu_compile_A2_A3\n    ret = subprocess.run(cmd_list, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/python3.11.15/lib/python3.11/subprocess.py\", line 571, in run\n    raise CalledProcessError(retcode, process.args,\nsubprocess.CalledProcessError: Command '['/usr/local/Ascend/cann-9.0.0/bin/bishengir-compile', '/tmp/tmpejitynqe/kernel.mlir', '--target=Ascend910B4-1', '--enable-auto-multi-buffer=False', '--enable-auto-bind-sub-block=True', '--link-aicore-bitcode=/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/lib/libdevice.10.bc', '--enable-hfusion-compile=true', '--enable-hivm-compile=true', '--enable-triton-kernel-compile=true', '-o', '/tmp/tmpejitynqe/kernel']' returned non-zero exit status 1.\n\nThe above exception was the direct cause of the following exception:\n\nTraceback (most recent call last):\n  File \"/data/hanle/ascend-optimization/runs/ir-performance-20261119/tools/ir_lowering_review.py\", line 92, in main\n    kernel = compiler.compile(str(source), target=target, options=restore(entry['compiler_options']))\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/python3.11.15/lib/python3.11/site-packages/triton/spec/ascend/compiler/compiler.py\", line 351, in compile\n    raise MLIRCompilationError(stage_name, error_detail) from e\ntriton.compiler.errors.MLIRCompilationError: \n///------------------[ERROR][Triton][BEG]------------------\n[ConvertLinalgIRToBinary] encounters error:\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: Failed to run BiShengHIR pipeline\n\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: ub overflow, requires 10485760 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: Failed to run BiShengHIR pipeline\n\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: ub overflow, requires 10485760 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: Failed to run BiShengHIR pipeline\n\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: ub overflow, requires 10485760 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: Failed to run BiShengHIR pipeline\n\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: ub overflow, requires 10485760 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: Failed to run BiShengHIR pipeline\n\nloc(\"/data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/workspace/frozen.py\":50:0): error: ub overflow, requires 10485760 bits while 1572864 bits available! (possible reason: tiling basic block is too large or block number is more than what user expect due to multi-buffer feature is enabled and some ops need extra local buffer.)\n[ERROR] Failed to run BiShengIR pipeline\n\n\n[INFO]: The compiled kernel cache is in /data/hanle/ascend-optimization/runs/ir-performance-20261119/batchnorm/agent-calls/ir-003/lowering-review/cache/6XHNTOVYGKA5LTULKP7SHYIT4SIPGZIKN4VO4PV6N2HECJP754QA\n\n///------------------[ERROR][Triton][END]------------------\n\n"
+        }
+      ],
+      "npu_initialized": false,
+      "scope": "IRSource lowering with captured target/options; actual AST injection, correctness and performance are separate"
+    }
+  },
+  {
+    "invocation": "ir-004",
+    "diagnosis": {
+      "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+      "selected_layer": "single_operator_ir",
+      "evidence": [
+        {
+          "path": "profiling.json",
+          "category": "paired_profiling",
+          "role": "当前最佳的真实设备耗时与对标线（正式结果身份）",
+          "finding": "候选 kernel batch_norm_with_update_kernel Task Duration=47.360947us，Block Dim=64，Op Type=vector，即 64 个 program 各占一个 AIV 核并各处理一个 feature 的 8x4096 元素；参考侧由 BatchNormV3(22.120443us/32核)+Add(1.740035us)+Rsqrt(2.500050us) 组合而成，runtime_tasks 合计约 24.4us。context.json 给出当前最佳对标 target_latency=0.04491291751488147ms、target_speedup=0.626948209054333，因此候选必须把 47.36us 压到该线以下才算超过当前最佳；源码 SHA 未变（frozen.py 逐字节一致）。"
+        },
+        {
+          "path": "hotspots.json",
+          "category": "simulator",
+          "role": "逐流水占用与热点排序（本次首选判据）",
+          "finding": "core0.veccore0 观测窗口 capture_duration=9.371994567918591us：VECTOR active_ratio=0.8969（productive 0.6410，wait_only 0.2559，event_count=552），MTE2 active_ratio=0.8855（productive 0.7759，wait 0.1104，event_count=116），SCALARLDST event_count=1667、SCALAR active 仅 0.0553。热点区域 'source_loop' 71-103（统计 Welford 内层）指令时间累计 78.1us 中 wait 占 52.2us。两条硬件流水几乎同时被占满、且各自带大量 WAIT/BAR，说明瓶颈是“每 tile 的 GM↔UB 搬移与向量计算之间的同步节奏”，而不是某一条多余算术；因此减少每通道的 tile 轮次（同步事件数与 DMA 命令数）是直接可测的作用点。"
+        },
+        {
+          "path": "timeline.json",
+          "category": "simulator",
+          "role": "相对时钟资质与空闲/等待解释（限制绝对结论）",
+          "finding": "clock_qualification='relative_only'，absolute_time_qualified=false，capture_scope='First to last visible hardware event on this core; partial capture boundaries preserved'，interpretation 明确“No full-kernel duration or dependency-stall attribution”；窗口仅以 fraction 表达（capture_start=0.0, capture_end=1.0），MTE2 idle 34 段、VECTOR idle 118 段。故本诊断只用窗口内的比例与事件计数做相对增量判断，不把 9.37us 窗口与 profiler 的 47.36us 整核 task duration 相减；未报告泳道（如 AIC/CACHEMISS）按辅助泳道处理，不进入关键路径推断。"
+        },
+        {
+          "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "category": "source_ir",
+          "role": "实际待编辑 TTIR（唯一可写面）",
+          "finding": "第160-211行是归一化/输出通道：m 循环（m_num_steps_4=cdiv(batch_dim,8)=1）内先做一次 8x128 prologue 载入（第178-182行），内层 n 循环（n_num_steps_6=cdiv(spatial_dim,128)=32）每轮预取下一 tile（第189行 minsi 夹紧到最后一 tile）、计算 addf(mulf(mulf(weight, subf(x,%var)), %inv_std_21), %9)（第197-203行）并写回（第208行）。该通道无归约、无跨 tile 依赖、无掩码（EVEN 路径），是纯逐 tile 流式循环；weight/inv_std/bias 的 tt.splat 位于最内层循环体内（第198、200、202行）。统计 Welford 通道（第47-115行）与两次 tt.reduce、running-stats 更新保持不动。"
+        },
+        {
+          "path": "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/eaea61f4850d20e42140da59577ec1ac4b6b7cf061027bbd093bb577c1d535d4/batch_norm_with_update_kernel.bcmlir",
+          "category": "source_ir",
+          "role": "实际后端产物（冻结）核对疑似冗余是否已被消除",
+          "finding": "输出通道第197-238行：每个 tile 一次 memref.copy(GM→UB, memref<8x128xf32>) + 张量算术，另加 3 个 linalg.fill（第227、229、231行，分别广播 weight/inv_std/bias）；而 mean 的 fill(%19，第109行) 已在循环外被保留 —— 说明后端在源 IR 已外提时会保留外提，循环内的广播确实按每轮一次 fill 落盘（未被消除）。第214-238行的 prefectch 结构显示每通道搬入 33 次（32 tile + 末尾重复搬入最后一 tile，约 3% GM 冗余，后端未消除）；ptr 张量未在 bcmlir 中出现（被折叠为 DMA 描述符/地址寄存器），UB 只承载数据缓冲，这是评估 UB 预算的关键依据。"
+        },
+        {
+          "path": "feedback.json",
+          "category": "paired_profiling",
+          "role": "上一轮正式/补测结论（本轮约束来源）",
+          "finding": "ir-003（及探索父 ir-002）在 CPU lowering 阶段即失败：UB 需 10485760 bits=1310720 字节，可用 1572864 bits=196608 字节；结论要求下一轮选“更低占用、独立”的 IR 机制、不得改编译选项、必须为运行时适用条件加守卫。对应 failed-lowering-ir003.json 的 status='lowering_review_failed'。原始 TTIR 已按字节恢复。"
+        },
+        {
+          "path": "lowered-inventory.json",
+          "category": "source_ir",
+          "role": "冻结低层身份清单（可编辑面边界）",
+          "finding": "仅 3 个条目：ttadapter(38781B)、bcmlir(34642B)、npubin(7264B)，全部绑定 ast_sha256=5c1607c0…2508 与同一特化路径，scope='Read-only actual lowering and binary identities from the frozen-source capture'；配合 ir-inventory.json（唯一 TTIR 条目，compiler_options 已冻结：num_warps=2、num_stages=1、multibuffer=true、shared_mem_dynamic_size=221184），可编辑面仅 ir/…/batch_norm_with_update_kernel.ttir。"
+        }
+      ],
+      "hypothesis": "归一化/输出通道的 tile 宽度 8x128 太小：每个 program 在该通道要做 32 轮“搬入 8 行各 512B → 4 个向量张量运算 → 写回 8 行各 512B”，每轮夹带一对 MTE2↔VECTOR 的 SET_FLAG/WAIT_FLAG 与 BAR 同步事件（bcmlir 每轮一次 memref.copy；simulator 中 MTE2 event_count=116、VECTOR wait_only=0.2559、两条流水同时约 89% 占用）。该通道没有归约、没有跨 tile 依赖、逐元素算术只依赖标量 mean/inv_std/weight/bias，所以分块宽度是纯 IR 层可自由选择的结构参数，而编译器当前固定按 BLOCK_N=128 展开（该值来自源码 heuristics 常量 21/128，已被冻结进 TTIR 常量）。把输出通道加宽到 8x256 可把该通道轮次 32→16、DMA 命令数与同步事件数近似减半、连续搬运段 512B→1KB，而每个元素的算术次数与顺序完全不变。Codex 的分析（codex-brief.json）也指出应“只加宽归一化/输出通道、保留完整统计通道，并用运行时空间整除守卫+原输出路径兜底，先做二倍宽度试探”，本诊断核对实际 TTIR/bcmlir 后采纳这一方向，并把实现限定在 scf.if 的单一真分支内以控制 UB 占用（统计通道与累加器一律不动，避免 ir-003 的 1.31MB UB 溢出）。",
+      "alternatives": [
+        "加宽统计(Welford)通道或 8x512 累加器：ir-002/ir-003 已证明 UB 需 1.31MB 远超 192KB，予以排除；本轮不再触碰统计累加器。",
+        "一次直接加到 8x512：每 tile 数据缓冲翻到 16KB×若干，且在 multibuffer=true 下存在 UB 超限风险；先用 8x256 二倍试探，若 UB 与收益都成立再考虑下一轮加宽。",
+        "把循环内的 3 个不变量 splat(weight/inv_std/bias) 外提到输出通道循环之外：bcmlir 第227/229/231行确认它们当前每轮各落一个 linalg.fill（每轮 7 个张量算子中 3 个是广播）；但该改动只削算术指令、不削每轮同步/DMA 节奏，且与“减少轮次”属不同机制，留作下一轮的独立候选。",
+        "消除每通道末尾重复搬入最后一 tile 的 3% 冗余（33 次 copy/32 tile，后端确未消除）：需改写预取/夹紧与 yield 结构或引入条件载入，收益小、破坏流水结构的风险大，暂不做。",
+        "改编译选项（num_stages/multibuffer 等）或重写 frozen.py：按本轮要求分别属于独立研究身份且源码冻结，不作为本轮候选。"
+      ],
+      "change": "只编辑 ir/5c1607c0…2508/batch_norm_with_update_kernel.ttir 的归一化/输出通道（原第160-211行区域）。具体：1) 在原输出 m 循环之前新增运行时守卫：%c255/%c256 常量、%spatial_rem = arith.remsi %spatial_dim, 256、%spatial_wide = arith.cmpi eq %spatial_rem, 0、%n_num_steps_w = arith.divsi(%spatial_dim+255, 256)，以及 %tile_lane_w = tt.make_range end=256；2) 用 scf.if %spatial_wide 分流：真分支使用 8x256 tile 的等价循环 —— 同一 prologue 载入、同一 minsi 夹紧预取（步长 256，迭代上界 %n_num_steps_w）、同一元素算术顺序 arith.subf → arith.mulf(weight) → arith.mulf(inv_std) → arith.addf(bias) → tt.store；假分支逐字节保留原 8x128 循环（含其原有 splat/夹紧/写回结构）；3) 统计(Welford)通道、两次 tt.reduce、final_mean/inv_std、running_mean/var 更新、weight/bias 空指针 scf.if、函数签名与 ABI、常量 8/128/EVEN 一律不改。真分支所有新 SSA 名带 _w 后缀，避免与假分支同名；不改变任何指针算术语义（feat/batch stride 用法与原通道逐项对应）。",
+      "expected": "守卫为真时（本用例 spatial_dim=4096，4096%%256==0，走真分支）：归一化通道每 program 轮次 32→16，该通道 MTE2 搬移命令数 33→17，每轮一对 SET_FLAG/WAIT_FLAG 与 BAR 同步事件减半，连续搬运段 512B→1KB；统计通道与归约完全不变。可测预测：simulator 中该核 MTE2 event_count 由 116 降到约 60–70、VECTOR event_count 由 552 降到约 480–520，VECTOR/MTE2 的 wait_only 比例下降，单核观测窗口相对下降 10–20%（当前窗口 9.37us 量级 → 7.5–8.4us 量级），formal 侧 Task Duration 由 47.36us 对应下降。明确不把循环数减半直接换算成等比例加速（每轮工作量随宽度翻倍，且 MTE2 字节量不变）；是否超过当前最佳 target_latency=0.04491ms 由宿主完整评测判定。",
+      "validation": "宿主侧建议检查：1) TTIR 可解析、lowering 成功，UB 需求显著低于 196608 字节（真分支只新增一个 8x256 的当前/预取/输出/填充临时缓冲，地址张量应如 bcmlir 现状被折叠，统计累加器不变）；2) bcmlir 真分支出现 memref<8x256xf32> 与每通道约 17 次 memref.copy，假分支仍是 memref<8x128xf32> 与 33 次 copy，且 scf.if 守卫条件为运行时 remsi 判定；3) 数值：本用例走真分支，输出须与当前最佳逐元素一致（tolerance atol=rtol=1e-4，required_matched_ratio=1.0，equal_nan=true），save_mean/save_invstd/running_mean_out/running_var_out 也应逐字节同值（统计通道未改）；4) 另以 spatial_dim 不能被 256 整除的合法形状验证守卫回退分支与 numpy/torch 语义一致；5) 完整 KGS 与正式+补测基准，任何一项未过则回到原 TTIR。",
+      "layer_reason": "缺陷本质是“循环分块宽度/每 tile 同步节奏”，这是 TTIR 层可表达的结构参数：源码 frozen.py 与 heuristics 常量（BLOCK_N=128）已冻结并逐字节一致，编译选项与低层 ttadapter/bcmlir/npubin 只读，唯一可写面是清单列出的 ir/*.ttir。该修改不改变函数 ABI、不改变数学语义与 FP 结合顺序、不引入跨 tile 依赖或新的归约，属于编译器本可自行选择的 tiling 决策（后端确实按源码常量 8x128 逐 tile 落 33 次 copy 与每轮同步），所以在 single_operator_ir 层做最小修复是最合适且唯一可行的层。",
+      "simulator_incremental_judgment": "profiling 给出的是整核 47.360947us（Block Dim=64）；simulator/timeline 给出的是单核 partial trace 窗口（hotspots 以 us 标注且 unit_validation 通过，timeline 却标注 clock_qualification='relative_only'、absolute_time_qualified=false、capture_start/end 仅 fraction），两者时钟资质不同，不可相减、不可外推为整核加速比。因此本轮增量判据只用窗口内的可观测量：MTE2/VECTOR 的 event_count 与 active/wait_only 比例、以及每 tile 的同步节奏是否随轮次减半而下降；绝对收益仍以宿主 formal+补测的 Task Duration 是否低于 0.04491291751488147ms 为准。",
+      "unknown": [
+        "8x256 真分支在 multibuffer=true 下的实际 UB 分配量（地址张量是否被完全折叠），需由 lowering 结果确认；若超限则回退 8x128 原路径再另选机制。",
+        "scf.if 双分支是否会因代码复制影响自动流水调度（是否把真分支的预取重排），只能由实际 bcmlir/器件观测确认。",
+        "减少轮次带来的同步节省与每轮变长的延迟暴露之间的净效应，属于需要在完整评测中测量而非由指令计数推断的量。"
+      ]
+    },
+    "result": {
+      "api_version": "v6.2",
+      "reference_source": "primary",
+      "status": "PASSED",
+      "device": "npu:0",
+      "server_backend": "npu",
+      "is_hack": false,
+      "hack_reason": "",
+      "geo_mean": 1.8521795093974103,
+      "min_speedup": 0.6845961463077725,
+      "worst_workload_uuid": "batch_norm_with_update_functional-timing-8",
+      "latency_ms": 0.046082168812620956,
+      "abs_err": 0.001953125,
+      "rel_err": 0.005076142027974129,
+      "num_workloads": 27,
+      "num_passed": 27,
+      "timing_skipped": false,
+      "log": "",
+      "per_workload": [
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-0",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-1",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-2",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-3",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-4",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0001220703125,
+          "rel_err": 0.0008250824175775051,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-5",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-6",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-7",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-8",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-9",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-10",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.001953125,
+          "rel_err": 0.005076142027974129,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-11",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-12",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 1.1920928955078125e-07,
+          "rel_err": 1.0033335939851895e-07,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-13",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 2.384185791015625e-07,
+          "rel_err": 2.510349190743e-07,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-14",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 4.76837158203125e-07,
+          "rel_err": 0.00010376304999226704,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-15",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 2.384185791015625e-07,
+          "rel_err": 9.441356496608933e-07,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-16",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 1.430511474609375e-06,
+          "rel_err": 3.1727817258797586e-05,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-17",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 4.76837158203125e-07,
+          "rel_err": 0.00038382329512387514,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-0",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 6.383888163456822,
+          "latency_ms": 0.007915398097534835,
+          "reference_latency_ms": 0.05053101622390128,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-1",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.3777021867829329,
+          "latency_ms": 0.04019044557911744,
+          "reference_latency_ms": 0.055370464762130554,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-2",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.4126748127013062,
+          "latency_ms": 0.042450310649458006,
+          "reference_latency_ms": 0.05996848464583535,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-3",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 6.382923846542953,
+          "latency_ms": 0.008088128212084673,
+          "reference_latency_ms": 0.051625906438812076,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-4",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.345444979869639,
+          "latency_ms": 0.04091937692271034,
+          "reference_latency_ms": 0.05505477026005418,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-5",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.3800473638486803,
+          "latency_ms": 0.043454388971068854,
+          "reference_latency_ms": 0.059969114947178735,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-6",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 3.547433330642509,
+          "latency_ms": 0.007778646493726583,
+          "reference_latency_ms": 0.02759422983913117,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-7",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 0.7173590277232705,
+          "latency_ms": 0.0392613321319653,
+          "reference_latency_ms": 0.02816447104530703,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-8",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 0.6845961463077725,
+          "latency_ms": 0.046082168812620956,
+          "reference_latency_ms": 0.03154767518262453,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        }
+      ]
+    },
+    "lowering": {
+      "status": "lowering_review_passed",
+      "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+      "compiler_identity": {
+        "triton_version": "3.5.1",
+        "sources": {
+          "compiler/compiler.py": "ca9380e543d8ccf6b9b363f57ff6bc9674c32a4e0db16ea79e5688cff2da0264",
+          "backends/ascend/compiler.py": "62ddbfbd42914b234b9c392a91095e313536b855d0bf121729a83c81a07c13b6",
+          "runtime/cache.py": "0355c3e3452fa4500122244b8fff8864f22bc05c417a3d6f5dada9f2e92f8040",
+          "knobs.py": "4cab52a62325ab5ffc0d1eb963d78a2621d8e6a8f9c1505186c1ba7c4976d2ac"
+        },
+        "resolved_sources": {
+          "triton.compiler.compiler": {
+            "path": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/spec/ascend/compiler/compiler.py",
+            "sha256": "31ea8760a43db36ef59d8622d74761a147fbad1cf05e1a760ec341d8a374308b"
+          },
+          "triton.backends.ascend.compiler": {
+            "path": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/compiler.py",
+            "sha256": "62ddbfbd42914b234b9c392a91095e313536b855d0bf121729a83c81a07c13b6"
+          },
+          "triton.runtime.jit": {
+            "path": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/spec/ascend/runtime/jit.py",
+            "sha256": "d4b9f4cc94c7a5beeb06d8c9404442cdfa26aabc4a474697a090639deb72d2db"
+          },
+          "triton.runtime.cache": {
+            "path": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/runtime/cache.py",
+            "sha256": "0355c3e3452fa4500122244b8fff8864f22bc05c417a3d6f5dada9f2e92f8040"
+          }
+        },
+        "compiler_environment": {}
+      },
+      "rows": [
+        {
+          "variant": "original",
+          "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "input_ir_sha256": "fb0bdf3547e0086bbfdd12e29b683b303c98733943ed02a161ffcbfb329eb634",
+          "target": {
+            "backend": "npu",
+            "arch": "Ascend910B4-1",
+            "warp_size": 0
+          },
+          "options": {
+            "add_auto_scheduling": false,
+            "allow_fp8e4nv": false,
+            "allowed_dot_input_precisions": {
+              "__tuple__": [
+                "ieee",
+                "hf32"
+              ]
+            },
+            "arch": "Ascend910B4-1",
+            "auto_blockify_size": 1,
+            "auto_tile_and_bind_subblock": true,
+            "auto_vectorize_v2_max_fused_ops_num": null,
+            "bisheng_options": "-cce-link-aicore-ll-module /usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/lib/libdevice.10.bc",
+            "cluster_dims": {
+              "__tuple__": [
+                1,
+                1,
+                1
+              ]
+            },
+            "compile_mode": "simd",
+            "compile_on_910_95": false,
+            "custom_pipeline": null,
+            "debug": false,
+            "default_dot_input_precision": "ieee",
+            "deprecated_fp8_dtypes": {
+              "__tuple__": []
+            },
+            "disable_auto_inject_block_sync": null,
+            "disable_fma": false,
+            "disable_size_align_for_cast": null,
+            "disable_tightly_coupled_buffer_reuse": false,
+            "enable_auto_bind_sub_block": null,
+            "enable_auto_blockify": null,
+            "enable_auto_vectorize_v2": null,
+            "enable_bishengir_simt_optimization": 0,
+            "enable_cce_vf_auto_sync": null,
+            "enable_cce_vf_remove_membar": null,
+            "enable_drop_unit_dims": null,
+            "enable_dynamic_cv_pipeline": false,
+            "enable_flatten": null,
+            "enable_fp_fusion": true,
+            "enable_hivm_auto_cv_balance": null,
+            "enable_mask_fallback_conversion": false,
+            "enable_mixed_cv": null,
+            "enable_nd2nz_on_vector": false,
+            "enable_persistent": false,
+            "enable_preload": null,
+            "enable_select_analysis": true,
+            "enable_simt_reorder_instruction": false,
+            "enable_sync_block_lock": false,
+            "enable_ubuf_saving": null,
+            "enable_vf_fusion": false,
+            "enable_warp_specialization": false,
+            "extern_libs": null,
+            "force_simt_only": false,
+            "force_simt_template": false,
+            "hfusion_enable_multiple_consumer_fusion": false,
+            "inject_barrier_all": null,
+            "inject_block_all": null,
+            "instrumentation_mode": "",
+            "kernel_name": "batch_norm_with_update_kernel",
+            "limit_auto_multi_buffer_of_local_buffer": null,
+            "limit_auto_multi_buffer_only_for_local_buffer": null,
+            "llvm_version": 15,
+            "max_num_imprecise_acc_default": 0,
+            "mix_mode": "aiv",
+            "multibuffer": true,
+            "num_buffers_warp_spec": 0,
+            "num_consumer_groups": 0,
+            "num_ctas": 1,
+            "num_stages": 1,
+            "num_warps": 2,
+            "optimize_dynamic_offset": false,
+            "optimize_epilogue": false,
+            "parallel_mode": "simd",
+            "prevec_max_fused_ops_num": null,
+            "reg_dec_producer": 0,
+            "reg_inc_consumer": 0,
+            "sanitize_overflow": true,
+            "set_workspace_multibuffer": null,
+            "shared_mem_dynamic_size": 221184,
+            "simt_stack_limit": null,
+            "stream": null,
+            "supported_fp8_dtypes": {
+              "__tuple__": [
+                "fp8e5",
+                "fp8e4b15",
+                "fp8e4nv",
+                "fp8e4b8",
+                "fp8e5b16"
+              ]
+            },
+            "sync_solver": null,
+            "tile_mix_cube_loop": null,
+            "tile_mix_vector_loop": null,
+            "unit_flag": null,
+            "use_bytecode": true,
+            "vf_merge_level": 1,
+            "warp_size": 32
+          },
+          "status": "lowered_to_binary",
+          "artifacts": [
+            {
+              "kind": "ttir",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.ttir",
+              "sha256": "d25a75ee59a44a23c2926a6ebdf16d9efa3b6f03523d821fd3e7d53ad9f1d4fd",
+              "bytes": 36223
+            },
+            {
+              "kind": "ttadapter",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.ttadapter",
+              "sha256": "2a07db077da890eea169dd0b35557350c7427fbe2ba3644648c33b892ba66013",
+              "bytes": 38781
+            },
+            {
+              "kind": "mlirbc",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.mlirbc",
+              "sha256": "75b1e5515b2fa4822e6eb3566a12124b53c581bae9aadd72196bed4a08d3a310",
+              "bytes": 5638
+            },
+            {
+              "kind": "bcmlir",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.bcmlir",
+              "sha256": "8e9692bd7d313af37cfc58effd71535695d9e6dce84cb51f5000e98acae5b6ae",
+              "bytes": 34642
+            },
+            {
+              "kind": "npubin",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.npubin",
+              "sha256": "7a391932534402cabe5699810ba005beff6acd3f97918fea18a76b6eeeebfa98",
+              "bytes": 7264
+            },
+            {
+              "kind": "json",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.json",
+              "sha256": "8be595ef8142f5b80c4beb7ad376e128dba2e9f9a32ac3007cd91c3f73213d15",
+              "bytes": 2872
+            }
+          ]
+        },
+        {
+          "variant": "candidate",
+          "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "input_ir_sha256": "574eddcba7a8b920c211880d4332fb710465bcda4a944dc3f81ae74c066a17cc",
+          "target": {
+            "backend": "npu",
+            "arch": "Ascend910B4-1",
+            "warp_size": 0
+          },
+          "options": {
+            "add_auto_scheduling": false,
+            "allow_fp8e4nv": false,
+            "allowed_dot_input_precisions": {
+              "__tuple__": [
+                "ieee",
+                "hf32"
+              ]
+            },
+            "arch": "Ascend910B4-1",
+            "auto_blockify_size": 1,
+            "auto_tile_and_bind_subblock": true,
+            "auto_vectorize_v2_max_fused_ops_num": null,
+            "bisheng_options": "-cce-link-aicore-ll-module /usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/lib/libdevice.10.bc",
+            "cluster_dims": {
+              "__tuple__": [
+                1,
+                1,
+                1
+              ]
+            },
+            "compile_mode": "simd",
+            "compile_on_910_95": false,
+            "custom_pipeline": null,
+            "debug": false,
+            "default_dot_input_precision": "ieee",
+            "deprecated_fp8_dtypes": {
+              "__tuple__": []
+            },
+            "disable_auto_inject_block_sync": null,
+            "disable_fma": false,
+            "disable_size_align_for_cast": null,
+            "disable_tightly_coupled_buffer_reuse": false,
+            "enable_auto_bind_sub_block": null,
+            "enable_auto_blockify": null,
+            "enable_auto_vectorize_v2": null,
+            "enable_bishengir_simt_optimization": 0,
+            "enable_cce_vf_auto_sync": null,
+            "enable_cce_vf_remove_membar": null,
+            "enable_drop_unit_dims": null,
+            "enable_dynamic_cv_pipeline": false,
+            "enable_flatten": null,
+            "enable_fp_fusion": true,
+            "enable_hivm_auto_cv_balance": null,
+            "enable_mask_fallback_conversion": false,
+            "enable_mixed_cv": null,
+            "enable_nd2nz_on_vector": false,
+            "enable_persistent": false,
+            "enable_preload": null,
+            "enable_select_analysis": true,
+            "enable_simt_reorder_instruction": false,
+            "enable_sync_block_lock": false,
+            "enable_ubuf_saving": null,
+            "enable_vf_fusion": false,
+            "enable_warp_specialization": false,
+            "extern_libs": null,
+            "force_simt_only": false,
+            "force_simt_template": false,
+            "hfusion_enable_multiple_consumer_fusion": false,
+            "inject_barrier_all": null,
+            "inject_block_all": null,
+            "instrumentation_mode": "",
+            "kernel_name": "batch_norm_with_update_kernel",
+            "limit_auto_multi_buffer_of_local_buffer": null,
+            "limit_auto_multi_buffer_only_for_local_buffer": null,
+            "llvm_version": 15,
+            "max_num_imprecise_acc_default": 0,
+            "mix_mode": "aiv",
+            "multibuffer": true,
+            "num_buffers_warp_spec": 0,
+            "num_consumer_groups": 0,
+            "num_ctas": 1,
+            "num_stages": 1,
+            "num_warps": 2,
+            "optimize_dynamic_offset": false,
+            "optimize_epilogue": false,
+            "parallel_mode": "simd",
+            "prevec_max_fused_ops_num": null,
+            "reg_dec_producer": 0,
+            "reg_inc_consumer": 0,
+            "sanitize_overflow": true,
+            "set_workspace_multibuffer": null,
+            "shared_mem_dynamic_size": 221184,
+            "simt_stack_limit": null,
+            "stream": null,
+            "supported_fp8_dtypes": {
+              "__tuple__": [
+                "fp8e5",
+                "fp8e4b15",
+                "fp8e4nv",
+                "fp8e4b8",
+                "fp8e5b16"
+              ]
+            },
+            "sync_solver": null,
+            "tile_mix_cube_loop": null,
+            "tile_mix_vector_loop": null,
+            "unit_flag": null,
+            "use_bytecode": true,
+            "vf_merge_level": 1,
+            "warp_size": 32
+          },
+          "status": "lowered_to_binary",
+          "artifacts": [
+            {
+              "kind": "ttir",
+              "path": "lowering-review/candidate/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.ttir",
+              "sha256": "8b634f618585a161ae342d7c75bc6d1512d75787344ea2950fdf9fb52177507c",
+              "bytes": 54216
+            },
+            {
+              "kind": "ttadapter",
+              "path": "lowering-review/candidate/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.ttadapter",
+              "sha256": "ab68237e6dbdfeba685bbdc54f9be003cdae014330481cab8f226338d461fcaa",
+              "bytes": 50964
+            },
+            {
+              "kind": "mlirbc",
+              "path": "lowering-review/candidate/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.mlirbc",
+              "sha256": "0b02d2734bfaea7e5508e7f517f998972ef3a70ccef95b3b2f5f18e674268033",
+              "bytes": 6763
+            },
+            {
+              "kind": "bcmlir",
+              "path": "lowering-review/candidate/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.bcmlir",
+              "sha256": "635dd3931997cbd43f59337fb9cd3b5de7967ca7c653b47ca3f7c5ca2009941a",
+              "bytes": 46485
+            },
+            {
+              "kind": "npubin",
+              "path": "lowering-review/candidate/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.npubin",
+              "sha256": "41483d746ba67cd3456434ea7d176386cbe6e987f3ab56d360d1baf5935be5fe",
+              "bytes": 8416
+            },
+            {
+              "kind": "json",
+              "path": "lowering-review/candidate/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.json",
+              "sha256": "73dfd5ed6ff49aeff15987e5e87f58ca2e86d49ba1f18065169bed0f9fa812d9",
+              "bytes": 2872
+            }
+          ]
+        }
+      ],
+      "npu_initialized": false,
+      "scope": "IRSource lowering with captured target/options; actual AST injection, correctness and performance are separate"
+    }
+  },
+  {
+    "invocation": "ir-005",
+    "diagnosis": {
+      "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+      "selected_layer": "single_operator_ir",
+      "evidence": [
+        {
+          "path": "profiling.json",
+          "category": "paired_profiling",
+          "role": "确定哪条硬件流水最忙、每block成本与搬运总量，作为改进方向的定量锚点",
+          "finding": "候选侧(64 block, 1650MHz): Task Duration 47.360947us, aiv_time mean 23.181022609375us, aiv_total_cycles mean 38248.6875; aiv_mte2_ratio mean 0.618693375 是三条执行流水里最高, aiv_vec_ratio mean 0.447329671875, aiv_mte3_ratio 0.215378234375; read_main_memory_datas 合计16952KB(=每block约264.9KB, 恰为8x4096x4B=128KB特征片的两次遍历)。MTE2(0.619)与VECTOR(0.447)之和约1.07接近1, 说明两条流水在本循环里近乎串行而非重叠, 且都没有饱和。"
+        },
+        {
+          "path": "hotspots.json",
+          "category": "simulator",
+          "role": "定位主导区域与其停顿构成(哪些PC在等, 谁在等)",
+          "finding": "主导区域为 source_loop(frozen.py 71-103, 即统计内层循环): 95条指令, instruction_time_sum_us 78.1, wait_instruction_time_sum_us 52.2, trace_interval_union 8.5508us(捕获窗口仅9.372us)。top_instructions 前5名全是 VECTOR BAR(calls 29/28, running_time_us 8.36/8.34/8.29/8.11/7.92), 其次 MTE2 WAIT_FLAG 7.98us 直接挂在 loc(frozen.py:83) 的 lookahead load 上, 再其次是同一条lookahead的 MOV_SRC_TO_DST_ALIGN 7.23us 与 SET_FLAG(TRIGGERPIPE:VEC) 7.21us; 真正的FP向量运算很小: VADDS(cnt) 1.42us、VMUL(var) 1.41us、VSUB(delta) 0.95us。等待与同步占绝对主导, 算术量不是主项。"
+        },
+        {
+          "path": "timeline.json",
+          "category": "simulator",
+          "role": "量化各流水active/wait/idle与重叠程度, 并确认时钟资质与观测范围",
+          "finding": "VECTOR: active_ratio 0.896892531534646, wait_ratio 0.26391045433789073, productive_ratio 0.6410413737370144, idle 0.1031; MTE2: active 0.8855, productive 0.7759, wait_only_ratio 0.1096, idle 0.1145; SCALAR 0.0553, SCALARLDST 0.2400, CACHEMISS 0.0015。clock_qualification=relative_only, absolute_time_qualified=false, capture_scope 为'首个至末个可见事件'的部分窗口。即: 本窗口内 VECTOR 有26%在等数据, MTE2 有约11%在等缓冲区, 两者都在互相让路。"
+        },
+        {
+          "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "category": "source_ir",
+          "role": "核对实际TTIR的循环结构、预取深度与跨迭代活跃值",
+          "finding": "常量 %m_num_steps=7/%n_num_steps=127 只是cdiv的(BLOCK-1)项, 实际 %m_num_steps_4=(8+7)/8=1、%n_num_steps_6=(4096+127)/128=32, 即内层循环每趟32次、每block两趟共64次迭代。统计内层 scf.for (行64-91) 的 iter_args 只有 (mean, var, cnt, curr_input) 四元组: 每次迭代只发一个 lookahead(行79) 写往'下一块'槽位, 回边只携带1个tile值。该值为 tensor<8x128xf32> 常量布局(8行, 行距=input_batch_stride, 每行512B), 预取用 min(n_step+1, n_num_steps-1) 钳位(行82)。"
+        },
+        {
+          "path": "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/eaea61f4850d20e42140da59577ec1ac4b6b7cf061027bbd093bb577c1d535d4/batch_norm_with_update_kernel.ttadapter",
+          "category": "source_ir",
+          "role": "在实际后端产物上核对疑似冗余是否已被消除(拷贝/布局/FMA/同步)",
+          "finding": "与同目录 bcmlir 的算子直方图完全一致(memref.copy 4, arith.mulf 13, arith.addf 9, linalg.reduce 2, 无任何 fma 记法), 说明这两份冻结产物处于同一阶段: 内层每次迭代都以 memref.alloc() : memref<8x128xf32> + memref.copy(行76-77) 物化 lookahead tile, 再 bufferization.to_tensor 作为回边值; 该产物里没有任何显式同步指令, BAR/FLAG 由下游按缓冲区活性插入, 因此同步结构完全由'回边携带几个tile'决定。mean 更新仍是 memulf($delta, fill(inv_step)) + addf(行82-83), var 更新是 mulf+mulf+addf(行84,88-90): 融合未在此阶段发生(由 disable_fma=false/enable_fp_fusion=true 在更下游决定)。"
+        },
+        {
+          "path": "ir001-post-simulator.json",
+          "category": "simulator",
+          "role": "用上一轮已实测的对照, 排除'减少向量算术'这一方向",
+          "finding": "IR001 去掉每迭代 cnt 的向量自增后, 该指令对应的 VADDS 与窗口内 BAR/WAIT 结构基本不变: 仍有5个 VECTOR BAR(calls 29-30, running_time_us 8.30-8.57)、MTE2 WAIT_FLAG 8.22us、MOV_SRC_TO_DST_ALIGN 7.48us、SET_FLAG 7.47us; VECTOR active_ratio 0.9201 与原版 0.8969 同级。说明该循环受同步/重叠不足支配, 单纯减少一条向量算术不改变延迟, 也不会减少同步点。"
+        }
+      ],
+      "hypothesis": "统计内层循环的软件预取深度只有1, 回边仅携带一个 tile 值(tensor<8x128xf32>)。在 ttadapter 中该值以'每迭代新 alloc + memref.copy'物化, 由于回边上同时活跃的 tile 只有1个, 缓冲区复用可以把所有 lookahead 目标压到同一个 UB 槽位, 于是 MTE2 对第 n+1 块 tile 的搬运必须等 VECTOR 读完第 n 块(同一槽位的 WAR)才能起步。这与三处独立观测一致:(1) 形式化分析里 MTE2 0.619 与 VECTOR 0.447 几乎相加≈1, 两条流水近于串行; (2) 模拟器里 VECTOR 26.4% 在等(WAIT_FLAG 正挂在 lookahead load 上, 7.98us), MTE2 10.96% 在等缓冲区释放; (3) IR001 证明该处不是算术吞吐瓶颈。将统计循环的预取深度加1(回边同时携带 curr 与 pending 两块, lookahead 改为 n+2 并钳位到 N-1)，三个 tile 值在回边上同时活跃, 缓冲区复用无法再把它们合并为一个槽位, 从而强制至少3个UB tile缓冲区, 让 MTE2 对第 n+2 块的搬运与 VECTOR 对第 n 块的计算真正重叠。该改动只改变搬运发出的时机, 不改变 tile 访问顺序、Welford 递推式、归约与任何舍入, 因而数值上与当前最佳逐位相同。",
+      "alternatives": [
+        {
+          "idea": "在 TTIR 中把 mean/M2 更新的 mulf+addf 显式改写为 FP32 融合乘加(Codex 的分析方向)",
+          "why_not_selected": "Codex 贡献: 指出统计区内层是乘积+加法成对出现, 建议先核查后端是否已融合。核查结果: ttadapter/bcmlir 仍是分离的 arith.mulf/arith.addf, 但两份冻结产物处于下游同步插入之前, 融合由 disable_fma=false 与 enable_fp_fusion=true 在更下游确定, 该阶段无法证伪; 同时 TTIR 没有张量级 fma 算子, 需依赖 math.fma 接受 tensor 操作数, 有验证失败风险; 最关键的是 IR001 已实测'减少一条向量算术'对延迟无影响, 说明该方向与本轮观测到的等待/串行结构不同源。留作独立分支。"
+        },
+        {
+          "idea": "把统计循环的 BLOCK_N 由128加宽到256(或更宽), 拉长每行的DMA突发并减少迭代次数",
+          "why_not_selected": "会改变特化的 tile/常量身份(inventory 记录 8/128/true)并连带改动两处 reshape/reduce 形状, 且此前更宽的变体已超出 UB 6.67 倍(见反馈), 风险与本轮'最小可验证机制'的要求不符, 作为后续独立分支。"
+        },
+        {
+          "idea": "去掉每次 m_step 末尾被 min(n+1, N-1) 钳位而重复读的最后一个 tile",
+          "why_not_selected": "每个 m_step 只多读一块(每趟约 1/32 的搬运量), 收益远小于同步开销, 且钳位是避免越界读取所必需, 不值得单独承担编辑风险。"
+        },
+        {
+          "idea": "把同样的预取深度加1同时应用到输出归一化循环(第二趟)",
+          "why_not_selected": "两者结构相同、机制相同, 但可观测证据(模拟器窗口)只覆盖统计循环; 本轮只改被测量的区域以保持归因单一, 输出循环留作同机制的后续一步。"
+        }
+      ],
+      "change": "只修改 ir/5c1607c0.../batch_norm_with_update_kernel.ttir 的统计内层循环(行64-91): (1) 新增常量 %c2_i32 = 2; (2) 在外层 m_step 序言中, 紧接现有 tile0 载入之后再载入 tile1(用 tt.splat %c128_i32 构造偏移张量与 %curr_input_44 相加后 tt.load); (3) 内层 scf.for 的 iter_args/结果由4元组扩为5元组, 增加第二个 tile 携带值 %curr_input_pd(初值 = prologue 载入的 tile1); (4) lookahead 偏移由 n_step+1 改为 n_step+2(仍用 min(., n_num_steps-1) 钳位); (5) yield 改为 (mean, var, cnt, 旧 pending, 新载入 tile)。其余指令、tile 访问顺序、递推式、归约、ABI 与常量 8/128/true 全部保持原样。",
+      "expected": "数值: 逐位相同(同一 tile 序列、同一 Welford 递推与归约顺序, 仅搬运发起时机变化), 仅额外多出每 m_step 一次钳位重复读(每趟32块中多1块, 约3.1%搬运量, 已计入预测)。性能可测预测: 每block aiv_total_cycles 由 38249 向 max(MTE2≈0.62, VEC≈0.45) 的比例下降, 预期 26000-31000; aiv_mte2_ratio 大致不变(字节数不变)而 aiv_vec_ratio 相对上升; 模拟器中统计区内层区域 trace_interval_union(8.55us)下降, VECTOR wait_ratio 由 0.264 向 0.10-0.15 靠近, MTE2 wait_only 由 0.110 下降, lookahead 上的 WAIT_FLAG 单项时间显著下降。若统计趟约占该核cycles的六成, 则 Task Duration(47.36us)预期向 38-42us 移动; 若瓶颈实为512B跨行突发的DMA吞吐而非缓冲区可用性, 则预期中性(不下降), 此情形下应转向 BLOCK_N 加宽分支。以上均为待测预测, 不作为收益结论。",
+      "validation": "1) 先确认 TTIR 可解析并完成 CPU 侧 lower(不通过则本分支无效); 2) 在 compiled 产物中确认统计内层回边上同时活跃的 tile 缓冲区由1个变为≥3个, 且每迭代 FLAG/BAR 数量与 WAIT_FLAG 位置发生变化(先看指令/同步变化, 再谈时间); 3) 完整正式评测 + 两个补测套件, FP32 atol=rtol=1e-4、matched_ratio=1.0、equal_nan, 特殊值(NaN/Inf/零方差/非整除形状走 EVEN=false 特化)必须保持; 4) 与保留原IR、IR001、ir-004 三条身份分别对比, 不混淆; 5) 性能以宿主正式与补测结果为准, 本文档与预检不作为收益证据。",
+      "layer_reason": "缺陷位于单算子 IR 层的循环流水深度: 冻结源码、编译选项、lowered-inventory 列出的 ttadapter/bcmlir/npubin 均保持冻结, 可编辑面只有清单允许的 ir/*.ttir; 该机制(回边携带的 tile 数量)直接决定下游同步插入与缓冲区复用, 在源码与选项层都无法表达, 因此归属 single_operator_ir。",
+      "simulator_incremental_judgment": "时钟资质: timeline 明确 clock_qualification=relative_only、absolute_time_qualified=false, 报告自身声明无绝对时钟与全设备关键路径; 因此本轮只使用同一窗口内的相对比例(各流水 active/wait/productive)与同一PC的并集时长做排序, 不把 instruction_time_sum_us 当墙钟耗时, 也不用它换算加速比。观测范围: 捕获为部分窗口(application_completed=false, 9.372us 对 47.36us 的核), 且统计内层区域并集 8.55us 几乎填满该窗口, 说明窗口证据只覆盖统计趟, 不能外推到输出趟与启动/收尾; 未报告泳道(CACHEMISS 为 auxiliary_trace_lane, 活动仅0.15%; SCALAR 5.5%、SCALARLDST 24.0%)按辅助/低占比处理, 不作为瓶颈。增量判断: 与已实测基线(原IR)及 IR001 对照, 本窗口内唯一未被证伪的高占比成本是 VECTOR/MTE2 的重叠不足(wait 26.4%/10.96%, 且两者busy近似相加), 且该成本可完全由'回边携带的 tile 数量'这一 IR 结构解释; 相对基线的增量主张只是'每迭代同步等待应随三缓冲下降', 幅度以 max(MTE2, VEC) 为上界, 不对绝对时间作承诺。",
+      "unknown": [
+        "下游同步插入(memref缓冲区复用与FLAG/BAR排布)不在这两份冻结产物里, '单槽位导致串行' 是依据 ttadapter 回边活性+Mte2/Vec比值相加+WAIT_FLAG位置推断的, 需在重编译后的产物中确认缓冲区数由1变3。",
+        "统计趟占整核周期的确切比例未知(捕获窗口只覆盖统计趟), 端到端幅度不可由本窗口换算。",
+        "512B跨行突发(行距1MB)的DMA吞吐上限未知, 若已接近该上限, 加深预取只会中性。"
+      ]
+    },
+    "result": null,
+    "lowering": {
+      "status": "lowering_review_passed",
+      "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+      "compiler_identity": {
+        "triton_version": "3.5.1",
+        "sources": {
+          "compiler/compiler.py": "ca9380e543d8ccf6b9b363f57ff6bc9674c32a4e0db16ea79e5688cff2da0264",
+          "backends/ascend/compiler.py": "62ddbfbd42914b234b9c392a91095e313536b855d0bf121729a83c81a07c13b6",
+          "runtime/cache.py": "0355c3e3452fa4500122244b8fff8864f22bc05c417a3d6f5dada9f2e92f8040",
+          "knobs.py": "4cab52a62325ab5ffc0d1eb963d78a2621d8e6a8f9c1505186c1ba7c4976d2ac"
+        },
+        "resolved_sources": {
+          "triton.compiler.compiler": {
+            "path": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/spec/ascend/compiler/compiler.py",
+            "sha256": "31ea8760a43db36ef59d8622d74761a147fbad1cf05e1a760ec341d8a374308b"
+          },
+          "triton.backends.ascend.compiler": {
+            "path": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/compiler.py",
+            "sha256": "62ddbfbd42914b234b9c392a91095e313536b855d0bf121729a83c81a07c13b6"
+          },
+          "triton.runtime.jit": {
+            "path": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/spec/ascend/runtime/jit.py",
+            "sha256": "d4b9f4cc94c7a5beeb06d8c9404442cdfa26aabc4a474697a090639deb72d2db"
+          },
+          "triton.runtime.cache": {
+            "path": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/runtime/cache.py",
+            "sha256": "0355c3e3452fa4500122244b8fff8864f22bc05c417a3d6f5dada9f2e92f8040"
+          }
+        },
+        "compiler_environment": {}
+      },
+      "rows": [
+        {
+          "variant": "original",
+          "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "input_ir_sha256": "fb0bdf3547e0086bbfdd12e29b683b303c98733943ed02a161ffcbfb329eb634",
+          "target": {
+            "backend": "npu",
+            "arch": "Ascend910B4-1",
+            "warp_size": 0
+          },
+          "options": {
+            "add_auto_scheduling": false,
+            "allow_fp8e4nv": false,
+            "allowed_dot_input_precisions": {
+              "__tuple__": [
+                "ieee",
+                "hf32"
+              ]
+            },
+            "arch": "Ascend910B4-1",
+            "auto_blockify_size": 1,
+            "auto_tile_and_bind_subblock": true,
+            "auto_vectorize_v2_max_fused_ops_num": null,
+            "bisheng_options": "-cce-link-aicore-ll-module /usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/lib/libdevice.10.bc",
+            "cluster_dims": {
+              "__tuple__": [
+                1,
+                1,
+                1
+              ]
+            },
+            "compile_mode": "simd",
+            "compile_on_910_95": false,
+            "custom_pipeline": null,
+            "debug": false,
+            "default_dot_input_precision": "ieee",
+            "deprecated_fp8_dtypes": {
+              "__tuple__": []
+            },
+            "disable_auto_inject_block_sync": null,
+            "disable_fma": false,
+            "disable_size_align_for_cast": null,
+            "disable_tightly_coupled_buffer_reuse": false,
+            "enable_auto_bind_sub_block": null,
+            "enable_auto_blockify": null,
+            "enable_auto_vectorize_v2": null,
+            "enable_bishengir_simt_optimization": 0,
+            "enable_cce_vf_auto_sync": null,
+            "enable_cce_vf_remove_membar": null,
+            "enable_drop_unit_dims": null,
+            "enable_dynamic_cv_pipeline": false,
+            "enable_flatten": null,
+            "enable_fp_fusion": true,
+            "enable_hivm_auto_cv_balance": null,
+            "enable_mask_fallback_conversion": false,
+            "enable_mixed_cv": null,
+            "enable_nd2nz_on_vector": false,
+            "enable_persistent": false,
+            "enable_preload": null,
+            "enable_select_analysis": true,
+            "enable_simt_reorder_instruction": false,
+            "enable_sync_block_lock": false,
+            "enable_ubuf_saving": null,
+            "enable_vf_fusion": false,
+            "enable_warp_specialization": false,
+            "extern_libs": null,
+            "force_simt_only": false,
+            "force_simt_template": false,
+            "hfusion_enable_multiple_consumer_fusion": false,
+            "inject_barrier_all": null,
+            "inject_block_all": null,
+            "instrumentation_mode": "",
+            "kernel_name": "batch_norm_with_update_kernel",
+            "limit_auto_multi_buffer_of_local_buffer": null,
+            "limit_auto_multi_buffer_only_for_local_buffer": null,
+            "llvm_version": 15,
+            "max_num_imprecise_acc_default": 0,
+            "mix_mode": "aiv",
+            "multibuffer": true,
+            "num_buffers_warp_spec": 0,
+            "num_consumer_groups": 0,
+            "num_ctas": 1,
+            "num_stages": 1,
+            "num_warps": 2,
+            "optimize_dynamic_offset": false,
+            "optimize_epilogue": false,
+            "parallel_mode": "simd",
+            "prevec_max_fused_ops_num": null,
+            "reg_dec_producer": 0,
+            "reg_inc_consumer": 0,
+            "sanitize_overflow": true,
+            "set_workspace_multibuffer": null,
+            "shared_mem_dynamic_size": 221184,
+            "simt_stack_limit": null,
+            "stream": null,
+            "supported_fp8_dtypes": {
+              "__tuple__": [
+                "fp8e5",
+                "fp8e4b15",
+                "fp8e4nv",
+                "fp8e4b8",
+                "fp8e5b16"
+              ]
+            },
+            "sync_solver": null,
+            "tile_mix_cube_loop": null,
+            "tile_mix_vector_loop": null,
+            "unit_flag": null,
+            "use_bytecode": true,
+            "vf_merge_level": 1,
+            "warp_size": 32
+          },
+          "status": "lowered_to_binary",
+          "artifacts": [
+            {
+              "kind": "ttir",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.ttir",
+              "sha256": "d25a75ee59a44a23c2926a6ebdf16d9efa3b6f03523d821fd3e7d53ad9f1d4fd",
+              "bytes": 36223
+            },
+            {
+              "kind": "ttadapter",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.ttadapter",
+              "sha256": "2a07db077da890eea169dd0b35557350c7427fbe2ba3644648c33b892ba66013",
+              "bytes": 38781
+            },
+            {
+              "kind": "mlirbc",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.mlirbc",
+              "sha256": "da50b1a377ec38a14037d0c660e78521d3511a4f3c15c01a5af92ac4d98e9103",
+              "bytes": 5638
+            },
+            {
+              "kind": "bcmlir",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.bcmlir",
+              "sha256": "8e9692bd7d313af37cfc58effd71535695d9e6dce84cb51f5000e98acae5b6ae",
+              "bytes": 34642
+            },
+            {
+              "kind": "npubin",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.npubin",
+              "sha256": "7a391932534402cabe5699810ba005beff6acd3f97918fea18a76b6eeeebfa98",
+              "bytes": 7264
+            },
+            {
+              "kind": "json",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.json",
+              "sha256": "8be595ef8142f5b80c4beb7ad376e128dba2e9f9a32ac3007cd91c3f73213d15",
+              "bytes": 2872
+            }
+          ]
+        },
+        {
+          "variant": "candidate",
+          "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "input_ir_sha256": "1a55e2837939ba926454ee4dfca345f15bbe19b9c5b8b71466ad616bda52a2f9",
+          "target": {
+            "backend": "npu",
+            "arch": "Ascend910B4-1",
+            "warp_size": 0
+          },
+          "options": {
+            "add_auto_scheduling": false,
+            "allow_fp8e4nv": false,
+            "allowed_dot_input_precisions": {
+              "__tuple__": [
+                "ieee",
+                "hf32"
+              ]
+            },
+            "arch": "Ascend910B4-1",
+            "auto_blockify_size": 1,
+            "auto_tile_and_bind_subblock": true,
+            "auto_vectorize_v2_max_fused_ops_num": null,
+            "bisheng_options": "-cce-link-aicore-ll-module /usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/lib/libdevice.10.bc",
+            "cluster_dims": {
+              "__tuple__": [
+                1,
+                1,
+                1
+              ]
+            },
+            "compile_mode": "simd",
+            "compile_on_910_95": false,
+            "custom_pipeline": null,
+            "debug": false,
+            "default_dot_input_precision": "ieee",
+            "deprecated_fp8_dtypes": {
+              "__tuple__": []
+            },
+            "disable_auto_inject_block_sync": null,
+            "disable_fma": false,
+            "disable_size_align_for_cast": null,
+            "disable_tightly_coupled_buffer_reuse": false,
+            "enable_auto_bind_sub_block": null,
+            "enable_auto_blockify": null,
+            "enable_auto_vectorize_v2": null,
+            "enable_bishengir_simt_optimization": 0,
+            "enable_cce_vf_auto_sync": null,
+            "enable_cce_vf_remove_membar": null,
+            "enable_drop_unit_dims": null,
+            "enable_dynamic_cv_pipeline": false,
+            "enable_flatten": null,
+            "enable_fp_fusion": true,
+            "enable_hivm_auto_cv_balance": null,
+            "enable_mask_fallback_conversion": false,
+            "enable_mixed_cv": null,
+            "enable_nd2nz_on_vector": false,
+            "enable_persistent": false,
+            "enable_preload": null,
+            "enable_select_analysis": true,
+            "enable_simt_reorder_instruction": false,
+            "enable_sync_block_lock": false,
+            "enable_ubuf_saving": null,
+            "enable_vf_fusion": false,
+            "enable_warp_specialization": false,
+            "extern_libs": null,
+            "force_simt_only": false,
+            "force_simt_template": false,
+            "hfusion_enable_multiple_consumer_fusion": false,
+            "inject_barrier_all": null,
+            "inject_block_all": null,
+            "instrumentation_mode": "",
+            "kernel_name": "batch_norm_with_update_kernel",
+            "limit_auto_multi_buffer_of_local_buffer": null,
+            "limit_auto_multi_buffer_only_for_local_buffer": null,
+            "llvm_version": 15,
+            "max_num_imprecise_acc_default": 0,
+            "mix_mode": "aiv",
+            "multibuffer": true,
+            "num_buffers_warp_spec": 0,
+            "num_consumer_groups": 0,
+            "num_ctas": 1,
+            "num_stages": 1,
+            "num_warps": 2,
+            "optimize_dynamic_offset": false,
+            "optimize_epilogue": false,
+            "parallel_mode": "simd",
+            "prevec_max_fused_ops_num": null,
+            "reg_dec_producer": 0,
+            "reg_inc_consumer": 0,
+            "sanitize_overflow": true,
+            "set_workspace_multibuffer": null,
+            "shared_mem_dynamic_size": 221184,
+            "simt_stack_limit": null,
+            "stream": null,
+            "supported_fp8_dtypes": {
+              "__tuple__": [
+                "fp8e5",
+                "fp8e4b15",
+                "fp8e4nv",
+                "fp8e4b8",
+                "fp8e5b16"
+              ]
+            },
+            "sync_solver": null,
+            "tile_mix_cube_loop": null,
+            "tile_mix_vector_loop": null,
+            "unit_flag": null,
+            "use_bytecode": true,
+            "vf_merge_level": 1,
+            "warp_size": 32
+          },
+          "status": "lowered_to_binary",
+          "artifacts": [
+            {
+              "kind": "ttir",
+              "path": "lowering-review/candidate/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.ttir",
+              "sha256": "03132c8278cf5fd0d67b29eb1ca679986a47f02cd65c8ae5f57a4d17e448788a",
+              "bytes": 37160
+            },
+            {
+              "kind": "ttadapter",
+              "path": "lowering-review/candidate/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.ttadapter",
+              "sha256": "94aee063e6b7dfef3728b9e25a265600aefd68d3e62e34e4be5f0f27dc13a197",
+              "bytes": 40030
+            },
+            {
+              "kind": "mlirbc",
+              "path": "lowering-review/candidate/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.mlirbc",
+              "sha256": "97f48b7de2c1b5577ee7ed190ec1f48c964e7ae13778c8a767521e621cbb0bbe",
+              "bytes": 5757
+            },
+            {
+              "kind": "bcmlir",
+              "path": "lowering-review/candidate/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.bcmlir",
+              "sha256": "ebd5b113b4d7f9d1b72bc1dd9f6b66446f31c11761e449e4da13962116918c7c",
+              "bytes": 35518
+            },
+            {
+              "kind": "npubin",
+              "path": "lowering-review/candidate/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.npubin",
+              "sha256": "7ee9e3bdaab1e0ec337d8e1ef328807ff518718e9f11be23eb3124d312f63715",
+              "bytes": 7328
+            },
+            {
+              "kind": "json",
+              "path": "lowering-review/candidate/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.json",
+              "sha256": "ebeb1f8c0facdd115de1b2e564aca065b3d23a2081efed9d0eb320e08d49f6a4",
+              "bytes": 2872
+            }
+          ]
+        }
+      ],
+      "npu_initialized": false,
+      "scope": "IRSource lowering with captured target/options; actual AST injection, correctness and performance are separate"
+    }
+  },
+  {
+    "stage": "midday-whitebox-20261120",
+    "invocation": "ir-001",
+    "diagnosis": {
+      "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+      "selected_layer": "single_operator_ir",
+      "evidence": [
+        {
+          "path": "profiling.json",
+          "category": "paired_profiling",
+          "role": "当前最佳(timing-7, shape 8x64x64x64)候选侧逐核 Roofline 指标",
+          "finding": "candidate 侧 64 行(每行一个 program/feature)：aiv_time 均值 19.289365us、aiv_total_cycles 31827；aiv_mte2_time 12.758428us(ratio 0.6651)、aiv_vec_time 9.515303us(ratio 0.4968)、aiv_mte3_time 2.902784us(0.1514)、aiv_scalar_time 4.645445us(0.2366)。关键对照：aiv_mte2_active_bw 仅 20.056GB/s，而 aiv_mte3_active_bw 已达 42.296GB/s；每核 GM_to_UB_datas 268.0KB、UB_to_GM 128.5KB、read_main_memory 268.875KB，与“统计趟 33 次 4KB + 输出宽趟 17 次 8KB 载入”一致。aiv_r0_read_cache_hit 563.5/ miss_allocate 512(Memory.csv L2 行)，即第二遍读约半数命中 L2，说明剩余成本主要不是 DRAM 链路而是单核 DMA 发起/等待。",
+          "interpretation": "MTE2 忙 66.5% 但激活带宽只有 MTE3 的一半，符合“每核同时只有一个 GM->UB 搬移在飞、按搬运延迟而非带宽排布”的形态；不把各流水比例相加当作耗时。"
+        },
+        {
+          "path": "hotspots.json",
+          "category": "simulator",
+          "role": "core0.veccore0 指令级热点与 per-pipeline 事件计数",
+          "finding": "top_instructions 全部是同步/搬运：VECTOR BAR 共 5 条、各 calls=64、running_time_us 18.36~18.58；WAIT_FLAG(PIPE:VEC,TRIGGER:MTE2,FLAGID:1) calls=64、29577 cycles、17.93us；MOV_SRC_TO_DST_ALIGN(MTE2, Dst:UB, Dtype:B32) calls=64、16.42us；SET_FLAG(MTE2->VEC) calls=64、16.38us。另一组来自宽输出通道：BAR calls=32(14.17~14.29us)、WAIT_FLAG(MTE2,FLAGID:1) calls=32、22090 cycles、13.39us、WAIT_FLAG(VECTOR,TRIGGER:MTE3) calls=32、10.71us、MOV_SRC_TO_DST_ALIGN(MTE3, UB->OUT) calls=32、10.30us。instruction_calls_by_pipeline：MTE2 451、VECTOR 1898、SCALAR 6998、MTE3 114。",
+          "interpretation": "宽输出通道只占 17 次载入却带 32 组 BAR/WAIT_FLAG，单次 8KB 搬运平均 13.39/32≈0.42us 被等待追上，说明该通道按“搬一块-等一块-算一块-写一块”串行；组内 instruction_time 可重叠，只作关注度排序。"
+        },
+        {
+          "path": "timeline.json",
+          "category": "simulator",
+          "role": "同核流水活跃/等待/空闲并集(窗口分数)",
+          "finding": "core0.veccore0 窗口为“首个到最后一个可见硬件事件”的分数(capture_scope 明示)，非绝对时钟：MTE2 active_ratio 0.8774 / wait 0.2367 / productive 0.6414；VECTOR active 0.9061 / wait_only 0.3948 / productive 0.5177；MTE3 active 0.4021 / productive 0.2896；SCALARLDST event_count 5332、active 0.1849(未报告的辅助泳道)；SCALAR active 0.0840。",
+          "interpretation": "VECTOR 有 39.5% 时间只是在等 MTE2/MTE3 的旗标，MTE2 自身又有 23.7% 在等缓冲释放，两条流水效率互补而非饱和，指向“在飞搬运深度不足”而非算术吞吐瓶颈；SCALARLDST 只登记关注度，不据此推断空泡。"
+        },
+        {
+          "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "category": "source_ir",
+          "role": "本轮唯一的实际 TTIR(constexpr BLOCK_M=8/BLOCK_N=128/EVEN=true)",
+          "finding": "统计通道(第47~93行)为 8x128 tile、内层 scf.for 回边只携带 4 元组(mean,var,cnt,curr)，lookahead 用 minsi(n+1, n_num_steps-1) 一级预取；输出通道分两支：scf.if %spatial_wide(第167行) 的真分支为 8x256、回边只携带一个 tile(第192~219行)、同样 minsi(n+1,last) 一级预取；假分支保留原 8x128。常量 %c255_i32/%c256_i32/%n_num_steps_w 已在文件内，无 %c2_i32。",
+          "interpretation": "宽输出分支的回边只让一块 tile 同时活跃，是本轮可直接否证的单点结构；统计通道与归约、running 统计、weight/bias 空指针分支本轮不动。"
+        },
+        {
+          "path": "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.bcmlir",
+          "category": "source_ir",
+          "role": "实际低层产物(冻结)，核对疑似冗余在后端是否已消除",
+          "finding": "bcmlir 第53~91行统计内层循环每次迭代 `%alloc_39 = memref.alloc() : memref<8x128xf32>` + `memref.copy`；第223~234行宽输出内层循环每次迭代 `%alloc_80 = memref.alloc() : memref<8x256xf32>` + `memref.copy`(随后 bufferization.to_tensor)，循环回边只携带一个 tensor<8x256xf32>。后端已消除掩码/i1 载体/select(memref.copy 无 mask)，但未把回边活跃 tile 数增加、未自动把单槽扩成多槽。",
+          "interpretation": "疑似冗余(掩码、where、计数选择)确已被后端消除，不能重复申报；真实存在且未消除的是“每迭代同形状 alloc+copy 只对应一个在飞 tile”，与 profiling 的 20GB/s 激活带宽相互印证。"
+        },
+        {
+          "path": "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttadapter",
+          "category": "source_ir",
+          "role": "符号核对：低层产物与当前 TTIR 同源",
+          "finding": "ttadapter 符号 @batch_norm_with_update_kernel，统计循环第65行 iter_args 4 元组、第78~79行 alloc+copy 8x128；宽输出第223行单 tensor<8x256xf32> 回边、第232~233行 alloc+copy 8x256；窄输出第267~277行保留 8x128。ast_sha256 与 ir-inventory.json 的 5c1607c0…2508 一致。",
+          "interpretation": "低层产物确属当前 IR，冻结不动，只作为机制核对依据。"
+        },
+        {
+          "path": "feedback.json",
+          "category": "paired_profiling",
+          "role": "正式评测基线(身份与噪声尺度)",
+          "finding": "parent_result 27/27 PASSED、geo_mean 1.8522、min_speedup 0.6846(timing-8 0.046082ms)；target timing-7 latency 0.039261ms/speedup 0.7174；supplementary 与 cann_supplementary 各 36/36 passed。父版同样形状(timing-6 0.007779ms、timing-0/3 约 0.0080ms)显示不同 shape 走不同瓦片分支，本次只针对 8x64x64x64 的宽输出分支。",
+          "interpretation": "收益须在正式延迟上体现并对全部 workload 保持 PASS；不得以预检或文档替代真机数值。"
+        },
+        {
+          "path": "codex-brief.json",
+          "category": "simulator",
+          "role": "宿主(Codex)证据分析与方向建议",
+          "finding": "起点为保留 ir-004(源码字节冻结、输出分块 8x256 已验收、目标 39.261332us)；要求结合真实 IR 定位 BAR/WAIT 到统计或输出通道，给出与当前热点对应的新假设，并先登记预测再改 IR；指出公共时钟比例须按窗口解释，直接 PC 源码映射待补齐。",
+          "interpretation": "本诊断采纳“先核对实际 TTIR/bcmlir 再选通道”的方法，但把通道限定在宽输出分支，并以 bcmlir 的单槽 alloc+copy 作为 Codex 提示的具体落点。"
+        }
+      ],
+      "hypothesis": "当前最佳 IR 的宽输出分支(8x256)只有一级软件预取：内层 scf.for 回边只携带一个 tensor<8x256xf32>(TTIR 第192行 iter_args 单值)，bcmlir/ttadapter 因此每迭代只对一个同形状 memref 做 alloc+copy，后端缓冲区复用把它压成一个 UB 槽位，同一时刻至多一个 8KB GM->UB 搬移在飞。三项独立观测一致：其一，该核 aiv_mte2_active_bw 仅 20.06GB/s，而同核 aiv_mte3_active_bw 达 42.30GB/s；其二，宽输出通道 17 次载入却触发 32 组 WAIT_FLAG(MTE2,FLAGID:1)(13.39us)与 4 条 BAR(各 14.2us)；其三，VECTOR wait_only 0.3948 而 productive 仅 0.5177。把一个 tile 的 8KB 搬运时延(~0.42us/次)与每 tile 的向量计算(约百纳秒级)相比，单级预取下计算无法覆盖搬运尾部。将宽输出分支的预取深度加到二级(回边同时携带 cur 与 pending，lookahead 改为 min(n+2, n_num_steps_w-1))，可让两个 8KB 搬运同时在飞，使搬运与 VECTOR 计算真正重叠；该改动只改变搬运发起时机，tile 访问顺序、逐元素 fp32 运算顺序(weight*(x-mean)*inv_std+bias)与写回地址完全不变，因而数值应与当前最佳逐位一致。",
+      "alternatives": [
+        "加宽统计通道(8x512/8x256)：ir-003 在该方向触发 ub overflow(requires 10485760 bits/1572864 bits available)，需要 Chan 合并与双路径并存才能保形状安全，UB 与一次性验证面都更大，本轮不选。",
+        "把宽输出从 256 再放宽到 512：同族参数续调，与本次单机制叠加后无法隔离归因，且每轮 UB 与 barrier 分组变化不可预测，留作后续独立调用。",
+        "消除末次钳位造成的重复预取(每趟多搬一块 tile，约 3~4.5% 流量)：需循环剥离/条件尾块，会破坏单级流水结构，风险大于收益。",
+        "统计通道 cnt 向量标量化：ir-001 已实测(0.045173ms)无收益，负结果保留，不再重访。",
+        "把两遍读取合并为一遍(整片 128KB 常驻 UB)：192KB UB 上限下与 8x4096 累加器/输出临时不可共存，且需大范围结构改写，非单点机制。"
+      ],
+      "change": "只编辑 ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir 的 scf.if %spatial_wide 真分支(第160~220行区域)，不动统计通道、窄输出假分支、归约、running 统计、weight/bias 空指针分支与函数签名/常量映射：(1) 新增常量 %c2_i32 = 2；(2) 在 prologue 的 %curr_in_w 载入之后，再载入第 1 块 tile(偏移 min(1, n_num_steps_w-1)*256，复用 %in_ptr_b_w + 广播 lane)；(3) 内层 scf.for 的 iter_args 由 (carry) 扩为 (cur, pend)，初值为 tile0/tile1；(4) lookahead 步改为 %n_step_w + 2 并以 min(·, n_num_steps_w-1) 钳位；(5) scf.yield 改为 (pend, 新载入 tile)；(6) 算术与写回仍消费 cur，算子次序逐项不变。n_num_steps_w=1 时钳位落到 tile0，重复读同一合法地址，不发生越界。",
+      "expected": "可测预测：(1) bcmlir/ttadapter 中宽输出内层循环回边由单 tensor 变为两个 tensor<8x256xf32>，缓冲槽位增加到 2~3，SET_FLAG/WAIT_FLAG(MTE2,FLAGID:1) 步数增加但单项等待时间下降；(2) profiling 中该核 aiv_mte2_instructions 由 121 微增至约 123(每 m_step 多一次钳位重复读，每核多搬 8KB，流量 +3%)，而 aiv_mte2_active_bw 由 20.06GB/s 上升(指向 25~30GB/s)，aiv_mte2_ratio 不下降而 aiv_time 下降；(3) hotspots 宽输出通道 WAIT_FLAG(MTE2) 单项由 13.39us 降至 11us 以下，VECTOR wait_only 由 0.3948 向 0.30 以下靠近；(4) 每核 aiv_time 由 19.29us 降至 17~18us，正式 timing-7 延迟低于当前最佳 0.039261ms(判据：≥15% 视为机制成立，<3% 视为落在噪声内并转统计通道方向)。证伪条件：若 bcmlir 回边仍是单槽，或正式延迟 ≥0.039261ms，则单核 DMA 并发已足，本机制不成立。",
+      "validation": "先 decision 桥、再落盘 IR；宿主侧顺序为：CPU 编译并核对新 bcmlir 的宽输出回边有两块活跃 tile 与 ≥2 个 UB 槽、符号/ABI 未变；真机 timing-7、timing-8 复测；完整 27 项 KGS 与双方 36 项补测；ABBA 与后双分析。数值要求：同一 tile 序列、同一 fp32 运算顺序，仅搬运时机不同，逐元素结果应与当前最佳逐位一致(correctness-0..17 的 abs/rel_err 不应变化)；special value、边界(spatial_dim 非 256 倍数走假分支)、别名与 running_mean/var 更新语义不变。以上均为待测预测，不当作收益结论。",
+      "layer_reason": "源码与低层产物均冻结，本轮只能改 TTIR。宽输出分支的预取深度是 TTIR 层的结构选择：constexpr 瓦片形状已由清单固定(8/128/true)，后端 multibuffer/auto-sync 只做缓冲区复用与同步注入，不会自行把回边活跃 tile 数从 1 提到 2(ir-004 与当前 bcmlir 均证实单槽 alloc+copy)，因此这是编译器不会自动完成、又不需要改动函数 ABI、tile 形状或数学语义的编译缺陷。统计通道加宽涉及 Chan 合并与形状守卫，属于 ir-003 已记录的 UB 风险面，另立调用处理。",
+      "simulator_incremental_judgment": "模拟器时间轴为窗口分数(capture_start 0.0/capture_end 1.0、time_unit fraction)，绝对 µs 只在同核同窗口内做相对比较，不与其他核对表或宿主时钟换算；hotspots 的 instruction_time_sum/largest_instruction 因流水可重叠不累加为总耗时，BAR/WAIT_FLAG 的“running_time_us”按占用区间解释而非独立成本。已报告泳道 MTE2/VECTOR/MTE3/SCALAR 用于判断等待归属，未报告的辅助泳道 SCALARLDST(5332 事件、active 0.1849)与 CACHEMISS(68 事件、0.0013)只登记关注度，不据此推断空泡。本轮只把“MTE2 激活带宽 20GB/s 且 wait 0.237 + VECTOR wait_only 0.395 + 宽通道 32 组 WAIT_FLAG”作为机制选择依据，增量验收以宿主真机正式评测为准。",
+      "unknown": [
+        "单核可并发的 GM->UB DMA 上限与每核可持续读带宽(需在驱动/编译产物层面另行确认)",
+        "其他 workload 中哪些 shape 会走 %spatial_wide 真分支(仅知本用例 spatial_dim=4096 满足 4096%256==0)"
+      ]
+    },
+    "result": null,
+    "lowering": {
+      "status": "lowering_review_failed",
+      "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+      "review_tool_sha256": "743d0543872213c12318f07b48252a957a43688ebe08d8361499d27c4877054d",
+      "comparison_baseline": "invocation_input",
+      "compiler_identity": {
+        "triton_version": "3.5.1",
+        "sources": {
+          "compiler/compiler.py": "ca9380e543d8ccf6b9b363f57ff6bc9674c32a4e0db16ea79e5688cff2da0264",
+          "backends/ascend/compiler.py": "62ddbfbd42914b234b9c392a91095e313536b855d0bf121729a83c81a07c13b6",
+          "runtime/cache.py": "0355c3e3452fa4500122244b8fff8864f22bc05c417a3d6f5dada9f2e92f8040",
+          "knobs.py": "4cab52a62325ab5ffc0d1eb963d78a2621d8e6a8f9c1505186c1ba7c4976d2ac"
+        },
+        "resolved_sources": {
+          "triton.compiler.compiler": {
+            "path": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/spec/ascend/compiler/compiler.py",
+            "sha256": "31ea8760a43db36ef59d8622d74761a147fbad1cf05e1a760ec341d8a374308b"
+          },
+          "triton.backends.ascend.compiler": {
+            "path": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/compiler.py",
+            "sha256": "62ddbfbd42914b234b9c392a91095e313536b855d0bf121729a83c81a07c13b6"
+          },
+          "triton.runtime.jit": {
+            "path": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/spec/ascend/runtime/jit.py",
+            "sha256": "d4b9f4cc94c7a5beeb06d8c9404442cdfa26aabc4a474697a090639deb72d2db"
+          },
+          "triton.runtime.cache": {
+            "path": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/runtime/cache.py",
+            "sha256": "0355c3e3452fa4500122244b8fff8864f22bc05c417a3d6f5dada9f2e92f8040"
+          }
+        },
+        "compiler_environment": {}
+      },
+      "rows": [
+        {
+          "variant": "original",
+          "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "input_ir_path": "/data/hanle/ascend-optimization/runs/midday-whitebox-20261120/batchnorm/agent-calls/ir-001/input-ir/ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "input_ir_sha256": "574eddcba7a8b920c211880d4332fb710465bcda4a944dc3f81ae74c066a17cc",
+          "target": {
+            "backend": "npu",
+            "arch": "Ascend910B4-1",
+            "warp_size": 0
+          },
+          "options": {
+            "add_auto_scheduling": false,
+            "allow_fp8e4nv": false,
+            "allowed_dot_input_precisions": {
+              "__tuple__": [
+                "ieee",
+                "hf32"
+              ]
+            },
+            "arch": "Ascend910B4-1",
+            "auto_blockify_size": 1,
+            "auto_tile_and_bind_subblock": true,
+            "auto_vectorize_v2_max_fused_ops_num": null,
+            "bisheng_options": "-cce-link-aicore-ll-module /usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/lib/libdevice.10.bc",
+            "cluster_dims": {
+              "__tuple__": [
+                1,
+                1,
+                1
+              ]
+            },
+            "compile_mode": "simd",
+            "compile_on_910_95": false,
+            "custom_pipeline": null,
+            "debug": false,
+            "default_dot_input_precision": "ieee",
+            "deprecated_fp8_dtypes": {
+              "__tuple__": []
+            },
+            "disable_auto_inject_block_sync": null,
+            "disable_fma": false,
+            "disable_size_align_for_cast": null,
+            "disable_tightly_coupled_buffer_reuse": false,
+            "enable_auto_bind_sub_block": null,
+            "enable_auto_blockify": null,
+            "enable_auto_vectorize_v2": null,
+            "enable_bishengir_simt_optimization": 0,
+            "enable_cce_vf_auto_sync": null,
+            "enable_cce_vf_remove_membar": null,
+            "enable_drop_unit_dims": null,
+            "enable_dynamic_cv_pipeline": false,
+            "enable_flatten": null,
+            "enable_fp_fusion": true,
+            "enable_hivm_auto_cv_balance": null,
+            "enable_mask_fallback_conversion": false,
+            "enable_mixed_cv": null,
+            "enable_nd2nz_on_vector": false,
+            "enable_persistent": false,
+            "enable_preload": null,
+            "enable_select_analysis": true,
+            "enable_simt_reorder_instruction": false,
+            "enable_sync_block_lock": false,
+            "enable_ubuf_saving": null,
+            "enable_vf_fusion": false,
+            "enable_warp_specialization": false,
+            "extern_libs": null,
+            "force_simt_only": false,
+            "force_simt_template": false,
+            "hfusion_enable_multiple_consumer_fusion": false,
+            "inject_barrier_all": null,
+            "inject_block_all": null,
+            "instrumentation_mode": "",
+            "kernel_name": "batch_norm_with_update_kernel",
+            "limit_auto_multi_buffer_of_local_buffer": null,
+            "limit_auto_multi_buffer_only_for_local_buffer": null,
+            "llvm_version": 15,
+            "max_num_imprecise_acc_default": 0,
+            "mix_mode": "aiv",
+            "multibuffer": true,
+            "num_buffers_warp_spec": 0,
+            "num_consumer_groups": 0,
+            "num_ctas": 1,
+            "num_stages": 1,
+            "num_warps": 2,
+            "optimize_dynamic_offset": false,
+            "optimize_epilogue": false,
+            "parallel_mode": "simd",
+            "prevec_max_fused_ops_num": null,
+            "reg_dec_producer": 0,
+            "reg_inc_consumer": 0,
+            "sanitize_overflow": true,
+            "set_workspace_multibuffer": null,
+            "shared_mem_dynamic_size": 221184,
+            "simt_stack_limit": null,
+            "stream": null,
+            "supported_fp8_dtypes": {
+              "__tuple__": [
+                "fp8e5",
+                "fp8e4b15",
+                "fp8e4nv",
+                "fp8e4b8",
+                "fp8e5b16"
+              ]
+            },
+            "sync_solver": null,
+            "tile_mix_cube_loop": null,
+            "tile_mix_vector_loop": null,
+            "unit_flag": null,
+            "use_bytecode": true,
+            "vf_merge_level": 1,
+            "warp_size": 32
+          },
+          "status": "lowered_to_binary",
+          "artifacts": [
+            {
+              "kind": "ttir",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.ttir",
+              "sha256": "7ba2a424e9d3d462ed40baeb92e2b1b0e6894d186e5e036e2f21fe43342ebdcc",
+              "bytes": 54216
+            },
+            {
+              "kind": "ttadapter",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.ttadapter",
+              "sha256": "7c9a8b826abf7ce9cc812be1a2ae96ea057ff2d9b827071481c9719063effcc5",
+              "bytes": 50964
+            },
+            {
+              "kind": "mlirbc",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.mlirbc",
+              "sha256": "3759faa2b87998d2188904ae565b967b1d40f2cee6366f89a9f9a3ec9a42dd83",
+              "bytes": 6763
+            },
+            {
+              "kind": "bcmlir",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.bcmlir",
+              "sha256": "33e1cc8cb7e25d934c538e2db3bf9e37a51376ed1a7ed764f4a3a30a494df23d",
+              "bytes": 46485
+            },
+            {
+              "kind": "npubin",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.npubin",
+              "sha256": "41483d746ba67cd3456434ea7d176386cbe6e987f3ab56d360d1baf5935be5fe",
+              "bytes": 8416
+            },
+            {
+              "kind": "json",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.json",
+              "sha256": "73dfd5ed6ff49aeff15987e5e87f58ca2e86d49ba1f18065169bed0f9fa812d9",
+              "bytes": 2872
+            }
+          ]
+        },
+        {
+          "variant": "candidate",
+          "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "input_ir_path": "/data/hanle/ascend-optimization/runs/midday-whitebox-20261120/batchnorm/agent-calls/ir-001/output-ir/ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "input_ir_sha256": "e21e1e258fd5ba94746817c090b36a69371189b9d59a382daadb602e1003b782",
+          "target": {
+            "backend": "npu",
+            "arch": "Ascend910B4-1",
+            "warp_size": 0
+          },
+          "options": {
+            "add_auto_scheduling": false,
+            "allow_fp8e4nv": false,
+            "allowed_dot_input_precisions": {
+              "__tuple__": [
+                "ieee",
+                "hf32"
+              ]
+            },
+            "arch": "Ascend910B4-1",
+            "auto_blockify_size": 1,
+            "auto_tile_and_bind_subblock": true,
+            "auto_vectorize_v2_max_fused_ops_num": null,
+            "bisheng_options": "-cce-link-aicore-ll-module /usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/lib/libdevice.10.bc",
+            "cluster_dims": {
+              "__tuple__": [
+                1,
+                1,
+                1
+              ]
+            },
+            "compile_mode": "simd",
+            "compile_on_910_95": false,
+            "custom_pipeline": null,
+            "debug": false,
+            "default_dot_input_precision": "ieee",
+            "deprecated_fp8_dtypes": {
+              "__tuple__": []
+            },
+            "disable_auto_inject_block_sync": null,
+            "disable_fma": false,
+            "disable_size_align_for_cast": null,
+            "disable_tightly_coupled_buffer_reuse": false,
+            "enable_auto_bind_sub_block": null,
+            "enable_auto_blockify": null,
+            "enable_auto_vectorize_v2": null,
+            "enable_bishengir_simt_optimization": 0,
+            "enable_cce_vf_auto_sync": null,
+            "enable_cce_vf_remove_membar": null,
+            "enable_drop_unit_dims": null,
+            "enable_dynamic_cv_pipeline": false,
+            "enable_flatten": null,
+            "enable_fp_fusion": true,
+            "enable_hivm_auto_cv_balance": null,
+            "enable_mask_fallback_conversion": false,
+            "enable_mixed_cv": null,
+            "enable_nd2nz_on_vector": false,
+            "enable_persistent": false,
+            "enable_preload": null,
+            "enable_select_analysis": true,
+            "enable_simt_reorder_instruction": false,
+            "enable_sync_block_lock": false,
+            "enable_ubuf_saving": null,
+            "enable_vf_fusion": false,
+            "enable_warp_specialization": false,
+            "extern_libs": null,
+            "force_simt_only": false,
+            "force_simt_template": false,
+            "hfusion_enable_multiple_consumer_fusion": false,
+            "inject_barrier_all": null,
+            "inject_block_all": null,
+            "instrumentation_mode": "",
+            "kernel_name": "batch_norm_with_update_kernel",
+            "limit_auto_multi_buffer_of_local_buffer": null,
+            "limit_auto_multi_buffer_only_for_local_buffer": null,
+            "llvm_version": 15,
+            "max_num_imprecise_acc_default": 0,
+            "mix_mode": "aiv",
+            "multibuffer": true,
+            "num_buffers_warp_spec": 0,
+            "num_consumer_groups": 0,
+            "num_ctas": 1,
+            "num_stages": 1,
+            "num_warps": 2,
+            "optimize_dynamic_offset": false,
+            "optimize_epilogue": false,
+            "parallel_mode": "simd",
+            "prevec_max_fused_ops_num": null,
+            "reg_dec_producer": 0,
+            "reg_inc_consumer": 0,
+            "sanitize_overflow": true,
+            "set_workspace_multibuffer": null,
+            "shared_mem_dynamic_size": 221184,
+            "simt_stack_limit": null,
+            "stream": null,
+            "supported_fp8_dtypes": {
+              "__tuple__": [
+                "fp8e5",
+                "fp8e4b15",
+                "fp8e4nv",
+                "fp8e4b8",
+                "fp8e5b16"
+              ]
+            },
+            "sync_solver": null,
+            "tile_mix_cube_loop": null,
+            "tile_mix_vector_loop": null,
+            "unit_flag": null,
+            "use_bytecode": true,
+            "vf_merge_level": 1,
+            "warp_size": 32
+          },
+          "status": "lowering_failed",
+          "error": "RuntimeError: Parse MLIR file failed.",
+          "traceback": "Traceback (most recent call last):\n  File \"/data/hanle/ascend-optimization/runs/midday-whitebox-20261120/tools/ir_lowering_review.py\", line 104, in main\n    kernel = compiler.compile(str(source), target=target, options=restore(entry['compiler_options']))\n             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/usr/local/python3.11.15/lib/python3.11/site-packages/triton/spec/ascend/compiler/compiler.py\", line 241, in compile\n    src = IRSource(src, context, backend)\n          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/data/hanle/ascend-optimization/runs/midday-whitebox-20261120/tools/ir_lowering_review.py\", line 81, in ir_init\n    native_ir_init(instance, path, context, backend)\n  File \"/usr/local/python3.11.15/lib/python3.11/site-packages/triton/spec/ascend/compiler/compiler.py\", line 112, in __init__\n    self.module = ir.parse_mlir_module(self.path, context)\n                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nRuntimeError: Parse MLIR file failed.\n"
+        }
+      ],
+      "npu_initialized": false,
+      "scope": "IRSource lowering with captured target/options; actual AST injection, correctness and performance are separate"
+    }
+  },
+  {
+    "stage": "midday-whitebox-20261120",
+    "invocation": "ir-002",
+    "diagnosis": {
+      "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+      "selected_layer": "single_operator_ir",
+      "evidence": [
+        {
+          "path": "feedback.json",
+          "category": "paired_profiling",
+          "role": "确认当前最佳身份、目标用例数值与本次调用（ir-001）的真实失败原因",
+          "finding": "父版（保留 ir-004，source_sha256=b8d4d4a2…）正式评测 27/27 PASSED、geo_mean 1.8522、min_speedup 0.6846（timing-8，46.082us），两套补测各 36/36；目标用例 timing-7 为 latency 39.2613us / reference 28.1645us / speedup 0.7174，故本轮必须超过该最佳。current_invocation=ir-001 状态为 CPU_parse_failed，compiler_log 精确指向 output-ir 第 204:9 'operation defines 2 results but was provided 1 to bind'，lowering.rows 里 candidate 直接 lowering_failed（RuntimeError: Parse MLIR file failed.），而 original 行 lowered_to_binary。host_instruction 要求只修复多结果 scf.for 的绑定语法、保留已登记的两块前瞻机制、并保持冻结源码与证据不变。"
+        },
+        {
+          "path": "profiling.json",
+          "category": "paired_profiling",
+          "role": "确定用例形状、每 block 搬运总量与哪条硬件流水最忙，作为改进方向的定量锚点",
+          "finding": "用例为 batch_norm_with_update_functional-timing-7，输入 8x64x64x64 fp32、affine、seed=1736，容差 atol=rtol=1e-4、required_matched_ratio=1.0、equal_nan=true。候选侧（64 block、1650MHz）Task Duration 47.360947us，aiv_mte2_ratio 0.6187 为三条执行流水最高，aiv_vec_ratio 0.4473，aiv_mte3_ratio 0.2154；read_main_memory_datas 合计 16952KB，即每 block 约 264.9KB，恰为单片特征（8x4096x4B=128KB）遍历两趟的量。MTE2 与 VECTOR 占比相加≈1.07，说明两条流水在本核内近乎串行、且都未饱和——这是‘搬运与计算重叠不足’的量化入口。"
+        },
+        {
+          "path": "hotspots.json",
+          "category": "simulator",
+          "role": "指令级定位同步/等待热点，区分统计趟与输出趟的同步构成，并核对 8x256 输出 tile 的实际搬运形态",
+          "finding": "top_instructions 全部是同步与搬运项：64 次调用的一组为 VECTOR BAR 18.58/18.49/18.45/18.41/18.36us、MTE2 WAIT_FLAG(PIPE:VEC,TRIGGERPIPE:MTE2,FLAGID:1) 17.93us、MOV_SRC_TO_DST_ALIGN(Src:OUT,Dst:UB,XD:X22=0x2000≈8192B，即 8x256 的 8 行 1KB 突发) 16.42us、SET_FLAG(TRIGGERPIPE:VEC) 16.38us；32 次调用的一组为 MTE3 WAIT_FLAG(PIPE:VEC,TRIGGERPIPE:MTE3,FLAGID:0) 14.30us、VECTOR BAR 14.29/14.27/14.23/14.17us、MTE2 WAIT_FLAG 13.39us、VECTOR 上等 MTE3 的 WAIT_FLAG 10.71us、MTE3 MOV_SRC_TO_DST_ALIGN(Src:UB,Dst:OUT) 10.30us。按调用次数与 8x256 tile 尺寸对应，32 次一组即输出趟（16 次 8x256 迭代按 AIV 子块拆分后 32 次 store）。真正的 FP 向量算术未进榜，说明输出趟的成本主体是‘每次 tile 装载与计算之间的显式 WAIT/BAR 串接’，而非算术量；指令时间只作关注度排序（可重叠、非墙钟）。"
+        },
+        {
+          "path": "timeline.json",
+          "category": "simulator",
+          "role": "切分两趟的窗口占比、量化各流水 active/productive/等待，并说明时钟资质与观测范围",
+          "finding": "clock_qualification=relative_only、absolute_time_qualified=false，capture_scope 为‘首个至末个可见硬件事件’的部分窗口；但 absolute_unit_validation 以 33/33 个非同步 PC 对照运行时间中位比 1.00055 核验了单位 us，raw_clock_window 185.793→224.198 = 38.405us，与 timing-7 的 39.26us 同量级，故本窗口覆盖统计趟与输出趟两趟。MTE3 唯一大空闲为 [0,0.2908]，此后才持续写回，据此统计趟占窗口前 29.1%、输出趟占其后 70.9%（≈27.2us），输出趟是主要成本区。流水占用：VECTOR active 0.9061、productive 0.5177、wait_only 0.3884；MTE2 active 0.8774、productive 0.6414、wait_only 0.2360、idle 0.1226；MTE3 active 0.4021、productive 0.2896、wait_only 0.1126、idle 0.5979。即 MTE2 有 23.6% 在等缓冲区释放（WAR），VECTOR 有 38.8% 在等数据（WAIT_FLAG 触发源为 MTE2），两者几乎互相让路；MTE2 在输出趟 0.31→0.53 段内以 0.0121（≈0.46us）的规则周期出现小空隙，与输出趟 16 次迭代的节奏一致，末段 [0.5057,0.5315] 另有 0.0259 的较大空闲。"
+        },
+        {
+          "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "category": "source_ir",
+          "role": "定位可独立验证的编译缺陷（唯一实际报错点）与已登记的流水机制，确认改动面",
+          "finding": "全文只有 5 处 scf.for：第 47 行 %cnt_7:3、第 64 行 %curr_input_48:4、第 257 行 %curr_input_51（单结果，均带 :N 绑定或单结果）语法合法；第 204 行 `%carry_w = scf.for … iter_args(%cur_in_w = %curr_in_w, %pend_in_w = %pd_in_w) -> (tensor<8x256xf32>, tensor<8x256xf32>)` 定义 2 个结果却只绑定 1 个名字，正是 compiler_log 报的第 204:9 错误，也是本候选唯一无法解析的原因。该循环即输出趟（scf.if %spatial_wide 真分支，8x256 tile）的两块前瞻：序言先载 tile0，再用 minsi(1, N-1) 偏移载入 tile1；循环体用 min(n+2, N-1) 钳位载入 tile n+2，算术顺序为 subf → mulf(weight) → mulf(inv_std) → addf(bias) 后 store，回边 yield (%pend_in_w, %nx_in_w)；循环结果在循环外未被使用。统计趟（第 47/64 行）与 EVEN=false 回退分支（第 234 行）保持父版原样，未在本轮改动。"
+        },
+        {
+          "path": "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.bcmlir",
+          "category": "source_ir",
+          "role": "在冻结的实际后端产物上核对缓冲数、拷贝形态与疑似冗余是否已被后端消除",
+          "finding": "该产物与同目录 ttadapter（sha bd1b88a7…/12c88ec8…，本次保持冻结）算子直方图一致：memref.alloc 共 6 个——4×memref<8x128xf32>（统计趟：当前 tile、前瞻 tile、均值/M2 累加器）与 2×memref<8x256xf32>（输出趟：当前 tile + 前瞻 tile），memref.copy 6 处、arith.mulf 15、arith.addf 10、arith.addi 19、linalg.reduce 2，且无任何显式同步指令。结论两点：(1) 输出趟在父版只有 2 个 8x256 tile 缓冲，回边上同时活跃的 tile 只有 1 个（当前+下一个），MTE2 必须等上一 tile 的缓冲被 VECTOR 释放才能起步，这与 timeline 中 MTE2 wait_only 0.236（等缓冲）和 VECTOR wait_only 0.388（等数据）互相印证，且与该阶段尚无显式同步、BAR/WAIT 完全由缓冲活性在下游插入的结构一致；(2) 疑似冗余的计数张量 tensor<8x128xi32> 在冻结产物中已不存在（无任何 xi32 memref/vector，19 个 arith.addi 全是标量/索引），即该冗余在后端已被消除，与 prior-explorations 中 ir-001 配对实测‘去掉 cnt 向量自增后 BAR/WAIT 结构基本不变、无收益’的结论吻合，故本轮对该点保持 IR 原样、不重复修改。"
+        },
+        {
+          "path": "frozen.py",
+          "category": "source_ir",
+          "role": "确认语义边界与源码已表达的流水意图，保证 IR 改动不跨越语义",
+          "finding": "第 52-54 行 mean/var/cnt 初始化；第 66 行 EVEN 分支无掩码装载 tile0；第 71-103 行统计内层循环：第 82 行 min(n_step+1, n_num_steps-1) 钳位前瞻、第 87-88 行 delta=curr-mean 与 cnt+=1、第 101-102 行 Welford 递推、第 103 行 curr_input=next_input；第 104-106 行两次 tl.sum 与 rsqrt；第 125-156 行输出趟：第 137-138 行注释明确写着‘Same one-tile lookahead as the statistics pass’，第 151 行 output=weight*(curr_input-mean)*inv_std+bias，第 153 行 store。即源码只表达深度 1 前瞻，输出趟的 tile 顺序、乘加结合顺序与写回位置都是语义约束：本轮 IR 的深度 2 前瞻只改变装载发起时机，不改变 tile 访问序列、算术结合顺序与舍入，EVEN 特化（batch%8==0、spatial%128==0）与全部特殊值路径（NaN/Inf、零方差、n=1、weight/bias 空指针分支）不受影响。"
+        },
+        {
+          "path": "prior-explorations.json",
+          "category": "paired_profiling",
+          "role": "保留此前负结果与已登记机制，避免重复已有研究身份",
+          "finding": "ir-001（cnt 标量化）正式 geo_mean 1.8269、timing-7 45.173us，低于父版、无收益；ir-002/ir-003（统计块加宽到 512 及配套合并）lowering_failed；ir-004（输出趟 8x256 加宽）geo_mean 1.8522、timing-7 39.261us，为当前最佳；ir-005（统计内层循环深度 2 前瞻，即本轮同机制）lowering_review_passed、候选 ttadapter 由 38781B 增至 40030B，但 result 为 null，尚无正式结果，且其 alternatives 明确把‘把同样的预取深度加1应用到输出归一化循环’留作同机制的后续一步。故本轮只在输出趟落同一机制，与统计趟分支互不重叠、可独立归因。"
+        },
+        {
+          "path": "lowered-inventory.json",
+          "category": "source_ir",
+          "role": "确认可编辑面与冻结面",
+          "finding": "清单登记 ast_sha256=5c1607c0… 的 ttadapter/bcmlir/npubin 三件套（bd1b88a7…/12c88ec8…/41483d74…）来自 ir-004 编译缓存并保持冻结，只允许编辑 ir-inventory.json 列出的 ir/5c1607c0…/batch_norm_with_update_kernel.ttir；因此本轮改动只能落在 TTIR 文本，低层产物仅用于读证。"
+        }
+      ],
+      "hypothesis": "当前候选的唯一编译缺陷是输出趟深度 2 前瞻循环的多结果 SCF 绑定语法（第 204 行少了 ':2'），它使整个候选在 IRSource 解析阶段即失败，成本为‘零收益 + 无法评测’，是必须先修的结构性缺陷；而它承载的机制本身有独立的执行成本支持：输出趟占窗口 70.9%（≈27.2us），冻结 bcmlir 中输出趟只有 2 个 memref<8x256xf32> tile 缓冲（当前+前瞻，回边仅活跃 1 个 tile），于是 MTE2 必须等 VECTOR 释放上一 tile 才能起步——这正好解释 timeline 中 MTE2 wait_only 0.2360（等缓冲释放）与 VECTOR wait_only 0.3884（WAIT_FLAG 触发源为 MTE2）近乎互相让路的近串行结构，以及 profiling 中 aiv_mte2_ratio 0.6187 与 aiv_vec_ratio 0.4473 相加≈1.07。把回边改为同时携带两块 tile（当前 + pending）并把前瞻偏移从 n+1 提到 n+2（仍用 minsi 钳到末块），编译期即可强制输出趟至少 3 个 tile 缓冲区，让第 n+2 块的 GM 装载与第 n 块的乘加/写回真正重叠，而 tile 访问顺序、每次的 subf→mulf(weight)→mulf(inv_std)→addf(bias) 结合顺序、store 地址与 EVEN 特化全部不变，因而数值逐位不变。",
+      "alternatives": [
+        {
+          "idea": "修复时顺手把该 scf.for 改成无结果形式（删掉两个 iter_args/yield），彻底消除未使用结果",
+          "why_not_selected": "会把回边携带值删光、前瞻被折叠成深度 1，等于放弃 host_instruction 要求保留的已登记机制，机制不可验证；且改动面大于单点语法修复。"
+        },
+        {
+          "idea": "同时对统计趟（第 64 行内层循环）套用同一深度 2 前瞻",
+          "why_not_selected": "同一机制在 ir-005 中已登记并 CPU lower 通过（候选 ttadapter 38781→40030B），但尚无正式结果；本轮若同时改两处，归因混淆，且统计趟只占窗口 29.1%，先在被更大的输出趟（70.9%）验证可独立归因，成功后再叠加。"
+        },
+        {
+          "idea": "把输出趟 tile 加宽到 8x512 或改 BLOCK_N",
+          "why_not_selected": "会改变特化常量身份（清单记录 8/128/EVEN=true）、连带 reshape/reduce 形状与 UB 预算；此前加宽统计分块已遇 UB 超限（ir-002/ir-003），风险与本轮‘单点可验证’要求不符；且 MTE2 已在小突发（1KB 行、1MB 跨步）上效率偏低，加宽未必改善突发效率。"
+        },
+        {
+          "idea": "把疑似冗余的 cnt 计数张量标量化（ir-001 身份）",
+          "why_not_selected": "冻结 bcmlir/ttadapter 中已无任何 i32 tile memref（该冗余在后端已消除），且 ir-001 已配对实测无收益（geo 1.8269 vs 父版 1.8522，timing-7 45.173us）；按‘后端已消除的疑似冗余保持 IR 原样’处理。"
+        },
+        {
+          "idea": "改编译选项（num_stages/multibuffer/disable_tightly_coupled_buffer_reuse 等）来加深流水",
+          "why_not_selected": "属独立的编译选项研究身份，且选项在 ir-inventory 的 compiler_options 中已记录、不在可编辑面内；本轮需保持 IR 身份可单独归因。"
+        }
+      ],
+      "change": "只做一处语法修复式编辑：把 ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir 第 204 行的 `%carry_w = scf.for` 改为 `%carry_w:2 = scf.for`，使该 scf.for 的两个结果（tensor<8x256xf32>, tensor<8x256xf32>）与 iter_args 正确绑定。其余全部字节保持不变，包括：输出趟 scf.if %spatial_wide 守卫与 8x256 tile、序言先载 tile0 再用 minsi(1, n_num_steps_w-1) 载入 tile1、循环体用 min(n_step_w+2, n_num_steps_w-1) 钳位的前瞻装载、算术顺序 subf→mulf(weight)→mulf(inv_std)→addf(bias)→tt.store、指针算术（input/output feat/batch stride 用法）、回边 yield (%pend_in_w, %nx_in_w)、统计趟与 EVEN=false 回退分支、两次 tt.reduce、running_mean/var 更新、weight/bias 空指针 scf.if、常量 8/128/EVEN=true，以及函数签名与 ABI。",
+      "expected": "编译：候选应通过 MLIR 解析并 lower 到二进制（当前唯一报错即该绑定；若仍失败则本机制作废）。结构（可先于性能核对）：输出趟回边上同时活跃的 8x256 tile 缓冲区应由 2 增至 ≥3，VECTOR 等 MTE2 的 WAIT_FLAG 与 MTE2 的 WAR 等待的分布应改变。数值：逐位一致——tile 访问序列与父版相同（迭代 n 计算 tile n，前瞻 tile n+2），每次乘加结合顺序与 store 位置不变；代价是每 m 趟末尾被钳位到同一末块的重复装载，本例 m_num_steps=1、n_num_steps_w=16，序言 2 次 + 循环 16 次装载（其中 2 次重复读末块且结果不被消费），即输出趟读流量 +16KB/块（128→144KB，+12.5%），不改变任何输出值。性能（待宿主真机验证的预测，非结论）：若输出趟如证据所示受‘缓冲可用性/重叠不足’限制，则 VECTOR wait_only（0.3884）与 MTE2 wait_only（0.2360）应下降，timing-7 的 39.2613us 预期向 33-36us 移动（speedup 0.7174 → 约 0.78-0.85），并经 geo_mean 体现；若真实上限是 1KB 行、1MB 跨步的 DMA 突发带宽（MTE2 productive 已 0.6414、VECTOR productive 0.5177 同时偏高），则本改动应接近中性甚至因 +12.5% 读流量略差——该情形下应记为该机制在此负载下无效，并转向 MTE3/store 侧（MTE3 idle 0.5979、productive 仅 0.2896）。",
+      "validation": "1) 宿主先做 CPU 解析与 lower：需通过并产出 npubin，函数签名/特化常量与清单一致；2) 与参考 KGS 组合按 atol=rtol=1e-4、required_matched_ratio=1.0、equal_nan 逐元素比对（预期逐位一致，含 NaN/Inf、零方差、n=1、weight/bias 空指针分支与 EVEN=false 非整除形状）；3) 在重编译产物中确认输出趟同时活跃 tile 缓冲由 2 增至 ≥3 且同步项位置变化，再谈时间；4) 完整正式 27 项 + 双方各 36 项补测 + ABBA 与后双分析，并与三条身份分开对比（保留父版 ir-004 geo 1.8522 / timing-7 39.261us、ir-001、ir-005）；5) profiling 复核 MTE2 event_count 应由每块 64 增至 66（+2 次 8KB 装载）级别、read_main_memory_datas 相应增加，作为机制隔离指标；6) 本文件、预检与建议均不作为收益证据，性能以宿主真机结果为准。",
+      "layer_reason": "缺陷位于单算子 IR 文本本身（多结果 SCF 绑定语法导致 IRSource 解析失败），且被承载的机制——回边上同时活跃的 tile 数量——决定下游缓冲复用与 FLAG/BAR 插入，属编译器流水结构，源码（frozen.py 只表达深度 1，且注释明示 one-tile lookahead）与编译选项都无法表达；可编辑面按 ir-inventory/lowered-inventory 只有 ir/*.ttir，冻结的 ttadapter/bcmlir/npubin 与源码保持原样，因此归入 single_operator_ir。",
+      "simulator_incremental_judgment": "时钟资质：timeline 明确 clock_qualification=relative_only、absolute_time_qualified=false，报告自述无全核关键路径归因；但 absolute_unit_validation 用 33/33 个非同步 PC 对照运行时间中位比 1.00055 核验出窗口单位为 us、窗口 38.405us 与 timing-7 时延 39.26us 同量级，故仅把窗口用于跨流水的相对比例与在窗口内的位置排序，不把 instruction_time_sum_us 当墙钟、不据此换算加速比。观测范围：capture_scope 为‘首个至末个可见事件’的部分窗口边界保留，MTE3 大空闲 [0,0.2908] 划出统计趟/输出趟边界，说明本次窗口比上轮（仅 9.372us、只覆盖统计趟）更完整，输出趟首次被覆盖正是本轮转向输出趟的理由。未报告/辅助泳道：ALL(2 事件)、FLOWCTRL(2)、CACHEMISS(68，active 0.0013) 均为 auxiliary_trace_lane，按辅助处理不作瓶颈；SCALAR active 0.0840、SCALARLDST 0.1849 属低占比辅助，不构成关键路径。增量判断：与父版相比本轮只改绑定语法（编译器文本层）与已登记的深度 2 前瞻，唯一增量来源是输出趟的缓冲深度；其理论增益上界为输出趟内 VECTOR wait_only 的份额（0.3884×0.709≈0.27 窗口），但其中一部分等待源自 MTE3 释放而非 MTE2 数据（VECTOR 等 MTE3 的 WAIT_FLAG 10.71us），故实际预期显著低于该上界；同时须扣除 +12.5% 输出趟读流量。因此只主张‘同步/等待结构应改变、延迟不高于当前最佳’，绝对值以宿主复测为准。",
+      "codex_contribution": "Codex 在 codex-brief.json 中的贡献被采纳并已核对实际 IR：(1) 要求‘当前热点中的 BAR 和 WAIT 须结合真实 IR 定位到统计或输出通道’——据此用 timeline 的 MTE3 写回起点把窗口切成统计趟 29.1% / 输出趟 70.9%，并把 32 次调用的同步组与 8x256 输出 tile（MTE2 MOV XD=0x2000、MTE3 MOV Src:UB,Dst:OUT）对上，确认此前的深度 2 前瞻只覆盖统计趟（ir-005），输出趟是同机制但未被处理的通道；(2) 要求‘在实际 BCMLIR 中确认成本’——在冻结 bcmlir/ttadapter 中确认输出趟只有 2 个 8x256 tile 缓冲、无显式同步、且已无 i32 计数张量（后者说明 ir-001 的疑似冗余已被后端消除，应保持原样）；(3) Codex 关于‘MTE2 与 VECTOR 近于串行’的判断被新窗口进一步支撑（MTE2 wait_only 0.2360 等缓冲、VECTOR wait_only 0.3884 等数据）。具体实现选择（只修绑定语法、保留两块前瞻、不合并统计趟改动、不动 cnt）由本人依据上述核对结果作出。",
+      "unknown": [
+        "下游同步插入与缓冲区复用不由这两份冻结产物决定，'输出趟仅 2 个 tile 缓冲导致串行' 是由 ttadapter/bcmlir 的 2×memref<8x256xf32> alloc、6 处 memref.copy 与 MTE2 wait_only 0.2360 推断，需在重编译产物中确认缓冲数由 2 增至 ≥3。",
+        "该 scf.for 的两个结果在循环外未被使用，前端 canonicalize 可能把 pend 直通参数折掉（yield 值等于对应区域参数），使前瞻退化为深度 1 而中性；需在产物中核对回边活跃 tile 数。",
+        "1KB 行、1MB 跨步的 DMA 突发带宽上限未知；若已接近该上限，加深前瞻只会中性并叠加 +12.5% 读流量。",
+        "ir-005（统计趟同机制）尚无正式结果，若其在本轮宿主复测中证实中性，则同机制在输出趟的有效性也需重新评估。"
+      ]
+    },
+    "result": {
+      "api_version": "v6.2",
+      "reference_source": "primary",
+      "status": "PASSED",
+      "device": "npu:0",
+      "server_backend": "npu",
+      "is_hack": false,
+      "hack_reason": "",
+      "geo_mean": 1.8506878462521223,
+      "min_speedup": 0.693636010959051,
+      "worst_workload_uuid": "batch_norm_with_update_functional-timing-8",
+      "latency_ms": 0.04544536187007669,
+      "abs_err": 0.001953125,
+      "rel_err": 0.005076142027974129,
+      "num_workloads": 27,
+      "num_passed": 27,
+      "timing_skipped": false,
+      "log": "",
+      "per_workload": [
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-0",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-1",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-2",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-3",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-4",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0001220703125,
+          "rel_err": 0.0008250824175775051,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-5",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-6",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-7",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-8",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-9",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-10",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.001953125,
+          "rel_err": 0.005076142027974129,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-11",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-12",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 1.1920928955078125e-07,
+          "rel_err": 1.0033335939851895e-07,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-13",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 2.384185791015625e-07,
+          "rel_err": 2.510349190743e-07,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-14",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 4.76837158203125e-07,
+          "rel_err": 0.00010376304999226704,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-15",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 2.384185791015625e-07,
+          "rel_err": 9.441356496608933e-07,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-16",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 1.430511474609375e-06,
+          "rel_err": 3.1727817258797586e-05,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-correctness-17",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 4.76837158203125e-07,
+          "rel_err": 0.00038382329512387514,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-0",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 6.805944854493474,
+          "latency_ms": 0.007628349628117127,
+          "reference_latency_ms": 0.05191812689976097,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-1",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.2913264564061684,
+          "latency_ms": 0.04230935084216678,
+          "reference_latency_ms": 0.054635184095860566,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-2",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.3613934784235104,
+          "latency_ms": 0.04346870471189426,
+          "reference_latency_ms": 0.05917801111029017,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-3",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 6.78617553754031,
+          "latency_ms": 0.007815823601341242,
+          "reference_latency_ms": 0.05303955092915214,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-4",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.275458324153935,
+          "latency_ms": 0.04295395750496534,
+          "reference_latency_ms": 0.05478598265506243,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-5",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.3350547727055277,
+          "latency_ms": 0.04453277588190391,
+          "reference_latency_ms": 0.05945369498296143,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-6",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 3.716970368131864,
+          "latency_ms": 0.0074648161073489925,
+          "reference_latency_ms": 0.027746500274569652,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-7",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 0.7144621712912799,
+          "latency_ms": 0.039317790231372336,
+          "reference_latency_ms": 0.028091073779081353,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "batch_norm_with_update_functional-timing-8",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 0.693636010959051,
+          "latency_ms": 0.04544536187007669,
+          "reference_latency_ms": 0.03152253952415055,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        }
+      ]
+    },
+    "lowering": {
+      "status": "lowering_review_passed",
+      "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+      "review_tool_sha256": "743d0543872213c12318f07b48252a957a43688ebe08d8361499d27c4877054d",
+      "comparison_baseline": "captured_original",
+      "compiler_identity": {
+        "triton_version": "3.5.1",
+        "sources": {
+          "compiler/compiler.py": "ca9380e543d8ccf6b9b363f57ff6bc9674c32a4e0db16ea79e5688cff2da0264",
+          "backends/ascend/compiler.py": "62ddbfbd42914b234b9c392a91095e313536b855d0bf121729a83c81a07c13b6",
+          "runtime/cache.py": "0355c3e3452fa4500122244b8fff8864f22bc05c417a3d6f5dada9f2e92f8040",
+          "knobs.py": "4cab52a62325ab5ffc0d1eb963d78a2621d8e6a8f9c1505186c1ba7c4976d2ac"
+        },
+        "resolved_sources": {
+          "triton.compiler.compiler": {
+            "path": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/spec/ascend/compiler/compiler.py",
+            "sha256": "31ea8760a43db36ef59d8622d74761a147fbad1cf05e1a760ec341d8a374308b"
+          },
+          "triton.backends.ascend.compiler": {
+            "path": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/compiler.py",
+            "sha256": "62ddbfbd42914b234b9c392a91095e313536b855d0bf121729a83c81a07c13b6"
+          },
+          "triton.runtime.jit": {
+            "path": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/spec/ascend/runtime/jit.py",
+            "sha256": "d4b9f4cc94c7a5beeb06d8c9404442cdfa26aabc4a474697a090639deb72d2db"
+          },
+          "triton.runtime.cache": {
+            "path": "/usr/local/python3.11.15/lib/python3.11/site-packages/triton/runtime/cache.py",
+            "sha256": "0355c3e3452fa4500122244b8fff8864f22bc05c417a3d6f5dada9f2e92f8040"
+          }
+        },
+        "compiler_environment": {}
+      },
+      "rows": [
+        {
+          "variant": "original",
+          "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "input_ir_path": "/data/hanle/ascend-optimization/runs/midday-whitebox-20261120/batchnorm/parent-inputs/ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "input_ir_sha256": "574eddcba7a8b920c211880d4332fb710465bcda4a944dc3f81ae74c066a17cc",
+          "target": {
+            "backend": "npu",
+            "arch": "Ascend910B4-1",
+            "warp_size": 0
+          },
+          "options": {
+            "add_auto_scheduling": false,
+            "allow_fp8e4nv": false,
+            "allowed_dot_input_precisions": {
+              "__tuple__": [
+                "ieee",
+                "hf32"
+              ]
+            },
+            "arch": "Ascend910B4-1",
+            "auto_blockify_size": 1,
+            "auto_tile_and_bind_subblock": true,
+            "auto_vectorize_v2_max_fused_ops_num": null,
+            "bisheng_options": "-cce-link-aicore-ll-module /usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/lib/libdevice.10.bc",
+            "cluster_dims": {
+              "__tuple__": [
+                1,
+                1,
+                1
+              ]
+            },
+            "compile_mode": "simd",
+            "compile_on_910_95": false,
+            "custom_pipeline": null,
+            "debug": false,
+            "default_dot_input_precision": "ieee",
+            "deprecated_fp8_dtypes": {
+              "__tuple__": []
+            },
+            "disable_auto_inject_block_sync": null,
+            "disable_fma": false,
+            "disable_size_align_for_cast": null,
+            "disable_tightly_coupled_buffer_reuse": false,
+            "enable_auto_bind_sub_block": null,
+            "enable_auto_blockify": null,
+            "enable_auto_vectorize_v2": null,
+            "enable_bishengir_simt_optimization": 0,
+            "enable_cce_vf_auto_sync": null,
+            "enable_cce_vf_remove_membar": null,
+            "enable_drop_unit_dims": null,
+            "enable_dynamic_cv_pipeline": false,
+            "enable_flatten": null,
+            "enable_fp_fusion": true,
+            "enable_hivm_auto_cv_balance": null,
+            "enable_mask_fallback_conversion": false,
+            "enable_mixed_cv": null,
+            "enable_nd2nz_on_vector": false,
+            "enable_persistent": false,
+            "enable_preload": null,
+            "enable_select_analysis": true,
+            "enable_simt_reorder_instruction": false,
+            "enable_sync_block_lock": false,
+            "enable_ubuf_saving": null,
+            "enable_vf_fusion": false,
+            "enable_warp_specialization": false,
+            "extern_libs": null,
+            "force_simt_only": false,
+            "force_simt_template": false,
+            "hfusion_enable_multiple_consumer_fusion": false,
+            "inject_barrier_all": null,
+            "inject_block_all": null,
+            "instrumentation_mode": "",
+            "kernel_name": "batch_norm_with_update_kernel",
+            "limit_auto_multi_buffer_of_local_buffer": null,
+            "limit_auto_multi_buffer_only_for_local_buffer": null,
+            "llvm_version": 15,
+            "max_num_imprecise_acc_default": 0,
+            "mix_mode": "aiv",
+            "multibuffer": true,
+            "num_buffers_warp_spec": 0,
+            "num_consumer_groups": 0,
+            "num_ctas": 1,
+            "num_stages": 1,
+            "num_warps": 2,
+            "optimize_dynamic_offset": false,
+            "optimize_epilogue": false,
+            "parallel_mode": "simd",
+            "prevec_max_fused_ops_num": null,
+            "reg_dec_producer": 0,
+            "reg_inc_consumer": 0,
+            "sanitize_overflow": true,
+            "set_workspace_multibuffer": null,
+            "shared_mem_dynamic_size": 221184,
+            "simt_stack_limit": null,
+            "stream": null,
+            "supported_fp8_dtypes": {
+              "__tuple__": [
+                "fp8e5",
+                "fp8e4b15",
+                "fp8e4nv",
+                "fp8e4b8",
+                "fp8e5b16"
+              ]
+            },
+            "sync_solver": null,
+            "tile_mix_cube_loop": null,
+            "tile_mix_vector_loop": null,
+            "unit_flag": null,
+            "use_bytecode": true,
+            "vf_merge_level": 1,
+            "warp_size": 32
+          },
+          "status": "lowered_to_binary",
+          "artifacts": [
+            {
+              "kind": "ttir",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.ttir",
+              "sha256": "7c5a3777705f3abe5e1122eb7fc3679d492f04a63f50d2c558496036f22e9a24",
+              "bytes": 53390
+            },
+            {
+              "kind": "ttadapter",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.ttadapter",
+              "sha256": "ae69d9ed9cdcc1601977d74c77983d91b4ee79a81af6fa7ff7ced38a48021184",
+              "bytes": 50488
+            },
+            {
+              "kind": "mlirbc",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.mlirbc",
+              "sha256": "7d8155f60b6b48ec75a5a3ccaac0c12d177224a0556df993952ad0675fdee1c5",
+              "bytes": 6749
+            },
+            {
+              "kind": "bcmlir",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.bcmlir",
+              "sha256": "2f09ec88f91cc8af31715f6c1410494372879229349698916e2d32a51e7f1857",
+              "bytes": 46009
+            },
+            {
+              "kind": "npubin",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.npubin",
+              "sha256": "41483d746ba67cd3456434ea7d176386cbe6e987f3ab56d360d1baf5935be5fe",
+              "bytes": 8416
+            },
+            {
+              "kind": "json",
+              "path": "lowering-review/original/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.json",
+              "sha256": "73dfd5ed6ff49aeff15987e5e87f58ca2e86d49ba1f18065169bed0f9fa812d9",
+              "bytes": 2872
+            }
+          ]
+        },
+        {
+          "variant": "candidate",
+          "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "input_ir_path": "/data/hanle/ascend-optimization/runs/midday-whitebox-20261120/batchnorm/agent-calls/ir-002/output-ir/ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+          "input_ir_sha256": "6029ed235487227335dd9b84b3b15f9a49038d5f5a43fc37dcba81de06e0071b",
+          "target": {
+            "backend": "npu",
+            "arch": "Ascend910B4-1",
+            "warp_size": 0
+          },
+          "options": {
+            "add_auto_scheduling": false,
+            "allow_fp8e4nv": false,
+            "allowed_dot_input_precisions": {
+              "__tuple__": [
+                "ieee",
+                "hf32"
+              ]
+            },
+            "arch": "Ascend910B4-1",
+            "auto_blockify_size": 1,
+            "auto_tile_and_bind_subblock": true,
+            "auto_vectorize_v2_max_fused_ops_num": null,
+            "bisheng_options": "-cce-link-aicore-ll-module /usr/local/python3.11.15/lib/python3.11/site-packages/triton/backends/ascend/lib/libdevice.10.bc",
+            "cluster_dims": {
+              "__tuple__": [
+                1,
+                1,
+                1
+              ]
+            },
+            "compile_mode": "simd",
+            "compile_on_910_95": false,
+            "custom_pipeline": null,
+            "debug": false,
+            "default_dot_input_precision": "ieee",
+            "deprecated_fp8_dtypes": {
+              "__tuple__": []
+            },
+            "disable_auto_inject_block_sync": null,
+            "disable_fma": false,
+            "disable_size_align_for_cast": null,
+            "disable_tightly_coupled_buffer_reuse": false,
+            "enable_auto_bind_sub_block": null,
+            "enable_auto_blockify": null,
+            "enable_auto_vectorize_v2": null,
+            "enable_bishengir_simt_optimization": 0,
+            "enable_cce_vf_auto_sync": null,
+            "enable_cce_vf_remove_membar": null,
+            "enable_drop_unit_dims": null,
+            "enable_dynamic_cv_pipeline": false,
+            "enable_flatten": null,
+            "enable_fp_fusion": true,
+            "enable_hivm_auto_cv_balance": null,
+            "enable_mask_fallback_conversion": false,
+            "enable_mixed_cv": null,
+            "enable_nd2nz_on_vector": false,
+            "enable_persistent": false,
+            "enable_preload": null,
+            "enable_select_analysis": true,
+            "enable_simt_reorder_instruction": false,
+            "enable_sync_block_lock": false,
+            "enable_ubuf_saving": null,
+            "enable_vf_fusion": false,
+            "enable_warp_specialization": false,
+            "extern_libs": null,
+            "force_simt_only": false,
+            "force_simt_template": false,
+            "hfusion_enable_multiple_consumer_fusion": false,
+            "inject_barrier_all": null,
+            "inject_block_all": null,
+            "instrumentation_mode": "",
+            "kernel_name": "batch_norm_with_update_kernel",
+            "limit_auto_multi_buffer_of_local_buffer": null,
+            "limit_auto_multi_buffer_only_for_local_buffer": null,
+            "llvm_version": 15,
+            "max_num_imprecise_acc_default": 0,
+            "mix_mode": "aiv",
+            "multibuffer": true,
+            "num_buffers_warp_spec": 0,
+            "num_consumer_groups": 0,
+            "num_ctas": 1,
+            "num_stages": 1,
+            "num_warps": 2,
+            "optimize_dynamic_offset": false,
+            "optimize_epilogue": false,
+            "parallel_mode": "simd",
+            "prevec_max_fused_ops_num": null,
+            "reg_dec_producer": 0,
+            "reg_inc_consumer": 0,
+            "sanitize_overflow": true,
+            "set_workspace_multibuffer": null,
+            "shared_mem_dynamic_size": 221184,
+            "simt_stack_limit": null,
+            "stream": null,
+            "supported_fp8_dtypes": {
+              "__tuple__": [
+                "fp8e5",
+                "fp8e4b15",
+                "fp8e4nv",
+                "fp8e4b8",
+                "fp8e5b16"
+              ]
+            },
+            "sync_solver": null,
+            "tile_mix_cube_loop": null,
+            "tile_mix_vector_loop": null,
+            "unit_flag": null,
+            "use_bytecode": true,
+            "vf_merge_level": 1,
+            "warp_size": 32
+          },
+          "status": "lowered_to_binary",
+          "artifacts": [
+            {
+              "kind": "ttir",
+              "path": "lowering-review/candidate/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.ttir",
+              "sha256": "128e0438509100dbc553f7795471b6efe61a8e8cad6e66595b6afad4f2aaacc7",
+              "bytes": 57320
+            },
+            {
+              "kind": "ttadapter",
+              "path": "lowering-review/candidate/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.ttadapter",
+              "sha256": "f60c83e2a14c35fc71c6b2418534089960620669b3077fffd40f9c5e2d6b74e0",
+              "bytes": 53024
+            },
+            {
+              "kind": "mlirbc",
+              "path": "lowering-review/candidate/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.mlirbc",
+              "sha256": "5b7dc815877f9613c687e14f2040250e93f0b391d2d181c16b4fb0b761f58222",
+              "bytes": 6897
+            },
+            {
+              "kind": "bcmlir",
+              "path": "lowering-review/candidate/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.bcmlir",
+              "sha256": "f4e74ee3abd9793c47bdf4ba465f7f481b5b5551c11365916869627fd6ff9369",
+              "bytes": 48496
+            },
+            {
+              "kind": "npubin",
+              "path": "lowering-review/candidate/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.npubin",
+              "sha256": "4785f6a6e4316a1babfbb2a6e9286e7685e3412f4da38018a65fe149aae6674b",
+              "bytes": 8664
+            },
+            {
+              "kind": "json",
+              "path": "lowering-review/candidate/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/@batch_norm_with_update_kernel.json",
+              "sha256": "36458d634c7ea6713c8de7aa46b98623cc02aea2e95c936f8eabccc3d1d31b14",
+              "bytes": 2872
+            }
+          ]
+        }
+      ],
+      "npu_initialized": false,
+      "scope": "IRSource lowering with captured target/options; actual AST injection, correctness and performance are separate"
+    }
+  }
+]

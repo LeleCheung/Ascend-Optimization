@@ -1,0 +1,83 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "9d53bf02833dc781fa26abd94c4fa6122f2517e93dc062b12e8f60cf03538baf",
+  "preserved_best_source_sha256": "3c34fdfb6ef2aacc3b0ae8cbd0683bd22d7610ffcb388c6ef2da50d0a72c04ee",
+  "selected_layer": "host launch condition: run() 中 M256 选择谓词（适用条件层），不改内核 body",
+  "layer_reason": "审查反馈的唯一失败是 host 谓词的适用范围缺口，而不是内核数学、精度路径或设备调度。M256 是为 fullKV256 的 PART_TILES 实验设计的：只有 SKV==BLOCK_N==256 时 SINGLE_KV 与 PART_TILES 同时成立，BLOCK_M=256 才会进入单块 KV 复用体。当前谓词只检查 BLOCK_N==256；而 host 在非因果 BLOCK_D<=128 路径上当 SKV>=256 且 SKV%256==0 就把 BLOCK_N 置 256，所以 SKV=512 之类形状也被改成 BLOCK_M=256。此时 SINGLE_KV=false、PART_TILES=false，内核落入通用二维 grid 的非 PART 分支，M256 只改变该分支 tiling：既不是审查要求的 fullKV256 PART_TILES 实验，也没有对应 profiling 证据，并让 256x256 fp32 p 与 256x128 fp32 acc 同时活跃、触碰 UB 预算。修复放在 host 谓词处可以用最小改动面收敛适用范围；M256 内核体、提前分母归约顺序、grid/P 公式、连续分区和精度路径全部保持不变。",
+  "simulator_incremental_judgment": "本轮未使用模拟器，不产生模拟器增量判断，也不把原版 simulator-evidence.json/current-profiling.json 当作当前候选（9d53bf…）的观测；它们仅为历史背景。当前候选尚无设备编译或真机结果。",
+  "host_recommendation": "host-repair-analysis.json：只补缺失的 fullKV 谓词（SKV==256 或 SINGLE_KV 等价），其余字节不变；不改数学、分支体、grid 公式、cache 或其他启动参数。",
+  "my_repair": "在 run() 的 M256 选择条件中增加 SKV == BLOCK_N（在本非因果、BLOCK_D<=128 路径上等价于 SKV==256，即 SINGLE_KV 谓词），并在同处注释记录该适用边界；不移动 SINGLE_KV 的计算位置，不改内核表达式、活跃缓冲、P/grid 常数或任何 dtype 精度路径。",
+  "evidence": [
+    {
+      "path": "workspace/repair-feedback.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "feedback_kind=source_review，status=source_review_repair_required，source_sha256=9d53bf…；reason 指明 M256 host selection requires BLOCK_N256 but does not require SKV==BLOCK_N，SKV512 时 SINGLE_KV=false 而通用非 PART 分支 tiling 被改变；requested_repair 只要求给既有 M256 host choice 增加 SKV==256（或 SINGLE_KV 等价）。cases 为空、complete_formal_result=null，说明该候选尚未设备评测。"
+    },
+    {
+      "path": "workspace/host-repair-analysis.json",
+      "category": "evaluation",
+      "role": "disambiguation",
+      "finding": "scope 明确限定为只修缺失的 fullKV 谓词，不改数学、分支体、grid、cache 或启动参数；analysis 与原审查 reason/requested_repair 一致。"
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "非因果分支先置 BLOCK_M=128、BLOCK_N = 256 if (SKV >= 256 and SKV % 256 == 0) else 128（candidate.py 708 行），随后 M256 谓词只检查 value.dtype==bfloat16、BLOCK_M==128、BLOCK_N==256、BLOCK_D==128、S%256==0（722-724 行），完全没有 SKV==256/BLOCK_N==SKV 条件；因此 SKV=512 也会被改成 BLOCK_M=256。BLOCK_M 的修改发生在 SINGLE_KV 计算（744 行）之前，谓词本身无法依赖后者。"
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "SINGLE_KV = (not is_causal) and (BLOCK_N == SKV)；PART_TILES 又要求 SINGLE_KV 且 BLOCK_N==256。故 SKV=512 时 BLOCK_M 被抬到 256 后 PART_TILES 仍为 false，执行的是 grid=(cdiv(S,BLOCK_M), B*NQ) 的通用非 PART 路径（candidate.py 771-772 行），M256 仅改变该路径 tiling。SKV==BLOCK_N 在非因果 BLOCK_D<=128 分支等价于 SKV==256，补上后 M256 只可能服务 PART_TILES。"
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "M256 分支的既有内核体（candidate.py 392-409 行）：p 为 BLOCK_M x BLOCK_N FP32（256x256），先 l_new=tl.sum(p,1)、再 p16=p.to(fp16)、acc=tl.dot(p16,v16)，随后 out=acc/l_new[:,None]；该提前分母归约顺序是已审查内容，必须逐字保留。新增谓词只影响是否选中该分支，不触碰这些语句。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "background",
+      "finding": "实际 TTIR 是保留父版的 M128 PART 分支：%qk = tt.dot 128x128xbf16 * 128x256xbf16 -> 128x256xf32（96 行），%acc = tt.dot 128x256xf16 * 256x128xf16 -> 128x128xf32（103 行），T=512、P=20（lo=pid*512/20，29-37 行）；说明 fullKV256 的既有观测基础是 M128。failed-ir/attempt-052 为空，当前 9d53bf… 源码没有任何实测 IR，不能据此声称 M256 已编译通过。"
+    },
+    {
+      "path": "workspace/contract.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "固定四 case 的 SKV 分别为 128(case1)、128(case2)、256(case4)、256(case7)；因此补 SKV==BLOCK_N 对这四项的 M256 选择结果不变（case4 仍命中，且原本就 SINGLE_KV），验证用例仍为 1,2,4,7，checker/golden/threshold/dtype/计时口径不变。"
+    }
+  ],
+  "hypothesis": "当前候选的唯一真实失败原因在 host 适用条件：M256 谓词缺少 fullKV(SKV==BLOCK_N) 约束，使不属于该实验的 SKV>=512 形状也进入 M256 tiling（且只能落入未经验证的通用非 PART 分支）。增加 SKV==BLOCK_N 后，M256 与其提前分母归约仅对 fullKV256 PART_TILES 生效；所有不满足该条件的形状回到父版已有的 M128/通用 tiling，从而消除“实验范围外的 tiling 变化”这一失败，而不改变本合同的任何执行路径。",
+  "change": "在 candidate.py 的 M256 选择条件（722-724 行）中加入 SKV == BLOCK_N；同步在该处与文件头 M256 机制说明中记录适用条件为 SKV==BLOCK_N==256。不修改内核任何语句、表达式、缓冲、grid 公式、P、cache 或 dtype 选路。",
+  "expected": "精度：无变化。合同四 case 的 BLOCK_M/BLOCK_N/SINGLE_KV/PART_TILES/grid 与修改前逐项相同（case4 仍 M256 PART_TILES；case7 仍 M128 PART_TILES，因 S=128 不满足 S%256==0，本就不命中 M256；case2 仍 M128 单块；case1 因果 64/64），故编译产物与浮点表达式应逐字相同。活跃缓冲：合同四 case 不变（M256 的 256x256 fp32 p 仍只在 case4 出现）；范围外 SKV>=512 的 tiling 不再被 M256 放大，恢复父版 M128 通用路径的峰值。交接次数：合同四 case 不变（case4 T=256、每 worker 12/13 链；case7 NB_M=1、T=64、P=20；case2/case1 走各自原分支）。并行度：合同四 case 不变（PART_TILES 的 P=20 与通用 grid 均逐字不变）。代价：无新增；仅放弃一个从未被请求、也无证据支持的 SKV>=512 M256 通用分支行为。",
+  "validation": "1) 修改后先调用工具桥 preflight（含源码审查），确认只改了这一个谓词且无其他差分；preflight 返回 awaiting_source_review 时保持字节并交接。2) 审查通过后按原四项（case 1,2,4,7）用同一 official checker/golden、同一 dtype 与同一 warmup/trials/iterations 计时口径完整评测。3) 对比修改前后该四 case 的实际 IR/launch 身份（BLOCK_M/BLOCK_N/SINGLE_KV/PART_TILES/T/P/grid），确认逐项一致；对 SKV>=512 的元数据做宿主侧纯元数据核对，确认 BLOCK_M 保持 128。4) 只有拿到真实设备结果后才更新本诊断的观测；不得预先宣称本源码已编译或存在真机收益。",
+  "observations_after_edit": {
+    "decision_id": "c623fcef0e304637b9365a06072cc6b9",
+    "source_sha256_before": "9d53bf02833dc781fa26abd94c4fa6122f2517e93dc062b12e8f60cf03538baf",
+    "source_sha256_after": "843cf1451ebed4a7c9adad71f53b48aa0f0e6df64d9e8c052d437ceefd41d93b",
+    "edit": "仅把 M256 host 谓词改为 BLOCK_N==256 and SKV==BLOCK_N（等价 SKV==256/SINGLE_KV），并在文件头与该处注释记录适用边界；内核 body、提前分母归约、grid/P 公式、cache 与 dtype 精度路径均未改动。",
+    "preflight": {
+      "status": "awaiting_source_review",
+      "source_sha256": "843cf1451ebed4a7c9adad71f53b48aa0f0e6df64d9e8c052d437ceefd41d93b",
+      "note": "工具桥等待外部只读路径与地址边界审查；按流程保持候选字节并交接，本阶段无设备编译或真机评测。"
+    },
+    "host_metadata_check": "按 contract 四 case 的 shape/dtype 做纯 host 静态推导（非设备执行）：case1 因果 BLOCK_M/BLOCK_N=64/64、FP16 两项分解、grid=(2,64)；case2 128/128、SINGLE_KV=true、PV_SINGLE_F16=false、grid=(1,96)；case4 bf16 BLOCK_M=256、BLOCK_N=256、SKV==BLOCK_N、SINGLE_KV=true、PART_TILES=true、NB_M=1、TPG=8、T=256、P=20、grid=(20,)；case7 bf16 BLOCK_M=128（S%256!=0）、BLOCK_N=256、SINGLE_KV=true、PART_TILES=true、NB_M=1、TPG=4、T=64、P=20、grid=(20,)。四项均与修改前的选择结果逐项一致；SKV=512 类形状现在 BLOCK_M 保持 128、SINGLE_KV/PART_TILES=false，回到父版通用二维 grid。",
+    "not_claimed": "本记录不声称当前源码已在设备上编译通过，也不声称存在真机性能或精度收益；等待审查与完整四项评测。"
+  },
+  "pending": [
+    "等待宿主源码审查（preflight=awaiting_source_review）并保持候选字节不变。",
+    "审查通过后对 case 1,2,4,7 运行官方 checker/golden 的完整四项评测，保持 dtype 与 warmup/trials/iterations 计时口径。",
+    "读取修改后实际 IR/launch 身份，确认四 case 的 BLOCK_M/BLOCK_N/SINGLE_KV/PART_TILES/T/P/grid 与上述静态推导一致。",
+    "如设备结果与预测不符（编译失败、精度越界或性能退步），按实际失败原因另立新机制，不降低精度阈值补救。"
+  ],
+  "unknown": [
+    "M256 PART_TILES 分支是否能在 196608B 的 UB/L0C 预算内编译：当前 9d53bf… 无设备结果，failed-ir/attempt-052 为空，需修改后预检/实测确认。",
+    "M256 把 case4 的 tile 链数 T=512->256、每 worker 链数 25/26->12/13 是否真能缩短墙钟，还是因单 tile 缓冲翻倍与链间隐藏减少而退步；须真机成对评测判定。",
+    "SKV>=512 且 BF16 非因果的形状恢复 M128 通用二维 grid 后，是否与父版性能一致（本次未对这些形状取数；补丁目标是恢复父版行为而非引入新路径）。",
+    "补谓词后是否还存在其他 host 谓词与实际内核分支不一致的边界（本次已核对 BLOCK_M/BLOCK_N/SINGLE_KV/PART_TILES/P 的推导链，仅发现此一处缺 SKV 约束）。"
+  ]
+}

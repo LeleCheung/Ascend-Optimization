@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 27,
+    "duration_ms": 87967,
+    "usage": {
+      "input_tokens": 49520,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 722816,
+      "output_tokens": 15055,
+      "output_tokens_details": {
+        "thinking_tokens": 6897
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 49520,
+        "outputTokens": 15055,
+        "cacheReadInputTokens": 722816,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 0.9853830000000001,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 6897,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 0.9853830000000001,
+    "result": "已完成本轮独立实验的决策登记、源码实现与预检交接；预检后未再改动源码字节。\n\n## 本轮修改（candidate.py，SHA 54938a… → 47f5d136…）\n\n**机制：head-major FP16 V scratch（仅连续 BF16 非因果 SINGLE_KV 路径）**\n\n证据链（本轮实际读取）：\n- `actual-ir/0-_gqa_fwd_kernel.bcmlir` 第 85–88 行：V 被重解释为 `memref<256x128xf16, strided<[1024,1]>>` 后 `memref.copy`，行跨度 1024 元素，同一 KV 头的行被其余 7 个头隔开，单次只能连续搬 256B。\n- `actual-ir/2-_gqa_fwd_kernel.ttir` 第 55–89 行：V 指针张量用常量 1024 作序列轴步长，改物理布局即可改变取块粒度，无需改算术 AST。\n- `current-profiling.json`：case4 主 kernel 317.806us、512 program；`previous-result.json`：012 全调用 346.6959us，006 保留最佳 328.4468us。\n\n实现要点：\n1. 新增 `_gqa_v_cast_f16_headmajor_kernel`：grid = (⌈SKV/BLOCK_R⌉, B·NKV)；program 标量 `pid_h` 只做一次 `//NKV`、`%NKV` 得到 batch/头，向量轴仅序列行块与通道块两个仿射轴；按原 V 真实 stride 载入 `[BLOCK_R, BLOCK_D]` 瓦片，唯一写到物理连续 `(pid_h*SKV + j)*D + d`；逐元素仍 bf16→f32→f16 两次舍入，位型不变。BLOCK_R = min(SKV, 8192/BD)（case4 为 64，128 program，约 64KiB UB）。\n2. host 分配 `(B,NKV,SKV,D)` fp16 scratch，主 kernel 逻辑 stride 变为 v_ss=128、v_sh=32768、v_sb=262144。\n3. 保留原 012 辅助路径：非连续 V 走原二维 strided kernel；连续但 D 非 2 的幂走原 flat kernel。Q/K、M128/N256、概率两项/单次 fp16 PV、输出表达式、mask 判据、计时合同与精度阈值全部未动。\n\n**预期**：V 的 `memref.copy` 变为 `strided<[128,1]>` 连续整块，主 kernel 时间下降；代价是预处理读端由完全连续变为 256B/2048B 跨步，总流量不变。case4 目标 < 328.4468us；case1/2 不命中该路径，case7 命中则记录其真实变化。\n\n**验证**：修改后需按合同重放实际 IR 核对 V copy 跨度，并由原完整四项 checker/golden 与全调用计时验收。\n\n## 状态\n\n- `decision --record`：已登记（decision_id `54477e60…`），source_sha256 = 54938a…。\n- `preflight --source candidate.py`：返回 `awaiting_source_review`，source_sha256 = `47f5d136799ab88e82d19536a807ccebe489c471e7a683e2206c55b59490457f`。\n- 现保持该字节不变，交接宿主只读审查与完整四项真机评测；完整结果与修改后 IR/模拟器重放待反馈。"
+  }
+}

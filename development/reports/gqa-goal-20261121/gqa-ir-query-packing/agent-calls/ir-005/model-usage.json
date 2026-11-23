@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 61,
+    "duration_ms": 416336,
+    "usage": {
+      "input_tokens": 65739,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 3477376,
+      "output_tokens": 60876,
+      "output_tokens_details": {
+        "thinking_tokens": 47907
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 65739,
+        "outputTokens": 60876,
+        "cacheReadInputTokens": 3477376,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 3.589282999999999,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 47907,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 3.589282999999999,
+    "result": "已登记并提交，状态 `awaiting_ir_review`，IR 文件保持为本轮修改后的内容。\n\n**本轮机制（单一、可独立验证）**：把 IR004 中两处同 rank 的非法 collapse/expand 改写为三维视图加合法 reassociation。\n\n- Q 侧（第 83–87 行）：`%q_view` 改为 `sizes [16, 8, 128], strides [8192, 128, 1]`，`%alloc_6`/`memref.copy`/`to_tensor` 目的类型同步为 `memref<16x8x128xbf16>`，`%39 = tensor.collapse_shape %q_t [[0, 1], [2]] : tensor<16x8x128xbf16> into tensor<128x128xbf16>`。\n- Out 侧（第 118–121 行）：`%o_view` 同样三维化，`%o_packed = tensor.expand_shape %55 [[0, 1], [2]] output_shape [16, 8, 128]`，`materialize_in_destination` 类型同步。\n- 线性地址与元素顺序和原 16x1024 视图逐项相同（16x8x128 行主序 = 16x1024 平铺 = 128x128 平铺）；loop 4、grid128、索引算式、两条 mmadL1、fixpipe、同步块、workspace 偏移、6 个标量 ABI 全部保持原字节。另外两处 `128x1↔128` 的合法 collapse/expand（掩码路径）未触碰。\n\n**登记的证据要点**（历史材料，均绑定 019 二进制，和未编译 IR 无对应关系）：\n- `profiling.json`：case4 cube0 19 行，`aic_time` 116.42us，`aic_mte2_time` 55.33us（0.436，AIC 累计最大搬运流水），`aic_fixpipe_time` 59.99us，`aic_cube_time` 35.48us，`aic_mte1_time` 29.42us，`aic_mte3_time` 2.49us，`aic_mte2_instructions` 83.8。\n- `hotspots.json`：`WAIT_FLAG_DEVI` 17.27us/16.37us 各 4 calls，MTE3 `MOV_SRC_TO_DST_ALIGN`（UB→OUT，B16）7.26us×4；占用 CUBE 10.36/21.90/67.74%，FIXP 32.90/21.10/46.00%，MTE2 19.43/0.72/79.85%。\n- `timeline.json`：窗口以首末可见事件界定、partial capture、单位窗口占比，指令集合与热点一致（每条 4 次重复印证 loop4）。\n- `compiled-readonly/_gqa_fwd_kernel.bcmlir`（sha 3f0752b8…，与清单 original 一致）显示同源码产物里 Q/Out 是 128 行×256B 的 `strides [8192, 1]` 直接拷贝，且该阶段已支持合法 `[[0, 1]]` 形态的 collapse/expand；`ir003-last-pass.txt` 显示手写 cbuf reinterpret 形态在 InferHIVMDataLayout 崩溃，故本轮避开该形态。\n- Codex 贡献已记录：IR004 同 rank 折叠非法、IR002/IR003 两条已被拒绝路径、显式行重排方向与固定 ABI/grid128/loop4 要求。\n\n**新增观察与待验证边界**：\n1. 本 IR 常量（S=256、B=4、NQ=64、G=8、grid 128、loop 4）与 case4 唯一绑定；四项验收中其余三案需由保留源码产物承担，交接时已写明。\n2. 后端对合法 collapse/expand 的处理方式未知：折叠为目的视图则零成本，生成显式 UB 拷贝则每迭代多一次 32KiB 数据移动；这决定 `aic_mte2_time` 的兑现幅度。\n3. 三维 GM 视图在 MTE2 描述符层的展开形式未观测，突发长度收益（预测 MTE2 降 5–15us、MTE3 小幅降或持平）需真机计数确认。\n4. 最可能的残余风险是布局推断再次把该视图折回 L1 目的 reinterpret 形态，届时按新的报错位置另立机制。"
+  }
+}

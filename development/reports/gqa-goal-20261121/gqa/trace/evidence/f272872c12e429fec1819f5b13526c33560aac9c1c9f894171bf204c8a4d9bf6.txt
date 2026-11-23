@@ -1,0 +1,156 @@
+triton/language/extra/cann/libdevice.py
+22: from triton.language import core, math, semantic
+23: from triton._C.libtriton import ir
+24: from triton.runtime.jit import jit
+25: from triton.backends.ascend.utils import get_ascend_arch_from_env, triton_enable_libdevice_simt
+26: from triton.tools.get_ascend_devices import is_compile_on_910_95
+27: import triton
+28: 
+29: 
+30: @core.extern
+31: def reciprocal(arg0, _semantic=None):
+32:     return core.extern_elementwise(
+33:         "", "", [arg0], {
+34:             (core.dtype("fp32"), ): ("__hmf_recipf", core.dtype("fp32")),
+35:             (core.dtype("fp16"), ): ("__hmf_recipDh", core.dtype("fp16")),
+36:         }, is_pure=True, _semantic=_semantic)
+37: 
+38: 
+39: @core.extern
+40: def log1p(arg0, _semantic=None):
+41:     return core.extern_elementwise(
+42:         "", "", [arg0], {
+150: 
+151: @core.extern
+152: def div_rz(arg0, arg1, _semantic=None):
+153:     return core.extern_elementwise("", "", [arg0, arg1], {
+154:         (core.dtype("fp32"), core.dtype("fp32")): ("__hmf_div_rz_fp32", core.dtype("fp32")),
+155:     }, is_pure=True, _semantic=_semantic)
+156: 
+157: 
+158: @core.builtin
+159: def fast_dividef(arg0, arg1, _semantic=None):
+160:     arg0 = _semantic.to_tensor(arg0)
+161:     arg1 = _semantic.to_tensor(arg1)
+162:     ret = _semantic.fdiv(arg0, arg1, False)
+163:     return ret
+164: 
+165: 
+166: @core.builtin
+167: def fast_expf(arg0, _semantic=None):
+168:     arg0 = _semantic.to_tensor(arg0)
+169:     ret = core.tensor(_semantic.builder.create_exp(arg0.handle), arg0.type)
+170:     return ret
+
+triton/language/semantic.py
+65:         raise TypeError(f"unexpected signedness {a_sn} and {b_sn}")
+66: 
+67:     def computation_type_impl(self, a_ty: tl.dtype, a_is_scalar: bool, b_ty: tl.dtype, b_is_scalar: bool,
+68:                               div_or_mod: bool) -> tl.dtype:
+69:         # 0) For scalars we follow semantics similar to PyTorch, namely:
+70:         # - If the scalar is of a lower or equal kind (bool < uint < int < fp),
+71:         #   it doesn't participate in the promotion
+72:         if a_is_scalar != b_is_scalar:
+73:             scalar_ty, tensor_ty = (a_ty, b_ty) if a_is_scalar else (b_ty, a_ty)
+74:             if scalar_ty.kind().value <= tensor_ty.kind().value:
+75:                 # Upcast because of 3) and 4) below!
+76:                 if div_or_mod and (tensor_ty in (tl.float16, tl.bfloat16)):
+77:                     return tl.float32
+78:                 return tensor_ty
+79: 
+80:         # 1) if one operand is double, the other is implicitly
+81:         #    converted to double
+82:         if a_ty.is_fp64() or b_ty.is_fp64():
+83:             return tl.float64
+84:         # 2) if one operand is float, the other is implicitly
+85:         #    converted to float
+86:         if a_ty.is_fp32() or b_ty.is_fp32():
+87:             return tl.float32
+88:         # 3 ) if one operand is half, the other is implicitly converted to half
+89:         #     unless we're doing / or %, which do not exist natively in PTX for fp16.
+90:         #     Supported PTX op: add, sub, mul, fma, neg, abs, min, max, tanh, ex2, setp
+91:         if a_ty.is_fp16() or b_ty.is_fp16():
+92:             if div_or_mod:
+93:                 return tl.float32
+94:             else:
+95:                 return tl.float16
+96:         # 4) return bf16 only if both operands are of bf16
+97:         if a_ty.is_bf16() and b_ty.is_bf16():
+98:             if div_or_mod:
+99:                 return tl.float32
+100:             else:
+101:                 return tl.bfloat16
+102:         if a_ty.is_bf16() or b_ty.is_bf16():
+103:             return tl.float32
+104:         # 5) return fp16 if operands are different fp8
+280:         elif scalar_ty.is_int():
+281:             if sanitize_overflow:
+282:                 self.binary_op_sanitize_overflow_impl(input, other, self.mul)
+283:             return self.tensor(self.builder.create_mul(input.handle, other.handle), input.type)
+284:         raise TypeError(f"unexpected type {scalar_ty}")
+285: 
+286:     def truediv(self, input: TensorTy | numbers.Number, other: TensorTy | numbers.Number) -> TensorTy:
+287:         input, other = self.binary_op_type_checking_impl(input, other, False, False, True, True)
+288:         input_scalar_ty = input.type.scalar
+289:         other_scalar_ty = other.type.scalar
+290:         # float / int
+291:         if input_scalar_ty.is_floating() and other_scalar_ty.is_int():
+292:             other = self.cast(other, input_scalar_ty)
+293:         # int / float
+294:         elif input_scalar_ty.is_int() and other_scalar_ty.is_floating():
+295:             input = self.cast(input, other_scalar_ty)
+296:         # int / int (cast to tl.float32)
+297:         elif input_scalar_ty.is_int() and other_scalar_ty.is_int():
+298:             input = self.cast(input, tl.float32)
+299:             other = self.cast(other, tl.float32)
+300:         # float / float (cast to the highest exponent type)
+301:         elif input_scalar_ty.is_floating() and other_scalar_ty.is_floating():
+302:             if input_scalar_ty.fp_mantissa_width > other_scalar_ty.fp_mantissa_width:
+303:                 other = self.cast(other, input_scalar_ty)
+304:             else:
+305:                 input = self.cast(input, other_scalar_ty)
+306:         # unreachable
+307:         else:
+308:             raise TypeError(f"unexpected type {input_scalar_ty}")
+309:         return self.tensor(self.builder.create_fdiv(input.handle, other.handle), input.type)
+310: 
+311:     def floordiv(self, input: TensorTy | numbers.Number, other: TensorTy | numbers.Number) -> TensorTy:
+312:         input, other = self.binary_op_type_checking_impl(input, other, False, False, True, True)
+313:         input_scalar_ty = input.type.scalar
+314:         other_scalar_ty = other.type.scalar
+315:         if input_scalar_ty.is_int() and other_scalar_ty.is_int():
+316:             ret_ty = self.integer_promote_impl(input_scalar_ty, other_scalar_ty)
+317:             input = self.cast(input, ret_ty)
+318:             other = self.cast(other, ret_ty)
+319:             if ret_ty.is_int_signed():
+320:                 return self.tensor(self.builder.create_sdiv(input.handle, other.handle), input.type)
+321:             else:
+322:                 return self.tensor(self.builder.create_udiv(input.handle, other.handle), input.type)
+323:         raise TypeError(f"unexpected type {input_scalar_ty}")
+324: 
+325:     def fdiv(self, input: TensorTy | numbers.Number, other: TensorTy | numbers.Number, ieee_rounding: bool) -> TensorTy:
+326:         input_scalar_ty = input.type.scalar
+327:         other_scalar_ty = other.type.scalar
+328:         if not input_scalar_ty.is_floating() or not other_scalar_ty.is_floating():
+329:             raise TypeError("both operands of fdiv must have floating scalar type")
+330:         input, other = self.binary_op_type_checking_impl(input, other, False, False, False, True)
+331:         ret = self.builder.create_fdiv(input.handle, other.handle)
+332:         return self.tensor(ret, input.type)
+333: 
+334:     def mod(self, input: TensorTy | numbers.Number, other: TensorTy | numbers.Number) -> TensorTy:
+335:         input, other = self.binary_op_type_checking_impl(input, other, False, False, True, True)
+336:         scalar_ty = input.type.scalar
+337:         other_scalar_ty = other.type.scalar
+338:         # float % float
+339:         if scalar_ty.is_floating():
+340:             return self.tensor(self.builder.create_frem(input.handle, other.handle), input.type)
+341:         # % int
+342:         elif scalar_ty.is_int():
+343:             if scalar_ty.int_signedness != other_scalar_ty.int_signedness:
+344:                 raise TypeError("Cannot mod " + scalar_ty.__repr__() + " by " + other_scalar_ty.__repr__() + " "
+345:                                 "because they have different signedness;"
+346:                                 "this is unlikely to result in a useful answer. Cast them to the same signedness.")
+347:             if scalar_ty.is_int_signed():
+348:                 return self.tensor(self.builder.create_srem(input.handle, other.handle), input.type)
+349:             else:
+350:                 return self.tensor(self.builder.create_urem(input.handle, other.handle), input.type)

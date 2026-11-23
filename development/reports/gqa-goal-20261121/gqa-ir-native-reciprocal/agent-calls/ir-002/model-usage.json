@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 54,
+    "duration_ms": 188716,
+    "usage": {
+      "input_tokens": 68509,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 2318208,
+      "output_tokens": 28621,
+      "output_tokens_details": {
+        "thinking_tokens": 16848
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 68509,
+        "outputTokens": 28621,
+        "cacheReadInputTokens": 2318208,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 2.2171739999999995,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 16848,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 2.2171739999999995,
+    "result": "已按登记的机制完成本次 IR 修复并交回审查。\n\n## 本轮改动（仅 `ir/target.hivm.mlir`，其余文件保持冻结）\n\n1. 私有辅助声明（第254行，紧随 `vexp_1d_float`）：\n   `@vrec_1d_float(memref<?xf32,…ub>, memref<?xf32,…ub>, memref<?xf32,…ub>)`，属性与 `vexp_1d_float` 逐项相同（`hacc.always_inline`、`func_core_type<AIV>`、`llvm.emit_c_interface`、`loc(#loc45)`）。\n   ABI 依据：`vexp_1d_float` 实际调用为三参 src→dst→tmp（`memref<0xf32>` 空临时），与 `EltWise2D.cpp` 一元模板 `(src0, dst, tmp_buf, mode)` 的参数序一致；`EltWise1D.cpp:1493-1494` 注册了 `REGISTE_ELTWISE_V(vrec, VREC, 1, float)`，与已链接成功的 `vexp_1d_float` 同属一个宏族。\n\n2. 倒数调用点（第424-429行）：\n   - 删除 `%cast_39` 与 `func.call @broadcast_scalar_float_to_1d(%cst_1, %cast_39)`（该 1.0 填充只服务这个分子，对应 hotspots 中 12 次 VBRCB）；\n   - 删除 `%cast_40`，把 `@vdiv_1d_float(1.0, den, dst, tmp)` 换成 `@vrec_1d_float(den→%cast_41, dst %58→%cast_42, tmp %cast_43)`；\n   - 保留原 `pipe_barrier[<PIPE_V>]`、`%59` 空临时指针、Newton 三步、expand 与 2D 广播、所有 pointer_cast 地址（114688 / 180224 / 81920 / 114944）、事件与跨核同步、常量定义、两个公开函数签名与 Cube 函数体；`broadcast_scalar_float_to_1d`、`vdiv_1d_float` 声明保留（改为未被调用）。\n\n## 新增观察（写最终回复，不入其它文件）\n\n- 别名：vrec 读 den（UB 180224）、写 114688，与原先 1.0 填充写入同一缓冲，跨迭代生存期与 WAR 关系未变；src/dst 无重叠。\n- 结构证据确认此改动是恢复分解前形态：`vrec-before-decompose.mlir:209-218` 为 `vrec(den)→独立缓冲` + 同一 Newton 链，`vrec-after-decompose.mlir:210-211` 才出现 `vbrc(1)+vdiv`。\n- 收益上限受测口径约束：veccore0 窗口内 VECTOR active 34.27us、wait 10.36us、idle 65.73us，两条 VDIV 累计 3.16+1.69us 可重叠，预测 0.5–3us 量级并须实测兑现。\n- 风险：case4 精度余量很薄（mare 7.81249375e-3 对阈值 7.8125e-3、mismatch 14013/1048576），vrec 实际精度在设备上未知；若续编译链接失败或检查器回落，本机制按 no-change 及负结果处理。"
+  }
+}

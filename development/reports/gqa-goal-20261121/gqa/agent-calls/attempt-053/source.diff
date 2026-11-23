@@ -1,0 +1,45 @@
+--- 
++++ 
+@@ -155,9 +155,12 @@
+ 的交接链数等于 tile 数 T=B*NKV*G*(S/BLOCK_M)，模拟器三核部分窗口的头部热点
+ （Cube WAIT_FLAG_DEVI 84.32us/9、FIX_L0C_TO_DST 23.07us/9，Vector
+ WAIT_FLAG_DEVI 62.07us/9，均按 tile 计次）指向逐链交接成本。故对非因果、
+-V 为 BF16、BLOCK_N==256、BLOCK_D==128 且 S%256==0 的元数据把 BLOCK_M 由 128
+-抬到 256：case4 的 T 由 512 降到 256、每 worker 链数 25/26->12/13，K/V 组
+-载入次数与单链结构不变。代价是单 tile 的 p 由 128x256 变 256x256 FP32，峰值
++V 为 BF16、BLOCK_N==SKV==256（整段 KV 单块、SINGLE_KV 成立）、BLOCK_D==128
++且 S%256==0 的元数据把 BLOCK_M 由 128 抬到 256：case4 的 T 由 512 降到 256、
++每 worker 链数 25/26->12/13，K/V 组载入次数与单链结构不变。适用域只到
++fullKV256 的 PART_TILES 实验：052 源码审查指出原谓词只查 BLOCK_N==256，令
++SKV>=512 且 SKV%256==0 的形状也会被抬到 M256，而那里 SINGLE_KV 为假，M256
++只会改变通用非 PART 分支的 tiling；本版补 BLOCK_N==SKV，其余字节不变。代价是单 tile 的 p 由 128x256 变 256x256 FP32，峰值
+ 活跃内存翻倍；因此仅在该 M256 分支先做 FP32 分母 sum 再做 p16 截断与 PV dot，
+ 使 p 在 dot 前即可释放（M128 仍保留父版 acc->sum 顺序）。表达式、相加顺序、
+ 精度路径与 P/NB_M/TPG/T 的分区规则均不变，数值风险只来自 tl.dot 的 M 维铺排
+@@ -708,9 +711,14 @@
+             BLOCK_N = 256 if (SKV >= 256 and SKV % 256 == 0) else 128
+ 
+             # 本轮机制（M256 PART_TILES，独立实验，仅 case4 形状命中）：
+-            # 仅当非因果、V 为 BF16、整段 KV 单块（BLOCK_N==256）、D==128 且
+-            # S 可被 256 整除时，把 query 行块再抬到 256。判据只读 dtype、
++            # 仅当非因果、V 为 BF16、整段 KV 单块（BLOCK_N==SKV==256）、D==128
++            # 且 S 可被 256 整除时，把 query 行块再抬到 256。判据只读 dtype、
+             # shape 与分块这类合法元数据，不读输入值、不按 case_id 选路。
++            # SKV==BLOCK_N 就是本非因果路径上的 SINGLE_KV：BLOCK_N 在此分支
++            # 只有 SKV>=256 且 SKV%256==0 时才为 256，故该条件等价于 SKV==256。
++            # 052 审查指出缺它时 SKV>=512 也会被抬到 M256，而 SINGLE_KV 为假使
++            # PART_TILES 不成立，M256 只会改变通用非 PART 分支 tiling；补上后
++            # M256 只服务被请求的 fullKV256 PART_TILES 实验。
+             # 理由：PART_TILES 的交接链数等于 tile 数 T=B*NKV*G*(S/BLOCK_M)，
+             # 模拟器部分窗口头部（Cube WAIT_FLAG_DEVI 84.32us/9、
+             # FIX_L0C_TO_DST 23.07us/9；Vector WAIT_FLAG_DEVI 62.07us/9）按
+@@ -720,7 +728,8 @@
+             # 表达式、相加顺序或精度路径；代价是单 tile 活跃内存翻倍，可能
+             # 触及 UB 预算，故在复用体中仅对 M256 提前分母归约（见下）。
+             if (value.dtype == torch.bfloat16 and BLOCK_M == 128
+-                    and BLOCK_N == 256 and BLOCK_D == 128 and S % 256 == 0):
++                    and BLOCK_N == 256 and SKV == BLOCK_N
++                    and BLOCK_D == 128 and S % 256 == 0):
+                 BLOCK_M = 256
+     elif BLOCK_D <= 256:
+         BLOCK_M, BLOCK_N = 32, 32

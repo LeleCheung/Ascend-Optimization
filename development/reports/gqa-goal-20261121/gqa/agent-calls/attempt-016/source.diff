@@ -1,0 +1,52 @@
+--- 
++++ 
+@@ -167,6 +167,19 @@
+         if MASK_KV:
+             # MASK_KV 为假时该掩码恒真，整体删除；保留分支只为通用形状正确性。
+             qk = tl.where(offs_n[None, :] < SKV, qk, -float("inf"))
++
++        # 本轮机制（仅 SINGLE_KV 且 PV_SINGLE_F16 的 BF16 单块路径）：把原有的
++        # V 载入与 bf16->fp16 转换紧随 QK dot、提前到 rowmax/softmax 之前，并让
++        # 下方 PV dot 复用同一 v16 tile。这样 V 的 MTE2 搬运（模拟器 pc0x10d11820
++        # 的 1.66us）可与随后的 max/exp2/sum 向量归约重叠，而不再串在 PV 交接
++        # 紧前；QK 仍先于 V 准备，避免 009 把 V 排在 QK 之前引入的 QK 前导等待。
++        # 索引、stride 与掩码公式逐字保持，只改变源码中载入/转换的位置。
++        if SINGLE_KV and PV_SINGLE_F16:
++            v_ptrs = v_base + offs_n[:, None] * v_ss + offs_d[None, :] * v_sd
++            if MASK_KV:
++                v16 = tl.load(v_ptrs, mask=kv_mask, other=0.0).to(tl.float16)
++            else:
++                v16 = tl.load(v_ptrs).to(tl.float16)
+ 
+         # Online softmax, all reductions in fp32.
+         #
+@@ -191,11 +204,14 @@
+             p = tl.exp2(qk - m_safe[:, None])
+             l_new = l_i * alpha + tl.sum(p, 1)
+ 
+-        v_ptrs = v_base + offs_n[:, None] * v_ss + offs_d[None, :] * v_sd
+-        if MASK_KV:
+-            v = tl.load(v_ptrs, mask=kv_mask, other=0.0)
+-        else:
+-            v = tl.load(v_ptrs)
++        # 除 SINGLE_KV 且 PV_SINGLE_F16 之外的路径仍在此处载入 V（原位置），
++        # 表达式与后续 PV 逐字不变；命中该分支时已在上方提前得到 v16。
++        if not (SINGLE_KV and PV_SINGLE_F16):
++            v_ptrs = v_base + offs_n[:, None] * v_ss + offs_d[None, :] * v_sd
++            if MASK_KV:
++                v = tl.load(v_ptrs, mask=kv_mask, other=0.0)
++            else:
++                v = tl.load(v_ptrs)
+ 
+         # Precision-first PV with a two-term split of the fp32 probabilities.
+         # Rounding p directly to v.dtype injects an absolute error of
+@@ -235,7 +251,8 @@
+         # (d1+d2)+acc*alpha 这种改变舍入的分组）。
+         if SINGLE_KV:
+             if PV_SINGLE_F16:
+-                acc = tl.dot(p.to(tl.float16), v.to(tl.float16))
++                # v16 已在 QK dot 之后、softmax 之前载入并转换，此处原样复用。
++                acc = tl.dot(p.to(tl.float16), v16)
+             else:
+                 p_hi = p.to(v.dtype)
+                 r1 = (p - p_hi.to(tl.float32)) * 2048.0

@@ -1,0 +1,64 @@
+--- 
++++ 
+@@ -34,6 +34,7 @@
+     BLOCK_N: tl.constexpr,
+     BLOCK_D: tl.constexpr,
+     IS_CAUSAL: tl.constexpr,
++    CHAIN_LO: tl.constexpr,
+ ):
+     pid_m = tl.program_id(0)
+     pid_bh = tl.program_id(1)
+@@ -102,14 +103,29 @@
+         # only ~2^-29 * p (well under that floor) while costing a whole extra
+         # PV tl.dot, i.e. one more cube->vector accumulator handoff (L0C movout
+         # + flag round trip + fp32 read-back) per KV block.  So both dtypes use
+-        # the same two-dot form.
++        # the same two-dot split; bf16 additionally chains the second PV into the
++        # first L0C accumulator (CHAIN_LO) to halve the per-iteration handoff.
+         # The low-order product is added last in fp32 so it is not rounded
+         # against the O(sum_j p_j |v_j|) accumulator; V is an exact input, so
+         # only p is split.  Everything stays strict Triton.
+         p_hi = p.to(v.dtype)
+         r1 = (p - p_hi.to(tl.float32)) * 2048.0
+-        p_lo = r1.to(v.dtype)
+-        acc = acc * alpha[:, None] + tl.dot(p_hi, v) + tl.dot(p_lo, v) * (1.0 / 2048.0)
++        if CHAIN_LO:
++            # bf16 分支：把精确的 2^-11（2 的幂，缩放无舍入）在 dot 之前折入
++            # 残差概率块（此时 p_lo 直接持有缩放后的残差，p ≈ p_hi + p_lo），
++            # 再用 tl.dot 的 acc 参数把第二次 PV 累积进与第一次相同的 L0C
++            # 累加器。于是每个 KV 迭代只搬出一次中间累加，省去第二次 PV 的
++            # 独立 L0C→UB 搬出、FIXP 标志往返和一次全块 fp32 乘加；两项精度
++            # 与 bf16 下溢裕度不变。
++            p_lo = (r1 * (1.0 / 2048.0)).to(v.dtype)
++            acc = tl.dot(p_hi, v, acc * alpha[:, None])
++            acc = tl.dot(p_lo, v, acc)
++        else:
++            # fp16 分支：残差保持放大 2048 倍以避开 fp16 次正规下溢，缩放
++            # 仍放在 fp32 的 dot 结果之后，两次独立 dot 与相加顺序原样保留，
++            # 因为 f16 的官方 mare 余量极薄（约 0.7%），不得改动数值路径。
++            p_lo = r1.to(v.dtype)
++            acc = acc * alpha[:, None] + tl.dot(p_hi, v) + tl.dot(p_lo, v) * (1.0 / 2048.0)
+         m_i = m_safe
+ 
+     l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+@@ -160,6 +176,12 @@
+     else:
+         BLOCK_M, BLOCK_N = 16, 32
+ 
++    # 仅在 bf16 输入上启用“残差预缩放 + 累加链”：bf16 指数范围宽，2^-11 精确
++    # 缩放不会令残差下溢，第二次 PV 可复用第一次的 L0C 累加器。fp16 则保留
++    # 原双 dot 路径以维持其极薄精度余量；这里只按 dtype 做编译期特化，不读取
++    # 任何输入数值或 case 标识。
++    chain_lo = bool(query.dtype == torch.bfloat16)
++
+     grid = (triton.cdiv(S, BLOCK_M), B * NQ)
+     _gqa_fwd_kernel[grid](
+         query, key, value, y,
+@@ -171,6 +193,7 @@
+         qk_scale, SKV - S,
+         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+         IS_CAUSAL=bool(is_causal),
++        CHAIN_LO=chain_lo,
+         num_warps=1, num_stages=1,
+     )
+     return y

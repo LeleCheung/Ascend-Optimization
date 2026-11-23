@@ -1,0 +1,92 @@
+{
+  "source_sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "feedback.json",
+      "category": "evaluation",
+      "role": "当前IR的真实编译结论",
+      "finding": "status=ir002_backend_layout_and_ub_failed，cpu_compile.compile_failed，returncode=1，命令为bishengir-compile（Ascend910B4-1，--enable-auto-multi-buffer=False）。compiler_stderr两条独立缺陷：ub overflow requires 2105344 bits while 1572864 bits available（即263168B对196608B，超66560B）；以及callsite q(candidate.py:173)处 memref.collapse_shape 在infer data layout阶段被拒，后端只允许折叠首维为1的batch维。本调用编辑前的IR在CPU后端即失败，设备上无任何结果。"
+    },
+    {
+      "path": "feedback.json",
+      "category": "evaluation",
+      "role": "验收比较起点",
+      "finding": "formal_result绑定source_sha256=2a98e3e0…，case4 original=472.46045us、candidate=262.27775us、native=128.9496us、official_checker passed；case1/2/7 candidate分别为187.5727/181.0167/178.68615us且均通过。四例几何平均降幅4.381%。本轮修复后的IR须以case4的262.27775us为同源码比较起点，并以原四项official checker为语义门槛。"
+    },
+    {
+      "path": "frozen.py",
+      "category": "source_ir",
+      "role": "数学语义与所有权约束",
+      "finding": "第155-197行为持久化K/V体：k_base/v_base按(b,kvh)一次载入并v16=v.to(float16)，循环for t in range(HG*NB_M)内hq=kvh*G+hg*HG+gi、offs_m=mb*BLOCK_M+arange(BLOCK_M)，随后qk=dot(q,trans(k))*qk_scale、max、exp2、sum、dot(p,v16)、l_safe保护除、l_new>0守卫，逐行表达式与顺序固定；tl.store所有权唯一。本机源码逐字节冻结，行打包只能通过重解释(gi,mb)坐标在IR层完成。"
+    },
+    {
+      "path": "compiled-readonly/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "已知可编译的后端约定",
+      "finding": "已成功编译的019原IR只用二维形状：K/V为memref.reinterpret_cast sizes[256,128] strides[1024,1]；循环内Q为sizes[128,128] strides[8192,1]→memref.alloc 128x128→memref.copy→bufferization.to_tensor；Out为memref.reinterpret_cast sizes[128,128] strides[8192,1]并配bufferization.materialize_in_destination。载入走memref.copy（GM条带→UB连续），写出一律走materialize_in_destination，全文件无三维张量、无tensor.collapse_shape/expand_shape（除128x1的mask张量）。"
+    },
+    {
+      "path": "compiled-readonly/_gqa_fwd_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "前端到后端的算子形态对照",
+      "finding": "ttadapter第58-65/84-87行同样以memref.reinterpret_cast+memref.copy+to_tensor表达K/V/Q载入，第119-121行以o_ptrs(memref<128x128,strided<[8192,1]>>)配materialize_in_destination表达store；即后端接受的写出口只有一个带strided GM目的地的materialize_in_destination。"
+    },
+    {
+      "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "当前待修的实际BCMLIR",
+      "finding": "IR-002把Q载入写成memref<16x8x128,strided<[8192,128,1]>>+alloc 16x8x128+tensor.collapse_shape[[0,1],[2]]→128x128，写出写成truncf→tensor.expand_shape[[0,1],[2]]→materialize到memref<16x8x128,strided<[8192,128,1]>>。坐标数学已核对正确：srb=hg*64+t*16覆盖0..255、khb=kvh*1024、bof=batch*2097152、%38共用Q与Out基址、16行×8头×128维的行序r=s*8+h与matmul的128行一致，K/V外提与全部浮点表达式与原IR逐字相同。失败点集中在这两个三维形状变换。"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "019保留二进制的逐block管道画像（历史材料）",
+      "finding": "candidate段128行、Task Duration 257.645142us；逐block均值：aic_time 35.39026us、aic_mte2_time 6.025781us、aic_mte1_time 3.933395us、aic_cube_time 5.173333us、aic_fixpipe_time 5.498537us、aic_scalar_time 18.010739us；vector侧aiv_mte2_time 3.966927us、aiv_mte2_active_bw 103.506727GB/s、aiv_mte3_time 3.020710us、aiv_mte3_active_bw 72.551719GB/s、aiv_vec_time 12.635757us、aiv_scalar_time 12.789257us、aiv_mte3_wait_ratio 0.0200467、aiv_mte2_wait_ratio 0。MTE3的活跃带宽比MTE2低约30GB/s，指向256B短突发。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "paired_profiling",
+      "role": "写出指令级定位（历史材料）",
+      "finding": "core0.veccore0的MTE3/MOV_SRC_TO_DST_ALIGN记录为Src:UB,Dst:OUT,Dtype:B16,XN=0x8000（32768B）、calls=4、running_time_us=7.26，来源栈指向candidate.py:197的tl.store；整窗MTE3 active_ratio 0.3668、wait_ratio 0.1375、productive_ratio 0.2293，同窗MTE2 active_ratio 0.1691且wait为0。四次调用搬运128KB，单block写出约3.0us，与profiling的aiv_mte3_time一致。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "窗口资质与等待结构",
+      "finding": "两核均为clock_qualification=relative_only、absolute_time_qualified=false，归一化到各自可见事件跨度[0,1]；cubecore0 raw_clock_window 137.0810-186.1720（49.091us），veccore0 137.0820-186.4510（49.369us），相对case4的257.645us为部分窗口，未报告的lane保持未知。absolute_unit_validation对22个非同步PC判定单位us、median_ratio 1.0011。instruction_calls显示veccore单窗MTE3/MOV_SRC_TO_DST_ALIGN 9次、MTE3/WAIT_FLAG 9次、VECTOR/WAIT_FLAG 31次、VECTOR/BAR 121次，写出与跨管线等待同时出现在窗口内。"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "evaluation",
+      "role": "宿主证据分析与候选方向（Codex）",
+      "finding": "Codex依据019真实BCMLIR与case4热点提出8共享query头×64序列的行打包，并明确以本地连续二维缓冲加128x128行主序view供matmul、输出先物化到本地连续缓冲再按16x1024行主序view写回GM，避免tensor.reshape与三维collapse/expand；同时要求保持全部ABI、K/V外提、每program 4个querytile与逐行浮点顺序。本轮实现采纳该方向，并把reshape替换为memref.reinterpret_cast零拷贝view。"
+    },
+    {
+      "path": "ir-inventory.json",
+      "category": "source_ir",
+      "role": "可编辑清单",
+      "finding": "仅登记ir/target/_gqa_fwd_kernel.bcmlir（symbol=_gqa_fwd_kernel，stage=bcmlir，original_sha256=3f0752b8…）。本轮只编辑这一份特化，函数ABI、参数表与attribute保持原字节。"
+    }
+  ],
+  "hypothesis": "当前IR的编译缺陷来自用三维张量形状变换承载行打包：tensor.collapse_shape([[0,1],[2]])在后端infer data layout阶段被拒（只允许折叠首维为1的batch维），而三维shape的同时存在使UB需求升到263168B、超过196608B预算66560B。行打包本身所需的行集合在GM与UB两侧都是每8行连续的1024个元素，用二维memref视图即可完整描述：Q载入memref<16x1024,strided<[8192,1]>>→memref.copy到本地连续128x128缓冲；写出把128x128结果先物化到本地连续缓冲，再以memref<16x1024,strided<[1024,1]>>的to_tensor写memref<16x1024,strided<[8192,1]>>的GM视图。这样每个tile的DMA突发由128段256B变为16段2048B，突发数降8倍、字节数与L0C总量不变，同时彻底去掉collapse/expand与三维中间形状。",
+  "alternatives": [
+    "保持IR原样交接：本轮CPU编译失败的状态延续，行打包机制无任何设备证据，故采用可行改法。",
+    "沿用IR-002的三维16x8x128加tensor.collapse_shape/expand_shape：反馈已证明后端在infer data layout阶段拒绝非单例batch维折叠，且UB超限66560B。",
+    "把写出拆成16段tensor.extract_slice[8,128]加materialize_in_destination：无需额外缓冲，但目的地址仍是跨度8192的行，突发长度维持256B，写出带宽无改善。",
+    "把f32累加结果直接物化到16x1024的f32暂存缓冲再截断：UB需求增至64KB，在196608B预算内的余量更小。",
+    "只打包2个query头（256元素/512B突发）：改善幅度为2倍，且每program需覆盖的头部组合变化更大，收益低于8头方案。",
+    "修改frozen.py的q_ptrs/reshape写法：源码逐字节冻结，本调用的研究身份是IR编译修复。"
+  ],
+  "change": "只编辑ir/target/_gqa_fwd_kernel.bcmlir，围绕同一行打包机制做两处替换，并新增一个index零常量。第一处（Q载入）：删除memref<16x8x128,strided<[8192,128,1]>>的reinterpret_cast、alloc 16x8x128、memref.copy、to_tensor与tensor.collapse_shape，改为(1)memref.reinterpret_cast %arg2 offset[%38] sizes[16,1024] strides[8192,1]；(2)memref.alloc 128x128xbf16；(3)把该alloc以memref.reinterpret_cast offset[%c0_index] sizes[16,1024] strides[1024,1]取view；(4)memref.copy把GM二维视图拷入该view；(5)bufferization.to_tensor直接读128x128的alloc供linalg.matmul。第二处（写出）：删除三维memref.reinterpret_cast、tensor.expand_shape与三维materialize，改为(1)memref.alloc 128x128xbf16暂存；(2)bufferization.materialize_in_destination %55（truncf结果）写入该identity alloc；(3)把该alloc以offset[%c0_index] sizes[16,1024] strides[1024,1]取view并bufferization.to_tensor；(4)memref.reinterpret_cast %arg5 offset[%38] sizes[16,1024] strides[8192,1]；(5)bufferization.materialize_in_destination把16x1024张量写入该GM视图。循环trip count仍为4、grid仍为128、K/V外提、全部arith/math/linalg表达式与第55行的truncf位置不变，函数签名与attribute不变。",
+  "expected": "1) 编译：去掉tensor.collapse_shape/expand_shape与全部三维形状，infer data layout不再遇到非单例batch维折叠；memref.reinterpret_cast只出现在GM参数与本地连续缓冲上，形状为二维且strides在本地侧为[1024,1]、GM侧为[8192,1]。2) UB资源：Q缓冲保持128x128xbf16=32KB（与019原IR同一尺寸），新增的写出暂存alloc同为32KB，其写入由materialize_in_destination就地完成、可与%55的缓冲合一；预测峰值UB需求落在196608B预算内，且不出现IR-002的66560B超出。3) DMA突发：每个querytile的Q载入由128段256B变为16段2048B（源跨步8192元素、目的连续），写出由128段256B变为16段2048B（源连续、目的跨步8192元素）；Q/Out每block字节数仍各为128KB、四例总字节不变。4) 动态轮次：每program仍4次循环、128个program、每program 512行，行所有权与K/V载入次数不变；MTE2/MTE3指令条数由每tile各1条大条带降为每tile各1条16突发条带，突发计数的动态总量从128x4降到16x4。5) 等待与管道：预测逐block aiv_mte3_time由3.020710us降至2.2us以内、aiv_mte3_active_bw由72.551719GB/s升到90GB/s以上并接近MTE2的103.506727GB/s，aiv_mte2_time由3.966927us降至3.4us以内、aic_mte2_time由6.025781us降至5.4us以内。6) 若写出暂存的materialize未能与%55合流而真实产生一次UB内拷贝，预测每block增加至多0.9us的vector/MTE时间，届时aiv_vec_time将由12.635757us上升，成为可区分的偏差项。7) 语义：逐行仍为同一q行对同一K/V的同一浮点表达式序列，预测四例official checker继续通过，case4时延以262.27775us为比较起点。",
+  "validation": "验收分三层。第一层为本调用交接后由宿主执行的CPU编译：bishengir-compile同参数（Ascend910B4-1，--enable-auto-multi-buffer=False）须返回0，并核对stderr无ub overflow与无collapse/expand报错；IR在本地先用mlir语法与SSA唯一性核对（%c0_index一处定义、新名q_view/q_buf/o_view/o_buf/o_t各一处）。第二层为原四项official checker与fullcall，case1/2/4/7全部通过方可进入性能比较，任何数值偏差以逐行等价性回查。第三层为性能：以case4的262.27775us、四例几何平均与原三项回退为比较项，并用同口径profiling核对aiv_mte3_time、aiv_mte3_active_bw、aiv_mte2_time、aic_mte2_time与aiv_vec_time是否按expected兑现，偏差项单独记录。",
+  "layer_reason": "Triton表达能力方面：源码层q_ptrs按offs_m[:,None]*q_ss+offs_d[None,:]*q_sd形成每行128个连续元素、行跨8192的访问，编译器据此只能生成256B行突发；020已在源码层尝试二维连续段载入并有序列reshape，实际tensor.reshape在后端重写阶段触发LLVM unexpected op，说明该层已触达表达极限。固定源码实验目的方面：frozen.py逐字节冻结，本轮研究身份是同一源码的BCMLIR编译修复与布局收益，源码改动会改变研究身份与比较起点。IR控制点方面：本层可直接指定memref视图的sizes/strides、memref.copy的形状与materialize_in_destination的目的视图，从而在不改动任何浮点表达式、ABI、循环次数与所有权的条件下把DMA突发从256B改为2048B，并绕开后端对非单例batch维折叠的限制；同类意图若在源码层表达，方向是让q_ptrs/o_ptrs天然呈现16x1024的连续段形状并避免任何reshape。",
+  "simulator_incremental_judgment": "本轮引用的profiling、热点与流水全部绑定source_sha256=2a98e3e0…的019保留二进制，编辑后的IR尚无任何设备产物，故这些材料只用于定位候选机制与设定预测区间。窗口资质按材料解释：cubecore0与veccore0两个窗口均为relative_only、absolute_time_qualified=false，归一化范围为各自可见事件跨度的[0,1]，原始时钟窗口分别49.091us与49.369us，相对case4整体257.645us属于部分覆盖，未报告泳道保持未知，因此不据此推断整核关键路径或设备波次。热点排名只用于选择写出与载入这两条有独立指令证据的管道；流水累计时间可重叠，本诊断把aic_time 35.39026us作为逐block参考量而非求和结论。预测的量化项限定为同一逐block口径的aiv_mte3_time、aiv_mte3_active_bw、aiv_mte2_time、aic_mte2_time与aiv_vec_time，以及可由IR直接数出的突发形态128x256B→16x2048B与每tile指令条数不变；编辑IR编译成功后需用新二进制的同口径材料逐项核对，更广的机制（标量瓶颈、跨核同步、L2行为）保留为待验证假设。",
+  "unknown": [
+    "本地写出暂存alloc是否与truncf结果的缓冲合流，决定是否出现额外32KB UB内拷贝。",
+    "后端对本地连续alloc的memref.reinterpret_cast视图作为memref.copy目的与to_tensor来源时的数据布局推断是否同样接受。",
+    "16段2048B突发是否被MTE3真正合并为单条16突发DMA，以及由此得到的活跃带宽提升幅度。",
+    "标量管道（aic_scalar_time 18.010739us、aiv_scalar_time 12.789257us）在总时长中的占比，本机制对其无直接作用。"
+  ]
+}

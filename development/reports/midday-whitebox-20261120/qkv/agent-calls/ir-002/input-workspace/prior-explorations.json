@@ -1,0 +1,2230 @@
+[
+  {
+    "invocation": "ir-001",
+    "diagnosis": {
+      "source_sha256": "0af5d533afea8f4be88e1fd6e0fc4a6ba76fae9a8b1478f7c4b93247fe7ec070",
+      "selected_layer": "single_operator_ir",
+      "evidence": [
+        {
+          "path": "profiling.json",
+          "category": "paired_profiling",
+          "role": "逐程序流水占用与带宽定量（candidate 侧 512 程序，reference 侧 40 block）",
+          "finding": "候选 Task Duration 40.020802us（reference 55.001099us）。候选每程序 aiv_mte2_time 1.8241us 且 aiv_mte2_ratio 0.6182，故程序驻留时间约 2.95us；同程序 aiv_mte3_time 0.9092us(ratio 0.3168)、aiv_vec_time 0.7414us(ratio 0.2587)、aiv_scalar_time 0.9448us(ratio 0.3140)。即程序 2.95us 里 MTE2 只忙 1.82us，其余 1.13us 使加载流水空转。aiv_mte2_active_bw 仅 26.79GB/s，而同程序 aiv_mte3_active_bw 达 52.49GB/s；reference 的 aiv_mte2_active_bw 为 31.68GB/s。read_main_memory_datas 每程序 48.625KB、write 48.0KB（sum 24896KB/24576KB），说明没有任何冗余读写字节可省，只能改重叠效率。"
+        },
+        {
+          "path": "hotspots.json",
+          "category": "simulator",
+          "role": "指令级热点与同步等待归属（core0.veccore0 窗口 109.804~119.544us）",
+          "finding": "窗口内最大单条指令是 MTE2 的 MOV_SRC_TO_DST_ALIGN（frozen.py:133 k 加载）6.98us/3 次，说明加载是长杆；紧随其后的是 MTE3 路径的 BAR 5.67us（line 147 tl.store）与 WAIT_FLAG 4.78us（PIPE:VEC→MTE3），以及 VECTOR 侧 BAR 5.64/5.54/5.38us，证明 store 与 vector 长时间在等上一次依赖链，而不是并发推进。流水比：MTE2 productive 0.8925，而 MTE3 productive 仅 0.2639(wait_only 0.6013)、VECTOR productive 仅 0.1113(wait_only 0.7959)。source_loop 区域 instruction_time_sum 104.51us、wait 39.81us（含循环两次）。"
+        },
+        {
+          "path": "timeline.json",
+          "category": "simulator",
+          "role": "相对时钟窗口内各流水活跃/空闲区间，用于判断程序内与程序间气泡",
+          "finding": "MTE2 active_ratio 0.9240（productive 0.8925、wait_only 0.0315），idle 0.0760，其中最大空闲段是 0.6055~0.6438（占窗口 3.83%）——这是程序边界处加载排空的单次气泡；另有窗口起点 0~0.0302 的起步气泡。MTE3 idle 0.1347 且 wait_only 0.6013，VECTOR wait_only 0.7959，与 profiling 的逐程序占用一致：加载之外的流水大部分时间在等，加载流水本身并不饱和（每程序 62%）。"
+        },
+        {
+          "path": "ir/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttir",
+          "category": "source_ir",
+          "role": "当前最佳的真实 TTIR（唯一特化：BLOCK_S=64、BLOCK_D=64、GROUP=2、EXACT=true）",
+          "finding": "第 45~104 行是 scf.for %i = 0 to 2 step 1（属性 tt.num_stages = 2），循环体内依次：算 q_in 地址（第 50~61 行）→ 算 out_off（第 62~73 行）→ tt.load q/k/v（第 74~80 行）→ vector 计算（第 81~94 行）→ 三次 tt.store（第 95~103 行）。也就是每程序两次完全串行的“加载→向量→存储”链，IR 里没有任何跨迭代预取/多缓冲结构（没有把第二次迭代的 load 提前到第一次的 store 之前）。bias 三次 load（第 38~44 行）与 k/v 位移 splat 已在循环外，这部分没有浪费。"
+        },
+        {
+          "path": "compiled-readonly/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/f67d9cdb9f445d242714897e48f68b992534a9c144549743ff721f2556ce6136/_transform_bias_rescale_qkv_kernel.bcmlir",
+          "category": "source_ir",
+          "role": "核对疑似冗余（循环内三块 64x64xf16 分配/读路径）是否在后端已消除",
+          "finding": "后端未消除：bcmlir 第 49~103 行仍是 scf.for %arg24 = 0 to 2 step 1，且每迭代新建 %alloc_5/%alloc_7/%alloc_9 三个 64x64xf16（memref.copy 载入 q/k/v），出口用 materialize_in_destination 写回 q/k/v；没有出现两槽轮转的多缓冲 alloc 对。frozen.py 注释中期望的 num_stages=2 多缓冲在可见低层产物里没有结构证据，与 profiling 中 MTE2 每程序只忙 62% 相互印证。据此判断该“循环内三次独立拷贝串行”的冗余需要在 TTIR 层显式展开消除。"
+        },
+        {
+          "path": "codex-brief.json",
+          "category": "source_ir",
+          "role": "宿主证据与候选方向（Codex 贡献）",
+          "finding": "Codex 指出当前 BCMLIR 仍保留 scf.for 0→2 step 1、循环内仍有三个 64x64xf16 的分配与读路径，并提示需在实际 IR 上确认；其 actual_lowering_check 明确要求以 lower 产物为准。本诊断采纳该方向（循环内串行读路径未被后端消除），并用 profiling/hotspots/timeline 的逐程序流水占比把它量化为“MTE2 每程序仅 62%、程序内两次迭代无重叠”，从而把 Codex 的定性观察落成一个可测的具体编译缺陷。Codex 的备选方向（扩大内维连续长度）因涉及 UB 内切分/换序算子的降级风险，本轮列为备选。"
+        }
+      ],
+      "hypothesis": "当前 TTIR 把每个程序的 2 个 [64,64] tile 写成 scf.for 内一条完全串行的 加载→向量→存储 链：第 i 次迭代的 3 次 MTE2 拷贝必须等第 i-1 次迭代的向量计算与 3 次 MTE3 存储推进之后才能发射（bcmlir 中每迭代都是新建 alloc+memref.copy，无跨迭代轮转缓冲）。因此每程序驻留 2.95us 中 MTE2 只忙 1.824us（62%），另外 38% 被同一程序内的依赖链排空；热点的 BAR/WAIT_FLAG（line 147 store 5.67us、line 133 k load 6.98us）和 timeline 里 0.6055~0.6438 的程序边界 3.83% 加载气泡就是这条依赖链的直接表现。因为逐程序读写字节已无冗余（48.625KB 读 / 48.0KB 写，与理论值一致），唯一可压缩的是“同一程序内两次迭代之间的串行化”。把两次迭代在 TTIR 里显式展开、并把 6 次加载全部提到任何向量计算之前，可以让 MTE2 连续发射 48KB 加载，使第 0 个 tile 的向量与存储完全落在第 1 个 tile 的加载窗口内。",
+      "alternatives": [
+        "扩大加载内维连续长度（每程序 2 头 [64,128]，行 256B；或 4 头 [32,256]，行 512B）以提高 aiv_mte2_active_bw（当前 26.79GB/s，reference 31.68GB/s）：需要把宽 tile 在 UB 内按头切分（reshape+trans+split 或等价换序算子）才能保持 8KB 连续 store，降级风险较高，列为下一轮独立机制。",
+        "减少 MTE2/MTE3 字节：不可行——read_main_memory_datas 48.625KB、write 48.0KB 已等于理论最小体积，qkv 每个元素恰好读一次、每个输出元素恰好写一次。",
+        "去掉 q 路径的 fp32 opmath（.to(f32) 加 bias 再乘 scale 再 truncf）：会改变参考数值语义（fp16 先加会溢出），禁止。",
+        "改编译选项（num_stages、multibuffer、enable_preload 等）：属于另一研究身份，且这些 knob 在冻结的 frozen.py 启动侧，本轮不动。",
+        "缩小 tile 增加每程序迭代数以获得更深流水（如 [32,64]×4）：会让 128B 行片段数翻倍、块大小降到 4KB，与提高加载效率方向相反，且 UB 内分配更碎。"
+      ],
+      "change": "只修改 ir/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttir：把 scf.for %i = 0 to 2 step 1（含 tt.num_stages=2）整体替换为两次直线展开的 tile 体（i=0 用 %seq_base，i=1 用 %seq_base+64），并把 6 次 tt.load（q/k/v × 两 tile）全部提前到任何 arith.extf/arith.addf/arith.mulf/tt.store 之前；循环外已有的 k_shift/v_shift splat 与 in_cols、out_off 基址在两次展开间复用（顺带减少标量重复计算）。函数签名、参数顺序、pid→(seq_group, head, batch) 映射、grid、掩码形式、bias 加法与 q 的 fp32 opmath 与 truncf 次数全部不变，每个输出元素的计算图与原来逐元素相同（无重结合、无精度改变）。",
+      "expected": "主要预测：每程序驻留时间由约 2.95us 降到约 2.5~2.7us（aiv_mte2_ratio 由 0.618 升到 0.70~0.75，aiv_mte3_ratio、aiv_vec_ratio 基本不变），Task Duration 由 40.02us 降到约 34~36us，相对当前最佳约 1.10~1.18x。次要预测：timeline 中 MTE2 的程序边界空闲段（0.6055~0.6438 那段 3.83% 气泡）消失或显著缩小；source_loop 区域的 BAR/WAIT_FLAG 累计时间下降（store 与 vector 不再等上一迭代）；read/write 字节数保持 48.625KB/48.0KB 不变（若变化说明改动引入了额外搬运，属失败信号）。",
+      "validation": "由宿主运行：完整 KGS/正式用例（当前 21/21）必须保持全过，数值容差 atol=rtol=0.015 且 matched_ratio=1.0；随后 paired profiling + simulator 复测 Task Duration，核对 (a) 程序驻留时间与 aiv_mte2_ratio 上升，(b) aiv_mte3_active_bw / aiv_vec_time 不恶化，(c) read/write 主存字节不变，(d) MTE2 边界空闲段缩小。若驻留时间未下降但字节与流水占比完全不变，则说明该后端对直线化后的 48KB 连续加载同样做了保守同步，需回退并按备选方向（内维加宽）另立机制。",
+      "layer_reason": "缺陷位于 TTIR 层的循环结构与操作顺序（迭代内串行、缺少跨迭代加载预取），不在 Python 源码的控制流抽象上（frozen.py 已用 tl.range(num_stages=2) 表达意图，但后端未产生多缓冲，改写源码会被冻结且重复同一表达），也不在编译选项层（knob 在启动侧且属另一研究身份）。TTIR 是能精确表达“先发 6 次加载、再算两次 tile”的最低层，改动能保持 ABI 不变、且可用字节数与流水占比独立验证。",
+      "simulator_incremental_judgment": "模拟器窗口为部分捕获（application_completed=false，单核 109.804~119.544us，仅覆盖每核约 8/12.8 个程序），绝对时钟仅用于同窗口相对比较，不做全器件关键路径推断；未报告泳道（CACHEMISS、FLOWCTRL、ALL）按辅助 trace 泳道解释，不计入因果。即便如此，窗口内 MTE2 与 MTE3/VECTOR 的占比差异（productive 0.8925 vs 0.2639/0.1113）与 profiling 的 512 程序统计（MTE2 62% vs 每程序驻留 2.95us）方向一致，且 MTE2 的 3.83% 边界空闲段在逐程序统计口径下对应约 1.13us/程序的未重叠部分，因此把该窗口观察当作“程序内两次迭代未重叠”的增量证据是自洽的，但收益幅度只以宿主复测的 Task Duration 为准。"
+    },
+    "result": {
+      "api_version": "v6.2",
+      "reference_source": "primary",
+      "status": "PASSED",
+      "device": "npu:0",
+      "server_backend": "npu",
+      "is_hack": false,
+      "hack_reason": "",
+      "geo_mean": 1.674593509373774,
+      "min_speedup": 1.3509284347430321,
+      "worst_workload_uuid": "transform_bias_rescale_qkv-timing-8",
+      "latency_ms": 0.1225254804884014,
+      "abs_err": 0.0,
+      "rel_err": 0.0,
+      "num_workloads": 21,
+      "num_passed": 21,
+      "timing_skipped": false,
+      "log": "",
+      "per_workload": [
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-0",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-1",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-2",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-3",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-4",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-5",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-6",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-7",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-8",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-9",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-10",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-11",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-0",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 2.2555210562811396,
+          "latency_ms": 0.0035688618322096493,
+          "reference_latency_ms": 0.008049643009506951,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-1",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.5669533017926554,
+          "latency_ms": 0.032717346887584625,
+          "reference_latency_ms": 0.05126655473139639,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-2",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.4578483550209091,
+          "latency_ms": 0.06302917570629396,
+          "reference_latency_ms": 0.0918869801217445,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-3",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 2.188077381761913,
+          "latency_ms": 0.0037175341462810222,
+          "reference_latency_ms": 0.008134252381405088,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-4",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.541261577056852,
+          "latency_ms": 0.03313734528122287,
+          "reference_latency_ms": 0.051073317047614995,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-5",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.4449743315759924,
+          "latency_ms": 0.0634719993813575,
+          "reference_latency_ms": 0.09171540987986886,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-6",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 2.2071314566408695,
+          "latency_ms": 0.003692951717933509,
+          "reference_latency_ms": 0.008150829904506987,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-7",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.3832785322469952,
+          "latency_ms": 0.06223598422185581,
+          "reference_latency_ms": 0.08608970090735586,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-8",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.3509284347430321,
+          "latency_ms": 0.1225254804884014,
+          "reference_latency_ms": 0.16552315557233402,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        }
+      ]
+    }
+  },
+  {
+    "invocation": "ir-002",
+    "diagnosis": {
+      "source_sha256": "0af5d533afea8f4be88e1fd6e0fc4a6ba76fae9a8b1478f7c4b93247fe7ec070",
+      "selected_layer": "single_operator_ir",
+      "evidence": [
+        {
+          "path": "profiling.json",
+          "category": "paired_profiling",
+          "role": "traffic_minimality",
+          "finding": "候选侧（512 blocks）Memory.csv/vector0 的 read_main_memory_datas=24896KB、write_main_memory_datas=24576KB；输入 qkv 为 8*512*3072*2B=24576KB，三个输出合计亦为24576KB。即主存读写总量等于理论最小流量（多出的约320KB约等于512个program各3次128B偏置读199KB加边界余量），没有重复读、没有写放大、也没有可删除的搬运。"
+        },
+        {
+          "path": "profiling.json",
+          "category": "paired_profiling",
+          "role": "bandwidth_and_block_budget",
+          "finding": "候选 Task Duration=40.020802us、Block Dim=512；49.5MB/40.02us≈1.24TB/s 聚合带宽。逐block aiv_time=2.9648us、aiv_total_cycles=4892，每block搬运96KB→32.4GB/s/core；512块/40核=12.8→13个波次，13*2.965=38.5us 与40.0us自洽，波次量化损失约1.5%。核内时间已无大的非内存空转可压缩。"
+        },
+        {
+          "path": "profiling.json",
+          "category": "paired_profiling",
+          "role": "reference_comparison",
+          "finding": "参考CANN原生（40 blocks）Task Duration=55.001099us，同流量聚合约1.05TB/s；候选 aiv_gm_to_ub_bw 16.12 vs 12.63、aiv_mte2_active_bw 26.79 vs 31.68、derived bytes_per_mte2 1981 vs 2048、aiv_mte2_instructions 12800 vs 12408。候选核内已比参考快1.37x，且每MTE2指令搬运字节与参考同量级（≈2KB），说明128B内层突发是两侧共同的硬件描述符粒度，不是候选独有的编译缺陷，也没有留下可复制的参考级余量。"
+        },
+        {
+          "path": "profiling.json",
+          "category": "paired_profiling",
+          "role": "store_burst_check",
+          "finding": "候选 aiv_mte3_instructions=7/block（全核3584），aiv_mte2_instructions=25/block；48KB存储只用约7条MTE3指令、约1.97KB/指令。因此源码IR中形如每行128B×64行的存储突发，在后端已合并为大块传输；写侧不存在可消除的逐行小突发成本（写命中率75%亦与连续8KB写一致）。"
+        },
+        {
+          "path": "profiling.json",
+          "category": "paired_profiling",
+          "role": "pipe_wait_attribution",
+          "finding": "候选逐block：aiv_mte2_ratio=0.618 但 aiv_mte2_wait_ratio=0.486（参考仅0.045），即MTE2处于忙态时约79%是等待；aiv_mte3_ratio=0.317、aiv_vec_ratio=0.259、aiv_vec_wait_ratio=0.528、aiv_scalar_single+dual≈0.194us、aiv_scalar_mte2_stall_time=0.292us、aiv_scalar_mte3_stall_time=0。即瓶颈不是搬不动的字节，而是载入/计算/存储之间只有2级多缓冲、每program仅2轮的依赖链；而唯一能加大在飞载入的改法（IR001）已被实测无收益。"
+        },
+        {
+          "path": "hotspots.json",
+          "category": "simulator",
+          "role": "pipeline_occupancy",
+          "finding": "core0.veccore0 窗口9.74us内：MTE2 active 8.9997us(92.4%, productive 89.2%, wait 3.1%)、VECTOR active 90.7% 但 wait 79.7%(productive 11.1%)、MTE3 active 86.5% 但 wait 77.7%(productive 26.4%)、SCALAR productive 4.9%、ALL/FLOWCTRL/CACHEMISS 为auxiliary_trace_lane（CACHEMISS 仅16事件、0.012us）。窗口内只有MTE2接近饱和，其余多为显式WAIT；热点集中在 source_loop(frozen.py:109-170)。"
+        },
+        {
+          "path": "timeline.json",
+          "category": "simulator",
+          "role": "qualification_and_block_boundaries",
+          "finding": "clock_qualification=relative_only、absolute_time_qualified=false、capture_scope 为 partial trace（首末可见硬件事件，outside_events=4），故只作窗口内占比解释，绝对时间以msprof计数器为准。MTE2共7段空闲，其中块边界两段 109.804→110.098(0.294us) 与 115.702→116.075(0.373us) 与 aiv_scalar_mte2_stall_time=0.292us 一致，指向每block约0.2-0.3us的启动/排空暴露（占2.965us约7-10%）。"
+        },
+        {
+          "path": "ir/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttir",
+          "category": "source_ir",
+          "role": "tile_loop_and_copies",
+          "finding": "每program一个(batch,head,seq_group)，GROUP=2 的 scf.for(tt.num_stages=2)：每轮3次[64,64]f16载入(addptr 内层连续128B、行距 stride_qkv_s 为运行时值)、q路径4遍f32向量(extf/addf/mulf/truncf)、k/v各1遍f16加法、3次[64,64]存储(行距 stride_out_s 为运行时值)；3×64偏置已在循环外只载一次，k/v 偏移在后端折叠为标量加法。IR中已无逐元素索引解码、无重复读、无非语义必需的dtype往返。"
+        },
+        {
+          "path": "compiled-readonly/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/f67d9cdb9f445d242714897e48f68b992534a9c144549743ff721f2556ce6136/_transform_bias_rescale_qkv_kernel.bcmlir",
+          "category": "source_ir",
+          "role": "lowered_check",
+          "finding": "按 lowered-inventory.json 登记的实际产物核对：后端把3次载入降为 memref<64x64, strided<[%stride_qkv_s,1]>> 的 memref.copy，把存储降为带动态 strides<[%stride_out_s,1]> 的 bufferization.materialize_in_destination，并保留 scf.for{tt.num_stages=2}；没有出现逐元素scalar化，也没有把 linalg.broadcast/linalg.fill 落成额外可见拷贝。疑似冗余（逐行小突发、偏置每轮重载、逐元素索引）在后端确已消除。ttadapter/npubin 冻结未改。"
+        },
+        {
+          "path": "ir001-formal-result.json",
+          "category": "paired_profiling",
+          "role": "prior_experiment",
+          "finding": "IR001（两tile展开、六个载入前置、去掉BCMLIR循环）正式结果 PASSED 21/21，但 target 63.029us vs 未改IR 62.861us、源 62.958us，无确认收益并略慢；即增加在飞载入、提升多缓冲重叠这一机制在本算子已被实测否证，同时给出约±0.2us 的测量噪声量级。"
+        }
+      ],
+      "hypothesis": "本算子已处于内存屋顶线，不存在同时满足“具体、未被后端消除、且有执行成本”三个条件的编译缺陷。三点支撑：(1) 主存流量等于理论最小（读24.9MB/写24.6MB），IR 与后端产物都不产生重复读、写放大或多余拷贝，因此任何布局/分块重排都不可能减少字节；(2) 核内 40.02us 对应聚合约1.24TB/s，已高于同日成对测量的参考CANN原生实现（55.0us，约1.05TB/s），每MTE2指令搬运字节与参考同量级，说明128B内层突发是硬件描述符粒度而非候选特有缺陷；(3) 剩余可观测成本只有依赖链等待（每block MTE2 61.8%忙态中48.6%为等待，块边界约0.2-0.3us排空）与约1.5%波次尾损，前者的唯一IR手段（加深在飞载入/去循环）已由IR001实测否证，后者需改动512的启动网格（冻结）。据此本轮判定的结论是：旧退步（IR001）方向正确但收益为零，不应重复；单纯改编译选项禁止且无语义无关的加速空间；因此保持IR原样交接，并把“屋顶线”作为可测预言交给宿主核验。Codex 的证据分析（成对测量差0.15%内、六次跨步载入与总字节不变、每tile每行仅128B连续而MTE2有效带宽低于参考）与本诊断一致；其假设1（跨相邻头合并载入以加宽连续行段）我核对后认为机制成立但预期收益很小，见 alternatives 第2项。在该判断下，本轮落地的不是高期望加速，而是对屋顶线结论最便宜的受控反证实验：同一个program仍覆盖同样的128行，但拆成4轮32行、把多缓冲深度由2提到3（见 change）。若每block MTE2 忙态中48.6%的等待（aiv_mte2_wait_ratio）、0.292us 的 scalar_mte2_stall 与块边界0.2-0.3us空闲确由流水深度不足造成，则核内时间应下降；若如我主假设那样由内存服务率决定，则应无变化。两个结果都可推进判断，且该改法在语义上逐位不变、覆盖关系不变。",
+      "alternatives": [
+        {
+          "option": "拆分轮次、加深同一 program 的软件流水（本轮采纳）：4轮×32行 + num_stages=3，覆盖128行/程序不变",
+          "verdict": "采纳为受控反证实验。它是 IR001 的对偶：IR001 把轮次合并到1轮以求最大在飞载入（实测无收益），本改法把同样的128行切成4个更小的轮次、并把多缓冲深度由2提到3，直接针对 aiv_mte2_wait_ratio≈0.49、scalar_mte2_stall≈0.292us、块边界0.2-0.3us MTE2 空闲这三个候选特有的观测。零语义风险（逐元素地址与算式不变、无掩码、覆盖关系不变、UB 由约112KB降到约88KB仍远低于192KB），代价是 MTE2/MTE3 指令数小幅上升。预测见 expected E3/E4。"
+        },
+        {
+          "option": "跨相邻头合并载入（Codex 假设1）：把块做成3维 [BLOCK_S=32, 2, 64]，行内连续段由128B升到256B，输出用 affine 3维strides[%stride_out_s, %stride_out_h, 1] 落到 head-major，不需要去交织或切片",
+          "verdict": "本轮未采纳。机制可实现且不破坏ABI，但读侧无字节可省（read_main_memory_datas 已等于输入大小，读命中率约1%、无放大），收益只能来自DRAM命令/行激活开销；且候选每MTE2指令已达1981B、与参考2048B同量级，参考自己也只有1.05TB/s。另有硬约束：该映射需要 num_heads 为偶数才精确覆盖，而本特化可被多个仅运行时标量不同的 workload 复用，材料未列明复用范围，故不宜引入形状相关的隐含前提。若本轮 E3 成立（说明核内确有余量可挖），下一轮应转向该3维实现。"
+        },
+        {
+          "option": "存储按 stride_out_s==BLOCK_D 特化为1维连续store（消掉[64,64]动态行距的2维写）",
+          "verdict": "已否证。实际后端产物中每block仅7条MTE3指令搬运48KB（≈1.97KB/指令），逐行小突发在二进制里已不存在，写侧无成本可削。"
+        },
+        {
+          "option": "增大在飞载入/去掉scf.for（等价IR001：两tile展开、六载入前置）",
+          "verdict": "已实测否证：IR001 63.029us vs 62.861us，PASSED但无收益。重复该方向只会得到噪声级结果；本轮改用其对偶（更多但更小的轮次+更深缓冲）以避免重复同一机制。"
+        },
+        {
+          "option": "压缩q的f32路径（例如预先把偏置乘scale、或改用fma合并addf/mulf）",
+          "verdict": "禁止。会改变 (x+b)*s 的舍入次序，破坏“偏置加与缩放在f32、结果只舍入一次”的数值语义（fp16先加会溢出为inf）。"
+        },
+        {
+          "option": "减少标量地址运算（把循环不变地址提到scf.for之外、消掉pid的div/rem）",
+          "verdict": "收益上限过小：逐block aiv_scalar_single+dual≈0.194us（约6.5%），且bcmlir显示后端已把k/v偏移折成标量加、地址计算已在索引层完成；LLVM本身的LICM已覆盖。"
+        },
+        {
+          "option": "重映射pid以消除波次尾损（512块/40核，尾波32核空闲，约1.5%）",
+          "verdict": "不可行：启动网格冻结，任何跨program的重分配都需要精确覆盖证明，且上限仅约1.5%，低于±0.2us噪声的两倍。"
+        }
+      ],
+      "change": "只编辑 ir/ca6c05a0.../_transform_bias_rescale_qkv_kernel.ttir（单一机制：加深同一 program 内的软件流水，不改分块覆盖）。具体：(1) 新增 %offs_d = make_range 0..64 承担列向量，%offs_s 由 64 改为 32 只承担行向量，列偏移 in_cols_1 与 out_off_28 改用 %offs_d（原先借用 %offs_s 仅因 BLOCK_S==BLOCK_D==64）；(2) 循环上界 %c2 → %c4、每轮行步长 %c64 → %c32，即同一 program 仍覆盖 seq_base 起的 128 行（%seq_base = seq_group*128 不变），但由 2 轮×64 行改为 4 轮×32 行；(3) 所有行向张量 64x64/64x1 全部改为 32x64/32x1（含 q/k/v 载入、f32 路径、k/v f16 加法、3 次存储），列向 64 宽向量与 64 元素偏置量保持不变；(4) 循环属性 tt.num_stages 由 2 改为 3。函数签名/参数/常量次序完全未改（ABI 不变），pid→(batch,head,seq_group) 解码未改，故覆盖关系与改动前逐元素一致（每个 (b,h,row,d) 仍由唯一 program 在唯一轮次写入，且 seq_len 在本特化下必为 128 的整数倍、无越界）。语义上每个元素仍走 extf→addf(bias)→mulf(scale)→truncf 的 f32 路径、k/v 仍为 f16 加法，指数/特殊值/别名与浮点精度逐位不变。源码、清单、context、证据与 compiled-readonly 产物均冻结未改。",
+      "expected": "可测预期（4轮×32行 + num_stages=3 的受控实验）：(E1) 正确性必须仍为 21/21 PASSED、abs_err=rel_err=0——本改法逐元素地址与算式未变，任何误差都说明我的 IR 编辑破坏了语义（尤其 32 行分块与列向量 %offs_d 的替换），应立即判为失败；(E2) 字节不变：read_main_memory_datas≈24896KB、write_main_memory_datas≈24576KB、Task Duration 仍应≈40.0us 数量级；若主存流量偏离，说明覆盖或地址算错；(E3) 若「MTE2 忙态等待48.6%来自流水深度不足」成立，则应看到 aiv_mte2_wait_ratio 由≈0.49 下降、aiv_scalar_mte2_stall_time 由≈0.292us 下降，且核内 Task Duration 降到 ≤38.8us（≥3%），timing-2 harness 延迟 <62.2us；(E4) 若我的主假设（内存屋顶线）成立，则上述计数基本不动、核内时间变化 ≤±1%、harness 延迟在 62.86us ±0.2us 内——此时应保留原 IR（回退本次编辑），并把结论定为「同字节流量下不可再加速」；(E5) 副产物预测：MTE2/MTE3 指令数会因 12 次较小块传输而小幅上升（约 24-30 条 MTE2/block），若反而大幅上升（>2x）说明 4KB 级传输已低于硬件有效突发粒度，属负结果。",
+      "validation": "由宿主执行完整KGS与正式评测：源码身份不变、仅 TTIR 变为4轮×32行+num_stages=3，故 (1) 正确性必须 PASSED 21/21 且 abs_err=rel_err=0（含 fp16 特殊值、非连续输出 stride 的边界形状；若任一误差非零即判本次编辑破坏语义并回退原文）；(2) 以同批实测的源/未改IR（62.958/62.861us）为对照，收益需超过约±0.2us 噪声才算确认；(3) 用 msprof 复核 expected 的 E2/E3/E5（主存读写字节、aiv_mte2_wait_ratio、aiv_scalar_mte2_stall_time、mte2/mte3 指令数），据此判定是「流水深度不足」还是「内存屋顶线」；(4) 若计时无收益而流量/正确性均正常，则保留原 IR 并在下一轮改走 alternatives 第2项的3维头合并。本轮不声明收益；文档、预检与建议不作为性能结果。",
+      "layer_reason": "缺陷候选全部位于单算子内部的分块、拷贝形状与流水深度上，可直接用现有冻结 TTIR 与实际后端产物（ttadapter/bcmlir）核对，无需改源码（禁止）、无需改编译选项（禁止且属另一研究身份）、也不涉及跨算子融合；因此层选择为 single_operator_ir。",
+      "simulator_incremental_judgment": "模拟器证据只按窗口内相对占比使用：clock_qualification=relative_only、absolute_time_qualified=false、capture_scope 为 partial trace（9.74us 窗口、outside_events=4），材料明确不重建关键路径、idle 不等于因果停顿、productive 已排除 WAIT/BAR；未报告的泳道（CUBE/AIC 及其它核）按材料视为未观测而非零活动，本算子 mix_mode=aiv 亦无cube侧。因此本轮增量判断的主体是成对 profiling 的绝对计数（Task Duration、read/write_main_memory_datas、bytes_per_mte2、mte2/mte3 指令数与 per-block aiv_time），模拟器只用于两件事：确认窗口内仅 MTE2 接近饱和而 VECTOR/MTE3 大半处于显式 WAIT，以及定位块边界处 0.294/0.373us 的 MTE2 空闲与 aiv_scalar_mte2_stall_time=0.292us 相印证。热点的 wait/idle 被视为核心输入但不被当作已证明因果，故未据此提出加速承诺。",
+      "unknown": [
+        "910B4 单卡可达 HBM 带宽（1.24TB/s 距峰值多少）未在材料中给出，故“屋顶线”以“与参考同流量下候选已快1.37x、且流量已达理论最小”表述，不宣称距峰值不足。",
+        "成对测量中 harness 延迟(62.86us)与核内 Task Duration(40.02us)相差约22.8us，该固定开销的构成（启动/同步/Python下发）不在材料内，也不受IR控制。",
+        "IR001 的 post-capture 尚不可用，故“增加在飞载入无收益”目前只有端到端延迟证据（63.029 vs 62.861us），缺逐流水解释。",
+        "不同 workload 是否复用同一特化（同一 ast_sha 与 constexpr 集，仅运行时标量不同）未在材料中列明；这是决定“能否在TTIR内硬编码形状”的关键前提，本轮因此不采用任何依赖具体形状的重写。",
+        "输入侧L2/DRAM行激活级效率无法从现有计数器直接读出；256B头合并的实际收益仍属未测。"
+      ]
+    },
+    "result": null
+  },
+  {
+    "invocation": "ir-003",
+    "diagnosis": {
+      "source_sha256": "0af5d533afea8f4be88e1fd6e0fc4a6ba76fae9a8b1478f7c4b93247fe7ec070",
+      "selected_layer": "single_operator_ir",
+      "evidence": [
+        {
+          "path": "profiling.json",
+          "category": "paired_profiling",
+          "role": "候选侧各流水真实耗时、活跃带宽与等待占比，用于定位哪条流水是每program的真实成本",
+          "finding": "候选kernel _transform_bias_rescale_qkv_kernel（Block Dim 512，512条记录）每block：mte2_time 1.824us / mte2_ratio 0.618、mte3_time 0.909us / 0.317、vec_time 0.741us / 0.259、scalar_time 0.945us / 0.314，aiv_time 2.965us。等字节量（GM_to_UB 48.375KB，UB_to_GM 48.0KB）下 mte2_active_bw 仅 26.79GB/s 而 mte3_active_bw 52.49GB/s，说明strided输入读的每指令效率约为连续写的一半（mte2 25指令/block 合 1981B/指令，mte3 7指令/block）。等待占比 vec_wait 0.528、mte3_wait 0.577、mte2_wait 0.486，且 scalar_mte2_stall_time 0.292us/block，表明MTE2与向量/写回之间缺乏稳态重叠，而不是某条流水算力饱和。"
+        },
+        {
+          "path": "hotspots.json",
+          "category": "simulator",
+          "role": "按源码循环/条件范围给出指令数与最大单指令时间，确认开销集中在 tile 循环体内的三读三写链",
+          "finding": "source_loop 109-170（即GROUP循环体）252条指令、instruction_time_sum 104.51us、最大单指令 6.98us；最大的三条均为MTE2：0x10d11364 MOV_SRC_TO_DST_ALIGN（源行133 k_val 读）、0x10d11378 SET_FLAG(MTE2→VEC)、0x10d1138c MOV_SPR_XN，calls=3；随后是BAR与WAIT_FLAG（MTE3 BAR 5.67us、VECTOR BAR 5.64/5.54/5.38us，WAIT_FLAG(PIPE:VEC→MTE3) 4.78us）。条件区 94-102（bias装载）仅18条指令、5.3us，且已证明在循环外。即成本主要在循环体内的 load→vector→store 依赖链，同步等待项显著。"
+        },
+        {
+          "path": "timeline.json",
+          "category": "simulator",
+          "role": "相对时间窗内各硬件流水的 productive/wait_only/idle 分解，判断重叠是否已达稳态",
+          "finding": "窗口 9.740us（clock_qualification=relative_only，absolute_time_qualified=false，只作相对占用解释）：MTE2 active 92.4%（productive 89.2%）、VECTOR active 90.7% 但 productive 仅 11.1%、wait_only 79.6%，MTE3 productive 26.4%、wait 77.7%，SCALAR idle 95.1%。读流水几乎全程有效，而向量与写回大部分时间停在等待上，说明当前每个program内是“读-等-算-等-写”的串行骨架，仅2次迭代的循环无法形成稳态重叠。"
+        },
+        {
+          "path": "ir/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttir",
+          "category": "source_ir",
+          "role": "当前冻结TTIR的实际循环与tile结构，确认可编辑的具体缺陷位置",
+          "finding": "实际TTIR：tile 为 64x64（第30行 tt.make_range end=64 同时被当作行与列偏移），第45行 `scf.for %i = 0 to 2 step 1` 带 `{tt.num_stages = 2}`，第46行 offs_rows = i*64，第31行 seq_base = seq_group*128。即128行覆盖由“2次迭代×64行”构成，num_stages=2 时只有 1/2 迭代可进入多缓冲稳态；且同一 64 元 range 混用为行、列两种语义，使 BLOCK_S 与 BLOCK_D 在IR层被耦合。"
+        },
+        {
+          "path": "compiled-readonly/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/f67d9cdb9f445d242714897e48f68b992534a9c144549743ff721f2556ce6136/_transform_bias_rescale_qkv_kernel.bcmlir",
+          "category": "source_ir",
+          "role": "按符号核对lowered产物，确认哪些疑似冗余已在后端消除、哪些真实存在于机器结构",
+          "finding": "同一符号的 bcmlir 显示：3个 bias（%alloc/%alloc_1/%alloc_3 各 memref<64xf16>）的 memref.copy 已在 scf.for 之外（重复装载已被后端消除，无需在TTIR处理）；循环体内是3个 `memref.copy`（sizes[64,64], strides[%stride_qkv_s,1]，即每行128B、行距6144B的strided读）与3个 `materialize_in_destination`（strides[%stride_out_s,1]，连续写）。`%38 = linalg.fill(%arg11)` 把标量 scale 物化成完整 64x64xf32 缓冲，是 tt.splat+arith.mulf 的后端正常形态，TTIR 侧无更简形式可写。因此可编辑的真实缺陷只剩循环/tile几何本身。"
+        },
+        {
+          "path": "feedback.json",
+          "category": "paired_profiling",
+          "role": "上一轮实际正式与补测结果的正式身份与结论，避免重复已被否证的方向",
+          "finding": "IR001 已跑全量21项与两项补测并通过，target 63.029us 对未改动 62.861us，没有保留可测收益；IR002 未上机。提示单纯改动并不自动带来延迟收益，必须以可测预测登记机制。"
+        }
+      ],
+      "hypothesis": "当前每program固定128行覆盖，但被编译成 2 次 64 行迭代 + num_stages=2 的循环，软件流水只有一个稳态槽：第2次迭代的 MTE2 才可能与前一次向量/写回重叠，因此 MTE2（每block 1.824us，26.8GB/s 有效带宽）与向量（productive 仅 11.1%）基本串行，整体每block 2.965us 接近三条流水时长之和而非最大值。若把同一128行覆盖改写为 4 次 32 行迭代（BLOCK_S=32，GROUP=4，seq_base 仍为 seq_group*128），循环深度翻倍、每级 tile 字节量减半，num_stages=2 的多缓冲可在 4 次迭代中的 3 次形成稳态重叠，从而让向量计算与写回掩蔽部分读时间；同时 32x64x2B=4KB 仍满足 128B 行对齐的连续写与 strided 读模式，访问模式与全局字节量不变。这是编译器本应通过更深循环流水获得的重叠，而非改动数学。",
+      "alternatives": [
+        "A（已排除）删除/下沉 bias 装载：bcmlir 证明三次 memref<64xf16> 复制已在循环外，后端已消除该冗余，TTIR 无需改。",
+        "B（已排除）把 scale 乘法改为标量广播以省一次 64x64 f32 物化：TTIR 中已是 tt.splat+arith.mulf 的最简形式，linalg.fill 是后端形态，TTIR 无更简写法。",
+        "C（不采用）把输入读改成完全连续的大块：q/k/v 在同一行内相隔 hidden_dim=1024 列，单 head 的列块无法连续化，除非改变每个program的覆盖语义（会破坏覆盖/ABI）。",
+        "D（不采用）调整编译选项（num_stages/多缓冲开关）：属于“单纯改编译选项”的独立研究身份，且 lowered 选项须冻结，本轮不采用。",
+        "E（备选，未采用）把k/v的fp16加法改为fp32：会改变参考数值顺序，违反精度要求。"
+      ],
+      "change": "只编辑 ir/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttir 的 tile/循环几何，保持函数签名、参数顺序与ABI不变：新增 64 元 %offs_d 专用于列偏移（in_cols / out_off 列向），把 %offs_s 改为 32 元专用于行偏移；循环上界 2→4、offs_rows 步距 64→32、%seq_base = seq_group*128 不变（覆盖仍为128行/ program）；所有 tile 形状 64x64→32x64，bias 仍为 64 元并在循环外装载。不新增/删除任何算术节点类型，不改变 q 的 fp32 加法-缩放-单次舍入顺序、k/v 的 fp16 加bias顺序、mask/边界处理（本特化 EXACT 路径）与别名关系。",
+      "expected": "可测预测（target_case = transform_bias_rescale_qkv-timing-2，当前最佳 target 62.861us / speedup 1.4524，paired task duration 40.02us）：(1) 全局访存字节不变——read_main_memory_datas 合计 24896KB、write 24576KB；(2) 每block aiv_time 由 2.965us 降到 ≤2.85us，向量productive占比上升、vec_wait/mte3_wait 下降；(3) mte2 指令数/block 基本持平（原25），mte3 指令数/block 因每次写块减半而由7上升；(4) 若重叠假设成立，timing-2 延迟应低于 62.861us（任何可保留的降低即成功，≥1.5% 即 <61.9us 为强证据）。否证条件：timing-2 ≥62.861us，或 KGS/补测出现任何数值不匹配，或全局字节数与上述不符。",
+      "validation": "先做 TTIR 可解析与 lowering（只读对照 compiled-readonly 同符号产物）核对：确认循环变为 4 次、tile 为 32x64、bias 装载仍在循环外、访问模式仍为 strided 读+连续写；随后由宿主运行完整21项正式KGS与两项补测（含 EXACT 与非 EXACT 路径的数值比对，atol/rtol 0.015，matched_ratio 1.0），并以 timing-2 与 paired task duration 作为性能判据；语义、完整KGS与性能均以宿主实际运行结果为准，本文档的预检不作为收益结论。",
+      "layer_reason": "缺陷位于单算子TTIR层：循环深度与tile几何在TTIR中已完全具体化（scf.for 上界、make_range 宽度、num_stages 注解），源文件与编译选项保持冻结；此处编辑只重排同一计算的迭代切分，不触碰ABI、程序解码与数值顺序，因此该层是唯一可独立验证且不越界的修改面。",
+      "simulator_incremental_judgment": "本轮不产生新的模拟器或设备增量证据，也不回溯归因历史不匹配轨迹：hotspots/timeline 为既有 partial-window 相对分析（absolute_time_qualified=false，窗口9.740us 仅含本核首个至末个可见事件，未报告泳道与启动前后空闲不计入），只用于相对占用解释与假设排序（MTE2 productive 89.2% 而 VECTOR productive 11.1%、wait_only 79.6%）。其最大单指令 6.98us 与 calls=3 只说明关注度，不重建动态循环次数或关键路径；收益判据仍取决于宿主后续的真实编译与计时。",
+      "unknown": [
+        "4次32行迭代后 mte3 指令数上升对写回占比（原0.317）的实际影响幅度未知，若写回成为新瓶颈则可能抵消重叠收益。",
+        "32行tile下 strided 读是否仍按每行128B成burst（mte2 指令数可能不变或上升）需由实际lowering确认。",
+        "formal timing 在 L2 清除条件下是否已由HBM带宽封顶（50.3MB/62.86us≈800GB/s），若已封顶则本机制收益将很小甚至为零。"
+      ]
+    },
+    "result": {
+      "api_version": "v6.2",
+      "reference_source": "primary",
+      "status": "PASSED",
+      "device": "npu:0",
+      "server_backend": "npu",
+      "is_hack": false,
+      "hack_reason": "",
+      "geo_mean": 1.6568928983125353,
+      "min_speedup": 1.350839823891542,
+      "worst_workload_uuid": "transform_bias_rescale_qkv-timing-8",
+      "latency_ms": 0.1229416411321788,
+      "abs_err": 0.0,
+      "rel_err": 0.0,
+      "num_workloads": 21,
+      "num_passed": 21,
+      "timing_skipped": false,
+      "log": "",
+      "per_workload": [
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-0",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-1",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-2",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-3",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-4",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-5",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-6",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-7",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-8",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-9",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-10",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-11",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-0",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 2.2253902909122827,
+          "latency_ms": 0.003550540643075231,
+          "reference_latency_ms": 0.007901338674589071,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-1",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.5569567910741071,
+          "latency_ms": 0.03253767556666445,
+          "reference_latency_ms": 0.050659754939284256,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-2",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.4335424078632923,
+          "latency_ms": 0.06351647820992312,
+          "reference_latency_ms": 0.09105356511204954,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-3",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 2.1614254694949553,
+          "latency_ms": 0.003706742722540382,
+          "reference_latency_ms": 0.008011848129363853,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-4",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.5371698661354571,
+          "latency_ms": 0.033141092969650295,
+          "reference_latency_ms": 0.05094348944374008,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-5",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.4446473495436167,
+          "latency_ms": 0.06316826636260252,
+          "reference_latency_ms": 0.09125586857599893,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-6",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 2.1174764964037336,
+          "latency_ms": 0.0038197710036831077,
+          "reference_latency_ms": 0.00808827532194348,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-7",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.3800988956820246,
+          "latency_ms": 0.06220201631116289,
+          "reference_latency_ms": 0.08584493402023119,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-8",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.350839823891542,
+          "latency_ms": 0.1229416411321788,
+          "reference_latency_ms": 0.16607446485592955,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        }
+      ]
+    }
+  },
+  {
+    "invocation": "ir-004",
+    "diagnosis": {
+      "source_sha256": "0af5d533afea8f4be88e1fd6e0fc4a6ba76fae9a8b1478f7c4b93247fe7ec070",
+      "selected_layer": "single_operator_ir",
+      "evidence": [
+        {
+          "path": "profiling.json",
+          "category": "paired_profiling",
+          "role": "本轮首选定量依据：per-block 流水时间、指令计数、活跃带宽、字节守恒",
+          "finding": "候选（512 blocks，Task Duration 40.020802us，Current Freq 1650）：aiv_mte2_time=1.824087us/block、aiv_mte3_time=0.909179us/block、aiv_time=2.964817us/block，故 MTE2 占每 block 时间 61.8%(aiv_mte2_ratio=0.6182)、MTE3 占 31.7%(0.3168)，两者之和 93.5%，即 load 与 store 在该 block 内几乎串行；aiv_mte2_instructions 合计 12800（=25.0 条/block），aiv_mte3_instructions 合计 3584（=7.0 条/block）；derived Memory.csv bytes_per_mte2=1981.44 B/条（reference 侧同口径 2048.41 B/条）。aiv_mte2_active_bw=26.790132 GB/s 对 aiv_mte3_active_bw=52.492918 GB/s：同样约 48KB 的字节量，load 路径因为按 ~2KB/条搬而比 store 路径（8KB/条）多花一倍时间。read_main_memory_datas=24896 KB、write_main_memory_datas=24576 KB，与理想字节（qkv 24576 KB 读 + 3 份输出 24576 KB 写）只差约 320KB 的 bias 重复读，说明数据量已最小，缺陷不在字节数而在 MTE2 事务粒度。"
+        },
+        {
+          "path": "hotspots.json",
+          "category": "simulator",
+          "role": "逐源码区域与逐流水占比，用于确认被改写的循环就是主导区域、向量不是瓶颈",
+          "finding": "source_loop（候选源 109-170 行，即本算子唯一 tile 循环）252 条指令、instruction_time_sum_us=104.51、wait_instruction_time_sum_us=39.81，是本核最重区域；窗口内 MTE2 productive_union=8.693us / 9.740us，MTE3 productive_union 仅 2.571us（wait_only 0.601），VECTOR productive_union 仅 1.084us 而 wait_only 0.796，SCALARLDST 693 个事件但仅 1.282us。含义：循环体是关注度最高区域，load 流水是唯一接近饱和的流水，向量/标量计算远不是关键路径（也与 f32 opmath 必须保留的语义要求不冲突）。"
+        },
+        {
+          "path": "timeline.json",
+          "category": "simulator",
+          "role": "泳道资质、观测范围与未报告泳道的解释",
+          "finding": "capture_start=109.804us、capture_end=119.544us、capture_duration=9.740us，time_unit 为窗口相对量，capture_scope 明确为“本核首个至末个可见硬件事件”，与正式 62.86us 非同一次绝对计时，故只用其占比不用绝对秒数；MTE2 active_ratio=0.924 且 idle_ratio 仅 0.076（7 段空闲，最大 0.373us），MTE3 active 0.865 但 productive 仅 0.264，VECTOR productive 0.111。auxiliary 泳道（ALL/FLOWCTRL/CACHEMISS）几乎全空闲：CACHEMISS 16 个事件、active 仅 0.0012，不构成独立瓶颈；未报告泳道不做因果归因。结论：窗口内 load 流水近乎连续、store 与向量被 load 拖动，与 per-block 计数一致。"
+        },
+        {
+          "path": "ir/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttir",
+          "category": "source_ir",
+          "role": "本轮唯一可编辑的实际 TTIR（当前最佳的真实编译输入）",
+          "finding": "单一特化：BLOCK_S=64、BLOCK_D=64、GROUP=2、EXACT=true；stride_qkv_d/stride_bias/stride_out_d 已作为 constexpr 消去，函数体里 in_cols=head*head_dim+offs_d，因此每行输入连续 64 个 f16=128 B，跨行 stride_qkv_s=3072 元素(6144 B)；store 侧 out_off=batch*stride_out_b+head*stride_out_h+rows*stride_out_s+d，stride_out_s=64 使整块 [64,64] 输出在运行期完全连续。scf.for 仅 2 次迭代，带 tt.num_stages=2；UB 预算按 frozen.py 注释为 12*8192+2*8192+768=115456 B（196608 B 的 59%）。"
+        },
+        {
+          "path": "compiled-readonly/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/f67d9cdb9f445d242714897e48f68b992534a9c144549743ff721f2556ce6136/_transform_bias_rescale_qkv_kernel.bcmlir",
+          "category": "source_ir",
+          "role": "核对“疑似冗余是否已在后端消除”，决定是否把索引冗余当目标",
+          "finding": "已消除：TTIR 中所有 [64,64] 指针/索引张量（in_cols 的 expand+broadcast、k_val/v_val 的 tt.splat hidden_dim 指针加、out_off 的 2D 广播求和）在后端全部折叠成标量 base 加一次 memref.reinterpret_cast，load 变成 memref.copy 到 memref<64x64xf16, strided<[?,1]>>（源 strides=[%stride_qkv_s,1]），store 变成 bufferization.materialize_in_destination 到同形 strided memref；bias 的 expand/collapse 也被折成 linalg.broadcast。因此“逐元素索引计算冗余”“指针张量广播”这类候选缺陷在本后端不存在，不应作为本轮机制；同时 loop 内仅残留 2-6 条标量乘加（SCALAR 全核仅 0.473us 的 4.8%），也不值得改。ttadapter 与 bcmlir 结构一致（同名 sha 记录见 lowered-inventory.json），低层产物冻结不改。"
+        },
+        {
+          "path": "ir001-formal-result.json",
+          "category": "paired_profiling",
+          "role": "旧反馈：同几何下的分组/深度类改动无收益，用于排除重复机制",
+          "finding": "ir001 全 21/21 与 48/48 通过，但 63.029176us 对原 62.860936us 无收益；feedback.json 另记录 ir003（32 行 x64 列、4 次迭代）仍在不可变快照中评测、结果未回。说明“只改分组/迭代深度”已被占用，本轮必须换成独立的访存粒度机制，且不得把 ir003 的未决结果当作依据。"
+        }
+      ],
+      "hypothesis": "被替换的机制（承接 Codex 在 codex-brief.json 中提出的方向，本轮由我核对实际 IR/低层产物后选定具体实现）：当前每个程序只覆盖 1 个 head 的 64 列，输入每个 2KB 的 MTE2 事务由 16 段 128 B 连续行（跨行 6144 B）拼成；相邻 head 在 qkv 行内本来就是相邻的 64 列，因此把一个程序改写为“相邻 2 个 head 的 128 列”后，每行连续段由 128 B 变 256 B、每 2KB 事务的 burst 数由 16 降为 8，且若后端事务上限按 burst 数（16）而非字节数约束，MTE2 指令数将直接减半。数据总字节、每程序元素数（4096）、UB 预算、grid 与 launch 全部不变，属纯 MTE2 事务形状优化。\n覆盖与所有权证明（整数、无投机越界）：令 G=num_groups、nh=num_heads、np=nh/2；pid 解码 seq_group=pid%G、rest=pid/G、slot=rest%nh、batch=rest/nh、pair=slot%np、half=slot/np、chunk=seq_group*2+half，程序负责行区间 [chunk*64, chunk*64+64)（GROUP=2 次迭代，每次 32 行）与列区间 [pair*2*head_dim, +128)。(seq_group,half)<->chunk 与 slot<->(pair,half) 都是双射，故 (batch,chunk,pair) 每个组合恰好被一个程序拥有，2G 个 chunk 覆盖 [0,num_seq_blocks*64)=[0,seq_len)（EXACT 蕴含 seq_len%64==0，且 GROUP=2 仅由宿主在 num_seq_blocks 为偶数时启用，故 G=num_seq_blocks/2）。列越界：host 侧 head_dim=hidden_dim//nh 蕴含 nh*head_dim<=hidden_dim，故 2*np*head_dim=nh*head_dim<=hidden_dim，pair 的两 head 列段总在 Q 区（K/V 再整体加 hidden_dim / 2*hidden_dim，与此无关）。head 索引下界：2*pair+1<=nh-1。num_heads 的偶性来自该特化自带的 tt.divisibility=16 属性（缓存键不同则必然重新编译），因此 np>=8 且 ih 不会落到未配对尾 head；这一点比原 kernel 多依赖了一条“分块属性”，已在 unknown 中标注。\n语义保持：q 仍为 extf->addf(bias in f32)->mulf(scale in f32)->truncf 一次 f16 舍入；k/v 仍是 f16 直接加；不新增掩码（仍走 EXACT 无 mask 路径），不改特殊值/NaN/Inf 行为，不改别名关系（输入输出仍互不重叠），不改函数 ABI 与 launch。",
+      "alternatives": [
+        "Codex 备选一：64 行 x128 列的整块（tile 16KB）。已否决为不可编译：frozen.py 注释记录的实测是 12*16384+2*16384+768=230144 B，超过 196608 B AIV UB，会被编译期拒绝；因此配对必须同时把行数减半才能保持 8KB tile 与 115456 B 预算。",
+        "Codex 备选二：只加宽列、输出仍走 2D 仿射 store。已否决：一个 128 列 tile 跨两个 head，输出 [b,h,s,d] 里两段相距 stride_out_h，2D 仿射表达不出来，会退化成非仿射指针张量或逐元素 store。",
+        "保持原 IR 原样交接。已考虑但否决：MTE2 与 MTE3 同字节耗时差 2 倍（1.824us 对 0.909us）是实际低层产物里可核查的具体缺陷，且存在不改变字节/UB/ABI 的可行改法，交接 no-change 会放弃唯一可测的访存粒度假设。",
+        "改 store 侧（转置/合并 head）或改 q 的 f32 中间表示：store 侧已经是 8KB 连续、MTE3 只占 31.7% 且大量等待；f32 opmath 是明确要求，均不作为本轮机制。",
+        "继续调分组/迭代深度（32x64、GROUP=4 之类）：与 ir003 已登记的机制重复，且 ir001 同类改动已证明无收益。"
+      ],
+      "change": "只编辑 ir/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttir（frozen.py、源码、清单、context 与证据均不动；函数签名与 ABI 一字不改）：1) 解码增加 num_pairs=divsi(num_heads,2)、pair=remsi(slot,num_pairs)、half=divsi(slot,num_pairs)，seq_chunk=seq_group*128+half*64；2) tile 由 [64,64] 改为 [32,128]，make_range 改为 32 行与 128 列，输入列基址 pair*2*head_dim，load 保持 2D 仿射（行内 256 B 连续、跨行 stride_qkv_s 不变），k/v 仍以 +hidden_dim / +2*hidden_dim 的 splat 指针加实现；3) bias 三处 load 由 64 变 128 个连续列（q/k/v bias 段仍由 hidden_dim 位移区分）；4) 计算保持 2D [32,128] 与原算子序列（extf/addf/mulf/truncf 与 f16 addf）不变；5) store 前对三个结果做 tt.reshape {allow_reorder=false} [32,128]->[32,2,64]，再用 3D 仿射 offset rows*stride_out_s + (pair*2+h)*stride_out_h + d 写入，保证仍是 memref.copy 可下推的仿射访存；6) 循环仍为 scf.for 0..2 num_stages=2，每程序仍是 4096 元素/8KB tile，UB 预算不变。",
+      "expected": "可测预测（以 profiling 同一口径对照本轮之前的值）：a. aiv_mte2_instructions 每 block 由 25.0 降到 13-19 条（若后端事务上限按 16 burst 约束则每次 load 2 条、共 6*2+3=15 条；若按 2KB 字节上限则仍约 24 条但每事务 8 段 256 B）；b. aiv_mte2_active_bw 由 26.79 GB/s 升到 29-35 GB/s，aiv_mte2_time 由 1.824us/block 降到 1.50-1.68us/block；c. 由于 load 与 store 近乎串行，block 时间 2.965us 应降 5-15%，对应正式用例从 62.860936us 降到 58-61us（即 >1.02x-1.08x），若 burst 上限假设成立可更好；d. 若 3D store 被后端拆成两条 4KB 事务，则 aiv_mte3_instructions 会从 7 升到约 13、aiv_mte3_time 升到 1.05-1.15us/block，此时净收益可能被吃掉——这是本机制的主要风险，必须由 c 与 d 同时判读；e. 正确性：完整 KGS 21/21 与 48/48 期望全过，数值应与当前最佳逐位一致（同样的 f32 偏置加与缩放后一次 f16 舍入、K/V f16 加、无新掩码）。",
+      "validation": "1) 编译/降级先看编译是否通过；2) lowering 产物核对：bcmlir 中 q/k/v load 必须是 sizes=[32,128]、strides=[%stride_qkv_s,1] 的 memref.copy（行内 128 元素连续），store 必须是 sizes=[32,2,64]、strides=[%stride_out_s,%stride_out_h,1] 的仿射 memref，且仍是 materialize_in_destination；若出现逐元素 store 或非仿射索引即为实现失败；3) 性能：与 62.860936us（当前原 IR）和 62.837203us（历史源码最佳）比较，并按 feedback 要求与 ir003 若已合格的新最佳比较；4) profiling 复核 a-c 三条预测（mte2 指令数、active_bw、mte2_time）并同时核对 d（mte3 指令数与时间），两者共同决定机制是否成立；5) 语义：21/21 与 48/48 全量 KGS，不看单点数值；6) 若 c 未达且 d 恶化，判定机制失败并回到原 IR，本轮不宣称任何收益。",
+      "layer_reason": "缺陷位于 TTIR 可直接表达的 tile 几何与访存事务形状层（哪些列属于同一个 tile、行内连续段多长），与源码算法、宿主分块决策（BLOCK_S/BLOCK_D/GROUP 由 frozen.py 固定且不得改）以及编译选项都无关；frozen.py 必须逐字节冻结、函数 ABI 与 launch 不变，而低层产物（ttadapter/bcmlir/npubin）已证明索引冗余被消除，因此唯一既能落地又可被本层完整验证的改动就是单算子 TTIR 的 tile 划分与 head 归属重排。",
+      "simulator_incremental_judgment": "窗口资质：timeline 的 9.740us 是“本核首个至末个可见硬件事件”的相对窗口（capture 109.804->119.544us），与正式 62.86us、profiling 的 40.02us 都不是同一次绝对计时，因此本轮只用窗口内的相对占比（MTE2 active 0.924/idle 0.076、MTE3 productive 0.264、VECTOR productive 0.111）来判断“load 流水接近饱和、store 与向量被拖动”，不用其绝对秒数做预算；CACHEMISS/ALL/FLOWCTRL 等辅助泳道几乎全空闲且未报告泳道不做因果归因。增量判断：per-block 计数与时间（MTE2 1.824us、MTE3 0.909us、两者之和占 93.5%）是本轮唯一可用于定量的证据，它同时给出“字节已最小（24896/24576 KB）”和“load 事务粒度仅约 2KB”两个事实；据此本轮只主张一个可独立验证的增量——把输入行内连续段从 128 B 加倍到 256 B 以降低 MTE2 事务/突发开销，并明确把“3D store 是否被拆成两条 4KB 事务”作为同一机制内的反向风险一起测量。等待与空闲均为核心输入：MTE2 仍在等待 store/向量结束的串行段不会因本改动消失，故收益上界按 load 段自身缩短估计（5-15%），不指望接近 DRAM 上限。",
+      "unknown": [
+        "华为后端把 GM->UB 传输切成约 2048 B/条（reference 与 candidate 两侧 bytes_per_mte2 都≈2KB）究竟是“每条指令字节上限”还是“每条指令突发数上限(16)”；本轮的宽行实验正是用来区分二者：若指令数 25->15 即按 burst 计，若 25 不变而仅带宽上升即按字节计。",
+        "3D 仿射 [32,2,64] store 会被降为一条 8KB 事务（两段 4KB）还是两条独立 4KB 事务；前者对 store 侧中性，后者会带来约 +0.3us/block 的抵消。",
+        "本轮不改变 load 与 store 的串行关系（那属于 ir003 已登记的迭代深度机制），故即使 MTE2 变快，剩余串行段仍是下一轮问题。",
+        "配对合法性依赖该特化自带的 tt.divisibility=16（num_heads 必为偶数）；若宿主以后以 num_heads 不被 16 整除的实参复用同一缓存键，则该前提不成立——正常 Triton 缓存键包含 divisibility，此处作为显式假定记录。"
+      ]
+    },
+    "result": null
+  },
+  {
+    "invocation": "ir-005",
+    "diagnosis": {
+      "source_sha256": "0af5d533afea8f4be88e1fd6e0fc4a6ba76fae9a8b1478f7c4b93247fe7ec070",
+      "selected_layer": "single_operator_ir",
+      "evidence": [
+        {
+          "path": "feedback.json",
+          "category": "source_ir",
+          "role": "宿主正式反馈与本轮前提",
+          "finding": "ir003 正式21/21与补测both48/48全通过但无提升(1.4335424x, 0.063516ms)，retained_best仍为原始IR的62.860936us；ir004被审阅判为rejected_semantic_error，唯一blocking指认%out_off_25/%out_off_26把head轴lane值0/1以元素单位直接加在输出基址上，缺少stride_out_h乘法，导致第二个配对head与相邻元素别名并允许冲突写；反馈要求先修复实际输出地址错误再做任何设备提交。"
+        },
+        {
+          "path": "codex-brief.json",
+          "category": "source_ir",
+          "role": "宿主证据分析与方向约束",
+          "finding": "Codex确认本轮方向为修复paired-head输出地址语义、保留原始数学与同一不可变源码与IR身份；要求显式证明num_heads整除16与运行期形状假设，并核对q/k/v三处store与原始全覆盖；宿主负责native lowering、21例正式、both48补测与性能留存。本轮据此复核全部三个store（q_res_47/k_res_48/v_res_49共用同一%out_off_37），确认只需修一处head步长即可覆盖q/k/v。"
+        },
+        {
+          "path": "profiling.json",
+          "category": "paired_profiling",
+          "role": "片上流水与带宽主证据",
+          "finding": "候选basic Task Duration 40.020802us(Block Dim 512)，参考55.001099us(Block Dim 40)，候选已优于参考；PipeUtilization.csv/vector0逐块统计显示aiv_mte2_time均值1.824087us、aiv_mte2_ratio均值0.618199(最大0.806605)，aiv_vec_ratio均值0.258736、aiv_mte3_ratio均值0.316766、aiv_scalar_ratio均值0.313994；而aiv_mte2_active_bw仅26.79GB/s。即每程序耗时最多的是MTE2加载流水，但其有效带宽远低于峰值，开销来自按行burst/描述符次数而非数据字节。"
+        },
+        {
+          "path": "profiling.json",
+          "category": "paired_profiling",
+          "role": "数据量对照，排除带宽型瓶颈",
+          "finding": "Memory.csv/vector0中GM_to_UB_datas均值620.525KB、GM_to_UB_bw_usage_rate均值5.738742%、UB_to_GM_datas均值614.4KB、aiv_gm_to_ub_bw均值12.63GB/s、aiv_ub_to_gm_bw均值12.50GB/s，数据量与带宽占用都远离峰值，佐证加载成本由事务粒度(行块128B)决定而不是总字节，支持把内维连续块由64元素加宽到128元素。"
+        },
+        {
+          "path": "hotspots.json",
+          "category": "simulator",
+          "role": "同核流水占用与指令级归因",
+          "finding": "core0.veccore0窗口109.804..119.544us(capture_duration 9.740us)：MTE2 productive_ratio 0.892483(productive_union 8.693us)、VECTOR productive_ratio 0.111251且wait_ratio 0.796561、MTE3 wait_only_ratio 0.601322(productive 0.263937)。top_instructions中MTE2的MOV_SRC_TO_DST_ALIGN(Dtype:B16, XM:X13=0x800400)在k/v/q三次load上分别占6.98/4.42/4.38us，说明窗口由三段按行strided加载事务主导，且MTE3/VEC的等待是加载结果依赖的下游表现。"
+        },
+        {
+          "path": "timeline.json",
+          "category": "simulator",
+          "role": "绝对时钟与观测范围资质",
+          "finding": "timeline为completed_relative_analysis，clock_qualification=relative_only且absolute_time_qualified=false(顶层同)，raw_clock_window 109.804..119.544单位unassigned，capture_scope为'本核首个至末个可见硬件事件'，scope声明为保留的部分trace的回顾分析。因此只用占用比率与区间并集作相对判据，不据此推断整核/整算子绝对耗时；未报告泳道(ALL/CACHEMISS/FLOWCTRL空闲比≈0.999)不参与瓶颈归因。"
+        },
+        {
+          "path": "ir/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttir",
+          "category": "source_ir",
+          "role": "被诊断的实际TTIR(当前为ir004修复对象)",
+          "finding": "当前TTIR用pid→seq_group/rest→head_slot/batch，再num_pairs=num_heads/2、pair=head_slot%num_pairs、half=head_slot/num_pairs，把program空间重排为(pair,half)；行区间为seq_group*128+half*64+i*32+offs_s(offs_s<32，循环2次)，列区间in_cols=2*pair*head_dim+offs_d(offs_d<128)，经reshape[32,128]→[32,2,64]拆成head 2pair/2pair+1，语义正确且与输入列连续；但第77-78行%out_off_25=splat(%out_off_22)、%out_off_26=addi(%out_off_25,%offs_h)只把lane值0/1以元素单位相加，缺(x)stride_out_h，故(q/k/v)共同使用的%out_off_37对第二个head完全错误。"
+        },
+        {
+          "path": "frozen.py",
+          "category": "source_ir",
+          "role": "冻结源码与特化合同",
+          "finding": "head_dim=64时block_d=next_pow2(64)=64、tile_elems=8192/2=4096、block_s=64；num_heads=16且seq_len=512时num_seq_blocks=8、exact=true、group=2、num_groups=4，故grid=batch*num_heads*num_groups=512，与IR中num_groups=4、seq_group*128的128行覆盖、i循环2、offs_s<32完全自洽(2*32*num_groups=seq_len)。输出stride为stride_out_b=num_heads*seq_len*head_dim、stride_out_h=seq_len*head_dim、stride_out_s=head_dim、stride_out_d=1；q路径为f32 opmath加bias再乘scale再单次截断，k/v为f16直接相加，IR逐条保留。"
+        },
+        {
+          "path": "compiled-readonly/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/f67d9cdb9f445d242714897e48f68b992534a9c144549743ff721f2556ce6136/_transform_bias_rescale_qkv_kernel.ttadapter",
+          "category": "source_ir",
+          "role": "冻结低层产物，核对疑似冗余是否被后端消除",
+          "finding": "lowered-inventory登记的ttadapter(sha 6955cc56)中，循环体内是六个memref.copy：三处来源为memref.reinterpret_cast(qkv_ptr) sizes:[64,64] strides:[stride_qkv_s,1]的加载，三处materialize_in_destination到sizes:[64,64] strides:[stride_out_s,1]的存储；后端未把q/k/v三段列合并成一次更宽传输，也未把64行64列(内维128B)的按行块加宽或重排，bcmlir(sha 8557bfc1)同源。结论：本轮针对的'内维128B burst过短'冗余在后端并未消除，且低层产物冻结不可改，唯一可改层是TTIR。"
+        }
+      ],
+      "hypothesis": "当前每程序的三次qkv加载都是[行数×64列]的二维strided块，内维仅64个f16=128B，MTE2按行发射burst的描述符/对齐开销与行数成正比；片上每程序aiv_mte2_time均值1.824us、占该块自身耗时的61.8%但active_bw仅26.8GB/s，模拟器MTE2 productive=0.8925且k/v/q单条MOV_SRC_TO_DST_ALIGN占6.98/4.42/4.38us，共同指向'传输事务粒度不足'而非数据量或带宽不足。若把内维连续段由head_dim=64扩展到两个相邻head=128元素(256B)、同时把每次的行数由64降到32(同一tile字节数8192B不变、每程序覆盖的元素数与行覆盖不变)，则每程序加载burst数减半，MTE2时间应随之下降。该加宽在现有TTIR中已由ir004的pair/half重排实现，但输出head轴地址缺stride_out_h乘法导致语义错误，必须先修复才可评估。",
+      "alternatives": [
+        {
+          "id": "A",
+          "description": "保持当前IR不改(或整体回退到原始IR)并交接",
+          "assessment": "零风险但无收益：ir003已用未改IR跑出正式全通过且无提升(1.4335x)，回退只是复现62.86us，不能超过当前最佳，故不作为本轮结论。"
+        },
+        {
+          "id": "B",
+          "description": "只把IR读出/计算路径改回原始单head 64列，保留其余常量",
+          "assessment": "等价于回退机制A，无法改善MTE2事务粒度。"
+        },
+        {
+          "id": "C",
+          "description": "把q/k/v三段列合并为一次更宽的列传输",
+          "assessment": "不成立：三段列区间起点为0、hidden_dim、2*hidden_dim且中间有其它head的列，合并会多读约3倍数据并跨段读入无关列，字节代价远超描述符节省。"
+        },
+        {
+          "id": "D",
+          "description": "保持每程序64行、把tile直接做成[64行,128列]而不做half行切分",
+          "assessment": "UB占用翻倍(16KB/tile)，六块tile加num_stages=2多缓冲与q的f32副本将逼近甚至超出AIV UB预算(源码注释记录8192B tile对应115456B、1.7x余量)，存在编译失败或占用冲突风险，本轮不选。"
+        },
+        {
+          "id": "E",
+          "description": "把三次bias load(各128元素)合并为一次384元素加载或复用splat常量",
+          "assessment": "只影响每次程序一次性的3条小load，相对每循环6条大load收益小，且属另一机制，需单独登记与验证，本轮不做。"
+        }
+      ],
+      "change": "保留当前TTIR的paired-head行/列重排(内维连续段128元素、每次32行、循环2次、tile字节数不变)，仅修复输出head轴地址：在%out_off_25/%out_off_26处插入(%offs_h × splat(stride_out_h))再与%out_off_22=batch*stride_out_b+pair2*stride_out_h相加，使head轴贡献为(2*pair+h)*stride_out_h，即(32行×2head×64维)三个store的地址平面彼此分离；函数签名、指针/标量参数、constexpr与tt.num_stages=2、q的f32 opmath顺序、k/v的f16加法、reshape[32,128]→[32,2,64]的allow_reorder=false均逐字不变；不新增参数、不改ABI、不改源码。",
+      "expected": "主判据(片上观测，来自profiling.json同名口径)：aiv_mte2_time均值由1.824us降到约1.1-1.5us，aiv_mte2_ratio均值由0.618降到≤0.50；次判据：每程序aiv_vec_ratio与aiv_mte3_ratio不升高(向量与存储字节未变，允许±0.03波动)。性能预期：正式latency应低于retained_best 62.861us，按MTE2占比换算目标≤60.5us(约≥3-4%提升)，speedup由1.4335x升到≥1.48x；若latency落在60.5-62.86us之间视为机制生效但收益在此阈值以下，若latency未见下降则判机制被否，需回退并另立方向。语义预期：q/k/v三个输出与参考在atol=rtol=0.015、required_matched_ratio=1.0、equal_nan=true下完全匹配，无NaN/Inf差异，无越界或别名写。",
+      "validation": "由宿主执行native lowering并在设备上编译后：1) 21例正式用例全通过(KGS完整覆盖)与both48补测全通过，matched_ratio=1.0且无特殊值回归；2) 复采profiling核对aiv_mte2_time/aiv_mte2_ratio是否达标，并核对GM_to_UB_datas不变(应为同一字节量)以证明降的是事务数而非数据量；3) 若lowering失败或UB占用被拒，则本轮判实现不可行并按机制回退；4) 模拟器增量仅作方向性核对(MTE2 productive_union应下降)，不作绝对时钟资质。本轮不把诊断或预检当作收益结果。",
+      "layer_reason": "冻结ttadapter与bcmlir显示后端逐字保留六个sizes:[64,64]、内维stride=1的memref.copy，既未合并q/k/v三段列，也未加宽内维或改变行切分，说明目标冗余在低层未被消除；而这些低层产物按清单冻结不可编辑，源码亦冻结禁改，故唯一可执行且在清单允许范围内的层是IR清单登记的ir/*.ttir。选择本轮只改TTIR中一处head步长表达式，属编译缺陷(地址生成缺少运行期步长乘法)而非改编译选项或源码重写。",
+      "simulator_incremental_judgment": "模拟器材料只能支撑增量方向判断：timeline为relative_only、absolute_time_qualified=false、raw clock window单位unassigned且仅覆盖core0的9.74us部分窗口，故不使用其绝对时间，也不把单核窗口外推到62.86us全长；其有效信息是同一窗口内的占用比率——MTE2 productive 0.8925为最饱和泳道、MTE3 wait_only 0.6013与VECTOR wait 0.7966属加载依赖的下游等待，与片上aiv_mte2_ratio 0.618方向一致。增量判据：修复后若MTE2 productive_union/每程序mte2_time显著下降且VECTOR/MTE3空转无恶化，则机制生效；若MTE2占用不变则机制被否。未报告/近全空闲泳道(ALL、CACHEMISS、FLOWCTRL)按材料解释为无硬件事件覆盖，不作任何瓶颈或收益归因。",
+      "unknown": [
+        "MTE2对256B内维与6144B行步长的burst效率提升倍数只能由设备实测确认，模拟器与静态分析都不能给出绝对时钟。",
+        "Ascend后端是否会把[32,2,64]三维持存重新合并/拆分从而削弱或是放大收益，需native lowering与设备复采确认。",
+        "lowering后UB实际占用与多缓冲行为是否与字节预算一致，需编译日志确认。"
+      ]
+    },
+    "result": null
+  },
+  {
+    "invocation": "ir-006",
+    "diagnosis": {
+      "source_sha256": "0af5d533afea8f4be88e1fd6e0fc4a6ba76fae9a8b1478f7c4b93247fe7ec070",
+      "selected_layer": "single_operator_ir",
+      "evidence": [
+        {
+          "path": "feedback.json",
+          "category": "source_ir",
+          "role": "本轮直接失败证据与前次登记机制",
+          "finding": "前次 ir-005 的 lowering review 对 original 与 candidate 两行均返回 lowering_failed / 'RuntimeError: Parse MLIR file failed.'，失败发生在 IRSource.parse_mlir_module，NPU 尚未初始化；formal_evaluation=not_submitted，retained_best 为 original IR 62.860936us。required 明确要求只修复已安装方言的语法及随之产生的编译错误，保持 paired-head 机制、输出步长、源码与 ABI 不变。"
+        },
+        {
+          "path": "codex-brief.json",
+          "category": "source_ir",
+          "role": "宿主证据分析与候选方向（Codex 贡献）",
+          "finding": "Codex 定位原生解析器拒绝 tt.reshape 的 allow_reorder=false，指出当前方言要求 unit attribute，且 original/exploration 与 candidate 都在 lowering 前失败；要求先确定保持元素顺序的 reshape 拼写，再登记修复，修复后仍须通过 UB 容量与 affine3D store 的原生 lowering。该分析与我随后对 IR 的独立核对一致。"
+        },
+        {
+          "path": "previous-host-review.json",
+          "category": "source_ir",
+          "role": "已批准的 IR 机制与语义边界",
+          "finding": "宿主已批准 changed_ir sha256=66aa2529...，机制为相邻头输入宽度 64->128 合并、32x128 分块，并把 128 序列 × H 头重新划分为两个 64 序列半区 × H/2 头对；num_heads 可被 2 整除、BLOCK_S=64/GROUP=2 保证序列整块覆盖；输出地址含 h*stride_out_h；Q 保持 f16->f32 加偏置->f32 缩放->单次 f16 截断，K/V 保持 f16 加法。"
+        },
+        {
+          "path": "ir/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttir",
+          "category": "source_ir",
+          "role": "当前待编译 TTIR 的实际语法缺陷",
+          "finding": "实际文件 235 行、sha256=66aa25293f0097b0e37c3606c93a0c0cd41e1f49b61a2348b438b58159c9d790；第 113–115 行三个 tt.reshape 写作 {allow_reorder = false}，把 allow_reorder 当 BoolAttr 赋值。反馈中的解析失败正对应这三处；除此之外 tt.func、scf.for {tt.num_stages=2}、tt.load/tt.addptr/tt.store 均为常规形式，未见第二个独立可疑属性。"
+        },
+        {
+          "path": "frozen.py",
+          "category": "source_ir",
+          "role": "数学语义、ABI 与特化常量核对",
+          "finding": "frozen.py 与源码 sha256 0af5d533... 对应；内核签名、启动参数顺序和特化常量（BLOCK_S=64、BLOCK_D=64、GROUP=2、EXACT=true，stride_qkv_d=stride_bias=stride_out_d=1）未变。当前 IR 内 BLOCK_D 实际改为 128、每个半区按 32 行做 2 次循环，正好等于原每程序 64 行；num_groups 仍由 frozen wrapper 按 BLOCK_S=64 计算为 4，故 seq_group*128+half*64 覆盖 0..511 恰好一次，没有越界或重复。"
+        },
+        {
+          "path": "ir-inventory.json",
+          "category": "source_ir",
+          "role": "可编辑 IR 身份与冻结边界",
+          "finding": "清单登记该路径、符号 _transform_bias_rescale_qkv_kernel、AST sha ca6c05a0...、原始 IR sha 3924918d...；当前文件为其 IR 层编辑版 66aa2529...，ABI 签名和 constants 未登记变化。源码、清单、context、证据均不可编辑，只允许 Edit 该 TTIR 与 diagnosis.json。"
+        },
+        {
+          "path": "compiled-readonly/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/f67d9cdb9f445d242714897e48f68b992534a9c144549743ff721f2556ce6136/_transform_bias_rescale_qkv_kernel.ttadapter",
+          "category": "source_ir",
+          "role": "后端实际低层产物核对（冻结只读）",
+          "finding": "按 lowered-inventory 读取的基线 ttadapter 表明后端已把输入/输出 tile 变成 memref.reinterpret_cast 的二维 [64,64]、strides [stride,1] 视图，配合 memref.copy 与 bufferization.materialize_in_destination；q/k/v bias 的三次 memref.alloc+copy 是既有 UB 物化，未出现按元素解码或逐元素 LD/ST。故三维 reshape 若保持元素顺序，理论上可折叠为带 [stride_s,stride_h,1] 的三维目标视图，不应引入额外数据搬运；但该结论只作为预测，需 lowering review 验证。"
+        },
+        {
+          "path": "profiling.json",
+          "category": "paired_profiling",
+          "role": "当前最佳配对性能与两侧时间口径",
+          "finding": "配对任务 transform_bias_rescale_qkv-timing-2（shape [8,512,3072]、heads=16、f16）中 candidate _transform_bias_rescale_qkv_kernel Task Duration=40.020802us、Block Dim=512，reference TransformBiasRescaleQkv_float16_high_performance_1=55.001099us；但正式保留比较器仍是 62.860936us（context 目标 0.0628372ms），说明配对 profiler 的单次窗口与正式多负载评测口径不同，不能把 40.02us 直接当作本轮收益。"
+        },
+        {
+          "path": "hotspots.json",
+          "category": "simulator",
+          "role": "流水占用与具体等待成本",
+          "finding": "core0.veccore0 的 9.7402447us 局部捕获窗口中：MTE2 active_ratio=0.92397、productive=0.89248、wait_only=0.03148、idle=0.07603；MTE3 active=0.86526 但 productive 仅 0.26394、wait_ratio=0.77667、wait_only=0.60132；VECTOR active=0.90712、productive 仅 0.11125、wait_only=0.79587。最贵单条为 6.98us 的 MTE2 MOV_SRC_TO_DST_ALIGN（源码 k_val=tl.load），另有 5.67us MTE3 BAR 与多条 VECTOR BAR。热点表现为 MTE2 负荷高、MTE3/VECTOR 大量显式等待，修复后若 reshape 被物化成额外 UB 拷贝，会加重 VECTOR/MTE3 等待，因此必须用低层产物确认无新增搬运。"
+        },
+        {
+          "path": "timeline.json",
+          "category": "simulator",
+          "role": "相对流水窗口与绝对时钟资质",
+          "finding": "timeline 明确 clock_qualification=relative_only、absolute_time_qualified=false，raw_clock_window 109.80400085449219–119.54424554109573 的 unit=unassigned，capture_scope 为首个至末个可见硬件事件的部分捕获，application_completed=false；只可作同窗占比排序（MTE2 0.92397、MTE3 productive 0.26394/wait 0.77667、VECTOR productive 0.11125/wait 0.79587），不得据此声称关键路径或绝对增量。"
+        }
+      ],
+      "hypothesis": "当前 TTIR 的唯一编译阻断是 tt.reshape 的 allow_reorder 被写成 BooleanAttr（{allow_reorder = false}），而已安装的 Triton/Ascend 方言按 UnitAttr 解析该属性，导致 IRSource.parse_mlir_module 在 lowering 前失败。保持顺序的 reshape 在方言中的正确写法是省略该属性（UnitAttr 缺席即 false 语义）；删除三处 {allow_reorder = false} 后，[32x128] -> [32x2x64] 仍是纯行主序拆分内层维，元素顺序、别名、特殊值与输出步长完全不变，并可被 bufferization 折叠进三维 store 的目标 memref，不产生新的计算或布局拷贝。",
+      "alternatives": [
+        "保持 IR 原样并走 no-change：会保留零可编译候选，无法评测，不能超过当前最佳，因此不选。",
+        "改写成 {allow_reorder} 单元属性：语法上或许可解析，但把 reorder 设为 true，允许编译器重排元素，会破坏 [s, head, d] 的行主序语义，风险不可接受。",
+        "用两次 [32x64] 的二维 load/store 代替 reshape（每对头各一次）：可避开 reshape，但把每程序三次 load/store 扩为六次，改变已登记的 paired-head 合并机制和地址表达，且可能增加指令与同步开销；不属于本轮最小修复。",
+        "修改 frozen.py 源码或编译选项：分别属于源码重写和选项身份，且源码冻结；不选。",
+        "保留原 IR 并在后端消除疑似冗余：后端产物只能证明基线已有二维 affine 视图与 UB 物化，无法让当前不解析的 IR 进入后端；因此消除语法阻断是任何后端优化的前提。"
+      ],
+      "change": "仅在 ir/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttir 中删除三处 tt.reshape 的 {allow_reorder = false} 属性（第 113–115 行），保留 tt.reshape 的类型 [32x128xf16] -> [32x2x64xf16] 与全部 SSA 使用者；不改函数 ABI、签名、常量、循环、地址计算、load/store、源码或编译选项。",
+      "expected": "decision 后该 TTIR 应通过原生 MLIR 解析并进入 Ascend lowering；三处顺序保持 reshape 应被折叠为输出三维 affine 视图或等价的零拷贝视图，TTAdapter 中不出现新增的整 tile 拷贝；UB 预算与三维 store 寻址成立。数值上 Q 仍为 f16->f32 加偏置、f32 乘 scale、单次 f16 截断，K/V 仍为 f16 加偏置，覆盖、别名和特殊值不变。性能不在本轮文档中宣称：若 reshape 未折叠而产生额外拷贝，预计 VECTOR/MTE3 等待上升并可能慢于 62.860936us；若正确折叠，则至少恢复当前最佳可评测性，并由后续正式/补测决定是否超过。",
+      "validation": "1) 先调用 decision 桥登记本诊断；2) 仅用 Edit 删除三处属性；3) 调用 submit 桥，要求 lowering review 从 'Parse MLIR file failed' 转为成功后端解析，并检查 TTAdapter/BCMIR 中 reshape 是否被折叠、是否新增 memref.alloc/copy、UB 容量是否满足；4) 宿主执行完整正确性测试（f16/f32、奇偶头数、EXACT 与非 EXACT 边界、特殊值/别名）并与原语义比对；5) 正式评测保留 62.860936us 比较器，运行 21 个正式用例与两组 48 用例补测，并用双捕获/ABBA 判断增量；6) 若解析仍失败或出现额外搬运，则回退本轮字节并另建调用登记新机制。",
+      "layer_reason": "缺陷位于可编辑的单算子 TTIR：三个 tt.reshape 的属性拼写与当前编译器方言不符，而源码、ABI、特化常量、lowering 选项与后端产物均冻结。修改源码会改变已合格最佳算子的身份；修改编译选项属于独立研究身份且无法修复非法文本；直接改后端产物被禁止。IR 层修复可最小化地恢复编译，同时不改变任何数学与布局语义。",
+      "simulator_incremental_judgment": "模拟器材料只提供 core0.veccore0 的相对部分窗口：absolute_time_qualified=false、时间单位未赋值、application_completed=false，故绝对时钟增量与关键路径均不可声明。可用的增量判断仅是流水占比：MTE2 productive 约 0.892、MTE3 wait_only 约 0.601、VECTOR wait_only 约 0.796，说明瓶颈在搬运与显式同步而非标量索引；因此本轮的首要可测收益是把不可解析的 IR 恢复到可评测状态，并把“reshape 是否被折叠、是否新增 UB 拷贝”作为后续低层可观测指标。任何性能结论必须以正式与补测结果为准。",
+      "unknown": [
+        "已安装方言对 order-preserving reshape 是否接受完全省略 allow_reorder（UnitAttr 缺席），还是要求显式 {allow_reorder} 单元属性；后者语义为允许重排，不可接受。",
+        "顺序保持 reshape 在 bufferization 中是否零成本折叠为三维目标视图，还是生成一次额外 UB 拷贝。",
+        "三维 store 的 affine map 是否满足 Ascend 后端的连续内层维向量化条件。",
+        "修复后在 21 个正式用例与两组 48 个补测用例上的实际时延与是否超过 62.860936us。"
+      ]
+    },
+    "result": {
+      "api_version": "v6.2",
+      "reference_source": "primary",
+      "status": "PASSED",
+      "device": "npu:0",
+      "server_backend": "npu",
+      "is_hack": false,
+      "hack_reason": "",
+      "geo_mean": 1.602006759263237,
+      "min_speedup": 0.9742583052738665,
+      "worst_workload_uuid": "transform_bias_rescale_qkv-timing-2",
+      "latency_ms": 0.094184119448528,
+      "abs_err": 0.0,
+      "rel_err": 0.0,
+      "num_workloads": 21,
+      "num_passed": 21,
+      "timing_skipped": false,
+      "log": "",
+      "per_workload": [
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-0",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-1",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-2",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-3",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-4",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-5",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-6",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-7",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-8",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-9",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-10",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-11",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-0",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 2.249627391936703,
+          "latency_ms": 0.003547285754384418,
+          "reference_latency_ms": 0.007980071200090038,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-1",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.5812054508570186,
+          "latency_ms": 0.03253851830682242,
+          "reference_latency_ms": 0.051450082509558494,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-2",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 0.9742583052738665,
+          "latency_ms": 0.094184119448528,
+          "reference_latency_ms": 0.0917596605976343,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-3",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 2.1902864049916246,
+          "latency_ms": 0.003739597405154239,
+          "reference_latency_ms": 0.008190789356651287,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-4",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.548731675641792,
+          "latency_ms": 0.03313146575400625,
+          "reference_latency_ms": 0.05131175047367075,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-5",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.4545626292380907,
+          "latency_ms": 0.06300976048616853,
+          "reference_latency_ms": 0.09165164288042366,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-6",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 2.2129084051756975,
+          "latency_ms": 0.00367237819495708,
+          "reference_latency_ms": 0.008126636574604478,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-7",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.3770481647877284,
+          "latency_ms": 0.06194218036837975,
+          "reference_latency_ms": 0.0852973657992278,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-8",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.3337793934004787,
+          "latency_ms": 0.12350171634493527,
+          "reference_latency_ms": 0.16472404431046575,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        }
+      ]
+    }
+  },
+  {
+    "invocation": "ir-007",
+    "diagnosis": {
+      "source_sha256": "0af5d533afea8f4be88e1fd6e0fc4a6ba76fae9a8b1478f7c4b93247fe7ec070",
+      "selected_layer": "single_operator_ir",
+      "layer_reason": "只允许编辑 ir/ 内已登记的 TTIR；源码(frozen.py)、编译选项、ABI、launch grid 全部冻结。本轮机制是编译器的循环不变量代码外提缺失，属于单算子 IR 层可独立修复的编译缺陷，不是源码重写、也不是改编译选项。当前 IR 为保留原版(sha256 3924918d…8854)，与 ir-inventory 登记的原件一致。",
+      "evidence": [
+        {
+          "path": "profiling.json",
+          "category": "paired_profiling",
+          "role": "同输入设备 OpProf：候选 512 program，单 program 的流水占比与字节量",
+          "finding": "candidate basic: Task Duration 40.020802us, Block Dim 512。每 program read_main_memory_datas 48.625KB、write_main_memory_datas 48.0KB（≈最小流量，无重复读写）。每 program aiv_mte2_instructions=25、aiv_mte3_instructions=7、aiv_mte2_time=1.824us(ratio mean 0.618)、aiv_mte3_time=0.909us(0.317)、aiv_vec_time=0.741us(0.259)、aiv_scalar_time=0.945us(0.314)、aiv_total_cycles mean 4892(≈2.97us/block)。MTE2 是唯一接近饱和的流水，读侧每指令≈1.95KB，与参考实现(310 instr/620.9KB)同一粒度，说明 128B 行并不是本轮可改的瓶颈。"
+        },
+        {
+          "path": "timeline.json",
+          "category": "simulator",
+          "role": "单核相对流水线窗口：判定关键资源与各流水 wait/idle 归属",
+          "finding": "窗口 capture_duration 9.74us（相对时间，仅首末可见事件，不含启动前后空闲）。MTE2 active_ratio 0.924、productive 0.892、idle 0.076；MTE3 active 0.865 但 productive 仅 0.264、wait 0.777；VECTOR active 0.907 但 productive 仅 0.111、wait 0.797；SCALAR active 0.049，SCALARLDST(辅助泳道) active 0.132。即 MTE2 是唯一高产出流水，VECTOR/MTE3 的“active”大部分是等待，未被报告的 ALL/FLOWCTRL/CACHEMISS 泳道按辅助泳道解释、未当作关键路径。",
+          "interpretation": "绝对时钟资质：该窗口是相对占位，不可当作 62.8us 的绝对分解；结论只用于比较同一窗口内各流水的忙碌/等待结构与排序。"
+        },
+        {
+          "path": "hotspots.json",
+          "category": "simulator",
+          "role": "区域级关注度：循环体与 bias 载入段的指令与等待分布",
+          "finding": "source_loop(源码 109-170) 252 instructions、instruction_time_sum 104.51us、wait_instruction_time_sum 39.81us、trace_interval_union 9.071us（占窗口 93%），流水为 FLOWCTRL/MTE2/MTE3/SCALAR/VECTOR；source_conditional(源码 94-102，即 3 次 bias 载入) 仅 18 instructions 却 trace_interval_union 1.030us（窗口 10.6%），largest_instruction 1.02us，流水只有 MTE2+SCALAR。解释按材料限定：累计指令时间只作排序，但 bias 段以小指令量占据约十分之一窗口，说明它是一条串行的小传输+scalar 前置段。"
+        },
+        {
+          "path": "compiled-readonly/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/f67d9cdb9f445d242714897e48f68b992534a9c144549743ff721f2556ce6136/_transform_bias_rescale_qkv_kernel.bcmlir",
+          "category": "source_ir",
+          "role": "按符号核对后端实际产物：哪些疑似冗余已消除、哪些没有",
+          "finding": "已消除：TTIR 里 64x64 指针张量的 splat/broadcast/addptr 全部塌缩为 memref.reinterpret_cast + memref.copy，实际只有 3 次 tile 载入 + 3 次 bias 载入 + 3 次 materialize_in_destination 存储（与 ir006-lowering-mechanism 记录的 copy_count 6、materialization 3 一致），不存在逐元素地址运算残留。未消除：scf.for 循环体内仍保留 %broadcasted(q_bias f32)、%broadcasted_10(k_bias f16)、%broadcasted_11(v_bias f16)、%38 = linalg.fill(scale_factor) 以及 tensor.empty；这些量与循环无关（bias 在循环外只载入一次），却每轮重新物化成 64x64 tile（f32 16KB×2 + f16 8KB×2）。"
+        },
+        {
+          "path": "compiled-readonly/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/f67d9cdb9f445d242714897e48f68b992534a9c144549743ff721f2556ce6136/_transform_bias_rescale_qkv_kernel.ttadapter",
+          "category": "source_ir",
+          "role": "低层 ttadapter 复核同一缺失：scalar 段与向量段在循环内的重复",
+          "finding": "ttadapter 中 scf.for(0..2) 体内仍出现 tensor.expand_shape/extf/broadcast(q_bias)、linalg.broadcast(k_bias/v_bias)、linalg.fill(scale_factor)；循环外只有 3 次 memref.copy(64xf16 bias)。即 LICM 未发生，每 program 重复计算一轮不变量。"
+        },
+        {
+          "path": "lowered-inventory.json",
+          "category": "source_ir",
+          "role": "低层产物身份冻结范围",
+          "finding": "ttadapter sha256 6955cc56…、bcmlir 8557bfc1…、npubin 92cc78be… 均登记为只读冻结；本轮只编辑 ir-inventory 列出的 TTIR，不改动这些实际低层产物。"
+        },
+        {
+          "path": "ir006-formal-result.json",
+          "category": "paired_profiling",
+          "role": "历史候选的正式结果（几何改动方向的反证）",
+          "finding": "status PASSED、21/21、abs_err 0.0，但 timing-2 latency 0.094184119ms（比保留原版 62.860936us 慢 50%），worst_workload_uuid 正是 transform_bias_rescale_qkv-timing-2；说明相邻 head 加宽/3D 输出的几何改动在本算子上是明确退步，不宜重复。"
+        },
+        {
+          "path": "feedback.json",
+          "category": "paired_profiling",
+          "role": "宿主正式/补测反馈与保留基线",
+          "finding": "retained_parent original IR 62.860936us；ir001 前载六次载入 63.029us、ir003 四 32x64 tile 63.516us、ir006 94.184us，均无收益。要求从已恢复的保留原版出发，并超过 62.860936us 与历史 62.837203us。"
+        },
+        {
+          "path": "codex-brief.json",
+          "category": "source_ir",
+          "role": "Codex 对失败几何与不变量方向的分析（宿主证据分析贡献）",
+          "finding": "Codex 记录：ir006 加宽输入行但输出变 3D 步进写、延迟升到 94.184us；ir001 两个 64x64 tile 仍是两个独立 tile 运算无收益；保留原版为 2D 连续 64-half 行写。其备选方向之一“检查原循环内不变量的 q-bias 扩展/broadcast 与 scale fill，若仍留在实际 BCMLIR 内，则外提是独立的低风险机制”——本轮实测 bcmlir/ttadapter 证实这些不变量确实仍在 scf.for 内，故选用该方向；其 128x64 单 tile 主推方向由我判定为不选（见 alternatives）。"
+        }
+      ],
+      "hypothesis": "实际低层产物证明编译器没有把与 GROUP 循环无关的张量物化外提：bias 在循环外只载入一次，但 q_bias 的 expand/extf/broadcast(f32)、k_bias/v_bias 的 broadcast(f16) 以及 scale_factor 的 splat 每轮循环都重新物化成 64x64 tile。按 UB 字节估算，每轮因此多写 16KB(f32 q bias) + 8KB + 8KB + 16KB(f32 scale fill) ≈ 48KB，而每个 program 的有效 tile 流量才 48KB 读 + 48KB 写；2 轮循环等于把这份不变量做两遍。VECTOR 处在 MTE2 载入与 MTE3 存储之间的依赖链上（timeline: VECTOR active 0.907 但 productive 仅 0.111、wait 0.797），因此缩短依赖链上的向量/UB 物化可直接缩短每 program 的实际耗时，而不是只减少可与 MTE2 重叠的旁路工作。",
+      "alternatives": [
+        "128 行单次 tile（Codex 主推）：把两轮 64x64 合并为一次 128x64，去掉循环，但会消灭“第二轮载入与第一轮计算/存储重叠”的机会；ir001 已用前载六次载入做过等价尝试且 63.029us 无收益，故不选。",
+        "把 3 次 64-element bias 载入合并为一次 [3,64] 步进拷贝：可把 bias 段 MTE2 指令从 3 降到 1，但本方言无法在不引入切片/重排的情况下把 [3,64] 拆回 3 个 64-vector（tt.split 只切末维、192 也非 2 的幂），强行改写会引入新的向量搬运，收益不确定，暂不选。",
+        "相邻 head 加宽输入行(64->128)+3D 输出：ir006 正式结果 94.184us，明确退步，不重复。",
+        "减少字节/跳过读取：input 与 output 每 program 已是 48.625KB/48.0KB 的最小流量，无冗余可删。",
+        "保持 IR 不变并登记无改动：bcmlir/ttadapter 显示不变量仍在循环内且 VECTOR 有 0.741us/program 的可归因时间，因此不属于“后端已消除”的情形，不选 no-change。"
+      ],
+      "change": "只编辑 ir/ca6c05a0…/_transform_bias_rescale_qkv_kernel.ttir，做一次循环不变量外提：在 scf.for 之前新增 %qb_e/%qb_f/%qb_b（q_bias 的 expand_dims→extf f32→broadcast[64,64]）、%kb_e/%kb_b、%vb_e/%vb_b（k/v bias 的 expand_dims→broadcast[64,64] f16）、%scale_t（scale_factor 的 64x64 f32 splat）；删除循环体内对应的 expand_dims/extf/broadcast/splat，循环内只保留 extf(q_val)、addf、mulf、truncf、addf、addf 及三次存储。复用既有 #loc115… #loc123 调试位置，不新增符号、不改函数签名/参数、不改 grid、不改 num_stages=2、不改任何 stride 或地址表达式，不改变 k/v 的 f16 加法与 q 的“f32 加 bias→f32 乘 scale→一次 f16 截断”的舍入顺序。",
+      "expected": "预测（可测、可否证）：(1) 每 program 的 aiv_vec_time 从 0.741us 降到约 0.60–0.65us，UB 写入减少约 48KB/program（2 轮各减一半不变量物化）；(2) 每 program 的 aiv_total_cycles / block 墙钟从 ~4892 cycle(2.97us) 降到约 2.8–2.9us；(3) timing-2 延迟应从 62.860936us 降到约 60.5–62.5us（1–4%），最佳情形接近 60us。若 VECTOR 已被 MTE2 完全掩盖，则 aiv_vec_time 会下降而延迟不变——这将被判为“无收益但仍可作为不变量外提的基线事实”。语义预测：21 个 correct 用例与两个 48 用例应保持 abs_err/rel_err 为 0（逐元素操作顺序不变，仅删除重复的同一值物化）。",
+      "validation": "由宿主执行：TTIR 可解析并可编译(含 UB 上限，新增约 48KB 常驻 tile 后估计 164KB/196608B)；21 个完整用例 + 两个 48 用例补测；与保留原版及历史 62.837203us 的正式计时对比；并核对实际 BCMLIR 中 scf.for 体内是否真的不再出现 linalg.broadcast/linalg.fill（用于判定预测 (1) 是否成立）。本轮不把文档、预检或建议当作收益结果。",
+      "simulator_incremental_judgment": "模拟器窗口是单核首末可见事件的相对时间（9.74us，capture_scope 明示不含启动前后空闲），因此只作同窗口内的结构与排序证据：MTE2 active 0.924/productive 0.892 是关键资源，VECTOR(productive 0.111/wait 0.797) 与 MTE3(productive 0.264/wait 0.777) 的活跃大部分是等待，SCALARLDST(693 事件)、CACHEMISS(16)、ALL/FLOWCTRL 属未报告/辅助泳道，按材料解释为辅助信息而不计入关键路径。热点与等待/空闲均为核心输入：source_loop 占窗口 93%、其 wait_instruction_time_sum 39.81us 与 source_conditional 的 1.03us 一起说明串行小传输与循环内重复物化都有执行成本。由于绝对时钟不可得，本轮不宣称绝对加速比，只声明机制与可测预测，真实收益由宿主正式计时裁决。",
+      "unknown": [
+        "后端在把不变量 tile 提升为循环内常驻后，是否仍保持 multibuffer=true 的双缓冲装载（若被迫降级为单缓冲，可能抵消收益）。",
+        "新增约 48KB 常驻 UB 是否触发编译器拒绝或额外的缓冲复用/插入同步，需以实际 BCMLIR 与编译结果核对。",
+        "VECTOR 的 0.741us/program 中有多少真正落在 block 墙钟的关键依赖链上，仍只能由正式计时判定。"
+      ]
+    },
+    "result": {
+      "api_version": "v6.2",
+      "reference_source": "primary",
+      "status": "PASSED",
+      "device": "npu:0",
+      "server_backend": "npu",
+      "is_hack": false,
+      "hack_reason": "",
+      "geo_mean": 1.6672889619898477,
+      "min_speedup": 1.3587167876083979,
+      "worst_workload_uuid": "transform_bias_rescale_qkv-timing-8",
+      "latency_ms": 0.1225217778105868,
+      "abs_err": 0.0,
+      "rel_err": 0.0,
+      "num_workloads": 21,
+      "num_passed": 21,
+      "timing_skipped": false,
+      "log": "",
+      "per_workload": [
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-0",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-1",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-2",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-3",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-4",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-5",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-6",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-7",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-8",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-9",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-10",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-11",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-0",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 2.243252255589641,
+          "latency_ms": 0.0035965368564783527,
+          "reference_latency_ms": 0.008067939415606342,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-1",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.5678078577772288,
+          "latency_ms": 0.032610063859282036,
+          "reference_latency_ms": 0.0511263143611996,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-2",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.463403841915041,
+          "latency_ms": 0.06303818700356827,
+          "reference_latency_ms": 0.09225032504838061,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-3",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 2.1575812363149245,
+          "latency_ms": 0.003747631475050344,
+          "reference_latency_ms": 0.008085819351191846,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-4",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.5336853320503967,
+          "latency_ms": 0.033278993730480926,
+          "reference_latency_ms": 0.05103950454983571,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-5",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.4557038311447472,
+          "latency_ms": 0.06320496005092727,
+          "reference_latency_ms": 0.09200770249348551,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-6",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 2.131788855965825,
+          "latency_ms": 0.0037977273979633735,
+          "reference_latency_ms": 0.00809595294497441,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-7",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.3864785649763847,
+          "latency_ms": 0.062025044999672735,
+          "reference_latency_ms": 0.08599639538374193,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-8",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.3587167876083979,
+          "latency_ms": 0.1225217778105868,
+          "reference_latency_ms": 0.16647239635887037,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        }
+      ]
+    }
+  },
+  {
+    "invocation": "ir-008",
+    "diagnosis": {
+      "source_sha256": "0af5d533afea8f4be88e1fd6e0fc4a6ba76fae9a8b1478f7c4b93247fe7ec070",
+      "selected_layer": "single_operator_ir",
+      "evidence": [
+        {
+          "path": "ir/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttir",
+          "category": "source_ir",
+          "role": "被检视并拟修改的实际 TTIR（EXACT=true, BLOCK_S=64, BLOCK_D=64, GROUP=2 的特化）",
+          "finding": "第45-104行为 scf.for %i=0..2 step 1 {tt.num_stages=2}，循环体只用 [64,64] 张量：每轮做 3 个 strided 输入加载（q_in_20 及 addptr 出的 k/v）、1 个 f32 提升 Q 路径与 2 个 f16 广播加法、3 个输出 store；两轮分别覆盖 seq_base+[0,64) 与 seq_base+[64,128)。因此同一个程序把连续 128 行拆成两次 8KB 传输、两组流水屏障，而 seq_base=%seq_group*128 已是 128 行粒度，说明 128 行本可由单个 tile 承担。",
+          "sha256_observed": "3924918d3cd31a2593550101e20ec9d7ef61d9f8cfb0aec29e53b8a8cb4d8854"
+        },
+        {
+          "path": "compiled-readonly/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/f67d9cdb9f445d242714897e48f68b992534a9c144549743ff721f2556ce6136/_transform_bias_rescale_qkv_kernel.bcmlir",
+          "category": "source_ir",
+          "role": "冻结的实际后端低层产物，核对循环与拷贝是否已被后端消除",
+          "finding": "后端原样保留 scf.for(%c0..%c2){tt.num_stages=2}：每轮 3 条针对 memref<64x64xf16, strided<[%stride_qkv_s,1]>> 的 memref.copy 进入彼此独立的 64x64 UB alloc，另有 3 条 materialize_in_destination 写出；即每个程序 6 次 8KB 拷贝、循环体完整保留。没有把两轮合并成一次 128 行传输，也没有消除 Q 路径的 extf/fill/mulf/truncf 或两处 linalg.broadcast。",
+          "sha256_observed": "8557bfc1c8ec73b02598c4d567fe0a72642fe4bc7da54ce373f0cb9c89ef5b1f"
+        },
+        {
+          "path": "lowered-inventory.json",
+          "category": "source_ir",
+          "role": "低层产物清单核对（只读，保持冻结）",
+          "finding": "bcmlir 8557bfc1… 与 npubin 92cc78be… 是当前最佳的真实编译结果；据其形状统计，输入/输出 tile 均为 [64,64]，loop_count=1（源码循环），copy_count=6，materialization_count=3。低层未见对 2×64 行循环的合并或跨轮流水优化，冗余未被后端消除。"
+        },
+        {
+          "path": "profiling.json",
+          "category": "paired_profiling",
+          "role": "候选与 torch 参考的成对算子级计数，给出每程序成本与管线占比",
+          "finding": "候选 512 个程序（参考 40）；每程序 aiv_time 均值 2.9648us、aiv_total_cycles 4891.9；aiv_mte2_ratio 0.6182、aiv_mte3_ratio 0.3168、aiv_vec_ratio 0.2587；等待侧 aiv_mte2_wait_ratio 0.4864、aiv_mte3_wait_ratio 0.5773、aiv_vec_wait_ratio 0.5278。MTE2 活跃带宽仅 26.79 GB/s，MTE3 活跃带宽 52.49 GB/s，而两侧搬运字节基本相同（GM_to_UB 24768KB / UB_to_GM 24576KB），说明每程序的同步/发射固定开销与 128B 行跨度读取一起构成了每程序 2.96us 的地板。另：程序间 aiv_time 最小 2.012us、最大 5.910us，均值只占最大值的 50%，512/40≈12.8 波次下尾波与轻量程序占比对总时长敏感。"
+        },
+        {
+          "path": "hotspots.json",
+          "category": "simulator",
+          "role": "逐指令/逐区域热点与流水有效、等待、空闲占用",
+          "finding": "core0.veccore0 捕获窗口 109.804→119.544us（9.740us，partial window）：MTE2 productive_union 8.693us（ratio 0.892）、wait_only 0.307us；MTE3 productive 2.571us（0.264）、wait_only 5.857us（0.601）；VECTOR productive 1.084us（0.111）、wait_only 7.752us（0.796）。最大单指令为 MTE2 的 MOV_SRC_TO_DST_ALIGN 6.98us（3 次调用，Src:OUT,Dst:UB,B16），调试位置落在第133/134行（k_val/v_val 加载），其次为 MTE3/VECTOR 的 BAR 与 WAIT_FLAG（5.67/5.64/5.54/5.38/4.78us，各 3 次）。向量流水与 MTE3 长期处于 WAIT，节奏由 MTE2 搬运决定。"
+        },
+        {
+          "path": "timeline.json",
+          "category": "simulator",
+          "role": "相对时间轴：以窗口分数表示的流水占用与空闲结构",
+          "finding": "MTE2 idle_ratio 0.0760、productive 0.8925；MTE3 idle 0.1347、wait_only 0.6013；VECTOR idle 0.0929、wait_only 0.7959；ALL/CACHEMISS/FLOWCTRL 为 auxiliary_trace_lane（ALL 仅 1 事件，active 0.0001，不能当作核心占用）。即窗口内几乎全程有 MTE2 动作，而计算与写回泳道大部分时间在等待，与 hotspots 一致。"
+        },
+        {
+          "path": "frozen.py",
+          "category": "source_ir",
+          "role": "冻结源码中的 UB 预算论证，判断 128 行 tile 是否被评估过",
+          "finding": "_TILE_BYTES=8192 的注释说明：BLOCK_S=128 的 16KB tile 曾被拒绝，理由是 12*16384+2*16384+768=230144B 超过 196608B；但该预算包含 GROUP=2 循环的 num_stages=2 双缓冲（12 个 tile 缓冲）。若取消循环，同尺寸 tile 只需 6*16384+32768(f32)+768≈131.8KB，处于预算内。因此循环自由的 128 行单 tile 从未被真正尝试，此前的拒绝来自循环双缓冲的记账，而非几何本身。"
+        },
+        {
+          "path": "feedback.json",
+          "category": "paired_profiling",
+          "role": "历史正式/补测结果，排除已失效方向",
+          "finding": "保留基线为原始 IR 62.860936us（历史最佳 62.837203us）；ir001 63.029us、ir003 63.516us 无收益，ir006 配对头 3D 输出 94.184us 明显退步，ir007 循环不变式外提 63.038187us 无收益。LICM、展开、配对头 3D 输出与单纯改编译选项均不应作为新机制重复。"
+        },
+        {
+          "path": "codex-brief.json",
+          "category": "source_ir",
+          "role": "宿主（Codex）证据分析与候选方向",
+          "finding": "Codex 指出四个 broadcast/fill 物化的 LICM、简单展开与四种更窄行 tile 均无收益，配对头几何导致 strided 3D 输出并强烈退步；建议在保持原始头归属与 2D 输出几何的前提下，把两轮 64 行改为单轮 128x64 tile，并先核对 UB 与实际内存布局。本诊断采用该方向，并由模型独立核对 TTIR/bcmlir/UB 记账后选择具体实现。"
+        }
+      ],
+      "hypothesis": "当前程序的 128 行被 scf.for 拆成两次 [64,64] 传输，每轮都要重复一次 3 条 strided 输入拷贝 + 3 条输出写回以及一整组 MTE2/MTE3/VECTOR 屏障（bcmlir 中保留为 6 次 8KB copy，热点中 BAR/WAIT_FLAG 各 3 次调用合计约 27us 累计指令时间）。这些同步与发射成本只与“轮数”成正比，与字节数无关，属于编译器在该特化下本应消除而未消除的冗余：seq_base 已是 128 行粒度、seq_len 对 128 整除（GROUP=2 的存在条件），因此 128 行完全可以由单个 [128,64] tile 在无循环、无循环屏障的情况下一次搬入一次写回。取消循环后 UB 需求 6*16384+32768+768≈131.8KB < 196608B，不再需要 num_stages=2 的双缓冲（当前账目 115456B 正是为双缓冲付出的），所以该改写同时降低了同步次数并仍在 UB 预算内。",
+      "alternatives": [
+        "保持 IR 不变：证据显示 MTE2 活跃带宽 26.79 GB/s 受 128B 行跨度限制，若认为字节效率已是硬地板、只剩同步开销可省，则应判定无可行改法。本诊断选择继续，因为每程序 2.96us 中有约 1.1us 不属于 MTE2 活跃时间，且循环屏障可按“轮数”削减。",
+        "把三条输入拷贝合并为一次 3 维 strided memref.copy（同 head 的 q/k/v 段，strided<[stride_qkv_s, hidden_dim, 1]>）：只减 2 次发射、不减字节和屏障，需引入 3 维张量并在 K/V 处切分，风险高于收益，暂不采用。",
+        "num_stages 2→3 的更深多缓冲：属于调度选项改动而非具体缺陷修复，且 UB 预算 192KB 逼近上限，不采用。",
+        "加宽输入行到 128 列（配对头）：ir006 已证明会引入 strided 3D 输出并强烈退步，不重复。",
+        "LICM/展开/更窄 tile：ir001/ir003/ir007 已无收益，不重复。"
+      ],
+      "change": "只改 ir/ca6c05a0…/_transform_bias_rescale_qkv_kernel.ttir 的循环几何，同一机制、同一特化：删除 scf.for %i=0..2 {tt.num_stages=2}，把其循环体提升为直线代码，并把体内所有 [64,64] 张量改为 [128,64]（%offs_s 的 make_range end 由 64 改为 128；%offs_rows_9 改为 seq_base + offs_s，与原两轮 offs_rows 覆盖的 0..127 行集合相同）。bias 张量仍是 [64]（按列广播），输出/输入指针公式、stride 全部保持符号形式，函数签名、常量集合（BLOCK_S=64/BLOCK_D=64/GROUP=2/EXACT=true）、grid 与编译选项一律不动。逐元素运算顺序不变：Q 为 f16→f32、加 f32 bias、乘 f32 scale、一次 truncf；K/V 保持 f16 加法，行集合与列集合逐元素一一对应，故为精确双模拟，无新增别名、无越界访问、特殊值与浮点精度语义不变。",
+      "expected": "目标用例 transform_bias_rescale_qkv-timing-2 由 0.062861ms/63.038us 降至 ≤0.0597ms（≥5% 改善，相对保留基线约 1.05x）。可测预测：(1) 每程序 memref.copy 由 6 次降为 3 次、materialize_in_destination 由 6 次降为 3 次，bcmlir 中 scf.for 消失、tile 变为 [128,64]，UB 请求约 131.8KB < 196608B；(2) profiling 中 aiv_mte2_instructions 由 12800 降到约 6400、aiv_mte3_instructions 由 3584 降到约 1792，aiv_mte2_ratio 上升而 aiv_vec_wait_ratio/aiv_mte3_wait_ratio 下降，每程序 aiv_time 由 2.965us 降到 ≤2.8us；(3) 全部 21 个正式用例与两份 48 用例补测的数值结果与当前最佳逐位一致（abs_err/rel_err 仍为 0）。若 UB 记账超限或编译拒绝，则该机制在本后端不可行，应据实登记并回退。",
+      "validation": "宿主复核后运行完整 21 用例 + 两份 48 用例补测，比较 timing-2/5/7/8 与 geo_mean、min_speedup，确认 21/21 与补测全通过且误差为 0；同时核对新 bcmlir：确认 scf.for 已移除、tile 形状为 [128,64]、copy 次数减半、UB 请求 ≤196608B；并做与保留基线的同批 ABBA 对照以避免漂移。文档与预检不作为收益结论。",
+      "layer_reason": "缺陷位于 TTIR 的循环几何与传输粒度（每程序 6 次 8KB 拷贝 + 两组流水屏障），源码已冻结、编译选项、ABI、grid 与低层产物均保持冻结，因此只能在单算子 IR 层以最小范围 Edit 表达；后端 bcmlir 已证实未自行合并该循环，故不存在“后端已消除”的替代解释。",
+      "simulator_incremental_judgment": "模拟器窗口资质说明：core0.veccore0 的 9.740us 窗口是从首个到末个可见硬件事件的绝对时间 109.804→119.544us，且标明 partial window/application did not finish，因此它是单核部分观测区间，不能当作核函数时长或总耗时，也不能与 63us 端到端延迟直接相减；ALL/CACHEMISS/FLOWCTRL 为 auxiliary_trace_lane，未报告为主计算泳道，其 idle 0.9999 不代表核空闲。可增量采信的是相对结构：窗口内 MTE2 productive 0.892（8.693us）而 MTE3/VECTOR 的 wait_only 分别为 0.601/0.796，且最大指令是 MTE2 的 3 次 8KB strided 搬运（6.98us）与各 3 次调用的 BAR/WAIT_FLAG（VECTOR 5.38-5.64us、MTE3 5.67/4.78us）；指令时间相互重叠、不是关键路径，但“轮数决定同步次数、字节数决定 MTE2 时间”这一结构与本轮取消一轮循环的目标一致。profiling 的柱状占比（mte2 0.618/mte3 0.317/vec 0.259）来自逐 block 分布均值，program 数两侧不同，仅用于确定瓶颈归属，不作为因果或加速比声明。",
+      "unknown": [
+        "后端在无循环时是否会为 strided 输入拷贝额外保留双缓冲，从而把 131.8KB 推近 196608B 上限",
+        "取消循环后不再有跨轮 MTE2/VECTOR 重叠，单轮暴露的加载延迟是否会抵消同步削减的收益"
+      ]
+    },
+    "result": {
+      "api_version": "v6.2",
+      "reference_source": "primary",
+      "status": "PASSED",
+      "device": "npu:0",
+      "server_backend": "npu",
+      "is_hack": false,
+      "hack_reason": "",
+      "geo_mean": 1.666222407904302,
+      "min_speedup": 1.3499492165791542,
+      "worst_workload_uuid": "transform_bias_rescale_qkv-timing-8",
+      "latency_ms": 0.12246103755088004,
+      "abs_err": 0.0,
+      "rel_err": 0.0,
+      "num_workloads": 21,
+      "num_passed": 21,
+      "timing_skipped": false,
+      "log": "",
+      "per_workload": [
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-0",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-1",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-2",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-3",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-4",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-5",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-6",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-7",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-8",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-9",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-10",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-correctness-11",
+          "axes": {},
+          "phase": "correctness",
+          "status": "PASSED",
+          "speedup": null,
+          "latency_ms": null,
+          "reference_latency_ms": null,
+          "abs_err": 0.0,
+          "rel_err": 0.0,
+          "matched_ratio": 1.0,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-0",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 2.267560893240761,
+          "latency_ms": 0.0035521567526945424,
+          "reference_latency_ms": 0.008054731739071237,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-1",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.5380877618418036,
+          "latency_ms": 0.033141239987458514,
+          "reference_latency_ms": 0.05097413563697215,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-2",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.4470126755421333,
+          "latency_ms": 0.06366569827442466,
+          "reference_latency_ms": 0.09212507240033341,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-3",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 2.166086610186399,
+          "latency_ms": 0.003717693070230297,
+          "reference_latency_ms": 0.008052845180208611,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-4",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.5234348073596922,
+          "latency_ms": 0.033456938557547666,
+          "reference_latency_ms": 0.05096946474626268,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-5",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.447095940087355,
+          "latency_ms": 0.06340310178951024,
+          "reference_latency_ms": 0.09175037118854558,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-6",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 2.1934313468974467,
+          "latency_ms": 0.003696383509464341,
+          "reference_latency_ms": 0.00810776345981388,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-7",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.3872215663524872,
+          "latency_ms": 0.06194566150063619,
+          "reference_latency_ms": 0.0859323575756535,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        },
+        {
+          "uuid": "transform_bias_rescale_qkv-timing-8",
+          "axes": {},
+          "phase": "timing",
+          "status": "PASSED",
+          "speedup": 1.3499492165791542,
+          "latency_ms": 0.12246103755088004,
+          "reference_latency_ms": 0.1653161817032809,
+          "abs_err": null,
+          "rel_err": null,
+          "matched_ratio": null,
+          "metrics": {},
+          "log": ""
+        }
+      ]
+    }
+  }
+]

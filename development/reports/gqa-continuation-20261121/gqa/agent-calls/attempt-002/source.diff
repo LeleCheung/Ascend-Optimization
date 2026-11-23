@@ -1,0 +1,60 @@
+--- 
++++ 
+@@ -53,10 +53,6 @@
+     k_base = K + b * k_sb + kvh * k_sh
+     v_base = V + b * v_sb + kvh * v_sh
+ 
+-    m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
+-    l_i = tl.zeros([BLOCK_M], tl.float32)
+-    acc = tl.zeros([BLOCK_M, BLOCK_D], tl.float32)
+-
+     # Bottom-right aligned causal mask: valid j <= i + (SKV - S).  Rows of this
+     # block are at most pid_m*BLOCK_M + BLOCK_M - 1, so later KV blocks are fully
+     # masked and are skipped entirely.
+@@ -65,7 +61,36 @@
+     else:
+         hi = SKV
+ 
+-    for n0 in range(0, hi, BLOCK_N):
++    # ---- 首个 KV 块剥离 ----
++    # 在线 softmax 的 m_i 初值为 -inf，故首块的 alpha = exp2(m_i - m_safe) 恒为 0，
++    # 首块的 acc*alpha 与 l_i*alpha 在数值上严格等于 0。把首块单独写出即可整段省去
++    # “运行中累加器 acc 搬出 L0C -> 向量按 alpha 重缩放 -> 搬回 L0C 作 dot 初值”
++    # 的往返（模拟器热点 WAIT_FLAG_DEVI / FIX_L0C_TO_DST 正落在该处），并省去一次
++    # exp2 与配套 flag 同步。p_hi/p_lo 的两项概率分解、表达式与相加顺序完全不变，
++    # 剥离前后逐位等价（0*x 与少一次乘加在 fp32 下结果相同）。
++    # hi >= 1 时首块总存在；因果分支若首块被整块屏蔽，m_safe 的 >-inf 保护仍生效。
++    offs_n = tl.arange(0, BLOCK_N)
++    n_mask = offs_n < SKV
++    k_ptrs = k_base + offs_n[:, None] * k_ss + offs_d[None, :] * k_sd
++    k = tl.load(k_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
++    qk = tl.dot(q, tl.trans(k)) * qk_scale   # fp32 accumulation
++    if IS_CAUSAL:
++        qk = tl.where(offs_n[None, :] <= offs_m[:, None] + delta, qk, -float("inf"))
++    qk = tl.where(n_mask[None, :], qk, -float("inf"))
++
++    m_i = tl.max(qk, 1)
++    m_i = tl.where(m_i > -float("inf"), m_i, 0.0)
++    p = tl.exp2(qk - m_i[:, None])
++    l_i = tl.sum(p, 1)
++
++    v_ptrs = v_base + offs_n[:, None] * v_ss + offs_d[None, :] * v_sd
++    v = tl.load(v_ptrs, mask=n_mask[:, None] & d_mask[None, :], other=0.0)
++    p_hi = p.to(v.dtype)
++    r1 = (p - p_hi.to(tl.float32)) * 2048.0
++    p_lo = r1.to(v.dtype)
++    acc = tl.dot(p_hi, v) + tl.dot(p_lo, v) * (1.0 / 2048.0)
++
++    for n0 in range(BLOCK_N, hi, BLOCK_N):
+         offs_n = n0 + tl.arange(0, BLOCK_N)
+         n_mask = offs_n < SKV
+ 
+@@ -141,6 +166,8 @@
+     # acc*alpha 作 L0C 初值、两次 L0C 搬出、向量合并），该链与算术量无关。
+     # 分块由 64 提到 128 后，非因果 case2 退化为单迭代，case4/7 迭代数 4/2
+     # 减半，每程序 PV 交接、acc 重缩放与 K/V 装入次数同比例减半。
++    # 首块已由内核剥离：第一块不再付 acc 重缩放往返，故 case2 的在线重缩放
++    # 整条消失，case4/7/1 的重缩放次数再减一。
+     #
+     # 资源约束（实际失败IR）：因果分支在循环内额外生成与 BLOCK_N 同宽的
+     # 整型索引/掩码临时量，把 64/128/128 的峰值推到 231488B，超过 196608B

@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 45,
+    "duration_ms": 129981,
+    "usage": {
+      "input_tokens": 79495,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1688960,
+      "output_tokens": 20454,
+      "output_tokens_details": {
+        "thinking_tokens": 11723
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 79495,
+        "outputTokens": 20454,
+        "cacheReadInputTokens": 1688960,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.7533050000000003,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 11723,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.7533050000000003,
+    "result": "已按本轮限定机制完成登记与单点落盘，`submit` 返回 `awaiting_ir_review`，两份 BCMLIR 保持当前字节，等待宿主审查、CPU 编译与完整四案例验收。\n\n## 本轮实际读取的材料\n- 工作区：`context.json`、`feedback.json`、`codex-brief.json`、`contract.json`、`diagnosis.json`、`ir-inventory.json`、`memory-partition-findings.json`、`gqa-head-row-language-evidence.txt`。\n- 历史证据：`profiling.json`、`hotspots.json`、`timeline.json`（三者均绑定 attempt-047 保留源 `3c34fd…`，属于历史材料）。\n- 实际 IR 与低层产物：`ir/target/_gqa_fwd_kernel.bcmlir`、`ir/case7/_gqa_fwd_kernel.bcmlir`、`compiled-readonly/` 下 `_gqa_fwd_kernel.bcmlir`、`.ttir`、`.ttadapter` 与两份 HIFVM 诊断。工作区没有 `lowered-inventory.json`，低层产物按冻结只读处理。\n\n## 机制合法性证明（输出行组循环）\n- case4：`arg14=0,8,…,120`，共 16 次迭代；只读 `%49` 行区间 `[arg14,arg14+8)` 与 `%reduced` 同区间，切片互不重叠。`%34=arg13*128` 与 `arg14` 均为 8 的倍数，组内 `o_seq=o_idx/8` 恒定，写 `%arg5` 的 `[o_seq*8192, +1024)`；不同 `arg14` 的写区间相隔 8192 元素，互斥。\n- case7：步长 4，同理 `o_seq` 恒定、写区间 `[o_seq*4096, +512)` 互斥。\n- 循环内其余值为不变量或本地 `tensor.empty`，无跨迭代读写、无别名，`hivm.parallel_loop` 声明成立。\n\n## 实际改动（仅属性位）\n- `ir/target/_gqa_fwd_kernel.bcmlir:136` 与 `ir/case7/_gqa_fwd_kernel.bcmlir:136`：`{ExtractedLoadOrStore}` → `{ExtractedLoadOrStore, hivm.parallel_loop}`，与既有输入拷贝循环（第98行）一致。\n- 循环体字节、地址数学、`loc`、函数 ABI、源码与输入拷贝循环全部保持原样；两份特化行数仍为 274。\n\n## 新增观察（供宿主核对）\n1. 两份 `compiled-readonly` 诊断显示：原始与分组 IR 的 AIV 都已生成 `get_sub_block_idx`、`compare==0`，且只对输出 store 施加 `limit_sub_block_id0`；分区机制已经存在，本轮标记检验的是输出行组循环的迭代分配。\n2. 分组诊断里峰值相关缓冲是循环外的 5 个 `128x256xf32`（各 131072B），输出循环自身缓冲仅 8x128 级；主预测是 UB 峰值维持 262144B 并继续报 `2097152/1572864`，替代预测是编译器由标记推导按行向量划分后峰值降到 196608B 以内，两种结果都已在 `expected` 中可测登记。\n3. 输出广播已 lower 为 8x1 视图上的 `vdiv broadcast=[1]`，历史上的整块分母广播分配未在该阶段出现。\n4. `timeline.json` 明确 `clock_qualification=relative_only`、`absolute_time_qualified=false`、partial 捕获窗口 `128.958–228.979`（单位未赋值）、`outside_events=20`；前后窗口覆盖量与归一化范围按 partial 解释，未报告泳道保持未知，器件性能结论仍需独立材料。\n5. `diagnosis.json` 已登记 `source_sha256`、`selected_layer=single_operator_ir` 及全部要求字段；decision 桥返回 `decision_recorded`（sha256 `2a20e87b…`）。"
+  }
+}

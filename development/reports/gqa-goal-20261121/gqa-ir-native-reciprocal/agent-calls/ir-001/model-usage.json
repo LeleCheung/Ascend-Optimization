@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 47,
+    "duration_ms": 159325,
+    "usage": {
+      "input_tokens": 50517,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1225344,
+      "output_tokens": 24867,
+      "output_tokens_details": {
+        "thinking_tokens": 13974
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 50517,
+        "outputTokens": 24867,
+        "cacheReadInputTokens": 1225344,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.486932,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 13974,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.486932,
+    "result": "本轮交接完成，状态 `awaiting_ir_review`，IR 文件保持已提交的候选形态，等待宿主审查与完整评测。\n\n## 读取的实际材料\n\n- `context.json`：保留最佳为 attempt-059（154.8871us、source 98c75570…），目标 case4，原四条全通过，`editable_ir_stage=bcmlir`，`target_marker: strides: [8192, 1]`。\n- `frozen.py`：确认归一化点在 `out = acc / l_new[:, None]`（498 行），PV 走 BF16 dot→FP16 截断→FP32，分母为 FP32 求和；注释给出 l_new 正有限推导与越界域限。\n- `ir/target/_gqa_fwd_kernel.bcmlir`（与 `compiled-readonly` 原件同 sha256 `810ba7cf…`）：99–105 行 `linalg.reduce dimensions=[1]`→`tensor<128xf32>`，`linalg.broadcast`→128x128，`arith.divf %54, %broadcasted`。\n- `compiled-readonly/current-cvpipelining.mlir`：同一内核后端形态为 `hivm.hir.vreduce <sum>` + `hivm.hir.vdiv … broadcast = [1]`，证实整矩阵逐元素除法，且 `vexp/vmul/vcast` 给了单元一操作数语法参照。\n- `ttir`/`ttadapter`：三层同形，无中间化简。\n- `profiling.json`、`hotspots.json`、`timeline.json`、`division-instructions.json`、`feedback.json`、`prior-scheduling-result.json`、`installed-reciprocal-evidence.txt`、`codex-brief.json`。\n\n## 关键新观察\n\n1. BCMLIR 函数体只含 linalg/arith/tensor/memref/scf，**零个 hivm 操作**，module 属性只有 `hacc.target`；hivm 操作与 `hivm.module_core_type` 都出现在 CVPipelining 之后的产物里——hivm 由转换阶段生成，所以本轮属于\"提前注入\"的可行性试验。\n2. `division-instructions.json`：veccore0/1 各有两处 VDIV（0x10d11b9c 12 次/5208 周期/3.16us，0x10d11b8c 12 次/2796 周期/1.69us），每 veccore 累计 8004 周期、4.85us，是窗口内最大向量算术簇。\n3. `hotspots.json`：绝对时钟资质 verified（us，22/22 PC，median_ratio 0.99984），窗口约 113.983–214.129us（约 100us，部分窗口），`application_completed=false`；veccore0 VECTOR active 0.3427 / wait 0.1036，cubecore0 CUBE 0.4499/0.2849、FIXP 0.6684/0.3309——向量侧三分之二非活跃，关键路径更可能由搬运与 fixpipe 衔接主导，故内核级收益记为条件性。\n4. `timeline.json` 三核各自归一化，含 `pc_neighborhood unmapped` 段；未报告泳道保持未知。\n5. Codex 贡献：给出 058（`__hmf_recipf` 仍降 VDIV）/048 负结果、060 FP16 分母溢出回归禁令，以及分母 FP32 区间与 VREC 控制点判断；本轮据此排除普通 1/den 与 extern 旧倒数路线。\n\n## 本轮改动（单一机制：行分母原生 FP32 向量倒数 + 一次 Newton + 广播乘）\n\n`ir/target/_gqa_fwd_kernel.bcmlir` 第 164–165 区域，把 `arith.divf %54, %broadcasted` 替换为：`hivm.hir.vrec ins(%reduced)` → `%r0`；`arith.mulf %reduced, %r0` → `arith.subf 2.0, ·` → `arith.mulf %r0, ·` → `%r1`（一次 FP32 Newton，r = r*(2−d*r)）；`linalg.broadcast` 输入换成 `%r1`（输出仍写原 `%3` 槽位）；末条改为 `arith.mulf %54, %broadcasted`。函数 ABI、参数、特化、host、缓冲与 `linalg.reduce` 归约树逐字保留。数值假设：vrec FP32 相对误差按 2^-10~2^-14，Newton 后约 2^-20~2^-28，远低于既有 FP16 截断（2^-11）与 BF16 输出（2^-8）；分母正有限，倒数落在 FP32 正规数区间。\n\n## 预测（登记于 `expected`，宿主逐项核）\n\nVDIV 两处 PC 的 12 次调用归零，改由 VREC（约 2 repeat）+ 128x128 广播 VMUL（256 repeat）+ 常数级 128 元素运算承担；tile 迭代、reduce/exp/matmul/fixpipe/MTE 次数不变；向量侧周期簇预计 8004→约 1000–1800 周期，VECTOR 活跃下降约 3–5us；UB 增加约 1.5KB，L0C/L1 与 HBM 字节不变；case4 full-call 预计下降 0.5–2.5%（约 1–4us），若归一化不在关键路径则落在噪声区记为无收益。首要前提由 CPU 编译判定：`hivm.hir.vrec` 能否在 BCMLIR 阶段解析、转换并真实出现 VREC。"
+  }
+}

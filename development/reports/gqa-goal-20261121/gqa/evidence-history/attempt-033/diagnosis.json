@@ -1,0 +1,61 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "2ffb6f6125d0b2ea3a06593661b9bba034a3df04040ec4610de4b0a982aaab9f",
+  "evidence": [
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "trigger",
+      "finding": "case4 的 veccore0 部分窗口里，MTE3/MOV_SRC_TO_DST_ALIGN(Src:UB,Dst:OUT,XD,XN=0x8000,id:73) 16 次共 57.720001us，同 PC 邻域 MTE3/SET_FLAG 57.709999us、FLOWCTRL/WAIT_FLAG_DEVI 89.080002us 与 76.059998us，源码栈都落在输出 stride 参数行（candidate.py:257 o_sb,o_ss,o_sh,o_sd）。MTE3 productive 39.39%/wait 7.60%，VECTOR productive 21.78%，FLOWCTRL wait 73.34%。窗口为三核各自归一化的部分窗口、application_completed=false，绝对指令时间不可相加。"
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "输出 %arg2 的 reinterpret_cast 为 sizes [128,128]、strides [8192,1]、bf16：每行输出仅 256B，相邻行间隔 16KiB（NQ*D=8192 元素），故单个 128x128 输出 tile 被拆成 128 条互不连续的 256B 段。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "TTIR 中输出指针张量的行索引直接乘常量 8192（%cst_6 = dense<8192>），并在 %o_ptrs_64 上执行 tt.store %2 : tensor<128x128x!tt.ptr<bf16>>；即物理行距完全由 Out.stride 元数据进入地址生成，内核本身不重排数据。"
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "background",
+      "finding": "候选 kernel _gqa_fwd_kernel_mix_aic 226.164520us、20 blocks；vector0/1 aiv_mte3_time 20.35/23.27us，UB_to_GM_datas 各 25.5MiB，aiv_scalar_wait_time 77.5/78.2us；参考 FusedInferAttentionScore 120.222404us。总量字节与参考对照只作辅助，不单独证明本次 store 布局的因果贡献。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "disambiguation",
+      "finding": "attempt-023 曾在 019 的 128 个短程序（每程序少量 tile）调度上尝试 BNSD 物理输出，case4 全调用 262.70425us，是明确的负结果。该调度每程序只覆盖少量 tile、K/V 反复重载；当前 029 是 20 常驻 worker、每 worker 25/26 条串行 tile 链、K/V 按组复用，两者环境不同，023 不能直接否定本调度下的同布局实验，也不能预测收益。"
+    },
+    {
+      "path": "workspace/context-brief.json",
+      "category": "other",
+      "role": "background",
+      "finding": "宿主记录：023 硬件时间 252.865051us 与其全调用负结果分开保存；本轮为独立实验，只改变 PART_TILES 输出的物理 stride，其余 fallback、公共入口、checker/golden/计时合同不变。"
+    }
+  ],
+  "hypothesis": "PART_TILES 分支的输出 store 是 MTE3/Vector 侧可操作热点，其原因之一是 BSND 连续布局下单个 128x128 bf16 输出 tile 被写成 128 条 256B、行距 16KiB 的不连续段。把 PART_TILES 的输出改为逻辑 BSND、物理 BNSD 连续（每 (b,hq) 的 S×D 连续），使同一 tile 的 128 行变成一段连续 32KiB 写入；内核按 Out.stride 元数据原样寻址，因此不需要任何 transpose 或复制，只改变 store 的物理地址模式与 MTE3 描述开销，可能降低该 store 的指令时间及其后续等待。",
+  "alternatives": [
+    "保持 BSND 物理布局，改为在内核里把输出 tile 暂存/重排后再写（需要额外 UB 与向量指令，属于新增复制阶段，本轮禁止）。",
+    "把 QK/PV 的跨核交接链继续合并或减少 tile 数（会改变 20worker 分区、BM/BN 与 launch，违反本轮只改输出 stride 的约束）。",
+    "按 023 的方式在短程序调度上复用 BNSD 输出（已被负结果否定，且改变调度）。",
+    "仅在 host 侧把所有输出都改为非连续物理布局（会波及 fallback 的公共输出语义，本轮只改 PART_TILES）。"
+  ],
+  "discriminating_observation": "修改后看三组独立信号：(1) profiling 的 vector0/1 aiv_mte3_time 与 UB_to_GM 字节；(2) 模拟器同一 MOV_SRC_TO_DST_ALIGN(Src:UB,Dst:OUT) store 及其 SET_FLAG/WAIT_FLAG_DEVI 的 running_time 与 calls；(3) case4 完整全调用计时。若 store/MTE3 明显下降而全调用不低于 232.23705us，说明该 store 不在关键路径，应保留真实负结果；若 store 改善且 case4 全调用下降、case1/2/7 逐位不变，则机制成立。",
+  "change": "只在 run() 的 PART_TILES 判定成立时，把输出分配从 torch.empty((B,S,NQ,D)) 换成 torch.empty_strided((B,S,NQ,D), (NQ*S*D, D, S*D, 1))，即逻辑 BSND shape/dtype 不变、物理 BNSD 连续；其余所有 fallback 继续使用原 torch.empty 与原逻辑输出。内核的 o_sb/o_ss/o_sh/o_sd 直接取 y.stride(...)，store 表达式、20worker 分区、tile 所有权、K/V 复用、BLOCK_M/BLOCK_N、launch 数与逐位算术全部不变；不新增 transpose、复制阶段或输出缓存。",
+  "expected": "数值逐位不变：同一批 tile、同一表达式、同一 store 目标逻辑坐标，只改物理地址步长，因此四项 checker 应给出与父版本一致的误差；输出张量变为非连续（is_contiguous()=False），物理 span 仍为 B*S*NQ*D 个元素。性能上期望 case4 的 store/MTE3 时间下降、kernel 时间或全调用时间有真实改善；case1/2/7 走原 fallback，应逐位与时间都不变。若 store 改善但全调用无收益，按真实负结果保留并记录。",
+  "validation": "1) 原完整四项 checker（case1/2/4/7，原 checker 与 golden、原精度阈值）验证数值；2) 完整真机计时（同 warmup/trials/iterations 合同）比较 case4 与 232.23705us，并核对 case1/2/7 的真实变化；3) profiling 复查 kernel 时间、aiv_mte3_time 与 UB_to_GM 总量；4) 模拟器回看同一输出 store（MOV_SRC_TO_DST_ALIGN Src:UB,Dst:OUT）及同位置 SET_FLAG/WAIT_FLAG_DEVI；5) 记录输出非连续性质与 application_completed 缺失。",
+  "selected_layer": "host 输出分配元数据（仅 PART_TILES 分支的物理 stride）",
+  "layer_reason": "输出物理布局在 Triton 内核内只能通过指针 stride 表达，而当前内核已经原样使用 Out.stride 元数据；最小且唯一的改动层就是分配输出时的 stride 元数据。这样可改变 store 的物理连续性而不触碰任何设备算术、分块、调度或 fallback，也避免新增 transpose/复制这类会改变数值或工作量的手段。",
+  "simulator_incremental_judgment": "本次模拟器新增的可操作信息是把两类 UB→GM 写入中的热点定位到源码输出 store：MOV_SRC_TO_DST_ALIGN(Src:UB,Dst:OUT) 的源码栈落在输出 stride 参数行，且与同位置 SET_FLAG、WAIT_FLAG_DEVI 重叠，而非此前假设的 PV 准备写入。热点证据因此增加；流水证据（MTE3 productive 39.39%/wait 7.60%、VECTOR productive 21.78%、FLOWCTRL wait 73.34%）未提供新的区分信息，只用于说明 store 与等待共存。profiling 总字节量和 023 旧经验仅作辅助，不据此声明因果或预期收益；completion 缺失与部分窗口限制保留。",
+  "unknown": [
+    "模拟器为三核各自归一化的部分窗口且 application_completed=false，绝对指令时间不能相加为全调用耗时。",
+    "非连续输出是否被宿主评测/下游按连续张量处理尚未在真机验证；本候选只保证逻辑 shape/dtype 与数值不变。",
+    "store 的物理连续性是否在 20 常驻 worker 的串行 tile 链上转化为全调用收益，仍需完整四项评测判定。"
+  ]
+}

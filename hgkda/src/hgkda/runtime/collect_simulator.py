@@ -57,6 +57,7 @@ def main():
     p.add_argument('--simulator-library',type=Path,required=True)
     p.add_argument('--core-id',type=int,default=0)
     p.add_argument('--kernel-name',help='多kernel调用中显式选择已发现的候选符号')
+    p.add_argument('--kernel-replay',type=Path,help='真机保存的目标launch输入；仅用于模拟器隔离阶段分析')
     p.add_argument('--timeout-minutes',type=int,default=5)
     p.add_argument('--trace-unit',choices=['us','ns','cycles'],required=True,
                    help='原始trace ts/dur单位，须依据工具格式确认，displayTimeUnit不是换算依据')
@@ -79,8 +80,22 @@ def main():
         # 真机和模拟器的编译产物可能不同；保留相同源码和case，分别写入独立目录。
         capture_spec=out/'spec.json'
         capture_values=dict(spec,ir_directory=str(out/'actual-ir'))
+        if spec.get('ir_input'):
+            from hgkda.runtime.ir_input import binary_bindings, freeze
+            alias=c.get('simulator_target_alias')
+            if alias is not None:
+                assert alias['observed_arch']==a.soc
+                alias=dict(alias,binary_sha256=binary_bindings(spec['ir_input']['manifest']))
+            frozen,binding=freeze(spec['ir_input']['manifest'],out/'implementation',source,
+                runtime_path=c.get('ir_capture_runtime'),analysis_target_alias=alias)
+            assert sha(frozen)==digest
+            capture_values.update(source=str(frozen),ir_input=binding)
         replay_values,replay_sha=freeze_autotune_replay(pair,out,digest,spec['case'])
         capture_values.update(replay_values)
+        if a.kernel_replay:
+            from hgkda.runtime.launch_replay import freeze
+            replay=freeze(a.kernel_replay,out/'launch-replay',digest,spec['case'],kernel)
+            capture_values['kernel_replay']=dict(replay,kernel=kernel)
         save(capture_spec,capture_values)
         app=shlex.join([c['device_python'],str(Path(__file__).with_name('paired_driver.py')),
                        '--spec',str(capture_spec),'--side','candidate'])
@@ -95,6 +110,9 @@ def main():
             PYTHONDONTWRITEBYTECODE='1',TRITON_DISABLE_LINE_INFO='false',
             TRITON_CACHE_DIR=str(out/'compiler-cache'),
             PYTHONPATH=c.get('device_pythonpath', ''))
+        if spec.get('ir_input'):
+            # IR原采集采用编译器默认行号设置；保持同一编译环境身份。
+            environment.pop('TRITON_DISABLE_LINE_INFO')
         shell='source '+shlex.quote(str(Path(c['sdk'])/'set_env.sh'))+'\n'
         shell+='\n'.join('export '+k+'='+shlex.quote(v) for k,v in environment.items())+'\n'
         shell+='export LD_LIBRARY_PATH='+shlex.quote(str(a.simulator_library))+':"${LD_LIBRARY_PATH:-}"\n'
@@ -130,7 +148,11 @@ def main():
         save(out/'postcapture-exit-qualification.json',qualification)
     else:qualification['kernel_completed']=True
     from hgkda.simulator import parse, validate_time_unit
-    listing=parse(out/'raw/kernel-000',kernel,source,digest,spec['case'])
+    debug_source=Path(spec.get('debug_source',source))
+    assert sha(debug_source)==digest,'Debug source differs from the frozen operator'
+    verified_sources={str(path):dict(text=path.read_text(encoding='utf8'),sha256=digest)
+        for path in [source,debug_source]}
+    listing=parse(out/'raw/kernel-000',kernel,debug_source,digest,spec['case'])
     assert listing['kernels'] and all(k['name']==kernel for k in listing['kernels'])
     save(out/'listing.json',listing)
     from hgkda.regions import analyze
@@ -146,7 +168,7 @@ def main():
             scope='单次模拟器采集的单kernel、单硬件核文件；不是整卡trace')
         target=out/(core['name']+'-bound-trace.json');save(target,trace)
         result=analyze(listing,trace,kernel=kernel,core=core['name'],trace_unit=a.trace_unit,
-                       sources={str(source):dict(text=source.read_text(encoding='utf8'),sha256=digest)})
+                       sources=verified_sources)
         result['collection_qualification']=qualification
         if not qualification['process_clean_exit']:result['limitations'].append(qualification['limitation'])
         save(out/(core['name']+'-regions.json'),result)

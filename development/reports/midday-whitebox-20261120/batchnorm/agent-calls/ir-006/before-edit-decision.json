@@ -1,0 +1,218 @@
+{
+  "timestamp": "2026-11-20T07:22:39.899288+00:00",
+  "diagnosis": {
+    "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "feedback.json",
+        "category": "paired_profiling",
+        "role": "确认当前保留身份、目标用例与全部已消费身份，确定本轮必须超过的基线",
+        "finding": "保留版为夜间 ir-004(输出8x256)+本轮同源 IR：正式 27/27 PASSED、双方补测各 36/36；目标 timing-7 本阶段 39.458217us、历史 39.261332us，参考 27.98~28.16us。ir-005(计数标量化)完整 27/27、双 36/36，但目标 40.024682us 慢于保留版，已作为完整负结果登记：64 次 S32 VADDS 与 2 次 VCONV 消失、独立 profiling 向量 9.515303→8.882737us，然而标量等待 1.502008→1.651477us、MTE3 2.902784→3.074242us，整调用反而变慢。night ir-003(输出8x512)正式 timing-7 36.647637us(-6.6%)、27/27、双 36/36，但 output512_stability 三轮 ABBA 中两轮未通过(单块中位数 A 36.59~41.91us、B 33.40~41.16us)，判为 not_retained_stability_confirmation_failed。即单块噪声带约 ±15%，本机制若要被保留必须给出明显大于噪声的余量。"
+      },
+      {
+        "path": "codex-brief.json",
+        "category": "paired_profiling",
+        "role": "宿主证据分析与候选方向(Codex 贡献)，本轮按其登记方向选具体实现",
+        "finding": "Codex 指出保留版纯输出循环每轮的搬运与 BAR/WAIT 成本应被评估，具体建议“更大的受守卫输出分块，例如 8×1024，或其他能够减少实际输出轮次的单一编译变换”，并明确要求统计 8×128、Welford/归约/running 状态保持原样，避免把统计分块与输出分块混在一起；成本核查项包括 8×1024 FP32 单 tile 32KiB、双缓冲与输出临时量的 UB 总量(此前统计分块 8×256 曾出现约 1.31MB UB 超限)，并要求为新增分块设置覆盖条件、保留原 8×256/8×128 回退。本诊断核对实际 IR 与冻结低层产物后采纳该方向，把改动限定在输出趟新增守卫分支内。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "确定每 block 成本、哪条流水最忙、带宽是否已接近上限(机制定量锚点)",
+        "finding": "候选侧(Block Dim=64, 1650MHz, Task Duration 39.880798us)：aiv_total_cycles mean 31827.453125(min 27763, max 35986)；aiv_mte2_time mean 12.758428125us / ratio 0.665149578125 / active_bw 20.055695890625GB/s；aiv_mte3_time 2.90278409375us / ratio 0.151377375 / bw 42.2958956875GB/s；aiv_vec_time 9.51530340625us / ratio 0.496787078125；aiv_scalar_time 4.64544509375us；aiv_scalar_mte2_stall_time 3.359621234375us。每 block 搬运约 256KB(8x4096x4B 两读)却只用 12.76us 的 20GB/s，说明 MTE2 受事务/描述符与同步节奏限制而非 HBM 带宽限制(与历史记录 GM_to_UB_bw_usage_rate 仅约 4.97% 一致)。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "simulator",
+        "role": "定位主导区域与停顿构成，判断成本来自同步/搬运还是算术",
+        "finding": "core0.veccore0 的 8 个 pc_neighborhood 区域全部是等待主导：区域(未映射 PC 0x10d123a0 邻域) 15 条指令累计 42.71us、其中 wait 24.98us；相邻区域累计 41.49us、最大单条指令 18.36us 且本身即 wait 18.36us；另一区域累计 38.92us、wait 36.94us。即热点构成是 BAR/WAIT_FLAG/SET_FLAG 一类的同步与搬运命令，FP 向量算术不进入榜单；同时报告记录 absolute_time_qualified=true 与 scope='Instruction hotspots and normalized same-core trace windows'，指令累计时间只作关注度排序并可重叠。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "各流水 active/wait/idle 的相对量化，时钟资质与观测范围界定",
+        "finding": "单核(core0.veccore0)窗口 raw_clock_window 185.793→224.198(=38.405us)，ALL/FLOWCTRL/END 事件数为 2，即该核上观察到 2 个 program 结束；clock_qualification='relative_only'、absolute_time_qualified=false、capture_scope='First to last visible hardware event on this core; partial capture boundaries preserved'，但 absolute_unit_validation 以 33/33 个非同步 PC 对照运行时间中位比 1.000548 核验了 us 单位。泳道：MTE2 active 0.877423/wait 0.236680/idle 0.122577(436 事件)、VECTOR active 0.906128/wait 0.394751/idle 0.093872(1865 事件)、MTE3 active 0.402138/wait 0.112770/idle 0.597862(107 事件)、SCALAR active 0.083995、SCALARLDST active 0.184939(5332 事件)、CACHEMISS 0.001299。未报告设备波次/逐核占用泳道，故波次数仍为假设，不作关键路径结论。"
+      },
+      {
+        "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+        "category": "source_ir",
+        "role": "待编辑 TTIR：确认输出趟结构、守卫、轮次与可编辑点",
+        "finding": "第 27-277 行为单 func(ABI 与清单签名一致)；统计趟为第 47 行外层 scf.for(iter_args mean/var/cnt)与第 64 行内层 scf.for，tile 为 tensor<8x128xf32>、每轮一次 lookahead(第 79 行、minsi 钳位第 72 行)；第 104-118 行两次 tt.reduce、rsqrt；第 160-166 行为输出趟守卫：%c255/%c256、remsi(spatial_dim,256)==0、%n_num_steps_w=(spatial+255)/256、tile_lane_w=make_range 256；第 167-220 行为 scf.if 真分支(8x256，16 轮/每 m 趟，预取第 205 行、算术第 206-212 行 subf→mulf→mulf→addf、store 第 217 行)，第 221-273 行为 else 分支(原 8x128 输出循环)。本用例 shape [8,64,64,64]→batch=8、feat=64、spatial=4096，m_num_steps=(8+7)/8=1、n_num_steps=4096/128=32、n_num_steps_w=16，因此每个 block 的纯输出部分是 16 轮、每轮一次 8x256 载入 + 一次 8x256 写回。%cst_1、%cst_2 等常量与 EVEN 特化均为编译期常量，签名与特化常量 8/128/true 不变。"
+      },
+      {
+        "path": "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttadapter",
+        "category": "source_ir",
+        "role": "在实际低层产物上核对输出趟的搬运形态、缓冲数与同步是否已由后端改写",
+        "finding": "每个 tile 载入都物化为 memref.reinterpret_cast(offset=按 feat/batch stride 计算) + memref.alloc + memref.copy(GM→UB) + bufferization.to_tensor(第 61-64、77-80、219-222、231-234 行)；输出写回为 bufferization.materialize_in_destination 到 reinterpret_cast 的 memref<8x256xf32>(第 244-245 行)。全文无任何显式同步指令(无 barrier/flag)，说明 BAR/WAIT 完全由下游按缓冲区活性插入，其数量由“每趟的 tile 轮次”决定；scf.if 的结构与 TTIR 一致(真分支 8x256、else 分支 8x128)，即后端未把 8x256 与 8x128 统一或进一步合并相邻 tile。"
+      },
+      {
+        "path": "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "核对疑似冗余在后端是否已消除，并量化每轮不变量广播成本",
+        "finding": "共 6 个 memref.alloc：4×memref<8x128xf32>(统计趟当前/预取/mean/M2 缓冲)与 2×memref<8x256xf32>(输出趟当前+预取)，6 处 memref.copy；输出分支内每轮在 linalg.fill(8x256) 上物化 weight/inv_std/bias 三个不变量广播，统计内层每轮另有 linalg.fill 物化 splat(inv_step) 与 splat(1-inv_step)(第 83、90 行)；第 44/53/65/82/93/97 行的 tensor<8x128xi32> 计数张量与其每轮 arith.addi 仍然存在(未被后端消除)，但 ir-005 已实测去除该 VADDS 后整调用变慢，故按“保留原样”处理。结论：相邻 tile 合并、不变量广播外提、计数张量的后端消除三件事都未发生，输出趟每轮的真实成本(一次 GM→UB copy、4 个张量算术、3 次 8x256 fill、一次写回)随轮次线性累积。"
+      },
+      {
+        "path": "count-uniformity-probe.json",
+        "category": "simulator",
+        "role": "确认计数张量指令的实际运行时间量级，避免重复已消费机制",
+        "finding": "同一保留二进制上 loop_integer_add 为 VADDS(PC 0x10d1137c, XD=0x4000 即 4096 个 S32 元素一次) calls=64、cycles=5184、running_time 3.14us；final_integer_to_float 为 VCONV calls=2、0.09us；END calls=2。即计数自增确有可测成本，但 ir-005 已证明把它标量化会把这部分成本转移到标量等待/MTE3 上并使整调用变慢，故本轮不重复。"
+      },
+      {
+        "path": "prior-explorations.json",
+        "category": "paired_profiling",
+        "role": "保留全部已消费身份，避免重复研究身份并确认 UB 失败先例",
+        "finding": "ir-001(统计趟 cnt 向量自增去除/标量化)正式 geo 1.8269、timing-7 45.173us，无收益；夜间 ir-002/ir-003(统计分块加宽并配套合并)在 CPU lowering 阶段 ub overflow requires 10485760 bits while 1572864 bits available(=1.31MB > 196608B)失败；ir-004(输出趟 8x256 加宽、保持统计 8x128)成为保留最佳，其 alternatives 明确把“先把 8x256 二倍试探、UB 与收益都成立再考虑下一轮加宽”留作后续；午间 ir-002(输出趟深度 2 前瞻)正式 geo 1.850688、低于 1.8522，无收益；ir-005(计数标量化)完整合格但变慢。故“加深预取”“标量化计数”“加宽统计”三个方向均已消费，输出趟宽度是唯一已被登记为待验证且未被消费的机制。"
+      },
+      {
+        "path": "lowered-inventory.json",
+        "category": "source_ir",
+        "role": "确认冻结面与唯一可编辑面",
+        "finding": "清单登记 ast_sha256=5c1607c0…2508 的 ttadapter(53174B, sha bd1b88a7…)、bcmlir(48695B, sha 12c88ec8…)、npubin(sha 41483d74…)三件套并保持冻结，只允许编辑 ir-inventory.json 列出的 ir/5c1607c0…2508/batch_norm_with_update_kernel.ttir；因此本轮改动只落 TTIR 文本，低层产物仅用于读证。"
+      }
+    ],
+    "hypothesis": "当前 IR 中具体且有执行成本的编译缺陷是：纯输出归一化趟的 tile 宽度被固定在源码 heuristics 的 BLOCK_N=128 之上，ir-004 只把它在受守卫的真分支里加宽到 8x256，于是本用例每个 block 仍然要做 16 轮“一次 GM→UB 8x256 搬运 → 4 个张量算术 + 3 次不变量 fill → 一次 8x256 写回”，每轮都带一对 SET_FLAG/WAIT_FLAG 与 BAR，行突发只有 1KB。冻结的 ttadapter/bcmlir 证明后端没有把相邻 tile 合并、也没有把不变量广播外提，因此轮次成本线性累积；而 profiling 显示 MTE2 只用 20.06GB/s(约为带宽上限的极小比例)、mte3 42.3GB/s，说明限制来自事务/描述符与同步节奏而不是带宽。把这一趟的输出 tile 在空间整除 1024 的用例上再加宽到 8x1024，可把每 m 趟的轮次 16→4(载入命令 17→5、写回轮次 16→4、不变量 fill 48→12)，行突发 1KB→4KB，而每个元素的算术顺序(subf→mulf(weight)→mulf(inv_std)→addf(bias))、tile 访问序列、写回地址与统计趟(Welford/两次 reduce/running 更新)完全不变，因此输出与保存的统计量在数值上逐位不变。该特化只在 spatial_dim%%1024==0 时启用，原 8x256 与 8x128 两条路径逐字节保留为回退。",
+    "alternatives": [
+      {
+        "idea": "把输出趟循环内的 3 个不变量广播(weight/inv_std/bias)外提到循环外，只削每轮 3 次 8x256 fill",
+        "why_not_selected": "同样针对输出趟且逐位安全，但只减少向量填充(估计 1~2us)，不削减 MTE2 事务数与每轮同步对，收益与本轮机制不在同一量级；且与外提后在循环外长期占用 3 个 8x256/8x1024 活跃缓冲冲突(会抬高 UB 峰值)。按 ir-004 alternatives 的登记留作下一轮独立候选。"
+      },
+      {
+        "idea": "直接把输出趟加宽到已知可行的 8x512(夜间 ir-003 正式 36.647637us)",
+        "why_not_selected": "该身份已被完整评测并因三轮 ABBA 两轮未过判为未保留；本轮重复同一身份不属于新研究身份，且在 ±15% 单块噪声下需要更大余量，故在已知可行宽度上再前进一档(8x1024)才是新机制。8x512 保留为 UB 超限时的回退证据。"
+      },
+      {
+        "idea": "加宽统计(Welford)趟的 8x128 tile，把 512B 行突发拉到 2KB 以上(该趟约占 MTE2 搬运量的 49%)",
+        "why_not_selected": "两重排除：一是会改变每车道样本划分与两次 reduce 的分组，不再与保留版逐位一致(只保证 1e-4 容差)，违反本轮“保留完整数学语义与浮点精度”的要求；二是夜间 ir-002/ir-003 的统计加宽已实测 ub overflow 1.31MB>196608B。Codex 也明确要求统计趟与 Welford/归约/running 保持原样。作为待验证假设保留。"
+      },
+      {
+        "idea": "继续加深输出趟预取深度(回边携带 2 块 tile)",
+        "why_not_selected": "午间 ir-002 已按该机制完整评测：geo 1.850688 低于保留版 1.8522，目标用例无收益；且它增加 12.5% 读流量，与本轮“减少轮次与事务数”方向相反。"
+      },
+      {
+        "idea": "把计数张量 cnt 用标量乘积替代(ir-005 身份)或去除被 minsi 钳位导致的重复末块载入",
+        "why_not_selected": "前者已由 ir-005 完整实测为负结果(整调用 40.024682us)；后者每趟只省 1 次载入(1/17)，需在循环内引入条件载入，破坏流水结构风险大于收益。"
+      },
+      {
+        "idea": "改 num_stages/multibuffer 等编译选项，或重写 frozen.py",
+        "why_not_selected": "编译选项在 ir-inventory 中已冻结且属独立研究身份；源码要求逐字节一致(b8d4d4a2…)，重写源码是另一研究身份。本轮只在 TTIR 层做单一编译变换。"
+      },
+      {
+        "idea": "把新增的 8x1024 分支替换掉现有 8x256 分支(而不是并列三条)",
+        "why_not_selected": "会让 spatial_dim%%256==0 但 %%1024!=0 的其它用例失去已有的 8x256 收益，可能拖低 geo_mean 并引入与本机制无关的回归；因此保留三条并列守卫分支(1024 / 256 / 128)，互斥执行。"
+      }
+    ],
+    "change": "只编辑 ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir 的输出趟区域：(1) 在原 %c255_i32/%c256_i32 守卫之前新增一组常量与判据 %c1023_i32、%c1024_i32、%spatial_rem_k=remsi(spatial_dim,1024)、%spatial_wide_k=(==0)、%n_num_steps_k=(spatial+1023)/1024、%tile_lane_k=make_range(0,1024)，并由 %not_wide_k=(spatial%%1024!=0) 与 %spatial_wide(现改名 %spatial_wide_b) 合成 %spatial_wide_k256=andi(两者)，使三条分支互斥；(2) 新增 scf.if %spatial_wide_k 真分支，内容是 8x1024 的等价纯流式循环：同一 batch_offset=(m_step*8+arange(8))、同一 feat/batch stride 指针算术、同一 minsi(n+1,N-1) 钳位预取、同一算术顺序 subf→mulf(weight)→mulf(inv_std)→addf(bias)、同一 store 地址表达式，新 SSA 名统一带 _k 后缀；(3) 原 8x256 分支改为 scf.if %spatial_wide_k256 的独立真分支(内容逐字节不变，仅把外层 if/else 拆成两个并列 if)；(4) 原 8x128 输出循环改由 scf.if %spatial_fallback=(spatial_dim%%256!=0) 守卫(内容逐字节不变)。统计趟(Welford 内层/外层循环、cnt)、两次 tt.reduce、final_mean/inv_std、running_mean/var 更新、weight/bias 空指针 scf.if、函数签名与 ABI、特化常量 8/128/EVEN=true 一律不改。",
+    "expected": "数值(预测，须宿主核对逐项兑现)：输出张量与 save_mean/save_invstd/running_mean_out/running_var_out 与保留版逐位一致——统计趟未改；spatial%%1024==0 时每个输出元素仍由同一组操作按同一顺序(subf→mulf(weight)→mulf(inv_std)→addf(bias))与同一操作数算出，且无掩码、无越界(spatial 被 1024 整除 ⇒ 无尾块)，NaN/Inf/零方差语义不变，非整除形状仍走未改动的 256/128 分支。指令与轮次(逐项预测)：输出趟每 m 趟 scf.for 轮次 16→4；GM→UB copy 命令数每 block 由 50(统计 33 + 输出 17)降到 38(统计 33 + 输出 5)；输出写回轮次 16→4(对应 MTE3 大批写回调用 32→8，按 AIV 子块对折)，输出趟内不变量 linalg.fill(8x256×3→8x1024×3) 次数 48→12，总 fill 面积不变(每轮 3 个 tile 大填充，但轮次 1/4)；每 block 总循环迭代 48→36；向量 FP 逐元素运算总量不变(元素数×4 个算子)。等待与流水(预测)：BAR 486→约 380~430、WAIT_FLAG 290→约 240~270；timeline 相对比例 MTE2 wait 0.2367→0.18~0.22、VECTOR wait 0.3948→0.32~0.37、MTE3 idle 0.5979→0.55~0.62；MTE2 active_bw 20.06GB/s 应随行突发 1KB→4KB 上升(预测 24~32GB/s)，MTE3 bw 42.3→45~55GB/s。资源(预测)：新增分支每 tile 8x1024x4B=32KiB，回边上同时活跃 2 块(当前+预取)加 4 个算术临时量，峰值约为 8x256 分支的 4 倍；UB 需求必须低于 196608 字节——若 lowering 报 ub overflow，则本预测的“资源”一项判定为不成立、机制判为在此形状上不可行(应回退 8x512 已知可行宽度)，其余预测一并作废。性能(待真机验证的预测，非结论)：per-block aiv_total_cycles 31827→约 28500~30500；该 kernel Task Duration 39.88→约 35~37us；timing-7 39.26~39.46us→约 34.5~37.0us，几何均值相应上移；由于 ABBA 单块噪声带约 ±15%，预测必须出现大于约 4us 的整调用下降才算兑现。若整调用中性或变慢而 MTE2 事务数确实下降，则说明限制已转为每轮更长突发暴露的字节成本(每 block 输出读量 136KB→160KB，+9%)，应记为“事务数不是本负载限制”的负结果。",
+    "validation": "宿主侧：1) TTIR 必须能解析并完成 CPU lower 到 npubin(UB 需求须低于 196608B，否则本机制作废并保留原 IR)；2) 在重编译的 bcmlir/ttadapter 中核对守卫为运行时 remsi 判定、新增分支出现 memref<8x1024xf32>、输出趟 copy 轮次与写回轮次如预测下降，原 8x256/8x128 分支逐字节仍在；3) 完整正式 27 项 + 双方各 36 项补测，FP32 atol=rtol=1e-4、required_matched_ratio=1.0、equal_nan，特殊值(NaN/Inf、零方差、n=1、weight/bias 空指针分支)与 EVEN=false 非整除形状必须保持；4) 目标 timing-7 的 ABBA 稳定性(候选须在每一轮都低于保留版)与修改后双分析；5) profiling 复核 MTE2/MTE3 命令数与 event_count 的下降，作为机制隔离指标(预测 event_count MTE2 436→约 360~400、MTE3 107→约 80~95)；6) 与本阶段保留 39.458217us、历史 39.261332us、ir-003 36.647637us、ir-001、ir-002、ir-005 六条身份分别对比，不混淆；7) 本文档、预检与建议均不作为收益证据，性能以宿主真机结果为准。",
+    "layer_reason": "Triton 表达能力：本轮意图(把纯输出归一化趟的 tile 宽度从 8x256 提到 8x1024，并为不相容形状保留 8x256/8x128 回退)在源码层是完全可表达的——只需改 frozen.py 的 _bn_block_n 或输出趟的 BLOCK_N 常量并加 EVEN 式守卫；但源码要求与 b8d4d4a2… 逐字节一致，且该 heuristics 常量已冻结进 TTIR，因此只能在 IR 里写等价的结构。固定源码实验目的：保持源码、编译选项、lowered-inventory 的 ttadapter/bcmlir/npubin 全部冻结，使“输出趟宽度”成为唯一变量，收益与退步可单独归因，不与源码重写或选项调优这两种独立研究身份混淆。IR 控制点：该缺陷的可测控制点正是 TTIR 里输出趟的 tensor<8x1024xf32> tile、其守卫条件(remsi spatial_dim%1024)与 minsi 钳位预取结构——它们直接决定下游 memref.copy 命令数、写回轮次与 BAR/WAIT 插入数量(冻结 bcmlir 已证明后端不会自行合并 tile 或外提广播)，且不改变函数 ABI、不新增跨 tile 依赖或归约；统计趟的 Welford 划分与两次 reduce 分组保持原样，故浮点结合顺序与特殊值语义完全保持。因此在 single_operator_ir 层做这一处编译变换是唯一可行且最可归因的层面。",
+    "simulator_incremental_judgment": "时钟资质：timeline 自身标注 clock_qualification='relative_only'、absolute_time_qualified=false、capture_scope 为首个至末个可见事件的部分窗口，且 interpretation 明确“No full-kernel duration or dependency-stall attribution”；但同一材料的 absolute_unit_validation 用 33/33 个非同步 PC 对运行时间中位比 1.000548 核验了 us 单位(hotspots 的 absolute_time_qualified=true 同源)，因此本诊断只用窗口内的相对比例(BAR/WAIT 计数、各流水 active/wait/idle 与 event_count)做增量判断，绝不把 instruction_time_sum_us(42.71/41.49/38.92us)当作墙钟或换算加速比。观测范围：窗口 raw 185.793→224.198=38.405us，同核仅 2 个 END，即覆盖 2 个 program 的完整生命周期而不是整设备；未报告泳道(设备波次、AIC、跨核占用)保持未知，波次数与“单核 critical path”仍为待验证假设，不作为结论。流水可重叠：MTE2(12.76us)+VECTOR(9.52us)+MTE3(2.90us)+SCALAR(4.65us)=29.8us 大于 aiv_time 19.3us(31827 cycles/1.65GHz)，故不把各流水时间相加当作关键路径，只用它们排序“谁最忙”(MTE2)。增量判断：相对保留版唯一的增量主张是“输出趟每轮的事务与同步对数量随轮次 16→4 下降”，可观测指标为每 block copy/写回/fill 次数、BAR/WAIT 计数与 MTE2 active_bw；上界以“输出趟占比(窗口后约 71%)中每轮固定开销所占份额”为界，不对绝对时间作承诺；统计趟与归约未改，任何统计侧指标变化都应视为噪声或二次效应。",
+    "unknown": [
+      "8x1024 分支在 multibuffer=true / auto_bind_sub_block=true 下的实际 UB 需求量未知：冻结 bcmlir 只有 6 个 memref.alloc 且指针张量被折叠，但当前内核的真实 UB 余量未记录；若 lowering 报 ub overflow(先例 1.31MB>196608B)，本机制在该形状上判为不可行。",
+      "输出趟读流量会由每 block 约 136KB 增至约 160KB(钳位预取的末块重复读在 4 轮时占 25%)，其与事务数下降的净效应只能由真机测量决定。",
+      "设备波次数与逐核占用未在材料中报告(timeline 只有单核窗口、2 个 END)，因此“每 block 时间下降 X% 等价于整 kernel 下降 X%”只是假设。",
+      "其余 26 个用例的 spatial_dim 是否满足 %%1024==0 未知；不满足者继续走 8x256/8x128 分支，本机制的收益只覆盖可整除形状(本目标用例 spatial_dim=4096 满足)。",
+      "单块测量噪声带约 ±15%(见 output512_stability 三轮)，本轮预测的 2.5~4.5us 整调用降幅是否足以在 ABBA 每轮都低于保留版，须由宿主稳定性测量判定。"
+    ]
+  },
+  "diagnosis_sha256": "b80338e1e157b96cbb95aec1d2a180dc5d1fdea36f4daf1d931d0511be6e88bc",
+  "evidence": [
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "确认当前保留身份、目标用例与全部已消费身份，确定本轮必须超过的基线",
+      "finding": "保留版为夜间 ir-004(输出8x256)+本轮同源 IR：正式 27/27 PASSED、双方补测各 36/36；目标 timing-7 本阶段 39.458217us、历史 39.261332us，参考 27.98~28.16us。ir-005(计数标量化)完整 27/27、双 36/36，但目标 40.024682us 慢于保留版，已作为完整负结果登记：64 次 S32 VADDS 与 2 次 VCONV 消失、独立 profiling 向量 9.515303→8.882737us，然而标量等待 1.502008→1.651477us、MTE3 2.902784→3.074242us，整调用反而变慢。night ir-003(输出8x512)正式 timing-7 36.647637us(-6.6%)、27/27、双 36/36，但 output512_stability 三轮 ABBA 中两轮未通过(单块中位数 A 36.59~41.91us、B 33.40~41.16us)，判为 not_retained_stability_confirmation_failed。即单块噪声带约 ±15%，本机制若要被保留必须给出明显大于噪声的余量。",
+      "sha256": "cce367f2abfb8b4e69f89dea3b81ea52cabf9de94b5ed97b016d81f26f692394"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "paired_profiling",
+      "role": "宿主证据分析与候选方向(Codex 贡献)，本轮按其登记方向选具体实现",
+      "finding": "Codex 指出保留版纯输出循环每轮的搬运与 BAR/WAIT 成本应被评估，具体建议“更大的受守卫输出分块，例如 8×1024，或其他能够减少实际输出轮次的单一编译变换”，并明确要求统计 8×128、Welford/归约/running 状态保持原样，避免把统计分块与输出分块混在一起；成本核查项包括 8×1024 FP32 单 tile 32KiB、双缓冲与输出临时量的 UB 总量(此前统计分块 8×256 曾出现约 1.31MB UB 超限)，并要求为新增分块设置覆盖条件、保留原 8×256/8×128 回退。本诊断核对实际 IR 与冻结低层产物后采纳该方向，把改动限定在输出趟新增守卫分支内。",
+      "sha256": "fa4477f5f4a6fa08d6d7a2bc2cf87fa2fc4cfa4d6e674a6d013f2efb22b461b9"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "确定每 block 成本、哪条流水最忙、带宽是否已接近上限(机制定量锚点)",
+      "finding": "候选侧(Block Dim=64, 1650MHz, Task Duration 39.880798us)：aiv_total_cycles mean 31827.453125(min 27763, max 35986)；aiv_mte2_time mean 12.758428125us / ratio 0.665149578125 / active_bw 20.055695890625GB/s；aiv_mte3_time 2.90278409375us / ratio 0.151377375 / bw 42.2958956875GB/s；aiv_vec_time 9.51530340625us / ratio 0.496787078125；aiv_scalar_time 4.64544509375us；aiv_scalar_mte2_stall_time 3.359621234375us。每 block 搬运约 256KB(8x4096x4B 两读)却只用 12.76us 的 20GB/s，说明 MTE2 受事务/描述符与同步节奏限制而非 HBM 带宽限制(与历史记录 GM_to_UB_bw_usage_rate 仅约 4.97% 一致)。",
+      "sha256": "a4cf9f718f9c58cb50a2e038ef4328449c1188ce0296a733b3b7005b3d3d46d2"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "定位主导区域与停顿构成，判断成本来自同步/搬运还是算术",
+      "finding": "core0.veccore0 的 8 个 pc_neighborhood 区域全部是等待主导：区域(未映射 PC 0x10d123a0 邻域) 15 条指令累计 42.71us、其中 wait 24.98us；相邻区域累计 41.49us、最大单条指令 18.36us 且本身即 wait 18.36us；另一区域累计 38.92us、wait 36.94us。即热点构成是 BAR/WAIT_FLAG/SET_FLAG 一类的同步与搬运命令，FP 向量算术不进入榜单；同时报告记录 absolute_time_qualified=true 与 scope='Instruction hotspots and normalized same-core trace windows'，指令累计时间只作关注度排序并可重叠。",
+      "sha256": "f2005872cd677b8e5940668f313222bd29f882f510b3ad98c8f5add992d6b16c"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "各流水 active/wait/idle 的相对量化，时钟资质与观测范围界定",
+      "finding": "单核(core0.veccore0)窗口 raw_clock_window 185.793→224.198(=38.405us)，ALL/FLOWCTRL/END 事件数为 2，即该核上观察到 2 个 program 结束；clock_qualification='relative_only'、absolute_time_qualified=false、capture_scope='First to last visible hardware event on this core; partial capture boundaries preserved'，但 absolute_unit_validation 以 33/33 个非同步 PC 对照运行时间中位比 1.000548 核验了 us 单位。泳道：MTE2 active 0.877423/wait 0.236680/idle 0.122577(436 事件)、VECTOR active 0.906128/wait 0.394751/idle 0.093872(1865 事件)、MTE3 active 0.402138/wait 0.112770/idle 0.597862(107 事件)、SCALAR active 0.083995、SCALARLDST active 0.184939(5332 事件)、CACHEMISS 0.001299。未报告设备波次/逐核占用泳道，故波次数仍为假设，不作关键路径结论。",
+      "sha256": "6777e8aaa5ec9a379af0b23450fe327545dea7a74a9803c25409d48f4798f263"
+    },
+    {
+      "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+      "category": "source_ir",
+      "role": "待编辑 TTIR：确认输出趟结构、守卫、轮次与可编辑点",
+      "finding": "第 27-277 行为单 func(ABI 与清单签名一致)；统计趟为第 47 行外层 scf.for(iter_args mean/var/cnt)与第 64 行内层 scf.for，tile 为 tensor<8x128xf32>、每轮一次 lookahead(第 79 行、minsi 钳位第 72 行)；第 104-118 行两次 tt.reduce、rsqrt；第 160-166 行为输出趟守卫：%c255/%c256、remsi(spatial_dim,256)==0、%n_num_steps_w=(spatial+255)/256、tile_lane_w=make_range 256；第 167-220 行为 scf.if 真分支(8x256，16 轮/每 m 趟，预取第 205 行、算术第 206-212 行 subf→mulf→mulf→addf、store 第 217 行)，第 221-273 行为 else 分支(原 8x128 输出循环)。本用例 shape [8,64,64,64]→batch=8、feat=64、spatial=4096，m_num_steps=(8+7)/8=1、n_num_steps=4096/128=32、n_num_steps_w=16，因此每个 block 的纯输出部分是 16 轮、每轮一次 8x256 载入 + 一次 8x256 写回。%cst_1、%cst_2 等常量与 EVEN 特化均为编译期常量，签名与特化常量 8/128/true 不变。",
+      "sha256": "574eddcba7a8b920c211880d4332fb710465bcda4a944dc3f81ae74c066a17cc"
+    },
+    {
+      "path": "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "在实际低层产物上核对输出趟的搬运形态、缓冲数与同步是否已由后端改写",
+      "finding": "每个 tile 载入都物化为 memref.reinterpret_cast(offset=按 feat/batch stride 计算) + memref.alloc + memref.copy(GM→UB) + bufferization.to_tensor(第 61-64、77-80、219-222、231-234 行)；输出写回为 bufferization.materialize_in_destination 到 reinterpret_cast 的 memref<8x256xf32>(第 244-245 行)。全文无任何显式同步指令(无 barrier/flag)，说明 BAR/WAIT 完全由下游按缓冲区活性插入，其数量由“每趟的 tile 轮次”决定；scf.if 的结构与 TTIR 一致(真分支 8x256、else 分支 8x128)，即后端未把 8x256 与 8x128 统一或进一步合并相邻 tile。",
+      "sha256": "bd1b88a7c7163074a7b0026087ee561101736a094dcfeeb4661df562285ee719"
+    },
+    {
+      "path": "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "核对疑似冗余在后端是否已消除，并量化每轮不变量广播成本",
+      "finding": "共 6 个 memref.alloc：4×memref<8x128xf32>(统计趟当前/预取/mean/M2 缓冲)与 2×memref<8x256xf32>(输出趟当前+预取)，6 处 memref.copy；输出分支内每轮在 linalg.fill(8x256) 上物化 weight/inv_std/bias 三个不变量广播，统计内层每轮另有 linalg.fill 物化 splat(inv_step) 与 splat(1-inv_step)(第 83、90 行)；第 44/53/65/82/93/97 行的 tensor<8x128xi32> 计数张量与其每轮 arith.addi 仍然存在(未被后端消除)，但 ir-005 已实测去除该 VADDS 后整调用变慢，故按“保留原样”处理。结论：相邻 tile 合并、不变量广播外提、计数张量的后端消除三件事都未发生，输出趟每轮的真实成本(一次 GM→UB copy、4 个张量算术、3 次 8x256 fill、一次写回)随轮次线性累积。",
+      "sha256": "12c88ec8a1907c3d149bbddc4e0a22c0a4528f8643463d0b92069123d570413c"
+    },
+    {
+      "path": "count-uniformity-probe.json",
+      "category": "simulator",
+      "role": "确认计数张量指令的实际运行时间量级，避免重复已消费机制",
+      "finding": "同一保留二进制上 loop_integer_add 为 VADDS(PC 0x10d1137c, XD=0x4000 即 4096 个 S32 元素一次) calls=64、cycles=5184、running_time 3.14us；final_integer_to_float 为 VCONV calls=2、0.09us；END calls=2。即计数自增确有可测成本，但 ir-005 已证明把它标量化会把这部分成本转移到标量等待/MTE3 上并使整调用变慢，故本轮不重复。",
+      "sha256": "9b4c0d6c838a440bf98e0e526d6ad0324f25e33fd92d6c39052f57698701f34a"
+    },
+    {
+      "path": "prior-explorations.json",
+      "category": "paired_profiling",
+      "role": "保留全部已消费身份，避免重复研究身份并确认 UB 失败先例",
+      "finding": "ir-001(统计趟 cnt 向量自增去除/标量化)正式 geo 1.8269、timing-7 45.173us，无收益；夜间 ir-002/ir-003(统计分块加宽并配套合并)在 CPU lowering 阶段 ub overflow requires 10485760 bits while 1572864 bits available(=1.31MB > 196608B)失败；ir-004(输出趟 8x256 加宽、保持统计 8x128)成为保留最佳，其 alternatives 明确把“先把 8x256 二倍试探、UB 与收益都成立再考虑下一轮加宽”留作后续；午间 ir-002(输出趟深度 2 前瞻)正式 geo 1.850688、低于 1.8522，无收益；ir-005(计数标量化)完整合格但变慢。故“加深预取”“标量化计数”“加宽统计”三个方向均已消费，输出趟宽度是唯一已被登记为待验证且未被消费的机制。",
+      "sha256": "1489e937f90923da4aa5b9a6a5afce721e927ea93207d7614fe4d3294644a701"
+    },
+    {
+      "path": "lowered-inventory.json",
+      "category": "source_ir",
+      "role": "确认冻结面与唯一可编辑面",
+      "finding": "清单登记 ast_sha256=5c1607c0…2508 的 ttadapter(53174B, sha bd1b88a7…)、bcmlir(48695B, sha 12c88ec8…)、npubin(sha 41483d74…)三件套并保持冻结，只允许编辑 ir-inventory.json 列出的 ir/5c1607c0…2508/batch_norm_with_update_kernel.ttir；因此本轮改动只落 TTIR 文本，低层产物仅用于读证。",
+      "sha256": "4945c33cae9b73c84e863e67c7d33e54cb8fdd74fa50003c86f71cc029944028"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+    "ir-inventory.json": "01565e88b83cbf813628c2653d351ee4c7b3845394b2b690b0c8351c0eef26e6",
+    "lowered-inventory.json": "4945c33cae9b73c84e863e67c7d33e54cb8fdd74fa50003c86f71cc029944028",
+    "profiling.json": "a4cf9f718f9c58cb50a2e038ef4328449c1188ce0296a733b3b7005b3d3d46d2",
+    "hotspots.json": "f2005872cd677b8e5940668f313222bd29f882f510b3ad98c8f5add992d6b16c",
+    "timeline.json": "6777e8aaa5ec9a379af0b23450fe327545dea7a74a9803c25409d48f4798f263",
+    "context.json": "315c5dc119a610d7bbcb9434e912f03c6502b87ab92aa3211dd64fd6ab7f9cec",
+    "diagnosis.json": "99f5358a90d0ab8981f4c7f62af16a4d3e1f772be34b48601510527e93507126",
+    "feedback.json": "cce367f2abfb8b4e69f89dea3b81ea52cabf9de94b5ed97b016d81f26f692394",
+    "codex-brief.json": "fa4477f5f4a6fa08d6d7a2bc2cf87fa2fc4cfa4d6e674a6d013f2efb22b461b9",
+    "prior-explorations.json": "1489e937f90923da4aa5b9a6a5afce721e927ea93207d7614fe4d3294644a701",
+    "count-uniformity-probe.json": "9b4c0d6c838a440bf98e0e526d6ad0324f25e33fd92d6c39052f57698701f34a",
+    "prior-count-post-mechanism.json": "f8068b52105e55b0cbd46435a7b0c370d46d2a40be365b3d434a385d3af657ee",
+    "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir": "574eddcba7a8b920c211880d4332fb710465bcda4a944dc3f81ae74c066a17cc",
+    "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttadapter": "bd1b88a7c7163074a7b0026087ee561101736a094dcfeeb4661df562285ee719",
+    "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.bcmlir": "12c88ec8a1907c3d149bbddc4e0a22c0a4528f8643463d0b92069123d570413c",
+    "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.npubin": "41483d746ba67cd3456434ea7d176386cbe6e987f3ab56d360d1baf5935be5fe"
+  },
+  "decision_tool_sha256": "7aec090daf3f1657c751a165b382859745b7735db4acd9465970a4fadd3bf1ab"
+}

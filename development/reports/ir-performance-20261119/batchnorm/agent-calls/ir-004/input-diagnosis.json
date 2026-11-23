@@ -1,0 +1,99 @@
+{
+  "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+      "category": "source_ir",
+      "role": "当前待修复的单一特化TTIR（唯一清单条目，符号 batch_norm_with_update_kernel，AST 5c1607c0…）",
+      "finding": "统计段在 scf.for %m_step 内部用 scf.if %wide_ok 进入 8x512 宽瓦片分支（行73-137）。该分支每个 m 分块把 w_mean/w_var/w_cnt 重置为 0（行79-82），而步长标量用的是全局 %w_step = m_step*wide_num_steps + w_n + 1（行83-86）：一旦 m_num_steps>1，第 2 个及以后的分块以全局步数做从零开始的 Welford，均值/方差/计数全部错误。另 %wide_ok（行54）只校验 spatial_dim 能被 512 整除，未校验 batch 维度：batch_dim 不是 8 的倍数时 8x512 无掩码加载会读越界行，EVEN 路径的 batch 谓词在宽路径中缺失。归一化段的宽分支（行260-295）无跨分块携带状态，不受此递推缺陷影响。"
+    },
+    {
+      "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+      "category": "source_ir",
+      "role": "宽分支的组内合并数学",
+      "finding": "%w_m3/%w_v3/%w_c3 把 8x512 重排为 8x4x128 后沿轴1规约：由于 4 条子流样本数相等（各 wide_num_steps），%w_mmean=Σ均值/4 与 %w_vsum=Σ(M2_g + c_g·(m_g-m̄)²) 在单分块、行全有效时是标准的并行方差合并，代数正确；错误仅来自分块间重置与缺失的 batch 守卫，因此可用标准 Chan 合并把分块结果并入携带状态，无需重写组内递推。"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "正式配对实测：候选内核实测耗时与 AIV 指标（来源 paired-b8d4d4a2/comparison.json）",
+      "finding": "候选 batch_norm_with_update_kernel：Task Duration 47.360947 us，Block Dim 64（64 个 AIV 核），aiv_time 均值 23.181 us、均值周期 38249、aiv_vec_ratio 均值 0.447；参考侧为 3 个算子（BatchNormV3 21.72us + Add 1.12us + Rsqrt 1.52us）。候选侧掩码/宽分支均在该特化内（EVEN=1，BLOCK_M=8，BLOCK_N=128）。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "模拟器热点区域排序（来源 simulator-b8d4d4a2/summary.json，core0.veccore0）",
+      "finding": "统计段 source_loop（源码行71-103）是该核最大热点：指令时间累计 78.1 us、其中 wait 累计 52.2 us，trace 区间并集 8.55 us，涉及 FLOWCTRL/MTE2/SCALAR/VECTOR 四条流水；外层 m 循环（58-103）仅 1.95 us，其余 PC 邻域均 <1.3 us。说明主要成本集中在“逐 128 列瓦片推进的串行 Welford 递推 + 每步载入”的循环体，而不是尾部规约或参数更新。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "相对时间线（来源 core0.veccore0-relative-timeline.json）",
+      "finding": "窗口为相对分数、非绝对时钟：MTE2 活跃 0.886（有效 0.776、等待 0.110、空闲 0.114，116 事件）；VECTOR 活跃 0.897（有效 0.641、等待 0.264、空闲 0.103，552 事件）；SCALARLDST 活跃 0.240（1667 事件）；SCALAR 活跃 0.055；CACHEMISS 活跃 0.0015、空闲 0.9985（未报告泳道/无可用于结论的缓存未命中信号）。即数据搬运几乎占满窗口，同时向量流水有 26% 时间在等待，符合“每轮 128 列载入 + 依赖串行的 Welford 步进”造成的停顿。"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "宿主对上一轮（ir-002）的正式评审结论",
+      "finding": "parent=ir-002，正式评测未提交（formal_evaluation: not submitted）；required 明确为“Read host review. Correct multi-batch recurrence before device execution.”；recommended 指出“单批次分块 + spatial 整除的运行时适用性守卫”可在不改 ABI、不针对基准数据特化的前提下保持加宽机制有效；other 指出四组 Welford 合并仅在单分块时代数有效，但改变了 FP32 分组，仍须满足完整容差。本轮必须先消除这一语义缺陷。"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "paired_profiling",
+      "role": "Codex 的宿主证据分析与候选方向（记录其贡献）",
+      "finding": "Codex 观察：均匀计数消除（ir-001）通过但无可保留收益，应寻找比“循环携带整数计数”更大的已测瓶颈；原 Welford 用 8x128 车道、目标形状下约 32 个 spatial 步，每步含多次向量屏障与行拷贝，模拟器把成本归于源码 Welford 循环。其候选方向为：在 IR 层加宽 spatial 瓦片以减少递推步数（需运行时守卫生效或回退），或保留逐元素浮点递推的小因子展开并预取。本轮采纳其“加宽 spatial 瓦片”方向，并把其要求的运行时守卫落到 batch 维度整除条件上；展开方向列为备选。"
+    },
+    {
+      "path": "baseline-result.json",
+      "category": "paired_profiling",
+      "role": "当前最佳正式基线与工作负载总览",
+      "finding": "当前最佳正式结果：geo_mean 1.8598，min_speedup 0.6204，27/27 通过，worst workload 为 batch_norm_with_update_functional-timing-7，latency 0.045318 ms（45.32 us），abs_err 0.00195、rel_err 0.00508。context.json 记录目标延迟 0.044913 ms、目标加速比 0.62695。本轮续接必须超过 45.32 us。"
+    },
+    {
+      "path": "ir001-post-profiling.json",
+      "category": "paired_profiling",
+      "role": "上一轮（ir-001）IR 的补测配对剖析",
+      "finding": "ir-001 候选核 Task Duration 46.640934 us（参考 BatchNormV3 21.280426 + Add 1.720034 + Rsqrt 2.560051），相对原始 47.360947 us 仅约 1.5%，与 feedback 的“无可保留收益”一致；说明计数消除/谓词简化不足以改变瓶颈，需要减少递推步数本身。"
+    },
+    {
+      "path": "ir-inventory.json",
+      "category": "source_ir",
+      "role": "可编辑清单与冻结边界",
+      "finding": "清单只含 1 个特化（batch_norm_with_update_kernel.ttir，original_sha256 fb0bdf35…，BLOCK_M=8/BLOCK_N=128/EVEN=true，8 个 constexpr 常量映射）。工作区不存在 lowered-inventory.json，也不存在 compiled-readonly/，因此没有可核对的 ttadapter/bcmlir 低层产物；本轮只改该 TTIR，源文件与清单冻结。"
+    }
+  ],
+  "hypothesis": "统计段宽分支（8x512）把每个 m 分块的 spatial 递推步数由 32 降到 8，直接削减热点统计循环的迭代固定开销与向量屏障次数，是模拟器证据指向的最大可改编译缺陷；但当前 IR 的实现在多批次分块时把累加器重置为 0 却沿用全局步数，并且 %wide_ok 缺少 batch 整除守卫，因此在 batch_dim>8 或非 8 倍数时语义错误，性能也不可信。若把分块结果用标准 Chan 合并并入携带的 (mean, var, cnt) 状态，并把守卫改为 (batch_dim % 8 == 0 && spatial_dim % 512 == 0)，则：单分块基准形状（batch=8, spatial=4096, m_num_steps=1）下合并退化为恒等（c_old=0 ⇒ mean=分块均值、var=分块 M2），生成的设备路径与当前宽分支完全一致；多分块形状得到与原逐元素 Welford 相同的全量均值/无偏方差语义。由此可测预测：统计循环每核迭代数 32→8，热点 wait 时间下降，内核耗时从 46.6-47.4 us 区间下降到 44 us 附近，正式延迟低于 45.32 us 的当前最佳。",
+  "alternatives": [
+    {
+      "name": "最小守卫方案（宿主推荐）：只在 %wide_ok 中加入 m_num_steps == 1 条件，宽分支保持分块内从零开始的合并",
+      "assessment": "能消除多分块错误且改动最小，但把加宽限制为 batch_dim 恰为 8（单分块且行全有效）的形状，对 batch_dim=16/24 等仍回退到 8x128 慢路径；机制适用面被基准形状绑定，泛化性差，故不选。"
+    },
+    {
+      "name": "把宽分支整体移出 m 循环，用扁平化 (m,n) 循环在 8x4x128 状态上做单一 Welford，末尾只合并一次",
+      "assessment": "FP 分组最接近原递推（每元素流只被切成 4 条子流），但需要重排外层循环结构与指针推导（每轮做整除/取余），IR 改动面大、编译风险高；收益预计与所选方案在基准形状上相同，留作后续候选。"
+    },
+    {
+      "name": "UB 内缓存第一遍输入，消除归一化段的第二次 GM 读取",
+      "assessment": "按 MTE2 有效占比 0.776、总流量约 24MB 估计，理论上可把搬运量降 1/3，是潜在更大的收益；但每个核的切片为 8x4096 fp32=128KB，叠加工作缓冲可能超出 UB 预算，且是独立机制，需单独评估并单独提交，本轮不做。"
+    },
+    {
+      "name": "Codex 备选：保留逐元素递推的小因子展开 + 预取",
+      "assessment": "统计递推是串行依赖，展开只减少循环控制开销，不减少屏障/载入次数；与加宽方向相比收益更小，本轮不选。"
+    },
+    {
+      "name": "仅修改编译选项或重写源码",
+      "assessment": "规则禁止；源码与 context 冻结，编译选项改动不属于单算子 IR 层研究身份。"
+    }
+  ],
+  "change": "在唯一特化 batch_norm_with_update_kernel.ttir 中做一处同机制的三点小编辑（不触碰函数 ABI、参数、常量映射与归一化段）：(1) 把 %wide_ok 扩展为 (wide_num_steps*512 == spatial_dim) && (m_num_steps*8 == batch_dim)，即新增 %wide_bspan/%wide_bok 并用 arith.andi 合成；(2) 宽统计循环内的步长标量改为分块本地计数 %w_step2 = w_n + 1（删除全局 m_step*wide_num_steps 偏移），使每个 m 分块的 4 条子流从零开始做标准 Welford；(3) 在宽分支 yield 之前用标准 Chan 合并把分块结果并入外层携带状态：c_new=c_old+w_csum，delta=w_mmean-mean，mean_new=mean+delta*(c_chunk/c_new)，var_new=var+w_vsum+delta²*(c_old*c_chunk/c_new)，yield 合并后的 (mean_new, var_new, c_new)。c_new 恒 >0，无 0 除；c_old=0 时退化为恒等。",
+  "expected": "语义：所有运行期形状保持完整数学语义——单分块（batch_dim=8）路径与修复前完全等价；多分块（batch_dim=16,24,…）得到正确全局均值与无偏方差，取代原先的错误重置；batch_dim 非 8 倍数或 spatial 非 512 倍数时宽路径不生效，回退到原有 8x128 掩码/无掩码路径，不越界、不改变输出顺序、别名与特殊值行为；计数恒等于有效样本数 (batch_dim*spatial_dim)。退化情形不新增特殊值行为：spatial_dim=0 或 batch_dim=0 时末尾均值/方差本就除以 0 得 NaN（与原实现一致，宽分支在 batch_dim=0 时 m 循环为空不会被进入）；非退化形状下合并分母 c_new=4*wide_num_steps ≥ 4，不存在 0 除。浮点：仅把分组方式从“单流 32 步”改为“4 条 8 步子流 + Chan 合并（单分块时仅一次组内合并）”，与原实现的分块一致性均属标准并行方差合并，仍满足 atol=rtol=1e-4、matched_ratio=1.0。性能预测（可测）：统计热点循环每核迭代次数由 32 降为 8，hotspots 中 source_loop(71-103) 的 wait 累计与 trace 并集应下降；timeline 中 VECTOR wait_ratio（0.264）应下降而 MTE2 有效占比基本不变（字节数不变）；内核 Task Duration 从 ir-001 实测 46.64 us 降至 44.0 us 附近（预测区间 42.5–45.0 us），正式 worst-case latency 应低于当前最佳 0.045318 ms 与目标 0.044913 ms。证伪条件：若正式评测 latency ≥ 0.045318 ms，或热点统计循环未见迭代/等待下降，则加宽机制在此目标上无效，应改用 UB 缓存第二遍读取方向。",
+  "validation": "宿主审查后执行：完整 KGS（27 个工作负载正确性 + 计时）与正式评测。重点核对 (a) correctness-* 全部 PASSED、abs/rel 误差在 1e-4 容差、matched_ratio=1.0；(b) 覆盖 batch_dim 非 8 倍数、spatial_dim 非 512 倍数、batch_dim>8（多分块）的补测形状，确认守卫与 Chan 合并；(c) timing-7 延迟与 baseline 0.045318 ms 对比；(d) 复测 profiling/hotspots，确认统计循环迭代数与 wait 下降。本轮文档与预检不作为收益结论。",
+  "layer_reason": "缺陷位于 TTIR 层的循环结构、跨迭代携带状态与运行时守卫，属于编译器/IR 可表达且可独立验证的机制；源码与 context 冻结，改动清单允许的唯一特化即可覆盖统计与归一化两段；不涉及 ABI、常量映射或编译选项，符合 single_operator_ir 研究身份。工作区无 lowered-inventory.json 与 compiled-readonly/，无法核对后端是否已消除该冗余，故直接在当前可编辑 TTIR 上修复，实测由宿主完成。",
+  "simulator_incremental_judgment": "模拟器取证为 core0.veccore0 的相对窗口（capture 0→1 为可见事件首末，display_time_unit=window_fraction），不具备绝对时钟资质，只用于同一窗口内的流水/等待/空闲对比与热点排序，不用于宣称真实耗时或因果；CACHEMISS 泳道 99.85% 空闲说明该核没有可用的缓存未命中信号，未报告泳道（如 AIC/cube、HBM 带宽计数器）不作推断。MTE2 有效 0.776 且几乎无空闲、VECTOR 等待 0.264，配合热点统计循环 52.2 us 等待累计，增量判断为：搬运量已接近饱和而向量侧因串行递推步进反复等待，减少递推步数（32→8）应主要降低 VECTOR 等待与循环控制开销，搬运量不变则 MTE2 占比基本不变；这与预期收益量级（数个百分点的内核时间）一致，若实测不符则说明瓶颈另在别处（下一步转向消除第二遍 GM 读取）。",
+  "unknown": [
+    "后端是否会把 8x512 宽瓦片拆成多指令并引入额外 UB 压力或寄存器/缓冲竞争；无 lowered-inventory.json 无法预判。",
+    "ir-002 的加宽路径从未在设备上运行，宽瓦片本身的实测收益只能由宿主评测确认。",
+    "显式 cache 相关泳道缺失，无法区分 HBM 与 UB 层级的实际瓶颈。"
+  ]
+}

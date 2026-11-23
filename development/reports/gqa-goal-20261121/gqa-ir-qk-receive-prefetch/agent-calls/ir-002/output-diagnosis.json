@@ -1,0 +1,74 @@
+{
+  "source_sha256": "19f7fb238946cb9006286d4d222425d07c4ea9fc38a7d4ff85c71c72c49c584a",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "ir/target.hivm.mlir",
+      "category": "source_ir",
+      "role": "定位 Cube 只发 PV 后 flag0 的同步缺口与 Vector 当前接收下界",
+      "finding": "AIC 在 scf.if(next) 内第 248 行完成 nextQK fixpipe，但仅在第 281 行 PV fixpipe 之后发 sync_block_set[CUBE,FIX] flag0；AIV 第 390-398 行在下一 tile 的 QK GM 视图只在有效 next 时计算，tile 循环第 382-387 行把 rawQK 由 GM 收到 UB0，且第 450 行以 flag0 等待后才做 PV 接收，因此当前每 tile 的 rawQK 接收被上一轮 PV FIX 完成所界定。"
+    },
+    {
+      "path": "ir/target.hivm.mlir",
+      "category": "source_ir",
+      "role": "确认可复用的 UB 布局与事件现状",
+      "finding": "P bf16 缓冲位于 pointer_cast 32768 的 64x256xbf16（第 425 行），rawQK 收到 pointer_cast 0 的 64x256xf16（第 379 行），UB 最高活跃终点为 180480B；现存 MTE3->V EVENT0/EVENT1 保护 P 缓冲与 PV，MTE2->V EVENT0 在 rawQK 与 PV 之间共用，V->MTE2 EVENT0 逐 tile 在 reduce 后 set、在下一次 rawQK 接收前 wait；现有 IR 未使用 MTE3->MTE2 与跨核 flag4。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "证明 Vector MTE2 存在可隐藏的等待与空闲",
+      "finding": "case 4 core0.veccore0 的 MTE2 泳道 event_count=151，active_ratio=0.1842、wait_ratio=0.0711、idle_ratio=0.8158、productive_ratio=0.1131；VECTOR 泳道 active_ratio=0.3231、wait_ratio=0.0697、idle_ratio=0.6769；MTE3 idle_ratio=0.5555。这些比例仅用于定位候选机制，累计重叠时间不作关键路径。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "给出同 Vector 核的实际重叠窗口，界定预取可重叠范围",
+      "finding": "core0.veccore0 的时钟校验 compared_pcs=30、matching_pcs=30、median_ratio=0.99949，窗口可读；当前 native IR001 模拟器显示前一轮归约 44.964..45.257us、VREC 45.258..45.271us、VMUL 45.287..45.468us、下一 rawQK GM->UB 45.259..45.739us、输出 MTE3 45.596..46.498us，说明 rawQK 接收已与归一化/输出部分重叠，进一步收益来自把下一 QK 接收提前到当前 PV flag0 等待之前。未报告泳道保持未知。"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "量化候选相对 CANN 的向量侧余量",
+      "finding": "成对 063 profiling：CANN kernel 122.662453us，Cube 侧 FIX 58.440us、MTE2 52.222us；候选 150.383011us，Cube 侧 FIX 21.468us、MTE2 33.360us；Vector 侧 CANN MTE3 35.650us、候选 19.509us，MTE2 CANN 40.257us、候选 14.479us。总量更小而墙钟更大，指向跨核等待/依赖方向，计数本身不作关键路径。"
+    },
+    {
+      "path": "event-capability-readonly/0-matmul_impl.h",
+      "category": "source_ir",
+      "role": "确认已安装 AscendC 存在 MTE3_MTE2 事件",
+      "finding": "CANN 9.0.0 matmul_impl.h 第 74-76 行以 FetchEventID/SetFlag/WaitFlag<HardEvent::MTE3_MTE2> 成对使用，证明当前 IR 可新增 MTE3->MTE2 事件保护 UB32768..65536 的 P 缓冲复用。"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "记录上一轮弃用的原因与被拒机制",
+      "finding": "retained 为已验收 IR001（ir_sha256 a28d4835..., target_us 145.9246，四例条件稳定复测 candidate_median 146.55685us），rejected_ir 为 ir-001；repair_feedback 指出上一提案新增 buffer 到 213248B 超 UB 196608B、预取被放到 PV flag0 之后且无法重叠、以及把首/非首 load 误计为新增。本调用据此只做已有缓冲复用且把预取放在 flag1 之后、flag0 之前。"
+    }
+  ],
+  "hypothesis": "当前 IR 中每 tile 的 rawQK GM->UB 接收被上一轮 Cube flag0（PV FIX 后才发）界定，导致 Vector MTE2 在 PV 等待窗口内空闲。若在 P bf16 发送与 flag1 通知之后、当前 PV flag0 等待之前，复用 UB32768..65536 预取下一 rawQK，并由 Cube 在 nextQK FIX 后新增跨核 ready flag4 供 Vector 接收前等待，则下一 rawQK 接收可与当前 PV 计算/等待重叠，Vector MTE2 的 PV 窗口空闲下降；首 tile 组仍在组首 prefill 到 UB0，后续 tile 从 32768 读，MTE3->MTE2 事件保证 P 缓冲在发送完成后才被预取写覆盖。",
+  "alternatives": [
+    "保持 IR 原样：当前每 tile rawQK 接收被上一轮 PV flag0 界定，保留现状即放弃把接收提前到 PV 等待之前的机会，作为无收益对照。",
+    "把预取放到 PV flag0 等待之后（上一提案方向）：预取与 PV 等待串行，无法重叠，本轮明确排除。",
+    "新增超出 180480B 的专用预取缓冲：UB 最高活跃终点 180480B、余量 16128B 小于 32768B，超容量被拒，本轮排除。",
+    "仅改编译选项或源码层表达：frozen.py 需逐字节一致，且 Triton 源无法直接表达 UB 显式地址复用与跨核 flag/pipe 事件，本轮排除。"
+  ],
+  "change": "在 AIV 组首（flag0 等待之后、tile 循环之前）新增一次 rawQK prefill：wait V->MTE2 EVENT0 后把该组首 tile 的 QK 由 GM 收到 UB0（pointer 0），set MTE2->V EVENT1 并 sync_block_set[VECTOR,MTE2] flag2。tile 循环内删除逐 tile 的 UB0 rawQK load 及其 MTE2->V EVENT0/flag2，改为 wait MTE2->V EVENT1 后按 first=(arg11==%22) 用 scf.if 从 UB0 或 UB32768 执行 vcast_half_to_float；删除 reduce 后逐 tile 的 V->MTE2 EVENT0 set，改到组末 tile 循环之后 set 一次，组首 prefill 前 wait 一次。在 P bf16 store 之后（flag1 通知之后、PV flag0 等待之前）新增 scf.if(next)：先 set PIPE_MTE3->PIPE_MTE2 EVENT0，再 sync_block_wait[VECTOR,FIX] flag4，再 wait MTE3->MTE2 EVENT0，然后把 next tile QK 由 %37 收到 UB32768，set MTE2->V EVENT1 并 sync_block_set[VECTOR,MTE2] flag2。AIC 在 scf.if(next) 内 nextQK fixpipe 之后新增 sync_block_set[CUBE,FIX] flag4。保持 Cube MMA/fixpipe 数学、PV 同步 flag0/flag1、所有数值路径与函数 ABI 不变。",
+  "expected": [
+    "指令：Vector rawQK 的 GM->UB load 动态总数保持每 tile 1 次（组首 prefill 1 次 + 非末 tile 预取 n-1 次 = 每组 n 次），不新增额外 load；vcast_half_to_float 改为 scf.if 两分支，每 tile 仍执行 1 次，源地址在首 tile 取 UB0、其余取 UB32768。",
+    "动态轮次：非空组交集 T tile 时，新增跨核 flag4 set/wait 各 T-1 次，新增 MTE3->MTE2 set/wait 各 T-1 次；flag2 set 由逐 tile load 后改为组首 prefill 与每次预取，动态总数保持 T；V->MTE2 EVENT0 set/wait 由每组 T 次降为每组各 1 次（另加初始 set 与末尾 drain）。",
+    "等待：rawQK 接收下界由上一轮 PV flag0（FIX 完成）改为 Cube nextQK FIX 后的 flag4，预取发生在 P 发送之后、PV flag0 等待之前，与当前 PV 计算/等待重叠。",
+    "资源：复用现有 UB0 与 UB32768..65536，UB 最高活跃终点保持 180480B，无新增缓冲、无改动函数 ABI。",
+    "数值：scale、exp、bf16 cast、reduce、vrec、vmul 的源、顺序、类型与特殊值处理不变。"
+  ],
+  "validation": [
+    "宿主先核对 diagnosis 与实际 diff 一致，再审查语义/KGS 完整性、所有新增事件的配对与跨核同步无死锁、末 tile 无预取与组边界 prefill 保护正确。",
+    "编译验证 hivm.hir.set_flag[<PIPE_MTE3>,<PIPE_MTE2>] 与 sync_block_set/wait flag4 能由 CPU 后端接受并保持 ABI。",
+    "四例（1,2,4,7）真机重放，逐项核对：flag4 与 MTE3->MTE2 出现次数、末 tile 无预取、MTE2 在 PV 窗口占用变化、以及是否超过当前最佳 145.9246us；任一偏差记录为待验证假设。"
+  ],
+  "layer_reason": "Triton 源层无法直接表达 UB 显式地址复用（0 与 32768 的选择）、跨核 sync_block flag4 与 MTE3->MTE2 事件，也无法表达 P 发送后、PV 等待前的预取放置；frozen.py 需逐字节保持一致以保证源码身份冻结，故本轮把该生成调度作为固定源码上的 IR 实验。IR 控制点正是 set_flag/wait_flag 的 pipe 与 event id、sync_block_set/wait 的 flag、以及 pointer_cast 的 UB 偏移，可在不改变数学与 ABI 的前提下精确落盘。若将来允许源码表达，可在源码层显式写出双缓冲接收与就绪信号作为替代方向。",
+  "simulator_incremental_judgment": "timeline 的 Vector 窗口显示 rawQK GM->UB 已与归一化及输出部分重叠，故本轮收益只来自把下一 QK 接收前移到当前 PV flag0 等待之前：预计 Vector MTE2 在每 tile 的 PV 等待窗口内由空闲转为预取占用。hotspots 中 Vector MTE2 wait_ratio=0.0711、idle_ratio=0.8158 与 VECTOR idle_ratio=0.6769 仅用于定位该空闲方向，累计重叠时间不作关键路径；动态总次数的比较须按执行覆盖核对，未报告泳道保持未知。",
+  "unknown": [
+    "新增 flag4 与 MTE3->MTE2 同步开销可能抵消每 tile 约 0.48us 的接收提前量，真实收益待四例真机确认。",
+    "模拟器未报告泳道与部分应用完成状态未知，跨组边界与末 tile 的实际空闲未单独量化。"
+  ]
+}

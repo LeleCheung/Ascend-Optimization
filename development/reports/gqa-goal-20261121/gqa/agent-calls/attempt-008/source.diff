@@ -1,0 +1,49 @@
+--- 
++++ 
+@@ -71,6 +71,21 @@
+ exp2(-inf-m)=0 exactly.  Cost/risk: a 128x256 fp32 qk tile and a 128x256 fp16
+ dot operand pair are larger than the previous 128/128 tiling, so the compile may
+ hit the UB/L0C budget; the causal path keeps 64/64 and is untouched.
++
++Query-row reuse, extended (this round's isolated experiment): the row tiling is
++still 64 on the causal path and 128 for the remaining non-causal shapes, but a
++non-causal *bf16* input with D <= 128 and S >= 256 now uses BLOCK_M = 256.  The
++current case-4 kernel (actual TTIR/BCMLIR of the accepted source) already loads
++the whole KV extent in one block and runs one QK, one softmax and one fp16 PV
++with no loop-carried accumulator, so doubling the M tile changes neither the
++expression nor any live-across-iteration state: it only halves the program count
++(case4: 2x256 -> 1x256 = 256 programs), the number of K/V reloads inside a
++program and the number of cross-core handoff chains, while every output row still
++accumulates the same products in the same j order.  The cost is that every
++M-scaled live buffer doubles; for the 128x256 fp32 qk/p tile seen in the BCMLIR
++that means 256x256 fp32 = 256KiB against the 196608B budget, so whether this
++geometry is allocatable is decided by the real external compilation, not by this
++comment.  FP16, short-S (S < 256) and causal launch geometries are untouched.
+ 
+ Compile-time geometry specialisation (earlier, retained mechanism): shape, stride,
+ head counts, scale and the causal offset are passed as tl.constexpr, because
+@@ -323,7 +338,23 @@
+         # 估算约 192KB、逼近 196608B 预算，故非因果才用；因果分支若回到
+         # BLOCK_N=128 会重新引入 BLOCK_N 线性相关的索引临时量，实测峰值曾达
+         # 231488B，故因果仍取 64/64，其编译与数值路径不变。
+-        BLOCK_M = 64 if is_causal else 128
++        # 本轮隔离实验（唯一改动）：非因果 BF16 且 D<=128 且 S>=256 时把 query
++        # 行分块由 128 提到 256。006 的实际 TTIR/BCMLIR 已确认整段 KV 单块、
++        # 单次 QK、单次 PV、无在线重缩放，故 M 翻倍不会重新引入跨轮残留累加；
++        # case4 的 grid 由 (2,256)=512 程序降到 (1,256)=256 程序，每程序固定
++        # 的 K/V 载入（2×64KiB）、标量初始化与交接链被 256 行复用，总 K/V
++        # 载入 64MiB->32MiB、总 L0C 搬出仍约 96MiB（每程序 192->384KiB、程序
++        # 数减半）。代价是 M 维活跃缓冲整体翻倍，按 BCMLIR 的 128x256 f32
++        # qk/p tile 推算 BM256 下为 256x256 f32=256KiB，已超 196608B 预算，
++        # 能否分配由外部真实编译判定；失败则原样保留确切字节供下轮资源调查。
++        # 因果 64/64、非因果短 S（S<256）与 FP16 非因果仍保持 128，BN 选择
++        # （SKV 为 256 整数倍时 256，否则 128）与 kernel 计算 AST 一律不变。
++        if is_causal:
++            BLOCK_M = 64
++        elif value.dtype == torch.bfloat16 and S >= 256:
++            BLOCK_M = 256
++        else:
++            BLOCK_M = 128
+         if is_causal:
+             BLOCK_N = 64
+         else:

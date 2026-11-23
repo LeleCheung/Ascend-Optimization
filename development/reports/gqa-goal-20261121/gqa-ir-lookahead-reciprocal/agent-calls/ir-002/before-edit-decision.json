@@ -1,0 +1,202 @@
+{
+  "timestamp": "2026-11-21T18:44:02.064019+00:00",
+  "diagnosis": {
+    "source_sha256": "19f7fb238946cb9006286d4d222425d07c4ea9fc38a7d4ff85c71c72c49c584a",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "ir/target.hivm.mlir",
+        "category": "source_ir",
+        "role": "机制定位：原生VREC归一化组的实际屏障序列",
+        "finding": "符号 _gqa_fwd_kernel_mix_aiv 的 loc(#loc212) 组内：%rcp_src/%rcp_dst/%rcp_tmp 定义后行477 有 pipe_barrier[<PIPE_V>]（归约→VREC），行481 为 func.call @vrec_1d_float，行482 为 VREC 之后第一处 pipe_barrier[<PIPE_V>]，行483 memref.expand_shape 与行484 hivm.pointer_cast(%c114944_i64) 两处纯视图/地址操作，行485 为第二处 pipe_barrier[<PIPE_V>]，行486-493 为 acc_src_c/rcp_2d_c/vmul_dst_c/vmul_tmp_c 四处 memref.cast 与 func.call @vmul_2d_float。行477、482、485 三处屏障同属 loc(#loc212)。行482 与行485 之间无 set_flag/wait_flag/sync、无函数调用、无内存访问。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "当前候选二进制内的屏障存活核验与时间位置",
+        "finding": "target_binary_sha256=5664717854b3f3cb7fe2a508b271b81216dab8ebbaceb27ed3eb619a56228473，与 context.current_ir_retention.binary_sha256 一致。core0.veccore0 报告：BAR 0x10d11cfc 起于 45.256us，VREC 0x10d11d10 覆盖 45.258-45.271us，BAR 0x10d11d20 起于 45.270us，VBRCB 0x10d11d3c 覆盖 45.272-45.287us，BAR 0x10d11d40 起于 45.285us，VMUL 0x10d11d6c 覆盖 45.287-45.385us；core0.veccore1 同样报告 VREC 0x10d11d10 与 BAR 0x10d11d40。三处 BAR 的 csv_calls 均为 15，csv_duration_us 依次为 8.12、8.26、8.43。窗口内 veccore0 的 VECTOR BAR 共计 6 个 PC（0x10d11c90/cb8/cec/cfc/d20/d40），VREC→VMUL 区间保留两条相邻 BAR。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "paired_profiling",
+        "role": "向量核等待量与热点归并方式",
+        "finding": "候选 _gqa_fwd_kernel_mix_aic 的 core0.veccore0 源码邻域（candidate.py 593-600）为 243 条指令、instruction_time_sum_us=389.55、largest_instruction_us=92.65、wait_instruction_time_sum_us=250.17，流水清单含 FLOWCTRL/MTE2/MTE3/SCALAR/VECTOR；interpretation 声明累计指令时间仅用于关注度排序、各流水可重叠、非已证实因果；limitations 声明静态源码范围对应多段指令、函数入口行号可覆盖大段代码。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "全局向量等待占比与独立核测口径",
+        "finding": "candidate Task Duration(us)=152.443054、Block Dim=20、Mix Block Dim=40、Current/Rated Freq=1650；ResourceConflictRatio.csv/vector0 的 aiv_vec_wait_ratio valid=20、mean=0.072571、min=0.064541、max=0.082289，aiv_mte2_wait_ratio mean=0.0821474、aiv_mte3_wait_ratio mean=0.2984688；reference/native Task Duration(us)=129.202591。"
+      },
+      {
+        "path": "compiled-readonly/manifest.json",
+        "category": "source_ir",
+        "role": "低层产物阶段核对与冗余消除检查",
+        "finding": "工作区无 lowered-inventory.json，实际低层产物清单为 compiled-readonly/manifest.json。_gqa_fwd_kernel.bcmlir 停在 linalg/tensor 层（tensor.empty、linalg.fill），_gqa_fwd_kernel.ttadapter 共 371 行，两者内 pipe_barrier、vrec、hivm 符号出现次数为零；其 npubin sha256=3972cdc5bef4ebdc816b6dccaf3405946f390cc04b21fa3e56ca7de85c11832f，对应条件交错 A 块二进制。这两级产物位于 HIVM 屏障生成之前，故屏障是否被后端消除由 timeline 绑定的 56647178… 二进制反汇编判定：三处屏障在两向量核循环体内均实际出现，当前后端对这些屏障保持原样。"
+      },
+      {
+        "path": "codex-brief.json",
+        "category": "paired_profiling",
+        "role": "Codex 证据分析与候选方向（本轮机制来源）",
+        "finding": "Codex 指认 VREC 与 VMUL 之间存在两次 Vector 屏障、中间只有 memref.expand_shape 与 hivm.pointer_cast 视图操作、无 Vector 工作，并提出仅删第二处屏障；同时限定本轮只改这一条屏障、保留 VREC 精度、地址与 QK/PV 结构，并约定二进制相同时按编译消除的同实现结果处理。本轮核对该判定与实际 IR 行477/482/485 及 timeline 的 BAR 位置一致，采纳其机制边界。"
+      }
+    ],
+    "hypothesis": "行485 的 PIPE_V 屏障等待对象为行482 已经等待完成的 VREC 及其前序向量工作。行482 至行485 之间只有 memref.expand_shape 与 hivm.pointer_cast 两类视图/地址操作，设备写入、向量指令、MTE 事务与事件操作数量均为零。VREC 结果到 VMUL 的完成依赖由行482 屏障承担，行486 起的四类 memref.cast 与 vmul_2d_float 继续按原顺序读取 %rcp_dst 与 %55。因此行485 屏障在该组内语义重复；删除后每轮每向量核少一次 PIPE_V 队列排空，向量等待占比与关键路径等待量下降，VMUL 紧随 VBRCB 在有序向量流水内执行，数据流由行482 屏障与同流水顺序覆盖。",
+    "alternatives": [
+      {
+        "id": "A",
+        "mechanism": "保持 IR 原样交接",
+        "reason": "若宿主编译证明 hivmc 在 lowering 阶段已重新合并或消去该屏障，二值与 56647178… 相同，机制退化为同实现，此时以 no-change 或等价二进制登记，收益为零。"
+      },
+      {
+        "id": "B",
+        "mechanism": "同时删除行482 屏障，仅留行485",
+        "reason": "行482 紧随 VREC 调用、与 VREC 之间零操作；删除它会把 VREC 完成等待推迟到行485，语义上仍可覆盖，但与本轮登记的“保留 VREC 之后第一处”不符，且扩大改动面，留作独立调用。"
+      },
+      {
+        "id": "C",
+        "mechanism": "源码层改写归一化组以自然减少屏障",
+        "reason": "Triton 语言层无 PIPE_V 屏障原语，最接近的源码表达是把倒数与逐元素乘合并为单次向量组；ir-001 已用 @vrec_1d_float 完成该方向，源码身份固定，本轮作为独立研究身份保留。"
+      },
+      {
+        "id": "D",
+        "mechanism": "改变 VREC 精度、向量长度或 acc/QK/PV 布局",
+        "reason": "属于另一类机制，涉及数值语义与 ABI 边界；本轮排除，留作独立调用验证。"
+      },
+      {
+        "id": "E",
+        "mechanism": "MTE3 等待与 cube 侧 PIPE_V 屏障（0x10d11c08 等）",
+        "reason": "profiling 显示 aiv_mte3_wait_ratio=0.298469，hotspots 显示 cubecore0 的 BAR 单次约 1.6us；两者位于 V→CUBE 与 V→MTE3 方向，本轮动机限于 loc212 组内冗余屏障，其他方向留作待验证假设。"
+      }
+    ],
+    "change": "仅删除 ir/target.hivm.mlir 行485 的 hivm.hir.pipe_barrier[<PIPE_V>] loc(#loc212)，即 %vmul_tmp = hivm.hir.pointer_cast(%c114944_i64) 之后、%acc_src_c memref.cast 之前的那一处。保留行477（归约→VREC）与行482（VREC→VMUL 依赖）屏障，保留 loc207/208/209/152 全部屏障、全部 set_flag/wait_flag/sync_block_set/sync_block_wait 及其 EVENT_ID/flag 配对、UB 地址常量（c114688/c114944/180224/81920/65536/32768）、buffer 别名与跨迭代生存期、函数 ABI 与 signature，以及全部算术、cast、浮点顺序、特殊值与边界路径。每次调用只落这一个机制，同时编辑同一机制所需的全部特化（本文件仅一个特化 _gqa_fwd_kernel_mix_aiv）。",
+    "expected": [
+      {
+        "item": "指令",
+        "prediction": "两向量核循环体内各少一条 BAR（veccore0 每轮 VECTOR BAR 由 6 条降为 5 条，对应 0x10d11d40 位置消失或改址）；VREC 每轮 1 条、VMUL 每轮 2 条、VBRCB 每轮 1 条、VCONV 每轮 1 条、VCADD 每轮 1 条与 MOVEMASK/SET_FLAG 计数保持原值。"
+      },
+      {
+        "item": "动态轮次",
+        "prediction": "20 个常驻 worker 的 tile 分区循环次数保持原值；观测窗口内每核归一化组实例数 15 保持原值；跨核 sync_block 握手次数保持原值。"
+      },
+      {
+        "item": "等待",
+        "prediction": "每轮每向量核减少一次 PIPE_V 排空。以 timeline 中被删屏障 csv_duration_us=8.43/15 次为上限，每核窗口等待上界减少约 8.4us；若其中主要部分为 VBRCB 完成等待仍然必要，实际减少量向 0 收缩。预测 aiv_vec_wait_ratio 由 0.072571 下降 0.5-3 个百分点。"
+      },
+      {
+        "item": "资源",
+        "prediction": "UB 地址分配、buffer 别名（vmul_tmp 位于已死亡的 exp 缓冲 114688-180224 内部）、MTE2/MTE3 事件编号与 flag 值、aiv_vec_bank_cflt_ratio 与 UB 读写字节量保持原值；VBRCB 与 VMUL 仍在同一 VECTOR 流水内有序发射。"
+      },
+      {
+        "item": "端到端",
+        "prediction": "case4 正式 full-call 由 145.9246us 预测进入 143.0-145.5us 区间（约 -0.3% 至 -2%），四案地均值同向；独立核测由 152.443054us 预测进入 150.0-152.4us 区间。宿主的原四项 checker 与条件交错分别核对兑现情况与偏差。"
+      },
+      {
+        "item": "二进制",
+        "prediction": "预期 npubin sha256 偏离 56647178…（少一条 BAR）；若宿主编译得到与 56647178… 或 3972cdc5… 相同的二进制，则按编译消除的同实现结果登记，收益记为 0，器件复测省略。"
+      },
+      {
+        "item": "数值",
+        "prediction": "全部数值运算、cast、特殊值（NaN/Inf/零行/极值）、边界掩码与浮点顺序逐字保持，官方 checker 四项通过状态与 ir-001 一致。"
+      }
+    ],
+    "validation": "宿主先对编辑后的 ir/target.hivm.mlir 做 HIVM 解析与 hivmc 续编译，比较 npubin sha256。二进制变化时：运行原四项官方 checker（checker_sha256=863f6862…、golden_sha256=c86aaa0b…）、独立核测与条件交错，并重放 timeline 核对每向量核 VECTOR BAR 计数 6→5、VREC/VMUL/VBRCB 计数不变、VREC 与 VMUL 区间相对顺序保持；二进制相同时：登记为编译消除的同实现结果，不改文件、不做器件复测。两条路径均以完整 KGS 与宿主审查为准。",
+    "layer_reason": "Triton 表达能力：loc212 归一化组由 tl.sum、tl.exp2 与 acc/l_new 生成，PIPE_V 屏障由编译器自动插入，Triton 语言层无屏障原语，源码无法表达“删除第二处屏障”；同类意图在源码可表达的方向是把倒数与逐元素乘合并为单次向量组，该方向已由 ir-001 的 @vrec_1d_float 落地。固定源码实验目的：本轮 source_sha256 与 frozen.py 逐字节固定，专门验证已编译 HIVM 内屏障冗余，与源码重写、编译选项两条研究身份相互独立。IR 控制点：hivm.hir.pipe_barrier[<PIPE_V>] 位于 loc(#loc212) 组内且被 hivmc 直接消费，是唯一可精确删除该重复排空的层；函数 ABI 与 signature 在此层可见并保持。",
+    "simulator_incremental_judgment": "时钟资质：timeline clock_validation status=verified、unit=us、compared_pcs=30、matching_pcs=30、median_ratio=0.9994920794990393，scalar_comparison 以 18 个 PC、median_ratio=1.0022727 单独保留口径差异，未用于校准。观测范围：cubecore0 窗口 32.599-138.761us、veccore0 32.599-139.884us、veccore1 32.601-139.882us，覆盖约 106-107us，相对 profiling 的 152.443054us 核任务为部分窗口，capture_scope 记为首末可见硬件事件，display_time_unit=window_fraction。已报告泳道为 CUBE/MTE1/MTE2/MTE3/FIXP/SCALAR/SCALARLDST/VECTOR，CACHEMISS 标为 auxiliary_trace_lane，未报告泳道保持未知。热点累计指令时间可跨流水重叠，排名仅用于定位本轮候选机制，设备波次、带宽与关键路径结论须引用独立支持材料。增量判定：本次增量是 loc212 组内一条 PIPE_V 屏障，预测由每核每轮 6 条 BAR 降为 5 条、等待量从 8.43us/15 次上限内部分回收，全部观测约束到本轮编辑后重编译的二进制与上述窗口。",
+    "unknown": [
+      "hivmc 在 lowering 阶段是否重新插入、重排或合并该屏障，决定二进制是否变化。",
+      "被删屏障 csv_duration_us 中 VBRCB 完成等待与纯队列排空的比例，决定实际收益落点。",
+      "cube 侧 BAR（0x10d11c08、0x10d11be4、0x10d11bbc，running_time_us 24.14/19.31/16.73 每 15 次）与 aiv_mte3_wait_ratio=0.298469 的独立机制。",
+      "未报告泳道（如 CACHEMISS 之外的空闲区间）的真实等待量。"
+    ]
+  },
+  "diagnosis_sha256": "1bf51c2b35b51d152e01535a1e468e173cb3b7eb1b14119984b4c1737615486b",
+  "evidence": [
+    {
+      "path": "ir/target.hivm.mlir",
+      "category": "source_ir",
+      "role": "机制定位：原生VREC归一化组的实际屏障序列",
+      "finding": "符号 _gqa_fwd_kernel_mix_aiv 的 loc(#loc212) 组内：%rcp_src/%rcp_dst/%rcp_tmp 定义后行477 有 pipe_barrier[<PIPE_V>]（归约→VREC），行481 为 func.call @vrec_1d_float，行482 为 VREC 之后第一处 pipe_barrier[<PIPE_V>]，行483 memref.expand_shape 与行484 hivm.pointer_cast(%c114944_i64) 两处纯视图/地址操作，行485 为第二处 pipe_barrier[<PIPE_V>]，行486-493 为 acc_src_c/rcp_2d_c/vmul_dst_c/vmul_tmp_c 四处 memref.cast 与 func.call @vmul_2d_float。行477、482、485 三处屏障同属 loc(#loc212)。行482 与行485 之间无 set_flag/wait_flag/sync、无函数调用、无内存访问。",
+      "sha256": "a28d48359241880dcb0890268a3695a1d8118c9327156c07081b0b079a5d1e7b"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "当前候选二进制内的屏障存活核验与时间位置",
+      "finding": "target_binary_sha256=5664717854b3f3cb7fe2a508b271b81216dab8ebbaceb27ed3eb619a56228473，与 context.current_ir_retention.binary_sha256 一致。core0.veccore0 报告：BAR 0x10d11cfc 起于 45.256us，VREC 0x10d11d10 覆盖 45.258-45.271us，BAR 0x10d11d20 起于 45.270us，VBRCB 0x10d11d3c 覆盖 45.272-45.287us，BAR 0x10d11d40 起于 45.285us，VMUL 0x10d11d6c 覆盖 45.287-45.385us；core0.veccore1 同样报告 VREC 0x10d11d10 与 BAR 0x10d11d40。三处 BAR 的 csv_calls 均为 15，csv_duration_us 依次为 8.12、8.26、8.43。窗口内 veccore0 的 VECTOR BAR 共计 6 个 PC（0x10d11c90/cb8/cec/cfc/d20/d40），VREC→VMUL 区间保留两条相邻 BAR。",
+      "sha256": "fe54ed0cf96773ce88169a3958c1c65858205d37c8d244c59e0757d6a101f754"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "paired_profiling",
+      "role": "向量核等待量与热点归并方式",
+      "finding": "候选 _gqa_fwd_kernel_mix_aic 的 core0.veccore0 源码邻域（candidate.py 593-600）为 243 条指令、instruction_time_sum_us=389.55、largest_instruction_us=92.65、wait_instruction_time_sum_us=250.17，流水清单含 FLOWCTRL/MTE2/MTE3/SCALAR/VECTOR；interpretation 声明累计指令时间仅用于关注度排序、各流水可重叠、非已证实因果；limitations 声明静态源码范围对应多段指令、函数入口行号可覆盖大段代码。",
+      "sha256": "fab4a43a804049e8360ebddd13981960ced79eae2411369196eaee5f21b4102e"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "全局向量等待占比与独立核测口径",
+      "finding": "candidate Task Duration(us)=152.443054、Block Dim=20、Mix Block Dim=40、Current/Rated Freq=1650；ResourceConflictRatio.csv/vector0 的 aiv_vec_wait_ratio valid=20、mean=0.072571、min=0.064541、max=0.082289，aiv_mte2_wait_ratio mean=0.0821474、aiv_mte3_wait_ratio mean=0.2984688；reference/native Task Duration(us)=129.202591。",
+      "sha256": "1bb6ba3828d583e97ba52778d88b9f6cf17897a70c8f74b0b4a12f8e3ad2b507"
+    },
+    {
+      "path": "compiled-readonly/manifest.json",
+      "category": "source_ir",
+      "role": "低层产物阶段核对与冗余消除检查",
+      "finding": "工作区无 lowered-inventory.json，实际低层产物清单为 compiled-readonly/manifest.json。_gqa_fwd_kernel.bcmlir 停在 linalg/tensor 层（tensor.empty、linalg.fill），_gqa_fwd_kernel.ttadapter 共 371 行，两者内 pipe_barrier、vrec、hivm 符号出现次数为零；其 npubin sha256=3972cdc5bef4ebdc816b6dccaf3405946f390cc04b21fa3e56ca7de85c11832f，对应条件交错 A 块二进制。这两级产物位于 HIVM 屏障生成之前，故屏障是否被后端消除由 timeline 绑定的 56647178… 二进制反汇编判定：三处屏障在两向量核循环体内均实际出现，当前后端对这些屏障保持原样。",
+      "sha256": "19c40de6d67b0eb7c4f6fd09b8f4b73638d6a54ace33d807b0d98ef39dea274f"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "paired_profiling",
+      "role": "Codex 证据分析与候选方向（本轮机制来源）",
+      "finding": "Codex 指认 VREC 与 VMUL 之间存在两次 Vector 屏障、中间只有 memref.expand_shape 与 hivm.pointer_cast 视图操作、无 Vector 工作，并提出仅删第二处屏障；同时限定本轮只改这一条屏障、保留 VREC 精度、地址与 QK/PV 结构，并约定二进制相同时按编译消除的同实现结果处理。本轮核对该判定与实际 IR 行477/482/485 及 timeline 的 BAR 位置一致，采纳其机制边界。",
+      "sha256": "e02bea97c1f510da6ecf2e8ab0b3bc1fc917fd5e633c53d0457a9128e231d484"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "19f7fb238946cb9006286d4d222425d07c4ea9fc38a7d4ff85c71c72c49c584a",
+    "contract.json": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858",
+    "ir-inventory.json": "eab2816fd23c47a8e919e6780dc7b00b409088ef531ccba0ac9829bb79e57076",
+    "profiling.json": "1bb6ba3828d583e97ba52778d88b9f6cf17897a70c8f74b0b4a12f8e3ad2b507",
+    "hotspots.json": "fab4a43a804049e8360ebddd13981960ced79eae2411369196eaee5f21b4102e",
+    "timeline.json": "fe54ed0cf96773ce88169a3958c1c65858205d37c8d244c59e0757d6a101f754",
+    "historical-059-native-vrec.mlir": "be4f69f4d9a2f1f8999dfa8fc0548b9f4a06bc1271e837b8a3a6424469923015",
+    "historical-059-native-vrec-result.json": "5e5654a383ad9e6331ecc1276a02961f2e91f61373267c8f54d6288ef603bb56",
+    "context.json": "1f47905142e71538d45a5d735175c10297ca68aeaaec55e459f34ca4b08d090c",
+    "feedback.json": "a52e73df16882b6026565ba526ecf2d4dfb739b367cb68a599113f6e8fe27687",
+    "diagnosis.json": "a8d77dee8ac32ec8c6bc494d90b9794368bfc486a25c3682fe7fce1604d859ae",
+    "codex-brief.json": "e02bea97c1f510da6ecf2e8ab0b3bc1fc917fd5e633c53d0457a9128e231d484",
+    "backend-binding.json": "037ff0b2558304288330a3f53e59a9c8e26e7fbe37d5133337922ae1eaf37421",
+    "ir/target.hivm.mlir": "a28d48359241880dcb0890268a3695a1d8118c9327156c07081b0b079a5d1e7b",
+    "compiled-readonly/_gqa_fwd_kernel.source": "e0dac92dbebfe6df5fbab3f1f2fcd64471f3068401d34a58efe87bd56a1ea632",
+    "compiled-readonly/_gqa_fwd_kernel.ttir": "5d66bbc4930f03ec142fde1f7aae8d01b71d5cfaa8527500198c810c2e49205b",
+    "compiled-readonly/_gqa_fwd_kernel.ttadapter": "e394963e0d7c4428865cf5c22f53a394855520a1c3549062432a73a8424a7f38",
+    "compiled-readonly/_gqa_fwd_kernel.mlirbc": "cb1d2dc9af307221254b1f408feb5ea9cd287f9701af273383ea35726f85562b",
+    "compiled-readonly/_gqa_fwd_kernel.bcmlir": "b39e0b3c3b69599dce8713f580ba48a934e262babd4652b4d7605252d95ac120",
+    "compiled-readonly/_gqa_fwd_kernel.npubin": "3972cdc5bef4ebdc816b6dccaf3405946f390cc04b21fa3e56ca7de85c11832f",
+    "compiled-readonly/manifest.json": "19c40de6d67b0eb7c4f6fd09b8f4b73638d6a54ace33d807b0d98ef39dea274f",
+    "public-source/EltWise1D.cpp": "adeefa4bb642711ecc76df257f8217fd91398e52453426e4f8736c5a973fa773",
+    "public-source/EltWise2D.cpp": "84f63673a9662d96e0ecd6f8dd78467dfe5e6e1daa529e50163d1d9ae74a312e",
+    "public-source/hivm-op-decompose.mlir": "104b8f583e8a163892c2ce0ad9785237eb7ba43eb201feedd5ef2fd6f11c951a",
+    "public-source/HIVMDecomposeOp.cpp": "2fd26ffb92eb0fc6c8dfd6e424b5874be32582773b28063cb49adec68dc9bbb0",
+    "public-source/HIVMToStandard.cpp": "8c8654126e129d88cc0d73c8c28f9886bade5f67ce1619e9d3cc2a9038fd4d60",
+    "public-source/sources.json": "4728abc28bb9507dba602d6292a5768e0117ba2b5f5f782d3b799a9aa643045f",
+    "public-source/tree-query.json": "27bab0976fa7ab2ae66ac9914488cba4bb4f22c8efbe6618f8a7e8d0e6bfdb6d",
+    "capability-readonly/installed-ascendc-reciprocal.txt": "f6ccc6d3049f02dfd43a768a8641bae22f4a7bab17642eb1cdd2757277ea1522",
+    "capability-readonly/status.json": "e60a92c022225d2918cdc8ea0809425a31be157bd646169adb063ea62255ce05",
+    "capability-readonly/llvm-inspection-request.json": "cd9c71f3a6d51cd91d3740a2bd11a88e7b5778e861a0e0e793f09f9160ab70fb",
+    "capability-readonly/llvm-inspection.log": "724f5e1d2db24f96c23f6ccfb23e8af7fc0b48aea72381fa3475f0b086bd16af",
+    "capability-readonly/llvm-reciprocal-symbols.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "capability-readonly/hivm-reciprocal-op-strings.txt": "04e9dcea5624136ca9d4a89ade7791efcbfcf61f306b7eb7e26827579bedef4a",
+    "capability-readonly/meta-llvm-inspection-request.json": "f005c9f012bd620b263c18e74d4e8060292735e88c86ee0984d02ae93a0c27f0",
+    "capability-readonly/meta-llvm-inspection.log": "6c7c789f8d222083719eaa60295241589e6f55c806f952dbf1a253e5624711f4",
+    "capability-readonly/meta-llvm-reciprocal-symbols.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "capability-readonly/backend-reciprocal-strings.txt": "09cfc26956265595950f4edfb22d02435f6461d07e96bbf9ad8717463a38bd47",
+    "capability-readonly/installed-triton-reciprocal-interface.txt": "494d3cf3c528779aa21a6f91b02c2d69da69d1f75827fec1344a6007f1b1f05e",
+    "capability-readonly/installed-reciprocal-evidence.txt": "86370a5c6ff93e03b7b04a6e15de4a927a6922ec8322dc0f972502524b6bcf10",
+    "capability-readonly/bishengir-hidden-help.txt": "ef3c382886a08314b6d3a11ffcc89e7e1ee06ea0e33a19f350fbbc04d11644d6"
+  },
+  "decision_tool_sha256": "2ba55ebab8be5b8a2363da657d6ee81799d4cabcdfb8e1494846aecfd1fde624"
+}

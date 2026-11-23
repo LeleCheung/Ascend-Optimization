@@ -1,0 +1,23 @@
+--- 
++++ 
+@@ -185,8 +185,19 @@
+ 
+         acc = tl.dot(p.to(tl.float16), v16)
+ 
++        # 本轮机制（PV 后归一化：行倒数 + 广播乘）：实际 IR 里此处是
++        # arith.divf tensor<128x128xf32>（BCMLIR 为 128x1 broadcast 后逐元素 divf），
++        # 即每 program 对 BLOCK_M*BLOCK_D 个 fp32 元素做秩2除法。保持"未归一化 p 的
++        # FP16 PV"与归一化仍位于 PV 之后不变，只把秩2除法改成先求 rank1 倒数
++        # inv_l = 1/l_safe（仅 BLOCK_M 次除法），再广播乘 acc*inv_l[:, None]，
++        # 使向量段的除法元素数由 BLOCK_M*BLOCK_D 降到 BLOCK_M。交接链条数、
++        # 输出流量、写出次序与下面的 l_new>0 掩码/地址均不变。
++        # 数值风险：a/b 与 a*(1/b) 不等价，多出一次 fp32 倒数舍入（相对约 2^-24）；
++        # 随后输出仍截断到 bf16（约 2^-8），故相对输出舍入可忽略，最终由原四项
++        # 官方 checker 判定。反例边界为 l_safe 极接近 0 已由 where 置 1，不代入。
+         l_safe = tl.where(l_new > 0.0, l_new, 1.0)
+-        out = acc / l_safe[:, None]
++        inv_l = 1.0 / l_safe
++        out = acc * inv_l[:, None]
+         out = tl.where(l_new[:, None] > 0.0, out, 0.0)
+ 
+         o_ptrs = Out + b * o_sb + hq * o_sh + offs_m[:, None] * o_ss + offs_d[None, :] * o_sd

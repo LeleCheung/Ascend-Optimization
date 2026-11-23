@@ -1,0 +1,85 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "c7de9e3207733ddffca530e3a1650576d5dd940caa608fdab4af1ef53736fba4",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "background",
+      "finding": "case4 候选 kernel task duration 174.043488us，CANN 参考 128.842575us；候选 Block/Mix 20/40、参考 19/38，设备侧算术量已与参考同量级（aic_cube_total_instr_number 均为 2048）。本项说明设备核时间之外仍存在完整调用差距，需要区分主机发射与设备本体。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "TTIR 函数签名只保留 %Q/%K/%V/%Out 四个指针参数且均带 tt.divisibility = 16；其余形状、stride、分块与算符标志全部作为 constexpr 常量折叠，确认主机 ABI 中仍保留完整签名槽位（constexpr 为 PyObject 占位），且对齐属性是编译特化的一部分。"
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "background",
+      "finding": "BCMLIR 与 TTIR 对应的设备计算图未变，本轮不改 kernel AST/算术，故设备产物应逐字保持；主机缓存只复用同一已编译句柄。"
+    },
+    {
+      "path": "workspace/host-dispatch-diagnostic.json",
+      "category": "probe",
+      "role": "trigger",
+      "finding": "case4 attempt-038 中位 enqueue 166.86665us、final drain 14.707us、total 181.57365us（试次另一组 184.75/180.71）。独立 instrumented cProfile 显示热调用中 jit.py run 累计 166.55us、dynamic_func(binder) 35.7us、specialize_impl 24.2us、compute_cache_key 8.19us、apply_compile_options 9.19us、launch_metadata 5.64us、__triton_launcher.launch 48.996us、torch.empty 12.19us。该证据表明暖调用的主机绑定/特化/键计算/选项分发仍占可观比例，值得用一个不改变设备产物的编译句柄缓存实验来区分。"
+    },
+    {
+      "path": "workspace/host-launch-knowledge.json",
+      "category": "knowledge",
+      "role": "background",
+      "source_sha256": "8764018cfb2cab9444a34caf7a171f7eac7395656631698ce491e676557462f0",
+      "finding": "历史 selu_ 实现曾缓存编译启动器、函数句柄与 packed metadata 并按当前指针/stream 直接启动，小输入完整调用由约 80us 恢复到约 13-15us；同时明确约束：必须动态读取当前 device/stream 与指针，不得缓存张量结果、指针或 stream，必须保留完整启动 ABI（含 constexpr 槽位），compile-only/debug/采集钩子须走普通 JIT，编译产物缓存键须含设备身份。"
+    },
+    {
+      "path": "workspace/installed-jit.py",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "JITFunction.run 先 apply_compile_options、取 device/stream、执行 pre_run_hooks、用 dynamic_func 绑定参数与 specialization、compute_cache_key 查 kernel_cache，再调用 kernel.run(grid_0..2, stream, kernel.function, kernel.packed_metadata, launch_metadata, launch_enter_hook, launch_exit_hook, *bound_args.values())，并在每次发射前校验 used_global_vals。bound_args 覆盖完整签名（含 constexpr 值），这是可复用句柄路径必须逐字重建的 ABI 序列。"
+    },
+    {
+      "path": "workspace/installed-driver.py",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "CompiledKernel.run 属性返回的正是 NPULauncher 实例；NPULauncher.__call__ 内部处理 compile_only、TRITON_REGISTER_TENSOR_MSPROF 的当前张量形状登记以及 debug 隐藏参数，最后调用生成的原生 launch。C launch 的 PyArg_ParseTuple 依次接收 gridX/Y/Z、stream、function、packedMetadata、launch_metadata、enter/exit hook，再接收完整签名槽位（constexpr 为 PyObject*）。因此缓存句柄后仍应经 NPULauncher 调用，才能自然继承 compile-only/采集/debug 语义。"
+    },
+    {
+      "path": "workspace/installed-compiler.py",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "CompiledKernel 持有 function、packed_metadata 与惰性 _init_handles；launch_metadata 在无自定义 launch_metadata 时仅构造 LazyDict，真正回调由 launch_enter/exit_hook 决定。主机的 function/packed_metadata 属于已编译产物元数据，可缓存；当前 stream 与张量地址必须逐次读取。"
+    },
+    {
+      "path": "workspace/installed-knobs.py",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "launch_enter_hook/launch_exit_hook 是始终存在的 HookChain 容器，活动性应看其 .calls 是否非空而非对象是否为 None；knobs.runtime.debug 在导入时读取。快路径据此在 .calls 为空时传 Py_None 跳过空链 Python 调用，在存在真实回调时回退普通 JIT。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "保留最佳源码 c7de9e32… 的四项正式结果全通过；case4 候选 full_call_us=190.58165，原生参考 128.9491，native_over_candidate=0.6766。其余 case1/2/7 分别为 91.24705/87.13105/99.5031us。目标是在不改设备算术的前提下测试主机发射缓存能否降低 case4 完整调用时间。"
+    }
+  ],
+  "hypothesis": "暖调用中，Triton 普通 JIT 路径每次重复执行参数绑定（dynamic_func）、specialize_impl、compute_cache_key、apply_compile_options 与 launch_metadata 构造；这些主机工作只用于选中一个已经编译好的、随几何完全固定的 kernel，并不改变设备计算。若在第一次普通 JIT 调用后按静态特化身份缓存已编译句柄、函数句柄与 packed metadata，并在后续调用以当前张量/当前 stream 重建完整 42 槽启动 ABI，则可减少 case4 的 enqueue 主机开销；设备 kernel 产物的字节与 task duration 应保持不变。",
+  "alternatives": [
+    "继续降低设备侧交接/搬运（PART_TILES 类）——本轮被要求保持全部 @triton.jit AST 与算术逐字不变，且实际 IR 已固定，故不作为本轮机制。",
+    "缓存输出张量或复用 acc 缓冲——违反合同（必须每次新分配且不得缓存张量结果），排除。",
+    "绕过 NPULauncher 直接调用原生 launch——会跳过 compile-only、msprof 张量登记与 debug 隐藏参数语义，排除。",
+    "直接缓存张量指针/stream 值以减少查询——违反知识约束且设备/stream 变化会错误发射，排除。"
+  ],
+  "discriminating_observation": "若主机绑定是独立可测损失：修改后暖调用不再经过 dynamic_func/specialize_impl/compute_cache_key/apply_compile_options，设备 task duration 与 IR 哈希保持不变，而 case4 full_call_us 相对 190.58165 观测到超出噪声的下降；若 enqueue 完全被设备背压掩盖，则时间持平或仅微降，同时设备指标不变，可据此判定主机开销被隐藏。",
+  "change": "仅在 candidate.py 的 run() 外围增加模块内主机快路径：首次遇到某静态特化身份时执行一次普通 JIT 调用（恰好一次计算）并登记由该调用返回的真实 CompiledKernel；后续同一身份直接以缓存的 NPULauncher、function、packed_metadata 和不可变 constexpr 模板启动，参数元组由当前 query/key/value 与每次新分配的 y 加完整 constexpr 尾部构成（42 槽，含 constexpr 占位）。每次调用动态读取当前 NPU device 与 raw stream，不缓存指针/stream/张量；缓存键包含 device、dtype、形状/连续性与分块几何、实际 16B 对齐类别、grid；并逐次校验 used_global_vals、debug、pre_run_hooks、活动 launch hook、compile_only 与 JIT kernel_cache 仍在位；任一不满足即回退普通 JIT。kernel AST、算术、分块与全部 @triton.jit 函数逐字不变。",
+  "expected": "case4 暖调用减少 dynamic_func/specialize_impl/compute_cache_key/apply_compile_options 与 launch_metadata LazyDict 等主机工作，enqueue 最多下降约数十微秒量级；设备 task duration 与 IR 不变；full_call_us 若未被背压完全掩盖则低于 190.58165us。case1/2/4/7 的数值输出逐位不变，其他三项不因主机路径产生真实回退。",
+  "validation": "经工具桥 preflight 只读审查后，用原官方四项 checker（阈值不变）与正式计时合同验收；比较修改前后 actual IR 与 kernel task duration，确认设备计算未变；若宿主提供模拟器重放，确认设备窗口不因主机改动而变化；逐 case 报告 full_call_us 与正确性。",
+  "selected_layer": "host_dispatch",
+  "layer_reason": "实际 IR 显示设备数组计算与 CANN 参考同量级，paired profiling 的候选 task duration 与参考差距主要不在新的算术组织；host-dispatch-diagnostic 的暖调用栈直接显示 JIT 绑定/特化/键计算与选项分发仍逐次执行。历史上同类小输入已由编译句柄缓存显著降低完整调用。故本轮选择主机发射层，且它是唯一能在冻结 kernel AST 前提下独立验证的机制。",
+  "simulator_incremental_judgment": "当前剩余歧义是：case4 的 190.58us 完整调用中，主机绑定开销有多少被设备执行/背压掩盖，以及缓存句柄是否真能命中。该歧义无法由静态 IR 或历史模拟器窗口回答，只能由同一源码的暖调用计数与完整四项真机计时区分。由于设备 @triton.jit AST、算术与分块完全未改，设备 IR 应保持不变，本轮无需新增模拟器输入；此前模拟器知识继续作为设备侧历史依据保留，仅按要求在修改后对固定源码做设备重放以确认产物不变。",
+  "unknown": [
+    "enqueue 时间包含队列背压，主机耗时与设备耗时的可分离比例未知。",
+    "FlagPrism 的编译选项若在同一进程内动态变化，本轮快路径不会重新计算选项；该条件被视为进程级编译配置而非每次发射状态，仍由首次普通 JIT 的产物体现。"
+  ]
+}

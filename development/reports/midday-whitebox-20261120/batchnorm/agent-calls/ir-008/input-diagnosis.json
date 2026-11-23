@@ -1,0 +1,104 @@
+{
+  "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "context.json",
+      "category": "source_ir",
+      "role": "运行身份与比较基准",
+      "finding": "target=batch_norm_with_update_functional-timing-7（8x64x64x64, fp32, affine），当前最佳来自 ir-004 保留版；目标 0.039261332 ms、参考 0.028164471 ms、speedup 0.717359，源码 sha256 与本轮冻结源码一致，源码不可编辑。"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "当前最佳（ir-004 保留版）配对 profiling 计量",
+      "finding": "Task Duration 39.880798us、Block Dim 64、1650MHz；aiv_mte2_time 12.758428us、aiv_mte2_active_bw 20.0557GB/s、aiv_mte2_ratio 0.6651；aiv_vec_time 9.515303us、aiv_mte3_time 2.902784us、aiv_scalar_time 4.645445us、aiv_scalar_vector_stall_time 9.125492us、aiv_time 19.289365us、aiv_total_cycles 31827.45。即 MTE2 是占用最高的搬运路径，且其有效带宽仅约 20GB/s。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "指令热点与流水活跃度（core0.veccore0）",
+      "finding": "MTE2 active_ratio 0.877423（event 436、idle 0.122577）为所有硬件执行泳道最高；VECTOR active 0.906128/wait 0.394751/idle 0.093872；MTE3 active 0.402138；SCALAR active 0.083995；SCALARLDST event 5332、active 0.184939。top_instructions 中唯一的 MTE2 搬运点 0x10d1133c（MOV_SRC_TO_DST_ALIGN）calls=64、cycles=27099、running 16.42us，是单点最大搬运开销；该点正是统计（Welford）循环的 GM→UB 装载点。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "绝对时钟资质（absolute_unit_validation 段）",
+      "finding": "status=verified、unit=us、compared_pcs 33/33、median_ratio 1.000548；application_completed=true、absolute_time_qualified=true。Scalar 对照 18PC/17 匹配、median 0.998864 仅作口径保留未用于校准。故热点中的 us 可作绝对口径引用，归一化泳道比例另按窗口解释。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "窗口覆盖与归一化范围",
+      "finding": "单核 core0.veccore0 的 timeline：time_unit=fraction、capture_start 0.0、capture_end 1.0、capture_scope=首个到最后一个可见硬件事件；对应原始窗口 185.792999→224.198006（跨度 38.405，us 口径）。ALL/CACHEMISS/FLOWCTRL 为 auxiliary_trace_lane（ALL idle 0.99995），未报告泳道保持未知；窗口只覆盖 2 个程序实例，不能外推到 64 程序的整体波次。"
+    },
+    {
+      "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+      "category": "source_ir",
+      "role": "待改 IR 的实际结构",
+      "finding": "统计阶段用 %tile_lane=make_range(0,128) 的 8x128 片，n_num_steps_6=cdiv(spatial_dim,128)=32（对 spatial=4096），每轮 tt.load 8x128 并以 min(n+1,n_num_steps-1) 钳位预取；输出阶段宽路 %spatial_wide（spatial%256==0）用 8x256 片、16 轮，否则回退 8x128。两阶段相对独立，统计阶段与输出阶段各读一遍完整输入。"
+    },
+    {
+      "path": "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "后端是否已消除统计阶段的小片冗余",
+      "finding": "后端 IR 中统计循环仍为 memref.copy ... memref<8x128xf32, strided<[?,1]>> to memref<8x128xf32>（第 62/78 行，双缓冲 alloc 各 4KiB），输出宽路为 memref<8x256xf32>（第 220/232 行）。即 8x128 的小片搬运原样进入后端，没有被重新分块、合并或提升；疑似冗余在后端未消除。"
+    },
+    {
+      "path": "prior-ir006-instructions.json",
+      "category": "simulator",
+      "role": "按搬运长度归一化的 MTE2 效率（同一保留版统计循环、同次重放）",
+      "finding": "统计循环装载点 0x10d11334：calls=64、cycles=27154（约 424 cycle/次，4KiB 片、8 行各 512B）；1024 输出分支装载点 0x10d11f6c：calls=8、cycles=5405（约 675 cycle/次，32KiB 片、8 行各 4KiB）。两者按 cycle 计相差 1.6 倍而按字节相差 8 倍，说明 MTE2 每次搬运有约 390 cycle 的固定代价，4KiB 片每字节成本约 9.7B/cycle，而 32KiB 片约 48B/cycle。"
+    },
+    {
+      "path": "prior-ir006-formal.json",
+      "category": "paired_profiling",
+      "role": "ir-006 的反例约束（正式结果，配套 prior-ir006-stability.json 与 prior-ir006-supplements.json）",
+      "finding": "ir-006 候选（新增 8x1024 输出分支、保留钳位预取）完整 27/27 与双方各 36/36 通过，地理均值 1.905、目标 33.539900us 级；但四段 ABBA 中位数 36.487154/36.536723（原版）对 36.429490/36.885589（候选），ratio 0.996028、candidate_below_every_original=false，未自动保留。结论：单纯把“输出”循环的片加宽没有收益。"
+    },
+    {
+      "path": "prior-ir006-post-mechanism.json",
+      "category": "simulator",
+      "role": "ir-006 后端计量与流水对比",
+      "finding": "候选相对保留版：GM→UB 读取 268→292KiB/程序、MTE2 指令 121→85；trace 上 MTE2 event 436→316、active_ratio 0.877423→0.828880、MTE3 active 0.402138→0.312977、VECTOR active 0.906128→0.863265、VECTOR wait 0.394751→0.318969，而墙钟不变。读字节增加 24KiB 与 MTE2 占用只下降约 5.5% 同时出现，说明该机制在“输出”流（第二遍、局部性较好）上收益天花板很低。"
+    },
+    {
+      "path": "count-uniformity-probe.json",
+      "category": "simulator",
+      "role": "已排除的候选机制（配套 prior-count-post-mechanism.json 结论：no_target_improvement）",
+      "finding": "np.int32 计数向量每次迭代做一次 8x128 VADDS（pc 0x10d1137c，calls=64、cycles=5184、3.14us），但 ir-005 的计数标量化/一致性改写经完整评测为 no_target_improvement，故本轮不再重复；同一 VADDS 的向量代价也说明统计循环的每轮向量工作本身不大，循环代价主要来自装载。"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "source_ir",
+      "role": "宿主证据分析与候选方向（Codex 贡献）",
+      "finding": "Codex 记录了末轮钳位预取导致 136→160KiB 的纯输出读取增量，并提出“剥离最后一次输出迭代、尾步排空”的方向，同时明确把具体 IR 变换交给模型依据实际 TTIR/BCMLIR/流水选择。本轮采纳其“先量化每轮次代价、再决定变换”的证据方法，但把落点改到统计流：因为 ir-006 已实测输出流加宽无效，而统计流是同一钳位结构与更小片宽的组合，且从未被单独加宽。"
+    }
+  ],
+  "hypothesis": "当前最佳 IR 的编译缺陷在“统计阶段”的分块：统计循环以 8x128 片（每行仅 512B、8 行跨 16KiB 步长）装载整幅输入，对 spatial=4096 需 32 轮；后端 bcmlir 中该 memref<8x128xf32> 的 strided 拷贝原样保留，说明编译器不会重新分块。按 ir-006 同次重放的长度—代价关系（约 390 cycle 固定 + 约 114B/cycle），该装载流约 32x424≈13.6k cycle，是单核 MTE2 占用（aiv_mte2_time 12.76us、active_ratio 0.877）的最大单一来源。把统计片加宽到 8x512（每行 2KiB）后，轮次与装载指令数降为 8（+1 次预热），预计该流装载代价降到约 8x532≈4.3k cycle，同时每字节的有效带宽随行长提高。该机制与 ir-006 被否证的“输出流加宽”正交：统计流是第一遍冷读、占 MTE2 时间的主体，输出流是第二遍且 ir-006 证明其加宽无收益。",
+  "alternatives": [
+    "剥离两处钳位预取的末轮重复装载（尾步排空）：只省 4KiB+8KiB=12KiB/程序（268→256KiB，-4.5%），低于 ABBA 观测的 ±1.3% 噪声量级，先不作为本轮机制，保留为同一 IR 的后续小步。",
+    "把统计片加宽到 8x1024 或让统计与输出共用一次性大 tile（读一遍）：前者 UB 峰值约 160KiB、末轮浪费 32KiB/程序，风险高；后者需要把 128KiB 特征片常驻 UB 并把输出写回，UB 预算（shared_mem_dynamic_size 216KiB、实机 UB 更小）不足以同时容纳输入片与输出片，判定不可行，除非牺牲通用性对 spatial 上界做特化。",
+    "同步/屏障削减（trace 中 VECTOR/BAR 484 次）：属于后端 sync solver（bcmlir 之后）的注入行为，不在本轮可编辑的 TTIR 控制点内。",
+    "计数标量化（ir-005）与输出片加宽（ir-006）均已实测无收益，不再重复；BLOCK_M 方向对 batch=8 已用满 8 行。",
+    "源码层等价改写（改 _bn_block_n 让统计片独立于输出片）：frozen.py 逐字节冻结，本轮不可用；若本轮机制兑现，可把该意图作为源码层迁移方向回报宿主。"
+  ],
+  "change": "只改 ir/5c1607c0.../batch_norm_with_update_kernel.ttir 一处机制：给统计阶段增加运行期特化分支 scf.if %stats_wide（spatial_dim % 512 == 0），其 then 分支用 8x512 片跑同一套 Welford delta 递推（tile_lane_512、n_num_steps=cdiv(spatial,512)、同样的 min(n+1,steps-1) 钳位预取、同样的 cnt/mean/var 三累加器与同形两段式合并公式），两侧分支都只产出 (mean, inv_std, var) 三个 f32 后汇合；else 分支逐字保留原 8x128 统计循环与其收尾公式，因此 spatial 不是 512 倍数的形状仍走原路径。为让两分支类型一致，把与分块无关的 n=batch_dim*spatial_dim 及 n_f32 两条标量计算上提到 if 之前（数值不变），下游对 final_mean_13/inv_std_21/var_20 的引用改为接收 scf.if 的结果。输出阶段、running 状态、weight/bias 分支、ABI 与函数签名一律不动。",
+  "expected": [
+    "指令：统计阶段 GM→UB 装载指令数 33→9/程序（2 程序窗口内 64→16），每次装载行宽 512B→2KiB；总 MTE2 指令数按 ir-006 的计法约 121→85 的同等幅度下降（预计 121→约 97）。",
+    "动态轮次：统计循环迭代 32→8 轮（spatial=4096）；跨 lane 的两次合并不再是 1024→4096 元素（两次 reduce 的元素数 x4，约 +6k 元素运算，属可忽略项）；VECTOR/BAR 预计 484→约 340-400。",
+    "资源与等待：单核 MTE2 占用（aiv_mte2_time）12.758→8.5-9.5us；trace MTE2 active_ratio 0.877→0.72-0.79；VECTOR wait_ratio 0.3948→0.25-0.31；VECTOR active 预计基本持平（逐元素运算总量不变），VECTOR idle 不上升超过 0.05。",
+    "读取量：单程序统计流逻辑读取 132KiB→144KiB（8 轮 + 1 次末轮钳位重复，比现在多 12KiB），这是本机制主动接受的代价，须与 MTE2 时间下降同时兑现；若只看到字节增加而 MTE2 时间不降，则长度—代价假设被否证。",
+    "宿主重放墙钟：若 MTE2 占用确为限制项，目标算子 39.26→34.5-36.5us（约 +7%~+12% 加速，speedup 0.717→0.78-0.82）；若墙钟变化在 ±1.5% 内而上述 MTE2/流水指标确按预测改善，则判定“搬运占用非墙钟限制项”，与 ir-006 同向，下一轮转向依赖链/同步机制。任何指标未按预测改变都作为偏差单独记录。",
+    "正确性：27/27 完整项与双方各 36/36 应全部通过；8x512 分支只在 spatial%512==0 时启用，其它形状走原样 else 分支，零迭代/单 tile/非整除边界语义不变；浮点仍用同一两段式 Welford 合并公式，只有归约分组顺序改变，须由容差 (atol/rtol 1e-4, 匹配比 1.0) 判定。"
+  ],
+  "validation": "宿主先做语义审查与 CPU 实际 lowering/二进制比较（确认真实 ttadapter/bcmlir 中出现 memref<8x512xf32> 的统计拷贝、输出阶段仍是 8x256 与 8x128 两条原路径、函数签名 20 参数不变），再跑完整 27 项正确性与双方各 36 项补充；通过后跑目标 ABBA 双分析并对候选做独立 profiling 与 simulator 重放，按同一 core0.veccore0 归一化窗口（capture 0→1，原始跨度约 38.4us）逐项核对 expected 中的指令数、轮次、MTE2 占用、VECTOR 等待与读取量，兑现与偏差分开记录；只有两段 ABBA 均快于原版且稳定性成立才具备保留资格。",
+  "layer_reason": "Triton 表达能力：源语言完全能表达该意图（统计循环用更大的 BLOCK_N 即可），但 frozen.py 中 BLOCK_N 由单一启发式 _bn_block_n 同时决定统计与输出片宽，源码逐字节冻结，无法在不改变输出片宽的前提下单独加宽统计片，因此该意图在源码层只能以“统计/输出分片宽”的等价改写表达。固定源码实验目的：本轮把源码与 ABI 完全钉死，只让 IR 承担“统计阶段分块”这一个变量，从而与 ir-006（输出阶段分块）形成单变量对照，避免源码层连带改变其它旋钮。IR 控制点：TTIR 是唯一能在不动 ABI、不动输出阶段、不动 running 状态的前提下，对统计循环的 tile 宽度、迭代次数与 GM→UB 搬运长度做定点修改的层级；且 bcmlir 证明后端不会自行重分块，故该改动只能在此层发生并被后端忠实继承。",
+  "simulator_incremental_judgment": "本轮增量只改 TTIR 一处统计分块分支，不新增或删除任何核，指令预算的净变化应为“统计流装载指令 −24/程序（2 程序窗口 −48）、每次装载行长 512B→2KiB、两次归约元素 +6k、UB 常驻张量 8x128→8x512（峰值约 80-112KiB，仍低于 216KiB declared 预算）”。前窗口（当前最佳）覆盖 core0.veccore0 的 0→1 归一化窗口、原始跨度 38.405us、绝对单位经 33PC 比值 1.000548 资质，且只覆盖 2 个程序实例；后窗口（候选）尚不存在，将由宿主在相同口径重放后逐项比较，绝不能把前窗口的 64 程序整体波次结论套用到 38.4us 的单核窗口上。未报告的辅助泳道（CACHEMISS/FLOWCTRL/ALL 等）与未捕获的其他核保持未知；热点排名只用于定位候选机制，关键路径与带宽结论必须另由独立 profiling 计量（aiv_mte2_time/active_bw 与配对墙钟）支持。",
+  "unknown": [
+    "MTE2 占用高（0.877）但 ir-006 中其下降 5.5% 未换来墙钟改善，故“MTE2 是否为墙钟限制项”仍是未验证假设；本轮把它作为可判伪的预测条件而不是前提。",
+    "8x512 片在真实后端是否被保持为单条 MTE2 指令、以及 UB 双缓冲后峰值是否仍在实机 UB 内，需由实际 lowering/编译结果确认；若需退回 8x256，属同一机制的小特化，需另行登记。",
+    "统计流第一遍是否为冷读（HBM）而输出流为局部性较好（L2 命中）尚无直接计数支持，仅由 ir-006 输出流加宽无收益间接推断。",
+    "trace 窗口仅覆盖 2 个程序实例、其他核与未报告泳道未知，64 程序的波次/尾效结论不在本轮证据范围内。"
+  ]
+}

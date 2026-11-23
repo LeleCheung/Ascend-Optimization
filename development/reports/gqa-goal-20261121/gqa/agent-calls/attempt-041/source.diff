@@ -1,0 +1,55 @@
+--- 
++++ 
+@@ -143,6 +143,19 @@
+ 若仅在 UB 发生则字节不变，按真实无减少记录并交接固定源码 IR 改法。数值上
+ rawQK 有符号就近舍入，|q·k| <= D = 128 不溢出 fp16，典型概率相对误差约 2e-4、
+ 最坏约 0.56%，合同值域 [-1,1]，由原四项 checker 以不变阈值判定。
++
++物理 BNSD 输出分配（本轮机制，仅 PART_TILES，host 侧）：实际 BCMLIR 的写回目标
++是 memref<128x128xbf16, strided<[8192,1], offset:?>>，这两个 stride 直接来自
++host 传入的 y.stride，故每个输出 tile 的 128 行各 256B、行间相隔 16KiB，属散射
++写；source-bound 模拟器窗口里 Dst:OUT 的 MOV_SRC_TO_DST_ALIGN 是向量核 MTE3 的
++主要占用（42.52us/14 次与 27.46us/15 次，MTE3 productive 42.5% 高于 VECTOR 21.6%，
++三核部分窗口、application_completed=false，全调用完成仍缺）。本轮只把 PART_TILES
++命中的输出改成 empty_strided 的物理 BNSD（stride [NQ*S*D, D, S*D, 1]）：返回张量
++逻辑形状仍为 [B,S,NQ,D]、dtype 不变、取值逐位不变，无转置内核、无输出缓存，同一
++tile 的写回退化为一段连续 32KiB。内核、Q/K/V 步长与 launch mapping 一字未改。
++代价：返回张量物理非连续（作为显式输出属性，需要连续内存的消费方须自行拷贝）；
++其余分支仍用 torch.empty 的 BSND 连续分配。同类改动在 032（旧双 KV 块结构）未获
++全调用收益，仅作历史负结果，不作成功方法引用。
+ """
+ 
+ import math
+@@ -487,7 +500,7 @@
+     # 路径不使用该值，保留逐行 max 稳定化。
+     sm_offset = float(D) * abs(qk_scale) - 15.0
+ 
+-    y = torch.empty((B, S, NQ, D), dtype=query.dtype, device=query.device)
++    # 输出分配推迟到 PART_TILES 判定之后：本轮唯一改动是它的物理布局。
+ 
+     # UB budget: acc is BLOCK_M x BLOCK_D fp32, plus q/k/v/p tiles.
+     # KV 方向分块取 128：每个 KV 块固定要付一次完整交接链（QK dot 搬出、
+@@ -586,6 +599,23 @@
+     T = B * NKV * TPG
+     PART_TILES = ((not is_causal) and PV_SINGLE_F16 and SINGLE_KV
+                   and BLOCK_M == 128 and BLOCK_N == 256 and BLOCK_D == 128)
++
++    # 本轮机制（仅 PART_TILES 的 host 输出分配）：BCMLIR 实测写回目标为
++    # memref<128x128xbf16, strided<[8192,1], offset:?>>，即 128 行各 256B、行间
++    # 相隔 16KiB 的散射写，而这两个 stride 完全来自这里的 y.stride；模拟器窗口
++    # 中 Dst:OUT 的 MOV_SRC_TO_DST_ALIGN 亦占向量核 MTE3 的主要 productive 时间。
++    # 故对 PART_TILES 命中的元数据按物理 BNSD 分配（stride [NQ*S*D, D, S*D, 1]）：
++    # 同一 tile 写回成为一段连续 32KiB。返回张量逻辑形状 [B,S,NQ,D]、dtype 与
++    # 取值逐位不变（只有物理地址变化），内核、Q/K/V 步长与 grid 全不动。
++    # 代价：返回张量物理非连续，是显式输出属性；其余分支仍为连续 BSND 分配。
++    if PART_TILES:
++        y = torch.empty_strided(
++            (B, S, NQ, D), (NQ * S * D, D, S * D, 1),
++            dtype=query.dtype, device=query.device,
++        )
++    else:
++        y = torch.empty((B, S, NQ, D), dtype=query.dtype, device=query.device)
++
+     if PART_TILES:
+         P = 20 if T >= 20 else T
+         grid = (P,)

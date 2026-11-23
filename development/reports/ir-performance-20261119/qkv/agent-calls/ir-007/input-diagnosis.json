@@ -1,0 +1,85 @@
+{
+  "source_sha256": "0af5d533afea8f4be88e1fd6e0fc4a6ba76fae9a8b1478f7c4b93247fe7ec070",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "feedback.json",
+      "category": "source_ir",
+      "role": "本轮直接失败证据与前次登记机制",
+      "finding": "前次 ir-005 的 lowering review 对 original 与 candidate 两行均返回 lowering_failed / 'RuntimeError: Parse MLIR file failed.'，失败发生在 IRSource.parse_mlir_module，NPU 尚未初始化；formal_evaluation=not_submitted，retained_best 为 original IR 62.860936us。required 明确要求只修复已安装方言的语法及随之产生的编译错误，保持 paired-head 机制、输出步长、源码与 ABI 不变。"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "source_ir",
+      "role": "宿主证据分析与候选方向（Codex 贡献）",
+      "finding": "Codex 定位原生解析器拒绝 tt.reshape 的 allow_reorder=false，指出当前方言要求 unit attribute，且 original/exploration 与 candidate 都在 lowering 前失败；要求先确定保持元素顺序的 reshape 拼写，再登记修复，修复后仍须通过 UB 容量与 affine3D store 的原生 lowering。该分析与我随后对 IR 的独立核对一致。"
+    },
+    {
+      "path": "previous-host-review.json",
+      "category": "source_ir",
+      "role": "已批准的 IR 机制与语义边界",
+      "finding": "宿主已批准 changed_ir sha256=66aa2529...，机制为相邻头输入宽度 64->128 合并、32x128 分块，并把 128 序列 × H 头重新划分为两个 64 序列半区 × H/2 头对；num_heads 可被 2 整除、BLOCK_S=64/GROUP=2 保证序列整块覆盖；输出地址含 h*stride_out_h；Q 保持 f16->f32 加偏置->f32 缩放->单次 f16 截断，K/V 保持 f16 加法。"
+    },
+    {
+      "path": "ir/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttir",
+      "category": "source_ir",
+      "role": "当前待编译 TTIR 的实际语法缺陷",
+      "finding": "实际文件 235 行、sha256=66aa25293f0097b0e37c3606c93a0c0cd41e1f49b61a2348b438b58159c9d790；第 113–115 行三个 tt.reshape 写作 {allow_reorder = false}，把 allow_reorder 当 BoolAttr 赋值。反馈中的解析失败正对应这三处；除此之外 tt.func、scf.for {tt.num_stages=2}、tt.load/tt.addptr/tt.store 均为常规形式，未见第二个独立可疑属性。"
+    },
+    {
+      "path": "frozen.py",
+      "category": "source_ir",
+      "role": "数学语义、ABI 与特化常量核对",
+      "finding": "frozen.py 与源码 sha256 0af5d533... 对应；内核签名、启动参数顺序和特化常量（BLOCK_S=64、BLOCK_D=64、GROUP=2、EXACT=true，stride_qkv_d=stride_bias=stride_out_d=1）未变。当前 IR 内 BLOCK_D 实际改为 128、每个半区按 32 行做 2 次循环，正好等于原每程序 64 行；num_groups 仍由 frozen wrapper 按 BLOCK_S=64 计算为 4，故 seq_group*128+half*64 覆盖 0..511 恰好一次，没有越界或重复。"
+    },
+    {
+      "path": "ir-inventory.json",
+      "category": "source_ir",
+      "role": "可编辑 IR 身份与冻结边界",
+      "finding": "清单登记该路径、符号 _transform_bias_rescale_qkv_kernel、AST sha ca6c05a0...、原始 IR sha 3924918d...；当前文件为其 IR 层编辑版 66aa2529...，ABI 签名和 constants 未登记变化。源码、清单、context、证据均不可编辑，只允许 Edit 该 TTIR 与 diagnosis.json。"
+    },
+    {
+      "path": "compiled-readonly/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/f67d9cdb9f445d242714897e48f68b992534a9c144549743ff721f2556ce6136/_transform_bias_rescale_qkv_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "后端实际低层产物核对（冻结只读）",
+      "finding": "按 lowered-inventory 读取的基线 ttadapter 表明后端已把输入/输出 tile 变成 memref.reinterpret_cast 的二维 [64,64]、strides [stride,1] 视图，配合 memref.copy 与 bufferization.materialize_in_destination；q/k/v bias 的三次 memref.alloc+copy 是既有 UB 物化，未出现按元素解码或逐元素 LD/ST。故三维 reshape 若保持元素顺序，理论上可折叠为带 [stride_s,stride_h,1] 的三维目标视图，不应引入额外数据搬运；但该结论只作为预测，需 lowering review 验证。"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "当前最佳配对性能与两侧时间口径",
+      "finding": "配对任务 transform_bias_rescale_qkv-timing-2（shape [8,512,3072]、heads=16、f16）中 candidate _transform_bias_rescale_qkv_kernel Task Duration=40.020802us、Block Dim=512，reference TransformBiasRescaleQkv_float16_high_performance_1=55.001099us；但正式保留比较器仍是 62.860936us（context 目标 0.0628372ms），说明配对 profiler 的单次窗口与正式多负载评测口径不同，不能把 40.02us 直接当作本轮收益。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "流水占用与具体等待成本",
+      "finding": "core0.veccore0 的 9.7402447us 局部捕获窗口中：MTE2 active_ratio=0.92397、productive=0.89248、wait_only=0.03148、idle=0.07603；MTE3 active=0.86526 但 productive 仅 0.26394、wait_ratio=0.77667、wait_only=0.60132；VECTOR active=0.90712、productive 仅 0.11125、wait_only=0.79587。最贵单条为 6.98us 的 MTE2 MOV_SRC_TO_DST_ALIGN（源码 k_val=tl.load），另有 5.67us MTE3 BAR 与多条 VECTOR BAR。热点表现为 MTE2 负荷高、MTE3/VECTOR 大量显式等待，修复后若 reshape 被物化成额外 UB 拷贝，会加重 VECTOR/MTE3 等待，因此必须用低层产物确认无新增搬运。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "相对流水窗口与绝对时钟资质",
+      "finding": "timeline 明确 clock_qualification=relative_only、absolute_time_qualified=false，raw_clock_window 109.80400085449219–119.54424554109573 的 unit=unassigned，capture_scope 为首个至末个可见硬件事件的部分捕获，application_completed=false；只可作同窗占比排序（MTE2 0.92397、MTE3 productive 0.26394/wait 0.77667、VECTOR productive 0.11125/wait 0.79587），不得据此声称关键路径或绝对增量。"
+    }
+  ],
+  "hypothesis": "当前 TTIR 的唯一编译阻断是 tt.reshape 的 allow_reorder 被写成 BooleanAttr（{allow_reorder = false}），而已安装的 Triton/Ascend 方言按 UnitAttr 解析该属性，导致 IRSource.parse_mlir_module 在 lowering 前失败。保持顺序的 reshape 在方言中的正确写法是省略该属性（UnitAttr 缺席即 false 语义）；删除三处 {allow_reorder = false} 后，[32x128] -> [32x2x64] 仍是纯行主序拆分内层维，元素顺序、别名、特殊值与输出步长完全不变，并可被 bufferization 折叠进三维 store 的目标 memref，不产生新的计算或布局拷贝。",
+  "alternatives": [
+    "保持 IR 原样并走 no-change：会保留零可编译候选，无法评测，不能超过当前最佳，因此不选。",
+    "改写成 {allow_reorder} 单元属性：语法上或许可解析，但把 reorder 设为 true，允许编译器重排元素，会破坏 [s, head, d] 的行主序语义，风险不可接受。",
+    "用两次 [32x64] 的二维 load/store 代替 reshape（每对头各一次）：可避开 reshape，但把每程序三次 load/store 扩为六次，改变已登记的 paired-head 合并机制和地址表达，且可能增加指令与同步开销；不属于本轮最小修复。",
+    "修改 frozen.py 源码或编译选项：分别属于源码重写和选项身份，且源码冻结；不选。",
+    "保留原 IR 并在后端消除疑似冗余：后端产物只能证明基线已有二维 affine 视图与 UB 物化，无法让当前不解析的 IR 进入后端；因此消除语法阻断是任何后端优化的前提。"
+  ],
+  "change": "仅在 ir/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttir 中删除三处 tt.reshape 的 {allow_reorder = false} 属性（第 113–115 行），保留 tt.reshape 的类型 [32x128xf16] -> [32x2x64xf16] 与全部 SSA 使用者；不改函数 ABI、签名、常量、循环、地址计算、load/store、源码或编译选项。",
+  "expected": "decision 后该 TTIR 应通过原生 MLIR 解析并进入 Ascend lowering；三处顺序保持 reshape 应被折叠为输出三维 affine 视图或等价的零拷贝视图，TTAdapter 中不出现新增的整 tile 拷贝；UB 预算与三维 store 寻址成立。数值上 Q 仍为 f16->f32 加偏置、f32 乘 scale、单次 f16 截断，K/V 仍为 f16 加偏置，覆盖、别名和特殊值不变。性能不在本轮文档中宣称：若 reshape 未折叠而产生额外拷贝，预计 VECTOR/MTE3 等待上升并可能慢于 62.860936us；若正确折叠，则至少恢复当前最佳可评测性，并由后续正式/补测决定是否超过。",
+  "validation": "1) 先调用 decision 桥登记本诊断；2) 仅用 Edit 删除三处属性；3) 调用 submit 桥，要求 lowering review 从 'Parse MLIR file failed' 转为成功后端解析，并检查 TTAdapter/BCMIR 中 reshape 是否被折叠、是否新增 memref.alloc/copy、UB 容量是否满足；4) 宿主执行完整正确性测试（f16/f32、奇偶头数、EXACT 与非 EXACT 边界、特殊值/别名）并与原语义比对；5) 正式评测保留 62.860936us 比较器，运行 21 个正式用例与两组 48 用例补测，并用双捕获/ABBA 判断增量；6) 若解析仍失败或出现额外搬运，则回退本轮字节并另建调用登记新机制。",
+  "layer_reason": "缺陷位于可编辑的单算子 TTIR：三个 tt.reshape 的属性拼写与当前编译器方言不符，而源码、ABI、特化常量、lowering 选项与后端产物均冻结。修改源码会改变已合格最佳算子的身份；修改编译选项属于独立研究身份且无法修复非法文本；直接改后端产物被禁止。IR 层修复可最小化地恢复编译，同时不改变任何数学与布局语义。",
+  "simulator_incremental_judgment": "模拟器材料只提供 core0.veccore0 的相对部分窗口：absolute_time_qualified=false、时间单位未赋值、application_completed=false，故绝对时钟增量与关键路径均不可声明。可用的增量判断仅是流水占比：MTE2 productive 约 0.892、MTE3 wait_only 约 0.601、VECTOR wait_only 约 0.796，说明瓶颈在搬运与显式同步而非标量索引；因此本轮的首要可测收益是把不可解析的 IR 恢复到可评测状态，并把“reshape 是否被折叠、是否新增 UB 拷贝”作为后续低层可观测指标。任何性能结论必须以正式与补测结果为准。",
+  "unknown": [
+    "已安装方言对 order-preserving reshape 是否接受完全省略 allow_reorder（UnitAttr 缺席），还是要求显式 {allow_reorder} 单元属性；后者语义为允许重排，不可接受。",
+    "顺序保持 reshape 在 bufferization 中是否零成本折叠为三维目标视图，还是生成一次额外 UB 拷贝。",
+    "三维 store 的 affine map 是否满足 Ascend 后端的连续内层维向量化条件。",
+    "修复后在 21 个正式用例与两组 48 个补测用例上的实际时延与是否超过 62.860936us。"
+  ]
+}

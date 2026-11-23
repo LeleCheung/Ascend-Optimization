@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 37,
+    "duration_ms": 95340,
+    "usage": {
+      "input_tokens": 53012,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1150208,
+      "output_tokens": 13360,
+      "output_tokens_details": {
+        "thinking_tokens": 5464
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 53012,
+        "outputTokens": 13360,
+        "cacheReadInputTokens": 1150208,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.1741640000000002,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 5464,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.1741640000000002,
+    "result": "已完成本轮单机制修改与交接。\n\n## 本轮机制（仅 PART_TILES 输出归一化）\n\n**修改前**（来源 SHA `99e77cb8…`）：\n```python\nl_safe = tl.where(l_new > 0.0, l_new, 1.0)\nout = acc / l_safe[:, None]\nout = tl.where(l_new[:, None] > 0.0, out, 0.0)\n```\n**修改后**（新 SHA `b8063d62…`）：\n```python\nrow_coeff = tl.where(l_new > 0.0, 1.0 / l_new, 0.0)\nout = acc * row_coeff[:, None]\n```\n每 tile 的 128x128 fp32 VDIV 变为 128 元倒数 + 128x128 VMUL，并删除末尾 128x128 比较/广播/select。`exp2(qk-SM_OFFSET)`、`tl.sum(p,1)`、rawQK FP16 交接、单次 FP32 累加 PV、worker20 分区、布局及全部回退分支逐字保留。\n\n## 证据与判断\n\n- **IR 事实**：TTIR 中 `%out_53 = arith.divf %acc_50, %out_52`（128x128），另有 128x1 `cmpf` → 128x128 `broadcast` → 128x128 `select`；BCMLIR 同样是 128 元分母 `linalg.broadcast` 后 `arith.divf` 128x128，再 expand/collapse/broadcast i1 后 `select` 128x128。冗余确由源码表达式铺开。\n- **模拟器（已实际读取）**：veccore0/1 各 `VDIV 30`、`VCMPV 30`、`VSEL 45`、`VBRCB 30`，VECTOR productive 21.64%、idle 68.14%。热点仍由 `WAIT_FLAG_DEVI`、`MOV_SRC_TO_DST_ALIGN`、`FIX_L0C_TO_DST` 等交接指令主导，因此只把本改写视为候选机制，不宣称已证因果；三核为部分窗口且各自归一化，`application_completed=false`，全调用 completion 缺失，窗口时间与指令时长不可相加。\n- **成对 profiling**：Vector 累计 `aiv_vec_time` 1287.59s（两核）明显高于 Cube 662.19us，归一化位于更长的 Vector 生产段。\n- **数值范围（显式）**：D=128、默认 scale 下 qk 界 ±16.322，SM_OFFSET=1.322，指数下界约 -17.644，每项 p>0 且每行 256 项有效，l_new 严格为正；完全掩码零行 acc=0、l_new=0 时系数为 0、输出仍为 0。不声明通用逐位恒等：倒数+乘法多一次 fp32 舍入（约 1.5ulp vs 0.5ulp），NaN/非有限输入超出官方有限合同，不作等价保证。\n- **影响面**：case4 与 case7 均走 PART_TILES，两者真实变化将同时保存；case1（因果 64/64）与 case2（fp16 通用 grid）不进入该分支，代码路径逐字不变。\n\n## 交接状态\n\n- 修改前决策已登记：`decision_id 5bb19f9072314031b59de21634b04278`（绑定父源码 SHA）。\n- diagnosis.json 已填写 source_sha256、证据（source_ir/simulator/paired_profiling/evaluation/other）、hypothesis、alternatives、discriminating_observation、change、expected、validation、selected_layer、layer_reason、simulator_incremental_judgment、numeric_risk 与未决项。\n- `preflight --source candidate.py` 返回 **`awaiting_source_review`**，新源码 SHA `b8063d6251a2000779c17c70b6cbf4478d8d52f942681002c9392bc16a53cc06`，字节保持不变。\n\n现交由宿主只读路径/地址边界审查及原完整四项真机评测（case1/2/4/7、原 official checker 与 golden、阈值不变）。判别观察：修改后 IR 应出现 128 元 `divf` 与 128x128 `mulf`、不再有 128x128 `divf`/末尾 `select`；目标 case4 需低于保留最佳 205.28415μs，否则保留最佳并记录真实无收益。"
+  }
+}

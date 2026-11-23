@@ -1,0 +1,142 @@
+--- 
++++ 
+@@ -9,7 +9,8 @@
+ 
+ Every device computation below is Triton: QK^T and PV are tl.dot, the softmax
+ (max / sum / rescaling) runs in fp32 registers, and the only Python-side work is
+-metadata (shape / stride), the torch.empty output allocation and the launch.
++metadata (shape / stride), the torch.empty allocations (output, plus the fp16 V
++scratch on the bf16 single-KV path) and the launches.
+ KV heads are never materialised to N_q heads: each program indexes the shared
+ K/V head hq // G directly.
+ 
+@@ -72,6 +73,32 @@
+ dot operand pair are larger than the previous 128/128 tiling, so the compile may
+ hit the UB/L0C budget; the causal path keeps 64/64 and is untouched.
+ 
++One-shot fp16 V scratch on the bf16 single-KV path (this round's mechanism):
++the retained source's actual BCMLIR/TTIR show each program copying its
++256x128 bf16 V tile into UB and then running arith.extf bf16->f32 followed by
++arith.truncf f32->f16 before the fp16 PV dot, i.e. the same V head slice is
++converted once per (query head, query block) that reads it -- 16 times for
++case4 -- although the original V is only B*SKV*NKV*D = 2MiB.  The case4
++simulator window puts the Cube's largest FLOWCTRL wait (9.59us, PV dot line) on
++the same line as a Vector BAR (2.34us), the V GM->UB load (1.66us) and two
++MOV_PAD_VAL handoffs, so the PV chain pays for a vector-prepared f16 operand on
++every program.  This round therefore pre-converts V once: the host only
++allocates a contiguous fp16 scratch (torch.empty, no torch data conversion),
++a new pure-Triton kernel `_gqa_v_cast_f16_kernel` reads the *original* V with
++its real strides and writes each element exactly once, and the unchanged
++`_gqa_fwd_kernel` receives the scratch pointer and its actual strides while
++PV_SINGLE_F16 still comes from the original V dtype.  Numerics are unchanged
++relative to the retained candidate: every V element still goes through the same
++bf16->f32->f16 pair of roundings, so the PV operand bits, the PV products and
++their j order are identical; |v| >= 2^-14 converts exactly, smaller values land
++in fp16 subnormals (absolute error <= 3e-8) and |v| > 65504 would overflow,
++which is outside this contract's [-1,1] domain and is recorded only as a range
++limitation.  Cost: ~2MiB extra write plus ~2MiB extra read through GM, one
++allocation and one extra launch per call; the main kernel's V load keeps the
++same byte count because bf16 and fp16 are both 2 bytes.  Every other path
++(causal fp16, non-causal fp16, and any shape where the KV span is not one
++BLOCK_N block) keeps the two-term expression and its summation order verbatim.
++
+ Compile-time geometry specialisation (earlier, retained mechanism): shape, stride,
+ head counts, scale and the causal offset are passed as tl.constexpr, because
+ they are legal input *metadata*, never input values.  The actual TTIR showed
+@@ -95,6 +122,44 @@
+ import torch
+ import triton
+ import triton.language as tl
++
++
++@triton.jit
++def _gqa_v_cast_f16_kernel(
++    V, Vs,
++    v_sb: tl.constexpr, v_ss: tl.constexpr, v_sh: tl.constexpr, v_sd: tl.constexpr,
++    o_sb: tl.constexpr, o_ss: tl.constexpr,
++    SKV: tl.constexpr, C: tl.constexpr, D: tl.constexpr,
++    BLOCK_R: tl.constexpr, BLOCK_C: tl.constexpr,
++):
++    """把原 V (B, SKV, NKV, D) 一次性由 bf16 转成连续 fp16 scratch。
++
++    本轮机制：主 kernel 里 V 的 bf16→f32→f16 转换此前由每个 program 重复
++    执行（同一 KV 头切片被 G 个 query 头 × S/BLOCK_M 个 query 块共用），
++    这里改成每个 V 元素只转一次。grid 三维分别覆盖 (NKV*D 列块, SKV 行块,
++    B)，每个输出元素恰好被一个 program 的一条掩码通道写到；读取按原 V 的
++    真实 stride（行 v_ss、头 v_sh、通道 v_sd），因此非连续输入也能正确取值。
++    写出目标是 host 分配的连续 fp16 缓冲（行 o_ss，批 o_sb）。
++    """
++    pid_c = tl.program_id(0)
++    pid_j = tl.program_id(1)
++    pid_b = tl.program_id(2)
++
++    offs_j = pid_j * BLOCK_R + tl.arange(0, BLOCK_R)
++    offs_c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
++    j_ok = offs_j < SKV
++    c_ok = offs_c < C
++    mask = j_ok[:, None] & c_ok[None, :]
++
++    # C 轴打包了 (NKV, D) 两维：h = offs_c // D、d = offs_c % D。D 是
++    # constexpr，除法/取模在编译期折叠为移位与掩码（D 为 2 的幂时）。
++    src = (V + pid_b * v_sb + offs_j[:, None] * v_ss
++           + (offs_c // D)[None, :] * v_sh + (offs_c % D)[None, :] * v_sd)
++    v = tl.load(src, mask=mask, other=0.0)
++    dst = Vs + pid_b * o_sb + offs_j[:, None] * o_ss + offs_c[None, :]
++    # 与主 kernel 原路径同为 bf16→f32→f16（两次显式舍入），保证每个 V 元素
++    # 的位型与父版本逐元素一致；被掩码的通道不写出。
++    tl.store(dst, v.to(tl.float32).to(tl.float16), mask=mask)
+ 
+ 
+ @triton.jit
+@@ -356,12 +421,49 @@
+     # SKV==BLOCK_N 的既有形状（如 case2）该路径与原来的 alpha=0 算术逐项等价。
+     SINGLE_KV = (not is_causal) and (BLOCK_N == SKV)
+ 
++    # 本轮机制（BF16 非因果单块 KV：V 一次性集中转 fp16）：
++    # 保留源码的 IR 显示 V 在每个 program 内是 memref.copy(GM→UB, bf16) 后
++    # 再做 extf bf16→f32 与 truncf f32→f16，才交给 PV dot；同一个 V 头切片
++    # 被 G 个 query 头 × S/BLOCK_M 个 query 块共 G*S/BLOCK_M 个 program 各自
++    # 重转一次（case4 为 16 次），而真实 V 只有 B*SKV*NKV*D 个元素。模拟器
++    # 的 PV 行上有 Cube WAIT_FLAG_DEVI 9.59us、Vector BAR 2.34us、V 载入
++    # 1.66us 与两次 MOV_PAD_VAL，指向这条逐 program 的 V 准备链。
++    # 因此这里只在该路径上：host 分配连续 fp16 scratch（仅分配，不做任何
++    # torch 数据转换），由纯 Triton 预处理 kernel 每个元素转换一次，再把
++    # scratch 指针与真实 stride 交给算术完全不变的主 kernel。
++    # 代价：额外 2MiB 写 + 2MiB 读的 GM 流量、一次额外 launch 与一次分配；
++    # 收益：主 kernel 不再有 V 的 extf/truncf，与其相关的向量侧准备/同步
++    # 一并消失（GM 字节数不变：bf16 与 f16 同为 2 字节）。
++    # 数值：每个 V 元素仍经 bf16→f32→f16 的同样两次舍入，位型与父版本逐元素
++    # 相同；|v|>=2^-14 时 bf16→f16 精确，更小值落 fp16 次正规（绝对误差
++    # <=3e-8），|v|>65504 会溢出——超出合同 [-1,1] 输入域，仅记录为范围限制。
++    # 选路只用 V 的 dtype 元数据与编译期分块，不读输入值、不看 case_id。
++    V_ARG = value
++    if PV_SINGLE_F16 and SINGLE_KV:
++        C = NKV * D
++        # UB 预算：每元素约 2B(bf16 入) + 4B(fp32 中间) + 2B(f16 出)，16K
++        # 元素的 tile 约 128KB，仍在 196608B 以内；列块取 2 的幂以让内核里的
++        # C//D、C%D 编译期折叠。
++        BLOCK_C = min(2048, triton.next_power_of_2(C))
++        BLOCK_R = max(1, 16384 // BLOCK_C)
++        v16 = torch.empty((B, SKV, NKV, D), dtype=torch.float16, device=value.device)
++        _gqa_v_cast_f16_kernel[(triton.cdiv(C, BLOCK_C),
++                                triton.cdiv(SKV, BLOCK_R), B)](
++            value, v16,
++            value.stride(0), value.stride(1), value.stride(2), value.stride(3),
++            v16.stride(0), v16.stride(1),
++            SKV=SKV, C=C, D=D,
++            BLOCK_R=BLOCK_R, BLOCK_C=BLOCK_C,
++            num_warps=1, num_stages=1,
++        )
++        V_ARG = v16
++
+     grid = (triton.cdiv(S, BLOCK_M), B * NQ)
+     _gqa_fwd_kernel[grid](
+-        query, key, value, y,
++        query, key, V_ARG, y,
+         query.stride(0), query.stride(1), query.stride(2), query.stride(3),
+         key.stride(0), key.stride(1), key.stride(2), key.stride(3),
+-        value.stride(0), value.stride(1), value.stride(2), value.stride(3),
++        V_ARG.stride(0), V_ARG.stride(1), V_ARG.stride(2), V_ARG.stride(3),
+         y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+         S=S, SKV=SKV, D=D, NQ=NQ, G=G,
+         qk_scale=qk_scale, delta=SKV - S,

@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 47,
+    "duration_ms": 297460,
+    "usage": {
+      "input_tokens": 63674,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1781504,
+      "output_tokens": 51862,
+      "output_tokens_details": {
+        "thinking_tokens": 41269
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 63674,
+        "outputTokens": 51862,
+        "cacheReadInputTokens": 1781504,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 2.505672,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 41269,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 2.505672,
+    "result": "本轮交接完成，IR 已冻结在 `awaiting_ir_review` 状态，等待宿主审查与完整评测。\n\n**读取的材料**：context.json、feedback.json、codex-brief.json、profiling.json、hotspots.json、timeline.json、ir-inventory.json、lowered-inventory.json、frozen.py、previous-host-review.json、ir001/ir006 正式结果与 ir006 lowering 记录，以及 `compiled-readonly/` 内实际 ttadapter 和 bcmlir。当前 IR 与源一致：TTIR 3924918d…8854、frozen.py 0af5d533…c070。\n\n**核对结论（实际低层产物）**\n- 已消除的疑似冗余：TTIR 中 64x64 指针张量的 splat/broadcast/addptr 在后端全部塌缩为 `reinterpret_cast + memref.copy`，实际仅 3 次 tile 载入、3 次 bias 载入、3 次 `materialize_in_destination` 存储（与 copy_count 6、materialization 3 一致），无逐元素地址残留，故不动这部分。\n- 未消除的真实缺陷：`scf.for` 体内仍保留 `linalg.broadcast`（q_bias→f32 16KB、k/v_bias f16 各 8KB）与 `linalg.fill`(scale_factor, f32 16KB)，而 bias 本身只在循环外载入一次——LICM 缺失，每 program 两轮各重复一遍不变量物化，约 48KB/轮 UB 写。\n\n**选择机制**：单一机制——把 q_bias 的 expand/extf/broadcast、k/v_bias 的 expand/broadcast、scale 的 64x64 splat 全部外提到 GROUP 循环之前；循环内只剩 extf、两次 addf(f32)、mulf、truncf、k/v 的 f16 addf 与三次存储。函数 ABI、grid、num_stages、地址表达式、stride、f32 opmath 与 k/v f16 舍入顺序均未变。\n\n**可测预测**：aiv_vec_time 0.741→~0.60–0.65us/program、block 墙钟 2.97→2.8–2.9us、timing-2 延迟 62.861→约 60.5–62.5us；若 VECTOR 已被 MTE2 完全掩盖，则表现为“向量时间下降但延迟不变”，即判无收益。\n\n**未采用的备选**：128 行单 tile（会消灭载入/计算重叠，ir001 已证无收益）；合并 3 次 bias 载入为 [3,64] 单拷贝（本方言无法拆回 3 个 64-vector）；相邻 head 加宽+3D 输出（ir006 正式 94.184us 退步）；no-change（bcmlir 证明不变量仍在循环内，且有 0.741us/program 的 VECTOR 归因时间）。\n\n**模拟器增量判断**：窗口为单核首末可见事件的相对时间（9.74us，不含启动前后空闲），只作同窗口结构证据——MTE2 active 0.924/productive 0.892 为关键资源；VECTOR(productive 0.111/wait 0.797)、MTE3(productive 0.264/wait 0.777) 活跃多为等待；SCALARLDST/CACHEMISS/ALL/FLOWCTRL 按辅助泳道解释；bias 段(source_conditional)以 18 条指令占窗口 1.03us，提示串行小传输成本。不宣称绝对加速比。\n\n**新增观察**：bcmlir 中 `linalg.broadcast` 的 v 与 k 复用同一 `tensor.empty` 缓冲（`%k_res`），说明后端缓冲复用良好，但也意味着外提后常驻 UB 会增加约 48KB（估计至 ~164KB/196608B），是否触发多缓冲降级交宿主编译核对。"
+  }
+}

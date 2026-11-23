@@ -1,0 +1,92 @@
+{
+  "source_sha256": "a0e1e0d687176b904af29fbac46b505a7ccd8fe76fc0ea6add1ccad350ab1110",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "context.json",
+      "category": "paired_profiling",
+      "role": "确认继承身份与目标口径",
+      "finding": "operator=upsample_bilinear2d，candidate_layer=TTIR，source_edit_allowed=false，source_sha256=a0e1e0d6…；comparator.parent_evaluation=ir-003，target=upsample_bilinear2d-timing-1，父版 PASSED、speedup=1.5380963582、latency=0.1595696972ms、reference=0.2454335701ms。本轮的对照基线即该 159.5697us。"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "读取实际正式与补测结果，确认当前最佳已完整合格并锁定待改进项",
+      "finding": "parent_result=PASSED，24/24 全过，geo_mean=1.07485、min_speedup=0.74327（最差 upsample_bilinear2d-timing-4，0.034406ms vs 0.025573ms）；correctness 侧 abs_err 最大 9.765625e-4、rel_err 最大 6.135e-3（correctness-7），matched_ratio 全 1.0；supplementary 30/30、cann_supplementary 30/30。timing-0/3/4/5 仅 0.97/1.03/0.74/1.02，说明本特化在小 shape 上仍偏慢，但正式目标 timing-1 是当前收益来源，须先保住 1.538 再谈继续超越。"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "simulator",
+      "role": "记录宿主证据分析与候选方向，核对后由我选择具体实现",
+      "finding": "Codex 指认当前重放仍有 MOV_SRC_TO_DST_ALIGN／MOV_SPR_XN 与同步指令热点，要求关联 TTIR 与实际 BCMLIR 检查行复制与重复向量工作，并提示'先核实际指令成本与数据依赖再选一项机制'。其判断与本轮在 hotspots.json（calls=16 的 MOV_SRC_TO_DST_ALIGN 与 MOV_SPR_XN/MOV_PAD_VAL）和 bcmlir（6 个 scf.for 逐行 memref.copy）中核到的结构一致，构成我选择机制的证据起点；其未指认具体缺陷位点，具体实现由我决定。"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "候选侧真实设备计时与流水占比，确定瓶颈流水与可测口径",
+      "finding": "候选 Op=upsample_bilinear2d_2x_kernel，Task Duration=156.043121us，Block Dim=1024，Freq 1650。逐 block 均值（1024 行）：aiv_time=5.9261us、aiv_total_cycles=9777.996、aiv_vec_ratio=0.5101（fp32=0.3140、fp16=0.0530、int32=0.00463、misc=0.1233）、aiv_mte2_ratio=0.4700、aiv_mte3_ratio=0.3268；带宽侧 aiv_gm_to_ub_bw=5.83GB/s、aiv_ub_to_gm_bw=2.59GB/s、aiv_main_mem_read_bw=7.49GB/s，说明 9 倍读放大并未把搬运推到带宽墙，成本落在搬运指令/发射与 pad 值通道上而非 DRAM。差值表另显示候选/参考 aiv_vec_misc_ratio 0.643x、aiv_r0_read_cache_miss_allocate 0.0036x，重复 stencil 读基本命中缓存。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "单核窗口内各流水活动/等待与最热指令，用于判断可动的手术位点",
+      "finding": "core0.veccore0 窗口 raw_clock 145.03199768~153.02599512（单位经 absolute_unit_validation 19/19、median_ratio=0.99679 校为 us，但 clock_qualification=relative_only、absolute_time_qualified=false、application_completed=false，仅部分窗口）。流水：MTE2 209 events、active_union 0.4386（productive 0.4330、wait 0.0056、idle 0.5614）；VECTOR 260 events、active 0.5724（productive 0.2991、wait 0.2780）；MTE3 仅 2 events、active 0.0797（wait 0.0574）；SCALAR 82 events、active 0.2929（wait 0.2264）；SCALARLDST 2270 events、active 0.2965。top_instructions 里 MTE2 侧最热两条是同一段逐行拷贝循环里的 0x10d11758 MOV_SRC_TO_DST_ALIGN（calls=16、14503 cycles、0.91us，Src:OUT,Dst:UB,Dtype:B16）与 0x10d1173c MOV_SPR_XN（calls=16、13118 cycles、0.91us，detail=SPR:MOV_PAD_VAL,XN:X6=0）。'MOV_PAD_VAL，XN=0、calls=16' 正是 masked load 的 other=0.0 在每条 1x128 行拷贝前重写 pad 值：一次 tile 载入被拆成 16 行，于是 pad 值编程也重复 16 次。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "绝对时钟资质、观测范围与未列泳道解释",
+      "finding": "窗口为 window_fraction 0.0~1.0（首个到末个可见事件，capture_scope 明确不含启动前后未知空闲），capture_duration=1.0（fraction）。absolute_unit_validation=verified/us/19 PCs/median_ratio=0.99679，scalar 子集 8/8 median_ratio=1.0；但 raw_clock_window unit=unassigned、absolute_time_qualified=false，故绝对时钟无资质，不能把窗口 8.0us 或 156.04us 相加或跨次比较。泳道：VECTOR active 0.5724（productive 0.2991、wait 0.2780）、MTE2 active 0.4386、MTE3 active 0.0797、SCALAR active 0.2929、SCALARLDST active 0.2965 且 2270 events、CACHEMISS 为 auxiliary_trace_lane（310 events、active 0.0301、wait 0），FLOWCTRL 事件极少——等待/空闲与辅助泳道均按材料原样解释，不据此重建关键路径。"
+    },
+    {
+      "path": "ir/f85be7a40348b16a3bb9f96d42d0385a8950cc3aea4e930615c06704c5b53127/upsample_bilinear2d_2x_kernel.ttir",
+      "category": "source_ir",
+      "role": "当前最佳真实 TTIR，定位具体且有执行成本的算子序列",
+      "finding": "符号 upsample_bilinear2d_2x_kernel，ABI=(ptr_o:*i32, ptr_i:*f16, IH, IW, OH, OW, BLOCK_I=16, BLOCK_J=128, PACK16=true)。共 9 个 tt.load（%ml_49/%mc_52/%mr_55/%cl_59/%cc_61/%cr_63/%pl_100/%pc_102/%pr_104），全部带掩码，且全部把 `%cst_1 = arith.constant dense<0.000000e+00> : tensor<16x128xf16>` 作为 other 操作数。掩码来源：%m_c_40=row_ok&in_col、%m_l_42=%m_c_40&has_l、%m_r_44=%m_c_40&has_r。掩码关闭的 lane 只有两类去向：(1) 被 6 个边界 select（%ml_65s/%mr_66s/%cl_67s/%cr_68s/%pl_106s/%pr_107s）用自己的 has_l/has_r 条件覆盖为同行的中心值；(2) 被最终 store 掩码 %m_word_88=row_ok&in_col&(j<row_words) 整体丢弃（本 2x 路径 row_words=OW/2=IW，与 in_col 同界）。因此 other=0.0 产生的零值在任何存活 lane 上都不可见。"
+    },
+    {
+      "path": "compiled-readonly/f85be7a40348b16a3bb9f96d42d0385a8950cc3aea4e930615c06704c5b53127/upsample_bilinear2d_2x_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "按符号核对疑似冗余是否在后端已消除",
+      "finding": "后端没有消除 other=0.0 的代价，反而把它显式化：%7 = linalg.fill ins(0.0 : f16) outs(16x128xf16) 被 6 个 arith.select 当作关闭通道来源（%44/%68/%81/%130 及 %80/%200 二级 select），另外 2 处 scf.if{hivm.unlikely_condition} 对动态 extent 尾部整块 fill 0。加载降级结构：中心行 cl/cc/cr 是一整块 16x128、strides=[IW,1] 的 reinterpret_cast+memref.copy（一次搬运），而行平移的 ml/mc/mr（#loc108/#loc125/#loc127）与 pl/pc/pr（#loc167/#loc168/#loc107）都是 `scf.for %arg14 = 0 to 16` 里 16 次 1x128 memref.copy（属性 ExtractedLoadOrStore, hivm.parallel_loop），即每程序 96 次行拷贝。每个行拷贝都要重新设置 pad 值，与 hotspots 里 calls=16 的 MOV_SPR_XN(MOV_PAD_VAL) 一一对应。同时确认打包链 %116=andi(%115,65535)、%150=andi(%149,65535) 未被折叠（但那属另一机制，本轮不动）。"
+    },
+    {
+      "path": "compiled-readonly/f85be7a40348b16a3bb9f96d42d0385a8950cc3aea4e930615c06704c5b53127/upsample_bilinear2d_2x_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "核对同一符号在更早一层的降级，确认掩码/pad 通道来自 IR 事实而非低层选择",
+      "finding": "ttadapter 与 bcmlir 结构一致：6 个 {ExtractedLoadOrStore, hivm.parallel_loop} 的逐行拷贝循环、2 个 {hivm.unlikely_condition} 的零填充分支；零常量来自 TTIR 的 other=0.0 操作数。说明'掩码关闭通道必须给出确定值'是 IR 语义约束，后端只能如实实现，不会自行删除 pad 值编程。"
+    },
+    {
+      "path": "lowered-inventory.json",
+      "category": "source_ir",
+      "role": "确认冻结低层产物清单，绑定同一符号与清单允许编辑的文件",
+      "finding": "清单只有一条特化 ast_sha256=f85be7a4…，含 ttadapter(7264a58f…)、bcmlir(4103fb70…)、npubin(49fa5649…) 三个 kind，symbol 均为 upsample_bilinear2d_2x_kernel，来源为 ir-003 compiler-state 缓存。三者按许可保持冻结只读，本轮仅编辑 inventory 允许的 ir/f85be7a4…/upsample_bilinear2d_2x_kernel.ttir。"
+    },
+    {
+      "path": "prior-explorations.json",
+      "category": "paired_profiling",
+      "role": "保留历史退步与已用机制身份，避免重复并提出本轮增量",
+      "finding": "ir-001（只让行号仿射、误删边界保护）被 ir-review 以 decision=rejected_memory_safety 拒绝；ir-002（行号仿射+行谓词，换取 6 个加载单次 strided 搬运）正式通过但 target 从 164.856us 退到 167.027us，属已测负向机制；ir-003（把 6 个边界 select 下沉到 f16 域）通过并成为当前最佳。ir-002 的 alternatives 明确把'去掉所有 masked load 的 other=0.0（掩码通道值均被 select 覆盖或被 store 掩掉）'留作下一轮独立机制，ir-003 的 alternatives 则把'去掉打包中的 arith.andi 0xFFFF'记为 int32 仅 0.436%、无可测成本。本轮即取被显式留出的 other=0.0 机制，不重复 ir-002/ir-003。"
+    }
+  ],
+  "hypothesis": "当前 TTIR 的 9 个 tt.load 全部把 other=0.0（%cst_1）作为掩码关闭通道的填充值，而后端把'掩码关闭通道必须有确定值'如实实现为：每程序一次 16x128 f16 零填充 + 6 个 select 的关闭通道来源，并在行平移的 6 个加载所降级出的 96 次 1x128 行拷贝上，每行前重写一次 pad 值（hotspots 里 calls=16、13118 cycles、0.91us 的 MOV_SPR_XN + detail=SPR:MOV_PAD_VAL,XN:X6=0，与 calls=16 的 MOV_SRC_TO_DST_ALIGN 同处一个循环体，MTE2 是窗口内最忙且几乎不等待的流水）。但这些填充值在存活通道上不可见：掩码关闭的 lane 要么被 has_l/has_r 的边界 select 覆盖为同行中心值，要么被 store 掩码 %m_word_88（row_ok&in_col&j<row_words）整体丢弃，且本 kernel 全部是逐元素运算、无归约，垃圾值不会横向污染。因此 other=0.0 是纯 IR 冗余：删掉它即可去掉 pad 值编程通道与那次零填充，而不改变任何写出元素的位级结果。这是编译器不会自行做的变换——它无法证明掩码关闭通道死掉。",
+  "alternatives": [
+    "去掉打包链里的 arith.andi 0xFFFF（extui 已零扩展，恒等）：位级安全，但 ir-003 已测 int32 向量占比仅 0.46%、bcmlir 中仍存在但无执行成本，属另一机制且预计不可测，本轮不选。",
+    "ir-002 的行号仿射+行谓词（96 次行拷贝折成 6 次 strided 搬运）：已被正式评测为负向（164.856→167.027us），且额外引入 6 个 andi+6 个 select，不重复。",
+    "保留 other 但把 other 换成同行中心张量（%mc_52/%cc_61/%pc_102）：会让加载多读一个 16x128 张量作为填充源，且行平移（m/p 行）的正确回退应是同一列的中心行而非中心列，语义不统一，改动面更大。",
+    "把 9 个加载全部去掩码（含 other 一起去掉）：会真实越界读（行 ii 超 IH、列 j+1 超 IW、平面首行 base-1），破坏访存边界，拒绝。",
+    "用 f16 算术或重结合减少 25 个 fp32 乘加（如把 0.25*a+0.75*b 改写为 b+0.25*(a-b)）：会改变舍入位级结果，违反浮点精度要求，拒绝。",
+    "把两次 store 通过 join/reshape 合并成一次 16x256 i32 写：MTE3 在窗口内只有 2 个事件、active 0.0797，非瓶颈，且引入布局重排风险，暂不选。"
+  ],
+  "change": "只编辑 ir/f85be7a40348b16a3bb9f96d42d0385a8950cc3aea4e930615c06704c5b53127/upsample_bilinear2d_2x_kernel.ttir：把 9 个 tt.load 的 other 操作数 `, %cst_1` 全部去掉（%ml_49、%mc_52、%mr_55、%cl_59、%cc_61、%cr_63、%pl_100、%pc_102、%pr_104 仍是同一个带掩码的 tt.load，掩码、指针、结果类型、存放位置不变），并删除因此不再被任何操作引用的常量定义 `%cst_1 = arith.constant dense<0.000000e+00> : tensor<16x128xf16>`。掩码 %m_c_40/%m_l_42/%m_r_44、6 个边界 select、25 个 fp32 乘加、truncf、打包、store 掩码 %m_word_88、函数签名与所有常量（含 65535/16）一律逐字节保持原样；frozen.py、inventory、context 与证据文件冻结。",
+  "expected": "可测预测：1) MTE2 侧最热的两条指令中，pc 0x10d1173c 的 MOV_SPR_XN(MOV_PAD_VAL) 与其重复的 pad 值编程应从 hotspots.top_instructions 消失或 calls 由 16 显著下降，MTE2 event_count（209）与 active_union（0.4386）相应下降；2) bcmlir 中 linalg.fill(0.0f16, 16x128) 与依赖它的关闭通道 select 来源消失，且 9 个 load 仍是带掩码的搬运（不得变成无掩码整块 copy，否则视为越界风险）；3) VECTOR active（0.5724）与 wait（0.2780）不因该改动上升；4) 数值：24 个正式用例与 30+30 补测必须与父版完全一致（不只 atol/rtol 内），matched_ratio 全 1.0、abs_err/rel_err 与 feedback.json 逐项相同；5) 性能：timing-1 延迟低于父版 0.1595696972ms 才算收益；若 pad 通道不在关键路径，则如实报告为落在噪声内（预期降幅量级 0.3%~2%，与 MTE2 窗口 active 0.44 中 pad 部分相当）。",
+  "validation": "宿主在 CPU 编译后按下列顺序核验：1) TTIR 可解析、符号与 ABI 不变（ptr_o 仍为 *i32、PACK16 分支、constexpr BLOCK_I=16/BLOCK_J=128 不变）；2) 位级等价论证逐条落表：9 个加载掩码关闭 lane 的去向要么是 has_l/has_r select、要么是 %m_word_88 store 掩码，且 kernel 内无归约，故其它元素不可观测；3) bcmlir/ttadapter 复核 pads 消失、掩码搬运仍在、地址区间仍落在 [base_i, base_i+IH*IW)；4) 完整 24 项 KGS + 双方 30 项补测与父版对比必须逐项相同；5) ABBA 与修改后双分析：读 MTE2 event_count/active_union、top_instructions 中 MOV_SPR_XN 与 MOV_SRC_TO_DST_ALIGN 的 calls，确认变化来自预期位点，再与 unchanged_ir target 同口径比较延迟。任何文档、预检或建议都不当作收益结果。",
+  "layer_reason": "缺陷是 TTIR 语义事实：other=0.0 是 tt.load 的操作数，后端只能把它实现为零填充与 pad 值编程（ttadapter/bcmlir 已证），任何编译选项都不会删除一个操作数；而源码冻结（source_edit_allowed=false，frozen.py 逐字节一致），源码里的掩码加载同样带 0 填充，不能在源码层表达'死通道不必填充'。因此只能在 IR 层把 other 去掉，属 single_operator_ir。",
+  "simulator_incremental_judgment": "模拟器材料按单核部分窗口解释：capture_scope 只覆盖本核首个至末个可见事件（145.032~153.026us，单位经 19/19 PC 对照校为 us，median_ratio=0.9968），clock_qualification=relative_only、absolute_time_qualified=false、application_completed=false，故绝对时钟无资质，不能把窗口时长与 profiling 的 156.043us 相加或跨次比较。窗口内 MTE2 active 0.4386（productive 0.4330、wait 仅 0.0056）与 VECTOR productive 0.2991/wait 0.2780 表明该窗口 MTE2 更接近限制面，故本轮把机制作用在 MTE2 的 pad 值通道上；CACHEMISS 属 auxiliary_trace_lane（310 events、active 0.0301）、FLOWCTRL 事件极少，均单列不计入，各流水可重叠，不重建关键路径也不线性外推收益。判据取结构性增量：MOV_SPR_XN(MOV_PAD_VAL)/零填充是否消失、MTE2 event 数是否下降，真实收益由宿主完整评测确认。",
+  "unknown": [
+    "后端在去掉 other 后是否仍保留逐行 16 次 1x128 拷贝结构（行非仿射问题本轮不处理），若仍逐行则只剩 pad 值通道的收益。",
+    "去掉 other 后掩码关闭通道在 UB 中变为未初始化数据，若后端因此插入别的清零或整块 copy，收益可能被抵消（需看新 bcmlir）。",
+    "本特化只覆盖 fp16/PACK16 分支，非 PACK16 的 tl.interleave 路径不在本 case 编译产物内，本轮不作任何声称。",
+    "窗口为部分捕获（application_completed=false），pad 值通道在整任务关键路径上的占比未知，收益幅度只能在宿主完整评测中量化。"
+  ]
+}

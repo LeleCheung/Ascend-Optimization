@@ -1,0 +1,153 @@
+{
+  "timestamp": "2026-11-21T15:58:43.111241+00:00",
+  "diagnosis": {
+    "source_sha256": "fd25f875c334f929efa8d0fab381344dfcdb901989c12b113e6ede30e537eda3",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "case4 待修特化的实际BCMLIR输入（原049，sha256 d4e494444fd707cd0e7a6ce95932d90e172e5f43867c64091738f48420ee667b）",
+        "finding": "第111-115行仅有单条 linalg.reduce：ins tensor<128x256xf32>（%47，exp2 的 FP32 结果）→ outs tensor<128xf32>（%51，零初值 %cst_1），dimensions=[1]；第116-135行输出拷贝循环按 %arg14=0..127 step1 逐行 tensor.extract %reduced[%arg14] 后做 FP32 除法并截断写回。第128-134行的2D切片、逐行除法与 materialize_in_destination 构成需要保留的原语义。"
+      },
+      {
+        "path": "ir/case7/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "case7 待修特化的实际BCMLIR输入（原049，sha256 113a7ad920daba2b61e0559a536200dcbeadd6c6434d60a2c996ecd4c489ec43）",
+        "finding": "与 case4 逐行对比后差异集中在 batch/head 步长常数（%c1024_i32/%c512_i32、%c8192_i32/%c4096_i32、%c16_i32/%c4_i32、%c2097152_i32/%c524288_i32、%c8_i32/%c4_i32）与 location 编号；第111-115行的128行FP32归约文本与 case4 完全一致，因此同一行切分改法覆盖两个特化。"
+      },
+      {
+        "path": "compiled-readonly/diagnostic-original-hivm.txt",
+        "category": "source_ir",
+        "role": "原049 BCMLIR 的后端诊断产物（冻结，用于核对实际UB分配而非复用为结果）",
+        "finding": "第269行实际生成 hivm.hir.vreduce <sum> ins(%alloc_17: memref<128x256xf32,UB>) outs(%alloc_21: memref<128x1xf32,UB>) temp_buffer(%alloc_22: memref<16384xf32,UB>) reduce_dims=[1]；第315行报 ub overflow, requires 1576960 bits while 1572864 bits available。131072B(128x256 FP32) + 65536B(temp 16384 f32) + 512B(128x1 FP32 结果) = 197120B，与 1576960 bits 精确对应，说明溢出峰值由这三项组成，其中 temp_buffer 与归约行数同阶。"
+      },
+      {
+        "path": "feedback.json",
+        "category": "evaluation",
+        "role": "本轮正式与补测结果（源 fd25f8…，与当前 frozen.py 相同）",
+        "finding": "case4 与 case7 的 candidate 状态为 failed，错误文本同为 ub overflow requires 1576960 bits while 1572864 bits available；ir001 output 报 failed to legalize operation 'linalg.generic'；ir002/ir003 报 requires 2097152 bits；ir004 报 requires 2101248 bits。保留最佳 attempt-047 的历史目标 case4 为 175.5726us，四个合格 case 的候选值为 111.56305/106.28305/175.5726/94.68955us。当前分支完成编译修复、同源码IR收益、超过保留最佳三项分别验收。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "历史版本 attempt-047 源 3c34fd… 的配对 OpProf（case4），与当前冻结源码身份不同，仅作机制定位",
+        "finding": "spec.source_sha256=3c34fdfb…、seed=1733、case_id=4；reference/candidate 两侧各有 19/20 条每核 CSV 组，derived_differences 记录 vector0/vector1 的 bytes_per_mte2 候选为参考的 0.3393；limitations 明确各流水可重叠、独立采集时间相减得到精确host耗时的做法不成立，等待与活跃比例需要实验核验。该材料给出候选机制排序，本轮归约行切分属于编译修复而非该窗口的直接观测量。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "paired_profiling",
+        "role": "历史版本 attempt-047 的每核热点与流水占用（source_sha256=3c34fdfb…）",
+        "finding": "PC 0x10d11c64 的 MTE3 指令 MOV_SRC_TO_DST_ALIGN 记录 calls=8、cycles=42246、running_time_us=25.6，来源栈指向候选源码第409行 tl.store 与第446行输出索引，属输出写回热点；MTE3 流水 active_ratio=0.6423、wait_ratio=0.2081、idle_ratio=0.3577，说明写回路径存在可观等待。该热点属历史047身份，用于说明输出拷贝机制与行归约机制的作用面不同。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "历史版本 attempt-047 的流水时间线（historical=true）",
+        "finding": "clock_qualification=relative_only、absolute_time_qualified=false，raw_clock_window 为 128.95799255371094–228.9790050049778（unit=unassigned）；absolute_unit_validation 以22个非同步非Scalar PC 对照 CSV 运行时间，median_ratio=0.9998037，故时间轴按相对刻度解释。时间线给出每流水占用与显式 WAIT/BAR 区间，outside_events=20，未报告泳道保持未知；该窗口约束历史047候选，与本轮UB峰值修复属于不同身份。"
+      }
+    ],
+    "hypothesis": "原049两个BF16特化（case4/case7）的编译失败来自UB峰值超出上限512B：峰值等于128x256 FP32 归约输入 131072B + vreduce 临时缓冲 65536B + 128x1 FP32 结果 512B = 197120B，而可用 UB 为 196608B。把同一条 dimensions=[1] 的128行FP32 linalg.reduce 拆成两条各64行的归约，每行仍在同一256键轴上以零初值求和，临时缓冲随行数减半至 32768B，峰值降到约 164352B，回到上限之内；两条64行结果按原行序经 2D tensor 切片与 1D tensor.insert_slice 装配为 tensor<128xf32>，下游逐行 extract/divf/truncf 与写回路径保持原样，每行求和顺序、初值与FP32精度逐位一致。",
+    "alternatives": [
+      "保留分组输出拷贝路线（ir002/ir003）：实测 2097152 bits，峰值 262144B，与本次机制冲突，已作为负结果保留。",
+      "整块输出提升（ir004）：实测 2101248 bits，峰值 262656B，超出更多。",
+      "把归约改写为手写标量/向量累加循环：改变逐行加法结合顺序，破坏与原IR的FP32逐位一致性，拒绝。",
+      "通过编译选项改变多缓冲或子块绑定：属于独立研究身份（编译选项），本轮限定在BCMLIR结构修复。",
+      "在源码层用两块64行的 tl.sum 并按行拼接：源码已冻结，同类意图的源码方向记录在 layer_reason，留作独立调用的候选。"
+    ],
+    "change": "在 ir/target/_gqa_fwd_kernel.bcmlir 与 ir/case7/_gqa_fwd_kernel.bcmlir 的同一位置（原第109-115行，#loc144）做同构替换：删除单条 tensor<128x256xf32>→tensor<128xf32> 的 linalg.reduce 及其 tensor<128xf32> 零初始化；新增两组 tensor<64xf32> 零初始化（linalg.fill ins(%cst_1)）、两条 tensor.extract_slice（%47[0,0][64,256] 与 %47[64,0][64,256]）、两条 dimensions=[1] 的 linalg.reduce（输入 tensor<64x256xf32>、输出 tensor<64xf32>、同一加法律单元），最后用 tensor.empty() : tensor<128xf32> 作目标，先 tensor.insert_slice 低半到 [0][64][1]，再 tensor.insert_slice 高半到 [64][64][1]，结果命名保持 %reduced。Q 加载循环、输出拷贝循环（%arg14=0..127 step1）、QK/PV 矩阵乘、exp2、FP16 截断、逐行除法与截断写回、函数签名与 ABI 全部逐字节保持。",
+    "expected": [
+      "指令结构：每特化由 1 条 linalg.reduce(128x256→128x1) 变为 2 条 linalg.reduce(64x256→64x1)，新增 2 条 tensor.extract_slice、2 条 tensor<64xf32> 的 linalg.fill、2 条 1D tensor.insert_slice（分别装 64 个FP32）。",
+      "后端指令：预期生成 2 条 hivm.hir.vreduce <sum>，reduce_dims=[1]，ins memref<64x256xf32,UB>，outs memref<64x1xf32,UB>，temp_buffer 为 memref<8192xf32,UB>=32768B；装配为两次 64 元素 FP32 的UB内拷贝。",
+      "动态轮次：外层 %arg12 与内层 %arg13 key-block 循环的迭代条件与步长保持原样，每个 key-block 迭代内归约执行次数由1次升为2次，单次覆盖行数由128降为64；输出行循环仍为128次 step1，Q 加载仍为128次 step1。",
+      "资源：UB 峰值预期由 197120B 降到约 164352B（131072B 输入 + 32768B 临时 + 512B 结果），低于 196608B 上限；若后端为两条临时缓冲保留独立偏移，峰值约 196864B（超512B），属宿主核对偏差项。GM workspace 偏移（0/65536/131072/196608）与 K/V/Q 加载字节数预期不变。",
+      "等待与流水：MTE2/MTE3 事件数与同步 flag 配对预期不变；VTOR 侧新增 2 次小规模 UB 拷贝，等待只可能在 VECTOR 内部小段出现，量级远小于历史 047 的 MTE3 25.6us 输出热点。",
+      "性能：本调用以编译修复为目标；按历史047材料，归约行切分触及 VECTOR 侧，单调用延迟预期变化在 ±1us 以内，若编译与四例检查通过再单独评估是否接近或超过 175.5726us。",
+      "数值：每行对同一256个FP32键值以零初值求和，行内结合顺序与初值不变，分母与输出应与原049 IR逐位一致；QK/PV 的 ieee 精度、FP16 截断点、逐行 FP32 除法与 BF16 写回保持不变。"
+    ],
+    "validation": "宿主对 case4 与 case7 两个特化分别续编译，读取后端 PlanMemory/UB 峰值与 hivm.hir.vreduce 的 temp_buffer 尺寸，核对是否落到约 164352B；随后在同一官方四例合同（case1/2/4/7，warmup5/trials3/iterations20，golden 与 checker 身份固定）上运行正确性与全调用计时，逐项核对 expected 中的指令、动态轮次、等待与资源偏差，并把编译结果、数值一致性、同源码IR收益与是否超过保留最佳047的175.5726us分开记录。",
+    "layer_reason": "Triton表达能力：源码049用 l_new = tl.sum(p, 1) 在128行块上一次归约，Triton语言层暴露归约轴与 dtype，不暴露UB临时缓冲尺寸与行块切分，行级切分放到BCMLIR层表达最直接。固定源码实验目的：frozen.py 逐字节冻结，本轮要回答UB峰值是否由归约临时缓冲构成、行切分是否足以恢复编译，同时保持算子数学与精度。IR控制点：BCMLIR第111-115行的 linalg.reduce 带显式 dimensions=[1]、零初值 tensor<128xf32> 与单一输出 %reduced，替换点具体且紧邻下游第129行的逐行 tensor.extract；同一机制需要的两个特化只在步长常数上不同，可同批编辑。替代方向：若改回源码表达，可用两个64行的 tl.sum 分别归约 p 的上下半块，再按行序写入一个128行FP32分母张量（例如两次 slice 赋值的 tl.cat 或显式行偏移写回），该方向留作独立调用的候选。",
+    "simulator_incremental_judgment": "timeline.json 与 profiling/hotspots 同属历史047源 3c34fd… 的材料（timeline historical=true、profiling spec.source_sha256=3c34fdfb…），其绝对时钟资质仅为 relative_only、absolute_time_qualified=false，raw_clock_window 128.95799255371094–228.9790050049778 的单位未标注，故这些数字只作相对占用与热点排序，current 候选的实际测量范围待宿主重放确定。历史窗口内 MTE3 写回热点（PC 0x10d11c64，8次调用、25.6us）与本次行归约切分作用于不同侧，本轮增量判断限定为：修复编译失败所需的最小结构改动，不预期引入新的跨流水等待；未报告的泳道与未覆盖窗口保持未知。",
+    "unknown": [
+      "两条64行归约的临时缓冲是否由规划器复用同一偏移；若复用则峰值约164352B，若不共用则约196864B。",
+      "2D tensor.extract_slice 输入在 bufferization 后是否零拷贝落到连续 subview；一旦插入显式 64KiB 物化拷贝，峰值可能回升。",
+      "64行归约结果的后端 outs 形状（memref<64x1xf32> 或 rank-1）与 insert_slice 的UB内拷贝形式。",
+      "本次机制在 VECTOR 侧的实际耗时增量，以及是否能与历史047的175.5726us比较需在编译通过后测定。"
+    ]
+  },
+  "diagnosis_sha256": "db5b00e8965b91672b5e086ffa8c2a07297e836e4f2e68139ef241c812c897e8",
+  "evidence": [
+    {
+      "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "case4 待修特化的实际BCMLIR输入（原049，sha256 d4e494444fd707cd0e7a6ce95932d90e172e5f43867c64091738f48420ee667b）",
+      "finding": "第111-115行仅有单条 linalg.reduce：ins tensor<128x256xf32>（%47，exp2 的 FP32 结果）→ outs tensor<128xf32>（%51，零初值 %cst_1），dimensions=[1]；第116-135行输出拷贝循环按 %arg14=0..127 step1 逐行 tensor.extract %reduced[%arg14] 后做 FP32 除法并截断写回。第128-134行的2D切片、逐行除法与 materialize_in_destination 构成需要保留的原语义。",
+      "sha256": "d4e494444fd707cd0e7a6ce95932d90e172e5f43867c64091738f48420ee667b"
+    },
+    {
+      "path": "ir/case7/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "case7 待修特化的实际BCMLIR输入（原049，sha256 113a7ad920daba2b61e0559a536200dcbeadd6c6434d60a2c996ecd4c489ec43）",
+      "finding": "与 case4 逐行对比后差异集中在 batch/head 步长常数（%c1024_i32/%c512_i32、%c8192_i32/%c4096_i32、%c16_i32/%c4_i32、%c2097152_i32/%c524288_i32、%c8_i32/%c4_i32）与 location 编号；第111-115行的128行FP32归约文本与 case4 完全一致，因此同一行切分改法覆盖两个特化。",
+      "sha256": "113a7ad920daba2b61e0559a536200dcbeadd6c6434d60a2c996ecd4c489ec43"
+    },
+    {
+      "path": "compiled-readonly/diagnostic-original-hivm.txt",
+      "category": "source_ir",
+      "role": "原049 BCMLIR 的后端诊断产物（冻结，用于核对实际UB分配而非复用为结果）",
+      "finding": "第269行实际生成 hivm.hir.vreduce <sum> ins(%alloc_17: memref<128x256xf32,UB>) outs(%alloc_21: memref<128x1xf32,UB>) temp_buffer(%alloc_22: memref<16384xf32,UB>) reduce_dims=[1]；第315行报 ub overflow, requires 1576960 bits while 1572864 bits available。131072B(128x256 FP32) + 65536B(temp 16384 f32) + 512B(128x1 FP32 结果) = 197120B，与 1576960 bits 精确对应，说明溢出峰值由这三项组成，其中 temp_buffer 与归约行数同阶。",
+      "sha256": "00d53a8d9c49950e44024f7e653dbf1f7c8f6c43fb164d9eed46436160525b99"
+    },
+    {
+      "path": "feedback.json",
+      "category": "evaluation",
+      "role": "本轮正式与补测结果（源 fd25f8…，与当前 frozen.py 相同）",
+      "finding": "case4 与 case7 的 candidate 状态为 failed，错误文本同为 ub overflow requires 1576960 bits while 1572864 bits available；ir001 output 报 failed to legalize operation 'linalg.generic'；ir002/ir003 报 requires 2097152 bits；ir004 报 requires 2101248 bits。保留最佳 attempt-047 的历史目标 case4 为 175.5726us，四个合格 case 的候选值为 111.56305/106.28305/175.5726/94.68955us。当前分支完成编译修复、同源码IR收益、超过保留最佳三项分别验收。",
+      "sha256": "d26ecf012182b116a2790c295935dbda2c4745cefb2b11e8572f115db2e5eaa3"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "历史版本 attempt-047 源 3c34fd… 的配对 OpProf（case4），与当前冻结源码身份不同，仅作机制定位",
+      "finding": "spec.source_sha256=3c34fdfb…、seed=1733、case_id=4；reference/candidate 两侧各有 19/20 条每核 CSV 组，derived_differences 记录 vector0/vector1 的 bytes_per_mte2 候选为参考的 0.3393；limitations 明确各流水可重叠、独立采集时间相减得到精确host耗时的做法不成立，等待与活跃比例需要实验核验。该材料给出候选机制排序，本轮归约行切分属于编译修复而非该窗口的直接观测量。",
+      "sha256": "cecc4a2287dbb4318d6be3f240c5c7d37a4fa7bb9deeca2da7bc41c4d720b2ca"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "paired_profiling",
+      "role": "历史版本 attempt-047 的每核热点与流水占用（source_sha256=3c34fdfb…）",
+      "finding": "PC 0x10d11c64 的 MTE3 指令 MOV_SRC_TO_DST_ALIGN 记录 calls=8、cycles=42246、running_time_us=25.6，来源栈指向候选源码第409行 tl.store 与第446行输出索引，属输出写回热点；MTE3 流水 active_ratio=0.6423、wait_ratio=0.2081、idle_ratio=0.3577，说明写回路径存在可观等待。该热点属历史047身份，用于说明输出拷贝机制与行归约机制的作用面不同。",
+      "sha256": "efbb0d7cc1cb231169af2f8dd9107c6b401a53bf0090ffbbdab60bab75c8d80b"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "历史版本 attempt-047 的流水时间线（historical=true）",
+      "finding": "clock_qualification=relative_only、absolute_time_qualified=false，raw_clock_window 为 128.95799255371094–228.9790050049778（unit=unassigned）；absolute_unit_validation 以22个非同步非Scalar PC 对照 CSV 运行时间，median_ratio=0.9998037，故时间轴按相对刻度解释。时间线给出每流水占用与显式 WAIT/BAR 区间，outside_events=20，未报告泳道保持未知；该窗口约束历史047候选，与本轮UB峰值修复属于不同身份。",
+      "sha256": "0f7146ec83e0916d404e7b62042bc2421d322e1bd0e67a3fa96f623682e22f3a"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "fd25f875c334f929efa8d0fab381344dfcdb901989c12b113e6ede30e537eda3",
+    "contract.json": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858",
+    "ir-inventory.json": "d6ff5d62d6c3a0fdae6c8b34ac7c938ce279064103bf067de1ae047800f25dda",
+    "feedback.json": "d26ecf012182b116a2790c295935dbda2c4745cefb2b11e8572f115db2e5eaa3",
+    "profiling.json": "cecc4a2287dbb4318d6be3f240c5c7d37a4fa7bb9deeca2da7bc41c4d720b2ca",
+    "hotspots.json": "efbb0d7cc1cb231169af2f8dd9107c6b401a53bf0090ffbbdab60bab75c8d80b",
+    "timeline.json": "0f7146ec83e0916d404e7b62042bc2421d322e1bd0e67a3fa96f623682e22f3a",
+    "gqa-head-row-language-evidence.txt": "da1fecda802f6fed0e6e8f2e1d78ce5b5c47b8d9587ea5dd5eb55897180bdcf1",
+    "context.json": "8db793a20e68946c015ea09942b39cca4dc2f7cdcee5aff323b46a92ed363f35",
+    "diagnosis.json": "d38ae0290ed2cc547d031033ffc806fce9c0e5eed19ed79604b15995b7e5de38",
+    "codex-brief.json": "7c413794ca22e5a5969b56ed00f0382b3346711ded505e19ef8aab5cc050e23c",
+    "memory-partition-findings.json": "b5e2b8abcb05299a6cc5c7fc4b5e6dc102ba6469140153fce353a0ce356000da",
+    "ir/target/_gqa_fwd_kernel.bcmlir": "d4e494444fd707cd0e7a6ce95932d90e172e5f43867c64091738f48420ee667b",
+    "ir/case7/_gqa_fwd_kernel.bcmlir": "113a7ad920daba2b61e0559a536200dcbeadd6c6434d60a2c996ecd4c489ec43",
+    "compiled-readonly/_gqa_fwd_kernel.ttir": "b940405368885e9fd449e76edd25e733822dc859e2f4933c63d2a0f6ff939edb",
+    "compiled-readonly/_gqa_fwd_kernel.ttadapter": "0dfa3181c57625c4ef4f3894f9b5cc35eba95f5df1e1cd30695f0a09f502c9fe",
+    "compiled-readonly/_gqa_fwd_kernel.bcmlir": "d4e494444fd707cd0e7a6ce95932d90e172e5f43867c64091738f48420ee667b",
+    "compiled-readonly/diagnostic-original-hivm.txt": "00d53a8d9c49950e44024f7e653dbf1f7c8f6c43fb164d9eed46436160525b99",
+    "compiled-readonly/diagnostic-grouped-hivm.txt": "19167f78e91f64a00adabc52ee34e9c9ba512726a6f7ca61f6cfe483d346dfbb",
+    "compiled-readonly/retained047-normalization.bcmlir": "1b8c41e573a25dec78d755766ef9228cae5f3f5204d00ef3353b67f77d9cc5cb"
+  },
+  "decision_tool_sha256": "2ba55ebab8be5b8a2363da657d6ee81799d4cabcdfb8e1494846aecfd1fde624"
+}

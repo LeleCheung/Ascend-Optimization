@@ -1,0 +1,241 @@
+{
+  "timestamp": "2026-11-21T19:35:04.938408+00:00",
+  "diagnosis": {
+    "source_sha256": "19f7fb238946cb9006286d4d222425d07c4ea9fc38a7d4ff85c71c72c49c584a",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "feedback.json",
+        "category": "paired_profiling",
+        "role": "验收起点与正式/补测结果",
+        "finding": "ir003（IR sha c3bfa792…）四项原始输入全部通过；条件式全调用中位145.73015→145.0894us、增益0.4397%；正式历史口径增益1.0193%；case4 全调用144.43715us，同轮 native 125.18865us，比值0.866734保持。本轮以此为比较起点，父IR即当前 ir/target.hivm.mlir。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "整流水分量与时间去向",
+        "finding": "同轮 candidate 20 核：aiv_vec_time 均值47.0228us/核（sum 940.456us）、aiv_mte2 14.514us、aiv_mte3 19.797us；vector 侧标量等待 id0 均值95.087us、id4 28.941us；cube 侧 fixpipe 21.79us、mte2 32.77us、标量等待 id1 104.87us。父版本 vec 58.999us、mte2 39.36us。向量段仍占每核窗口约三分之一，标量等待占据主要空闲。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "simulator",
+        "role": "veccore0 聚合热点与等待归因",
+        "finding": "core0.veccore0 窗口内每个 PC 计14次：WAIT_FLAG_DEVI UIMM:0（PC 0x10d11bb0）63.68us 为 PV 就绪等待；WAIT_FLAG_DEVI UIMM:0x4（PC 0x10d11e3c）37.40us 为 nextQK flag4 等待；WAIT_FLAG MTE3→MTE2 27.39us；VECTOR BAR 20.61us/16.12us/13.70us 分别落在源码529/530/532；PV 结果经 MTE3 写回 40.26us。累计值跨流水可重叠，仅用于排序与定位，represent 区域最大项63.68us。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "同核窗口事件相对次序",
+        "finding": "veccore0 捕获窗口33.202–148.679（绝对时钟未绑定，28/28 PC 校验，14区间/PC）。与 prefetch-mechanism.json 对齐的相对次序：P发送40.867–42.787、nextQK就绪等待39.588–44.480、nextQK接收44.486–44.968、PV就绪等待44.488–45.895、PV接收45.897–46.221、分母归约46.336–46.886、VREC 46.887–46.900。分母与倒数整段落在两次跨核等待与PV接收之后。"
+      },
+      {
+        "path": "prefetch-mechanism.json",
+        "category": "simulator",
+        "role": "上一轮机制的实际窗口记录与限制",
+        "finding": "记录 nextQK MTE2 接收与当前 PV 就绪等待在同核窗口重叠，新就绪等待 UIMM=4 在 PC 0x10d11e3c、原 PV 等待 UIMM=0 在 0x10d11bb0，QK 消费信号在 MTE2 完成之后；并明确分母 sum 仍位于 PV 接收之后，作为后续依赖研究候选；窗口为部分重放、application_completed=false、动态计数非整核总量。"
+      },
+      {
+        "path": "ir/target.hivm.mlir",
+        "category": "source_ir",
+        "role": "实际发射点、缓冲地址与事件配对",
+        "finding": "AIV 段：P（BF16 UB32768）由 MTE3 存出后 set_flag MTE3→V EVENT0 并 sync_block_set MTE3→S flag=1；随后 nextQK 分支内含 set_flag MTE3→MTE2 EVENT0、sync_block_wait FIX→S flag=4、wait MTE3→MTE2 EVENT0、load 到 UB32768；再 sync_block_wait FIX→S flag=0、load PV 到 UB65536、半→浮转换到 UB81920；之后才是 enablevc_reduce_sum_ar_float（源 %45 = 64x256 fp32 @114688，结果 @180224，scratch UB0）与 vrec_1d_float（源180224，目的114688即分母源区首256字节，tmp UB0）。"
+      },
+      {
+        "path": "ir/target.hivm.mlir",
+        "category": "source_ir",
+        "role": "别名、生存期与依赖审查",
+        "finding": "分母输入区间114688–180224在P转换（读114688、写32768）之后无其它读者与写者；VREC 目的114688与 tmp UB0 落在同区间前部与UB0，故保持先归约后倒数的原有顺序即可。sum scratch UB0 的 qk_lo 数据在本迭代首次半→浮转换（`%is_first` 分支）已被读完，后续迭代读 qk_hi（32768），UB0 在本迭代后续保持死区；nextQK 与 PV 接收分别写 UB32768、UB65536，均与 UB0 及114688段无别名。跨迭代生存期由既有 MTE3→MTE2 EVENT0、MTE2→V EVENT1 与 FIX→S flag4/flag0 覆盖。"
+      },
+      {
+        "path": "frozen.py",
+        "category": "source_ir",
+        "role": "冻结语义与语句序来源",
+        "finding": "PART_TILES 分支第529–534行为 p=exp(qk)、p_bf=p.to(bf16)、acc=dot(p_bf,v)、l_new=tl.sum(p,1)，第552行 out=acc/l_new[:,None]。分母只服务于 PV 之后的归一化，与 PV dot 无数据依赖；源码已把 sum 放在 PV 之后，编译产物据此把 FP32 归约排在 PV 之后。"
+      },
+      {
+        "path": "compiled-readonly/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "后端低层产物核对（冻结）",
+        "finding": "第121行 PV matmul、第126行 linalg.reduce（FP32、dim=1、addf 树）、第131行 broadcast、第132行 arith.divf 依次排列，归约与除法各自独立成形；ttadapter 第126行同一 linalg.reduce。归约与倒数在低层保持两个独立算子，无折叠或冗余重排，故发射位置由 HIVM 语句序决定。工作区无 lowered-inventory.json，本轮不修改这些冻结产物。"
+      },
+      {
+        "path": "historical-sum059-negative.json",
+        "category": "paired_profiling",
+        "role": "历史同类负结果与身份区分",
+        "finding": "059 六语句 IR 重排把未改动的 sum 提前到 PV 等待之前：原始四项通过、正式评测更慢、条件式中位0.522%更慢，未保留。该版本无 nextQK 预取、无原生 VREC、无独立 UB32768 接收缓冲；本轮为不同 IR 身份下的组合检验，负结果先验保留。"
+      },
+      {
+        "path": "codex-brief.json",
+        "category": "simulator",
+        "role": "宿主证据分析与候选方向（归功 Codex）",
+        "finding": "Codex 指出同一窗口次序、新接收复用 UB32768 而 sum scratch UB0 已死、VREC 目的114688须在 sum 读完后，并列出别名/屏障/事件数审查要求；本轮采纳该机制方向，由其分析定位到 P 发送与两次跨核等待之间的窗口。"
+      }
+    ],
+    "hypothesis": "当前每个 (程序, 相交组) 迭代里，分母归约与原生倒数在整条链的最尾部发射，恰落在 nextQK 就绪等待与 PV 就绪等待都结束、PV 接收完成之后，此时 V 队列已无其它可发工作，向量链尾直接暴露。把同一归约与倒数的发射点提前到 P 存出并置位 flag1 之后、nextQK flag4 等待与 PV flag0 等待之前，可以让标量在两次跨核等待期间先把 sum 与 VREC 排入 V 队列：sum 只依赖已在114688成形的 FP32 p，VREC 只依赖 sum 写出的180224，二者与 UB32768/UB65536 上的 P、nextQK、PV 接收都不相交，乘积与归一化仍留在原位置。若标量派发开销与 V 队列排队可被等待吸收，每迭代的尾部向量链将移入既有等待窗口，kernel 与全调用延迟下降。",
+    "alternatives": [
+      {
+        "option": "保持 IR 原样并登记观察",
+        "reason": "若别名、依赖或事件审查阻止提前发射，则按 no-change 交接；当前审查显示可行，故作为退路保留。"
+      },
+      {
+        "option": "只提前 sum、保留 VREC 在 vmul 之前",
+        "reason": "更保守，但把倒数留在等待之后，尾部链仍有约0.01us 级的串行段，且需单独身份验证。"
+      },
+      {
+        "option": "额外插入 pipeline barrier 或拆分归一化",
+        "reason": "会新增同步成本并混入第二机制，本轮只沿用原有 barrier，事件与屏障数保持。"
+      },
+      {
+        "option": "回退到059式源码语句序",
+        "reason": "059 已判定合格负结果，且缺 nextQK 预取、原生 VREC 与独立接收缓冲，与本轮 IR 身份不同。"
+      }
+    ],
+    "change": "在 ir/target.hivm.mlir 的 _gqa_fwd_kernel_mix_aiv 内做同一机制的三处语句搬移：把 %56/%57 指针、%cast_32/%cast_33/%cast_34、enablevc_reduce_sum_ar_float 调用，以及 %rcp_src/%rcp_dst/%rcp_tmp、vrec_1d_float 调用、%rcp_2d expand_shape 连同其原有 pipe_barrier[<PIPE_V>] 两条，整体从 PV 接收与半→浮转换之后搬到 sync_block_set[<VECTOR>, <PIPE_MTE3>, <PIPE_S>] flag = 1（P 发送完成信号）之后、scf.if nextQK 接收块之前。浮点运算种类、归约树、FP32 精度、缓冲地址（114688/180224/UB0/UB32768/81920/114944）、%58 与 %vmul_tmp 位置、标志位与跨核事件数量、函数实参、AIC 段与函数 ABI 逐字保持；不新增 barrier。",
+    "expected": [
+      "指令：新增或删除的动态指令数为0；求和仍是同一 vcadd/归约序列，倒数仍是同一 vrec，VMUL 与 bf16 转换、存储指令保持。",
+      "动态轮次：每组迭代仍各执行一次 sum 与一次 VREC；窗口内每 PC 计数延续14次的同口径检查，动态总次数须按覆盖量归一后再比。",
+      "等待：nextQK flag4（UIMM=4）与 PV 就绪 flag0（UIMM=0）等待的发射点与位置保持不变；重放观察 sum/VREC 落在 flag1 之后、两次等待之前，PV 接收之后的尾部窗口内这两条不再出现。",
+      "资源：GM↔UB、L0C→GM 字节量不变；UB 区间占用不新增；事件/flag 计数与 barrier 数不变，故不引入新的同步停顿。",
+      "时间：预测每迭代尾部向量链（约0.55us 量级的局部链）并入既有等待窗口，上界为向量段减少、下界为0；四项原始输入与条件式全调用分别核对，全调用可能因标量派发与队列排队而收益更小。"
+    ],
+    "validation": "宿主先跑原始四项 checker（阈值不变）与条件式 A/B 全调用；随后对本次候选做部分窗口重放，按 PC 核对 (1) enablevc_reduce_sum_ar_float 与 vrec 的区间落在 P 发送/flag1 之后、flag4 与 flag0 等待之前，(2) PV 接收之后的 sum/VREC 区间消失，(3) 每 PC 动态次数与搬运字节与父版本一致，(4) 无新增 WAIT/BAR。若重放次序兑现而延迟未降，按真实无收益记录；若次序未兑现，说明后端另有权衡，作为待验证假设保留。",
+    "layer_reason": "Triton 表达层：frozen.py 第529–534行的语句序把 sum 放在 PV 之后，语言层能表达的替代方向是把 l_new 计算移到 p 截断与 PV 之间（源码注释已记录该意图）；TTIR/BCMLIR 与 HIVM 已按该序落定，而“把倒数发射到某个跨核等待之前”属于发射时序，语言层无对应表达。固定源码实验目的：本轮保持 frozen.py 逐字节一致，以同源码不同编译产物区分机制，归因到单算子 IR 层的调度缺陷。IR 控制点：hivm.hir 的 set_flag/sync_block_wait/pipe_barrier 与语句序共同决定标量派发与 V 队列顺序，把同一条归约/倒数语句搬到 flag1 之后即可改变其相对等待的位置，而计算内容与地址保持。",
+    "simulator_incremental_judgment": "证据来自同轮部分窗口重放：veccore0 捕获33.202–148.679us，绝对时钟资质未绑定，跨核与跨运行的绝对时间不可比，比较限于同轮同窗口相对次序；每 PC 14个区间，动态总次数按覆盖量归一后比较；未报告的泳道（例如 sum 的 VECTOR 微指令、AIC 侧同一时刻的细节）保持未知，本轮不据此下结论。热点累计时间跨流水可重叠，仅用于排序。预测的局部链上界约0.55us 属单迭代量级估计，整核与全调用收益由宿主重放与四项评测确认。",
+    "unknown": [
+      "sum 的 VECTOR 微指令未在 hotspots/timeline 中单列，其单次执行时长只能由源码形状与 profiling 向量占用间接约束。",
+      "标量派发 sum/VREC 后进入 flag4 等待的派发开销、以及 V 队列在等待期间的调度优先级，需重放实测。",
+      "本轮只覆盖 case4 部分窗口；四项同口径的整核与全调用差异待宿主评测。"
+    ]
+  },
+  "diagnosis_sha256": "34b7a843ff780e58ad67a98a12c64895b72cfb7fb55ef68fc77a3c2703769c39",
+  "evidence": [
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "验收起点与正式/补测结果",
+      "finding": "ir003（IR sha c3bfa792…）四项原始输入全部通过；条件式全调用中位145.73015→145.0894us、增益0.4397%；正式历史口径增益1.0193%；case4 全调用144.43715us，同轮 native 125.18865us，比值0.866734保持。本轮以此为比较起点，父IR即当前 ir/target.hivm.mlir。",
+      "sha256": "9b5feb5f54609affb590d9019904c42560dde839c731a69051b702d84a2a62f8"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "整流水分量与时间去向",
+      "finding": "同轮 candidate 20 核：aiv_vec_time 均值47.0228us/核（sum 940.456us）、aiv_mte2 14.514us、aiv_mte3 19.797us；vector 侧标量等待 id0 均值95.087us、id4 28.941us；cube 侧 fixpipe 21.79us、mte2 32.77us、标量等待 id1 104.87us。父版本 vec 58.999us、mte2 39.36us。向量段仍占每核窗口约三分之一，标量等待占据主要空闲。",
+      "sha256": "e231ceadace9768e669822cbeb987fd61376218677ff1bb3437c2fe8f92f02d7"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "veccore0 聚合热点与等待归因",
+      "finding": "core0.veccore0 窗口内每个 PC 计14次：WAIT_FLAG_DEVI UIMM:0（PC 0x10d11bb0）63.68us 为 PV 就绪等待；WAIT_FLAG_DEVI UIMM:0x4（PC 0x10d11e3c）37.40us 为 nextQK flag4 等待；WAIT_FLAG MTE3→MTE2 27.39us；VECTOR BAR 20.61us/16.12us/13.70us 分别落在源码529/530/532；PV 结果经 MTE3 写回 40.26us。累计值跨流水可重叠，仅用于排序与定位，represent 区域最大项63.68us。",
+      "sha256": "33a9970a32bd0a46f7a21ededac872d9817854eed2df0b98ec55e2c1d443de28"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "同核窗口事件相对次序",
+      "finding": "veccore0 捕获窗口33.202–148.679（绝对时钟未绑定，28/28 PC 校验，14区间/PC）。与 prefetch-mechanism.json 对齐的相对次序：P发送40.867–42.787、nextQK就绪等待39.588–44.480、nextQK接收44.486–44.968、PV就绪等待44.488–45.895、PV接收45.897–46.221、分母归约46.336–46.886、VREC 46.887–46.900。分母与倒数整段落在两次跨核等待与PV接收之后。",
+      "sha256": "59c5f0a0f8cce6fddf753497caa0e9375edff7cbc84790f2f235cb34f89b5762"
+    },
+    {
+      "path": "prefetch-mechanism.json",
+      "category": "simulator",
+      "role": "上一轮机制的实际窗口记录与限制",
+      "finding": "记录 nextQK MTE2 接收与当前 PV 就绪等待在同核窗口重叠，新就绪等待 UIMM=4 在 PC 0x10d11e3c、原 PV 等待 UIMM=0 在 0x10d11bb0，QK 消费信号在 MTE2 完成之后；并明确分母 sum 仍位于 PV 接收之后，作为后续依赖研究候选；窗口为部分重放、application_completed=false、动态计数非整核总量。",
+      "sha256": "ad72c3592102ecb4e43f8a2262fa595f3572468e3d75b4200d5475f452bcd925"
+    },
+    {
+      "path": "ir/target.hivm.mlir",
+      "category": "source_ir",
+      "role": "实际发射点、缓冲地址与事件配对",
+      "finding": "AIV 段：P（BF16 UB32768）由 MTE3 存出后 set_flag MTE3→V EVENT0 并 sync_block_set MTE3→S flag=1；随后 nextQK 分支内含 set_flag MTE3→MTE2 EVENT0、sync_block_wait FIX→S flag=4、wait MTE3→MTE2 EVENT0、load 到 UB32768；再 sync_block_wait FIX→S flag=0、load PV 到 UB65536、半→浮转换到 UB81920；之后才是 enablevc_reduce_sum_ar_float（源 %45 = 64x256 fp32 @114688，结果 @180224，scratch UB0）与 vrec_1d_float（源180224，目的114688即分母源区首256字节，tmp UB0）。",
+      "sha256": "c3bfa79252997697a999f80291af3e0e38b678d5c4339fa22c603d3b9406fa1a"
+    },
+    {
+      "path": "ir/target.hivm.mlir",
+      "category": "source_ir",
+      "role": "别名、生存期与依赖审查",
+      "finding": "分母输入区间114688–180224在P转换（读114688、写32768）之后无其它读者与写者；VREC 目的114688与 tmp UB0 落在同区间前部与UB0，故保持先归约后倒数的原有顺序即可。sum scratch UB0 的 qk_lo 数据在本迭代首次半→浮转换（`%is_first` 分支）已被读完，后续迭代读 qk_hi（32768），UB0 在本迭代后续保持死区；nextQK 与 PV 接收分别写 UB32768、UB65536，均与 UB0 及114688段无别名。跨迭代生存期由既有 MTE3→MTE2 EVENT0、MTE2→V EVENT1 与 FIX→S flag4/flag0 覆盖。",
+      "sha256": "c3bfa79252997697a999f80291af3e0e38b678d5c4339fa22c603d3b9406fa1a"
+    },
+    {
+      "path": "frozen.py",
+      "category": "source_ir",
+      "role": "冻结语义与语句序来源",
+      "finding": "PART_TILES 分支第529–534行为 p=exp(qk)、p_bf=p.to(bf16)、acc=dot(p_bf,v)、l_new=tl.sum(p,1)，第552行 out=acc/l_new[:,None]。分母只服务于 PV 之后的归一化，与 PV dot 无数据依赖；源码已把 sum 放在 PV 之后，编译产物据此把 FP32 归约排在 PV 之后。",
+      "sha256": "19f7fb238946cb9006286d4d222425d07c4ea9fc38a7d4ff85c71c72c49c584a"
+    },
+    {
+      "path": "compiled-readonly/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "后端低层产物核对（冻结）",
+      "finding": "第121行 PV matmul、第126行 linalg.reduce（FP32、dim=1、addf 树）、第131行 broadcast、第132行 arith.divf 依次排列，归约与除法各自独立成形；ttadapter 第126行同一 linalg.reduce。归约与倒数在低层保持两个独立算子，无折叠或冗余重排，故发射位置由 HIVM 语句序决定。工作区无 lowered-inventory.json，本轮不修改这些冻结产物。",
+      "sha256": "b39e0b3c3b69599dce8713f580ba48a934e262babd4652b4d7605252d95ac120"
+    },
+    {
+      "path": "historical-sum059-negative.json",
+      "category": "paired_profiling",
+      "role": "历史同类负结果与身份区分",
+      "finding": "059 六语句 IR 重排把未改动的 sum 提前到 PV 等待之前：原始四项通过、正式评测更慢、条件式中位0.522%更慢，未保留。该版本无 nextQK 预取、无原生 VREC、无独立 UB32768 接收缓冲；本轮为不同 IR 身份下的组合检验，负结果先验保留。",
+      "sha256": "a5231ec3cd4834a088f82fa9d65118510d2e1af454c18b08ae45b79e6cb0f4f1"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "simulator",
+      "role": "宿主证据分析与候选方向（归功 Codex）",
+      "finding": "Codex 指出同一窗口次序、新接收复用 UB32768 而 sum scratch UB0 已死、VREC 目的114688须在 sum 读完后，并列出别名/屏障/事件数审查要求；本轮采纳该机制方向，由其分析定位到 P 发送与两次跨核等待之间的窗口。",
+      "sha256": "731737b539af9e18c22ab4a94b0fd1de485a9d409279e4d120bfd5db629cea42"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "19f7fb238946cb9006286d4d222425d07c4ea9fc38a7d4ff85c71c72c49c584a",
+    "contract.json": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858",
+    "ir-inventory.json": "48c504d44cd3e9537e532cfc7b2bc949dda4114d79a5197a99d5dfe22074621a",
+    "profiling.json": "e231ceadace9768e669822cbeb987fd61376218677ff1bb3437c2fe8f92f02d7",
+    "hotspots.json": "33a9970a32bd0a46f7a21ededac872d9817854eed2df0b98ec55e2c1d443de28",
+    "timeline.json": "59c5f0a0f8cce6fddf753497caa0e9375edff7cbc84790f2f235cb34f89b5762",
+    "historical-059-native-vrec.mlir": "be4f69f4d9a2f1f8999dfa8fc0548b9f4a06bc1271e837b8a3a6424469923015",
+    "historical-059-native-vrec-result.json": "5e5654a383ad9e6331ecc1276a02961f2e91f61373267c8f54d6288ef603bb56",
+    "context.json": "5831fffb6b6ccb8ca9ea5b2e3d8e4d10186e37c1dc87345184d2220f7962c38a",
+    "feedback.json": "9b5feb5f54609affb590d9019904c42560dde839c731a69051b702d84a2a62f8",
+    "diagnosis.json": "a8d77dee8ac32ec8c6bc494d90b9794368bfc486a25c3682fe7fce1604d859ae",
+    "codex-brief.json": "731737b539af9e18c22ab4a94b0fd1de485a9d409279e4d120bfd5db629cea42",
+    "backend-binding.json": "037ff0b2558304288330a3f53e59a9c8e26e7fbe37d5133337922ae1eaf37421",
+    "reviewed-prefetch-draft.mlir": "c3bfa79252997697a999f80291af3e0e38b678d5c4339fa22c603d3b9406fa1a",
+    "profiling-full.json": "0103fa2eefe5001a246b4b62b6cabf5a3e6bfcce429cf385965b1a2b38d91932",
+    "prefetch-mechanism.json": "ad72c3592102ecb4e43f8a2262fa595f3572468e3d75b4200d5475f452bcd925",
+    "historical-sum059-negative.json": "a5231ec3cd4834a088f82fa9d65118510d2e1af454c18b08ae45b79e6cb0f4f1",
+    "ir/target.hivm.mlir": "c3bfa79252997697a999f80291af3e0e38b678d5c4339fa22c603d3b9406fa1a",
+    "compiled-readonly/_gqa_fwd_kernel.source": "e0dac92dbebfe6df5fbab3f1f2fcd64471f3068401d34a58efe87bd56a1ea632",
+    "compiled-readonly/_gqa_fwd_kernel.ttir": "5d66bbc4930f03ec142fde1f7aae8d01b71d5cfaa8527500198c810c2e49205b",
+    "compiled-readonly/_gqa_fwd_kernel.ttadapter": "e394963e0d7c4428865cf5c22f53a394855520a1c3549062432a73a8424a7f38",
+    "compiled-readonly/_gqa_fwd_kernel.mlirbc": "cb1d2dc9af307221254b1f408feb5ea9cd287f9701af273383ea35726f85562b",
+    "compiled-readonly/_gqa_fwd_kernel.bcmlir": "b39e0b3c3b69599dce8713f580ba48a934e262babd4652b4d7605252d95ac120",
+    "compiled-readonly/_gqa_fwd_kernel.npubin": "3972cdc5bef4ebdc816b6dccaf3405946f390cc04b21fa3e56ca7de85c11832f",
+    "compiled-readonly/manifest.json": "19c40de6d67b0eb7c4f6fd09b8f4b73638d6a54ace33d807b0d98ef39dea274f",
+    "public-source/EltWise1D.cpp": "adeefa4bb642711ecc76df257f8217fd91398e52453426e4f8736c5a973fa773",
+    "public-source/EltWise2D.cpp": "84f63673a9662d96e0ecd6f8dd78467dfe5e6e1daa529e50163d1d9ae74a312e",
+    "public-source/hivm-op-decompose.mlir": "104b8f583e8a163892c2ce0ad9785237eb7ba43eb201feedd5ef2fd6f11c951a",
+    "public-source/HIVMDecomposeOp.cpp": "2fd26ffb92eb0fc6c8dfd6e424b5874be32582773b28063cb49adec68dc9bbb0",
+    "public-source/HIVMToStandard.cpp": "8c8654126e129d88cc0d73c8c28f9886bade5f67ce1619e9d3cc2a9038fd4d60",
+    "public-source/sources.json": "4728abc28bb9507dba602d6292a5768e0117ba2b5f5f782d3b799a9aa643045f",
+    "public-source/tree-query.json": "27bab0976fa7ab2ae66ac9914488cba4bb4f22c8efbe6618f8a7e8d0e6bfdb6d",
+    "capability-readonly/installed-ascendc-reciprocal.txt": "f6ccc6d3049f02dfd43a768a8641bae22f4a7bab17642eb1cdd2757277ea1522",
+    "capability-readonly/status.json": "e60a92c022225d2918cdc8ea0809425a31be157bd646169adb063ea62255ce05",
+    "capability-readonly/llvm-inspection-request.json": "cd9c71f3a6d51cd91d3740a2bd11a88e7b5778e861a0e0e793f09f9160ab70fb",
+    "capability-readonly/llvm-inspection.log": "724f5e1d2db24f96c23f6ccfb23e8af7fc0b48aea72381fa3475f0b086bd16af",
+    "capability-readonly/llvm-reciprocal-symbols.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "capability-readonly/hivm-reciprocal-op-strings.txt": "04e9dcea5624136ca9d4a89ade7791efcbfcf61f306b7eb7e26827579bedef4a",
+    "capability-readonly/meta-llvm-inspection-request.json": "f005c9f012bd620b263c18e74d4e8060292735e88c86ee0984d02ae93a0c27f0",
+    "capability-readonly/meta-llvm-inspection.log": "6c7c789f8d222083719eaa60295241589e6f55c806f952dbf1a253e5624711f4",
+    "capability-readonly/meta-llvm-reciprocal-symbols.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "capability-readonly/backend-reciprocal-strings.txt": "09cfc26956265595950f4edfb22d02435f6461d07e96bbf9ad8717463a38bd47",
+    "capability-readonly/installed-triton-reciprocal-interface.txt": "494d3cf3c528779aa21a6f91b02c2d69da69d1f75827fec1344a6007f1b1f05e",
+    "capability-readonly/installed-reciprocal-evidence.txt": "86370a5c6ff93e03b7b04a6e15de4a927a6922ec8322dc0f972502524b6bcf10",
+    "capability-readonly/bishengir-hidden-help.txt": "ef3c382886a08314b6d3a11ffcc89e7e1ee06ea0e33a19f350fbbc04d11644d6",
+    "event-capability-readonly/0-matmul_impl.h": "8059d160027333ea3fbf497476fff4b85e69d8d4deef16b723533634acfb65a9",
+    "event-capability-readonly/1-batch_copy_cube_in_using_ub.h": "956a83361ae0ea91ce1c27ead07e19f7b879576aa0326167b0836321a743bd78",
+    "event-capability-readonly/sources.json": "d059674ef7d37536dd2716e61721acacc52d7853f9d792c92b1dec38e52b7858"
+  },
+  "decision_tool_sha256": "2ba55ebab8be5b8a2363da657d6ee81799d4cabcdfb8e1494846aecfd1fde624"
+}

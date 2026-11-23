@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 35,
+    "duration_ms": 95385,
+    "usage": {
+      "input_tokens": 48801,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1039232,
+      "output_tokens": 14321,
+      "output_tokens_details": {
+        "thinking_tokens": 6691
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 48801,
+        "outputTokens": 14321,
+        "cacheReadInputTokens": 1039232,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.1216460000000001,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 6691,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.1216460000000001,
+    "result": "已完成本轮独立调度分支的实现并停在验收边界，字节保持冻结。\n\n## 本轮改动（仅源码调度位置）\n\n在 `candidate.py` 中只对 `SINGLE_KV and PV_SINGLE_F16`（case4、case7 的 BF16/SKV=256 单块路径）做了顺序重排，并新增了 011/012/013/009 未测过的独立机制：V 的载入与 bf16→fp16 转换现在紧随 QK dot / qk_scale / 掩码之后、rowmax 之前，PV dot 复用同一 `v16` tile。QK 仍先于 V 准备，避免 009 把 V 排到 QK 之前引入的前导等待。\n\n其他路径全部原样：非 `SINGLE_KV`、`PV_SINGLE_F16=false`（case1 FP16 因果、case2 FP16 SKV=128）仍在 softmax 之后原位置载入 V；分块、掩码判据、stride/索引公式、dtype、算术表达式与相加顺序、输出、公共入口均未改动，无新增 launch/缓存/后端。\n\n## 修改前记录\n\n- diagnosis.json 已写入完整证据（`workspace/simulator-evidence.json`、`workspace/actual-ir/2-_gqa_fwd_kernel.ttir`、`workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir`、`workspace/current-profiling.json`、`workspace/context-brief.json`、`workspace/previous-result.json`），含 hypothesis/alternatives/discriminating observation/selected_layer/simulator_incremental_judgment。\n- 模拟器增量判断已明确：热点（Cube PV `WAIT_FLAG_DEVI` 9.59μs、Vector V 载入 1.66μs、PV 前 MTE2→VEC 1.66μs、BAR 2.34μs）用于定位；流水（Cube CUBE 11.2% productive、Vector VECTOR 19.6%/MTE2 17.2%）用于判断可重叠余量；两者为三核部分归一化窗口、不可相加，且 `application_completed=false` 保留全调用 completion 缺失，收益仅由完整四项计时判定。\n- 桥 `decision --record diagnosis.json` 已登记：`decision_id=666f4f2f26e4499c80d0564d100c6e93`，绑定修改前 `source_sha256=aec8e907...`。\n\n## 预检结果\n\n`preflight --source candidate.py` 返回 `awaiting_source_review`，冻结候选 `source_sha256=edf701a86432e001154d47585164de59f1e862bf07030228fcc2975289fa338d`（与文件实测一致），字节保持不变。\n\n## 交接给宿主（验收边界）\n\n请对冻结候选执行宿主只读路径/地址边界审查及完整四项真机评测（原 checker、golden、case1/2/4/7、dtype 与计时合同、阈值 `0.0009765625` 不变），并重放修改后实际 IR 顺序与事后模拟器。需要据实观察的判别点：V 的 `memref.copy`/`extf`+`truncf` 是否被提升到 softmax reduce 之前；Vector 处 PV 前 MTE2→VEC 1.66μs 是否消除且未新增前导等待；case4 是否低于 `328.4468μs`，case7 同分支的真实变化，case1/2 是否路径不变。完整结果与重放反馈回后我再更新诊断中的观测与未决问题。"
+  }
+}

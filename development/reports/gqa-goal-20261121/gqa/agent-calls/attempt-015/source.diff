@@ -1,0 +1,36 @@
+--- 
++++ 
+@@ -427,8 +427,16 @@
+     # 数量主导）。动机二：M256 下若仍做单条 256x256 QK dot，L0C 累加器为
+     # 256KiB 超单块容量；改为两条 256x128 FP32 QK dot（各 128KiB）后，PV 输出
+     # 256x128 FP32 同样为 128KiB，两处都落入已知单块容量。
++    # 适用条件修复（源码审查）：此分支的 K 载入无掩码，隐含“真实通道数恰为
++    # 128”。BLOCK_D = next_power_of_2(D) 只是在 D=65..127 时也被填充到 128，
++    # 因此旧判据仅凭 BLOCK_D==128 会把真实 D 不足 128 的几何放进无掩码 split-K
++    # 载入（越界读通道 D..127），且此时 MASK_KV 为真而 kv_mask 只在普通分支
++    # 定义。加入真实 D == 128（与 BLOCK_D == 128 同时成立即 D==BLOCK_D）后，
++    # 新分支满足 SKV==BLOCK_N==256、S%BLOCK_M==0，MASK_KV/MASK_MD 均为假，
++    # 所有无掩码载入与守卫删除都可证成立。原四项 D 均为 128，选路结果不变。
+     SPLIT_QK = ((value.dtype == torch.bfloat16) and (not is_causal)
+-                and (BLOCK_D == 128) and (SKV == 256) and (S % 256 == 0))
++                and (D == 128) and (BLOCK_D == 128)
++                and (SKV == 256) and (S % 256 == 0))
+     if BLOCK_D <= 128:
+         # 保留机制：非因果沿 query 行方向由 64 提到 128。
+         # 成对 profiling（case4，1024 program，kernel 763.155us）显示每 program
+@@ -465,9 +473,12 @@
+     else:
+         BLOCK_M, BLOCK_N = 16, 32
+ 
+-    # 精确路径守卫删除标志：与 SPLIT_QK 同一几何条件。该路径输入域为合同
+-    # 的有限 [-1,1]、非因果、SKV 非空且 S%256==0 整块覆盖，故 rowmax 有限、
+-    # softmax 分母 >= 1；全掩码/max/分母/零输出守卫冗余。其他路径保持原守卫。
++    # 精确路径守卫删除标志：与 SPLIT_QK 同一几何条件，且该条件现已含真实
++    # D==128（D==BLOCK_D==128），故 split 分支的 128 宽无掩码 K 载入不会越过
++    # 真实通道界；同时 SKV==BLOCK_N==256、S%256==0，MASK_KV 与 MASK_MD 均可证
++    # 为假。该路径输入域为合同的有限 [-1,1]、非因果、SKV 非空且整块覆盖，故
++    # rowmax 有限、softmax 分母 >= 1；全掩码/max/分母/零输出守卫冗余。其他路径
++    # 保持原守卫。
+     EXACT_UNGUARDED = SPLIT_QK
+ 
+     # 掩码可证冗余判据：只用合法元数据（shape 与分块整除性、D 是否等于

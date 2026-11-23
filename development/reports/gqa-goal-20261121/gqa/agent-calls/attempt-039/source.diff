@@ -1,0 +1,25 @@
+--- 
++++ 
+@@ -261,9 +261,19 @@
+ 
+                 acc = tl.dot(p.to(tl.float16), v16)
+ 
+-                l_safe = tl.where(l_new > 0.0, l_new, 1.0)
+-                out = acc / l_safe[:, None]
+-                out = tl.where(l_new[:, None] > 0.0, out, 0.0)
++                # 本轮机制（仅 PART_TILES 输出归一化）：分母与有效性都是 128
++                # 元行标量，原式把 l_safe 广播成 128x128 后做 fp32 除法，再
++                # 生成 128x128 的 l_new>0 条件并 select。改为在行向量上先取
++                # fp32 倒数、把 l_new>0 折进行系数，再把 fp32 PV 累加器按广播
++                # 行系数相乘：每 tile 一次 128x128 VDIV 降为 128 元 VDIV 加
++                # 128x128 VMUL，并删除末尾 128x128 比较/广播/select。代价是
++                # 多一个 128 元 fp32 暂存与一次舍入（倒数+乘法，相对约 1.5ulp），
++                # 故不声明逐位恒等；合同 D=128、scale=1/sqrt(128)、|q|,|k|<=1
++                # 下 exp2 自变量 ∈[-17.644,15]，每项 p>0 且每行 256 项有效，
++                # l_new 严格为正。完全掩码零行 acc=0、l_new=0 时系数为 0，
++                # 输出仍为 0；NaN/非有限值超出官方有限合同，不作通用等价声明。
++                row_coeff = tl.where(l_new > 0.0, 1.0 / l_new, 0.0)
++                out = acc * row_coeff[:, None]
+ 
+                 o_ptrs = Out + b * o_sb + hq * o_sh + offs_m[:, None] * o_ss + offs_d[None, :] * o_sd
+                 if MASK_MD:

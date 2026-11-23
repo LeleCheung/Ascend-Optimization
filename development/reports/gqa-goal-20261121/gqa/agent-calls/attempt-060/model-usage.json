@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 36,
+    "duration_ms": 86827,
+    "usage": {
+      "input_tokens": 52974,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 940160,
+      "output_tokens": 13564,
+      "output_tokens_details": {
+        "thinking_tokens": 5291
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 52974,
+        "outputTokens": 13564,
+        "cacheReadInputTokens": 940160,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.07405,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 5291,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.07405,
+    "result": "已记录修改前决策并完成候选提交，现进入验收边界。\n\n## 本轮机制\n**PART_TILES 且 NO_OFF 命中的输出归一化半精度化（仅改一处除法表达式）**\n\n- 决策记录：`decision_id=613eacdcb3954a2d9c4e532fdb4c3a8a`，绑定修改前源码 `662015b9…a730`。\n- 修改：`diagnosis.json`（含 6 条本轮实际读取的证据、假设、替代方案、区分观测、预期、验证、层次说明与模拟器增量判断）。\n- 源码改动：`_gqa_tile_part_body` 内\n  - `NO_OFF` 为真：`out = tl.fdiv(acc.to(tl.float16), l_new[:, None].to(tl.float16))`，随后沿用既有 `out.to(Out.dtype.element_ty)` 的 BF16 落盘；\n  - `NO_OFF` 为假：保留原 `out = acc / l_new[:, None]`（FP32 除法）。\n  - 同步更新文件头说明；未改分块、20 worker 分区、host 缓存、非 PART 路径、checker/golden/阈值、公共入口。\n\n## 证据要点\n- **paired_profiling (case4)**：候选 `aiv_vec_time` 49.19us 已低于参考 59.01us，但 `aiv_scalar_wait_time` 9.12/9.31us 对参考 1.48/1.52us；`L0C_to_GM` 49152KB 表明 QK/PV 两条交接均已按 f16 搬出，剩余串行段在输出归一化。\n- **TTIR 99–109 / BCMLIR 94–107**：PV 的 f16 交接值被 `arith.extf` 扩回整幅 128×128 f32，FP32 分母 broadcast 成整幅 f32，执行整幅 `arith.divf f32` 才 `truncf` 到 bf16；该 f32 扩展唯一使用者即此除法。\n- **已安装语义**：`semantic.fdiv` 关闭算术提升、按输入类型建结果，故只有 `tl.fdiv` 能保持 f16；`/` 必升 f32。\n- **父基线**：case1 103.65705 / case2 100.4906 / case4 158.34115 / case7 100.7191 µs。\n\n## 数值风险（已在诊断中如实登记）\n分母 l_new 转 f16 引入 2^-11 相对舍入、f16 除法再舍入，但输出本以 bf16(2^-9) 落盘；合同 [-1,1] 下每行 l_new 典型 1.5e2~3e2（远低于 65504），而理论上界 256·e^{D·|X_SCALE|}≈3e9 超出 f16，属适用范围限制，不作全值域安全声明。近似而非逐位等价。\n\n## 预期与验证\n预期实际 IR 出现 `arith.divf tensor<128x128xf16>`、acc 的 `arith.extf` 与 f32 广播消失；若后端把 f16 除法内部提升回 f32，则按真实无收益记录。收益影响 case4 与 case7（同为 BF16 非因果 SKV=256、NO_OFF 命中），case1/2 不走该分支应不回归。\n\n## 交接状态\n- 预检返回 `awaiting_source_review`，新源码 SHA：`de1831f594263bb73423e3335d2953f91a22789f867d192660474b7dc8f2b091`。\n- 当前候选字节保持不变，等待宿主只读路径与地址边界审查，以及原官方四项 checker（不变阈值）完整真机评测；随后请回传逐 case 用时、实际 TTIR/BCMLIR 与模拟器重放结果，以便对照上面的区分观测判断机制成立与否。"
+  }
+}

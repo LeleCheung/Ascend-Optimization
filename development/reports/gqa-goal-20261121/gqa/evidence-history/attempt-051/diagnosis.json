@@ -1,0 +1,91 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "fd25f875c334f929efa8d0fab381344dfcdb901989c12b113e6ede30e537eda3",
+  "decision_id": "f67850e024a34dc184812c18a25101ff",
+  "phase": "explicit_unretained_repair",
+  "selected_layer": "device_kernel_source::PART_TILES row-address computation (Triton source -> TTIR/BCMLIR index layer)",
+  "layer_reason": "The only hard failure is an MLIR/Linalg UB overflow at kernel _gqa_fwd_kernel for the two BF16 specializations, and the failed BCMLIR/ttadapter localize the extra live tiles to the runtime tensor divsi/remsi row map that expanded Q loads and Out stores into 128-iteration scalar per-row copies with their own staging buffers. The arithmetic/softmax/PV layers are identical to the previously compiling 047 IR and are not implicated; the host layer (grid/metadata) is already proven by cases 1/2 running. So the smallest layer that can remove the excess buffer without changing tiling or math is this index-computation layer.",
+  "host_suggestion": {
+    "path": "workspace/host-repair-analysis.json",
+    "summary": "Keep 049 math/host exactly; do not reduce tiling or change arithmetic. Under BLOCK_M%G==0 express e//G = t*(BLOCK_M//G)+lane//G and e%G = lane%G so the runtime tile contribution is a scalar and the lane row/head offsets are compile-time constants; keep direct 2D pointers, all p/sum/PV/normalization arithmetic, tile dims, output layout, cache and partitions. Generic 049 mapping remains as constexpr fallback when G does not divide BLOCK_M. Only this factoring this call; record negative for the next mechanism if no buffer improvement.",
+    "adopted": true
+  },
+  "selected_repair": {
+    "name": "static lane row/head offsets + scalar tile base in _gqa_tile_part_body",
+    "what": "Add constexpr STATIC_ROWS = (BLOCK_M % G == 0). When true, hoist lane_seq = offs_e // G and lane_gi = offs_e % G (constexpr arange arithmetic) and their address contributions lane_off_q = lane_seq*q_ss + lane_gi*q_sh and lane_off_o = lane_seq*o_ss + lane_gi*o_sh once outside the grp/t loops; per tile compute only the scalar base seq_base = t*(BLOCK_M//G) and use row_q = seq_base*q_ss + lane_off_q, row_o = seq_base*o_ss + lane_off_o; mask uses seq_row = seq_base + lane_seq. When STATIC_ROWS is false keep the current 049 e//G, e%G mapping verbatim. Addresses, row ownership, mask, and every floating-point expression stay identical.",
+    "how_it_targets_failure": "Makes the row-offset vector a compile-time constant tensor plus one splatted scalar, the same form that attempt-047's affine offs_m*q_ss had when it lowered to one bulk strided memref.copy for Q and one bulk materialize for Out. Removing tensor divsi/remsi and the runtime per-row address chain is the plausible route to drop the per-row 1x128 staging buffers; one 1x128xf32 buffer (512B) is exactly the reported excess (197120-196608).",
+    "tradeoffs": {
+      "precision": "No change. Same rows, same addresses, same qk/p/l_new/PV/out expressions and order; only integer address arithmetic is rewritten by an exact distributive identity guarded by BLOCK_M%G==0. No new cast, no reassociation.",
+      "active_buffers": "Expected equal or lower: removes tensor-wide divsi/remsi results and per-row 1x128 address/staging temporaries; lane offset vectors are compile-time constants. Worst case the backend materializes a 128-entry i32 constant vector (512B) and nothing improves.",
+      "handoffs": "Unchanged: still 2 matmuls (QK, fp16 PV) and one QK/PV handoff chain per tile, same L0C traffic.",
+      "parallelism": "Unchanged: same PART_TILES grid of P=min(20,T), same T tiles, same worker intervals.",
+      "risk": "Backend may not fold the constant-vector addptr back into a bulk copy; then UB stays 197120B and compile still fails. In that case record negative and pick an independent buffer-reduction mechanism next call without touching precision."
+    }
+  },
+  "simulator_incremental_judgment": "No simulator or paired profiling was read or used this round; context-brief sets current_profiling/current_simulator to null and the historical profiling/simulator files keep their original-version identity. No causal or performance claim from them is made for the current candidate.",
+  "evidence": [
+    {
+      "path": "workspace/repair-feedback.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "Formal four-case feedback on source fd25f87: case1 and case2 (fp16) compile and pass the official checker with unchanged thresholds (mere 9.36e-08 / 8.95e-08, all normal/small/cancel subchecks passed), candidate full_call_us 102.53 / 98.75. case4 and case7 (bf16) fail with MLIRCompilationError at _gqa_fwd_kernel: 'ub overflow, requires 1576960 bits while 1572864 bits available', resource_bytes required=197120 available=196608 (excess 512B); no checker result and no candidate timing exist for those two."
+    },
+    {
+      "path": "workspace/failed-ir/attempt-049/3-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "BF16 PART_TILES G=8 128x256 body: %alloc_4 memref<128x128xbf16> is filled by a 128-iteration scf.for that recomputes e_row+i, divsi/remsi by 8 and copies memref<1x128xbf16> per row; the Out path is another 128-iteration scalar loop with tensor.empty tensor<1x128xf32> (512B) + linalg.fill + divf + truncf + materialize per row; v16 is bf16->f32 (tensor<256x128xf32>, 128KB) then f16 (64KB)."
+    },
+    {
+      "path": "workspace/failed-ir/attempt-049/4-_gqa_fwd_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "Same specialization in TTAdapter form: Q load loop q_34 = 0 to 128 step 1 with divsi(q_36, 8), remsi(q_36, 8), reinterpret_cast memref<1x128xbf16> and memref.copy; output loop likewise per row with a tensor<1x128xf32> temporary, i.e. the dynamic flat row map is the source of the per-row scalar staging tiles carried through UB allocation."
+    },
+    {
+      "path": "workspace/failed-ir/attempt-049/5-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "TTIR keeps e_row_32 = addi(splat(t*128), offs_d) : tensor<128xi32>, then arith.divsi and arith.remsi of that whole vector by dense<8>, then two tensor muls to form row_q; no constant folding of lane//G or lane%G occurred, so the lane offsets stay dynamic even though BLOCK_M%G==0."
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "Compiled attempt-047 BF16 single-chain IR, identical tiling/arithmetic but affine offs_m*q_ss row base: Q loads as one bulk memref.copy from a strided memref<128x128xbf16, strided<[8192,1]>> and Out is one bufferization.materialize_in_destination of the whole 128x128 bf16 tensor. This shows the 512B-class staging buffers are created specifically by the runtime flat row map, not by the matmul/exp2/PV path."
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "other",
+      "role": "background",
+      "finding": "Current source fd25f87 (matches contract feedback); lines 350-358 build seq_row = e_row // G, gi_row = e_row % G and row_q from them per tile, and lines 429-435 reuse them for Out; PART_TILES currently requires BLOCK_M==128, BLOCK_N==256, BLOCK_D==128, SINGLE_KV and BF16, with G=8 in both failing cases."
+    }
+  ],
+  "hypothesis": "The BF16 UB peak is pushed over 196608B by per-row scalar staging tiles that the backend creates only because the flat query-head-fast row offsets are computed with runtime tensor divsi/remsi inside the tile loop. Expressed as scalar tile base + compile-time constant lane offsets (exact when BLOCK_M%G==0), the address expression again has the affine/constant-vector form that lowered to bulk strided copies in attempt-047, removing at least one 1x128xf32 (512B) row buffer and permitting compilation within the unchanged 192KB UB budget.",
+  "change": "In _gqa_tile_part_body: add STATIC_ROWS constexpr = (BLOCK_M % G == 0) and pass it through from _gqa_fwd_kernel; when true compute lane_seq/lane_gi/lane_off_q/lane_off_o once before the grp loop from offs_e and constexpr strides, compute per tile only scalar seq_base = t*(BLOCK_M//G) and seq_row = seq_base + lane_seq, and form q_ptrs/o_ptrs from the scalar base plus the constant lane offset; when false keep current e//G, e%G code exactly. No other line changes: same tl.dot, FP16 rawQK round, exp2 with SM_OFFSET, p16, l_new sum after PV, acc/l_new, mask, stores and host launch.",
+  "expected": "BF16 specializations case4/case7 compile (resource_bytes required <= 196608), with TTIR row offsets becoming constant tensor plus splat scalar and BCMLIR Q/Out copies no longer scalar per-row loops. FP16 case1/case2 code paths and results identical to this source. If the backend still emits per-row loops and required stays 197120, the compile still fails and the mechanism is recorded negative.",
+  "validation": "1) Bridge preflight on the edited source; if awaiting_source_review keep bytes and hand off. 2) Full formal four-case evaluation with the same checker/golden, dtypes, thresholds, warmup/trials/iterations and CPU wall-clock timing method: require case1/case2 checker unchanged and case4/case7 error empty with resource_bytes <= 196608 and official_checker.passed true. 3) Inspect the new attempt IR: verify TTIR no longer carries divsi/remsi on the 128-vector and BCMLIR no longer allocates 1x128 per-row buffers, and compare UB/resource reporting. 4) Any numerical or timing claim only from this real evaluation.",
+  "observations": [
+    {
+      "stage": "source_edit_applied",
+      "candidate_sha256": "bb60b0354359739f69652d32765ee2aa2fcb88edaf8f23477028415820b13531",
+      "finding": "Edits limited to _gqa_tile_part_body: hoisted constant lane_seq/lane_gi/lane_off_q/lane_off_o under BLOCK_M%G==0, per-tile scalar seq_base and factored row_q/row_o, generic 049 else-branch kept, module docstring note added. No change to kernel signature/ABI, tiling, masks, dtype routing, arithmetic, expressions or host launch; output row uses the same row_o value."
+    },
+    {
+      "stage": "preflight",
+      "status": "awaiting_source_review",
+      "finding": "Bridge preflight on the edited source returned awaiting_source_review (external read-only path and address-boundary review pending). No device compile, IR capture, checker run or timing was produced; nothing is claimed about whether the UB overflow is fixed yet."
+    }
+  ],
+  "open_questions": [
+    "Awaiting bridge/device preflight+formal evaluation on sha bb60b03: whether case4/case7 now compile with resource_bytes <= 196608 and pass the unchanged official checker.",
+    "Whether the new TTIR emits constant lane offset vectors and the BCMLIR restores bulk strided Q/Out copies; if not, the negative result must be recorded and an independent buffer-reduction mechanism chosen.",
+    "Performance effect on case1/case2 must stay identical (same source path), and BF16 timings have no prior baseline that can be claimed."
+  ],
+  "unknown": [
+    "Whether the Ascend backend folds splat(scalar)+constant-vector addptr back into a bulk strided copy for the 16-chunk (G=8, D=128) row pattern, or still emits a per-row loop.",
+    "The exact composition of the 197120B peak; only the 512B excess is certain, so removal of one different 512B tile would also fix it.",
+    "Whether the bf16->f32->f16 V conversion (128KB intermediate) remains on the peak path; not touched this call per host constraint.",
+    "Actual performance of the BF16 specializations after they compile; no timing exists yet and no gain is claimed."
+  ]
+}

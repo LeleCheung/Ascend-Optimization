@@ -1,0 +1,120 @@
+--- 
++++ 
+@@ -88,6 +88,16 @@
+ bit-identical to the previous candidate.  Cost: one compiled specialisation per
+ (distinct shape, stride, tiling) combination, i.e. a slightly longer first
+ call per case.
++
++持久程序 headgroup 拆分（本轮机制）：父版本每个持久程序拥有一个共享 KV 头的
++全部 G 个 query head，32 个程序在 20 个 Cube 核上形成 20+12 的不均衡两波
++（case4 每程序 16 次迭代、case7 4 次）。本轮在 G 可被 2 整除且 G>=2 时把每个
++KV 头拆成 G/2 个 headgroup、每程序只负责 2 个 query head：case4 grid 32→128、
++每程序 4 次迭代，case7 grid 16→32、每程序 2 次迭代，核间负载更均衡、长尾更短。
++K/V 仍每程序在循环外整段载入一次并只转换 V 一次，因此总 K/V 载入次数上升
++（case4 约 4 倍、case7 约 2 倍），这是明确的交通代价；QK/softmax/PV/输出
++表达式、M128/N256 分块、guard 与精度路径逐字不变。G 不整除 2 时 HG=G、NGRP=1，
++与父版本所有权一致，不增加尾 head 掩码。
+ """
+ 
+ import math
+@@ -110,18 +120,22 @@
+     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+     MASK_MD: tl.constexpr, MASK_KV: tl.constexpr,
+     NB_M: tl.constexpr,
++    HG: tl.constexpr, NGRP: tl.constexpr,
+ ):
+-    """每 (batch, 共享 KV 头) 一程序的持久化复用体。
++    """每 (batch, 共享 KV 头, headgroup) 一程序的持久化复用体。
+ 
+     程序先一次性载入该 KV 头的整段 K，并把 V 一次性转换成 fp16，二者都放在
+-    query-tile 循环之外；随后按 G 个 query head × NB_M 个行块遍历本程序拥有的
+-    全部 query tile。逐 tile 的 QK、FP32 softmax、单次 fp16 PV 与归一化写出
+-    表达式与通用路径逐字一致，只有 K/V 的载入与转换从每 tile 一次降为每程序一次。
+-    hq = kvh*G + gi 与行块 mb 是本程序的显式坐标，对 (b,hq,row-block) 的写出所有权唯一。
++    query-tile 循环之外；随后按 HG 个 query head × NB_M 个行块遍历本 headgroup
++    拥有的全部 query tile。逐 tile 的 QK、FP32 softmax、单次 fp16 PV 与归一化
++    写出表达式与通用路径逐字一致，只有 K/V 的载入与转换从每 tile 一次降为每程序一次。
++    hq = kvh*G + hg*HG + gi 与行块 mb 是本程序的显式坐标，对 (b,hq,row-block) 的
++    写出所有权唯一；NGRP=G//HG 个 headgroup 覆盖该 KV 头的全部 G 个 query head。
+     """
+     pid = tl.program_id(0)
+-    b = pid // NKV
+-    kvh = pid % NKV
++    ng = pid // NGRP
++    hg = pid % NGRP
++    b = ng // NKV
++    kvh = ng % NKV
+ 
+     offs_d = tl.arange(0, BLOCK_D)
+     offs_n = tl.arange(0, BLOCK_N)
+@@ -145,11 +159,11 @@
+         v = tl.load(v_ptrs)
+     v16 = v.to(tl.float16)
+ 
+-    # 扁平遍历 G*NB_M 个 query tile；显式坐标保证每个 (hq, mb) 只写一次。
+-    for t in range(0, G * NB_M):
++    # 扁平遍历 HG*NB_M 个 query tile；显式坐标保证每个 (hq, mb) 只写一次。
++    for t in range(0, HG * NB_M):
+         gi = t // NB_M
+         mb = t % NB_M
+-        hq = kvh * G + gi
++        hq = kvh * G + hg * HG + gi
+         offs_m = mb * BLOCK_M + tl.arange(0, BLOCK_M)
+ 
+         q_ptrs = Q + b * q_sb + hq * q_sh + offs_m[:, None] * q_ss + offs_d[None, :] * q_sd
+@@ -203,6 +217,8 @@
+     SINGLE_KV: tl.constexpr,
+     PERSIST_KV: tl.constexpr,
+     NB_M: tl.constexpr,
++    HG: tl.constexpr,
++    NGRP: tl.constexpr,
+ ):
+     # 本轮机制：每 (batch, 共享 KV 头) 一程序的持久复用分支。仅在
+     # BF16 非因果 SINGLE_KV D128 的原 128/256 分块下启用（见 run()），
+@@ -219,7 +235,7 @@
+             qk_scale=qk_scale, delta=delta,
+             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+             MASK_MD=MASK_MD, MASK_KV=MASK_KV,
+-            NB_M=NB_M,
++            NB_M=NB_M, HG=HG, NGRP=NGRP,
+         )
+         return
+ 
+@@ -464,13 +480,25 @@
+     SINGLE_KV = (not is_causal) and (BLOCK_N == SKV)
+ 
+     # 持久 KV 复用判据：只用元数据（dtype、causal、SINGLE_KV、分块），不读输入值、
+-    # 不按 case_id 选路。命中时 grid 由 (行块, b×hq) 改为 (b×kvh)，每程序循环其
+-    # G 个 query head 与 NB_M 个行块；K/V 载入与 V 转换在循环外只付一次。
++    # 不按 case_id 选路。命中时 grid 由 (行块, b×hq) 改为 (b×kvh×headgroup)，
++    # 每程序循环其 headgroup 的 HG 个 query head 与 NB_M 个行块；K/V 载入与 V
++    # 转换在循环外每程序只付一次。
++    #
++    # 本轮机制（持久占用率/复用拆分）：父版本每个持久程序独占一个共享 KV 头的
++    # 全部 G 个 query head（case4 grid=32、每程序 16 次迭代；case7 grid=16、
++    # 4 次迭代），32 个程序在 20 个 Cube 核上形成 20+12 的不均衡两波。把每头
++    # 按 2 个 query head 一组拆成 G/2 个 headgroup 后，case4 grid=128（每程序
++    # 4 次迭代）、case7 grid=32（每程序 2 次迭代），核间负载更均衡、长尾更短。
++    # 代价是 K/V 整段载入次数随程序数增加：case4 约 4 倍、case7 约 2 倍
++    # （成对 profiling 的 GM_to_L1 可验证）；L0C 搬出与全部算术量不变。
++    # G 不能整除 2 时 HG=G、NGRP=1，与父版本逐程序所有权一致，不产生尾 head。
+     NB_M = triton.cdiv(S, BLOCK_M)
++    HG = 2 if (G % 2 == 0 and G >= 2) else G
++    NGRP = G // HG
+     PERSIST_KV = ((not is_causal) and PV_SINGLE_F16 and SINGLE_KV
+                   and BLOCK_M == 128 and BLOCK_N == 256 and BLOCK_D == 128)
+     if PERSIST_KV:
+-        grid = (B * NKV,)
++        grid = (B * NKV * NGRP,)
+     else:
+         grid = (triton.cdiv(S, BLOCK_M), B * NQ)
+     _gqa_fwd_kernel[grid](
+@@ -487,7 +515,7 @@
+         PV_SINGLE_F16=PV_SINGLE_F16,
+         SINGLE_KV=SINGLE_KV,
+         PERSIST_KV=PERSIST_KV,
+-        NB_M=NB_M,
++        NB_M=NB_M, HG=HG, NGRP=NGRP,
+         num_warps=1, num_stages=1,
+     )
+     return y

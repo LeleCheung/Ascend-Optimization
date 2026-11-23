@@ -1,0 +1,175 @@
+{
+  "timestamp": "2026-11-21T15:29:37.939264+00:00",
+  "diagnosis": {
+    "source_sha256": "fd25f875c334f929efa8d0fab381344dfcdb901989c12b113e6ede30e537eda3",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "feedback.json",
+        "category": "evaluation",
+        "role": "当前049目标特化的编译失败记录与同源已测量对照",
+        "finding": "顶层status=target_compile_failed。case4与case7的candidate_error均为ConvertLinalgIRToBinary阶段失败，原文为ub overflow, requires 1576960 bits while 1572864 bits available，即需求197120B、可用196608B，超出512B。同源FP16特化case1与case2的status=measured，candidate full_call_us为102.53005与98.74950，native为101.33755与97.60355，说明同一行映射在较小K/V工作集下可以编译，超限量与256长度K/V工作集同现。"
+      },
+      {
+        "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "本轮可编辑的case4（G=8）BCMLIR实体",
+        "finding": "第82至97行为Q载入：alloc_4为memref<128x128xbf16>，scf.for %arg14 = %c0 to %c128 step %c1内每行用reinterpret_cast取memref<1x128, strided<[128,1]>>再memref.copy到subview，共128条单行拷贝，行地址为(idx//8)*8192+(idx%8)*128。第116至135行为输出：同样128行，逐行tensor.extract_slice取1x128 f32、tensor.extract取1个分子、linalg.fill生成1x128 f32广播、arith.divf、arith.truncf到bf16、bufferization.materialize_in_destination写入memref<1x128, strided<[128,1], offset:?>>。因c8192_i32=8192=64*128为Nq*D、c128_i32=128为D、G=8整除128，同组8行的地址差恒为128个元素，组内连续且起点为256B对齐。"
+      },
+      {
+        "path": "ir/case7/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "本轮可编辑的case7（G=4）BCMLIR实体",
+        "finding": "结构与case4同构，G=4、行首址为(idx//4)*4096+(idx%4)*128，输出侧同一套逐行fill/divf/truncf/materialize。4行一组时地址差恒为128个元素、合计512个元素连续，起点同样256B对齐。该特化需与case4分开实施，不能共用同一组常量。"
+      },
+      {
+        "path": "compiled-readonly/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "按符号核对后端已有低层产物，确认疑似冗余在后端是否被消除",
+        "finding": "compiled-readonly的bcmlir与ir/target逐字节同构（diff为空），同目录的ttadapter只是把%arg2改为%Q等重命名，ttir为同一TTIR层级；三份产物保留了128条单行memref.copy与逐行fill/divf/materialize，未见把相邻行合并为连续块拷贝的清理。可见失败发生在BCMLIR之后、二进制生成之前的UB分配阶段，单行拷贝冗余在后端仍然存在。这三份低层产物保持冻结，仅作核对。"
+      },
+      {
+        "path": "gqa-head-row-language-evidence.txt",
+        "category": "source_ir",
+        "role": "语言与后端表示边界",
+        "finding": "记载source049采用直接2D行映射，其BCMLIR把Q载入与输出写回降为128条单行拷贝，目标UB为197120B并超过196608B；050把标量静态地址分量提出后，后端拒绝非单位batch的memref.collapse_shape且需327680B；历史020的显式reshape同样失败。据此本轮只在既有2D memref形状和拷贝上做queryhead分组，避开3D折叠与reshape。"
+      },
+      {
+        "path": "codex-brief.json",
+        "category": "source_ir",
+        "role": "宿主证据分析与候选方向（Codex贡献）",
+        "finding": "Codex指出Q与Out的原始BSND布局中同一queryhead组内的G行连续，可用memref<Gx128, strides<128,1>>从行号为G倍数的位置开始，源与目的地址逐行对应不变；分母归约与FP16的QK/PV数学保持原op；同时提示输出临时量可能增大UB，须先做CPU编译再宣称修复，并说明这是未保留分支049的编译修复，收益身份与047的175.5726us保留最佳分开验收。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "paired_profiling",
+        "role": "历史047源的机制定位材料（当前049无目标二进制）",
+        "finding": "case4的历史047报告中，MTE3的MOV_SRC_TO_DST_ALIGN（pc 0x10d11c64）running_time_us=25.60、calls=8，detail为Src:UB,Dst:OUT,XM:X21=0x1000400,Dtype:B16，来源栈指向candidate.py:409的tl.store，属strided输出写回；同核FLOWCTRL/WAIT_FLAG_DEVI为35.32us、9 calls；instruction_calls汇总MTE3/MOV_SRC_TO_DST_ALIGN=18、VECTOR/VDIV=18。这些累计时间与热点排名只用于定位候选机制，各流水可重叠。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "历史窗口的时钟资质、覆盖范围与未报告泳道说明",
+        "finding": "顶层historical=true。每核capture_scope为First to last visible hardware event on this core; partial capture boundaries preserved，clock_qualification=relative_only、absolute_time_qualified=false，raw_clock_window为128.9580至229.0818、unit=unassigned；同一份材料里的absolute_unit_validation为verified、unit=us、22/22 PC匹配、median_ratio=0.99980与1.00016。占用比例按窗口分数归一化（display_time_unit=window_fraction），idle_intervals_total在98至251之间、idle_union从0.365到0.9976，记录显式WAIT/BAR形成的空窗；未报告泳道保持未知。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "历史配对采集的时长口径参照",
+        "finding": "reference侧FusedInferAttentionScore（mix）Task Duration(us)=119.902397，candidate侧_gqa_fwd_kernel_mix_aic为174.563492，source_sha256为047的3c34fdfb。该口径与context中047正式结果175.5726us属不同采集批次，仅作历史参照。"
+      }
+    ],
+    "hypothesis": "当前049两个BF16特化的编译失败来自逐行展开的Q载入与输出写回：每个query行各生成一条1x128的GM到UB拷贝、逐行5条标量寻址（divsi/remsi/muli/addi/extsi）以及逐行512B的f32广播与除法临时量，后端在UB分配时超出512B。因G整除128且组内G行在原始BSND布局内连续，把两个内层循环按queryhead组步进（case4步长8、case7步长4），用既有的memref<Gx128, strided<[128,1], offset:?>>视图与原有2D alloc/subview覆盖完全相同的地址，可把单行拷贝条数与逐行临时量实例数同比例降低，使UB需求回到196608B以内并可编译；同时减少GM↔UB DMA命令数与逐行地址算术，缩短MTE3写回与FLOWCTRL等待。",
+    "alternatives": [
+      "只分组Q载入循环、输出循环维持逐行：UB上界最保守，但逐行f32临时量保留，若512B超限来自输出侧则编译仍失败，可作独立调用定位超限来源。",
+      "只分组输出循环、Q载入维持逐行：用于判定512B超限归属，与上一分支互为对照。",
+      "输出侧改用先广播成Gx128 f32再divf再truncf的三步形式：语义相同，但额外多一份Gx128 f32临时量（case4为4096B），UB风险高于本轮的单一融合linalg.generic。",
+      "3D折叠/reshape或非单位batch的memref.collapse_shape：历史020与050已在同一后端被拒绝（327680B与collapse_shape校验失败），保留为待验证假设，本轮不采用。",
+      "在源码层改用Gx128的2D块指针load/store：源049在本编译修复分支逐字节冻结，本轮仅以IR表示做等价实验，源码表达留作后续独立研究身份。"
+    ],
+    "change": "仅编辑清单内的两个BCMLIR（ir/target对应case4 G=8、ir/case7对应case7 G=4），函数签名与ABI保持不变。每个文件新增一个index型分组步长常量（case4为%c8=8、case7为%c4=4，仅新增常量，不新增缓冲）。Q载入循环由step 1改为step G，循环体沿用原地址公式（(idx//G)*NqD+(idx%G)*D，case4的NqD=8192、case7的NqD=4096，D=128）计算组首址，reinterpret_cast按sizes [G,128]、strides [128,1]取连续块，目的改为alloc_4的[G,128] subview，memref.copy的元素区间与原来G条单行拷贝逐字节相同，保留{ExtractedLoadOrStore, hivm.parallel_loop}标记。输出循环同样由step 1改为step G：reinterpret_cast %arg5取memref<Gx128, strided<[128,1], offset:?>>，%49按[%arg14,0][G,128][1,1]取f32切片，%reduced按[%arg14][G][1]取G个分母，随后用单个linalg.generic（indexing_maps为(d0,d1)->(d0,d1)、(d0,d1)->(d0)、(d0,d1)->(d0,d1)，iterator_types为parallel,parallel）在体内执行arith.divf再arith.truncf到bf16，最后bufferization.materialize_in_destination写入同一Gx128目的视图，保留{ExtractedLoadOrStore}标记。运算集合、运算次序、f32除法与bf16截断精度、特殊值路径、别名关系与内存地址集合均与修改前一致，未引入新GM缓冲、未改变归约与矩阵乘的输入形状。",
+    "expected": [
+      "拷贝指令数（静态）：case4每个内层迭代的Q载入memref.copy由128条降为16条、输出materialize由128条降为16条；case7由128条降为32条。整核MTE2/MTE3的MOV_SRC_TO_DST_ALIGN调用计数按同一比例下降，宿主可在trace的instruction_calls中核对。",
+      "动态轮次：Q载入循环与输出循环的迭代次数case4由128降为16、case7由128降为32；外层arg13动态次数、块数与设备波次保持不变（kernel ABI与并行切分未改）。",
+      "逐行地址算术：每个内层迭代的divsi/remsi/muli/addi/extsi由逐行128份降为每组1份（case4为16份、case7为32份），预测SCALAR的DIV/REM/MUL/ADD类计数显著下降，SCALAR流水占用随之下降。",
+      "输出侧UB临时量：由逐行1x128 f32广播512B加1x128 f32除法512B加1x128 bf16截断256B，改为单个融合linalg.generic的Gx128 bf16临时量（case4为2048B、case7为1024B）与G个f32分母（case4为32B、case7为16B），f32广播整块临时量在本实现中不出现。",
+      "UB总量：预测两特化的UB需求从197120B降到196608B以内并通过ConvertLinalgIRToBinary；该预测由宿主CPU编译直接核对，若仍报ub overflow则本机制在本后端不成立，本轮不对应任何真机性能结论。",
+      "等待与资源：预测MTE3每行的SET_FLAG/WAIT_FLAG序列由128组降为16组（case7为32组），VEC与MTE3之间的同步等待与FLOWCTRL/WAIT_FLAG_DEVI累计时间下降；历史047中MTE3 25.60us/8 calls与WAIT_FLAG_DEVI 35.32us/9 calls仅作关注度参照，本轮以独立采集为准。",
+      "新增IR实体：每个文件新增1个index常量、2个2D视图（memref<Gx128, strided<[128,1], offset:?>>）与1个linalg.generic；alloc_4、%49、%reduced的布局与生命周期不变，未新增GM缓冲，未改变矩阵乘与归约的形状。",
+      "性能申报口径：case4与case7的相对保留最佳175.5726us与官方四项真机测量由宿主执行；本IR未含case1与case2特化，本轮不对这两个case做收益声明。"
+    ],
+    "validation": "宿主后续按序执行：第一步用CPU编译本例两个BCMLIR，核对无ub overflow且转换通过；第二步语义核对，用049源码生成的KGS与全量输出逐元素比对，确认f32除法次序、bf16截断、特殊值与边界一致；第三步对case4与case7做官方形式真机测量并与保留最佳175.5726us比较，四项完整集合的结论按context的固定case1/2/4/7口径给出；第四步在trace的instruction_calls与热点表中核对MTE2/MTE3拷贝调用数、SCALAR div/rem计数、VECTOR/VDIV计数与实际UB分配量，逐项对照expected的兑现与偏差。profiling.json、hotspots.json、timeline.json为历史047材料，本轮任何因果与带宽结论须引用本轮独立采集的配对测量。",
+    "layer_reason": "Triton表达能力：源049以逐行2D指针做Q载入与输出写回，同一queryhead组内G行在BSND布局中连续，Triton侧可用2D块指针形状直接表达这一连续块，reshape与3D折叠在本后端属更受限的表达方式。固定源码实验目的：本轮固定source_sha256逐字节不变，使唯一差异落在IR表示，从而单独检验分组拷贝是否修复UB并可编译，避免把源码改动与表示改动混在一起。IR控制点：BCMLIR中memref.copy的形状、scf.for步长、reinterpret_cast/subview的形状以及materialize_in_destination所对应的memref形状，正是后端生成DMA命令与计算UB活跃区间的输入，属于清单允许编辑的具体控制点；若日后转回源码表达，等价方向是按queryhead组构造Gx128的2D块指针批量load与store。",
+    "simulator_incremental_judgment": "历史窗口的绝对时钟资质：timeline标注clock_qualification=relative_only、absolute_time_qualified=false，窗口128.9580至229.0818为未指派单位的相对钟；同一材料中的absolute_unit_validation以22/22同名PC与CSV运行时长对照得出us口径，median_ratio为0.99980与1.00016，此处只借它校准单位，绝对时钟资质按未定级的相对钟记录。观测范围：每核首末可见事件之间的部分捕获，占用比例按窗口分数归一化，idle_intervals_total在98至251之间、idle_union最高0.9976，说明大段显式WAIT/BAR空窗被记录在窗口内；未报告泳道保持未知。所有窗口均来自047历史源，049当前无目标二进制，故本轮不据历史窗口给出关键路径、设备波次或带宽结论，只把MTE3输出写回与FLOWCTRL等待列为候选机制，待本轮CPU编译与独立采集检验。",
+    "unknown": [
+      "512B超限量的确切归属（逐行拷贝的后端描述量或输出侧逐行f32临时量）须由宿主CPU编译的分配明细确认。",
+      "融合linalg.generic的广播分母写法在本后端的向量化与UB分配行为须由编译实测确认。",
+      "分组后case4与case7能否落在196608B以内、以及若仍溢出时的次优分组大小，留待编译结果决定。"
+    ]
+  },
+  "diagnosis_sha256": "add33903c4cfc55e6134ab034f8ddbafe158d506dafee2b38c32997e1b300ee9",
+  "evidence": [
+    {
+      "path": "feedback.json",
+      "category": "evaluation",
+      "role": "当前049目标特化的编译失败记录与同源已测量对照",
+      "finding": "顶层status=target_compile_failed。case4与case7的candidate_error均为ConvertLinalgIRToBinary阶段失败，原文为ub overflow, requires 1576960 bits while 1572864 bits available，即需求197120B、可用196608B，超出512B。同源FP16特化case1与case2的status=measured，candidate full_call_us为102.53005与98.74950，native为101.33755与97.60355，说明同一行映射在较小K/V工作集下可以编译，超限量与256长度K/V工作集同现。",
+      "sha256": "da554c4e9835e2b05b59854ddf2f021522f92fe475ac979303382ea9e60036f7"
+    },
+    {
+      "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "本轮可编辑的case4（G=8）BCMLIR实体",
+      "finding": "第82至97行为Q载入：alloc_4为memref<128x128xbf16>，scf.for %arg14 = %c0 to %c128 step %c1内每行用reinterpret_cast取memref<1x128, strided<[128,1]>>再memref.copy到subview，共128条单行拷贝，行地址为(idx//8)*8192+(idx%8)*128。第116至135行为输出：同样128行，逐行tensor.extract_slice取1x128 f32、tensor.extract取1个分子、linalg.fill生成1x128 f32广播、arith.divf、arith.truncf到bf16、bufferization.materialize_in_destination写入memref<1x128, strided<[128,1], offset:?>>。因c8192_i32=8192=64*128为Nq*D、c128_i32=128为D、G=8整除128，同组8行的地址差恒为128个元素，组内连续且起点为256B对齐。",
+      "sha256": "d4e494444fd707cd0e7a6ce95932d90e172e5f43867c64091738f48420ee667b"
+    },
+    {
+      "path": "ir/case7/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "本轮可编辑的case7（G=4）BCMLIR实体",
+      "finding": "结构与case4同构，G=4、行首址为(idx//4)*4096+(idx%4)*128，输出侧同一套逐行fill/divf/truncf/materialize。4行一组时地址差恒为128个元素、合计512个元素连续，起点同样256B对齐。该特化需与case4分开实施，不能共用同一组常量。",
+      "sha256": "113a7ad920daba2b61e0559a536200dcbeadd6c6434d60a2c996ecd4c489ec43"
+    },
+    {
+      "path": "compiled-readonly/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "按符号核对后端已有低层产物，确认疑似冗余在后端是否被消除",
+      "finding": "compiled-readonly的bcmlir与ir/target逐字节同构（diff为空），同目录的ttadapter只是把%arg2改为%Q等重命名，ttir为同一TTIR层级；三份产物保留了128条单行memref.copy与逐行fill/divf/materialize，未见把相邻行合并为连续块拷贝的清理。可见失败发生在BCMLIR之后、二进制生成之前的UB分配阶段，单行拷贝冗余在后端仍然存在。这三份低层产物保持冻结，仅作核对。",
+      "sha256": "d4e494444fd707cd0e7a6ce95932d90e172e5f43867c64091738f48420ee667b"
+    },
+    {
+      "path": "gqa-head-row-language-evidence.txt",
+      "category": "source_ir",
+      "role": "语言与后端表示边界",
+      "finding": "记载source049采用直接2D行映射，其BCMLIR把Q载入与输出写回降为128条单行拷贝，目标UB为197120B并超过196608B；050把标量静态地址分量提出后，后端拒绝非单位batch的memref.collapse_shape且需327680B；历史020的显式reshape同样失败。据此本轮只在既有2D memref形状和拷贝上做queryhead分组，避开3D折叠与reshape。",
+      "sha256": "da1fecda802f6fed0e6e8f2e1d78ce5b5c47b8d9587ea5dd5eb55897180bdcf1"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "source_ir",
+      "role": "宿主证据分析与候选方向（Codex贡献）",
+      "finding": "Codex指出Q与Out的原始BSND布局中同一queryhead组内的G行连续，可用memref<Gx128, strides<128,1>>从行号为G倍数的位置开始，源与目的地址逐行对应不变；分母归约与FP16的QK/PV数学保持原op；同时提示输出临时量可能增大UB，须先做CPU编译再宣称修复，并说明这是未保留分支049的编译修复，收益身份与047的175.5726us保留最佳分开验收。",
+      "sha256": "9fb4094dbb1de677023d6f3a846c28015e6e73e0cb330f37fafd35ae09070a17"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "paired_profiling",
+      "role": "历史047源的机制定位材料（当前049无目标二进制）",
+      "finding": "case4的历史047报告中，MTE3的MOV_SRC_TO_DST_ALIGN（pc 0x10d11c64）running_time_us=25.60、calls=8，detail为Src:UB,Dst:OUT,XM:X21=0x1000400,Dtype:B16，来源栈指向candidate.py:409的tl.store，属strided输出写回；同核FLOWCTRL/WAIT_FLAG_DEVI为35.32us、9 calls；instruction_calls汇总MTE3/MOV_SRC_TO_DST_ALIGN=18、VECTOR/VDIV=18。这些累计时间与热点排名只用于定位候选机制，各流水可重叠。",
+      "sha256": "efbb0d7cc1cb231169af2f8dd9107c6b401a53bf0090ffbbdab60bab75c8d80b"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "历史窗口的时钟资质、覆盖范围与未报告泳道说明",
+      "finding": "顶层historical=true。每核capture_scope为First to last visible hardware event on this core; partial capture boundaries preserved，clock_qualification=relative_only、absolute_time_qualified=false，raw_clock_window为128.9580至229.0818、unit=unassigned；同一份材料里的absolute_unit_validation为verified、unit=us、22/22 PC匹配、median_ratio=0.99980与1.00016。占用比例按窗口分数归一化（display_time_unit=window_fraction），idle_intervals_total在98至251之间、idle_union从0.365到0.9976，记录显式WAIT/BAR形成的空窗；未报告泳道保持未知。",
+      "sha256": "0f7146ec83e0916d404e7b62042bc2421d322e1bd0e67a3fa96f623682e22f3a"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "历史配对采集的时长口径参照",
+      "finding": "reference侧FusedInferAttentionScore（mix）Task Duration(us)=119.902397，candidate侧_gqa_fwd_kernel_mix_aic为174.563492，source_sha256为047的3c34fdfb。该口径与context中047正式结果175.5726us属不同采集批次，仅作历史参照。",
+      "sha256": "cecc4a2287dbb4318d6be3f240c5c7d37a4fa7bb9deeca2da7bc41c4d720b2ca"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "fd25f875c334f929efa8d0fab381344dfcdb901989c12b113e6ede30e537eda3",
+    "contract.json": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858",
+    "ir-inventory.json": "d6ff5d62d6c3a0fdae6c8b34ac7c938ce279064103bf067de1ae047800f25dda",
+    "feedback.json": "da554c4e9835e2b05b59854ddf2f021522f92fe475ac979303382ea9e60036f7",
+    "profiling.json": "cecc4a2287dbb4318d6be3f240c5c7d37a4fa7bb9deeca2da7bc41c4d720b2ca",
+    "hotspots.json": "efbb0d7cc1cb231169af2f8dd9107c6b401a53bf0090ffbbdab60bab75c8d80b",
+    "timeline.json": "0f7146ec83e0916d404e7b62042bc2421d322e1bd0e67a3fa96f623682e22f3a",
+    "gqa-head-row-language-evidence.txt": "da1fecda802f6fed0e6e8f2e1d78ce5b5c47b8d9587ea5dd5eb55897180bdcf1",
+    "context.json": "e28c1bb9fd884e0c8dacbdcad4840087b22f12997f58259510461581c7369c3c",
+    "diagnosis.json": "d38ae0290ed2cc547d031033ffc806fce9c0e5eed19ed79604b15995b7e5de38",
+    "codex-brief.json": "9fb4094dbb1de677023d6f3a846c28015e6e73e0cb330f37fafd35ae09070a17",
+    "ir/target/_gqa_fwd_kernel.bcmlir": "d4e494444fd707cd0e7a6ce95932d90e172e5f43867c64091738f48420ee667b",
+    "ir/case7/_gqa_fwd_kernel.bcmlir": "113a7ad920daba2b61e0559a536200dcbeadd6c6434d60a2c996ecd4c489ec43",
+    "compiled-readonly/_gqa_fwd_kernel.ttir": "b940405368885e9fd449e76edd25e733822dc859e2f4933c63d2a0f6ff939edb",
+    "compiled-readonly/_gqa_fwd_kernel.ttadapter": "0dfa3181c57625c4ef4f3894f9b5cc35eba95f5df1e1cd30695f0a09f502c9fe",
+    "compiled-readonly/_gqa_fwd_kernel.bcmlir": "d4e494444fd707cd0e7a6ce95932d90e172e5f43867c64091738f48420ee667b"
+  },
+  "decision_tool_sha256": "2ba55ebab8be5b8a2363da657d6ee81799d4cabcdfb8e1494846aecfd1fde624"
+}

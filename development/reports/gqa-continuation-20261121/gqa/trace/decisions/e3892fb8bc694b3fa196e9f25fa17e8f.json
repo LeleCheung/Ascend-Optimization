@@ -1,0 +1,81 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "e3892fb8bc694b3fa196e9f25fa17e8f",
+  "recorded_at": "2026-11-21T07:15:32.733838+00:00",
+  "round_id": "attempt-005",
+  "input_source": {
+    "path": "trace/sources/d59c1ca7f3d2a8bd16c9a33bbeecb8b6b0205623174958f83959f0e2da5818fc.py",
+    "sha256": "d59c1ca7f3d2a8bd16c9a33bbeecb8b6b0205623174958f83959f0e2da5818fc"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/39c034fd6a51f2dd9b2d52361bdac836bd7c545411ab0838cb24edc97108063b.json",
+        "sha256": "39c034fd6a51f2dd9b2d52361bdac836bd7c545411ab0838cb24edc97108063b"
+      },
+      "original": {
+        "path": "workspace/current-profiling.json",
+        "sha256": "39c034fd6a51f2dd9b2d52361bdac836bd7c545411ab0838cb24edc97108063b"
+      },
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4（bf16 4xSq256xNq64xNkv8x128，非因果）候选 hardware kernel 763.155us、Block Dim 1024。每 program 均值：aic_cube_time 1.087us、aic_mte2 2.413us、aic_mte1 1.521us、aic_fixpipe 1.920us、aic_scalar_wait_id1 9.150us；vector0 vec 3.658us、mte2 1.136us、mte3 0.829us、scalar_wait 2.298us。即在约 15us 的每 program 墙钟中 Cube 只有 1.09us 有效，其余主要是等待。每 program 搬运：GM→L1 208KiB、L0C→GM 192KiB、GM→UB 96KiB、UB→GM 40KiB。参考 CANN 实现只用 19 个 block（约每核 1 个）即 131.42us、cube_time/block 35.5us，说明参考把 K/V 复用放在长寿命 program 内，而候选把同样算力拆成 1024 个短寿命 program。",
+      "source_sha256": "d59c1ca7f3d2a8bd16c9a33bbeecb8b6b0205623174958f83959f0e2da5818fc"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/db1ac1865bf6be23a9b23786fa63f90334a67d0816a836bd61bf59a7887cc70b.ttir",
+        "sha256": "db1ac1865bf6be23a9b23786fa63f90334a67d0816a836bd61bf59a7887cc70b"
+      },
+      "original": {
+        "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+        "sha256": "db1ac1865bf6be23a9b23786fa63f90334a67d0816a836bd61bf59a7887cc70b"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "case4 实际 TTIR 为 64x128 与 128x128 tile，scf.for 从 0 到 256 步长 128（每 program 2 轮 KV）；每轮固定 3 次 tt.dot（qk、p_hi·v、p_lo·v），acc 以 %acc_65 = acc*alpha 作为 %acc_66 = tt.dot 的 L0C 初值，再 %acc_69 = %acc_66 + %acc_67*(1/2048)。掩码确已消除（无 n 掩码的 cmpi/andi/broadcast，仅 4 个指针参数），故本轮要动的是每链的固定交接与 K/V 装载，而不是掩码或索引。链总数 = program 数 × KV 轮数 = 1024 × 2 = 2048。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/05e67333dd2f3017acbac03401ed61c8848795b3ea8274b4c4023721d99d7f2d.json",
+        "sha256": "05e67333dd2f3017acbac03401ed61c8848795b3ea8274b4c4023721d99d7f2d"
+      },
+      "original": {
+        "path": "workspace/simulator-evidence.json",
+        "sha256": "05e67333dd2f3017acbac03401ed61c8848795b3ea8274b4c4023721d99d7f2d"
+      },
+      "category": "simulator",
+      "role": "disambiguation",
+      "finding": "三个核的部分窗口各自归一化（Cube 与两个 Vector 各 0~1），application_completed=false，clock_qualification=relative_only。Cube：CUBE productive 7.90%、wait_only 33.27%、idle 58.83%，FLOWCTRL wait_only 86.19%（WAIT_FLAG_DEVI 8.31us 落在第 145 行 acc 更新），MTE2 productive 43.82%。Vector：VECTOR productive 25.14%、wait_only 17.13%、idle 57.73%，热点 WAIT_FLAG_DEVI 4.02us（第 145 行）、WAIT_FLAG_DEVI 3.74us（第 102 行 QK dot 前的 K 数据依赖）。热点清单全部是同步或搬运指令（FLOWCTRL WAIT、CUBE WAIT_FLAG、MTE2 MOV_OUT_TO_L1），没有与算术量成正比的 VEC/MMAD 项，故热点只说明「等谁」，不能直接当作根因；流水三项占比显示 Cube 与 Vector 同时既空闲又等待，符合每链一次跨核往返（cube→fixpipe→vector softmax→MTE2 回 L1→cube）的串行依赖，而不是算力或带宽饱和。",
+      "source_sha256": "d59c1ca7f3d2a8bd16c9a33bbeecb8b6b0205623174958f83959f0e2da5818fc"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/bb93e0891182fedabc643c80c58e3ac4deb90e032363154af3d03614a84ee2a0.json",
+        "sha256": "bb93e0891182fedabc643c80c58e3ac4deb90e032363154af3d03614a84ee2a0"
+      },
+      "original": {
+        "path": "workspace/previous-result.json",
+        "sha256": "bb93e0891182fedabc643c80c58e3ac4deb90e032363154af3d03614a84ee2a0"
+      },
+      "category": "evaluation",
+      "role": "background",
+      "finding": "当前保留版四项通过：case1 171.730us、case2 169.709us、case4 774.8852us、case7 172.665us；case4 目标条件 ABBA 785.3982/774.20565/773.9462/785.3137us。历史负例：attempt-002（BLOCK_M=32、BLOCK_N=256）四项通过但 case4 825.248us，说明只加宽 N 同时把 program 数翻倍的几何会退步；attempt-003 同结构 1042.364us。因果 64/128 曾在编译期因 BLOCK_N 相关整型索引临时量达到 231488B 峰值（>196608B 预算）而失败，故因果路径本轮不得回到 BLOCK_N=128。",
+      "source_sha256": "d59c1ca7f3d2a8bd16c9a33bbeecb8b6b0205623174958f83959f0e2da5818fc"
+    }
+  ],
+  "hypothesis": "case4 墙钟主要由跨核交接链的数量决定：每 program 每轮 KV 都要付一次 cube→fixpipe 搬出 qk、vector softmax 与两项概率分解、p_hi/p_lo 经 MTE2 回 L1、两次 PV dot、acc 搬出与重缩放的固定往返，而每链算术只有 64x128x128 + 2×(64x128x128)。因此把非因果 BLOCK_M 由 64 提到 128、BLOCK_N 保持 128：program 数 1024→512，chain 总数 2048→1024，每 program 的 K/V 装载量不变而总 K/V 搬运减半（208KiB→约 136KiB/program），每链在 M 方向复用 128 行，Cube 每链有效时间占比上升；预期 case4 明显下降。",
+  "change": "仅修改 run() 中 BLOCK_D<=128 分支的分块常量：BLOCK_M 由固定 64 改为 64 if is_causal else 128（BLOCK_N 仍为因果 64、非因果 128）。内核函数体、MASK_MD/MASK_KV 判据、指针表达式、两项概率分解及其相加顺序、acc*alpha 重缩放、num_warps/num_stages、grid 公式 cdiv(S, BLOCK_M) 全部不变；不读输入值、不按 case_id 选路。",
+  "expected": "case4 由 774.8852us 降到约 500~650us（chain 数减半、总 K/V 搬运减半）；case2 由 192 个 program 降到 96 个、chain 数 192→96，预计小幅改善或持平；case7 由 128 个 program 降到 64 个、chain 数 256→128，在约 20 个 AI 核上仅 3.2 波，存在尾效应，预计改善幅度小于 case4，需实测确认不退化；case1 因果分块未动，编译路径与其结果应逐位不变（171.730us 量级）。精度：每行输出仍按同一 j 顺序累加同一组 KV 块、同一 alpha 重缩放与同一两项分解，QK 归约维仍是 D=128、PV 归约维仍是每块 128 列，数值序列不变，预计四项 checker 结论与当前一致。代价：非因果 case 的 per-program 峰值缓冲按 M 维翻倍（acc 128x128 fp32 64KB、qk/p 128x128 fp32 64KB、p_hi/p_lo 各 32KB、q 32KB），估算峰值约 192KB，逼近 196608B 预算，存在编译期资源失败风险。",
+  "validation": "先 preflight --source candidate.py；随后由宿主只读审查并以官方 checker/golden 跑固定 case1/2/4/7 的完整四项正确性与计时，比较 case4 与 774.8852us 并记录另外三项真实变化；再在新一次成对 profiling 中核对 Block Dim、每 program GM→L1 与 L0C→GM、aic_cube_time 是否按 discriminating_observation 同向变化，以区分「链数主导」与「每链延迟主导」。",
+  "alternatives": [
+    "BLOCK_M=128、BLOCK_N=64：program 数同样 1024→512、总 K/V 搬运减半，但 chain 总数仍 2048（每链 N 减半），qk/acc 缓冲更小（估算峰值约 160KB），风险低、上限也低；作为本次资源失败时的第一顺位替代。",
+    "BLOCK_M=64、BLOCK_N=256：chain 总数同样 1024，但 qk/p 变为 64x256 fp32（64KB），且 case2/case1 的 SKV=128 会让 MASK_KV 重新为真、白装一半掩码数据，K/V 装载粒度翻倍对 MTE1 更不利，故不选。",
+    "因果路径 BLOCK_M=128 / BLOCK_N=128：会重新引入 BLOCK_N 线性相关的因果索引临时量，叠加 128 行 M 缓冲，已知 64/128 因果峰值 231488B 已超标，故因果保持 64/64 不动。",
+    "在 L0C 内部省掉每轮 acc*alpha 重缩放（把重缩放并入 PV 第二项）：属计算顺序与精度路径变更，本轮合同要求保持两项概率分解及其相加顺序，故不做。"
+  ],
+  "discriminating_observation": "若墙钟由 chain 数主导：case4 的 chain 数减半后真机全调用应显著低于 774.8852us（向 500us 量级移动），且成对 profiling 中 Block Dim 1024→512、每 program GM→L1 由 208KiB 降到约 136KiB、每 program L0C→GM 由 192KiB 升到约 384KiB（总量不变）、aic_cube_time 每 program 约 2.2us。若实测几乎不变，则瓶颈在每链的串行延迟本身（装载粒度与 flag 往返）而非链数，下一机制应改为压缩每链依赖深度（例如合并 p_hi/p_lo 的两次 PV 交接或调整 K/V 装载粒度），而不是继续加大分块。",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 67,
+    "duration_ms": 519087,
+    "usage": {
+      "input_tokens": 119998,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 2719488,
+      "output_tokens": 74722,
+      "output_tokens_details": {
+        "thinking_tokens": 51159
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 121370,
+        "outputTokens": 83101,
+        "cacheReadInputTokens": 2863744,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 4.1162469999999995,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 51159,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 4.1162469999999995,
+    "result": "已提交，状态 `awaiting_ir_review`。\n\n本轮落盘的唯一改动（`ir/ca6c05a0…/_transform_bias_rescale_qkv_kernel.ttir`，scf.for 循环体内纯节点重排）：\n\n- 原顺序：`q 链(f16→f32 extf→bias extf/broadcast/addf→scale splat/mulf→truncf)` → `k 链` → `v 链` → `store q` → `store k` → `store v`\n- 新顺序：`k 链` → `store k` → `v 链` → `store v` → `q 链` → `store q`\n\n语义与身份不变：三次 `tt.load` 仍全部先于任何 `tt.store`；每元素的舍入次数（q 单次 `truncf`，k/v 纯 f16 加法）、地址表达式（`out_off_31`、`k_shift/v_shift`、bias 指针）、张量类型、`tt.num_stages = 2`、循环边界、函数签名与参数顺序逐字未改；无新增/删除算子类型，无掩码/别名/覆盖变化。`frozen.py` 仍为 `0af5d533…`，`ir-inventory.json`、`lowered-inventory.json`、`compiled-readonly/` 下 ttadapter/bcmlir/npubin 与全部证据文件未触碰。\n\n诊断（`diagnosis.json`，专业中文）核心：\n\n- 机制：q 的依赖链是 6 个 f32 张量遍，k/v 只有 2 个 f16 遍，就绪时间差 3–5 倍；TTIR 却按书写顺序先发 q，使 MTE3 的首条 store 被最慢的一条链挡住（热点 `WAIT_FLAG(PIPE:VEC,FLAGID:2)` 3 次共 6000 cycles/3.64us，VECTOR `productive 0.121` 对 `wait_only 0.743`；每 block `mte2 1.8099 + mte3 1.1549 = 2.9648us` 占 `aiv_time 3.0727us` 的 96.5%）。ttadapter/bcmlir 的 store 顺序与 TTIR 逐条一致，说明这是从 TTIR 继承、未被调度阶段纠正的顺序成本。\n- 已核对并否证的 Codex 方向：EXACT 特化零掩码，`MOV_PAD_VAL` 是每条 MTE2 描述符固定下发的 pad 寄存器设置（耗时与相邻 copy 排队同值），主存读只比输入多 1.3%（仅偏置重读），不存在零填充流量。\n- 可测预测：语义逐位不变（21+48 项 PASSED，`abs_err=rel_err=0`）；若机制成立则 `(mte2+mte3)/aiv_time` 由 0.965 降至 ≤0.93、`aiv_time` ≤2.95us、timing-2 ≤60.5us；若后端本就按依赖调度则持平（62.86±0.3us，结论记为“顺序不是成本”）；字节守恒 `read≈24896KB / write≈24576KB`。\n- 未报告泳道（ALL/CACHEMISS/FLOWCTRL 为 auxiliary_trace_lane）、窗口 `relative_only` 资质与程序边界 MTE2 空闲段的解释均已写入 `simulator_incremental_judgment`。\n\n后续语义、完整 KGS 与性能由宿主审查后运行；本文档与预检不作为收益结果。"
+  }
+}

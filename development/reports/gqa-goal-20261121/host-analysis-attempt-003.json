@@ -1,0 +1,6 @@
+{
+  "source_sha256": "23d7322958578d08372dfd9f830f7dc251c4235aa34e7bacf8a3cacdcee90afc",
+  "author": "Codex",
+  "evidence_mode": "profiling-source-ir",
+  "analysis": "新假设从已验收472.46045μs原字节出发。001合并PV在实际IR减少到2个matmul，但BF16 UB855552>196608字节，完整结果已返回；002模型仅恢复原计算AST，宿主确认与已验收版计算AST完全一致，记录恢复事件并复用原测量。本次具体机制改为按共享KV头组织query行，改善BSND输入输出访存，保持当前128行dot和128列KV分块、两项PV精度表达式、每行KV顺序。目标当前每个program取同一query-head的128个序列位置，Q/Out行间隔8192个元素、每行仅128个BF16；同一KV头的8个query-head在BSND中相邻。建议将一个program的128个逻辑query行组成16个序列位置×8个共享KV的query-head，Q按[序列子块,G,D]三维连续头段载入，再reshape为dot的[128,D]，输出反向reshape/store。显式3D地址组织可帮助编译器识别头组内连续数据，减少仅用1D取余构造行向量可能产生的gather。目标Q/Out每个连续段由256字节扩展为2048字节，段数128降为16；实际lowering是否生成大块连续copy由TTIR/BCMLIR与profiling验证。按KV头组织grid后，目标program数仍512，每个program仍128个逻辑query行、两轮KV，共同K/V输入次数和三dot数均保持；避免声称这一步将program数或K/V总流量再除以8。仅非因果且G可用该静态分组的metadata路径尝试，因果及通用fallback保持。尾部mask需按实际序列行覆盖重新证明，输出地址每个(b,s,h,d)唯一，所有stride按输入元数据处理，禁止依输入值或case_id选路。若G过大、非2幂或BM无法整除，保留当前路径。此机制可由源码/BCMLIR中的8192行stride与profiling搬运等待提出，当前无需新增模拟器输入；宿主保留历史模拟器知识，后续持续重放并检查新的load/store与等待变化。仅实现这一机制，禁止只回退或给旧实现换注释后作为新优化。若无法提出实质修改，交接说明原因为无修改事件。"
+}

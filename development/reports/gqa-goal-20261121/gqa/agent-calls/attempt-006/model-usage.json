@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 40,
+    "duration_ms": 238254,
+    "usage": {
+      "input_tokens": 66086,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1913856,
+      "output_tokens": 35281,
+      "output_tokens_details": {
+        "thinking_tokens": 23577
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 66086,
+        "outputTokens": 35281,
+        "cacheReadInputTokens": 1913856,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 2.1693829999999994,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 23577,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 2.1693829999999994,
+    "result": "本轮已实现一个可评测机制并完成交接。以下是本轮实际做了什么、依据和边界。\n\n## 决策与证据（已先登记再改源码）\n`decision --record diagnosis.json` → `decision_id 6fd48bacd13d461d80a0a41f895d2291`，绑定修改前源码 SHA `fb1233ed…003a6`。证据仅引用本轮实际读取的材料：\n\n- **成对 profiling（trigger）**：case4 候选 512 程序 / kernel 394.987885μs；每程序 `aic_cube_total_instr_number=4`（2 个 KV 块 ×(QK+PV)）、`L0C_to_GM=256KiB`、`GM_to_L1=224KiB`，而 `aic_cube_time` 仅 1.345455μs 对 `aic_scalar_wait_id1` 10.260232μs；AIV vec 5.004881 / mte2 1.686396 / mte3 1.173484 / scalar_wait 3.696625μs。\n- **对照（disambiguation）**：CANN 参考仅 19 个 block/130.1026μs，cube 指令总数同为 2048，且没有 scalar_wait 字段 → 总算术量相同，慢在 512 个短程序 × 约 21 个波次、每波都要付数次跨核交接延迟。\n- **实际 IR（mechanism）**：TTIR 的 `scf.for 0→256 step 128`；`acc_60 = acc*alpha` 正好作为 PV `tt.dot` 的初值。BCMLIR 中 `linalg.matmul` 的 `outs(%52)` 就是 `acc*alpha`，且 p 的 truncf 与 v 的 extf+truncf 每轮重复 → 交接链的固定成本与 M/N 尺寸无关。\n- **评测（background）**：四项原 checker 全通过，case4 mare 0.0078124937 已贴近阈值 0.0078125 → 本轮不得再加精度损失，因此机制只做结构与调度。\n\n## 机制（只改一处）\n非因果路径在 `SKV % 256 == 0`（case4/case7 的 SKV=256）时取 `BLOCK_N=256`，整段 KV 一个块；内核新增编译期分支 `SINGLE_KV=(not IS_CAUSAL) and (BLOCK_N==SKV)`，直接用本块 row-max 做最终 max，`p`/`l` 一次算完，PV 由零初值 `dot` 直接产生——删除整段 online 重缩放（`acc*alpha`、`l_i*alpha`）及其 L0C 初值往返。\n\n不变量：因果 case1 仍 64/64；`BLOCK_M=128` 不变；grid 程序数不变；两项概率分解与单次 fp16 PV 的表达式、相加顺序逐字保留（按 dtype×分支各写一次，避免出现 `(d1+d2)+acc*alpha` 这种改变舍入的分组）；dtype 选路仍只看 V 的 dtype 元数据。case2（SKV=BLOCK_N=128）在新路径上与原来的 `alpha=0` 算术逐项等价。\n\n**数值风险（已写入诊断）**：case4/case7 的 PV 归约分组由「两次 k=128 累加 + 一次精确重缩放」变为「一次 k=256 归约」，同 j 顺序、同乘积，是否有差异由原四项 checker 判定；`SKV<256` 与非 256 整除形状退回 128 分块，适用范围明确。\n\n## 交接状态\n`preflight --source candidate.py` → `awaiting_source_review`，新源码 SHA `aec8e907…0895d`，候选字节保持不动。等待宿主只读路径/地址边界审查与完整四项真机评测。\n\n预期待验（不作结论）：case4 每程序链 2→1、matmul 4→2、`L0C_to_GM` 256→192KiB，kernel 由 394.99μs 向 ~250–300μs 移动；case7 同构；case2 持平或微降；case1 不变。主要风险是 `qk(128×256 fp32)` 与 PV 累加器同处导致 UB/L0C 超预算而编译失败——若失败，保存完整四项结果后回退并另选机制（候选备选已记录：BLOCK_M 128→256、剥离首轮迭代、num_stages 流水、两遍法求 max）。工具增量仅记录本轮实际输入；模拟器部分窗口按范围引用，未隔离为独立增量，也未作为本轮前置输入。"
+  }
+}

@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 45,
+    "duration_ms": 153359,
+    "usage": {
+      "input_tokens": 97720,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 2884608,
+      "output_tokens": 26003,
+      "output_tokens_details": {
+        "thinking_tokens": 14481
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 97720,
+        "outputTokens": 26003,
+        "cacheReadInputTokens": 2884608,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 2.5809790000000006,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 14481,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 2.5809790000000006,
+    "result": "本轮已完成候选落盘并进入审查交接，文件不再改动。\n\n## 已登记机制（ir-004）\n\n在 `ir/target.hivm.mlir` 的 `_gqa_fwd_kernel_mix_aiv` 内，把**同一**分母归约与原生倒数整段从 PV 接收/半→浮转换之后，搬到 `sync_block_set[<VECTOR>, <PIPE_MTE3>, <PIPE_S>] flag = 1`（P 发送完成）之后、`scf.if` nextQK 接收块（flag4 等待）之前：\n\n- 搬移语句：`%56`/`%57` 指针、`%cast_32/33/34`、`enablevc_reduce_sum_ar_float`、`%rcp_src/%rcp_dst/%rcp_tmp`、`vrec_1d_float`、`%rcp_2d`，连同其原有两条 `pipe_barrier[<PIPE_V>]`。\n- 留在原位：`%58`（81920）、`%vmul_tmp`（114944）、`vmul_2d_float`、bf16 转换与 Out 存出。\n\n## 审查结论（别名／依赖／同步）\n\n- 分母输入区间 114688–180224 在 P 转换（读 114688、写 32768）之后无其它读写；VREC 目的 114688（分母区首 256B）与 tmp UB0 仅在 sum 之后访问，原有“先归约后倒数”次序保留。\n- sum scratch UB0 中的 qk_lo 在本迭代首次半→浮转换已被读完，后续迭代读 qk_hi（32768）；nextQK/PV 接收分别写 UB32768、UB65536，与 UB0、114688 段无别名。\n- P 存出后的 MTE3→MTE2 EVENT0 与 flag1 是既有同步；本轮事件/flag 数、`pipe_barrier` 数（7 条）、函数实参、缓冲地址、AIC 段与 ABI 逐字保持，未新增 barrier。\n- `frozen.py` sha256 仍为 `19f7fb23…`（逐字节一致）；IR 新 sha `c0dcca3e…`。\n\n## 新增观察\n\n- 低层冻结产物 `compiled-readonly/_gqa_fwd_kernel.bcmlir` 第121/126/131/132 行显示 matmul、`linalg.reduce`、broadcast、`arith.divf` 为独立算子且归约/倒数无折叠，发射位置由 HIVM 语句序决定；工作区无 `lowered-inventory.json`，这些产物本轮未改动。\n- Codex 的窗口次序分析（P 发送 40.867–42.787、flag4 等待 39.588–44.480、flag0 等待 44.488–45.895、PV 接收 45.897–46.221、sum 46.336–46.886、VREC 46.887–46.900）与本轮搬移依据一致，其“UB32768 复用而 UB0 已死”判断成立。\n- 059 的合格负结果（条件式慢 0.522%）作为先验保留：该版本缺 nextQK 预取、原生 VREC 与独立接收缓冲，与本轮 IR 身份不同。\n- 未报告泳道（sum 的 VECTOR 微指令单次时长、标量派发开销、V 队列在等待期间的调度优先）保持未知，待宿主重放实测；预测的尾部链上界约 0.55us 属单迭代量级估计。"
+  }
+}

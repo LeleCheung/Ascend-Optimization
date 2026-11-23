@@ -39,9 +39,18 @@ def main():
     spec=json.loads(args.spec.read_bytes())
     import torch,torch_npu
     torch.set_num_threads(1);torch.npu.set_device(0)
+    if args.side=='candidate' and spec.get('ir_input'):
+        from ir_input import install
+        install(spec)
     oracle=imported('_skill_oracle',Path(spec['leaf'])/'oracle.py')
     candidate=imported('_skill_source',spec['source']) if args.side=='candidate' else None
-    inputs=oracle.gen_inputs(spec['case'],'npu:0')
+    if candidate is not None and spec.get('kernel_replay'):
+        replay=imported('_hgkda_launch_replay',Path(__file__).with_name('launch_replay.py'))
+        replay_kernel,replay_values,replay_options=replay.load_call(spec,candidate)
+        invoke=lambda:replay_kernel.run(*replay_values,**replay_options)
+    else:
+        inputs=oracle.gen_inputs(spec['case'],'npu:0')
+        invoke=lambda:getattr(candidate,spec.get('entrypoint','run'))(**inputs)
     if candidate is None:
         oracle.run(**inputs);torch.npu.synchronize();return
     if spec.get('autotune_replay'):
@@ -59,7 +68,7 @@ def main():
                 tuner.cache[tuple(item['key'])]=config
     # Resolve native autotuning before recording the selected specialization.
     for _ in range(spec.get('warmup_before_capture',0)):
-        getattr(candidate,spec.get('entrypoint','run'))(**inputs)
+        invoke()
     if spec.get('warmup_before_capture',0):torch.npu.synchronize()
     clear_launch_caches(candidate)
     from triton.runtime.jit import JITFunction
@@ -81,7 +90,7 @@ def main():
         return compiled
     JITFunction.run=capture
     try:
-        getattr(candidate,spec.get('entrypoint','run'))(**inputs);torch.npu.synchronize()
+        invoke();torch.npu.synchronize()
     finally:JITFunction.run=original
     autotune=[]
     for name,depth,tuner in wrapped_kernels(candidate):
@@ -93,6 +102,8 @@ def main():
     (Path(spec['ir_directory'])/'autotune-cache.json').write_text(json.dumps(dict(
         source_sha256=spec['source_sha256'],case=spec['case'],entries=autotune),indent=2)+'\n')
     value=dict(source_sha256=spec['source_sha256'],files=artifacts)
+    if spec.get('kernel_replay'):value['analysis_kernel_replay']=spec['kernel_replay']
+    if spec.get('ir_input'):value['ir_input']=spec['ir_input']
     (Path(spec['ir_directory'])/'manifest.json').write_text(json.dumps(value,indent=2)+'\n')
 
 

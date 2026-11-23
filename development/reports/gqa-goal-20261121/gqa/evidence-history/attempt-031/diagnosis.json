@@ -1,0 +1,45 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "2ffb6f6125d0b2ea3a06593661b9bba034a3df04040ec4610de4b0a982aaab9f",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4 候选 kernel 226.164520us、Block Dim 20/Mix 40；每 Cube 核 aic_cube_time 均值 33.109us，cube 指令 2048 条（102.4/程序），L0C_to_GM 总计 98304KB（4915.2KB/程序）；vector0/vector1 的 aiv_vec_time 各 79.394us、aiv_scalar_wait_time 77.52/78.16us；参考实现 120.222404us、19 程序。候选墙钟仍由跨核交接链主导，Cube 与 Vector 存在可尝试交叠的窗口。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "内层 scf.for 每个 tile 严格串行完成 tt.dot(QK) → 乘 scale → reduce max → select safeguard → sub → exp2 → reduce sum → truncf fp16 → tt.dot(PV) → div → select → tt.store 后才进入下一 tile 的 q 载入与 dot；当前没有任何让下一 tile 的 QK 提前进入 Cube 流水线的源码组织。"
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "QK 的 linalg.matmul 输出到 %1（tensor<128x256xf32>，预填 0 的累加器），scale %2 与 broadcast %0 同为 128x256xf32，PV 输出 %7 为 128x128xf32。原始 QK 前瞻使两张 128x256 fp32 rawscore 同时存活，相较当前单 tile 生命周期净增约 128KiB；相对 196608B 的 UB 预算，这是本轮最直接的编译与分配风险（也可能在 L0C 上冲突）。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "029 当前源四项官方 checker 全通过（passed=true），current 目标耗时 232.23705us，保留最佳 262.27775us；golden、official checker 与合同身份固定，本轮不得改动阈值或输入输出 dtype。"
+    }
+  ],
+  "hypothesis": "在 20 常驻 worker 的内层、同一 KV 组同一份已载入 K 的相交 tile 区间内，把相邻两个 query tile 的原始 QK 前瞻发出：先 tl.dot(q0,k^T) 得 rawscore0，再 tl.dot(q1,k^T) 得 rawscore1，然后才依次对 tile0、tile1 执行原来的 FP32 scale/max/safeguard/exp2/sum、单次 FP16 PV、PV 后除法、guard 与 BSND store。这样 Cube 可以在 Vector 处理 tile0 的 softmax/PV 时提前执行 QK1，缩短每条 worker 串行交接链；每个输出 tile 的算术表达式与相加顺序逐字不变，故数值上应与当前实现逐位一致（非近似）。收益是否出现、编译器是否保留该顺序、两张 rawscore 是否放得下，均未预设。",
+  "alternatives": [
+    "维持当前逐 tile QK→softmax→PV→store 的串行组织，依赖编译器自身流水（父版本现状）",
+    "只把 QK1 提前到 tile0 的 PV 之后（部分前瞻），可减少同时存活的 rawscore 但 Cube 提前量更小",
+    "把 BLOCK_N 降到 128 以容纳两张 rawscore（违反本轮固定的 BM128/BN256，且改变 PV 归约分组）",
+    "三阶段 scratch 或 scores 压缩（host 明确排除，不采用）",
+    "改用部分两项 PV 精度结构（与本次调度实验无关，且会改变数值结构，不在本轮）"
+  ],
+  "discriminating_observation": "若编译通过并保留源码顺序，配对分支的 QK matmul 次数不应改变（每对仍 2 次），但会多一张同时存活的 128x256 fp32 rawscore；case4 修改后成对 profiling 中 Cube/Vector 的重叠指标（aiv_scalar_wait_time、aic 侧等待）与 Task Duration 是否下降，可区分真实交叠与仅是形式重排。若编译因 UB/L0C 预算失败，则同样为 rawscore 生命周期的判断提供直接证据。",
+  "change": "在 PART_TILES 分支（仅 BF16 非因果 SINGLE_KV、BM128/BN256、D128，即 case4/case7）内：新增 _gqa_finish_tile helper，逐字保留原 tile 的 scale→max→safeguard→exp2→sum→单次 FP16 PV→除法→guard→store 表达式；把内层 for t in range(t0,t1) 改为按 npairs=(t1-t0)//2 的成对循环，每对先载入并发 q0/k dot 得 rawscore0、再载入并发 q1/k dot 得 rawscore1，随后依次调用 finish(rawscore0)、finish(rawscore1)；当 (t1-t0) 为奇数时，尾 tile 用 if (t1-t0)%2==1 走原单 tile 路径（自带 QK dot 后 finish）。P=20、tile 连续分区、每组 K/V 只载入一次、V 一次性转 fp16、FP16 及其他 dtype 的 fallback 路径、因果 64/64 与 case1/2 的 grid 均不变。buffer 生命周期记录：每对执行期间 rawscore0 与 rawscore1 同时存活（各 128x256 fp32），K（256x128 bf16）与 v16（256x128 fp16）跨对存活，q0/q1 在各自 dot 后即可释放；net 峰值相对父版本增加约一张 128KiB fp32 张量，编译/分配风险高。",
+  "expected": "pair 路径每个输出 tile 的算子与浮点顺序与父版本一致，理论逐位相同；若编译器不重叠，则耗时不升（仅多一次 q 载入的调度差异）或略升；若重叠成立，case4（及同分支 case7）的 Cube/Vector 交接等待下降、Task Duration 可能低于 232.23705us。主要风险是两张 128x256 fp32 rawscore 超出 UB/L0C 预算导致编译失败。case1（因果）与 case2（fp16/非 PART_TILES）代码路径不变，期望真实计时不变。",
+  "validation": "先 preflight --source candidate.py，收到 awaiting_source_review 后保持字节，交宿主只读审查与完整四项官方 checker 真机评测（阈值不变），随后以修改后成对 profiling 与模拟器重放验证；仅当四项真实通过且 case4 低于当前目标才讨论保留。",
+  "selected_layer": "triton_source_schedule",
+  "layer_reason": "机制是同一程序内两次 tl.dot 的发出顺序与 tile 配对，属于可用 Triton 源码表达的分块/计算组织；未发现单算子生成缺陷，故不提交 IR 交接建议，本轮只改源码调度结构。",
+  "simulator_incremental_judgment": "当前剩余歧义是编译器是否保留该源码顺序、两张 rawscore 是否落在 UB/L0C 预算内、以及真机是否出现 Cube/Vector 重叠——这些由编译结果、实际 IR 与真机 timing 回答，不是模拟器能区分的调度/分配问题。宿主保留此前模拟器知识（019 的 Cube 高 wait/idle、交接链主导墙钟）已足以支持本假设，故本轮不新增前置模拟器输入；本诊断未引用任何模拟器证据，后续实际观察另行归因。"
+}

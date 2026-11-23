@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 48,
+    "duration_ms": 106187,
+    "usage": {
+      "input_tokens": 40043,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 933504,
+      "output_tokens": 14247,
+      "output_tokens_details": {
+        "thinking_tokens": 5753
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 40043,
+        "outputTokens": 14247,
+        "cacheReadInputTokens": 933504,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.023142,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 5753,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.023142,
+    "result": "提交已受理，状态 `awaiting_ir_review`；IR 文件保持当前内容并结束本次调用。\n\n## 本轮实际工作\n\n**读取材料**：context.json、feedback.json、codex-brief.json、profiling.json、hotspots.json、timeline.json、ir-inventory.json、frozen.py、q-row-packing-language-evidence.txt、`ir/target/_gqa_fwd_kernel.bcmlir`、`compiled-readonly/_gqa_fwd_kernel.{bcmlir,ttadapter,ttir}`。\n\n**实际核对结果**\n- 当前 BCMLIR 只有两个非法 SSA 名：第 85 行 `%39_s`（`bufferization.to_tensor %alloc_6`）与第 120 行 `%55_s`（`tensor.expand_shape %55`），各被第 86、121 行引用；文件内已无 `tensor.reshape`，无其他数字开头带后缀的名称。\n- `compiled-readonly` 的 019 适配器用 `memref.copy` + `bufferization.to_tensor %q` 载入 128×128 Q，输出经 `materialize_in_destination` 直接落到 `strided<[8192,1]>`；019 无 reshape 类算子，确认当前 `collapse_shape/expand_shape` 是打包实验引入的零拷贝视图。\n- 疑似冗余：当前 IR 的 `collapse_shape`/`expand_shape` 对为静态可折叠视图，字节总量不变；其后端消除情况需在修复解析后由真实编译验证，本轮保留该写法。\n- 历史材料均绑定 019 源码 `2a98e3e0…49113`：profiling 中 candidate Task Duration 257.645us、aiv_mte3_ratio 均值 0.269、写主存均值 1732KB；hotspots 中输出 store/SET_FLAG 各 4×7.26us、MTE3 wait_ratio 0.1375、CUBE 0.2190；timeline 中 227–240 区域 instruction_time_sum 147.38us、wait 78.61us，`clock_qualification=relative_only`、`absolute_time_qualified=false`、窗口 137.081–186.172 且 unit 未赋值，属部分捕获，未报告泳道保持未知。\n\n**登记机制**：`single_operator_ir` 层只修复 SSA 命名（Codex 的语法诊断与 2 处重命名建议已记入 evidence 的 evaluation 项）。\n\n**落盘改动**：仅 `ir/target/_gqa_fwd_kernel.bcmlir` 两处\n- `%39_s` → `%q_packed`（定义 + 第 86 行引用）\n- `%55_s` → `%out_packed`（定义 + 第 121 行引用）\n其余字节、`16x8x128` 静态形状、`[8192,128,1]` 跨度、偏移 `%38`、ABI 与全部浮点表达式未动。当前文件 sha256 为 `3c7be682…0a83e`，共 251 行。\n\n**新增观察**：`%39_s`/`%55_s` 是该 IR 中唯一违反 SSA 命名的符号；`%39`/`%55` 本身合法，重命名后与现有 `%q_packed`/`%out_packed` 无冲突。编译修复、同源码 IR 收益与超过保留最佳 262.27775us 的结论均待宿主 CPU 编译与真机四项/ABBA 验收。"
+  }
+}

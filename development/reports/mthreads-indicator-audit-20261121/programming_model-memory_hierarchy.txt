@@ -1,0 +1,123 @@
+编程指南 MUSA 编程模型 内存层次结构 文档版本 v5.2.0 最新 当前正在查看最新版本。 切换版本 选择文档版本 ✓ v5.2.0 最新 v5.1.0 v4.3.x v3.1.0 版本说明 版本说明 本页总览 内存模型 
+ 本文聚焦各类型内存的特性、使用方式、访问优化原则。 
+ 内存层次回顾 ​ 
+ MUSA 内存系统包含多个层次，各层次在访问速度、容量和可见范围上存在差异： 
+ 访问速度 ↑          │ 寄存器 (Register)        - 每线程私有，1 周期          │ 共享内存 (Shared Memory) - Block 内共享，1-2 周期          │ L1/L2 缓存               - 缓存加速          │ 常量内存 (Constant)      - 只读，缓存命中时快          │ 全局内存 (Global)        - 所有线程可访问，100+ 周期           ↓ 
+ 
+ 基础概念 见  GPU 并行计算基础 。 
+ 
+ 寄存器（Register） ​ 
+ 特性 ​ 
+ 特性 说明 速度 最快（1 周期） 容量 每线程有限（由编译器分配） 可见范围 线程私有 生命周期 线程存在期间 
+ 使用方式 ​ 
+ // 编译器自动分配寄存器 __global__  void   kernel ( )   {      float  a ,  b ,  c ;    // 通常存储在寄存器中     c  =  a  +  b ; } 
+ 寄存器溢出 ​ 
+ 当寄存器不足时，编译器会将变量溢出到局部内存（位于全局显存），性能显著下降： 
+ // 可能导致寄存器溢出 __global__  void   registerSpill ( )   {      float  temp [ 100 ] ;    // 大数组容易溢出      for   ( int  i  =   0 ;  i  <   100 ;  i ++ )   {         temp [ i ]   =  data [ i ] ;      } } 
+ 
+ 共享内存（Shared Memory） ​ 
+ 特性 ​ 
+ 特性 说明 速度 快（1-2 周期，片上内存） 容量 每线程块有限（通常 48-96KB） 可见范围 线程块内线程共享 生命周期 线程块存在期间 
+ 使用方式 ​ 
+ __global__  void   sharedMemKernel ( float *  data )   {     __shared__  float  shared_data [ 256 ] ;    // 显式声明           // 线程块内线程协作     shared_data [ threadIdx . x ]   =  data [ threadIdx . x ] ;      __syncthreads ( ) ;    // 同步，确保所有线程完成写入           // 访问其他线程的数据      float  neighbor  =  shared_data [ threadIdx . x  +   1 ] ; } 
+ 
+ 全局内存（Global Memory） ​ 
+ 特性 ​ 
+ 特性 说明 速度 慢（100+ 周期） 容量 大（GB 级，GPU 显存） 可见范围 所有线程可访问 生命周期 应用程序存在期间 
+ 使用方式 ​ 
+ // 通过 musaMalloc 分配 float *  d_data ; musaMalloc ( & d_data ,  size  *   sizeof ( float ) ) ; // Kernel 中访问 __global__  void   globalMemKernel ( float *  data )   {      int  idx  =  blockIdx . x  *  blockDim . x  +  threadIdx . x ;     data [ idx ]   =  data [ idx ]   *   2.0f ; } // 释放 musaFree ( d_data ) ; 
+ 
+ NOTE: musaMalloc 和 muMemCreate 在申请完毕时，其内容不保证清零。 
+ 
+ 
+ 常量内存（Constant Memory） ​ 
+ 特性 ​ 
+ 特性 说明 速度 快（缓存命中时） 容量 较小（通常 64KB） 可见范围 所有线程可读 生命周期 应用程序存在期间 
+ 使用方式 ​ 
+ // 声明常量内存 __constant__  float  coefficients [ 10 ] ; __global__  void   constantMemKernel ( float *  data )   {      // 所有线程读取相同的常量值      float  result  =  data [ threadIdx . x ]   *  coefficients [ 0 ] ; } 
+ 
+ 系统内存（Host Memory） ​ 
+ 系统内存是位于 CPU 端的内存，MUSA 提供多种类型优化 Host-Device 数据传输。 
+ 特性对比 ​ 
+ 内存类型 分配 API 传输方式 性能特点 可分页内存（Pageable Memory） malloc() 同步拷贝 阻塞 CPU，性能低 锁定内存（Pinned Memory） musaMallocHost() 异步拷贝 支持 PCIe 并行传输 映射锁定内存（Mapped Pinned Memory） musaMallocHost(..., musaHostAllocMapped) 零拷贝访问 无需拷  贝，直接访问 写合并内存（Write-Combined Memory） musaMallocHost(..., musaHostAllocWriteCombined) 异步拷贝 优化写入带宽 
+ 可分页内存（Pageable Memory） ​ 
+ 传统的  malloc()  分配内存，可能被操作系统交换到磁盘： 
+ // 慢：使用 pageable memory float *  h_data  =   ( float * ) malloc ( size  *   sizeof ( float ) ) ; musaMemcpy ( d_data ,  h_data ,  size ,  musaMemcpyHostToDevice ) ;    // 同步，阻塞 CPU // 问题： // 1. musaMemcpy 前需要先分配到临时 pinned buffer // 2. 额外的内存拷贝开销 // 3. 无法与 kernel 执行重叠 
+ 锁定内存（Pinned Memory） ​ 
+ 物理内存被锁定，不会被操作系统交换，支持异步传输： 
+ // 快：使用 pinned memory float *  h_pinned ; musaMallocHost ( & h_pinned ,  size  *   sizeof ( float ) ) ; // 异步拷贝，支持并发 musaStream_t stream ; musaStreamCreate ( & stream ) ; musaMemcpyAsync ( d_data ,  h_pinned ,  size ,  musaMemcpyHostToDevice ,  stream ) ; // 优势： // 1. 直接 PCIe 传输，无需临时 buffer // 2. 支持异步拷贝 // 3. 可与 kernel 执行重叠 
+ 映射锁定内存（Mapped Pinned Memory） ​ 
+ GPU 可直接访问的宿主内存，无需显式拷贝： 
+ // 分配映射的 pinned memory float *  h_mapped ; musaMallocHost ( & h_mapped ,  size ,  musaHostAllocMapped ) ; // 获取设备指针 float *  d_mapped ; musaHostGetDevicePointer ( & d_mapped ,  h_mapped ,   0 ) ; // GPU 直接访问，无需拷贝 kernel << < grid ,  block >> > ( d_mapped ) ; 
+ 写合并内存（Write-Combined Memory） ​ 
+ 优 化写入带宽，适合一次写入、不重复读取的场景： 
+ // 分配 write-combined memory（优化写入带宽） float *  h_wc ; musaMallocHost ( & h_wc ,  size ,  musaHostAllocWriteCombined ) ; 
+ 详细使用示例见  高级内存优化 。 
+ 
+ 内存层次对比 ​ 
+ 内存类型 速度 容量 可见范围 分配方式 寄存器 ⚡⚡⚡ 最快 小 线程私有 编译器自动 共享内存 ⚡⚡ 快 中 线程块内共享 __shared__ 常量内存 ⚡⚡ 快（命中） 小 全局只读 __constant__ 全局内存 ⚡ 慢 大 全局可访问 musaMalloc 系统内存 自动迁移 大 CPU 可访问 malloc / musaMallocHost 
+ 
+ 内存性能优化 ​ 
+ 内存访问是 GPU 性能的关键瓶颈。优化内存访问模式可实现 10 倍以上的性能提升。 
+ 全局内存合并访问（Coalesced Access） ​ 
+ 合并访问 ：连续的线程访问连续的内存地址，多个内存请求合并为一次事务。 
+ // ✅ Good: 完全合并访问 // 线程 0,1,2,3... 访问地址 0,1,2,3... __global__  void   coalescedAccess ( float *  data )   {      int  idx  =  blockIdx . x  *  blockDim . x  +  threadIdx . x ;     data [ idx ]   =  data [ idx ]   *   2.0f ; } // ❌ Bad: 非合并访问（跨步访问） // 线程 0,1,2,3... 访问地址 0,1024,2048,3072... __global__  void   stridedAccess ( float *  data ,   int  stride )   {      int  idx  =  blockIdx . x  *  blockDim . x  +  threadIdx . x ;     data [ idx  *  stride ]   =  data [ idx  *  stride ]   *   2.0f ; } 
+ 合并访问规则： 
+ 访问模式 事务数 带宽利用率 连续 32 线程访问连续 32 地址 1 个事务 100% 连续 32 线程访问间隔 2 地址 2 个事务 50% 连续 32 线程访问间隔 4 地址 4 个事务 25% 随机访问 32 个事务 ~3% 
+ 数据结构优化（结构体数组 vs 数组结构体） ​ 
+ 结构体数组（AoS）- 不推荐： 
+ struct   Point   {      float  x ,  y ,  z ; } ; __global__  void   processAoS ( Point *  points )   {      int  idx  =  blockIdx . x  *  blockDim . x  +  threadIdx . x ;      // 只访问 x 分量，但会加载整个结构      float  x  =  points [ idx ] . x  *   2.0f ; } // 带宽浪费：每个线程实际只用了 1/4 的数据 
+ 数组结构体（SoA）- 推荐： 
+ struct   Points   {      float *  x ;      float *  y ;      float *  z ; } ; __global__  void   processSoA ( Points points ,   int  n )   {      int  idx  =  blockIdx . x  *  blockDim . x  +  threadIdx . x ;      // 连续访问 x 数组，实现合并访问      float  x  =  points . x [ idx ]   *   2.0f ; } // 带宽利用率：100% 
+ 共享内存 Bank 冲突 
+ 共享内存分为 32 个 bank，每个 bank 宽度为 4 字节（32 位）。 
+ Bank Conflict 规则： 
+ 
+ 同一 warp 中多个线程访问同一 bank 的不同地址 → 序列化 
+ 同一 warp 中多个线程访问同一 bank 的同一地址 → 广播（无冲突） 
+ 
+ // ❌ Bad: 32-way Bank Conflict // 所有线程访问第 0 列 → 所有线程访问 bank 0 __shared__  float  matrix [ 32 ] [ 32 ] ; value  =  matrix [ threadIdx . x ] [ 0 ] ;    // 冲突！ // ✅ Good: 无冲突访问 // 每个线程访问不同 bank __shared__  float  matrix [ 32 ] [ 32 ] ; value  =  matrix [ 0 ] [ threadIdx . x ] ;    // 无冲突 
+ Padding 消除 Bank Conflict： 
+ // ❌ 32×32 数组，列访问冲突 __shared__  float  sharedA [ 32 ] [ 32 ] ; value  =  sharedA [ threadIdx . x ] [ col ] ;    // 32-way 冲突 // ✅ 添加 padding，32×33 数组 __shared__  float  sharedB [ 32 ] [ 33 ] ; value  =  sharedB [ threadIdx . x ] [ col ] ;    // 无冲突 // 每行多 1 个元素，偏移了 bank 映射 
+ 内存访问模式对比 ​ 
+ 模式 描述 性能影响 优化方案 合并访问 连续线程访问连续地址 ✅ 最佳 保持线  程 ID 与地址连续 跨步访问 线程访问间隔地址 ⚠️ 带宽下降 使用共享内存中转 随机访问 无规律访问 ❌ 性能极差 预先排序或使用纹理内存 广播访问 所有线程访问同一地址 ✅ 最优 常量内存/共享内存广播 
+ 优化检查清单 ​ 
+ 
+ 
+   全局内存访问是否合并？ 
+ 
+ 线程 ID 是否连续映射到内存地址 
+ 避免  idx * stride  模式 
+ 
+ 
+ 
+   共享内存是否避免 Bank Conflict？ 
+ 
+ 检查 2D 数组列访问 
+ 使用 padding 打破对齐 
+ 
+ 
+ 
+   数据结构是否适合并行访问？ 
+ 
+ AoS → SoA 转换 
+ 数据预排序 
+ 
+ 
+ 
+   是否充分利用缓存？ 
+ 
+ 只读数据使用常量内存 
+ 二维数据使用纹理内存 
+ 
+ 
+ 
+   是否减少不必要的内存分配？ 
+ 
+ 使用内存池 
+ 复用设备内存 
+ 
+ 
+ 
+ 
+ 典型内存使用模式

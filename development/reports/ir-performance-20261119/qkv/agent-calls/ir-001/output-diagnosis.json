@@ -1,0 +1,55 @@
+{
+  "source_sha256": "0af5d533afea8f4be88e1fd6e0fc4a6ba76fae9a8b1478f7c4b93247fe7ec070",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "逐程序流水占用与带宽定量（candidate 侧 512 程序，reference 侧 40 block）",
+      "finding": "候选 Task Duration 40.020802us（reference 55.001099us）。候选每程序 aiv_mte2_time 1.8241us 且 aiv_mte2_ratio 0.6182，故程序驻留时间约 2.95us；同程序 aiv_mte3_time 0.9092us(ratio 0.3168)、aiv_vec_time 0.7414us(ratio 0.2587)、aiv_scalar_time 0.9448us(ratio 0.3140)。即程序 2.95us 里 MTE2 只忙 1.82us，其余 1.13us 使加载流水空转。aiv_mte2_active_bw 仅 26.79GB/s，而同程序 aiv_mte3_active_bw 达 52.49GB/s；reference 的 aiv_mte2_active_bw 为 31.68GB/s。read_main_memory_datas 每程序 48.625KB、write 48.0KB（sum 24896KB/24576KB），说明没有任何冗余读写字节可省，只能改重叠效率。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "指令级热点与同步等待归属（core0.veccore0 窗口 109.804~119.544us）",
+      "finding": "窗口内最大单条指令是 MTE2 的 MOV_SRC_TO_DST_ALIGN（frozen.py:133 k 加载）6.98us/3 次，说明加载是长杆；紧随其后的是 MTE3 路径的 BAR 5.67us（line 147 tl.store）与 WAIT_FLAG 4.78us（PIPE:VEC→MTE3），以及 VECTOR 侧 BAR 5.64/5.54/5.38us，证明 store 与 vector 长时间在等上一次依赖链，而不是并发推进。流水比：MTE2 productive 0.8925，而 MTE3 productive 仅 0.2639(wait_only 0.6013)、VECTOR productive 仅 0.1113(wait_only 0.7959)。source_loop 区域 instruction_time_sum 104.51us、wait 39.81us（含循环两次）。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "相对时钟窗口内各流水活跃/空闲区间，用于判断程序内与程序间气泡",
+      "finding": "MTE2 active_ratio 0.9240（productive 0.8925、wait_only 0.0315），idle 0.0760，其中最大空闲段是 0.6055~0.6438（占窗口 3.83%）——这是程序边界处加载排空的单次气泡；另有窗口起点 0~0.0302 的起步气泡。MTE3 idle 0.1347 且 wait_only 0.6013，VECTOR wait_only 0.7959，与 profiling 的逐程序占用一致：加载之外的流水大部分时间在等，加载流水本身并不饱和（每程序 62%）。"
+    },
+    {
+      "path": "ir/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttir",
+      "category": "source_ir",
+      "role": "当前最佳的真实 TTIR（唯一特化：BLOCK_S=64、BLOCK_D=64、GROUP=2、EXACT=true）",
+      "finding": "第 45~104 行是 scf.for %i = 0 to 2 step 1（属性 tt.num_stages = 2），循环体内依次：算 q_in 地址（第 50~61 行）→ 算 out_off（第 62~73 行）→ tt.load q/k/v（第 74~80 行）→ vector 计算（第 81~94 行）→ 三次 tt.store（第 95~103 行）。也就是每程序两次完全串行的“加载→向量→存储”链，IR 里没有任何跨迭代预取/多缓冲结构（没有把第二次迭代的 load 提前到第一次的 store 之前）。bias 三次 load（第 38~44 行）与 k/v 位移 splat 已在循环外，这部分没有浪费。"
+    },
+    {
+      "path": "compiled-readonly/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/f67d9cdb9f445d242714897e48f68b992534a9c144549743ff721f2556ce6136/_transform_bias_rescale_qkv_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "核对疑似冗余（循环内三块 64x64xf16 分配/读路径）是否在后端已消除",
+      "finding": "后端未消除：bcmlir 第 49~103 行仍是 scf.for %arg24 = 0 to 2 step 1，且每迭代新建 %alloc_5/%alloc_7/%alloc_9 三个 64x64xf16（memref.copy 载入 q/k/v），出口用 materialize_in_destination 写回 q/k/v；没有出现两槽轮转的多缓冲 alloc 对。frozen.py 注释中期望的 num_stages=2 多缓冲在可见低层产物里没有结构证据，与 profiling 中 MTE2 每程序只忙 62% 相互印证。据此判断该“循环内三次独立拷贝串行”的冗余需要在 TTIR 层显式展开消除。"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "source_ir",
+      "role": "宿主证据与候选方向（Codex 贡献）",
+      "finding": "Codex 指出当前 BCMLIR 仍保留 scf.for 0→2 step 1、循环内仍有三个 64x64xf16 的分配与读路径，并提示需在实际 IR 上确认；其 actual_lowering_check 明确要求以 lower 产物为准。本诊断采纳该方向（循环内串行读路径未被后端消除），并用 profiling/hotspots/timeline 的逐程序流水占比把它量化为“MTE2 每程序仅 62%、程序内两次迭代无重叠”，从而把 Codex 的定性观察落成一个可测的具体编译缺陷。Codex 的备选方向（扩大内维连续长度）因涉及 UB 内切分/换序算子的降级风险，本轮列为备选。"
+    }
+  ],
+  "hypothesis": "当前 TTIR 把每个程序的 2 个 [64,64] tile 写成 scf.for 内一条完全串行的 加载→向量→存储 链：第 i 次迭代的 3 次 MTE2 拷贝必须等第 i-1 次迭代的向量计算与 3 次 MTE3 存储推进之后才能发射（bcmlir 中每迭代都是新建 alloc+memref.copy，无跨迭代轮转缓冲）。因此每程序驻留 2.95us 中 MTE2 只忙 1.824us（62%），另外 38% 被同一程序内的依赖链排空；热点的 BAR/WAIT_FLAG（line 147 store 5.67us、line 133 k load 6.98us）和 timeline 里 0.6055~0.6438 的程序边界 3.83% 加载气泡就是这条依赖链的直接表现。因为逐程序读写字节已无冗余（48.625KB 读 / 48.0KB 写，与理论值一致），唯一可压缩的是“同一程序内两次迭代之间的串行化”。把两次迭代在 TTIR 里显式展开、并把 6 次加载全部提到任何向量计算之前，可以让 MTE2 连续发射 48KB 加载，使第 0 个 tile 的向量与存储完全落在第 1 个 tile 的加载窗口内。",
+  "alternatives": [
+    "扩大加载内维连续长度（每程序 2 头 [64,128]，行 256B；或 4 头 [32,256]，行 512B）以提高 aiv_mte2_active_bw（当前 26.79GB/s，reference 31.68GB/s）：需要把宽 tile 在 UB 内按头切分（reshape+trans+split 或等价换序算子）才能保持 8KB 连续 store，降级风险较高，列为下一轮独立机制。",
+    "减少 MTE2/MTE3 字节：不可行——read_main_memory_datas 48.625KB、write 48.0KB 已等于理论最小体积，qkv 每个元素恰好读一次、每个输出元素恰好写一次。",
+    "去掉 q 路径的 fp32 opmath（.to(f32) 加 bias 再乘 scale 再 truncf）：会改变参考数值语义（fp16 先加会溢出），禁止。",
+    "改编译选项（num_stages、multibuffer、enable_preload 等）：属于另一研究身份，且这些 knob 在冻结的 frozen.py 启动侧，本轮不动。",
+    "缩小 tile 增加每程序迭代数以获得更深流水（如 [32,64]×4）：会让 128B 行片段数翻倍、块大小降到 4KB，与提高加载效率方向相反，且 UB 内分配更碎。"
+  ],
+  "change": "只修改 ir/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttir：把 scf.for %i = 0 to 2 step 1（含 tt.num_stages=2）整体替换为两次直线展开的 tile 体（i=0 用 %seq_base，i=1 用 %seq_base+64），并把 6 次 tt.load（q/k/v × 两 tile）全部提前到任何 arith.extf/arith.addf/arith.mulf/tt.store 之前；循环外已有的 k_shift/v_shift splat 与 in_cols、out_off 基址在两次展开间复用（顺带减少标量重复计算）。函数签名、参数顺序、pid→(seq_group, head, batch) 映射、grid、掩码形式、bias 加法与 q 的 fp32 opmath 与 truncf 次数全部不变，每个输出元素的计算图与原来逐元素相同（无重结合、无精度改变）。",
+  "expected": "主要预测：每程序驻留时间由约 2.95us 降到约 2.5~2.7us（aiv_mte2_ratio 由 0.618 升到 0.70~0.75，aiv_mte3_ratio、aiv_vec_ratio 基本不变），Task Duration 由 40.02us 降到约 34~36us，相对当前最佳约 1.10~1.18x。次要预测：timeline 中 MTE2 的程序边界空闲段（0.6055~0.6438 那段 3.83% 气泡）消失或显著缩小；source_loop 区域的 BAR/WAIT_FLAG 累计时间下降（store 与 vector 不再等上一迭代）；read/write 字节数保持 48.625KB/48.0KB 不变（若变化说明改动引入了额外搬运，属失败信号）。",
+  "validation": "由宿主运行：完整 KGS/正式用例（当前 21/21）必须保持全过，数值容差 atol=rtol=0.015 且 matched_ratio=1.0；随后 paired profiling + simulator 复测 Task Duration，核对 (a) 程序驻留时间与 aiv_mte2_ratio 上升，(b) aiv_mte3_active_bw / aiv_vec_time 不恶化，(c) read/write 主存字节不变，(d) MTE2 边界空闲段缩小。若驻留时间未下降但字节与流水占比完全不变，则说明该后端对直线化后的 48KB 连续加载同样做了保守同步，需回退并按备选方向（内维加宽）另立机制。",
+  "layer_reason": "缺陷位于 TTIR 层的循环结构与操作顺序（迭代内串行、缺少跨迭代加载预取），不在 Python 源码的控制流抽象上（frozen.py 已用 tl.range(num_stages=2) 表达意图，但后端未产生多缓冲，改写源码会被冻结且重复同一表达），也不在编译选项层（knob 在启动侧且属另一研究身份）。TTIR 是能精确表达“先发 6 次加载、再算两次 tile”的最低层，改动能保持 ABI 不变、且可用字节数与流水占比独立验证。",
+  "simulator_incremental_judgment": "模拟器窗口为部分捕获（application_completed=false，单核 109.804~119.544us，仅覆盖每核约 8/12.8 个程序），绝对时钟仅用于同窗口相对比较，不做全器件关键路径推断；未报告泳道（CACHEMISS、FLOWCTRL、ALL）按辅助 trace 泳道解释，不计入因果。即便如此，窗口内 MTE2 与 MTE3/VECTOR 的占比差异（productive 0.8925 vs 0.2639/0.1113）与 profiling 的 512 程序统计（MTE2 62% vs 每程序驻留 2.95us）方向一致，且 MTE2 的 3.83% 边界空闲段在逐程序统计口径下对应约 1.13us/程序的未重叠部分，因此把该窗口观察当作“程序内两次迭代未重叠”的增量证据是自洽的，但收益幅度只以宿主复测的 Task Duration 为准。"
+}

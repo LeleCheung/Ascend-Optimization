@@ -1,0 +1,74 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "662015b9edecc3a76cfe60656e2441f51fcfe31483fe514d387dda21d84aa730",
+  "evidence": [
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "第 881 行普通 JIT 发射固定 num_warps=1、num_stages=1；run() 由元数据判定 PART_TILES（BF16、非因果、SINGLE_KV、128/256/128 分块），命中时 grid=(P,) 且 P=20。本轮只改这个 num_stages 取值，内核 AST、算术、dtype、地址、grid/worker 数与 host 快路径缓存逐字保留。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "TTIR 中 K/V 的 tt.load 位于外层按 (b,kvh) 组遍历的 scf.for 内、内层 scf.for %t 之外；内层每个 tile 依次为 Q 载入、tt.dot→truncf/extf、mulf、math.exp、truncf、第二次 tt.dot→truncf/extf、tt.reduce 分母、divf、tt.store。内层没有预取或多缓冲标注，故 num_stages 若生效只能重新编排这条 tile 循环；K/V 已在循环外，可重叠的对象主要是下一 tile 的 Q 载入与当前 tile 的向量/交接尾部。"
+    },
+    {
+      "path": "workspace/actual-ir/1-_gqa_fwd_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "实际缓冲图：每组 memref.alloc 一份 256x128 bf16 K 与 V（各 64KiB），每 tile alloc 一份 128x128 bf16 Q（32KiB）；QK 128x256 f32 与 PV 128x128 f32 累加器在循环外 tensor.empty。V 没有 extf/truncf，PV 为单次 bf16 matmul，PV 结果以 truncf/extf 先窄到 f16 再扩回 f32。相对旧 035 的 live-buffer 图，本版本的 V 转换与公共偏移已删、PV 交接已窄化，缓冲生命周期更短，因此同名 num_stages 组合是新的组合而非旧结论复用。"
+    },
+    {
+      "path": "workspace/compiler-pipeline-evidence.txt",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "已安装 ascend 后端在 metadata[\"enable_dynamic_cv_pipeline\"] 为真时才 add_dynamic_cv_pipeline；其选项 dataclass 中 add_auto_scheduling 与 enable_dynamic_cv_pipeline 默认均为 False，且该关键字被明确注明与 num_stages/auto-multi-buffer 不是同一条路径。因此 num_stages=2 是否真正置位 auto-multi-buffer、是否改变生成调度属于预测，必须由重编后的 metadata/二进制与重放判定，不能从选项名推断收益。"
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "候选真机任务耗时 160.623215us、Block Dim 20；每程序均值 aic_scalar_wait_id1 142.18us，而 aic_cube_time 仅 33.11us、aic_mte1 25.32us、aic_mte2 30.68us、aic_fixpipe 20.96us；L0C_to_GM 合计 49152KB、GM_to_L1 合计 55296KB。墙钟仍由跨核等待/交接主导，存在用更深流水隐藏交接尾部的空间。"
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "trigger",
+      "finding": "三核部分窗口、各自归一化，application_completed=false、全调用 completion 缺失。Cube：CUBE productive 0.165/wait 0.282/idle 0.552，MTE2 idle 0.813，FLOWCTRL wait 0.870；头部 WAIT_FLAG_DEVI 90.22us/13、FIX_L0C_TO_DST 25.19us/14、MOV_OUT_TO_L1 12.73us/14。Vector：VECTOR productive 0.238/wait 0.101/idle 0.661，MTE3 productive 0.396/wait 0.185；头部为 PV 回程 WAIT_FLAG_DEVI 61.99us/13、QK 回程 WAIT_FLAG_DEVI 34.76us/14、输出搬运 MOV_SRC_TO_DST_ALIGN 27.04us/12。热点均按 tile 重复出现，正是 2 深调度可能隐藏的交接等待，但部分窗口不可相加、也不能单独证明因果收益。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "source_sha256 与当前候选一致；四项官方 checker 全部 passed（阈值不变）。case4 候选 158.34115us、原生 128.6901us（0.8127x），case1 103.65705us；本轮 num_stages 不改变任何数学表达式与相加顺序，正确性基线不变，仍需原四项 checker 复核。"
+    },
+    {
+      "path": "workspace/context-brief.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "宿主记录：旧 018/035 的 num_stages=2 在更旧的 live-buffer 图上是合格负例（035 212.76us 对 033 196.16us）；当前 057 因 BF16 V 免转换与 PV FP16 交接改变了缓冲生命周期，属于值得做一次受控组合验证的新组合。仅此不构成收益声明。"
+    }
+  ],
+  "hypothesis": "num_stages=2 仅作用于 PART_TILES 分支：后端应对内层 tile 循环启用更深的流水/自动多缓冲，使下一 tile 的 Q 载入与当前 tile 的 QK→Vector→PV 交接尾部重叠，从而压低 Vector 侧 PV 回程 61.99us/13 与 QK 回程 34.76us/14 这类重复交接等待；若后端对含动态边界、跨核 flag 与循环外 K/V 的 mix kernel 不建立可重叠生产者-消费者对，则该选项可能不改变二进制或不产生实际重叠，需要据实记录为无变化。",
+  "alternatives": [
+    "保持 num_stages=1（现状，零风险但保留已有交接等待）。",
+    "改 num_warps 或手工 IR/调度（本调用明确排除）。",
+    "在源码中手工预取下一 tile 或重排循环（属于 kernel AST 修改，本调用明确排除）。",
+    "假设 num_stages 一定置位 auto-multi-buffer 并一定有收益（无二进制/重放证据，不采纳）。"
+  ],
+  "discriminating_observation": "对同一源码分别以 num_stages=1 与 2 编译 PART_TILES 分支，比较编译 metadata/fkey/二进制与生成调度是否出现自动多缓冲或流水差异；再跑完整四项并做修改后重放。若二进制字节相同且 case4 落在噪声内，则机制未生效；若调度改变、case4 低于保留最佳 158.34115us、四项 checker 通过且重放稳定，则重叠成立。",
+  "change": "在 run() 的普通 JIT 发射处把 num_stages=1 改为 num_stages=2 if PART_TILES else 1，并加一段中文注释说明收益、代价与缓存身份；其余全部保持不变：@triton.jit 内核 AST、全部数学/dtype/地址、grid 与 20 worker 分区、num_warps=1、host 快路径缓存表与缓存键、公共入口 run 均逐字不动。",
+  "expected": "只有 PART_TILES 命中的 case4/case7 以 2 阶流水重编，case1/case2 的编译产物与计时应保持不变。预测后端会为内层 tile 循环置位自动多缓冲（双缓冲），生成调度把下一 tile 的载入/交接提前；若后端不改二进制或不形成重叠，则记录为真实无变化。本诊断不以 num_stages 推断收益，目标 case4 < 158.34115us 由真机评测判定。",
+  "validation": "先 preflight --source candidate.py 取得 awaiting_source_review 并保持字节交接宿主只读审查；由宿主用原 checker、golden、固定 case1/2/4/7 与计时合同跑完整四项真机评测并做修改后重放与二进制/调度比对。不新增测试、不改阈值。",
+  "selected_layer": "host_launch_compiler_option",
+  "layer_reason": "瓶颈是重复的跨核交接等待，而本调用唯一被允许且仍保持内核 AST/数学不变的可表达杠杆就是发射时的编译流水选项 num_stages；改内核循环或 num_warps 均超出本实验边界。",
+  "simulator_incremental_judgment": "模拟器为三个核的部分窗口、Cube 与 Vector 各自归一化、application_completed=false，全调用 completion 缺失，各窗口时间不可相加。它相对成对 profiling 的增量作用是给出热点排序：Vector 侧 PV 回程 61.99us/13 与 QK 回程 34.76us/14 高于输出搬运 27.04us/12，且这些等待按 tile 重复，与 current-profiling 的 aic_scalar_wait_id1 142.18us  dominates 33.11us cube 时间互相印证。它只支持“试一次更深 tile 流水”的排序判断，不单独证明 num_stages 会生效或带来收益。",
+  "unknown": [
+    "该后端是否把 num_stages 映射到 enable-auto-multi-buffer/自动双缓冲，还是仅作为未消费的元数据。",
+    "含动态边界与跨核 flag 的内层 tile 循环是否满足流水/多缓冲的合法条件。",
+    "额外缓冲后 UB/L1 峰值是否仍在 196608B 预算内。",
+    "即使生成调度改变，交接等待是否真的与下一 tile 的载入/计算重叠。"
+  ]
+}

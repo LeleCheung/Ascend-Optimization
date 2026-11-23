@@ -1,0 +1,79 @@
+{
+  "source_sha256": "0af5d533afea8f4be88e1fd6e0fc4a6ba76fae9a8b1478f7c4b93247fe7ec070",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "ir/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttir",
+      "category": "source_ir",
+      "role": "被检视并拟修改的实际 TTIR（EXACT=true, BLOCK_S=64, BLOCK_D=64, GROUP=2 的特化）",
+      "finding": "第45-104行为 scf.for %i=0..2 step 1 {tt.num_stages=2}，循环体只用 [64,64] 张量：每轮做 3 个 strided 输入加载（q_in_20 及 addptr 出的 k/v）、1 个 f32 提升 Q 路径与 2 个 f16 广播加法、3 个输出 store；两轮分别覆盖 seq_base+[0,64) 与 seq_base+[64,128)。因此同一个程序把连续 128 行拆成两次 8KB 传输、两组流水屏障，而 seq_base=%seq_group*128 已是 128 行粒度，说明 128 行本可由单个 tile 承担。",
+      "sha256_observed": "3924918d3cd31a2593550101e20ec9d7ef61d9f8cfb0aec29e53b8a8cb4d8854"
+    },
+    {
+      "path": "compiled-readonly/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/f67d9cdb9f445d242714897e48f68b992534a9c144549743ff721f2556ce6136/_transform_bias_rescale_qkv_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "冻结的实际后端低层产物，核对循环与拷贝是否已被后端消除",
+      "finding": "后端原样保留 scf.for(%c0..%c2){tt.num_stages=2}：每轮 3 条针对 memref<64x64xf16, strided<[%stride_qkv_s,1]>> 的 memref.copy 进入彼此独立的 64x64 UB alloc，另有 3 条 materialize_in_destination 写出；即每个程序 6 次 8KB 拷贝、循环体完整保留。没有把两轮合并成一次 128 行传输，也没有消除 Q 路径的 extf/fill/mulf/truncf 或两处 linalg.broadcast。",
+      "sha256_observed": "8557bfc1c8ec73b02598c4d567fe0a72642fe4bc7da54ce373f0cb9c89ef5b1f"
+    },
+    {
+      "path": "lowered-inventory.json",
+      "category": "source_ir",
+      "role": "低层产物清单核对（只读，保持冻结）",
+      "finding": "bcmlir 8557bfc1… 与 npubin 92cc78be… 是当前最佳的真实编译结果；据其形状统计，输入/输出 tile 均为 [64,64]，loop_count=1（源码循环），copy_count=6，materialization_count=3。低层未见对 2×64 行循环的合并或跨轮流水优化，冗余未被后端消除。"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "候选与 torch 参考的成对算子级计数，给出每程序成本与管线占比",
+      "finding": "候选 512 个程序（参考 40）；每程序 aiv_time 均值 2.9648us、aiv_total_cycles 4891.9；aiv_mte2_ratio 0.6182、aiv_mte3_ratio 0.3168、aiv_vec_ratio 0.2587；等待侧 aiv_mte2_wait_ratio 0.4864、aiv_mte3_wait_ratio 0.5773、aiv_vec_wait_ratio 0.5278。MTE2 活跃带宽仅 26.79 GB/s，MTE3 活跃带宽 52.49 GB/s，而两侧搬运字节基本相同（GM_to_UB 24768KB / UB_to_GM 24576KB），说明每程序的同步/发射固定开销与 128B 行跨度读取一起构成了每程序 2.96us 的地板。另：程序间 aiv_time 最小 2.012us、最大 5.910us，均值只占最大值的 50%，512/40≈12.8 波次下尾波与轻量程序占比对总时长敏感。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "逐指令/逐区域热点与流水有效、等待、空闲占用",
+      "finding": "core0.veccore0 捕获窗口 109.804→119.544us（9.740us，partial window）：MTE2 productive_union 8.693us（ratio 0.892）、wait_only 0.307us；MTE3 productive 2.571us（0.264）、wait_only 5.857us（0.601）；VECTOR productive 1.084us（0.111）、wait_only 7.752us（0.796）。最大单指令为 MTE2 的 MOV_SRC_TO_DST_ALIGN 6.98us（3 次调用，Src:OUT,Dst:UB,B16），调试位置落在第133/134行（k_val/v_val 加载），其次为 MTE3/VECTOR 的 BAR 与 WAIT_FLAG（5.67/5.64/5.54/5.38/4.78us，各 3 次）。向量流水与 MTE3 长期处于 WAIT，节奏由 MTE2 搬运决定。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "相对时间轴：以窗口分数表示的流水占用与空闲结构",
+      "finding": "MTE2 idle_ratio 0.0760、productive 0.8925；MTE3 idle 0.1347、wait_only 0.6013；VECTOR idle 0.0929、wait_only 0.7959；ALL/CACHEMISS/FLOWCTRL 为 auxiliary_trace_lane（ALL 仅 1 事件，active 0.0001，不能当作核心占用）。即窗口内几乎全程有 MTE2 动作，而计算与写回泳道大部分时间在等待，与 hotspots 一致。"
+    },
+    {
+      "path": "frozen.py",
+      "category": "source_ir",
+      "role": "冻结源码中的 UB 预算论证，判断 128 行 tile 是否被评估过",
+      "finding": "_TILE_BYTES=8192 的注释说明：BLOCK_S=128 的 16KB tile 曾被拒绝，理由是 12*16384+2*16384+768=230144B 超过 196608B；但该预算包含 GROUP=2 循环的 num_stages=2 双缓冲（12 个 tile 缓冲）。若取消循环，同尺寸 tile 只需 6*16384+32768(f32)+768≈131.8KB，处于预算内。因此循环自由的 128 行单 tile 从未被真正尝试，此前的拒绝来自循环双缓冲的记账，而非几何本身。"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "历史正式/补测结果，排除已失效方向",
+      "finding": "保留基线为原始 IR 62.860936us（历史最佳 62.837203us）；ir001 63.029us、ir003 63.516us 无收益，ir006 配对头 3D 输出 94.184us 明显退步，ir007 循环不变式外提 63.038187us 无收益。LICM、展开、配对头 3D 输出与单纯改编译选项均不应作为新机制重复。"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "source_ir",
+      "role": "宿主（Codex）证据分析与候选方向",
+      "finding": "Codex 指出四个 broadcast/fill 物化的 LICM、简单展开与四种更窄行 tile 均无收益，配对头几何导致 strided 3D 输出并强烈退步；建议在保持原始头归属与 2D 输出几何的前提下，把两轮 64 行改为单轮 128x64 tile，并先核对 UB 与实际内存布局。本诊断采用该方向，并由模型独立核对 TTIR/bcmlir/UB 记账后选择具体实现。"
+    }
+  ],
+  "hypothesis": "当前程序的 128 行被 scf.for 拆成两次 [64,64] 传输，每轮都要重复一次 3 条 strided 输入拷贝 + 3 条输出写回以及一整组 MTE2/MTE3/VECTOR 屏障（bcmlir 中保留为 6 次 8KB copy，热点中 BAR/WAIT_FLAG 各 3 次调用合计约 27us 累计指令时间）。这些同步与发射成本只与“轮数”成正比，与字节数无关，属于编译器在该特化下本应消除而未消除的冗余：seq_base 已是 128 行粒度、seq_len 对 128 整除（GROUP=2 的存在条件），因此 128 行完全可以由单个 [128,64] tile 在无循环、无循环屏障的情况下一次搬入一次写回。取消循环后 UB 需求 6*16384+32768+768≈131.8KB < 196608B，不再需要 num_stages=2 的双缓冲（当前账目 115456B 正是为双缓冲付出的），所以该改写同时降低了同步次数并仍在 UB 预算内。",
+  "alternatives": [
+    "保持 IR 不变：证据显示 MTE2 活跃带宽 26.79 GB/s 受 128B 行跨度限制，若认为字节效率已是硬地板、只剩同步开销可省，则应判定无可行改法。本诊断选择继续，因为每程序 2.96us 中有约 1.1us 不属于 MTE2 活跃时间，且循环屏障可按“轮数”削减。",
+    "把三条输入拷贝合并为一次 3 维 strided memref.copy（同 head 的 q/k/v 段，strided<[stride_qkv_s, hidden_dim, 1]>）：只减 2 次发射、不减字节和屏障，需引入 3 维张量并在 K/V 处切分，风险高于收益，暂不采用。",
+    "num_stages 2→3 的更深多缓冲：属于调度选项改动而非具体缺陷修复，且 UB 预算 192KB 逼近上限，不采用。",
+    "加宽输入行到 128 列（配对头）：ir006 已证明会引入 strided 3D 输出并强烈退步，不重复。",
+    "LICM/展开/更窄 tile：ir001/ir003/ir007 已无收益，不重复。"
+  ],
+  "change": "只改 ir/ca6c05a0…/_transform_bias_rescale_qkv_kernel.ttir 的循环几何，同一机制、同一特化：删除 scf.for %i=0..2 {tt.num_stages=2}，把其循环体提升为直线代码，并把体内所有 [64,64] 张量改为 [128,64]（%offs_s 的 make_range end 由 64 改为 128；%offs_rows_9 改为 seq_base + offs_s，与原两轮 offs_rows 覆盖的 0..127 行集合相同）。bias 张量仍是 [64]（按列广播），输出/输入指针公式、stride 全部保持符号形式，函数签名、常量集合（BLOCK_S=64/BLOCK_D=64/GROUP=2/EXACT=true）、grid 与编译选项一律不动。逐元素运算顺序不变：Q 为 f16→f32、加 f32 bias、乘 f32 scale、一次 truncf；K/V 保持 f16 加法，行集合与列集合逐元素一一对应，故为精确双模拟，无新增别名、无越界访问、特殊值与浮点精度语义不变。",
+  "expected": "目标用例 transform_bias_rescale_qkv-timing-2 由 0.062861ms/63.038us 降至 ≤0.0597ms（≥5% 改善，相对保留基线约 1.05x）。可测预测：(1) 每程序 memref.copy 由 6 次降为 3 次、materialize_in_destination 由 6 次降为 3 次，bcmlir 中 scf.for 消失、tile 变为 [128,64]，UB 请求约 131.8KB < 196608B；(2) profiling 中 aiv_mte2_instructions 由 12800 降到约 6400、aiv_mte3_instructions 由 3584 降到约 1792，aiv_mte2_ratio 上升而 aiv_vec_wait_ratio/aiv_mte3_wait_ratio 下降，每程序 aiv_time 由 2.965us 降到 ≤2.8us；(3) 全部 21 个正式用例与两份 48 用例补测的数值结果与当前最佳逐位一致（abs_err/rel_err 仍为 0）。若 UB 记账超限或编译拒绝，则该机制在本后端不可行，应据实登记并回退。",
+  "validation": "宿主复核后运行完整 21 用例 + 两份 48 用例补测，比较 timing-2/5/7/8 与 geo_mean、min_speedup，确认 21/21 与补测全通过且误差为 0；同时核对新 bcmlir：确认 scf.for 已移除、tile 形状为 [128,64]、copy 次数减半、UB 请求 ≤196608B；并做与保留基线的同批 ABBA 对照以避免漂移。文档与预检不作为收益结论。",
+  "layer_reason": "缺陷位于 TTIR 的循环几何与传输粒度（每程序 6 次 8KB 拷贝 + 两组流水屏障），源码已冻结、编译选项、ABI、grid 与低层产物均保持冻结，因此只能在单算子 IR 层以最小范围 Edit 表达；后端 bcmlir 已证实未自行合并该循环，故不存在“后端已消除”的替代解释。",
+  "simulator_incremental_judgment": "模拟器窗口资质说明：core0.veccore0 的 9.740us 窗口是从首个到末个可见硬件事件的绝对时间 109.804→119.544us，且标明 partial window/application did not finish，因此它是单核部分观测区间，不能当作核函数时长或总耗时，也不能与 63us 端到端延迟直接相减；ALL/CACHEMISS/FLOWCTRL 为 auxiliary_trace_lane，未报告为主计算泳道，其 idle 0.9999 不代表核空闲。可增量采信的是相对结构：窗口内 MTE2 productive 0.892（8.693us）而 MTE3/VECTOR 的 wait_only 分别为 0.601/0.796，且最大指令是 MTE2 的 3 次 8KB strided 搬运（6.98us）与各 3 次调用的 BAR/WAIT_FLAG（VECTOR 5.38-5.64us、MTE3 5.67/4.78us）；指令时间相互重叠、不是关键路径，但“轮数决定同步次数、字节数决定 MTE2 时间”这一结构与本轮取消一轮循环的目标一致。profiling 的柱状占比（mte2 0.618/mte3 0.317/vec 0.259）来自逐 block 分布均值，program 数两侧不同，仅用于确定瓶颈归属，不作为因果或加速比声明。",
+  "unknown": [
+    "后端在无循环时是否会为 strided 输入拷贝额外保留双缓冲，从而把 131.8KB 推近 196608B 上限",
+    "取消循环后不再有跨轮 MTE2/VECTOR 重叠，单轮暴露的加载延迟是否会抵消同步削减的收益"
+  ]
+}

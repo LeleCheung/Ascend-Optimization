@@ -1,0 +1,54 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "99e77cb819ea900a6ca6cebfacb26777879a756d7256abb7d15f736334445031",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4 候选 kernel 191.02us、参考 119.56us；候选 cube L0C_to_GM 合计 65536KB（20 程序、每 tile 128KiB），参考 98304KB。按 512 tile 折算：QK 搬出 64KiB(f16) + PV 搬出 64KiB(f32)，即 QK 的 fp16 化已生效、PV 仍以 fp32 搬出。aic_fixpipe_time 512.4us、aic_cube_time 662.2us、aiv_vec_time 1287.6us、aiv_scalar_wait 1082.3us。"
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "mechanism",
+      "finding": "三核部分窗口、各自归一化、application_completed=false。Cube 核：FIXP productive 0.394 为所有流水最高，头部两条 FIX_L0C_TO_DST 分别 36.85us/15 次与 29.13us/15 次，恰对应 QK(64KiB f16) 与 PV(64KiB f32) 两次 L0C→UB 搬出；CUBE productive 0.117 / wait 0.274 / idle 0.609。Vector 核：VECTOR productive 0.216 / idle 0.681、FLOWCTRL wait_only 0.772、MTE3 productive 0.425，说明向量端大量时间在等 Cube 交接。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "%qk_45 = tt.dot(...)->f32，随后 arith.truncf->f16、arith.extf->f32（该模式已使 FIXP 以 f16 搬出，见 64KiB 折算）；而 %acc_50 = tt.dot(...)->f32 之后直接 cmp/select/divf，没有 dot 输出处的类型转换，故 PV 的 L0C→UB 搬出保持 128x128 f32=64KiB。p 为 128x256 f32（VEXP 结果）+ f16 副本，sum 走 f32 tt.reduce。"
+    },
+    {
+      "path": "workspace/actual-ir/1-_gqa_fwd_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "PV 为 linalg.matmul 输出 tensor<128x128xf32>，之后是 broadcast + arith.divf 与 select；可见 acc 的 f32 形态只被除法/守卫使用，语义上允许在 dot 输出处先作一次 f16 就近舍入再扩回 f32。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "父版本 case4 full_call 216.79415us（trials 207.62/241.66/216.79），保留最佳 205.28415us；四项官方 checker 全通过，case4 bf16 阈值 0.0078125，候选 mere 5.056e-5、max_diff 9.77e-4，余量约 150 倍，可容纳 2^-11 量级的额外舍入。"
+    }
+  ],
+  "hypothesis": "每 tile 的跨核交接链上，PV 的 L0C→UB 搬出仍是 128x128 f32（64KiB），是 Cube 核 FIXP 上第二大热点；若在 PV 的 tl.dot 输出处显式作 f16 就近舍入再扩回 f32（与 QK 已生效的 truncf/extf 模式相同），后端可把该转换折叠进 FIXP，使 PV 搬出 64KiB→32KiB、每 tile 的 L0C 总量 128KiB→96KiB，缩短每个 tile 的交接链并提升墙钟。",
+  "alternatives": [
+    "改 p 的中间 dtype（f32 exp2 直接落 f16、sum 用 f16）：sum 需 f32 动态范围，且 p 已为 f16 供 PV，收益不明而额外引入升/降转换，本轮不选。",
+    "继续调分区/常驻 worker 数：链数与程序数机制已在父版本固定，本轮宿主指定独立实验为 dtype/搬出侧，不改调度。",
+    "减少向量端 exp2/sum 元素数：模拟器显示向量 idle 0.68 在等 Cube 交接，纯向量算力不是当前增量点。"
+  ],
+  "discriminating_observation": "修改后 BCMLIR/二进制与 profiling 的 L0C_to_GM 合计：若由 65536KB 降到约 49152KB，说明 truncf 被折叠进 FIXP、PV 搬出确为 32KiB；若仍为 65536KB，则转换留在 UB、只增加两次 VCONV，应记录为无收益并回退。",
+  "change": "仅在 PART_TILES 复用体 _gqa_tile_part_body 内，把 acc = tl.dot(p16, v16) 改为 tl.dot(...).to(tl.float16).to(tl.float32)；QK、exp2、sum、除法、输出 guard、地址、分区与 grid 逐字不变，通用二维 grid 内核与 FP16 路径不改。",
+  "expected": "case4/case7 每 tile PV 搬出 64→32KiB、L0C 总量 65536→约 49152KB，FIXP 每 tile 约 -0.6~-0.9us、25~26 tile/程序下墙钟预计下降约 15~22us；代价是多两次 128x128 VCONV 与 acc 的 f16 舍入（相对 2^-11）。case1/2 走原路径，源码与耗时不变。",
+  "validation": "工具桥 preflight --source candidate.py 后交接宿主只读审查与完整四项真机评测：官方 checker 阈值不变（fp16 2^-10、bf16 2^-7），并复采 BCMLIR/profiling 判定折叠是否发生。数值风险与适用范围：acc = sum_j p_j v_j，f16 上限 65504 要求 sum_j p_j|v_j| < 65504；合同均匀随机输入下 l=sum p 典型约 68、acc 量级约 3，余量约 300 倍，需单行内多个 j 同时达 |q·k|≈128 才可能溢出，值域/分布外输入（如 q=k=1 全对齐）可能溢出，作为适用范围限制记录。",
+  "selected_layer": "Triton 源码（PART_TILES 复用体的 PV dot 输出类型）",
+  "layer_reason": "该搬出字节数由源码中 dot 输出处是否显式表达类型收窄决定，Triton 可直接表达；不改 IR、不改调度即可验证折叠是否发生，若后端未折叠再在 diagnosis 中交接 IR 建议（在 fixpipe 侧把 PV 的 f32 累加结果以 f16 落 UB）。",
+  "simulator_incremental_judgment": "热点判断（本轮新增）：Cube 核 FIXP 上两条 FIX_L0C_TO_DST（36.85us/15、29.13us/15）是最大的 productive 项，二者字节数相同（64KiB）但 QK 已 f16、PV 仍 f32，故 PV 搬出是可直接削减的具体字节。流水判断（本轮新增）：Vector 核 VECTOR productive 0.216/idle 0.681、FLOWCTRL wait_only 0.772 且 Cube productive 仅 0.117，说明墙钟由逐 tile 交接链的串行延迟而非算术吞吐主导，需从链上单项（PV 搬出）下手；由此预期向量侧不会因此变慢，只是新增两次 VCONV。保留限制：三核窗口为部分窗口、各自归一化，application_completed=false，全调用 completion 与真机完整耗时仍缺失，收益必须由完整四项评测确认。",
+  "unknown": [
+    "后端是否把 PV dot 输出的 f16 转换折叠进 FIXP（区分性观测：L0C_to_GM 合计是否降到约 49152KB）。",
+    "该转换若留在 UB，两次 128x128 VCONV 的净代价尚未实测。",
+    "acc 在合同分布下的实际最大值未采样，仅按解析上界与分布估计余量。"
+  ]
+}

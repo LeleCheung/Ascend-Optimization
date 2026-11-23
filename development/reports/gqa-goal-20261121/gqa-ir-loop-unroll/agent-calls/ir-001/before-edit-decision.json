@@ -1,0 +1,164 @@
+{
+  "timestamp": "2026-11-21T11:43:00.965887+00:00",
+  "diagnosis": {
+    "source_sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "定位每程序代价与各流水构成",
+        "finding": "case4 candidate 侧 Task Duration 257.645142us、Block Dim 128；逐 block 均值 aic_time 35.390us，其中 aic_scalar_time 18.011us 为最大忙碌流水，aic_cube_time 5.173us、aic_mte2_time 6.026us、aic_mte1_time 3.933us、aic_fixpipe_time 5.499us；向量侧 aiv_time 36.161us、aiv_vec_time 12.636us、aiv_scalar_time 12.789us、aiv_scalar_wait_time 11.514us；L1 读带宽 3.317GB/s、主存读带宽 1.896GB/s，内存吞吐处于低位。标量管道承载当前程序主要可压缩执行量。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "核对低层指令计数与等待构成",
+        "finding": "同一 candidate 表内 aic_mte1_instructions 每程序 57、aic_mte2_instructions 11、aic_mte3_instructions 1、aic_cube_fp_instr_number 16、aic_fixpipe_time 5.499us；aiv_scalar_wait_id1_time 22.514us 与 aiv_scalar_wait_time 11.514us 表明跨核等待占据向量程序大量时间。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "simulator",
+        "role": "核对循环体指令的动态调用与窗口归属",
+        "finding": "core0.cubecore0 报告中 PV/QK 相关 PC 的 calls 均为 4，FLOWCTRL/JUMPCMP 计数 4，四个 query tile 以同一组 PC 重复执行；窗口内标量指令 MOVK 112、MOV_XD_IMM 81、ADD 30、SHL 21、AND 16、SHR 14、MUL 4，SCALAR/DIV 与 SCALAR/REM 各 2 次，对应循环外 %arg9 的 div/rem，循环内 t/2 与 t%2 已被强度削减；FLOWCTRL 活跃占比 0.910，其中等待 0.910 与有效 6.1e-05，CUBE productive 0.104、idle 0.677，MTE2 idle 0.831。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "simulator",
+        "role": "窗口时钟资质与观测范围",
+        "finding": "absolute_unit_validation 状态 verified、单位 us、compared_pcs 22 且 matching_pcs 22、median_ratio 1.00113；每核 raw_clock_window 约 137.081→186.172（约 49.09us），capture_start 0、capture_end 1 为相对归一化，application_completed 为 false；仅报告 core0.cubecore0、core0.veccore0、core0.veccore1 三个泳道，其余核心与整核时序保持未知。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "逐核窗口与等待结构的独立对照",
+        "finding": "timeline.json 绑定 source_sha256 2a98e3e0…，三份逐核报告与 hotspots 对应；FLOWCTRL 等待占比高、MTE2 空闲占比 0.83、各流水活跃区间可重叠，说明窗口时间主要由显式等待构成，逐核窗口独立且只覆盖部分执行。"
+      },
+      {
+        "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "确认可编辑 BCMLIR 中的循环形态",
+        "finding": "scf.for %arg12 = 0 to 4 step 1 : i32 包围整个 query-tile 体；%24 = arith.divsi(%arg12,2)、%25 = arith.remsi(%arg12,2) 决定 gi 与 mb；%29 经 %33/%34 与 %37 形成 %38，%38 同时作为 Q 与 Out 的 reinterpret_cast 偏移，全部依赖 %arg12；循环体含一次 linalg.transpose(%20)、两次 input_precision=ieee 的 matmul、maxnumf/addf 归约、exp2、截断与写回，循环无迭代间承载值，行程为常量 4。"
+      },
+      {
+        "path": "compiled-readonly/_gqa_fwd_kernel.ttadapter",
+        "category": "source_ir",
+        "role": "核对低层产物是否已展开该常量循环",
+        "finding": "ttadapter 与 ttir 保留同一四轮 scf.for 与 %c4_i32，未出现后端展开；ir/target/_gqa_fwd_kernel.bcmlir 与 compiled-readonly/_gqa_fwd_kernel.bcmlir 的 sha256 同为 3f0752b87549d3622671e660efcd63cee0d4e7286e342001b1b25900e878f4a7，可编辑文件即真实编译输入。本轮没有 lowered-inventory.json，低层产物按冻结材料核对。"
+      },
+      {
+        "path": "feedback.json",
+        "category": "paired_profiling",
+        "role": "确认验收起点与比较基线",
+        "finding": "case4 candidate full_call_us 262.27775（trials 262.2967、261.98475、262.27775），native 128.9496；case1/2/7 为 187.5727、181.0167、178.68615；四例官方 checker 全部 passed，状态 retained_four_case_best，源码身份 2a98e3e0…。"
+      },
+      {
+        "path": "loop-unroll-compiler-evidence.txt",
+        "category": "source_ir",
+        "role": "记录宿主证据分析的来源",
+        "finding": "该文件记录原始 BCMLIR 的 scf.for 0..4 与模拟器同一 PC 组 calls=4，并声明自身为宿主分析材料；本轮以它作为候选方向来源，具体判断以我实际读取的 IR、profiling 与窗口数据为准（Codex 贡献：提出常量行程展开方向并给出四个合法作用域或顺序展开两种语法）。"
+      }
+    ],
+    "hypothesis": "当前 BCMLIR 把固定 4 轮的 query-tile 循环保留为 scf.for；对 case4 该循环等价于 HG=2、NB_M=2 的四个常量 tile。常量行程循环在编译期可完全展开，展开后 gi/mb 成为字面常量，Q 与 Out 偏移中依赖 %arg12 的 divsi/remsi 与后续乘加/类型转换可被折叠，回边分支消失；标量管道每程序 18.011us 的忙碌时间里因此含可消除的地址与控制计算，每程序 aic_time 与总时长存在下降空间，而张量、矩阵与向量数学次数保持不变。",
+    "alternatives": [
+      "源码层用 tl.static_range 表达同一展开属于等价意图的另一实现位置，本轮固定源码，留作源码层替代方向。",
+      "只调整编译选项中的展开开关属于独立研究身份，本轮不采用。",
+      "把循环体内循环不变的 linalg.transpose(%20) 提升到循环外：低层证据尚无法确认该转置是否被物化为独立拷贝，收益不确定，保留为待验证假设。",
+      "改动 K/V 载入、分块或行所有权会改变数学路径与写出所有权，超出单机制范围。"
+    ],
+    "change": "在 ir/target/_gqa_fwd_kernel.bcmlir 中删除 scf.for %arg12 = 0 to 4，按 t=0,1,2,3 顺序写入四个同构体：每个体把 gi=t//2 与 mb=t%2 直接写为常量，其余算术、两次 input_precision=ieee 的 matmul、maxnumf/addf 归约、exp2、截断、select、transpose 与写回逐字保留，SSA 名加 u0..u3 前缀；函数 ABI、参数、张量形状、strides 与每 tile 写出所有权保持不变。",
+    "expected": "1) 指令：删除 4 次动态 arith.divsi 与 arith.remsi 及 scf.for 回边与循环计数，静态循环体由 1 份变 4 份，Q/Out 偏移中的 muli 与 index_cast 在常量 gi/mb 下获得折叠机会。2) 动态轮次：query-tile 轮次保持 4；每程序 MTE2 指令 11、MTE1 指令 57、CUBE 浮点指令 16、transpose 4 次、exp2/max/sum/div 元素次数保持不变。3) 等待：标量地址链缩短与回边分支消失带来 FLOWCTRL 有效占比略升；PV/QK 的 WAIT_FLAG_DEVI 与跨核等待由数据依赖决定，预测基本不变。4) 资源：L0C/L1/UB 字节、AIC 与 AIV 分工不变；代码体积约增至原循环体四倍，AIC icache miss 当前为 0.0，存在轻微上升风险。5) 时间：预测 case4 candidate full_call 下降 1–4us（约 0.4%–1.5%），下降幅度在标量管道主导时更明显、在跨核等待主导时接近零。6) 正确性：四例输出在官方 checker 阈值内通过，exp2、除法与截断顺序不变，特殊值分支逐字保留。",
+    "validation": "第一步做 MLIR 解析与编译验证；第二步在同一官方四例、同一 seed、warmup 5、trials 3、iterations 20 下运行，确认 checker 全部 passed 且四例差异落在既有阈值内；第三步比较 case4 full_call_us 与 019 的 262.27775us，并用逐 block aic_time、aic_scalar_time 与热点 calls 计数核对回边与 div/rem 是否消失、MTE/CUBE 计数是否不变；第四步记录代码体积与 icache miss；性能结论绑定本次实际候选与官方固定四例测量范围。",
+    "layer_reason": "Triton 表达能力：同一展开在源码里可用 tl.static_range(0, HG*NB_M) 表达，属于源码层可写清的等价意图；本轮选择单算子 IR，因为 BCMLIR 保留原始 scf.for，可直接控制展开而无需触碰冻结源码，且源码层只能通过重新编译间接验证。固定源码实验目的：frozen.py 与源码 sha256 2a98e3e0… 保持逐字节一致，把“编译器应否展开常量行程循环”作为独立可测命题，配方、精度与写出所有权不变，性能差异可归因到该 IR 控制点。IR 控制点：scf.for 的行程常量、gi/mb 与依赖 %arg12 的 Q/Out 地址；可编辑范围限于清单登记的 ir/target/_gqa_fwd_kernel.bcmlir，compiled-readonly 产物与函数 ABI 保持冻结。",
+    "simulator_incremental_judgment": "绝对时钟资质：absolute_unit_validation 为 verified、单位 us、22/22 个 PC 匹配、median_ratio 1.00113，因此报告中的 running_time_us 可用于同核相对比较。观测范围：逐核部分窗口，raw 约 137.08→186.17us，capture_start/end 是 0→1 的相对归一化，application_completed 为 false，仅覆盖 core0 的三个泳道；未报告的核与泳道保持未知，动态总次数只按窗口内 calls 计数解释。机制定位：同一 PC 的 calls=4 与 FLOWCTRL/JUMPCMP=4 支持“四轮循环以重复 PC 执行、后端未展开”的判断，但 FLOWCTRL 等待占比 0.910 说明窗口时间主要耗在显式等待上，流水时间可重叠，排名只用于定位候选机制。增量预测：展开去掉 4 次动态 div/rem 与回边分支并缩短标量地址链，属单机制可测预测；跨核等待与 PV 依赖保持不变，若实测无收益则可判定标量控制在该核上已被等待掩盖。",
+    "unknown": [
+      "其余核心与全部 128 个程序的动态标量指令总数",
+      "linalg.transpose 在后端是否被物化为独立拷贝",
+      "case7 的两轮循环特化产物未列入清单，其独立展开效果保持未知"
+    ]
+  },
+  "diagnosis_sha256": "560d7a0230ce755944384a78f420f2b0a0ed2219b34dd8801a6514dfe1e55839",
+  "evidence": [
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "定位每程序代价与各流水构成",
+      "finding": "case4 candidate 侧 Task Duration 257.645142us、Block Dim 128；逐 block 均值 aic_time 35.390us，其中 aic_scalar_time 18.011us 为最大忙碌流水，aic_cube_time 5.173us、aic_mte2_time 6.026us、aic_mte1_time 3.933us、aic_fixpipe_time 5.499us；向量侧 aiv_time 36.161us、aiv_vec_time 12.636us、aiv_scalar_time 12.789us、aiv_scalar_wait_time 11.514us；L1 读带宽 3.317GB/s、主存读带宽 1.896GB/s，内存吞吐处于低位。标量管道承载当前程序主要可压缩执行量。",
+      "sha256": "69e5acb628d09675c4c333f008d651f0c49fc467975789ecf7283eacc16a1256"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "核对低层指令计数与等待构成",
+      "finding": "同一 candidate 表内 aic_mte1_instructions 每程序 57、aic_mte2_instructions 11、aic_mte3_instructions 1、aic_cube_fp_instr_number 16、aic_fixpipe_time 5.499us；aiv_scalar_wait_id1_time 22.514us 与 aiv_scalar_wait_time 11.514us 表明跨核等待占据向量程序大量时间。",
+      "sha256": "69e5acb628d09675c4c333f008d651f0c49fc467975789ecf7283eacc16a1256"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "核对循环体指令的动态调用与窗口归属",
+      "finding": "core0.cubecore0 报告中 PV/QK 相关 PC 的 calls 均为 4，FLOWCTRL/JUMPCMP 计数 4，四个 query tile 以同一组 PC 重复执行；窗口内标量指令 MOVK 112、MOV_XD_IMM 81、ADD 30、SHL 21、AND 16、SHR 14、MUL 4，SCALAR/DIV 与 SCALAR/REM 各 2 次，对应循环外 %arg9 的 div/rem，循环内 t/2 与 t%2 已被强度削减；FLOWCTRL 活跃占比 0.910，其中等待 0.910 与有效 6.1e-05，CUBE productive 0.104、idle 0.677，MTE2 idle 0.831。",
+      "sha256": "9c3c2cc35e4b0c64e5ffb863f9cded01f545a7aecbfa13667a466d3890d6f5aa"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "窗口时钟资质与观测范围",
+      "finding": "absolute_unit_validation 状态 verified、单位 us、compared_pcs 22 且 matching_pcs 22、median_ratio 1.00113；每核 raw_clock_window 约 137.081→186.172（约 49.09us），capture_start 0、capture_end 1 为相对归一化，application_completed 为 false；仅报告 core0.cubecore0、core0.veccore0、core0.veccore1 三个泳道，其余核心与整核时序保持未知。",
+      "sha256": "9c3c2cc35e4b0c64e5ffb863f9cded01f545a7aecbfa13667a466d3890d6f5aa"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "逐核窗口与等待结构的独立对照",
+      "finding": "timeline.json 绑定 source_sha256 2a98e3e0…，三份逐核报告与 hotspots 对应；FLOWCTRL 等待占比高、MTE2 空闲占比 0.83、各流水活跃区间可重叠，说明窗口时间主要由显式等待构成，逐核窗口独立且只覆盖部分执行。",
+      "sha256": "3e592e77d23a31278e191adec58dd4fc6c9e27e92e10bf03ad6917846dfc632e"
+    },
+    {
+      "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "确认可编辑 BCMLIR 中的循环形态",
+      "finding": "scf.for %arg12 = 0 to 4 step 1 : i32 包围整个 query-tile 体；%24 = arith.divsi(%arg12,2)、%25 = arith.remsi(%arg12,2) 决定 gi 与 mb；%29 经 %33/%34 与 %37 形成 %38，%38 同时作为 Q 与 Out 的 reinterpret_cast 偏移，全部依赖 %arg12；循环体含一次 linalg.transpose(%20)、两次 input_precision=ieee 的 matmul、maxnumf/addf 归约、exp2、截断与写回，循环无迭代间承载值，行程为常量 4。",
+      "sha256": "3f0752b87549d3622671e660efcd63cee0d4e7286e342001b1b25900e878f4a7"
+    },
+    {
+      "path": "compiled-readonly/_gqa_fwd_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "核对低层产物是否已展开该常量循环",
+      "finding": "ttadapter 与 ttir 保留同一四轮 scf.for 与 %c4_i32，未出现后端展开；ir/target/_gqa_fwd_kernel.bcmlir 与 compiled-readonly/_gqa_fwd_kernel.bcmlir 的 sha256 同为 3f0752b87549d3622671e660efcd63cee0d4e7286e342001b1b25900e878f4a7，可编辑文件即真实编译输入。本轮没有 lowered-inventory.json，低层产物按冻结材料核对。",
+      "sha256": "cdcbbfad8ec97625f2e5743ec02932455f698bc4ffe8f09563a3abf9dc84c252"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "确认验收起点与比较基线",
+      "finding": "case4 candidate full_call_us 262.27775（trials 262.2967、261.98475、262.27775），native 128.9496；case1/2/7 为 187.5727、181.0167、178.68615；四例官方 checker 全部 passed，状态 retained_four_case_best，源码身份 2a98e3e0…。",
+      "sha256": "1059aa282cdc9ec679766a5bb58d5ac10a93e8e7ea21c8189e0e3f88dfc8155a"
+    },
+    {
+      "path": "loop-unroll-compiler-evidence.txt",
+      "category": "source_ir",
+      "role": "记录宿主证据分析的来源",
+      "finding": "该文件记录原始 BCMLIR 的 scf.for 0..4 与模拟器同一 PC 组 calls=4，并声明自身为宿主分析材料；本轮以它作为候选方向来源，具体判断以我实际读取的 IR、profiling 与窗口数据为准（Codex 贡献：提出常量行程展开方向并给出四个合法作用域或顺序展开两种语法）。",
+      "sha256": "7158d0712aa88701e74b92070959164157097a6fa807a5d86e0209fb151e8c07"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113",
+    "contract.json": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858",
+    "ir-inventory.json": "b890c63368cd39fb251bb86ffb4cefc87b1b4f3fd128d71c4a563db67142bf7a",
+    "feedback.json": "1059aa282cdc9ec679766a5bb58d5ac10a93e8e7ea21c8189e0e3f88dfc8155a",
+    "profiling.json": "69e5acb628d09675c4c333f008d651f0c49fc467975789ecf7283eacc16a1256",
+    "hotspots.json": "9c3c2cc35e4b0c64e5ffb863f9cded01f545a7aecbfa13667a466d3890d6f5aa",
+    "timeline.json": "3e592e77d23a31278e191adec58dd4fc6c9e27e92e10bf03ad6917846dfc632e",
+    "loop-unroll-compiler-evidence.txt": "7158d0712aa88701e74b92070959164157097a6fa807a5d86e0209fb151e8c07",
+    "context.json": "e7724d34505daf6b6118512416fd05a81769d97b42422c990a5fd5a778007d20",
+    "diagnosis.json": "bff2c89a1c04ecada9fea1f9dd6213ed9717c5b0c405e8b5e120cdefc43cbff4",
+    "codex-brief.json": "d8491854b1bff640abb0b2f08131e4f547f8381ff7f273ae5c49f9d863cbe499",
+    "ir/target/_gqa_fwd_kernel.bcmlir": "3f0752b87549d3622671e660efcd63cee0d4e7286e342001b1b25900e878f4a7",
+    "compiled-readonly/_gqa_fwd_kernel.ttir": "3872e0b7e8321c12da290bbec07142d727dcd444fefc9d5afd78f81e606dd8b8",
+    "compiled-readonly/_gqa_fwd_kernel.ttadapter": "cdcbbfad8ec97625f2e5743ec02932455f698bc4ffe8f09563a3abf9dc84c252",
+    "compiled-readonly/_gqa_fwd_kernel.bcmlir": "3f0752b87549d3622671e660efcd63cee0d4e7286e342001b1b25900e878f4a7"
+  },
+  "decision_tool_sha256": "5bef69abbe2d24d40092eade140c6c5d68f831185dbcc5e7930d535926348208"
+}

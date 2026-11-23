@@ -1,0 +1,60 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "f8e9efce09653a20f7eff8419a2e62defc93c5a6a06b113c73935883490f615a",
+  "selected_layer": "kernel_tiling_ub_budget",
+  "layer_reason": "四项合同结果中唯一失败是case1(因果,fp16,B2 S128 Nq32 Nkv8 D128)在D<=128统一分块BLOCK_M=64/BLOCK_N=128下的编译期UB超限;失败点是单个kernel内活跃缓冲峰值,不是数值精度或checker口径。降低该峰值的可控自由度只有分块形状、缓冲生命周期与概率分解结构;后者是合同要求的两项精度机制必须保留,故选择分块按is_causal分流这一资源修复层。",
+  "simulator_incremental_judgment": "未使用模拟器;历史simulator-evidence.json绑定137e585d仅为背景,不作为当前失败候选的观测。本次判断只依据实际失败IR与四项评测反馈。",
+  "evidence": [
+    {
+      "path": "workspace/repair-feedback.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "case1报ub overflow: requires 1851904 bits (231488 B) while 1572864 bits (196608 B) available;case2/4/7均已编译并通过官方checker(阈值1/1024与1/128,两项概率分解未改动)。"
+    },
+    {
+      "path": "workspace/failed-ir/attempt-001/3-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "因果fp16编译产物:q为memref<64x128xf16>,K/V为memref<128x128xf16>,点积结果64x128xf32,并在循环内额外产生tensor<64x128xi32>、tensor<64x1xi32>、tensor<64x128xi1>等因果掩码临时量;该64x128整型/浮点临时量与BLOCK_N成正比,是超出192KB的主因。"
+    },
+    {
+      "path": "workspace/failed-ir/attempt-001/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "非因果fp16产物在同一64/128/128分块下只保留q 64x128xf16、K/V 128x128xf16与64x128xf32中间量,没有循环内64x128xi32因果索引临时量;与case2编译通过一致,说明超限来自因果编译分支而非分块本身过不了UB。"
+    },
+    {
+      "path": "workspace/failed-ir/attempt-001/6-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "bf16非因果产物与fp16非因果产物缓冲形状一致(仅元素类型不同),印证case4/7的可用性与case1失败的差异在因果掩码生命周期,不在dtype带宽。"
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "run()对BLOCK_D<=128统一取BLOCK_M,BLOCK_N=64,128,不看is_causal;kernel内两次tl.where(因果掩码与n_mask)生成与BLOCK_N同宽的临时量,p_hi/p_lo两项分解要求p、qk、p_hi、p_lo同时存活。"
+    },
+    {
+      "path": "workspace/contract.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "四个固定case(1,2,4,7)、dtype(fp16/fp16/fp16/bf16)、阈值与计时口径不变;修复不得改动checker/golden与两项分解精度结构。"
+    }
+  ],
+  "hypothesis": "UB超限是因果编译分支特有:除q/k/v/qk/p/p_hi/p_lo/acc外,因果掩码在循环内多出一个64x128整型/浮点临时量,使峰值从非因果的可编译水平升到231488 B。峰值中k、v、qk、p、p_hi、p_lo六块均与BLOCK_N线性相关,因果临时量亦同;把仅因果编译的BLOCK_N由128降到64可将峰值削减约80KB。",
+  "change": "在run()中把D<=128分块从统一(64,128)改为按属性分流:`BLOCK_M=64`,非因果仍`BLOCK_N=128`,因果取`BLOCK_N=64`;D<=256与其余分支保持不变。kernel体、两项概率分解表达式与相加顺序、mask语义、dtype、grid维度和计时口径全部不动。",
+  "expected": "case1因果编译峰值估算约149.6KB(q 16KB、k 16KB、v 16KB、qk 16KB、p 16KB、p_hi 8KB、p_lo 8KB、acc 32KB 加约18KB杂项),约为196.6KB预算的76%,留约47KB余量;case2/4/7源码路径完全不变,应保持原通过结果与延迟。代价:case1每程序KV迭代由2次(128宽,含半块被掩码)变为3次(64宽),PV交接链与acc重缩放次数每个程序由2次增到3次(+50%);同时被掩码列减少,向量softmax元素数由2*64*128降到3*64*64(-25%),K/V装入列数同减;并行度不变(case1仍为grid=(2,64)=128程序),因果case1相对保留版的收益预期为零,收益仍集中在非因果的case2/4/7。",
+  "validation": "调用工具桥preflight审查源码,再由宿主按合同重跑四项:确认case1不再报ub overflow且官方checker通过,case2/4/7结果与现有反馈一致,记录四项延迟;核对p_hi/p_lo两项分解与相加顺序字节级未改。",
+  "unknown": [
+    "编译器多缓冲与缓冲复用策略未知,149.6KB为按IR缓冲形状的估算,实测峰值可能高出数KB。",
+    "case1因果case在BLOCK_N=64下是否与保留版137e585d完全同速尚未验证(本候选仍未编译/未上机)。",
+    "非因果BLOCK_N=128当前仅由通过结果反证未超限,实际余量未测得。",
+    "若后续要提高case1,还需要其他降低活跃缓冲或改变生命周期的机制,本次不做。"
+  ],
+  "post_edit_state": {
+    "source_sha256": "247091f353b9877d40603d725176b8b1d2418e828d4129da85c413e7f533f524",
+    "preflight_status": "awaiting_source_review",
+    "note": "分块分流编辑已落盘并通过preflight源码审查;尚未编译、无设备重放、无四项checker或计时结果,不声明已通过或存在收益。"
+  }
+}

@@ -1,0 +1,49 @@
+--- 
++++ 
+@@ -133,6 +133,21 @@
+ p 进入 FP16 次正规，更低则整体下溢（l_new 仍由 fp32 提供正值，输出退化为 0）；
+ 合同均匀随机输入行 max 约 2、std 约 0.48，到达该边界需约 -30σ；值域外 |q|,|k|>1
+ 可能溢出 FP16。故该机制依赖合同值域，通用 FP16 路径与二维 grid 保持逐行 max。
++
++PART_TILES 内先发概率/PV、后做分母归约（本轮机制，独立实验，从 031 起）：
++031 的 TTIR（math.exp2 → tt.reduce → arith.truncf p→f16 → tt.dot PV）与 BCMLIR
++（math.exp2 → linalg.reduce → truncf → linalg.matmul PV）都把 l_new 排在 PV 之前，
++同核 trace 同为 VEXP → VADD/VCADD（约 0.58us/tile）→ VCONV → 概率 MTE3 写。由于
++sum 与 PV 仅在 out=acc/l_safe 处汇合、彼此无依赖，本轮仅把 l_new = tl.sum(p, 1)
++移到 p16 = p.to(tl.float16) 与 acc = tl.dot(p16, v16) 之后、l_safe 之前，让概率转换
++与发送先发出，由后端实际的 Cube/Vector 调度决定归约能否与 PV 重叠。归约对象仍是
++原 FP32 p（p16 只是原转换的命名），rawQK FP32、全部算术表达式、地址、20 worker
++连续分区、组内 K/V 复用与 host 判据逐字不变，故 acc 与 l_new 取值逐位等同。代价
++与风险：p 的 live range 跨过 p16 与 PV dot（FP32 p 128KiB 与 p16 64KiB 同时存活），
++缓冲复用不足时可能触及 UB 预算导致编译失败；若后端把 reduce 重排回 conv 之前，
++或为保持 p 存活插入额外拷贝/同步，则该顺序位移无收益甚至退步，此时应记录并交接
++固定源码 IR 调度位置，而非重复同类顺序试验。该分支只覆盖命中 PART_TILES 的
++BF16 非因果 SKV=256 形状（本合同 case4、case7）；因果路径与二维 grid 逐字不变。
+ """
+ 
+ import math
+@@ -235,9 +250,22 @@
+                 # （std 约 0.48），到达该边界需约 -30σ，实际不可达；此机制
+                 # 依赖 |q|,|k| <= 1 的合同值域，域外可能溢出 FP16。
+                 p = tl.exp2(qk - SM_OFFSET)
++
++                # 本轮机制（仅 PART_TILES）：先发概率/PV，再做独立 FP32 分母归约。
++                # 031 的 TTIR/BCMLIR 显示 tt.reduce/linalg.reduce 排在 p→f16 转换与
++                # PV matmul 之前，同核 trace 亦为 VEXP → VADD/VCADD(约0.58us/tile)
++                # → VCONV → 概率 MTE3 写，即每 tile 的向量归约挡在 Cube PV 供数
++                # 之前。这里只把 l_new 的语句移到 PV dot 之后、l_safe 之前：
++                # 分母仍是对原 FP32 p 的归约（p16 仅为原 p.to(tl.float16) 命名），
++                # rawQK FP32、全部数值表达式、地址与 20 worker 分区逐字不变，
++                # 故 acc 与 l_new 的取值逐位等于原顺序，仅交给后端按 C/V 调度
++                # 尝试把归约与 PV/概率搬运重叠。代价：p 的 live range 跨过 p16
++                # 与 PV dot（FP32 p 128KiB + p16 64KiB 同时存活），若缓冲无法复用
++                # 可能触及 UB 预算；若后端把 reduce 重排回 conv 之前或为保 p 插入
++                # 额外拷贝/同步，则本次顺序位移不产生收益。
++                p16 = p.to(tl.float16)
++                acc = tl.dot(p16, v16)
+                 l_new = tl.sum(p, 1)
+-
+-                acc = tl.dot(p.to(tl.float16), v16)
+ 
+                 l_safe = tl.where(l_new > 0.0, l_new, 1.0)
+                 out = acc / l_safe[:, None]

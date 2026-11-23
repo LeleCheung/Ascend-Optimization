@@ -1,0 +1,56 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "3c34fdfb6ef2aacc3b0ae8cbd0683bd22d7610ffcb388c6ef2da50d0a72c04ee",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "background",
+      "finding": "case4 候选 kernel 174.563us 对 CANN 参考 119.902us；Cube 累计 cube_time 662.19us、mte2 591.86us，两份 Vector aiv_vec_time 各 1060.4us；每 program 的指令数固定，说明墙钟由跨核交接链条数而非单链算术量决定。"
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "trigger",
+      "finding": "三核部分窗口、各自归一化、application_completed=false：Cube 头部 WAIT_FLAG_DEVI 84.32us/9 次、FIX_L0C_TO_DST 23.07us/9（QK 搬出）、FIXP SET_FLAG 23.07us/9；Vector 头部 WAIT_FLAG_DEVI 62.07us/9、输出 MTE3 25.6us/8。热点集中在每条 tile 的 QK/PV 跨核交接边界，按 tile 计次。"
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "disambiguation",
+      "finding": "流水占比（Cube productive 12.08%/idle 59.48%，MTE2 idle 84.90%，Vector productive 18.90%/idle 73.23%）与热点指向同一机制：空闲来自逐 tile 串行的交接等待，减少 tile（交接链）数比提高单链算术利用率更直接。部分窗口无 completion，不能据此给出全调用耗时。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "当前 TTIR 为 M128/N256：k/v 载入 256x128，QK dot 128x128xbf16 * 128x256xbf16 -> 128x256xf32，p 截断为 128x256xf16 后做 PV dot；NB_M=2、TPG=16。父版把 FP32 分母 tt.reduce 排在 PV dot 之后，故 128x256 f32 的 p 在 dot 期间必须保持活跃。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "保留最佳 case4 = 175.5726us（trials 174.99/175.65），CANN 参考 130.6631us；case1/2/7 分别为 116.84/107.13/94.69us，原始四项 official checker 均通过。本轮仅以 case4 下降为收益判据，其余三项须记录真实变化。"
+    },
+    {
+      "path": "workspace/candidate.py",
+      "category": "source_ir",
+      "role": "background",
+      "finding": "修改后源码（sha256 9d53bf02…）仅新增两处：M256 的元数据判据与 PART_TILES 接受 M256；复用体内 BLOCK_M>=256 时先 tl.sum(p,1) 再 p16/PV dot。M128、FP16、因果与二维 grid 分支文本逐字未动。preflight 返回 awaiting_source_review（未编译），故 M256 的实际 TTIR 与 UB 余量仍为未知，等待只读审查后由宿主编译与真机评测。"
+    }
+  ],
+  "hypothesis": "PART_TILES 的交接链条数等于 tile 数 T = B*NKV*G*NB_M。case4 在 M128 下 T=512、每 worker 25/26 条链；把 BLOCK_M 提到 256 且 S 可被 256 整除（case4 S=256，NB_M=1）后 T=256、每 worker 12/13 条链，QK 搬出/softmax/PV 链与 K/V 组重载次数同比例下降，是当前证据下最直接的热点削减。代价是每 tile 的 p 变为 256x256 FP32、单 tile 活跃内存翻倍；故仅在 M256 分支把 FP32 分母归约提到 p16 截断与 PV dot 之前，使 p 在 dot 开始前即可释放以降低峰值活跃量。该重排不改变任何算术：同一 FP32 p 的同一 reduce、同一 fp16xfp16、FP32 累加的 dot。",
+  "alternatives": "(1) 保持 M128 只改语句序：链数不变，最多改善单链重叠，无法削减 84.32us/9 次的 Cube 交接等待，故不选。(2) M256 但保留父版 sum-after-dot 顺序：p 与 p16 在 PV dot 期间同时活跃，峰值更高、编译/UB 风险更大且无额外收益。(3) 行打包、额外 cast、改 P 或按组重排：被本调用范围排除，且不属于同一机制。",
+  "discriminating_observation": "修改后实际 TTIR 是否出现 256x256 QK dot 与 NB_M=1（TPG=8、T=256），且 tt.reduce 是否排在 PV dot 之前；预检若报 UB/L0C 超限则说明 M256 不可编译（保留失败证据，不以降低精度补救）。最终判别仍是修改后重放（每 worker 链数 25/26→12/13）与原始四项真机计时：case4 是否低于 175.5726us，且 case1/2/7 是否在噪声内不变。",
+  "change": "仅改 candidate.py 两处：(a) run() 中在非因果、V 为 BF16、BLOCK_N==256、BLOCK_D==128 且 S%256==0 时把 BLOCK_M 由 128 提升到 256，其余元数据路径与因果/FP16/二维 grid 分支逐字不变，PART_TILES 判据相应接受 BLOCK_M==256；(b) _gqa_tile_part_body 中仅当 BLOCK_M==256（编译期常量）时先做 l_new=tl.sum(p,1)、再做 p16 与 PV dot，M128 保持父版 acc→sum 顺序。host 快路径键已含 BLOCK_M/NB_M/TPG/T/P，无需另改。",
+  "expected": "case4 交接链条数 512→256、每 worker 25/26→12/13；若等待与搬出时间随链数下降，则 case4 目标耗时低于 175.5726us；case1/2/7 走原分支应保持真实不变。明确风险：M256 的 p 为 256x256 FP32，峰值可能超过 196608B UB 预算（父版 M128 已逼近），编译失败即记录为真实负结果。",
+  "validation": "先 preflight --source candidate.py 取得编译结果与修改后 IR；再由宿主执行原始完整四项 checker（阈值不变）与真机计时合同（warmup5/trials3/iterations20），比较 case4 与保留最佳 175.5726us，并检查 case1/2/7 的真实变化；最后用修改后模拟器重放与 IR 对照确认 reduce 与 dot 的先后。",
+  "selected_layer": "triton_source_tiling_and_scheduling",
+  "layer_reason": "BLOCK_M 的程序几何与语句序都可直接在 Triton 源码表达，Triton 是其唯一来源；当前实际 IR 未显示单算子生成缺陷（M128 的 dot/reduce/搬出与源码一一对应），故无需交接 IR 改法。",
+  "simulator_incremental_judgment": "热点增量：三核窗口头部仍是 Cube WAIT_FLAG_DEVI 84.32us/9 与 FIX_L0C_TO_DST 23.07us/9（QK 搬出）、Vector WAIT_FLAG_DEVI 62.07us/9 与 MTE3 25.6us/8，均按 tile 计次，指示逐链交接成本。流水增量：Cube productive 12.08%/idle 59.48%、MTE2 idle 84.90%、Vector productive 18.90%/idle 73.23%，说明单核内算术占比低、大量空闲来自链间等待，支持「减少链数」而非「提高单链算力」。全部为部分窗口、每核各自归一化、application_completed=false，全调用 completion 缺失，故本判断只用于机制选择，不作为耗时结论。",
+  "unknown": [
+    "M256 是否在 UB/L0C 预算内可编译",
+    "提前 sum 是否被后端落实为更短的 p 活跃期",
+    "链数减半能否在真机上按比例转化为耗时下降"
+  ]
+}

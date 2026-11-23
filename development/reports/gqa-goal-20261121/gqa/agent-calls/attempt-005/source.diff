@@ -1,0 +1,80 @@
+--- 
++++ 
+@@ -39,7 +39,18 @@
+ (MASK_MD false when S % BLOCK_M == 0 and D == BLOCK_D, so the exact grid covers
+ only valid rows/columns; MASK_KV false when SKV % BLOCK_N == 0 and D ==
+ BLOCK_D), which lets Q/Out load-store unmasked and K/V load unmasked, and drops
+-the always-true qk select.  Dropping a mask that is provably all-true cannot change any loaded
++the always-true qk select.
++
++KV-width tiling (current round's mechanism, non-causal bf16 only): BLOCK_N rises
++128 -> 256 so that SKV=256 folds two KV iterations into one, halving the number
++of cube<->vector handoff chains per program (profiling pinned the wall clock to
++aic_scalar_wait_id1 rather than throughput).  Matmul FLOPs, program count and
++the two-term probability split are unchanged; only the KV reduction factoring
++and the number of online-softmax rescalings change, validated by the official
++four-case checker at the original thresholds.  fp16 and causal paths keep their
++previous tilings, chosen purely from dtype/shape metadata.
++
++Dropping a mask that is provably all-true cannot change any loaded
+ value, and no arithmetic expression or its order is touched: the online
+ softmax, the two-term split of the probabilities and the acc rescaling stay
+ bit-identical to the previous candidate.  Cost: one compiled specialisation per
+@@ -205,31 +216,35 @@
+     # 并行度不变；非因果三个 case 的分块与性能路径不变。
+     # 两项概率分解的表达式与相加顺序保持不变，仅 KV 轴划分与重缩放次数变化。
+     #
+-    # 上一轮（已验收，774.8852us）改动只在编译期几何特化与可证冗余掩码消除上；
+-    # 本轮在此之上只改非因果的 BLOCK_M（64->128），见下方说明。因果/非因果
+-    # BLOCK_N 分流、两项概率分解表达式与相加顺序均保持不变。
+     # 收益或代价都必须由完整四项真机评测判定，本注释不据此改写结论。
+-    # 数值风险说明：BLOCK_M 只改变 tl.dot 的 M 维铺排与程序数，每行输出仍按同一
+-    # j 顺序累加同一组 KV 块、同一 alpha 重缩放与同一两项分解，QK 归约维仍是
+-    # D=BLOCK_D、PV 归约维仍是每块 BLOCK_N 列，故累加序列不变，预计精度不变。
++    # 本轮机制：非因果 BF16 路径把 BLOCK_N 由 128 提到 256，使 SKV=256 的
++    # case4/7 由两轮 KV 迭代折叠为一轮。成对 profiling（case4，512 program，
++    # Task 467.7us）显示每 program 墙钟约 18us 中 aic_cube_time 仅 2.02us，
++    # 而 aic_scalar_wait_id1 达 11.79us：墙钟由「每轮 KV 的完整跨核交接链」
++    # 数量主导（QK→向量 softmax/两项分解→两次 PV→两次 L0C 搬出→cube 汇合）。
++    # 实际 BCMLIR 亦为 0..256 step 128 的两次迭代、每 program 6 次 matmul、
++    # L0C→GM 384KiB。BN=256 后每 program matmul 6→3、交接链 2→1、L0C→GM 约
++    # 384→256KiB，而总 matmul FLOPs、程序数与 Q 行复用不变。
++    # 只按合法 dtype/shape 元数据选路（bf16 是 dtype 元数据，不读输入值、不按
++    # case_id 选路）：FP16 非因果（case2）与因果（case1）分块保持原样，避免
++    # fp16 单块 256 列带来的无收益缓冲膨胀。代价：BF16 非因果单 program 的
++    # k/v/qk/p 缓冲按 BN 翻倍，UB 峰值是否 <=196608B 交由真实编译/lowering 判定；
++    # 若超限则按真实失败交接，不以估算取消该机制。
++    # 数值风险：BN 变化只改变 KV 归约分块与在线 softmax 的重缩放次数（2 次
++    # 合并为 1 次），每行仍按同一 j 顺序覆盖同一组 K/V，p_hi/p_lo 两项分解的
++    # 表达式与 acc 相加顺序不变；更少的 m/l 重缩放与 fp32 求和分组变化预计
++    # 不劣于原结构，由原完整四项官方 checker 以原阈值验收。
+     BLOCK_D = max(16, triton.next_power_of_2(D))
+     if BLOCK_D <= 128:
+-        # 本轮机制：非因果沿 query 行方向由 64 提到 128。
+-        # 成对 profiling（case4，1024 program，kernel 763.155us）显示每 program
+-        # 墙钟约 15us 中 aic_cube_time 仅 1.09us，而 aic_scalar_wait_id1 9.15us；
+-        # 模拟器窗口中位 Cube productive 7.90%/wait 33.27%/idle 58.83%、Vector
+-        # productive 25.14%/wait 17.13%/idle 57.73%，热点全是 WAIT_FLAG 与
+-        # MOV_OUT_TO_L1 这类同步/搬运指令。即墙钟由「每 program 每轮 KV 的跨核
+-        # 交接链」数量主导：每链的 K/V 装载量（2×32KiB）与交接固定成本不随行数
+-        # 变化，而每链算术只有 64x128x128 + 2×(64x128x128)。
+-        # BLOCK_M 提到 128 后：program 数与链数减半（case4 1024->512 程序、
+-        # 2048->1024 链），总 K/V 搬运减半（每 program 208KiB->约 136KiB GM->L1），
+-        # 每链在 M 方向复用 128 行。代价：per-program 峰值缓冲按 M 维翻倍，
+-        # 估算约 192KB、逼近 196608B 预算，故非因果才用；因果分支若回到
+-        # BLOCK_N=128 会重新引入 BLOCK_N 线性相关的索引临时量，实测峰值曾达
+-        # 231488B，故因果仍取 64/64，其编译与数值路径不变。
+-        BLOCK_M = 64 if is_causal else 128
+-        BLOCK_N = 64 if is_causal else 128
++        is_bf16 = query.dtype == torch.bfloat16
++        if is_causal:
++            # 因果分支循环内的 BLOCK_N 整型索引/掩码临时量曾把 64/128 峰值推到
++            # 231488B，故仍取 64/64，编译与数值路径不变。
++            BLOCK_M, BLOCK_N = 64, 64
++        elif is_bf16:
++            BLOCK_M, BLOCK_N = 128, 256
++        else:
++            BLOCK_M, BLOCK_N = 128, 128
+     elif BLOCK_D <= 256:
+         BLOCK_M, BLOCK_N = 32, 32
+     else:

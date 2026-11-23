@@ -1,0 +1,89 @@
+--- 
++++ 
+@@ -364,17 +364,71 @@
+             # 本 worker 与本组相交的 tile 子区间（组内局部序号）。
+             t0 = tl.maximum(lo, grp * TPG) - grp * TPG
+             t1 = tl.minimum(hi, (grp + 1) * TPG) - grp * TPG
++
++            # 本轮机制（PART_TILES 组内一深度 QK 前瞻，一 query tile 一步）：
++            # 同一 KV 组的 K 已在组循环外整段驻留，tile t+1 的 raw QK 只依赖
++            # q(t+1) 与这份 K，与本 tile t 的 softmax/PV 无数据依赖。当前编译
++            # 产物（actual-ir TTIR 第 72-115 行、BCMLIR 同形）却把下一个 QK 排
++            # 在当前 exp/PV 的 FIX 窗口之后：模拟器 Cube 窗口 QK MMAD
++            # 118.396..119.031us、PV MMAD 124.459..125.094us、下一 QK
++            # 126.328..126.963us（三核部分窗口、各自归一化、
++            # application_completed=false，仅用于排序）。故进入组内循环前先为
++            # 首 tile t0 预取一次 raw QK，此后每次迭代在计算本 tile 的
++            # softmax/PV 之前发出 t+1（t+1 < t1）的 QK，把这条独立的 Cube MMA
++            # 塞进本 tile 的 exp/sum/PV 向量窗口。
++            #
++            # 循环不变量：进入下标 t 的迭代时 raw_next = round_f16(dot(q(t),
++            # trans(K_group)))。归纳基础即下面的预取；第 t 次迭代在 t+1 < t1 时
++            # 把它改写为 t+1 的值，在尾部（t+1 == t1）不发 dot、此后无人再读它。
++            # 故每组 QK 次数恰为 1 + (t1-t0-1) = t1-t0，与父版本相同、无多余
++            # tail dot；每次 QK 仍落在 t+1 < t1 <= TPG 的本组 tile 上，
++            # gi = t//NB_M、mb = t%NB_M 与父版本一致，绝不读出组外地址。
++            # 同一 tile 的 FP32 缩放乘、自然指数、BF16 概率截断、单次 BF16 PV、
++            # FP16 PV 结果交接、FP32 分母归约、FP32 除法与 store 逐字不变，
++            # 只有发射次序不同，故预期输出逐位不变。
++            # 资源风险：raw_next 为循环携带的 128x256 FP16（64KiB），叠加提前
++            # 载入的 q_n（32KiB），且两个 128x256 f32 QK 累加器（各 128KiB L0C）
++            # 可能与 128x128 PV 累加器同时活跃。若超 UB/L0C 预算，后端可能编译
++            # 失败或重新串行化（后者无收益但不改结果）；此时如实记录，不静默
++            # 改块大小、数学或编译选项。
++            gi = t0 // NB_M
++            mb = t0 % NB_M
++            hq = kvh * G + gi
++            offs_m = mb * BLOCK_M + tl.arange(0, BLOCK_M)
++            q_ptrs = Q + b * q_sb + hq * q_sh + offs_m[:, None] * q_ss + offs_d[None, :] * q_sd
++            if MASK_MD:
++                q = tl.load(q_ptrs, mask=(offs_m[:, None] < S) & (offs_d[None, :] < D), other=0.0)
++            else:
++                q = tl.load(q_ptrs)
++            raw_next = tl.dot(q, tl.trans(k)).to(tl.float16)
++
+             for t in range(t0, t1):
++                # 本 tile 的 raw QK（FP16）来自上一迭代的预取。
++                raw = raw_next
++
++                # 先发下一 tile 的 QK：只依赖 q(t+1) 与本组已驻留的 K，放在
++                # exp/PV 之前，使 Cube MMA 有机会与当前向量段重叠；后端若不前移
++                # 则退回父版本串行次序，结果不变。
++                if t + 1 < t1:
++                    nt = t + 1
++                    gi_n = nt // NB_M
++                    mb_n = nt % NB_M
++                    hq_n = kvh * G + gi_n
++                    offs_m_n = mb_n * BLOCK_M + tl.arange(0, BLOCK_M)
++                    q_ptrs_n = (Q + b * q_sb + hq_n * q_sh
++                                + offs_m_n[:, None] * q_ss + offs_d[None, :] * q_sd)
++                    if MASK_MD:
++                        q_n = tl.load(q_ptrs_n,
++                                      mask=(offs_m_n[:, None] < S) & (offs_d[None, :] < D),
++                                      other=0.0)
++                    else:
++                        q_n = tl.load(q_ptrs_n)
++                    raw_next = tl.dot(q_n, tl.trans(k)).to(tl.float16)
++
+                 gi = t // NB_M
+                 mb = t % NB_M
+                 hq = kvh * G + gi
+                 offs_m = mb * BLOCK_M + tl.arange(0, BLOCK_M)
+-
+-                q_ptrs = Q + b * q_sb + hq * q_sh + offs_m[:, None] * q_ss + offs_d[None, :] * q_sd
+-                if MASK_MD:
+-                    q = tl.load(q_ptrs, mask=(offs_m[:, None] < S) & (offs_d[None, :] < D), other=0.0)
+-                else:
+-                    q = tl.load(q_ptrs)
+ 
+                 # 本轮机制（PART_TILES 的 QK→Vector 交接，FP16 rawQK）：Q/K 仍为
+                 # 原 BF16，tl.dot 内部仍按 FP32 累加；dot 之后先把 rawQK 就近
+@@ -391,7 +445,7 @@
+                 # 本轮机制（自然指数仿射折叠）：rawQK 仍先做 FP16 交接，随后用
+                 # 自然域常数做一次乘/减（raw*X_SCALE-X_OFF），由后端决定是否与
+                 # exp 的 log2e 缩放重结合成单条向量乘加；不写未经确认的 fma。
+-                raw_qk = tl.dot(q, tl.trans(k)).to(tl.float16).to(tl.float32)
++                raw_qk = raw.to(tl.float32)
+                 if NO_OFF:
+                     # 元数据判据命中：去掉 -X_OFF，仅保留一次缩放乘；实数上
+                     # 等价于公共因子整体放大，归一化后抵消。

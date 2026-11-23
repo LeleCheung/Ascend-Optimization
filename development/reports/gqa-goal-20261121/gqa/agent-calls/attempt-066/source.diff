@@ -1,0 +1,47 @@
+--- 
++++ 
+@@ -840,8 +840,10 @@
+             # (b,kvh,hq,行块) 且每 (b,hq) 只写一次；每 worker 串行交接链条数
+             # 约减半，单链在 M 维承载两倍行。内核 AST、全部数学/dtype/FP16
+             # 交接、BF16 PV、FP32 分母与除法、NoOff 守卫、QK 前瞻、20 worker、
+-            # num_stages=2、缓存与输出分配逐字不变。数值上 BLOCK_M 只改 tl.dot
+-            # 的 M 铺排与程序/行块划分，不改变每行 softmax/PV 的归约顺序。
++            # 缓存与输出分配逐字不变；M256 分支的发射选项 num_stages 由 2 改为
++            # 1（见下方 num_stages 单变量实验），本准入判据不变。数值上
++            # BLOCK_M 只改 tl.dot 的 M 铺排与程序/行块划分，不改变每行
++            # softmax/PV 的归约顺序。
+             # 资源未知：raw_next 256x256 f16=128KiB、acc 256x128 f32=128KiB、
+             # Q 256x128 bf16=64KiB 叠加可能超 UB/L0C 196608B 预算；若编译失败
+             # 则如实保留，不回退、不引入额外机制。未命中的形状（case7 S=128、
+@@ -952,16 +954,21 @@
+         SINGLE_KV=SINGLE_KV,
+         PART_TILES=PART_TILES,
+         NB_M=NB_M, TPG=TPG, T=T, P=P,
+-        # 本轮机制（宿主指定单变量实验，仅发射选项）：PART_TILES 分支取
+-        # num_stages=2，其余路径仍为 1。内核 AST、全部数学/dtype/地址、grid、
+-        # 20 worker 分区、num_warps 与 host 快路径缓存逐字不变；num_stages 只
+-        # 影响编译期流水/多缓冲，不进入 constexpr 发射 ABI，故打包元数据与快
+-        # 路径仍一致。PART_TILES 已在缓存键 fkey 中，num_stages 是它的确定
+-        # 函数，编译产物身份保持一一对应。预测后端为内层 tile 循环置位自动多
+-        # 缓冲并把下一 tile 的载入/交接提前；若后端不改二进制或不形成重叠，则
+-        # 按真实无变化记录，不以选项名推断收益。收益与代价由完整四项真机评测
+-        # 及修改后重放判定。
+-        num_warps=1, num_stages=(2 if PART_TILES else 1),
++        # 本轮机制（宿主指定的单变量可逆实验，仅发射选项）：PART_TILES 且
++        # BLOCK_M==128 取 num_stages=2（相对已通过项保持原状），PART_TILES 且
++        # BLOCK_M==256（仅 case4 命中）与其余通用路径取 num_stages=1。目的：
++        # case4 在 BLOCK_M=256 下 ub 需求 294912B>196608B、cc 需求
++        # 262144B>131072B，而 cc 恰为 L0C 容量 2 倍；实际 IR 显示 QK tt.dot
++        # 输出为单块 tensor<256x256xf32>=262144B，但无法从 IR 判定后端是否将
++        # 其内部切成 128 行子块并因 num_stages=2 做双缓冲。把 M256 分支降到
++        # num_stages=1 用于判别该差异：若 cc 仍为 262144B，则单块张量本身超
++        # L0C、num_stages 无效；若降到 131072B，则确有多缓冲放大。内核 AST、
++        # 全部数学/dtype/地址、grid、20 worker 分区、num_warps、缓存/输出分配
++        # 与 host 快路径逐字不变；num_stages 只影响编译期流水/多缓冲，不进入
++        # constexpr 发射 ABI。BLOCK_M 已在缓存键 fkey 中，num_stages 是其确定
++        # 函数，编译产物身份仍一一对应。本注释不以此选项名推断任何收益；是否
++        # 编译通过、精度与耗时均由真实编译及完整四项评测判定。
++        num_warps=1, num_stages=(2 if (PART_TILES and BLOCK_M == 128) else 1),
+         grid=grid, warmup=False,
+     )
+ 

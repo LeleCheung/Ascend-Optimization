@@ -1,0 +1,140 @@
+{
+  "timestamp": "2026-11-21T14:38:01.540232+00:00",
+  "diagnosis": {
+    "source_sha256": "c7de9e3207733ddffca530e3a1650576d5dd940caa608fdab4af1ef53736fba4",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "ir/target.hivm.mlir",
+        "category": "source_ir",
+        "role": "候选机制定位与可编辑点核对",
+        "finding": "_gqa_fwd_kernel_mix_aiv 第 379/387/395/403 行构成每个 tile 的指数链：vmuls(16384 f32, cst_4=0.127517432) -> vadds(cst_0=-1.32223117) -> vmuls(cst_2=0.693147182) -> vexp，四步都在 UB 32768 起的同一缓冲区原地读写，并在 374/382/390/398 各插一条 pipe_barrier<PIPE_V>。cst_0/cst_4/cst_2 在整份模块里只被这条链引用（第 387/379/395 行），第 391 行 %62 与第 392-394 行 %cast_38/%cast_39/%cast_40 只服务第 395 行这条乘法。"
+      },
+      {
+        "path": "compiled-readonly/_gqa_fwd_kernel.ttir",
+        "category": "source_ir",
+        "role": "确认低层产物的数学形态与 P 生产链次序",
+        "finding": "第 99-104 行为 arith.mulf(qk, cst_4) -> arith.subf(常量) -> math.exp2 后接 truncf 到 f16，即 p = exp2(qk*qk_scale - SM_OFFSET)；第 106-110 行的 tt.dot(acc) 在源码序里先于 tt.reduce，与 frozen.py 第 276-281 行的语句序一致。HIVM 用自然底数 vexp 实现 exp2，因此在乘 scale 与 exp 之间多出一趟 ln2 乘法，属后端 lowering 的常量换算残留。compiled-readonly/manifest.json 记录 .npubin 哈希 590ff99abb83fa6e287b39d515b6148df274f15642b448df97fb2e49abd2961e，与本轮 A 侧二进制一致。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "确定龙头停顿位置与流水计数",
+        "finding": "cubecore0 最大单条指令是 pc 0x10d11588 的 WAIT_FLAG_DEVI（UIMM:0 即 flag0，V 侧 MTE3 到 Cube 的 P 就绪信号）10 次共 95.370003us；veccore0 最大两条是 0x10d11d28 的 47.89us 与 0x10d11aa4 的 26.24us（UIMM:0x1 即 flag1，Cube 到 V 的 QK/PV 就绪）。veccore0 的 instruction_calls 为 VECTOR/VMULS 20、VECTOR/BAR 231、VEXP 10、VCONV 32、VCADD 10、VDIV 20；MTE3 的 P 发送 MOV_SRC_TO_DST_ALIGN 10 次共 19.870001us（detail 里 XN:0x20000 即 UB+131072，id:39）。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "simulator",
+        "role": "量化热点区域与等待占比",
+        "finding": "veccore0 的 source 329-336 区域有 504 条指令、累计指令时间 414.060001us、等待累计 271.040001us、最大单条 47.889999us；cubecore0 同一区域有 314 条、累计 368.320002us、等待 196.610004us、最大单条 95.370003us。Cube 侧等 P 是窗口内最大单项停顿，V 侧同时在等 Cube 的 flag1，两侧互为节拍。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "绑定候选与参考的实测口径",
+        "finding": "candidate basic 为 Task Duration 180.023605us、Block Dim 20、Mix Block Dim 40；reference 为 FusedInferAttentionScore 128.082565us、19/38；execution_groups 记录 candidate 20 条、reference 19 条；limitations 明确各流水可重叠、等待与活跃比例只形成假设、不同 block/program 数的每记录均值不可直接归因整任务。"
+      },
+      {
+        "path": "feedback.json",
+        "category": "paired_profiling",
+        "role": "上一轮 IR001 结果与机制诊断",
+        "finding": "IR001 条件 A/B 四块中位 190.78/193.63/186.24/191.36us，汇总 A 191.0714us、B 189.9334us，both_candidate_blocks_faster=false，因此未保留；kernel_before 174.043488us -> kernel_after 180.023605us。mechanism_confirmed 给出同核重放 Psend 46.523..49.065us、sum 46.527..47.118us、PVwait 47.159..52.344us；038 的 Psend 中位 1.7545us、周期 9.549us，IR001 为 1.8795us、10.373us。IR001 只把分母 sum 前移、V 侧工作量未减，周期反而变长。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "时钟资质与观测覆盖范围",
+        "finding": "两核 absolute_time_qualified=false、clock_qualification=relative_only；absolute_unit_validation 用同 PC 非同步、非同步等待区间对齐 CSV，cube 侧 22 个 PC 全部吻合、median_ratio 1.0000000428，vec 侧 52 个 PC 全部吻合、median_ratio 0.9999999776，据此判单位为 us。观测窗口 cube 36.28499984741211-147.20999255380593us、vec 36.2859992980957-147.54303188621998us，覆盖 180.02us 内核约 62%，outside_events 20、application_completed=false，窗口外的泳道与瓦片保持未知。"
+      }
+    ],
+    "hypothesis": "每个 tile 的 p = exp2(qk*qk_scale - SM_OFFSET) 在 HIVM 里被展开成三趟 16384 元素 f32 逐元素运算再加一趟 vexp：先乘 qk_scale*log2e，再减 SM_OFFSET，再乘 ln2，最后由自然底数 vexp 求值。第三趟乘法只承担把 log2e 缩放的指数差换算回自然底数，属可折叠的常量换算：把乘数换成 0.088388349（= qk_scale，即 0.127517432*0.693147182）并把偏移换成 -0.916500810（= ln2*SM_OFFSET），数学上等于同一 exp2 表达式，却可以删掉一整趟原地乘法与其 PIPE_V 屏障。P 的产生链（MTE2 装入 -> VCONV f16->f32 -> 指数链 -> VCONV f32->f16 -> MTE3 发送）由 V 核串行承担，而 Cube 侧最大停顿正是等这条链的 flag0（95.37us/10 次），所以削减该链上真实执行的工作量直接缩短节拍；IR001 只重排时序、工作量不变，与其条件 A/B 无增益、周期 9.549->10.373us 的实测相符。Codex 的证据分析（Psend 退化、sum 与 P 发送重叠、等待下降但周期上升）是本判读的起点，其具体改法列入 alternatives。",
+    "alternatives": [
+      "Codex 建议：保持 IR001 次序，插入一对 MTE3->V 的 set_flag/wait_flag（该方向 EVENT_ID2 当前空闲，ID0/ID1 已分别被 P 发送与 Out 发送占用），让分母 sum 等到 P 的 MTE3 发送完成后再起步。该方向针对 Psend 中位 1.7545->1.8795us 的退化，预测量级 <=0.15us/tile（每核窗口约 1-1.5us），不改数值；本轮先取删除一趟真实运算的改法，此方向作为下一轮可独立登记的机制保留。",
+      "把分母 sum 与比较/选择移回 PV 载入之后（回到原始 038 次序）。IR001 已实测该重排无增益，回退只能回到 174.043488us 的 038 内核锚点，属于旧退步修复，留作对照而非本轮改动。",
+      "把 PV 的 fixpipe 输出由 f32 改为 f16（模块内已有 fixpipe_nz2nd_float_to_half_4d_to_2d），使 FIXP 写回与 V 侧 PV 载入字节减半。该改法把 acc 提前舍入到 f16，改变 out = acc/l_safe 的数值语义，超出调度与常量换算范围，留作需单独数值审查的假设。",
+      "把 reduce_sum 的 98304 工作区挪到不冲突的 UB 偏移，提前释放 V->MTE2 EVENT_ID1。核对 IR 后判定该门控已被跨核链遮蔽：V 在第 364 行用 flag2 通知 Cube 已读完 P，Cube 的 QK_{i+1} fixpipe 才置 flag1，因此下一次 P 装载由 flag1 而非该门控决定，收益接近零。"
+    ],
+    "change": "只改 ir/target.hivm.mlir 的 _gqa_fwd_kernel_mix_aiv：(1) 第 233 行 cst_0 由 -1.32223117 改为 -0.916500810；(2) 第 238 行 cst_4 由 0.127517432 改为 0.088388349；(3) 删除第 390 行的 pipe_barrier<PIPE_V> 与第 391-395 行的 %62、%cast_38、%cast_39、%cast_40 定义及 @vmuls_vs_1d_float(%cast_38, %cst_2, %cast_39, %cast_40) 调用。保留第 398 行屏障继续保护 vadds 到 vexp 的原地读写，%cst_2 常量保留但不再被引用。函数 ABI、所有 buffer 地址与别名、事件对、跨核 sync_block flag、循环边界、AIC 侧全部指令原样。折叠后该链为 vmuls(0.088388349) -> vadds(-0.916500810) -> vexp，数学上等于 exp2(qk*qk_scale - SM_OFFSET)。",
+    "expected": "(1) 指令：每个 tile 少一条 16384 元素 f32 原地 vmuls_vs_1d_float 与一条 pipe_barrier<PIPE_V>；同一观测窗口内 veccore0 的 VECTOR/VMULS 由 20 降到 10、VECTOR/BAR 由 231 降到 221，VEXP/VCONV/VCADD/VDIV 与 MTE2/MTE3/FIXP 指令计数及搬运字节不变。(2) 动态轮次：Block Dim 20/40、外层 tile 循环与内层循环步数、跨核 flag 次数（V 侧 flag0/2/3/4 与 Cube 侧 flag1/2/3/4/5 各保持每 tile 一次量级）全部不变，动态总次数不因本次改动改变。(3) 等待：若 V 侧确为限速方，cubecore0 pc 0x10d11588 的 flag0 等待由 95.37us/10 次下降，veccore0 的 flag1 等待（47.89us 与 26.24us 两条）同步下降；同核重放周期由 10.373us 降到 10.1us 附近或更低，Psend 中位保持 <=1.9us，sum 段相应缩短。(4) 资源：VECTOR 侧 UB 读写各少 64KiB/tile（每核每窗口约 640KiB），VECTOR active_union 与 productive_ratio 相应下降，MTE3/FIXP 字节、Memory.csv 的 MTE2 字节不变。(5) 任务级：Task Duration 由 180.023605us 降到 178.0-179.7us 区间，四例条件中位应低于 183.7017us；若周期与内核时长保持不变或变长，则判定 V 侧一趟乘法对该节拍无贡献，转而验证 alternatives 第 1 项。",
+    "validation": "先确认 MLIR 可解析且 diff 只落在上述两处常量与六行删除；再按 contract 的四例跑官方 checker（阈值与 golden 不变，case1 fp16 允许末位差异）与补充 allclose；最后用与 IR001 相同的条件 A/B 协议（同输入、同 seed、warmup 5、trials 3、迭代 20、四块交错、单一设备锁）测 case4，要求两个 B 块都快于两个 A 块；同时重放同核窗口逐项核对 VMULS/BAR 计数、flag0/flag1 等待区间与 MTE2/MTE3/FIXP 字节的预测兑现情况，偏差写入最终回复。",
+    "layer_reason": "Triton 表达能力：源码写作 p = tl.exp2(qk - SM_OFFSET)，log2e 与 ln2 的换算由后端 lowering 引入，源码里没有可删的独立乘法；若在源码表达同等折叠需改写成 tl.math.exp(qk*(qk_scale*ln2) - SM_OFFSET*ln2)，会更换数学表达并改变源码身份。固定源码实验目的：frozen.py 与本轮源码哈希 c7de9e32 逐字节一致，038 与 045 两个对照锚点保持独立，本轮只用 IR 表达这一控制点，便于把收益单独归到该折叠。IR 控制点：折叠落在 _gqa_fwd_kernel_mix_aiv 的两个 arith.constant 与一条 func.call 上，只触及 AIV 内一条原地逐元素链，AIC/Cube 段、函数 ABI、buffer 地址与跨核事件全部原样，处于 hivm 阶段可编辑范围内。",
+    "simulator_incremental_judgment": "仿真窗口为相对时钟：两核 absolute_time_qualified=false、clock_qualification=relative_only，绝对单位经同 PC 非同步区间对齐后判为 us（median_ratio 1.0000000428 与 0.9999999776），可用于同核同方向的区间比较，跨核绝对先后来自不同采集源，仅作机制诊断。覆盖范围：cube 36.285-147.210us、vec 36.286-147.543us，约占 180.02us 内核的 62%，outside_events 20、application_completed=false，窗口外的泳道与尾部瓦片保持未知，动态总次数的比较只在同一窗口内进行。因此 Psend/sum/PVwait 区间与 95.37us 的 flag0 停顿用于定位机制，不用其比值推算整任务加速；本轮增量判断以可数的指令与字节（少一趟 VMULS、一条 BAR、UB 读写各 64KiB/tile）为主，时间收益由条件 A/B 与重放窗口分别核对。",
+    "unknown": [
+      "一个 Cube 核与两个 Vector 子核配对（Mix Block Dim 40 / Block Dim 20），窗口内每条 PC 只出现 10 次，整核到整任务的缩放关系未定；flag0 停顿按 tile 计，不换算为总时长。",
+      "V 侧与 Cube 侧最终由哪一侧限速只由同核重放推断，需本轮 A/B 与重放窗口复核。",
+      "MemoryUB 表是否单独记录 VECTOR 读写口径在已读材料中未确认，UB 字节预测按通用口径给出。"
+    ]
+  },
+  "diagnosis_sha256": "5586c8bc925f5aad7289be41559732048a0d7cd2d0af6ea3ea7d5c15c0548626",
+  "evidence": [
+    {
+      "path": "ir/target.hivm.mlir",
+      "category": "source_ir",
+      "role": "候选机制定位与可编辑点核对",
+      "finding": "_gqa_fwd_kernel_mix_aiv 第 379/387/395/403 行构成每个 tile 的指数链：vmuls(16384 f32, cst_4=0.127517432) -> vadds(cst_0=-1.32223117) -> vmuls(cst_2=0.693147182) -> vexp，四步都在 UB 32768 起的同一缓冲区原地读写，并在 374/382/390/398 各插一条 pipe_barrier<PIPE_V>。cst_0/cst_4/cst_2 在整份模块里只被这条链引用（第 387/379/395 行），第 391 行 %62 与第 392-394 行 %cast_38/%cast_39/%cast_40 只服务第 395 行这条乘法。",
+      "sha256": "a6740bc8363fbdccf6ce19530d6b7adc5b941acb8bd935e32b19c0ec1dec7d2b"
+    },
+    {
+      "path": "compiled-readonly/_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "确认低层产物的数学形态与 P 生产链次序",
+      "finding": "第 99-104 行为 arith.mulf(qk, cst_4) -> arith.subf(常量) -> math.exp2 后接 truncf 到 f16，即 p = exp2(qk*qk_scale - SM_OFFSET)；第 106-110 行的 tt.dot(acc) 在源码序里先于 tt.reduce，与 frozen.py 第 276-281 行的语句序一致。HIVM 用自然底数 vexp 实现 exp2，因此在乘 scale 与 exp 之间多出一趟 ln2 乘法，属后端 lowering 的常量换算残留。compiled-readonly/manifest.json 记录 .npubin 哈希 590ff99abb83fa6e287b39d515b6148df274f15642b448df97fb2e49abd2961e，与本轮 A 侧二进制一致。",
+      "sha256": "bf34e92ee2781858868378f0bc1d6a30d68db797072e054f20a2e836f450fcc3"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "确定龙头停顿位置与流水计数",
+      "finding": "cubecore0 最大单条指令是 pc 0x10d11588 的 WAIT_FLAG_DEVI（UIMM:0 即 flag0，V 侧 MTE3 到 Cube 的 P 就绪信号）10 次共 95.370003us；veccore0 最大两条是 0x10d11d28 的 47.89us 与 0x10d11aa4 的 26.24us（UIMM:0x1 即 flag1，Cube 到 V 的 QK/PV 就绪）。veccore0 的 instruction_calls 为 VECTOR/VMULS 20、VECTOR/BAR 231、VEXP 10、VCONV 32、VCADD 10、VDIV 20；MTE3 的 P 发送 MOV_SRC_TO_DST_ALIGN 10 次共 19.870001us（detail 里 XN:0x20000 即 UB+131072，id:39）。",
+      "sha256": "c3d2675abaa870afe0b96c957d6bc28847bed42710a7246be0cb209eeecd1c67"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "量化热点区域与等待占比",
+      "finding": "veccore0 的 source 329-336 区域有 504 条指令、累计指令时间 414.060001us、等待累计 271.040001us、最大单条 47.889999us；cubecore0 同一区域有 314 条、累计 368.320002us、等待 196.610004us、最大单条 95.370003us。Cube 侧等 P 是窗口内最大单项停顿，V 侧同时在等 Cube 的 flag1，两侧互为节拍。",
+      "sha256": "c3d2675abaa870afe0b96c957d6bc28847bed42710a7246be0cb209eeecd1c67"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "绑定候选与参考的实测口径",
+      "finding": "candidate basic 为 Task Duration 180.023605us、Block Dim 20、Mix Block Dim 40；reference 为 FusedInferAttentionScore 128.082565us、19/38；execution_groups 记录 candidate 20 条、reference 19 条；limitations 明确各流水可重叠、等待与活跃比例只形成假设、不同 block/program 数的每记录均值不可直接归因整任务。",
+      "sha256": "f4c3d3ab927de54861773197bb56bd23fe10f76a088f5282db000354964c261d"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "上一轮 IR001 结果与机制诊断",
+      "finding": "IR001 条件 A/B 四块中位 190.78/193.63/186.24/191.36us，汇总 A 191.0714us、B 189.9334us，both_candidate_blocks_faster=false，因此未保留；kernel_before 174.043488us -> kernel_after 180.023605us。mechanism_confirmed 给出同核重放 Psend 46.523..49.065us、sum 46.527..47.118us、PVwait 47.159..52.344us；038 的 Psend 中位 1.7545us、周期 9.549us，IR001 为 1.8795us、10.373us。IR001 只把分母 sum 前移、V 侧工作量未减，周期反而变长。",
+      "sha256": "452a793938180f014f553caea0477623dd481f444b47b24030dc4473fa626db5"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "时钟资质与观测覆盖范围",
+      "finding": "两核 absolute_time_qualified=false、clock_qualification=relative_only；absolute_unit_validation 用同 PC 非同步、非同步等待区间对齐 CSV，cube 侧 22 个 PC 全部吻合、median_ratio 1.0000000428，vec 侧 52 个 PC 全部吻合、median_ratio 0.9999999776，据此判单位为 us。观测窗口 cube 36.28499984741211-147.20999255380593us、vec 36.2859992980957-147.54303188621998us，覆盖 180.02us 内核约 62%，outside_events 20、application_completed=false，窗口外的泳道与瓦片保持未知。",
+      "sha256": "c3d2675abaa870afe0b96c957d6bc28847bed42710a7246be0cb209eeecd1c67"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "c7de9e3207733ddffca530e3a1650576d5dd940caa608fdab4af1ef53736fba4",
+    "contract.json": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858",
+    "profiling.json": "f4c3d3ab927de54861773197bb56bd23fe10f76a088f5282db000354964c261d",
+    "hotspots.json": "c3d2675abaa870afe0b96c957d6bc28847bed42710a7246be0cb209eeecd1c67",
+    "timeline.json": "c3d2675abaa870afe0b96c957d6bc28847bed42710a7246be0cb209eeecd1c67",
+    "feedback.json": "452a793938180f014f553caea0477623dd481f444b47b24030dc4473fa626db5",
+    "original-resume-result.json": "57ba44f8c2e869940df05552ee8d093d232e60abd033ca9ee1a2baaf073bbd64",
+    "context.json": "5394e9ef1e2d0208067d71a958f1fb2be79b815ac4d7d89589374a09644357ad",
+    "ir-inventory.json": "9abf5271a6a659c35e5cf3ceb85e33b01c9e47e2ab30d04434ecef02ee25ce91",
+    "diagnosis.json": "86970cd4799e41d84bba9214545094b6b7bbe8a439a995aecf8576d236980a12",
+    "codex-brief.json": "3670a35bb3152ce0ccbe28824e97d495e6d9bf6c911f88c28d233f3edd847a20",
+    "denominator-schedule.json": "f31c6737c63806936f76711e2af7c2f152b1b0518e42e948961bc254f1415476",
+    "original-denominator-schedule.json": "89c18d3f6069472f851c3775f0905f58de604325a56dc64984d6be50a07d4244",
+    "ir/target.hivm.mlir": "a6740bc8363fbdccf6ce19530d6b7adc5b941acb8bd935e32b19c0ec1dec7d2b",
+    "compiled-readonly/_gqa_fwd_kernel.ttir": "bf34e92ee2781858868378f0bc1d6a30d68db797072e054f20a2e836f450fcc3",
+    "compiled-readonly/_gqa_fwd_kernel.bcmlir": "39a0f4e1fb516d7785ff1ca904c39621587fdd173bfed761add7083160940cc7",
+    "compiled-readonly/manifest.json": "ffbda168b127f472b63ff574a4b978f59b422d9f3c9f5bc0019142ee10bb0bd8"
+  },
+  "decision_tool_sha256": "a07440c1a9b5cf6b0aa638f37ee09a5fe4c05340ce7c86b95490f131d19d1edb"
+}

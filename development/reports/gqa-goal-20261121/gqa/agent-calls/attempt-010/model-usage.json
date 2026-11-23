@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 34,
+    "duration_ms": 120253,
+    "usage": {
+      "input_tokens": 59849,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1076864,
+      "output_tokens": 17707,
+      "output_tokens_details": {
+        "thinking_tokens": 8957
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 59849,
+        "outputTokens": 17707,
+        "cacheReadInputTokens": 1076864,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.280352,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 8957,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.280352,
+    "result": "已完成本轮独立资源实验的修改前诊断登记与源码修改，并已进入宿主验收边界。\n\n## 本轮机制（最小、单一）\n\n- **父版本**：qualified negative 009，`candidate.py` sha `92b61659…`（与 `starter-provenance.json` 一致）；accepted006 冻结在 328.4468μs。\n- **只改宿主 metadata 选择**：在 `run()` 中把 `pv_single_f16 = value.dtype == torch.bfloat16` 提前计算；在 `BLOCK_D<=128` 分支内，对**非因果 + V 为 bf16 + `SKV%256==0` + `S%256==0`** 的几何取 `BLOCK_M=256`（`BLOCK_N` 已为 256，即 008 测过的 BM256/BN256）。\n- **完全保留**：kernel 函数体、`tl.dot` 表达式、softmax/概率算术与相加顺序、早置 V 载入与 `bf16→f32→fp16` 转换位置、`PV_SINGLE_F16`/`SINGLE_KV`/`PREFETCH_V`/`MASK_*` 派生公式、`num_warps/num_stages`。case1（64/64）、case2（128/128）、case7（S=128 不满足 256 整除，仍 128/256）不变。判据只用 shape/dtype/causal，不读输入值、不按 case_id 选路。\n\n## 证据与判断\n\n- `workspace/simulator-evidence.json`（实际成功读取）：case4 三核部分窗口，`application_completed=false`；Cube productive 7.84%/wait 17.56%/idle 74.60%，热点为 PV 位置 `WAIT_FLAG_DEVI` 8.13μs；Vector productive 19.52%/wait 20.70%，热点为 QK 位置 8.69μs、早置 V 的 BAR 2.54μs 与 MTE2 等待 2.36μs。热点与流水都指向交接链同步开销，而非算术。\n- `workspace/current-profiling.json`：每程序 cube 1.293μs vs `aic_scalar_wait_id1` 8.549μs；L0C→GM 总量 98304KiB 已与 CANN 持平，墙钟跟 program/链数。\n- `workspace/actual-ir/2-…ttir` 与 `0-…bcmlir`：父版 BM128/BN256，V 载入+转换位于 QK dot 之前；qk 为 128×256 f32（128KiB），M=256 时变为 256×256 f32=256KiB，恰为 008 的 CC 需求。\n- `workspace/previous-result.json`：008 同组合实测 **UB 需求 230912B > 196608B，CC 262144B > 131072B**；本实验即与 230912B 实际对比。\n\n**预期**：最可能仍编译失败，且 CC 仍为 262144B（早置 V 只可能影响 UB 生命周期，不能降低未分块 qk 的 CC 需求）；若意外编译通过，case4 program/链数 512→256，目标耗时有望低于 328.4468μs。失败作为编译器资源结果保留。\n\n## 交接状态\n\n- 修改前决策已登记：`decision_id = 50a5b86ba8b54c468b031948a43bcd26`。\n- 修改后源码 sha：`f8b9e6d4edadc02a7f9640e463ff272cf1f653cddfa455353ba32a9e7535a93b`。\n- preflight 返回 `awaiting_source_review`，**当前候选字节已冻结**，交宿主只读路径/地址边界审查，并按原官方四项 checker、golden、dtype 与计时合同做完整真机评测；实际 UB/CC 字节数、case4 是否低于 328.4468μs、case1/2/7 是否真实不变，待完整结果与修改后重放反馈后回填 `diagnosis.json`。"
+  }
+}

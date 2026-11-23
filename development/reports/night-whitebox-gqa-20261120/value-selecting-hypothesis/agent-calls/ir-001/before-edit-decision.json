@@ -1,0 +1,139 @@
+{
+  "timestamp": "2026-11-20T11:30:26.164805+00:00",
+  "diagnosis": {
+    "source_sha256": "aaf74e7b4c22ef3941480023b67c16a52ec81f9b5071151832cc492d985d532e",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "candidate kernel _vsrb_inner1_kernel 的完整核心计数与带宽",
+        "finding": "Task Duration 151.863 us；write_main_memory 合计 262144 KB，恰为 8192x8192 fp32 的整张输出，写入量无冗余；read_main_memory 每程序均值 4.12 KB。每程序 mte3_time 8.62 us（ratio 均值 0.741）、vec_time 6.87 us（vec_ratio 均值 0.636）、mte2_time 4.06 us（ratio 0.338）、scalar_wait_time 均值 9.20 us。mte3_active_bw 每程序均值 65.9 GB/s（最大 111.4），mte3_instructions 均值 17/程序。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "写入带宽聚合与瓶颈定位",
+        "finding": "512 程序 x 512 KB/程序 = 256 MiB 写入，151.86 us 下聚合写带宽约 1.77 TB/s；MTE3 活跃占比 0.741 并伴随约 0.31 的等待占比，说明存储流水在程序内未能连续发射，存在与向量结果耦合的空档。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "paired_profiling",
+        "role": "热点区域与流水构成排序",
+        "finding": "source_loop（候选源 50-69 行）归集 141 条指令，覆盖 MTE2/MTE3/VECTOR/SCALAR/FLOWCTRL，累计指令时间 743.14 us、等待累计 307.45 us、最大单指令 91.38 us；该累计量仅用于关注度排序，各流水可重叠。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "同核归一化窗口的流水活跃与等待",
+        "finding": "core0.veccore0 首末可见事件窗口内：VECTOR active_ratio 0.9485、MTE3 active_ratio 0.9031 且 wait_ratio 0.1563、MTE2 active_ratio 0.3080、SCALAR active_ratio 0.8202 且 wait_ratio 0.7922、SCALARLDST event_count 10256。单位为窗口分数，绝对时钟资质与未报告泳道保持原样。"
+      },
+      {
+        "path": "ir/893449211de307c7344961e7520d98aa287afd9d2ccaf2b6a671214aad91f6de/_vsrb_inner1_kernel.ttir",
+        "category": "source_ir",
+        "role": "实际 TTIR 循环体",
+        "finding": "每个 scf.for 轮次在整行存储前做：expand_dims(g)+broadcast 到 1x8192 fp32、expand_dims(v)+broadcast 到 1x8192 i32、arith.cmpi eq 8192 元、arith.select 8192 元，然后 tt.store 整行 1x8192；常量 1x8192 零位于循环外。"
+      },
+      {
+        "path": "compiled-readonly/893449211de307c7344961e7520d98aa287afd9d2ccaf2b6a671214aad91f6de/e0d769342f059e04c39cbbe7b342e9598cc782df35d7ecbe8f459b34046200e8/_vsrb_inner1_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "后端低层产物核对冗余消除",
+        "finding": "后端把零常量 linalg.fill 提到循环外（只此一次），但循环体仍保留 linalg.broadcast(g)、linalg.broadcast(v)、arith.cmpi、arith.select 与 materialize_in_destination 的密集选择；同时每轮仍 memref.alloc + memref.copy 单个 i64 与单个 f32。疑似密集选择在后端未被消除。"
+      },
+      {
+        "path": "compiled-readonly/893449211de307c7344961e7520d98aa287afd9d2ccaf2b6a671214aad91f6de/e0d769342f059e04c39cbbe7b342e9598cc782df35d7ecbe8f459b34046200e8/_vsrb_inner1_kernel.ttadapter",
+        "category": "source_ir",
+        "role": "低层张量适配层核对",
+        "finding": "ttadapter 同样显示有效载荷为 1x8192 的 broadcast/cmpi/select 后整行写出，为零填充与选择结构提供与 bcmlir 一致的第二份独立证据。"
+      }
+    ],
+    "hypothesis": "该特化每行输出是 8192 个元素中仅 1 个非零（r==idx 处取 grad，其余为 0）。当前 IR 用每行密集 broadcast+8192 元比较+8192 元 select 生成整行，再整行存储；这份向量工作（vec_ratio 0.636）与 MTE3 存储相互制约，使 MTE3 活跃占比仅 0.741 并带约 0.31 等待。改为：无条件整行写出循环外已常量的零张量，再用一次带范围守卫的动态单位置散点存，把选中的 grad 写到第 idx 列。这样每行向量计算降为零，MTE3 的零流与比较解耦，可在保持逐位语义（零为 +0.0 与 torch.zeros 一致、选中值逐位搬运含 -0.0/NaN/Inf、越界 idx 不散点即全零、与原 select 为假的边界一致）的前提下减少向量与等待成本。",
+    "alternatives": [
+      "保持 IR 原样：向量与 MTE3 均未饱和（0.636/0.741），存在可观测空档，暂不作为首选。",
+      "两段密集掩码存（零掩码 + 值掩码）：会使每行 MTE3 描述符翻倍、写字节近似翻倍，劣于现方案。",
+      "把循环改为每程序连续行块以改善局部性：本轮已用斜式分配保证并发程序聚合连续覆盖，局部性收益无独立证据，且改动面更大，留作后续假设。",
+      "仅调大 num_stages/多缓冲：属编译选项身份、源码与 IR 之外的独立研究，本轮不并入。",
+      "两行合并为 2x8192 单块：UB 约需 192 KB 逼近 216 KB 上限，风险高，留作后续假设。"
+    ],
+    "change": "仅编辑 ir/893449211de307c7344961e7520d98aa287afd9d2ccaf2b6a671214aad91f6de/_vsrb_inner1_kernel.ttir 的 scf.for 循环体：删除每行的 expand_dims/broadcast(g)、expand_dims/broadcast(v)、arith.cmpi、arith.select；先对循环外常量零张量执行一次整行 tt.store（off+arange 的连续指针），再构造 pos=off+trunci(v) 的 1 元动态指针，用 arith.cmpi sge/slt 生成 (v>=0) 与 (v<8192) 守卫掩码，带掩码把 g 散点存入该地址。保留三指针 ABI、constexpr 几何、循环上界与步进、模块属性与 loc。",
+    "expected": "指令：每行移除 1 次 fp32 广播、1 次 i32 广播、1 次 8192 元 cmpi、1 次 8192 元 select；每行新增 1 次 1 元守卫散点存（mte3_instructions 约 17→33/程序），整行零存字节不变。动态轮次：循环迭代数与行覆盖保持 512 程序 x 16 轮、8192 行各写一次，作为执行覆盖核对项。等待：预期 MTE3 wait_ratio 由约 0.31 下降、active 由 0.741 上升，MTE3 零流与比较解耦后连续发射。资源：vec_ratio 由 0.636 降至 0.1 以下、vec_time 由 6.87 us 大幅下降；MTE2 维持约 4.06 us；write_main_memory 维持满输出 262144 KB 加约 32 KB 散点。墙钟：每程序 aiv 由约 11.43 us 预期降至约 9.0-9.8 us，timing-14 任务由 151.86 us 预期至约 128-140 us（约 -8% 到 -16%），该预测以 HBM 写带宽存在高于约 1.77 TB/s 余量为前提。",
+    "validation": "复用固定完整合同 96 例与既有补测；重点核对 timing-14 的逐位一致（atol/rtol 1e-4、matched_ratio 1.0），覆盖有符号零、非有限值、越界与截断索引；核对每个输出位置被写恰好一次、散点存未被同轮零存覆盖；改动前后各做一次模拟器重放；增益接近噪声时触发 ABBA。",
+    "layer_reason": "Triton 表达能力：稀疏写（整行零存 + 动态单位置散点存）在 Triton 语言层可以表达，源码侧可用整行零存再加一次带掩码的标量存改写同一意图；本轮固定源码以隔离编译器变换。固定源码实验目的：在源码、ABI、启动方式不变下，单独验证“删除每行密集选择”能否削减 MTE3 空档与向量成本。IR 控制点：具体控制点是该特化 TTIR 循环体的 broadcast/cmpi/select/store 序列，改动它既保留三指针 ABI 与 constexpr 几何，又能检验后端对带守卫散点存的降级路径。",
+    "simulator_incremental_judgment": "模拟器各泳道为单核归一化窗口分数，绝对时钟资质与观测范围按材料保留，未报告泳道保持未知。累积指令时间与热点等待仅用于排序，流水间可重叠，故不据此断因果。前后重放将分别记录覆盖量与归一化范围，并分别核对 VECTOR 活跃占比是否下降、MTE3 活跃占比是否上升、以及每程序指令与等待变化；比较动态总次数时同步核对行覆盖。",
+    "unknown": [
+      "HBM 写带宽是否存在高于约 1.77 TB/s 的余量；若已在写带宽屋顶，则墙钟下降将小于预测。",
+      "带守卫的 1 元动态散点存在后端是否低效降级，其每轮 MTE3 指令开销是否抵消向量节省。",
+      "两处针对可能重叠地址的 GM 存（整行零存与其内单位置散点）在后端是否保持程序序，避免散点值被随后零存覆盖。"
+    ]
+  },
+  "diagnosis_sha256": "6a7cbed4f6dd56422d1e8f290ba6dee51eefed2100d30e19860cbde3b24a0ff8",
+  "evidence": [
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "candidate kernel _vsrb_inner1_kernel 的完整核心计数与带宽",
+      "finding": "Task Duration 151.863 us；write_main_memory 合计 262144 KB，恰为 8192x8192 fp32 的整张输出，写入量无冗余；read_main_memory 每程序均值 4.12 KB。每程序 mte3_time 8.62 us（ratio 均值 0.741）、vec_time 6.87 us（vec_ratio 均值 0.636）、mte2_time 4.06 us（ratio 0.338）、scalar_wait_time 均值 9.20 us。mte3_active_bw 每程序均值 65.9 GB/s（最大 111.4），mte3_instructions 均值 17/程序。",
+      "sha256": "c3f5db157af6bf609fceb355e3ff9d33a700b1a1b66d63eeb4cbb4215539df90"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "写入带宽聚合与瓶颈定位",
+      "finding": "512 程序 x 512 KB/程序 = 256 MiB 写入，151.86 us 下聚合写带宽约 1.77 TB/s；MTE3 活跃占比 0.741 并伴随约 0.31 的等待占比，说明存储流水在程序内未能连续发射，存在与向量结果耦合的空档。",
+      "sha256": "c3f5db157af6bf609fceb355e3ff9d33a700b1a1b66d63eeb4cbb4215539df90"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "paired_profiling",
+      "role": "热点区域与流水构成排序",
+      "finding": "source_loop（候选源 50-69 行）归集 141 条指令，覆盖 MTE2/MTE3/VECTOR/SCALAR/FLOWCTRL，累计指令时间 743.14 us、等待累计 307.45 us、最大单指令 91.38 us；该累计量仅用于关注度排序，各流水可重叠。",
+      "sha256": "2e5973729156c436dc42a40b9d88d3a1506abaa79f08a4e3f3d097941a0c2e86"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "同核归一化窗口的流水活跃与等待",
+      "finding": "core0.veccore0 首末可见事件窗口内：VECTOR active_ratio 0.9485、MTE3 active_ratio 0.9031 且 wait_ratio 0.1563、MTE2 active_ratio 0.3080、SCALAR active_ratio 0.8202 且 wait_ratio 0.7922、SCALARLDST event_count 10256。单位为窗口分数，绝对时钟资质与未报告泳道保持原样。",
+      "sha256": "8ee00ab37e8def314d7db98cf394d6f4fb9821fd2202cab7ea5f5847d5c00370"
+    },
+    {
+      "path": "ir/893449211de307c7344961e7520d98aa287afd9d2ccaf2b6a671214aad91f6de/_vsrb_inner1_kernel.ttir",
+      "category": "source_ir",
+      "role": "实际 TTIR 循环体",
+      "finding": "每个 scf.for 轮次在整行存储前做：expand_dims(g)+broadcast 到 1x8192 fp32、expand_dims(v)+broadcast 到 1x8192 i32、arith.cmpi eq 8192 元、arith.select 8192 元，然后 tt.store 整行 1x8192；常量 1x8192 零位于循环外。",
+      "sha256": "05c7c8bdbd58580c10fc09cab1a9bc19d8955cb99e55113f832bc6af687e7f98"
+    },
+    {
+      "path": "compiled-readonly/893449211de307c7344961e7520d98aa287afd9d2ccaf2b6a671214aad91f6de/e0d769342f059e04c39cbbe7b342e9598cc782df35d7ecbe8f459b34046200e8/_vsrb_inner1_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "后端低层产物核对冗余消除",
+      "finding": "后端把零常量 linalg.fill 提到循环外（只此一次），但循环体仍保留 linalg.broadcast(g)、linalg.broadcast(v)、arith.cmpi、arith.select 与 materialize_in_destination 的密集选择；同时每轮仍 memref.alloc + memref.copy 单个 i64 与单个 f32。疑似密集选择在后端未被消除。",
+      "sha256": "3a62ba6c117b0d845153722786cb27f53c0690678fccb8be0ca067e008011cb0"
+    },
+    {
+      "path": "compiled-readonly/893449211de307c7344961e7520d98aa287afd9d2ccaf2b6a671214aad91f6de/e0d769342f059e04c39cbbe7b342e9598cc782df35d7ecbe8f459b34046200e8/_vsrb_inner1_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "低层张量适配层核对",
+      "finding": "ttadapter 同样显示有效载荷为 1x8192 的 broadcast/cmpi/select 后整行写出，为零填充与选择结构提供与 bcmlir 一致的第二份独立证据。",
+      "sha256": "8b1122088f24e5fb3bad552eb2b0e9f15818476b2f002bab0c10b5ed9b59cb08"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "aaf74e7b4c22ef3941480023b67c16a52ec81f9b5071151832cc492d985d532e",
+    "validation-policy.json": "7b877397007091f3d1e79ba53ea042d0a756074f769cf785f308b3999864c75f",
+    "contract.json": "244b6579cf2e9531ec6159b40c8599ae368caaf5fbf838a814c607391149148e",
+    "profiling.json": "c3f5db157af6bf609fceb355e3ff9d33a700b1a1b66d63eeb4cbb4215539df90",
+    "hotspots.json": "2e5973729156c436dc42a40b9d88d3a1506abaa79f08a4e3f3d097941a0c2e86",
+    "timeline.json": "8ee00ab37e8def314d7db98cf394d6f4fb9821fd2202cab7ea5f5847d5c00370",
+    "ir-inventory.json": "8628cd8f2bce9c27731203b85866028ee8b94349c961ae826ac359312484efc0",
+    "diagnosis.json": "01bfc44b6f75b5a4ed6125b7d465d8fd2fc5227ac42433012f6c11d390e2831f",
+    "lowered-inventory.json": "2c9d58aa8c769f522cf07442a31f17dd869c89c4015cfd48057c0cc3c6dfc511",
+    "context.json": "d06a24d7e4d50c69b5b8e416f5a6558585c26624c9c393b1a90cf26262c6968f",
+    "codex-brief.json": "c6ece3eb5ce2a940116cb4de09286d3abc705fb7f244f15327d0aafaa52dc666",
+    "feedback.json": "194481303baa0c020fba47766033c76c759c423d4c99f94be80b66867fe89d04",
+    "ir/893449211de307c7344961e7520d98aa287afd9d2ccaf2b6a671214aad91f6de/_vsrb_inner1_kernel.ttir": "05c7c8bdbd58580c10fc09cab1a9bc19d8955cb99e55113f832bc6af687e7f98",
+    "compiled-readonly/893449211de307c7344961e7520d98aa287afd9d2ccaf2b6a671214aad91f6de/e0d769342f059e04c39cbbe7b342e9598cc782df35d7ecbe8f459b34046200e8/_vsrb_inner1_kernel.ttadapter": "8b1122088f24e5fb3bad552eb2b0e9f15818476b2f002bab0c10b5ed9b59cb08",
+    "compiled-readonly/893449211de307c7344961e7520d98aa287afd9d2ccaf2b6a671214aad91f6de/e0d769342f059e04c39cbbe7b342e9598cc782df35d7ecbe8f459b34046200e8/_vsrb_inner1_kernel.bcmlir": "3a62ba6c117b0d845153722786cb27f53c0690678fccb8be0ca067e008011cb0"
+  },
+  "decision_tool_sha256": "5329b40be224e21cb1f1dc6847185b94c25336873cb0a9531771245729f6591b"
+}

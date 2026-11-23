@@ -1,0 +1,68 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "98c755709dd428d0955bfc11a666b679f5afdc412ecb441e1c094568a3805661",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4 候选 kernel 159.603195us；每程序 aic_cube_time 33.109us、aic_scalar_wait_id1 140.765us，Vector aiv_vec_time 49.192us、aiv_scalar_wait_time 9.04us。Cube 侧时间主要花在等待交接而非算术，墙钟由交替的 QK/softmax/PV 交接链决定，而不是 cube 计算量。"
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "trigger",
+      "finding": "三核部分窗口各自归一化、application_completed=false：cubecore0 productive 16.51%/wait 28.48%/idle 55.01%，头部 WAIT_FLAG_DEVI 88.78us(13 次)与 FIX_L0C_TO_DST 22.03us(13 次)；veccore0/1 productive 23.98%/wait 10.29%/idle 65.73%，头部 WAIT_FLAG_DEVI 58.31us(12 次)+31.24us(13 次)、MOV_SRC_TO_DST_ALIGN 25.39us。两侧都在等对方的 QK/PV 交接，支持把独立的下一 QK 塞进当前向量窗口。"
+    },
+    {
+      "path": "workspace/simulator-evidence-full.json",
+      "category": "simulator",
+      "role": "mechanism",
+      "finding": "同一 Cube 窗口的时间序列：QK MMAD 118.396..119.031us、FIX 119.033..120.320us，PV MMAD 124.459..125.094us、FIX 125.096..126.102us，下一 QK MMAD 126.328..126.963us。下一块 QK 在当前 PV 的 FIX 窗口结束后才发射，尽管它只依赖下一 tile 的 q 与同组已驻留 K。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "第 72-115 行 scf.for body 逐字显示单 tile 串行：q load → tt.dot → truncf/extf(FP16 rawQK) → mulf(X_SCALE) → math.exp → truncf bf16(p_bf) → PV tt.dot → truncf/extf(FP16 acc) → FP32 reduce → divf → store；当前无任何下一 tile QK 预取。"
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "background",
+      "finding": "BCMLIR 中同一 tile 的 QK matmul、FIX、exp、PV matmul、归约顺序与 TTIR 一致，确认当前编译产物沿父版本串行结构。"
+    },
+    {
+      "path": "workspace/lookahead-history.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "旧 042 前瞻机制在 038 保留 190.58165us 上得到 190.8117us，未产生新最好；旧 030 也为负结果。它们当时是 FP16 PV 输入、FP32 PV 结果、num_stages=1 与不同指数结构；本轮为 BF16 PV、FP16 QK/PV 交接、num_stages=2、20 常驻 worker 的新组合，故允许重测但保负历史、不宣称新发明。"
+    }
+  ],
+  "hypothesis": "PART_TILES 中同一 KV 组的 K 已整段驻留，tile t+1 的 raw QK 只依赖 q(t+1) 与这份 K，与 tile t 的 softmax/PV 无数据依赖。把 t+1 的 QK tl.dot 在源码顺序上提前到 tile t 的 exp/sum/PV 之前，可让 Cube MMA 与 Vector 的 exp2、FP16 截断、PV 搬出/归一化重叠，减少 Cube idle/wait 与 Vector 等待 QK 的 WAIT_FLAG_DEVI。数学表达式、matmul 操作数与 FP16 舍入点全部不变，预期输出逐位不变。",
+  "alternatives": [
+    "双 tile 展开并在同一迭代发两次 QK：改变 tl.dot 的组织与 UB/L0C 峰值，风险更高，本轮不选",
+    "继续调整归约/PV 语句序（父版本已做）：剩余收益有限，且当前 IR 已是 PV 前的独立降序",
+    "降低概率精度或改分块：改变数值与资源合同，超出本轮单机制范围",
+    "增大 worker 数或改 grid 分配：改变调度而非隐藏交替依赖，且父版本已取 20",
+    "仅依赖 num_stages=2 自动流水：无源码级前瞻时后端未把独立下一 QK 前移，需要显式表达"
+  ],
+  "discriminating_observation": "修改后实际 TTIR/BCMLIR 中 t+1 的 tt.dot 是否在 tile t 的 math.exp 之前文本出现，或模拟器 Cube 窗口是否出现下一 QK MMAD 落在当前 PV/FIX 窗口内；同时 case4 完整四项真机耗时是否低于 154.88710us 且官方 checker 阈值不变通过。若编译产物仍把 QK 排在 PV 之后，则记为无收益。",
+  "change": "仅改 _gqa_tile_part_body 的 PART_TILES 内层：进入组内 tile 循环前先为 t0 预取一次 raw_next = dot(q(t0), trans(K)).to(fp16)；循环携带该 FP16 raw 分数，每次迭代先 raw = raw_next，再在 t+1 < t1 时载入 q(t+1) 并把 raw_next 改写为 dot(q(t+1), trans(K)).to(fp16)，之后才执行逐字不变的 qk=raw.to(fp32)*X_SCALE(或 -X_OFF)、exp、p_bf=bf16、acc=dot(p_bf,v).to(fp16).to(fp32)、FP32 分母 sum、FP32 除法与 store。尾部 t+1==t1 不发 dot，故每组 QK 次数恰为 1+(t1-t0-1)=t1-t0，无多余 tail dot；组边界、tile 归属、MASK_MD/MASK_KV 通用分支、地址、host 缓存、分配、num_stages=2、20 worker 与四项合同全部保持。",
+  "expected": "若后端按源码意图把下一 QK 与当前向量段重叠：case4 低于保留最佳 154.88710us（目标降幅约 3%~10%），cases 1/2/7 记录真实变化；QK matmul 数不变。若 UB/L0C 预算不足：额外循环携带 128x256 FP16 raw(64KiB) + 提前载入 q_next(32KiB)，并与两个 128x256 f32 QK 累加器(各 128KiB L0C)和 128x128 PV 累加器可能同时活跃；编译可能失败或后端重新串行化，此时如实记录，不静默改块大小/数学/选项。数值预期逐位不变（同一表达式、同一 FP16 舍入、同一相加顺序），最终由原四项 checker 以不变阈值判定。",
+  "validation": "先 preflight --source candidate.py；收到 awaiting_source_review 后保持字节交由宿主只读审查与完整四项真机评测；随后用修改后实际 IR/模拟器重放核对编译发射顺序与 case4 真实耗时；保留每个候选源码与证据，不以本轮结果结束搜索。",
+  "selected_layer": "device_source_triton",
+  "layer_reason": "证据指向 Cube/Vector 交替等待而非算术或搬运上限，且该发序可在 Triton 源码循环内表达；host 缓存、分配与合同均无需改动，故只改 PART_TILES 设备源码调度层。",
+  "simulator_incremental_judgment": "热点证据：Cube 侧头部是等 P 的 WAIT_FLAG_DEVI(88.78us/13) 与 FIX_L0C_TO_DST(22.03us/13)，Vector 侧头部是两处 WAIT_FLAG_DEVI(58.31us/12、31.24us/13)，即两侧交替互等；流水证据：cubecore0 productive 16.51%/wait 28.48%/idle 55.01%，veccore productive 23.98%/wait 10.29%/idle 65.73%。新增判断：完整时间序列显示下一 QK MMAD(126.328..126.963us) 落在当前 PV FIX(125.096..126.102us) 之后，说明当前编译产物确实把数学独立的下一 QK 串行化在 PV 之后，本机制有可隐藏窗口。限制：三核为部分窗口且各自归一化，application_completed=false、全调用 completion 缺失，绝对时钟仅相对排序，不能把该窗口相加当正式耗时；收益仍须完整真机四项评测确认。"
+  ,
+  "post_edit_observation": {
+    "candidate_sha256": "19f7fb238946cb9006286d4d222425d07c4ea9fc38a7d4ff85c71c72c49c584a",
+    "preflight_status": "awaiting_source_review",
+    "note": "已在 PART_TILES 内实现组内一深度 QK 前瞻；设备侧编译/真机结果尚未返回。保持候选字节，交宿主只读审查与完整四项真机评测；随后需用修改后实际 IR/模拟器重放核对下一 QK 是否前移，并记录四项真实耗时。"
+  },
+  "unknown": [
+    "Triton/后端是否把条件块内的 t+1 tl.dot 真正前移到当前 exp/PV 之前（源码意图不等于编译顺序）",
+    "额外 FP16 循环携带分数与提前 q 载入是否触发 UB 峰值超限或 L0C 双 QK 累加器重串行化",
+    "case4 之外的 case1/2/7 在该机制下的真实耗时变化"
+  ]
+}

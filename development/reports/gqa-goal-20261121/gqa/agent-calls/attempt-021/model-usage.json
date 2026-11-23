@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 37,
+    "duration_ms": 87388,
+    "usage": {
+      "input_tokens": 56955,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 982656,
+      "output_tokens": 13039,
+      "output_tokens_details": {
+        "thinking_tokens": 5014
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 56955,
+        "outputTokens": 13039,
+        "cacheReadInputTokens": 982656,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.1020780000000001,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 5014,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.1020780000000001,
+    "result": "已完成本轮独立实验的源码实现，并在改动前通过工具桥登记了决策。\n\n**证据与判断**\n- `current-profiling.json`（case4，257.645μs 内核）：vector 每程序 `aiv_vec_time` 12.636μs 与 `aiv_scalar_wait_time` 11.514μs 同量级，`UB_to_GM` 224KiB/程序，说明 PV 后的归一化/写回是实际工作段。\n- `actual-ir/2-_gqa_fwd_kernel.ttir`：PV `tt.dot` 之后依次为 `l_safe` 比较/选择、broadcast、128x128 `arith.divf`、按 `l_new>0` 的 select、`truncf` 与 store —— 归一化完全在 PV 结果读出之后。\n- `simulator-evidence.json`：FIXP productive 0.329 为最高流水，热点为 `FIX_L0C_TO_DST(Dst:OUT)` 与配对 `WAIT_FLAG`；vector 有 `VDIV`/`VSEL`/`VCONV`。模拟器为三核部分窗口（`application_completed=false`、各自归一化），仅用于确认热点方向，不用于全调用归因，也不能证明融合。\n- `previous-result.json`：case4 262.27775μs（trials 262.2967/261.98475/262.27775），native 128.9496μs。\n\n**修改（仅 `_gqa_persist_kv_body`）**\n保持 `p=exp2(qk-m_safe)`、`l_new=sum(p)` 逐字不变；新增 `l_safe`，计算 FP32 `p/l_safe`，把零行保护移到归一化权重上，再转 FP16 做原单次 PV dot；PV 结果直接 `acc.to(Out.dtype.element_ty)` 按原地址/掩码写出，删除 post-PV 除法与 where。非持久回退内核（含原 FP16 两项 PV）、公共入口、分块、grid、启动与编译选项均未动；无新增缓冲或启动。\n\n**数值差异（已事前记录）**：由“FP16 round(p) 点乘 V 后除以 FP32 sum(p)”变为“FP16 round(p/sum(p)) 点乘 V”，舍入对象改为归一化权重（相对误差仍约 2^-11，行和不再精确为 1）；有限合同下权重为正且行最大项为 1 故 `l_new>=1`，`l_safe` 仅为通用全 -inf 行保护，无效行权重精确为 0 → PV 精确零行。原四项 checker、golden、seed、阈值与完整调用保持不变。\n\n**登记与预检**\n- 决策已登记：`decision_id 22696f1b75604a1bbcf81a52192ba152`，绑定父源 `2a98e3…`。\n- `preflight` 返回 `awaiting_source_review`，修改后源码 SHA `0631c7953544e4c5dab66f441ce2d1382288235bd6c03625ab57405b0126ce86`。\n\n现保持该字节不变，交接宿主只读路径/地址边界审查，随后进行修改后实际 IR、成对 profiling/模拟器采集与完整四项真机评测。待反馈后我会依据实际结果更新诊断中的观测与未决问题，并继续下一轮优化。"
+  }
+}

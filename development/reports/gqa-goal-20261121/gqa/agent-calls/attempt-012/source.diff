@@ -1,0 +1,66 @@
+--- 
++++ 
+@@ -160,6 +160,24 @@
+     # 与主 kernel 原路径同为 bf16→f32→f16（两次显式舍入），保证每个 V 元素
+     # 的位型与父版本逐元素一致；被掩码的通道不写出。
+     tl.store(dst, v.to(tl.float32).to(tl.float16), mask=mask)
++
++
++@triton.jit
++def _gqa_v_cast_f16_flat_kernel(V, Vs, N, BLOCK: tl.constexpr):
++    """连续输入快路径：把原 V 展平后一次性 bf16→f32→f16 拷到连续 fp16 scratch。
++
++    本轮机制：原二维打包路径的源地址含 (offs_c//D)*v_sh+(offs_c%D)*v_sd，
++    对 offs_c 非仿射，实际 BCMLIR 把读端降成 16K 次/程序的标量 memref.load。
++    当原 V 连续时，(B,SKV,NKV,D) 的物理展平与连续 scratch 逐元素一一对应，
++    这里直接用一维线性索引，无 div/mod，读端因此可成为连续块搬运。
++    offs 在 program 间互不重叠、program 内 arange 唯一，故每个输出元素恰好
++    由一条掩码通道写一次；只保留 N 边界 mask。
++    """
++    pid = tl.program_id(0)
++    offs = pid * BLOCK + tl.arange(0, BLOCK)
++    mask = offs < N
++    v = tl.load(V + offs, mask=mask, other=0.0)
++    tl.store(Vs + offs, v.to(tl.float32).to(tl.float16), mask=mask)
+ 
+ 
+ @triton.jit
+@@ -447,15 +465,29 @@
+         BLOCK_C = min(2048, triton.next_power_of_2(C))
+         BLOCK_R = max(1, 16384 // BLOCK_C)
+         v16 = torch.empty((B, SKV, NKV, D), dtype=torch.float16, device=value.device)
+-        _gqa_v_cast_f16_kernel[(triton.cdiv(C, BLOCK_C),
+-                                triton.cdiv(SKV, BLOCK_R), B)](
+-            value, v16,
+-            value.stride(0), value.stride(1), value.stride(2), value.stride(3),
+-            v16.stride(0), v16.stride(1),
+-            SKV=SKV, C=C, D=D,
+-            BLOCK_R=BLOCK_R, BLOCK_C=BLOCK_C,
+-            num_warps=1, num_stages=1,
+-        )
++        # 连续输入快路径：原 V 物理展平与连续 scratch 一一对应，用一维线性索引
++        # 让读端成为连续块搬运（消除原二维 (//D,%D) 地址导致的逐元素标量
++        # gather）。仅依据连续性元数据选路，不读输入值、不看 case_id；非连续
++        # 输入仍走原二维 strided kernel。两条路径产出的 scratch 形状与逐元素
++        # bf16→f32→f16 位型完全相同，主 kernel 实参不变。
++        if value.is_contiguous():
++            N = v16.numel()
++            BLOCK_FLAT = 16384
++            _gqa_v_cast_f16_flat_kernel[(triton.cdiv(N, BLOCK_FLAT),)](
++                value, v16, N,
++                BLOCK=BLOCK_FLAT,
++                num_warps=1, num_stages=1,
++            )
++        else:
++            _gqa_v_cast_f16_kernel[(triton.cdiv(C, BLOCK_C),
++                                    triton.cdiv(SKV, BLOCK_R), B)](
++                value, v16,
++                value.stride(0), value.stride(1), value.stride(2), value.stride(3),
++                v16.stride(0), v16.stride(1),
++                SKV=SKV, C=C, D=D,
++                BLOCK_R=BLOCK_R, BLOCK_C=BLOCK_C,
++                num_warps=1, num_stages=1,
++            )
+         V_ARG = v16
+ 
+     grid = (triton.cdiv(S, BLOCK_M), B * NQ)

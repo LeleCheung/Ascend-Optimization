@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 54,
+    "duration_ms": 181921,
+    "usage": {
+      "input_tokens": 76132,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 2729088,
+      "output_tokens": 32373,
+      "output_tokens_details": {
+        "thinking_tokens": 15187
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 76132,
+        "outputTokens": 32373,
+        "cacheReadInputTokens": 2729088,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 2.554529,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 15187,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 2.554529,
+    "result": "本次调用已完成登记、IR 编辑与提交，当前状态 `awaiting_ir_review`，文件保持已提交状态、不再改动。\n\n## 已完成的工作\n\n**材料读取**：context.json、profiling.json、hotspots.json、timeline.json、ir-inventory.json、lowered-inventory.json、frozen.py、feedback.json、codex-brief.json、validation-policy.json，以及 ir/ 下唯一特化 `_gn_kernel.ttir` 和 compiled-readonly/ 内实际 `_gn_kernel.ttadapter`、`_gn_kernel.bcmlir`。源文件、清单、context 与低层产物保持冻结。\n\n**后端冗余核对（关键新观察）**：ttadapter 与 bcmlir 两个实际低层产物都保留了同一结构——第一 `scf.for` 与第二 `scf.for` 各发 8 次 `memref.reinterpret_cast %X + memref.alloc + memref.copy(4096xf32)`，每 program 合计 16 次拷贝、262144B。也就是说“第二遍重复读入”在后端完整存在，属于可由编译器跨循环复用消除、实际下降未消除的具体缺陷。\n\n**证据要点**：timing-7 候选块均值 `aiv_time=8.163us`、`aiv_mte2_time=4.489us`(0.562)、`aiv_vec_time=3.214us`、`aiv_mte3_time=2.137us`；热点第二遍历 60.93us/等待31.83us 为最大关注度；timeline 窗口 106.712→122.475us(15.76us)，absolute_unit_validation=verified(us,21/21 PC)。Codex 的分析贡献已记录：两遍 256KiB/program、MTE2/向量服务量化，并提示须以实际下降核对物理 live-range 与 221184B 共享内存预算。\n\n**登记机制**（decision 桥返回 `decision_recorded`, sha `6b2270e1…`）：跨统计保留首遍输入，消除第二遍 GM→UB 重复搬运。\n\n**实际 IR 编辑**（单一特化、函数 ABI 不变）：\n- 第一 channel 循环展开为 8 次顺序 `tt.load`，得到 `%x0..%x7`，保持原有 `accs/accq` 累加顺序（含首次 `0+x`、`0+x*x`）；\n- 两次 `tt.reduce` 改用展开后的 `%accs_7`、`%accq_7`；\n- 第二 channel 循环展开，直接复用 `%x0..%x7`，仅加载每 channel 的 W/B 标量，保持 `a=rstd*w`、`b2=B-mean*a`、`y=x*a+b2` 逐元素顺序；`OUT+cb` 基址提出循环计算一次。\n- 校验：无残留 `scf.for`/`accq#`，无重名 SSA，`tt.load` 24 次（8 次输入 + 16 次标量）与 `tt.store` 10 次（8 输出 + MEAN/RSTD）符合预期。\n\n**预测（待宿主重放核对）**：输入拷贝 16→8 次、字节 262144→131072/program、总计 16MiB→8MiB；MTE2 服务约 4.489→2.2–2.6us；UB 保留新增 131072B，峰值预估 176–192KiB（预算 221184B，须 CPU 下降确认）；timing-7 设备段约缩短 2–4us（机制级预测，量化对照基线 24.812us）。\n\n**下一步**：宿主先做 CPU 下降（核对 8 次拷贝、UB 容纳、无新增阻塞同步），再跑固定 27 完整合同与既有双 42 补测；若增益与约 2.8% 噪声同量级，沿用既有 ABBA 疑点流程。"
+  }
+}

@@ -1,0 +1,31 @@
+--- 
++++ 
+@@ -229,7 +229,12 @@
+                 else:
+                     q = tl.load(q_ptrs)
+ 
+-                qk = tl.dot(q, tl.trans(k)) * qk_scale
++                # 本轮机制（仅 PART_TILES）：QK dot 的 FP32 结果先窄化到 FP16、
++                # 立即扩回 FP32 再乘 qk_scale，使 fixpipe 的 L0C→DST 可按 16-bit
++                # 搬出；|q·k|<=D=128 在 FP16 范围内安全，相对误差 2^-11（细于
++                # bf16 输入的 2^-8），与父版非逐位相同。代价是若后端不融合该
++                # truncf，则退化为额外的向量转换而不减少 L0C 搬运。
++                qk = tl.dot(q, tl.trans(k)).to(tl.float16).to(tl.float32) * qk_scale
+ 
+                 if MASK_KV:
+                     qk = tl.where(offs_n[None, :] < SKV, qk, -float("inf"))
+@@ -264,7 +269,13 @@
+                 # 可能触及 UB 预算；若后端把 reduce 重排回 conv 之前或为保 p 插入
+                 # 额外拷贝/同步，则本次顺序位移不产生收益。
+                 p16 = p.to(tl.float16)
+-                acc = tl.dot(p16, v16)
++                # 本轮机制（仅 PART_TILES）：PV 累加结果先窄化到 FP16、立即扩回
++                # FP32，再走原 acc/l_safe 归一化；两次 dot 输出的 L0C 搬出因此都
++                # 可按 16-bit 走 fixpipe。先 PV 后 FP32 分母归约的顺序不变。
++                # 数值范围：合同均匀输入远低于 FP16 上限；但 |p|<=2^15、|v|<=1
++                # 的 256 项对齐输入理论上可使 acc 溢出 65504，故本机制仅声明适用
++                # 固定官方 uniform-input 合同，不声称全输入证明或逐位等价。
++                acc = tl.dot(p16, v16).to(tl.float16).to(tl.float32)
+                 l_new = tl.sum(p, 1)
+ 
+                 l_safe = tl.where(l_new > 0.0, l_new, 1.0)

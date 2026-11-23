@@ -1,0 +1,81 @@
+Moore Perf Tools Moore Perf Compute 性能分析 本页总览 Moore Perf Compute 性能分析 
+ 1. 什么是性能分析？ ​ 
+ 性能分析 (Profiling)是识别 GPU 应用程序性能瓶颈的过程。通过分析关键指标，了解内核在 GPU 上的执行效率，找出限制性能的因素。 
+ 性能指标模块 (Sections) ​ 
+ Moore Perf Compute 按照分析目的，将性能指标划分为 3 个模块，在报告中以 Section 形式展示： 
+ Section 用途 LaunchStats 内核启动配置和资源使用情况 MemoryWorkloadAnalysis 内存访问模式分析 SpeedOfLight 计算和内存吞吐量评估 
+ Section 启用说明 LaunchStats 、 MemoryWorkloadAnalysis  和  SpeedOfLight  默认启用。 MemoryWorkloadAnalysis_Chart  与  MemoryWorkloadAnalysis_Tables  用于补充展示内存分析结果，默认关闭，需要在采集时按需启用。 
+ 
+ 2. Roofline 模型 ​ 
+ 2.1 什么是 Roofline 模型？ ​ 
+ Roofline 模型是可视化 GPU 性能上限的有效方式。它直观地显示内核性能与硬件极限之间的关系，帮助开发者快速定位性能瓶颈类型（计算受限或内存受限）。 
+ 信息 下文提到的"峰值 TFLOPS"和"峰值 GB/s"均指 S5000 架构的理论值。 
+ 2.2 物理瓶颈 ​ 
+ 所有 GPU 性能问题最终可归约为三类物理限制： 
+ 性能 = min(计算吞吐, 内存吞吐, 延迟隐藏效率) 
+ 瓶颈类型 物理根源 典型症状 优化方向 计算受限 FP32/FP16/INT8 计算单元饱和 高计算利用率，低内存利用率 减少 FLOPs、使用低精度 内存受限 全局内存带宽饱和 高内存利用率，低计算利用率 合并访问、共享内存缓存 延迟受限 指令流水线停顿 低计算利用率，低内存利用率 提高占用率、减少同步 
+ 关键洞察 在优化之前，必须先识别瓶颈类型。盲目优化可能导致无效工作。 
+ 2.2 Roofline 图表解读 ​ 
+     性能 (FLOPS)       ↑       │                    ╭─────────────── 峰值计算性能       │                  ╱│       │                ╱  │       │              ╱    │       │            ╱      │       │          ╱        │       │        ╱          │       │      ╱ 内存带宽极限       │    ╱              │       │  ╱                │       │╱                  │       └───────────────────┴────────────→ 算术强度      0                  脊点            (FLOPs/Byte) 
+ 区域 诊断 优化策略 脊点左侧 内存受限 增加算术强度（共享内存、数据重用） 脊点右侧 计算受限 减少 FLOPs 或使用更低精度 脊点位置 内存/计算平衡点 算法设计的理论目标 
+ 2.3 算术强度计算 ​ 
+ 算术强度 = 每秒浮点运算数FLOP / 每秒内存带宽总数。 指每从内存中读取一个字节的数据，程序可以执行多少浮点运算（FLOP），单位为 FLOPs/Byte。 对于 GEMM (C = A × B):   FLOPs = 2 × M × N × K              # 每次乘累加算 2 次 FLOP   内存访问取决于数据重用策略：   策略 A: 无重用（每次从全局内存读取）   内存访问 = (M×K + N×K + M×N) × sizeof(FP32)   策略 B: 矩阵 B 完全缓存（典型共享内存实现）   内存访问 = (M×K + N×K) × sizeof(FP32) 示例：M=N=K=1024, FP32, 策略 B   FLOPs = 2 × 1024³ = 2.15 GFLOPs   内存 = (1024² + 1024²) × 4 = 8 MB   算术强度 = 2.15G / 8M = 269 FLOPs/Byte   → 对于 S5000（峰值约 200+ FLOPs/Byte），处于计算受限区域边缘   → 优化方向：增加数据重用（共享内存分块）可进一步提升性能 
+ 
+ 3. 如何使用性能分析工具？ ​ 
+ 3.1 重放机制 (Replay) ​ 
+ 不是所有性能计数器都能在同一时间读取。为了获取完整指标集，需要多次执行内核： 
+ 
+ 3.2 可重现性 (Reproducibility) ​ 
+ 为确保分析结果的可重现性，Moore Perf Compute 会强制串行化执行 kernel： 
+ 
+ 每次运行都会强制 kernel 串行执行 
+ 同一时间只能分析一个进程 
+ 
+ 为什么需要串行化？  并发执行会导致 GPU 资源竞争，引入非确定性的性能波动。串行化可消除这种干扰，确保每次测量的一致性。 
+ 数据差异的可能原因： 
+ 原因 说明 系统负载变化 其他进程占用 GPU GPU 温度变化 散热不良导致降频 后台服务 动态频率调整 
+ 提高可重现性的建议： 
+ # 1. 关闭其他 GPU 程序（将 other_gpu_app 替换为实际进程名） pkill   -f  other_gpu_app # 2. 多次运行取平均值 for   i   in   { 1 .. 5 } ;   do     mcu  -o  run_ $i .mcu-rep ./my_app done # 3. 在稳定环境中测试 
+ 3.3 MUSA Green Contexts 支持 ​ 
+ Green Contexts 是多上下文支持机制，允许多个进程/应用共享 GPU 资源： 
+ ┌─────────────────────────────────────────────────────────┐ │                   GPU                                   │ │  ┌─────────────┬─────────────┬─────────────┐            │ │  │   MPX 0     │   MPX 1     │   MPX 2     │  ...       │ │  │  (Context A)│  (Context B)│  (Context C)│            │ │  │   App 1     │   App 2     │   App 3     │            │ │  └─────────────┴─────────────┴─────────────┘            │ └─────────────────────────────────────────────────────────┘ 
+ 识别 Green Context 结果： 
+ 
+ 报告标题栏的 Attributes 按钮会变成 绿色 
+ Session 页面显示  Green Context Resources  部分 
+ 显示 MPX IDs 和 MP 数量 
+ 
+ 详细使用指南 如需了解 Green Contexts 分析的详细操作步骤和界面说明，请参考  用户指南  中的 Green Contexts 分析章节。 
+ 3.4 内存工作负载分析 ​ 
+ 内存工作负载分析（Memory Workload Analysis）用于帮助您判断 kernel 是否主要受内存访问、带宽或内存指令吞吐限制。该能力由以下三个 section 组成： 
+ 
+ MemoryWorkloadAnalysis ：默认开启，也可以手动取消 
+ MemoryWorkloadAnalysis_Chart ：默认关闭 
+ MemoryWorkloadAnalysis_Tables ：默认关闭 
+ 
+ 这三个 section 可以同时选中，也可以任选其中一个或两个，或者全部不选。 
+ 可以通过以下方式控制采集内容： 
+ 
+ 命令行：使用  mcu --sections <section列表> my_application  指定要采集的 section。常见示例如下： 
+ 
+ mcu  --sections  MemoryWorkloadAnalysis my_application mcu  --sections  MemoryWorkloadAnalysis,MemoryWorkloadAnalysis_Chart my_application mcu  --sections  MemoryWorkloadAnalysis_Chart,MemoryWorkloadAnalysis_Tables my_application 
+ 
+ GUI：在  Connect to process  窗口配置分析任务时，打开  Metrics  配置页面，勾选或取消勾选  Memory Workload Analysis 、 Memory Workload Analysis Chart  和  Memory Workload Analysis Tables  选项 
+ 
+ 采集完成后，相关结果会显示在报告的  Details  页面。 
+ 不同 section 组合下的展示方式 
+ MemoryWorkloadAnalysis  +  MemoryWorkloadAnalysis_Chart  +  MemoryWorkloadAnalysis_Tables ：三者数据统一显示在  Memory Workload Analysis  分区中。展开后，可通过分区右上角的下拉框在  全部（All） 、 内存图表（Memory Chart）  和  内存表格（Memory Tables）  之间切换 
+ MemoryWorkloadAnalysis  +  MemoryWorkloadAnalysis_Chart ，或  MemoryWorkloadAnalysis  +  MemoryWorkloadAnalysis_Tables ：数据仍显示在  Memory Workload Analysis  分区中，但不会出现右上角的下拉切换 
+ MemoryWorkloadAnalysis_Chart  +  MemoryWorkloadAnalysis_Tables ： Details  页面会分别显示  Memory Workload Analysis Chart  和  Memory Workload Analysis Tables  两个独立分区 
+ 只选其中一个 section： Details  页面只显示对应名称的独立分区，即  Memory Workload Analysis 、 Memory Workload Analysis Chart  或  Memory Workload Analysis Tables 
+ 三个都不选：报告中不会显示相关分区 
+ 
+ 多 GPU 场景下，结果会按 device 分别展示；切换 device、kernel 和 launch 时，数据不会混淆。 
+ 如果当前环境不支持相应的 section，采集阶段会给出提示，报告中也不会显示该部分内容。 
+ 理解结果时，通常结合以下几类信息使用： 
+ 
+ 顶部摘要指标： Memory Throughput 、 Mem Busy 、 Max Bandwidth 、 Mem Pipes Busy 、 L1 Hit Rate  和  L2 Hit Rate 
+ Memory Chart ：用图形方式展示 kernel 与缓存、共享内存、设备内存之间的数据流 
+ Memory Tables ：用表格方式汇总共享内存和设备内存的访问统计 
+ 
+ 3.4.1 如何快速判断瓶颈

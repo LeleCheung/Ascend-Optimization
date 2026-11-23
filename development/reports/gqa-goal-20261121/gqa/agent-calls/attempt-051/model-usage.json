@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 46,
+    "duration_ms": 133416,
+    "usage": {
+      "input_tokens": 45564,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1223936,
+      "output_tokens": 19393,
+      "output_tokens_details": {
+        "thinking_tokens": 10307
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 45564,
+        "outputTokens": 19393,
+        "cacheReadInputTokens": 1223936,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.324613,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 10307,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.324613,
+    "result": "已按要求完成本轮机制修改并停在验收边界。\n\n## 本轮实验（attempt-051）\n\n**机制**：`PART_TILES` 内把 softmax 自变量从「exp2 域」改写为「自然指数仿射域」，与 current047 的 FP16 rawQK 交接组合：\n\n```python\nLN2:      tl.constexpr = 0.6931471805599453\nX_SCALE:  tl.constexpr = qk_scale * LN2      # 自然域缩放\nX_OFF:    tl.constexpr = SM_OFFSET * LN2     # 自然域公共偏移\n\nqk = tl.dot(q, tl.trans(k)).to(tl.float16).to(tl.float32) * X_SCALE - X_OFF\nif MASK_KV: qk = tl.where(offs_n[None,:] < SKV, qk, -inf)   # 同一语义边界\np  = tl.exp(qk)\n```\n实数上 `exp(ln2*(raw*qk_scale − SM_OFFSET)) = 2^(raw*qk_scale − SM_OFFSET)`，故 softmax 不变；主机 ABI/缓存键、启动几何、Cube/dot 布局、其他分支（二维 grid 与 causal 路径）逐字未动。\n\n**证据（均已实际读取并绑定）**\n- `workspace/current-profiling.json`：候选 174.563us vs 参考 119.902us；Cube 侧已不劣（cube 33.11 vs 35.42us、L0C 搬出 3276.8 vs 5173.9KB），缺口在 AIV。\n- `workspace/actual-ir/2-_gqa_fwd_kernel.ttir` 97–101 行与 `0-_gqa_fwd_kernel.bcmlir` 93–97 行：exp 之前是**两道独立** 128x256 FP32 张量 `mulf`(0.127517432) + `subf`(1.32223117)，无 fma、无重结合——正是本轮折叠目标。\n- `workspace/previous-result.json`：保留最佳 case1/2/4/7 = 111.56305 / 106.28305 / **175.57260** / 94.68955us，四项 checker 全通过（阈值 0.0078125 未变）。\n\n**数值风险与适用域**（已写入源码注释与 diagnosis）：仅多一次常数舍入（相对 ~1e-7），小于 p 的 FP16 截断 2^-11；指数上界不变（p ≤ 2^15）；依赖合同值域 [-1,1]、单块 fullKV、非因果，与父版依赖一致。未采用未经确认的 `tl.math.fma`，按分离乘/减书写，是否融合交由后端。\n\n**判别观察**：修改后 TTIR/BCMLIR 中该段是否只剩一条 128x256 FP32 乘加（或 exp2 前的 log2e 乘法消失），及 case4 的 `aiv_vec_time`/整调用耗时；若仍是 mulf+subf 两条且耗时不变，则假设否证、保留原最佳。\n\n**决策记录**：`decision_id c6936167266943379a395f1157fd3c10`（修改前登记，绑定父 SHA `3c34fdfb…`）。\n\n## 交接状态\n\n- 预检返回 `awaiting_source_review`；候选字节已固定，当前源码 SHA = `c47c65f013911570d3305b0e02ce62194fe3aeaafc1a2a95c32c891f8fb7c5a1`，不再改动。\n- 请宿主执行只读路径/地址边界审查，随后进行完整四项真机评测（原 checker、golden、dtype 与计时合同不变）与修改后 TTIR/BCMLIR、成对 profiling 采集；完整结果与模拟器重放请回传，用于判定折叠是否真实成立并决定是否取代 175.57260μs。"
+  }
+}

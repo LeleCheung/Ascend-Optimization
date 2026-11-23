@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 50,
+    "duration_ms": 491338,
+    "usage": {
+      "input_tokens": 67003,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 3432192,
+      "output_tokens": 89308,
+      "output_tokens_details": {
+        "thinking_tokens": 75667
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 67003,
+        "outputTokens": 89308,
+        "cacheReadInputTokens": 3432192,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 4.283811,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 75667,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 4.283811,
+    "result": "已登记并落盘，`submit` 返回 `awaiting_ir_review`，本轮保持文件不变，等待宿主审查与完整评测。\n\n## 本轮交接摘要\n\n**层与机制**：`single_operator_ir`，针对 Codex 在 `codex-brief.json` 指出的同步缺口——AIC 只在 PV fixpipe 之后发 `sync_block_set[CUBE,FIX] flag0`，导致 AIV 每 tile 的 rawQK GM→UB 接收被上一轮 PV FIX 完成界定。已按登记的“P-BF16 发送后复用 UB32768..65536 预取下一 rawQK”机制实施。\n\n**实际 IR 改动**（`ir/target.hivm.mlir`，函数 ABI、数值路径、Cube MMA/fixpipe 数学、原 PV flag0/flag1 语义均不变）：\n\n1. **AIV 组首 prefill 到 UB0**：组首 `sync_block_wait flag0` 之后、tile 循环之前，`wait V→MTE2 EVENT0` 后把该组首 tile QK 由 `%view`(map4) 收到 `pointer_cast(0)`，`set MTE2→V EVENT1` 并 `sync_block_set[VECTOR,MTE2] flag2`。\n2. **tile 循环内去掉逐 tile UB0 load**：改为 `wait MTE2→V EVENT1` 后按 `%is_first=(arg11==%22)` 用 `scf.if` 从 UB0 或 UB32768 执行 `vcast_half_to_float`；删除原逐 tile 的 `MTE2→V EVENT0`/`flag2`。\n3. **P 发送后、PV flag0 等待前预取**：在 `set MTE3→V EVENT0`(发 P)、`sync_block_set flag1` 之后、`sync_block_wait flag0` 之前新增 `scf.if(next)`：`set PIPE_MTE3→PIPE_MTE2 EVENT0` → `sync_block_wait[VECTOR,FIX] flag4` → `wait MTE3→MTE2 EVENT0` → 把 `%37`(map7) 的 next QK 收到 UB32768 → `set MTE2→V EVENT1` + `flag2`。\n4. **AIC nextQK FIX 后新增 ready flag4**：`scf.if(next)` 内 nextQK fixpipe 之后 `sync_block_set[CUBE,FIX] flag4`。\n5. **UB0 复用保护重平衡**：删除 reduce 后逐 tile 的 `V→MTE2 EVENT0` set，改为组末 tile 循环之后 set 一次，组首 prefill 前 wait 一次；原初始 set 与末尾 drain 保留。\n\n**事件配对核对**：`flag4` set/wait 各 T-1；`MTE3→MTE2` set/wait 各 T-1（均在 `scf.if(next)` 内，末 tile 成对跳过）；`flag2` 由逐 tile load 后改为“组首 prefill + 每次预取”，动态总数保持 T；`MTE2→V EVENT1` 每组 T 次 set、T 次 wait；`MTE2→V EVENT0` 归还给 PV 单独使用；`V→MTE2 EVENT0` 每组各 1 次（加初始 set/末尾 drain）。GM 双缓冲 map4/map7 的写→读(flag4)→读→写(flag2) 握手在每个 tile 自洽。缓冲仅复用既有 UB0 与 32768..65536，UB 顶点保持 180480B。\n\n**新增观察**：\n- rawQK 接收在模拟器中已被归一化/输出部分重叠（timeline 44.964..46.498us 窗口），本机制收益只来自把下一 QK 接收提前到当前 PV flag0 等待之前，待四例真机确认。\n- `flag2` 的语义从“已读当前 tile”平移为“已读下一 tile”，Cube 每 tile 的 flag2 等待相应提前一拍，这是本次可提前接收的关键；若宿主发现跨组边界 flag2 计数与 Cube 最后迭代等待不匹配，请以实际编译/重放为准修正。\n- 其余事件（flag0/flag1/flag3、`MTE3→V EVENT0/1`、`V→MTE3 EVENT0`）保持原字节，未改动。"
+  }
+}

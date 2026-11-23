@@ -3,11 +3,13 @@ import copy
 import html
 import json
 import math
+import os
 import re
 from pathlib import Path
 
 from .stitched import svg, export_check
 from .render import BG, GREEN, COLORS, text
+from .selection import remeasurement_indices
 
 
 def read(path):return json.loads(path.read_bytes())
@@ -16,16 +18,29 @@ def save(path,value):path.write_text(json.dumps(value,ensure_ascii=False,indent=
 
 def improving(row):
     view=copy.deepcopy(row);kept=[];hidden=[];best=None
-    for event in row['display_events']:
+    remeasurements=remeasurement_indices(row['display_events'])
+    for index,event in enumerate(row['display_events']):
         score=event.get('score')
-        if not kept or (score is not None and (best is None or score>best)):
+        if not kept or (index not in remeasurements and score is not None and (best is None or score>best)):
             kept.append(event)
             if score is not None:best=score
         else:hidden.append(event['id'])
     view['display_events']=kept
     view['progress_view']=True
-    view['connections']=[dict(start=a['id'],end=b['id'],kind='progress_summary',reference_change=False)
-                         for a,b in zip(kept,kept[1:])]
+    positions={e['id']:i for i,e in enumerate(row['display_events'])}
+    original={(c['start'],c['end']):c for c in row['connections']}
+    connections=[]
+    for a,b in zip(kept,kept[1:]):
+        span=row['display_events'][positions[a['id']]:positions[b['id']]+1]
+        proof=[original.get((x['id'],y['id']),dict(kind='unresolved')) for x,y in zip(span,span[1:])]
+        kinds={c['kind'] for c in proof}
+        verified=kinds <= {'same_source','recorded_lineage','recorded_recovery'}
+        switched=kinds <= {'same_source','recorded_lineage','recorded_recovery','documented_method_switch'}
+        connections.append(dict(start=a['id'],end=b['id'],
+            kind='progress_summary' if verified else ('documented_method_switch' if switched else 'unresolved'),
+            reference_change=False,proof=proof,
+            relation='source_ancestry' if verified else ('documented_method_transfer' if switched else 'unresolved')))
+    view['connections']=connections
     view['presentation_hidden_ids']=hidden
     return view
 
@@ -64,8 +79,13 @@ def update_catalog(root, png=False):
             for name in ['mainline.svg','mainline.png','mainline-presentation.json']:
                 (folder/name).write_bytes((origin/name).read_bytes())
             page=(origin/'index.html').read_text(encoding='utf8')
-            page=page.replace('href="details.html"','href="../../native-upsample-contrast-20261118/details.html"')
-            page=page.replace('href="../upsample-performance-20261118.md"','href="../../upsample-performance-20261118.md"')
+            copied={'mainline.png','mainline.svg','mainline-presentation.json'}
+            def relocate(match):
+                href=match.group(1)
+                if href in copied or href.startswith(('#','http:','https:','data:')):return match.group(0)
+                target=(origin/href).resolve()
+                return 'href="'+os.path.relpath(target,folder).replace('\\','/')+'"'
+            page=re.sub(r'href="([^"]+)"',relocate,page)
             page=page.replace('<p><a href="mainline.png">','<p><a href="../index.html">返回总览</a> <a href="delivery-history.html">原交付历史</a> <a href="mainline.png">',1)
             page=page.replace('<summary>轮次映射与原始记录</summary>','<summary>轮次映射与原始记录</summary><p>'+html.escape(replacement['scope'])+'</p>')
             (folder/'index.html').write_text(page,encoding='utf8')
@@ -79,11 +99,16 @@ def update_catalog(root, png=False):
         # Keep a single figure in the active page; evidence remains available on demand.
         page=re.sub(r'<p><a href="method-history.svg">.*?</a></p>','',page)
         page=page.replace('主图数值：重算值与原始成绩','完整数值：重算值与原始成绩')
+        page=page.replace('已接通部分片段，虚线处仍待核实。横向滚动查看全部节点；换参考不算代码优化。',
+            '主图展示最佳性能进展；具体源码继承和方法复用保留在完整证据中。')
+        page=page.replace('已找到根到交付的版本来历。横向滚动查看全部节点；换参考不算代码优化。',
+            '原生起点与版本记录已绑定；主图展示最佳性能进展。')
         page=page.replace('<div class="viewport">','<p>实线展示最佳进展；下降与复测记录保留在详情。标题保留交付成绩。</p><div class="viewport">',1) if '实线展示最佳进展' not in page else page
         (folder/'index.html').write_text(clean_prose(page),encoding='utf8')
         figures.append(chart.replace('<svg ','<svg style="display:block;width:100%;height:auto" ',1))
         records.append(dict(operator=row['operator'],displayed_ids=[e['id'] for e in view['display_events']],
-                            hidden_ids=view['presentation_hidden_ids'],scores=[e['score'] for e in view['display_events']]))
+                            hidden_ids=view['presentation_hidden_ids'],scores=[e['score'] for e in view['display_events']],
+                            connections=view['connections'], full_lineage_verified=row['full_lineage_verified']))
     charts={row['operator']:figure for row,figure in zip(data['operators'],figures)}
     card_pattern=r'<div class="card">.*?</div>'
     cards=re.findall(card_pattern,index,flags=re.S)
@@ -99,6 +124,7 @@ def update_catalog(root, png=False):
     it=iter(cards);index=re.sub(card_pattern,lambda _:next(it),index,flags=re.S)
     records.sort(key=lambda r:(ranks.get(r['operator'],len(ranks)),original_ranks[r['operator']]))
     index=index.replace('仅原生起点允许显示失败叉号。','实线保留最佳进展，下降点收进详情。')
+    index=index.replace('已接通部分片段，虚线处仍待核实','最佳性能进展；方法复用与源码来源见详情')
     index=index.replace('>方法来源占比</a>','>历史方法来源占比</a>')
     index=index.replace('≈：历史耗时重算；交付终点：CANN实测。实线保留最佳进展，下降点收进详情。',
         '交付与后续研究进展。≈：历史耗时重算；实线维护最佳版本，虚线展示下降探索。具体测量范围见各图详情。')
@@ -106,6 +132,8 @@ def update_catalog(root, png=False):
         index=re.sub(r'<p><a href="../native-upsample-contrast-20261118/index.html">.*?</a></p>','',index)
     elif 'native-upsample-contrast-20261118/index.html' not in index:
         index=index.replace('<div class="cards">','<p><a href="../native-upsample-contrast-20261118/index.html">上采样 · 模拟器实验轨迹</a></p><div class="cards">',1)
+    if '../group-meeting-20261119/index.html' not in index:
+        index=index.replace('<div class="cards">','<p><a href="../group-meeting-20261119/index.html">四项模拟器案例 · 固定输入曲线与组会材料</a></p><div class="cards">',1)
     (out/'index.html').write_text(clean_prose(index),encoding='utf8')
     save(out/'progress-presentation.json',dict(policy='strictly improving measured milestones; original evidence unchanged',operators=records))
     if png:export_check(out)
@@ -242,7 +270,7 @@ def upsample(root):
         row=rows[attempt-1]
         assert row['formal']['status']=='PASSED'
         assert all(row['supplementary'][k]['status']=='passed' for k in ['supplementary.json','cann_supplementary.json'])
-        events.append(dict(display_round=display_round,attempt=attempt,score=target(row),
+        events.append(dict(display_round=display_round,attempt=attempt,score=row['formal']['geo_mean'],target_case_speedup=target(row),
             source_sha256=row['output_sha256'],parent_sha256=row['input_sha256'],
             method=method,category=category,decisions=row['decisions']))
     continuation=root/'development/reports/upsample-performance-20261118/continuation.json'
@@ -250,60 +278,15 @@ def upsample(root):
         annotations=read(continuation.parent/'presentation-methods.json')
         for row in read(continuation)['qualified_rounds']:
             annotation=annotations[row['source_sha256']]
-            events.append(dict(display_round=row['display_round'],attempt=row['invocation'],score=row['target_speedup'],
+            events.append(dict(display_round=row['display_round'],attempt=row['invocation'],score=row['geo_mean'],target_case_speedup=row['target_speedup'],
                 source_sha256=row['source_sha256'],**annotation,
                 retained=row['retained']))
-    w,h=(1600 if len(events)<=3 else 2000),1060
-    xs=[180+(w-310)*i/len(events) for i in range(len(events)+1)]
-    high=max(1,math.ceil(max(e['score'] for e in events)*1.15*4)/4)
-    y=lambda s:735-s*400/high
-    native=read(out/'evidence/native-result.json')
-    ns=next(x['speedup'] for x in native['per_workload'] if x['uuid']=='upsample_bilinear2d-timing-1')
-    parts=[f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">',
-        f'<rect width="{w}" height="{h}" fill="{BG}"/>',
-        '<defs>'+''.join(f'<marker id="tip-{cat}" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0 0L6 3L0 6Z" fill="{COLORS[cat]}"/></marker>' for cat in COLORS)+'</defs>',
-        '<g font-family="Microsoft YaHei,Noto Sans CJK SC,sans-serif">',
-        text(52,62,'upsample_bilinear2d',42),text(52,112,f'保留 {max(e["score"] for e in events):.3f}× CANN',30,GREEN)]
-    for k,(cat,label) in enumerate([('paired','Profiling'),('knowledge','知识／经验'),('ir','源码／IR分析'),('sim','模拟器')]):
-        x=w-520+(k%2)*255;yy=55+(k//2)*40
-        parts.extend([f'<path d="M{x} {yy}h23" stroke="{COLORS[cat]}" stroke-width="3"/>',text(x+32,yy+8,label,23,COLORS[cat])])
-    parts.extend([f'<circle cx="{w-510}" cy="145" r="8" fill="{GREEN}"/>',text(w-488,153,'设备kernel',23),text(52,295,'加速比',27)])
-    ticks=[0,.25,.5,.75,1] if high==1 else [0,.5,1,1.5]
-    for tick in ticks:
-        parts.extend([f'<path d="M150 {y(tick)}H{w-65}" stroke="#ded7c9"/>',text(125,y(tick)+9,f'{tick:.2f}×',25,anchor='end')])
-    # Best-performance progression is a presentation summary; source lineage stays in JSON.
-    best=events[1]['score']
-    parts.append(f'<path class="baseline-progress" d="M{xs[0]} {y(ns)}L{xs[1]} {y(events[0]["score"])}" fill="none" stroke="{GREEN}" stroke-width="3.5"><title>原生FlagGems经生成尝试1至5到达第1轮；中间探索与修复见完整证据</title></path>')
-    parts.append(f'<path class="retained-best" d="M{xs[1]} {y(events[0]["score"])}L{xs[2]} {y(best)}L{xs[3]} {y(best)}" fill="none" stroke="{GREEN}" stroke-width="3.5"/>')
-    retained_score=best
-    for i,event in enumerate(events[3:],4):
-        new_best=max(retained_score,event['score'])
-        parts.append(f'<path class="retained-best" d="M{xs[i-1]} {y(retained_score)}L{xs[i]} {y(new_best)}" fill="none" stroke="{GREEN}" stroke-width="3.5"/>')
-        retained_score=new_best
-    parts.append(f'<path class="exploration" d="M{xs[2]} {y(best)}L{xs[3]} {y(events[2]["score"])}" fill="none" stroke="{GREEN}" stroke-width="3" stroke-dasharray="8 8"/>')
-    parts.extend([f'<circle cx="{xs[3]}" cy="{y(best)}" r="9" fill="{GREEN}"/>',text(xs[3],y(best)-30,'保留第2轮',27,GREEN,anchor='middle')])
-    parts.extend([f'<path d="M{xs[0]-9} {y(ns)-9}L{xs[0]+9} {y(ns)+9}M{xs[0]-9} {y(ns)+9}L{xs[0]+9} {y(ns)-9}" stroke="#b84c42" stroke-width="4"/>',text(xs[0],y(ns)-25,f'{ns:.4f}×',27,anchor='middle'),text(xs[0],1005,'FlagGems',25,anchor='middle')])
-    for i,event in enumerate(events,1):
-        x=xs[i];yy=y(event['score']);cat=event['category'];color=COLORS[cat]
-        parts.append('<g><title>'+html.escape(clean_prose(json.dumps(event,ensure_ascii=False)))+'</title>')
-        parts.extend([f'<circle cx="{x}" cy="{yy}" r="9" fill="{GREEN}" stroke="{BG}" stroke-width="2"/>',text(x,yy-23,f'{event["score"]:.3f}×',27,anchor='middle'),text(x,1005,f'第{i}轮',25,anchor='middle')])
-        # Short arrows and nearby labels follow the existing operator main figures.
-        tx=x-90 if i==len(events) else x
-        lines=['边界钳制加载','标量化退步'] if i==3 else [event['method']]
-        label_y=yy-105 if i==2 else yy+(125 if i>=4 else 85)
-        for j,line in enumerate(lines):parts.append(text(tx,label_y+j*33,line,28,color,anchor='middle'))
-        start,end=(yy-75,yy-45) if i==2 else ((yy+90,yy+58) if i>=4 else (yy+50,yy+18))
-        parts.append(f'<path class="method-arrow" d="M{x} {start}L{x} {end}" stroke="{color}" stroke-width="2" fill="none" marker-end="url(#tip-{cat})"/>')
-        parts.append('</g>')
-    parts.append('</g></svg>');chart='\n'.join(parts)
-    (out/'mainline.svg').write_text(chart,encoding='utf8')
-    save(out/'mainline-presentation.json',dict(scope='qualified optimization rounds, target case',events=events,
-        hidden_attempts=[1,2,3,4,7],retained_source=max(events,key=lambda e:e['score'])['source_sha256'],
-        numbering_policy='display rounds 1/2/3 map to generation attempts 5/6/8; repairs remain in full evidence',
-        connection_policy='performance summary across hidden attempts; original source parents preserved'))
-    css='body{margin:24px;background:#fff7e8;color:#1b2434;font:20px/1.6 "Microsoft YaHei",sans-serif}svg{width:100%;height:auto;display:block}a{color:#276980;text-decoration:none;padding:8px 14px;background:#eee7d9;border-radius:8px}details{margin-top:18px}'
-    page=f'<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>upsample_bilinear2d · 优化轨迹</title><style>{css}</style><p><a href="mainline.png">PNG</a> <a href="mainline.svg">SVG</a> <a href="details.html">完整证据</a> <a href="../upsample-performance-20261118.md">续接实验</a></p>'+chart+'<details><summary>轮次映射与原始记录</summary><p>第1、2、3轮分别对应生成尝试5、6、8。其余尝试及修复过程保存在完整证据中。第3轮经尝试7继续修改；虚线展示下降探索，上方实线保留第2轮。第4轮从第2轮最佳源码继续，映射见mainline-presentation.json。原生起点显示目标用例测量，完整合同通过18/24。图中数值采用搜索期间实测，第2轮最终复测为0.790354× CANN。</p></details></html>'
-    (out/'index.html').write_text(page,encoding='utf8')
+    from .research_progress import write_report
+    presentation=dict(operator='upsample_bilinear2d',metric='kgs_full_contract_geo_mean',
+        scope='KGS全合同性能几何平均，相对CANN，profiler计时。原生起点18/24，缺少有效全合同成绩，失败标记无纵轴数值。单用例成绩、方法来源及原始记录保留在事件详情。',
+        events=[dict(label='FlagGems',qualified=False,score=None)]+[
+            dict(**e,label=f'V{e["display_round"]}',qualified=True) for e in events])
+    write_report(presentation,out)
     return out
 
 

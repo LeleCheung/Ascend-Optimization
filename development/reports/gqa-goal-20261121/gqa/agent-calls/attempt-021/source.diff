@@ -1,0 +1,58 @@
+--- 
++++ 
+@@ -98,6 +98,20 @@
+ （case4 约 4 倍、case7 约 2 倍），这是明确的交通代价；QK/softmax/PV/输出
+ 表达式、M128/N256 分块、guard 与精度路径逐字不变。G 不整除 2 时 HG=G、NGRP=1，
+ 与父版本所有权一致，不增加尾 head 掩码。
++
++PV 归一化前移（本轮机制，仅持久分支）：父版本先以 FP16 舍入的未归一化概率做
++单次 PV dot，再对 128x128 的 FP32 累加器做行除法与零行 select；实际 TTIR 在
++PV 之后仍保留 divf/比较/select 的独立向量段，模拟器 cube 窗口的 FIXP 热点也
++落在 L0C→OUT 的搬出与配对接手上。本轮保持 p = exp2(qk - max) 与
++l_new = sum(p) 逐字不变，先算带保护的 l_safe，再算 FP32 的 p/l_safe 并把零行
++保护放到权重上（无效行权重精确为 0，PV 得到精确零行），之后才转 FP16 做原来
++的单次 PV dot；PV 结果直接转 Out dtype，按原地址与掩码写出，删掉 post-PV 的
++除法与 where。数值上这是近似而非等价：舍入对象由未归一化概率变为归一化权重，
++单项相对误差仍约 2^-11，但行和不再精确为 1；有限合同下 l_new >= 1，除法不
++放大。收益代价：删掉 128x128 FP32 除法/broadcast/select，但引入 128x256 的
++权重除法；若编译器把 PV 结果的转换与写出融合为 FIXP 直接输出，还可省去 PV
++结果的 GM→UB 与额外交接，该融合仅作为待检验预测，由实际 IR、profiling 与
++原四项 checker 判定。非持久回退内核（含 FP16 两项分解分支）逐字不变。
+ """
+ 
+ import math
+@@ -183,18 +197,28 @@
+         p = tl.exp2(qk - m_safe[:, None])
+         l_new = tl.sum(p, 1)
+ 
+-        acc = tl.dot(p.to(tl.float16), v16)
+-
++        # 本轮机制：把行归一化前移到 PV 之前。p 与 l_new 的 FP32 表达式不变；
++        # 先由 l_new 得到带保护的 l_safe，再算 FP32 归一化权重 p/l_safe，并把
++        # 零行保护施加在权重上（无效行权重精确为 0，PV 因此得到精确零行），
++        # 之后才转 FP16 参与原来的单次 PV dot。PV 累加器即输出值，可直接转
++        # Out dtype 写回，省掉 PV 之后 128x128 的 FP32 除法、broadcast 比较
++        # 与 select。数值上由「round(p) 点乘 V 后除以 sum(p)」变为
++        # 「round(p/sum(p)) 点乘 V」：舍入对象改为归一化权重（fp16 相对误差
++        # 仍约 2^-11，行和不再精确为 1）。有限合同下 softmax 权重为正且行
++        # 最大项为 1，故 l_new >= 1，除法不放大；l_safe 仅为全 -inf 行的
++        # 通用保护保留。编译器是否把 PV 结果的转换与写出融合进 FIXP 输出
++        # 路径属待检验预测，由实际 IR、profiling 与真机四项 checker 判定。
+         l_safe = tl.where(l_new > 0.0, l_new, 1.0)
+-        out = acc / l_safe[:, None]
+-        out = tl.where(l_new[:, None] > 0.0, out, 0.0)
++        p_norm = tl.where(l_new[:, None] > 0.0, p / l_safe[:, None], 0.0)
++
++        acc = tl.dot(p_norm.to(tl.float16), v16)
+ 
+         o_ptrs = Out + b * o_sb + hq * o_sh + offs_m[:, None] * o_ss + offs_d[None, :] * o_sd
+         if MASK_MD:
+-            tl.store(o_ptrs, out.to(Out.dtype.element_ty),
++            tl.store(o_ptrs, acc.to(Out.dtype.element_ty),
+                      mask=(offs_m[:, None] < S) & (offs_d[None, :] < D))
+         else:
+-            tl.store(o_ptrs, out.to(Out.dtype.element_ty))
++            tl.store(o_ptrs, acc.to(Out.dtype.element_ty))
+ 
+ 
+ @triton.jit

@@ -1,0 +1,108 @@
+{
+  "source_sha256": "0af5d533afea8f4be88e1fd6e0fc4a6ba76fae9a8b1478f7c4b93247fe7ec070",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "本轮首选定量依据：两侧同口径的逐block流水时间、活跃带宽、GM字节守恒与总时长",
+      "finding": "候选（basic Task Duration 41.140823us，Block Dim 512，Current Freq 1650，512 条 block 记录）aiv_time=3.072685us/block、aiv_mte2_time=1.809911us(ratio 0.590062、active_bw 27.240542GB/s)、aiv_mte3_time=1.154888us(ratio 0.390835、active_bw 45.055894GB/s)、aiv_vec_time=0.739323us(ratio 0.248564)、aiv_scalar_time=1.009835us、ub_read/write_bw_vector=74.945/56.578GB/s；参考（Task Duration 55.521111us，Block Dim 40，40 条记录）aiv_time=47.701697us、mte2 19.235742us(30.821GB/s)、mte3 36.741167us(15.989682GB/s)、vec 20.291939us、scalar 32.543394us。字节侧：候选 read_main_memory_datas 合计 24896KB、write 24576KB，参考 24836/24581KB，即候选读比输入理论值(24576KB)只多 1.3%(=320KB，等于 512×3×128B 的偏置重读)，写等于输出理论值，两侧都不存在重复读、写放大或布局拷贝。派生量：每核 (48.625+48.0)KB/3.072685us=31.4GB/s，×40 核=1.26TB/s；整算子 49472KB/41.140823us=1.23TB/s，而参考只有 0.89TB/s。另有 (mte2+mte3)=2.9648us 占 aiv_time 3.0727us 的 96.5%，说明本算子每 block 的时间几乎就是两条 DMA 流水时间的直接相加。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "同核部分窗口的流水占用/等待结构与逐指令关注度，用于判定谁是真正被占满的流水",
+      "finding": "core0.veccore0 窗口 raw_clock_window 110.48799896240234→118.87899835209828（8.39us，relative_only）：MTE2 active 0.859016/productive 0.823143/idle 0.140984，MTE3 active 0.811029 但 productive 仅 0.352086、wait_only 0.458944，VECTOR active 0.864078 而 productive 仅 0.121012、wait_only 0.743066，SCALAR productive 0.056608、SCALARLDST productive 0.152062。top_instructions 里最重的是同步与搬运：4 个 BAR（VEC 三个站点各 3 次调用 4.50/4.66/4.75us，MTE3 一个 4.79us，另有 BAR ALL 3.04us），MTE2 侧 MOV_SRC_TO_DST_ALIGN(Dtype:B16, XD:X7=0x4280 / X3=0x2280 / X5=0x280) 各 2-3 次调用 2.86-4.15us，且每条搬运都伴随 MOV_SPR_XN(SPR:MOV_PAD_VAL,XN:X8=0)。MTE2 的 idle 段集中在 0.704564→0.749256(0.0447 窗口≈0.375us) 与 0.939102→1.0(0.0609≈0.51us)，即程序边界/尾部，不是循环体内的缺口。instruction_calls_by_pipeline：SCALAR 765、VECTOR 77、MTE2 60、MTE3 34、FLOWCTRL 33、ALL 1。absolute_unit_validation=verified、unit=us、22 个非同步 PC 的 median_ratio=0.99951，因此逐指令时间可作微秒量级核对，但窗口为部分截取、clock_qualification=relative_only。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "绝对时钟资质、观测范围与未报告泳道的解释",
+      "finding": "capture_start=0、capture_end=1、capture_scope='First to last visible hardware event on this core; partial capture boundaries preserved.'，clock_qualification=relative_only、absolute_time_qualified=false，activity_includes_wait=true（MTE2/MTE3/VECTOR）而 SCALAR/SCALARLDST 为 false。同一窗口内 MTE2 productive 0.823143、MTE3 0.352086、VECTOR 0.121012、SCALAR 0.056608、SCALARLDST 0.152062；ALL/CACHEMISS/FLOWCTRL 三个 auxiliary_trace_lane 的 idle 0.99988/0.99845/0.99964 表示未报告为主计算泳道、窗口内几乎无事件，不据此推断核空闲或瓶颈。故本轮只用窗口内相对占比判断'哪条流水在忙、谁在等谁'，绝对耗时一律取自 profiling 的逐 block 均值与 Task Duration。"
+    },
+    {
+      "path": "ir/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttir",
+      "category": "source_ir",
+      "role": "当前最佳的真实编译输入（唯一可编辑对象），用于核对 Codex 指出的 padding/mask 疑似冗余是否存在",
+      "finding": "本特化只有一条路径：BLOCK_S=64、BLOCK_D=64、GROUP=2、EXACT=true，stride_qkv_d/stride_bias/stride_out_d 已被 constexpr 消去。全文件没有任何 tt.load 的 mask/other、没有 arith.select、没有 scf.if：三次偏置 tt.load 与循环内六次 tile tt.load 都是无掩码全块载入（第 38-44、74-80 行），因此'未被有效输出消费的 padding/零填充'在本 IR 里根本不存在可删对象。循环为 scf.for %i=0..2（仅在 2 次迭代，带 tt.num_stages=2），体内是 3 load→vector→3 store 的单链，地址为 (batch*stride_qkv_b + rows*stride_qkv_s)[:,None] + (head*head_dim + offs_d)[None,:] 的二维仿射。"
+    },
+    {
+      "path": "compiled-readonly/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "按 lowered-inventory 清单核对疑似冗余是否在后端已消除（冻结产物，只读）",
+      "finding": "已消除：TTIR 的全部指针/索引张量（in_cols 的 splat+expand+broadcast、k_val/v_val 的 splat(hidden_dim) 指针加、out_off 的二维广播求和）在后端折叠成标量 base offset（%23=%18+%21+%6 等）+ memref.reinterpret_cast，循环体内只剩 6 条 memref.copy（源 memref<64x64xf16, strided<[%stride_qkv_s,1]>>）与 3 条 bufferization.materialize_in_destination（目标 strides [%stride_out_s,1]，因 stride_out_s=head_dim=64 即整块 8KB 连续）。没有 scf.if、没有 mask/select、没有逐元素 LD/ST、没有额外 layout 拷贝；偏置只展开为 linalg.broadcast（每轮一次），q 的 f32 路径为 extf→linalg.broadcast+addf→linalg.fill(scale)+mulf→truncf，逐轮各一次。ttadapter(sha 6955cc56) 结构一致（3 条 memref<64xf16> 偏置 copy + 6 条 tile copy + 6 条 materialize）。结论：索引冗余、掩码填充、多余物化这三类疑似缺陷在后端产物中均不存在或已折叠，不能作为本轮机制。"
+    },
+    {
+      "path": "compiled-readonly/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "同符号的另一份实际低层产物，用于确认 q 与 k/v 依赖链的异步程度以及 store 的发射依赖",
+      "finding": "循环体内三条 store 都以同一条 VEC→MTE3 同步（FLAGID 2）为前提，而 q 的 store 依赖链最长：q_res 需经 extf→broadcast(f32)→addf→fill(scale f32)→mulf→truncf 六个张量遍才产生 tensor<64x64xf16>，k_res/v_res 只需 broadcast(f16)→addf 两遍；三条 store 彼此没有数据依赖，却按 q、k、v 的顺序串行发射，导致 MTE3 的第一条指令被 q 链拖住。ttadapter 与 bcmlir 结构逐条一致（列表 sha 见 lowered-inventory.json），确认该顺序来自 TTIR 的书写顺序而非某个后端 pass 的再调度。"
+    },
+    {
+      "path": "prior-explorations.json",
+      "category": "paired_profiling",
+      "role": "八轮历史实测（避免重复同一机制），并给出唯一可能的读侧粒度改法的既得结果",
+      "finding": "保留基线 62.860936us。已实测：ir-001 显式展开两轮并把 6 次载入全部提前（即'让第0块向量+存储与第1块载入重叠'）→63.029176us 无收益；ir-003 4×32行+ns2→63.516478us；ir-006 配对头（行内连续段 128→256B）+[32,2,64]三维 store→94.184119us（目标用例 −50%，且 min_speedup 掉到 0.974）；ir-007 循环不变量外提（bias/scale 物化移出循环）→63.038187us；ir-008 单块[128,64]、去循环→63.665698us。即'加深/减少流水、展开与预取、分组几何、不变量外提、加宽读突发'五类都已占据，且加宽读突发是唯一物理上能提升 MTE2 每字节效率的方向，实测反而大幅退步。"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "source_ir",
+      "role": "宿主（Codex）证据分析与候选方向，本轮须核对其假设并说明贡献",
+      "finding": "Codex 提出：上一阶段删除'不影响有效输出的 masked-load 填充值'后零填充 3→1、条件区域 2→0、目标耗时约 −7.99%；要求核对 QKV 当前实际 IR 中未被有效输出消费的 padding 是否仍导致指令/条件工作。核对结果（见 ir 与 bcmlir 两条证据）：该假设对本算子不成立——QKV 的 EXACT 特化没有任何掩码，热点的 MOV_SPR_XN(MOV_PAD_VAL,XN:X8=0) 不是掩码填充，而是后端为每条 MTE2 描述符固定下发的 pad 寄存器设置（无掩码时同样存在，id:18/20/22/24/26 与每次 copy 一一对应），其 running_time 与相邻 MOV_SRC_TO_DST_ALIGN 几乎相同（2.86/3.69/4.15us 三组同值），说明它记录的是 MTE2 队列占用/排队时间而非新增工作；同时 read_main_memory_datas 只比输入大 1.3%（仅偏置重读），没有任何零填充字节被搬入。故'条件区域与零填充'在本算子已无成本，Codex 的机制在此不可复用；其'转向真实热点'的要求由下一条 hypothesis 回答。"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "正式与补测结果，确认当前身份与保留基线",
+      "finding": "parent_result：21/21 PASSED、abs_err=rel_err=0、geo_mean 1.668840、min_speedup 1.361835（worst=timing-8）、target timing-2 0.062860935ms/1.452447x；context 的 baseline 复核记录 expected/observed npubin sha 一致（92cc78be…）、complete_passed 21，即当前最佳就是'原源码 + 原 IR'这一组合，本轮不得改变源码或低层产物身份。"
+    }
+  ],
+  "hypothesis": "Codex 的 padding/mask 假设在本算子不成立（EXACT 特化零掩码，热点的 MOV_PAD_VAL 是后端为每条 MTE2 描述符固定下发的 pad 寄存器设置，耗时口径与相邻 copy 排队时间同值，且主存读字节只比输入多 1.3% 的偏置重读，没有任何零填充流量）。按 codex-brief '选择当前真实热点对应的另一处问题'的要求，本轮把诊断落在真实热点对应的另一处成本上：本算子是字节流受限（每 block 3.0727us 中 mte2 1.8099 + mte3 1.1549 = 2.9648us 占 96.5%，读 48.625KB/写 48.0KB 已是理论最小，整芯片 1.23TB/s 比 CANN 参考 0.89TB/s 高 38%），因此可争取的不是减少字节，而是把已经算好的结果更早交给 MTE3，让 VECTOR 的长依赖链与排队中的 DMA 重叠。当前 TTIR 循环体把三份结果按源码书写顺序 q→k→v 发射，恰好使依赖链最长的一条挡在最前面：q 路径是 f16→f32 的 extf、bias 的 expand/extf/broadcast(f32)、addf(f32)、scale 的 splat(f32 16KB)、mulf(f32)、truncf 共 6 个 f32 张量遍（bcmlir 第 78-87 行），而 k/v 路径只是 f16 的 broadcast(8KB)+addf(8KB)（第 89-92 行），两者就绪时间相差约 3-5 倍；但 MTE3 的第一条 store 必须等 q 链完成（热点里 MTE3 的 WAIT_FLAG(PIPE:VEC,FLAGID:2) 3 次调用合计 6000 cycles/3.64us，VECTOR wait_only 0.743 而 productive 仅 0.121），于是每次迭代都白白让 MTE3 空闲一段等于'q 链减去 k/v 链'的时间。把发射顺序改为'k 链→store k→v 链→store v→q 链→store q'后，k/v 的 8KB 连续性写可以在 q 的 f32 链开始之前就进入 MTE3 队列，并与之重叠；每个元素的计算图、舍入次数、f16/f32 路径、地址与覆盖完全不变，只是把三条互不依赖的 store 与各自的依赖链重新排序。这是编译器本应在调度阶段完成的'按就绪时间而非书写顺序发射'，在该特化下没有做。",
+  "alternatives": [
+    {
+      "id": "A",
+      "description": "（选中）把循环体内三条互不依赖的 store 由书写顺序 q→k→v 改为'k 链→store k→v 链→store v→q 链→store q'，让就绪最早的两条 8KB 连续写先进入 MTE3，与最长的 f32 q 链重叠",
+      "assessment": "选中：机制单一、可独立验证，语义逐元素不变（每元素仍是 q: f16→f32 加 bias→f32 乘 scale→一次 truncf；k/v: f16 加 bias），不新增指令、不改地址/覆盖/别名/ABI/grid/字节量，风险仅为'后端本来就按依赖调度，改序后等价'，此时结果为持平而非退步。"
+    },
+    {
+      "id": "B",
+      "description": "保持 IR 原样交接，把'字节流已到顶（1.23TB/s、mte2+mte3=96.5%）'作为结论",
+      "assessment": "作为唯一结论已被否掉：它与'r/w 相加'的观测一致，但漏掉了一条仍可测的顺序成本——q 链挡住 MTE3 首发（热点里 MTE3 的 WAIT_FLAG 3 次 6000 cycles、VECTOR wait_only 0.743）。该顺序成本不需要改字节、改网格或改几何即可消除，属于尚未被 ir-001/003/006/007/008 占据的独立机制。"
+    },
+    {
+      "id": "C",
+      "description": "合并三次 128B 偏置载入为一次 [3,64] 或 [2,64] 的 copy",
+      "assessment": "不可实现：三处使用点需要三个独立 tensor<64xf16> 与三个 [64,64] tile 广播，而 tt.split 只允许最后一维为 2；用 [.., 2] 排布会让最内维 stride 变成 hidden_dim(1024)，后端只能退化成两次 128B copy，收益归零；收益上界也只有 2 条/25 条 MTE2 指令并被程序边界空闲吸收。"
+    },
+    {
+      "id": "D",
+      "description": "手工交错两个 tile 的 load/store（绕开 ns=2 多缓冲）",
+      "assessment": "已实测否证（ir-001，63.029us）：'6 次载入全部提前'已实现 load(tile1) 与 store(tile0) 的在飞重叠，无收益；说明 r/w 两条 DMA 受同一 GM 带宽约束，故本轮不再把'让 load 与 store 重叠'作为机制，只压缩同一条依赖链上的就绪延迟。"
+    },
+    {
+      "id": "E",
+      "description": "把行内连续段由 128B 加宽到 256B（相邻两 head 同 program，保持 8KB tile 与 512 网格）",
+      "assessment": "物理上是提升读侧每字节效率（27.24GB/s 对写侧 45.06GB/s）的唯一表达方式，但已实测大幅负结果：ir-006 的 [32,128]+reshape→[32,2,64] 三维 store 在目标用例上 94.184us（−50%）；二维仿射 store 无法表达两 head 相距 stride_out_h 的输出，绕过三维 store 又需要 tt.split 无法提供的二维切分。"
+    },
+    {
+      "id": "F",
+      "description": "减少循环体向量物化（bias 广播与 16KB scale fill 外提）或改循环几何（单块 [128,64] 去循环、4×32 行加深流水、ns=1/ns=3）",
+      "assessment": "均已实测：ir-007（外提，63.038us）、ir-008（单块去循环，63.666us）、ir-003（4×32+ns2，63.516us）、ir-002（ns3，未获实测）——都不改善 block 时间；本轮不再重复。"
+    },
+    {
+      "id": "G",
+      "description": "把 512 块启动网格改为每程序覆盖更多行以减少波次与程序边界 MTE2 空闲",
+      "assessment": "禁止：grid = batch*num_heads*num_groups 由冻结的 frozen.py 依 BLOCK_S/BLOCK_D/GROUP 唯一决定，源码与 ABI 均不可改；程序边界 MTE2 空闲（窗口内 0.375us 与 0.51us 两段、idle_ratio 0.141）只能靠减少块数消除，属宿主层。"
+    }
+  ],
+  "change": "只编辑 ir/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttir 的 scf.for 循环体内顺序（同一机制、同一特化）：把原来的 'q 链 → k 链 → v 链 → store q → store k → store v' 改为 'k 链 → store k → v 链 → store v → q 链 → store q'，即先算并先写 k/v 两个短的 f16 结果，再算 q 的 f32 链并最后写 q。所有 SSA 定义仍在使用之前，操作数、张量类型、地址表达式（in_cols/out_off、k_shift/v_shift、bias 指针）、tt.load 与 tt.store 的指针、循环边界(0..2)、tt.num_stages=2、函数签名与参数顺序全部逐字不变；不新增/删除任何算子节点类型，不改变 q 的 f16→f32 加 bias→乘 scale→单次 truncf 的舍入次数、k/v 的 f16 加法、无掩码路径与别名关系（三次 load 仍全部先于任何 store）。frozen.py、ir-inventory.json、lowered-inventory.json、compiled-readonly/ 下的 ttadapter/bcmlir/npubin 与所有证据文件保持逐字节不变。",
+  "expected": "可测预言（基准：target_case=transform_bias_rescale_qkv-timing-2，current_best=0.062860935ms/62.861us；paired Task Duration 41.140823us；逐 block aiv_time 3.072685us、mte2 1.809911us、mte3 1.154888us、vec 0.739323us）：(P1) 语义必须逐位不变：21 项正式 + 两份 48 项补测全部 PASSED，abs_err=rel_err=0、matched_ratio=1.0（本改动只重排互不依赖的 store 与其依赖链，任何非零误差都说明我的编辑破坏了 SSA 或语义，应立即判为失败）。(P2) 若'q 链挡住 MTE3 首发'这一机制成立，应看到 VECTOR 的 productive 段与 MTE3 的 productive 段在时间上更靠前并部分重叠：每 block aiv_mte3_time 基本不变或略升（1.15us 量级），但 (mte2+mte3)/aiv_time 由 0.965 下降到 ≤0.93，aiv_time 由 3.0727us 降到 ≤2.95us（≥4%），对应 Task Duration 41.14us → ≤39.5us、timing-2 延迟由 62.861us 降到 ≤60.5us；热点侧应看到 MTE3 的 WAIT_FLAG(PIPE:VEC,FLAGID:2) 累计时间下降、VECTOR 的 wait_only 由 0.743 下降。(P3) 若后端本来就按依赖调度、改序等价，则上述计数不变（±1%）、延迟落在 62.86±0.3us，此时应保留原 IR 并把结论记为'顺序不是成本'。(P4) 字节守恒：read_main_memory_datas 仍 ≈24896KB、write ≈24576KB（±0.5%）；读出变大说明引入了重复读，写入变小说明覆盖不全。",
+  "validation": "宿主侧完整核验：(1) 语义与覆盖：完整 21 项 KGS + 两份 48 项补测全通过，abs_err=rel_err=0、matched_ratio=1.0、无 NaN/Inf 回归；(2) 编译：该 TTIR 必须能被原生 MLIR 解析并完成 Ascend lowering（本轮只做纯节点重排，无新算子、无属性改动，若解析/降级失败说明编辑破坏了 SSA 顺序，按失败处理）；(3) 性能：与保留基线做同批 ABBA，按 P2/P3 的阈值判读（≥4% 为机制成立，±1% 为机制不成立），不以本诊断文档或预检当作收益；(4) 片上复核 P2/P4：复采 profiling 后核对 aiv_time/aiv_mte3_time/(mte2+mte3)/aiv_time、read_main_memory_datas=24896KB、write=24576KB，并用 hotspots 复核 MTE3 的 WAIT_FLAG 与 VECTOR wait_only 是否下降；若 aiv_time 未降而 MTE3 wait 下降，则判为'顺序改善但被带宽吸收'。",
+  "layer_reason": "缺陷位于 TTIR 层的指令发射顺序：三条 store 及各自的依赖链在 IR 中按书写顺序串行排列，而它们的就绪时间相差 3-5 倍（q 的 f32 链 6 遍张量运算 vs k/v 的 f16 链 2 遍），这一顺序是后端从 TTIR 逐字继承的（ttadapter/bcmlir 中 store 顺序与 TTIR 一致），因此它是本层可直接消除的具体成本；它不属于已冻结的源码算法、不属于编译选项、也不是低层产物里的索引冗余（后端已把索引折成标量基址 + reinterpret_cast + memref.copy）。在源码、ABI、grid 与 compiled-readonly 产物都冻结的前提下，唯一既能落地又可被本层完整验证的改动就是单算子 TTIR 的发射顺序。",
+  "simulator_incremental_judgment": "窗口资质：hotspots/timeline 覆盖 core0.veccore0 的首末可见硬件事件区间 raw_clock_window 110.48799896240234→118.87899835209828（8.39us），clock_qualification=relative_only、activity_includes_wait=true，属部分截取窗口，不能当作核函数时长（正式 62.86us）或 Task Duration(41.14us) 的同一次绝对计时；但 hotspots 的 absolute_unit_validation=verified（unit=us、22 个非同步 PC median_ratio 0.99951）说明逐指令时间可按微秒量级读取，故我只用它做'谁在忙、谁在等'的结构判断，绝对耗时一律取自 profiling 的 512 条 block 记录。可增量采信的相对结构：MTE2 productive 0.8231 是唯一接近饱和的主流水，MTE3 productive 仅 0.3521（wait_only 0.4589）、VECTOR productive 仅 0.1210（wait_only 0.7431）；top_instructions 里 MTE3 的 WAIT_FLAG(PIPE:VEC,TRIGGERPIPE:MTE3,FLAGID:2) 3 次调用合计 6000 cycles/3.64us，正是'MTE3 在等 VEC 交出数据'的直接证据，而 VEC 交出的第一条数据恰是依赖链最长的 q。因此本轮的增量判据是'MTE3 的等 VEC 时间是否前移/缩短、aiv_time 是否下降'，其余泳道不作为因果依据；MTE2 的 idle_ratio 0.1410 集中在 0.7046→0.7493 与 0.9391→1.0 两段（约 0.375us 与 0.51us）位于程序边界，属冻结的 512 块启动网格决定的结构成本，本轮不动也不据此宣称收益。未报告泳道：ALL/CACHEMISS/FLOWCTRL 为 auxiliary_trace_lane（idle 0.99988/0.99845/0.99964），按材料解释为窗口内几乎无事件、不参与瓶颈或收益归因；SCALAR/SCALARLDST 的 activity_includes_wait=false，productive 0.0566/0.1521 仅为标量发射与描述符下发占用。",
+  "unknown": [
+    "本芯片 GM 混合读写时的实际可达总线速率未在材料中给出（只有候选 1.23TB/s 与参考 0.89TB/s 两个实测点），因此'相加=总线约束'仍是推断而非厂家规格；若宿主能给出该芯片读写混合峰值，可直接判定是否真到顶。",
+    "ir-006（配对头 + 三维 store，94.18us）的退步原因无法从现有材料定位到具体降级（三维 store 退化为多次 4KB 事务、reshape 未折叠、或 UB 分配退化），因此'加宽读突发不可行'这一否证仍可能被更干净的实现推翻（例如在 UB 内先转置再二维 store）。",
+    "后端为每条 MTE2 描述符固定下发 MOV_PAD_VAL/SET_FLAG（无掩码时同样存在），这部分指令在 25 条/block 的 MTE2 计数里占多少、是否随 copy 形状变化，本层不可改也不可测，只能作为后端层缺陷登记。"
+  ]
+}

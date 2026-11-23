@@ -1,0 +1,109 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "29601a4946584a4da0bad8324e8c8aa8",
+  "recorded_at": "2026-11-21T08:12:19.664933+00:00",
+  "round_id": "attempt-004",
+  "input_source": {
+    "path": "trace/sources/23d7322958578d08372dfd9f830f7dc251c4235aa34e7bacf8a3cacdcee90afc.py",
+    "sha256": "23d7322958578d08372dfd9f830f7dc251c4235aa34e7bacf8a3cacdcee90afc"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/cb83dc2b755f82aefa8379c2372cddd9a1cc5994fd8ba101eaa808bce12082af.json",
+        "sha256": "cb83dc2b755f82aefa8379c2372cddd9a1cc5994fd8ba101eaa808bce12082af"
+      },
+      "original": {
+        "path": "workspace/current-profiling.json",
+        "sha256": "cb83dc2b755f82aefa8379c2372cddd9a1cc5994fd8ba101eaa808bce12082af"
+      },
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4 候选 512 个 block（BLOCK_M=128、每程序 2 次 KV 迭代）实际每程序 aic_cube_total_instr_number=6，即每 KV 块 3 次 matmul；L0C_to_GM 每程序 384KiB（合计 196608KiB）而 CANN 参考合计仅 98304KiB，多出的正好是第二次 PV 的输出。cube 时间均值 2.02us/程序，但 aic_scalar_wait_id1_time 均值 11.79us/程序（墙钟约 18us），说明每程序墙钟由跨核交接链（QK 搬出、softmax、p 回 L1、PV 搬出）数量决定，而非算术量。矢量侧 aiv_vec_time 6.32us，aic_fixpipe_time 2.99us，两侧都受 PV 第二次搬出牵动。",
+      "source_sha256": "23d7322958578d08372dfd9f830f7dc251c4235aa34e7bacf8a3cacdcee90afc"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/6d4b6e4a42cc23d1751ef9202a6a6385bb87c239c8b60f67038d137e370a3ac3.ttir",
+        "sha256": "6d4b6e4a42cc23d1751ef9202a6a6385bb87c239c8b60f67038d137e370a3ac3"
+      },
+      "original": {
+        "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+        "sha256": "6d4b6e4a42cc23d1751ef9202a6a6385bb87c239c8b60f67038d137e370a3ac3"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "scf.for 为 0..256 step 128（2 次迭代），循环体内恰有 3 个 tt.dot：QK（bf16×bf16→f32）、tt.dot %p_hi,%v,%acc_64（bf16×bf16→f32，以 acc*alpha 作累加初值）、tt.dot %p_lo,%v,%cst_3（bf16×bf16→f32，零初值）随后 arith.mulf 1/2048 与 addf。第二个 PV dot 是纯为补概率尾数而付出的整条 L0C 产出链。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/f287bc84ae05b7af77aab243b412680ab1da2122a70ad406d917c935f4170968.bcmlir",
+        "sha256": "f287bc84ae05b7af77aab243b412680ab1da2122a70ad406d917c935f4170968"
+      },
+      "original": {
+        "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+        "sha256": "f287bc84ae05b7af77aab243b412680ab1da2122a70ad406d917c935f4170968"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "BCMLIR 同一循环内 3 个 linalg.matmul：QK 的 ins(%23,%transposed) outs(%3)；PV 的 ins(%54,%53) outs(%59)（%59 = arg15*alpha 广播，即 acc 重缩放并入累加初值）；以及 ins(%58,%53) outs(%3) 后接 %62=mulf %61,1/2048、%63=addf %60,%62。即每次 KV 迭代真实产生三次 L0C 搬出与一次额外的矢量合并（形如 128x128 f32 = 64KiB）。%54/%58 由 truncf/extf/subf/mulf 组成的 p 分解序列产生。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/2c3fd4804cbc4f21aae949b8d6cf2234dfedef51c14ba26e97b531bab6e38a25.json",
+        "sha256": "2c3fd4804cbc4f21aae949b8d6cf2234dfedef51c14ba26e97b531bab6e38a25"
+      },
+      "original": {
+        "path": "workspace/previous-result.json",
+        "sha256": "2c3fd4804cbc4f21aae949b8d6cf2234dfedef51c14ba26e97b531bab6e38a25"
+      },
+      "category": "evaluation",
+      "role": "background",
+      "finding": "冻结保留版 23d73229 实测：case1 165.96us（CANN 81.21us）、case2 154.95us（78.29us）、case4 472.46us（133.38us）、case7 156.68us（92.69us）。case4 精度：mean_diff 7.36e-8、max_diff 4.88e-4、small_value_error_count 0、cancel_error_count 0，官方 checker 通过，BF16 阈值 0.0078125；同一 checker 下 CANN 自身 mean_diff 4.97e-5、small_value_error_count 509951 仍通过，说明 BF16 验收对概率量级误差留有一个数量级以上的实测余量（本行仅为该 checker 的行为记录，不构成新方案必然通过的证明）。旧版本对照属 background。",
+      "source_sha256": "23d7322958578d08372dfd9f830f7dc251c4235aa34e7bacf8a3cacdcee90afc"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/23d7322958578d08372dfd9f830f7dc251c4235aa34e7bacf8a3cacdcee90afc.py",
+        "sha256": "23d7322958578d08372dfd9f830f7dc251c4235aa34e7bacf8a3cacdcee90afc"
+      },
+      "original": {
+        "path": "workspace/candidate.py",
+        "sha256": "23d7322958578d08372dfd9f830f7dc251c4235aa34e7bacf8a3cacdcee90afc"
+      },
+      "category": "source_ir",
+      "role": "background",
+      "finding": "当前源码统一用两项概率分解：p_hi=p.to(v.dtype)、r1=(p-p_hi)*2048、p_lo=r1.to(v.dtype)，acc=acc*alpha+dot(p_hi,v)+dot(p_lo,v)/2048；FP16 与 BF16 共用同一结构，因此 BF16 每 KV 块付 3 个 matmul。源码中无任何按输入值或 case 的分支，dtype 仅作为元数据可用于选路。",
+      "source_sha256": null
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/f0a06b3458f7fb9760a9f7789de0770348e323940823925908bad67c361d7049.json",
+        "sha256": "f0a06b3458f7fb9760a9f7789de0770348e323940823925908bad67c361d7049"
+      },
+      "original": {
+        "path": "workspace/host-repair-analysis.json",
+        "sha256": "f0a06b3458f7fb9760a9f7789de0770348e323940823925908bad67c361d7049"
+      },
+      "category": "other",
+      "role": "background",
+      "finding": "此前把两项概率合并成单个宽矩阵（join/cat + V 复制）的尝试在别的源码 SHA 上因 join 生成 128x128x2 末轴步长 2 的张量、V 广播复制，UB 需求 855552B>196608B 而编译失败。该历史说明“靠拼接把两次 dot 合成一次”代价高；本轮改用不需要任何拼接或广播复制的形式。",
+      "source_sha256": "9c3488b743b2c953259e72c1f75ef3dc060f63cfd5362576bd227171aae0aa08"
+    }
+  ],
+  "hypothesis": "BF16 路径的第二个 PV matmul 及其 L0C 搬出/零初值/1/2048 缩放，是为把 8 位尾数的 bf16 概率补到 18 位而付的；若改用 11 位尾数的 fp16 作为 PV 计算类型（p→fp16，V 由 bf16 精确/近似转 fp16），单次 fp16×fp16、fp32 累加的 PV 就把概率相对误差从 bf16 单项的 2^-9 提升到 2^-11，同时每 KV 块 matmul 由 3 降到 2、L0C 搬出由 384KiB 降到 256KiB，并消去零初值 dot、1/2048 缩放和一次矢量合并。由于约 65% 墙钟是 aic_scalar_wait_id1（交接/同步等待）而非 cube 算术，减少一条交接链应带来真实下降。数值上这是一次近似而非等价变换：p 的 fp16 舍入是随机符号的相对误差 2^-11，V 在 |v|>=2^-14 时由 bf16→fp16 精确，|v|<2^-14 落 fp16 次正规/下溢（绝对误差 <=3e-8），|v|>65504 会溢出——后者超出本合同的 [-1,1] 输入域，但属于能力范围限制，必须记录。",
+  "change": "仅在 value.dtype 为 bfloat16 时走新的 PV 组织（host 只用 dtype 元数据生成一个 constexpr 标志 PV_SINGLE_F16，不读输入值、不看 case_id）：循环内 p_dot=p.to(tl.float16)、v_dot=v.to(tl.float16)，acc = acc*alpha[:,None] + tl.dot(p_dot, v_dot)（单次 fp16×fp16、fp32 累加）；FP16 及其他 dtype 保持原两项分解表达式与相加顺序逐字不变。QK 的 bf16 输入、fp32 缩放与 softmax、mask、分块（非因果 128/128、因果 64/64）、grid、输出 dtype 全部不变。不引入 join/cat/广播复制，UB 占用相对原两项版本下降。公共入口 run 签名与调用方式不变。",
+  "expected": "case4：每程序 aic_cube_total_instr_number 6→4，L0C_to_GM 384→256KiB/程序（合计 196608→131072KiB），PV 交接链与 fixpipe 搬出各减一条，full_call_us 从 472.46 下降（方向明确，幅度由真机决定，乐观区间 380-430us）；case7 同路径同步下降（156.68us 起）。case1/case2 走 FP16 两项原路径，预计耗时与精度逐位不变。代价：BF16 两项 2^-18 的概率精度降为单次 fp16 的 2^-11，绝对误差量级 1e-4~1e-3，对消去主导的小值元素相对误差放大；V 的 bf16→fp16 转换增加一次 128x128 矢量 cast。",
+  "validation": "先 preflight --source candidate.py（等待只读审查），再由宿主做完整四项真机评测：固定 case1/2/4/7、原官方 checker 与 golden、原输入输出 dtype 与计时合同，验收全部按原阈值（FP16 0.0009765625、BF16 0.0078125）与 small_value/cancel/normal 判定，不改 golden、阈值、seed 或输入。随后对 case4（必要时含 case7）采集成对 profiling 与重放模拟器，核对 cube 指令数、L0C_to_GM 总量、wait_id1 与墙钟是否沿预期方向变化；若精度失败则保留完整反馈，先定位是 p 舍入还是 V 次正规/溢出，再换机制。",
+  "alternatives": [
+    "把两项概率按连续 BN 段排成 1 个 2N 宽矩阵做单次 dot（更宽 N、需 join/cat 或 V 复制），历史上 UB 溢出，且 N=256 会让 L0C 与 UB 压力更大；",
+    "BF16 单次 bf16 PV（不转 fp16）：省同样一条链，但概率只有 2^-9 相对精度，历史上单项 BF16 精度失败，收益相同而精度风险显著更高，故不选；",
+    "保持两项 PV，只压缩 K/V 载入或再调 BLOCK_M/N：不减少交接链数，且 BLOCK_M 已到 196608B 预算边缘，收益空间小；",
+    "FP16 case 也改单次 PV：FP16 两项已提供 2^-22 与 2^-18 的余量，而单次会降到 2^-11，精度代价换同样一条链，本轮不动，保留其已验收路径。"
+  ],
+  "discriminating_observation": "TTIR/BCMLIR 显示每 KV 迭代 3 个 matmul，其中第三个仅产出零初值 dot 后再由一个 128x128 f32 矢量乘法和加法合并；成对 profiling 显示同程序 cube 2.02us 远小于 wait_id1 11.79us，且 L0C_to_GM 每程序 384KiB 恰为 3×64KiB×2 迭代。若墙钟确实由交接链数主导，删掉这条链应同时把每程序 cube 指令 6→4、L0C 384→256KiB 并降低墙钟；若墙钟其实由别的瓶颈主导，则这些计数下降而耗时基本不变——两者可区分。",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

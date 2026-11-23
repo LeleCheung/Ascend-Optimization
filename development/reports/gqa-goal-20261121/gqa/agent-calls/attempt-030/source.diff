@@ -1,0 +1,167 @@
+--- 
++++ 
+@@ -114,6 +114,18 @@
+ 是按组遍历的运行时边界循环，K/V 缓冲需在循环内复用（形状与 019 相同，不新增
+ 张量，峰值由同一批 128x256/128x128 张量决定）。FP16 与其他 dtype 的通用二维
+ grid 路径、因果 64/64 分块、两项分解表达式与相加顺序全部保持原样。
++
++相邻两 query tile 的原始 QK 前瞻（本轮机制，仅 PART_TILES 分支）：同一 KV 组
++的相交 tile 子区间按 2 个 tile 成对处理，先发出 q0/k dot 得 rawscore0、再发出
++q1/k dot 得 rawscore1，随后才依次对 tile0、tile1 执行原来的 FP32
++scale/max/safeguard/exp2/sum、单次 FP16 PV、PV 后除法、guard 与 BSND store，
++使 Cube 有机会在 Vector 处理 tile0 时提前计算 QK1；奇数尾 tile 走原单 tile 路径。
++K/V 仍每组只载入一次、P=20、tile 分区、BM128/BN256 与 FP16 回退不变，未引入
++三阶段 scratch 或 scores 压缩。每个输出 tile 的算术表达式与相加顺序未变，故
++预期数值逐位一致（非近似）。代价与风险：一对执行期间两张 128x256 fp32
++rawscore 同时存活，相比父版本净增约 128KiB 峰值，实际 IR 显示 QK matmul 输出
++为 128x256 f32 累加器，接近 196608B 的 UB 预算，可能编译/分配失败；是否真正
++重叠及收益均需完整四项真机评测与后采集判定，此处不预设。
+ """
+ 
+ import math
+@@ -121,6 +133,45 @@
+ import torch
+ import triton
+ import triton.language as tl
++
++
++@triton.jit
++def _gqa_finish_tile(
++    raw_qk, v16, Out,
++    b, hq, offs_m, offs_d, offs_n,
++    qk_scale: tl.constexpr,
++    SKV: tl.constexpr, S: tl.constexpr, MASK_KV: tl.constexpr,
++    o_sb: tl.constexpr, o_ss: tl.constexpr, o_sh: tl.constexpr, o_sd: tl.constexpr,
++    BLOCK_D: tl.constexpr, D: tl.constexpr, MASK_MD: tl.constexpr,
++):
++    """单个 query tile 的收尾：父版本表达式逐字保留。
++
++    raw_qk 是未乘 scale 的 FP32 QK（tl.dot 的零初值结果）。这里从乘
++    qk_scale 开始，按原顺序执行 FP32 scale、max/safeguard、exp2、sum、
++    单次 FP16 PV、PV 后除法、全掩码行 guard 与 BSND 写出；前瞻分支与
++    奇数尾 tile 都调用它，故两条路径的浮点表达式和相加顺序一致。
++    """
++    qk = raw_qk * qk_scale
++    if MASK_KV:
++        qk = tl.where(offs_n[None, :] < SKV, qk, -float("inf"))
++
++    m_safe = tl.max(qk, 1)
++    m_safe = tl.where(m_safe > -float("inf"), m_safe, 0.0)
++    p = tl.exp2(qk - m_safe[:, None])
++    l_new = tl.sum(p, 1)
++
++    acc = tl.dot(p.to(tl.float16), v16)
++
++    l_safe = tl.where(l_new > 0.0, l_new, 1.0)
++    out = acc / l_safe[:, None]
++    out = tl.where(l_new[:, None] > 0.0, out, 0.0)
++
++    o_ptrs = Out + b * o_sb + hq * o_sh + offs_m[:, None] * o_ss + offs_d[None, :] * o_sd
++    if MASK_MD:
++        tl.store(o_ptrs, out.to(Out.dtype.element_ty),
++                 mask=(offs_m[:, None] < S) & (offs_d[None, :] < D))
++    else:
++        tl.store(o_ptrs, out.to(Out.dtype.element_ty))
+ 
+ 
+ @triton.jit
+@@ -183,7 +234,61 @@
+             # 本 worker 与本组相交的 tile 子区间（组内局部序号）。
+             t0 = tl.maximum(lo, grp * TPG) - grp * TPG
+             t1 = tl.minimum(hi, (grp + 1) * TPG) - grp * TPG
+-            for t in range(t0, t1):
++
++            # 本轮机制：同一 KV 组内相邻两 query tile 的原始 QK 前瞻。
++            # 每对先背靠背发出两次未乘 scale 的 FP32 QK dot（rawscore0、
++            # rawscore1），再依次调用 _gqa_finish_tile 完成 tile0、tile1，
++            # 为 Cube 在 Vector 处理 tile0 时提前执行 QK1 留出机会。
++            # buffer 生命周期：一对执行期间 rawscore0/rawscore1 各为
++            # 128x256 fp32 且同时存活（净增约 128KiB 峰值），k 与 v16 跨对
++            # 存活，q0/q1 在各自 dot 后即死；这是本轮主要编译/分配风险。
++            n_tile = t1 - t0
++            npairs = n_tile // 2
++            for pj in range(0, npairs):
++                t = t0 + pj * 2
++
++                # tile A：只做原始 QK，暂不乘 qk_scale。
++                gi0 = t // NB_M
++                mb0 = t % NB_M
++                hq0 = kvh * G + gi0
++                offs_m0 = mb0 * BLOCK_M + tl.arange(0, BLOCK_M)
++                q_ptrs0 = Q + b * q_sb + hq0 * q_sh + offs_m0[:, None] * q_ss + offs_d[None, :] * q_sd
++                if MASK_MD:
++                    q0 = tl.load(q_ptrs0, mask=(offs_m0[:, None] < S) & (offs_d[None, :] < D), other=0.0)
++                else:
++                    q0 = tl.load(q_ptrs0)
++                raw0 = tl.dot(q0, tl.trans(k))
++
++                # tile B：rawscore1 在 tile0 的 scale/softmax 之前发出。
++                tb = t + 1
++                gi1 = tb // NB_M
++                mb1 = tb % NB_M
++                hq1 = kvh * G + gi1
++                offs_m1 = mb1 * BLOCK_M + tl.arange(0, BLOCK_M)
++                q_ptrs1 = Q + b * q_sb + hq1 * q_sh + offs_m1[:, None] * q_ss + offs_d[None, :] * q_sd
++                if MASK_MD:
++                    q1 = tl.load(q_ptrs1, mask=(offs_m1[:, None] < S) & (offs_d[None, :] < D), other=0.0)
++                else:
++                    q1 = tl.load(q_ptrs1)
++                raw1 = tl.dot(q1, tl.trans(k))
++
++                # 两张 rawscore 就绪后，按原表达依次收尾 tile0、tile1。
++                _gqa_finish_tile(
++                    raw0, v16, Out, b, hq0, offs_m0, offs_d, offs_n,
++                    qk_scale=qk_scale, SKV=SKV, S=S, MASK_KV=MASK_KV,
++                    o_sb=o_sb, o_ss=o_ss, o_sh=o_sh, o_sd=o_sd,
++                    BLOCK_D=BLOCK_D, D=D, MASK_MD=MASK_MD,
++                )
++                _gqa_finish_tile(
++                    raw1, v16, Out, b, hq1, offs_m1, offs_d, offs_n,
++                    qk_scale=qk_scale, SKV=SKV, S=S, MASK_KV=MASK_KV,
++                    o_sb=o_sb, o_ss=o_ss, o_sh=o_sh, o_sd=o_sd,
++                    BLOCK_D=BLOCK_D, D=D, MASK_MD=MASK_MD,
++                )
++
++            # 奇数尾 tile：走与父版本逐字相同的单 tile 路径。
++            if n_tile % 2 == 1:
++                t = t1 - 1
+                 gi = t // NB_M
+                 mb = t % NB_M
+                 hq = kvh * G + gi
+@@ -195,29 +300,13 @@
+                 else:
+                     q = tl.load(q_ptrs)
+ 
+-                qk = tl.dot(q, tl.trans(k)) * qk_scale
+-
+-                if MASK_KV:
+-                    qk = tl.where(offs_n[None, :] < SKV, qk, -float("inf"))
+-
+-                # SINGLE_KV 无 online 重缩放：表达式与通用路径的 SINGLE_KV 分支一致。
+-                m_safe = tl.max(qk, 1)
+-                m_safe = tl.where(m_safe > -float("inf"), m_safe, 0.0)
+-                p = tl.exp2(qk - m_safe[:, None])
+-                l_new = tl.sum(p, 1)
+-
+-                acc = tl.dot(p.to(tl.float16), v16)
+-
+-                l_safe = tl.where(l_new > 0.0, l_new, 1.0)
+-                out = acc / l_safe[:, None]
+-                out = tl.where(l_new[:, None] > 0.0, out, 0.0)
+-
+-                o_ptrs = Out + b * o_sb + hq * o_sh + offs_m[:, None] * o_ss + offs_d[None, :] * o_sd
+-                if MASK_MD:
+-                    tl.store(o_ptrs, out.to(Out.dtype.element_ty),
+-                             mask=(offs_m[:, None] < S) & (offs_d[None, :] < D))
+-                else:
+-                    tl.store(o_ptrs, out.to(Out.dtype.element_ty))
++                raw = tl.dot(q, tl.trans(k))
++                _gqa_finish_tile(
++                    raw, v16, Out, b, hq, offs_m, offs_d, offs_n,
++                    qk_scale=qk_scale, SKV=SKV, S=S, MASK_KV=MASK_KV,
++                    o_sb=o_sb, o_ss=o_ss, o_sh=o_sh, o_sd=o_sd,
++                    BLOCK_D=BLOCK_D, D=D, MASK_MD=MASK_MD,
++                )
+ 
+ 
+ @triton.jit

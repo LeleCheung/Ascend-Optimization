@@ -1,0 +1,66 @@
+--- 
++++ 
+@@ -112,6 +112,11 @@
+ 由“PV 后 fp32 除法”改为“PV 前 fp32 归一化并舍入 fp16”，权重相对误差同为 2^-11，
+ 适用本合同 [-1,1] bf16 输入域；其余路径（因果、fp16、其他形状）仍走原单内核，
+ 函数体逐字不变（仅改名 _gqa_fused_kernel）。
++本轮修复（地址口径）：阶段2 的 V 转换是逐元素拷贝，V16 因此保持输入的 BSND 平坦
++顺序；阶段3 早期版本却按 [B, NKV, SKV, D] 取址（base=(b*NKV+kvh)*SKV*D、行步长 D），
++除 kvh==n==0 外读到的是别的 (n,kvh) 的 V 行，属于“读错地址但不越界”的静默错误。
++现按真实 BSND 布局取址 base=b*(SKV*NKV*D)+kvh*D、行步长 NKV*D、D 步长 1，三阶段
++机制、fp16 回退路径与 scratch 所有权均不变。
+ """
+ 
+ import math
+@@ -413,9 +418,14 @@
+ #                                  无掩码、无向量 epilogue（M128×SKV256 整块）。
+ #   阶段2 _gqa_softmax_vcast_kernel：纯 Vector；fp32 scale/max/exp2/sum 与受保护
+ #                                  的行倒数归一化 -> fp16 P；同一启动的尾部程序
+-#                                  以互不重叠的连续块把 bf16 V 转成 fp16。
++#                                  以互不重叠的连续块把 bf16 V 逐元素转成 fp16
++#                                  （顺序不变，V16 仍是输入 BSND 的平坦副本）。
+ #   阶段3 _gqa_fwd_kernel        ：fp16 P × fp16 V、fp32 累加、直接转 out dtype
+ #                                  存回 BSND（保留 JIT 名为观察口径的最终 PV）。
++#                                  其 V 取址按 V16 的真实 BSND 平坦布局：
++#                                  b*(SKV*NKV*D) + n*(NKV*D) + kvh*D + d，与
++#                                  阶段2 写入口径一致（此前按 BNSD 取址，会读到
++#                                  别的 (n,kvh) 行，是本轮修复的对象）。
+ # 代价（如实记录）：额外全局中间量 case4 scores 64MiB fp32 + P 32MiB fp16 +
+ # V16 2MiB，约 192MiB 额外写读，3 次分配与 3 次 launch。收益或退步由完整
+ # 四项真机评测判定，本注释不据此写结论。
+@@ -523,7 +533,9 @@
+ ):
+     """阶段3（观察口径的最终 PV）：fp16 P × fp16 V，fp32 累加后直接写回 BSND。
+ 
+-    P 为连续的 [B*NQ, S, SKV] fp16，V16 为连续的 [B*NKV, SKV, D] fp16；
++    P 为连续的 [B*NQ, S, SKV] fp16；V16 是 stage2 对连续输入 V 的逐元素转换，
++    因此保持输入的原 BSND 元素顺序，即逻辑上仍是 [B, SKV, NKV, D] 的平坦数组，
++    元素 (b, n, kvh, d) 位于 b*(SKV*NKV*D) + n*(NKV*D) + kvh*D + d。
+     BLOCK_N == SKV、BLOCK_D == D、S % BLOCK_M == 0，故载入无需掩码。
+     归一化已在阶段2完成，这里只有一次 tl.dot、一次 out dtype 转换与 store，
+     没有除法、没有 online 重缩放、也没有每 tile 的跨核握手。
+@@ -542,8 +554,12 @@
+     p_ptrs = P + pid_bh * (S * SKV) + offs_m[:, None] * SKV + offs_n[None, :]
+     p = tl.load(p_ptrs)
+ 
+-    v_base = (b * NKV + kvh) * (SKV * D)
+-    v_ptrs = V16 + v_base + offs_n[:, None] * D + offs_d[None, :]
++    # V16 保持输入 BSND 的平坦顺序（stage2 是逐元素转换，不做转置），故按原
++    # 张量的真实地址读：batch 块 b*(SKV*NKV*D)，KV 头通道偏移 kvh*D，序列步长
++    # NKV*D，D 方向步长 1。若按 [B, NKV, SKV, D]（BNSD）取址，同一 (b,n,kvh,d)
++    # 元素会读到别的 (n,kvh) 行，除 kvh==n==0 外都与输入 V 不符。
++    v_base = b * (SKV * NKV * D) + kvh * D
++    v_ptrs = V16 + v_base + offs_n[:, None] * (NKV * D) + offs_d[None, :]
+     v = tl.load(v_ptrs)
+ 
+     acc = tl.dot(p, v)  # fp16 × fp16 -> fp32 累加
+@@ -601,7 +617,8 @@
+         p16 = torch.empty(B * NQ * S * SKV, dtype=torch.float16, device=query.device)
+         v16 = torch.empty(num_v, dtype=torch.float16, device=query.device)
+         # V 连续由判据保证，内核把 value 的基址当作平坦数组使用；不做视图/拷贝，
+-        # 主机侧只传元数据与指针。
++        # 主机侧只传元数据与指针。v16 沿用该平坦顺序（BSND），阶段3 按同一
++        # 布局取址，故 (b,n,kvh,d) 与输入 V 一一对应。
+ 
+         qk_grid = (S // BLOCK_M_ST, B * NQ)
+         _gqa_qk_stage_kernel[qk_grid](

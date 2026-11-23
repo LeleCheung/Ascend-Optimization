@@ -1,0 +1,88 @@
+{
+  "source_sha256": "98c755709dd428d0955bfc11a666b679f5afdc412ecb441e1c094568a3805661",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "本轮唯一可编辑控制点与现状基线（sha256 810ba7cf…f652b8，与 compiled-readonly 内原件逐字节相同）",
+      "finding": "第 99-103 行 linalg.reduce dimensions=[1] 由 %50 求和得到 %reduced tensor<128xf32>；第 104 行 linalg.broadcast dimensions=[1] 升到 128x128 得 %broadcasted；第 105 行 arith.divf %54, %broadcasted 做整矩阵逐元素除法，%54 为 PV 结果 FP16 截断再扩展的 FP32 值。该函数体只含 linalg/arith/tensor/memref/scf 操作，全文没有 hivm.* 操作，module 属性只有 hacc.target。"
+    },
+    {
+      "path": "compiled-readonly/current-cvpipelining.mlir",
+      "category": "source_ir",
+      "role": "同一内核在 CVPipelining 之后的后端实际降低形态，用于推断 hivm 操作语法与流水映射",
+      "finding": "第 105 行 hivm.hir.vcast 把 FP16 结果扩到 FP32；第 107 行 hivm.hir.vreduce <sum> ins(%59) outs(%74) reduce_dims=[1] 产出 tensor<128x1xf32>；第 108 行 hivm.hir.vdiv ins(%73, %75) outs(%8) broadcast=[1] 把上一步的整矩阵逐元素除法实现为一条广播除法；第 90-92 行为 hivm.hir.vmul/vexp/vcast 的单元一操作数语法（ins 纯输入 + outs 目标 + 返回类型）。后端把 linalg/arith 结构一一映射到 hivm.hir，说明 hivm 操作由转换阶段生成，cvdump 中出现的具体语法可作为本候选的书写依据。"
+    },
+    {
+      "path": "compiled-readonly/_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "前端同形核对，确认控制点在 Triton/适配层/BCMLIR 三层一致",
+      "finding": "第 102-106 行 tt.reduce axis=1 得 tensor<128xf32>；第 107-109 行 tt.expand_dims + tt.broadcast + arith.divf %acc_44, %out_45 构成同一个除法控制点，中间没有减法或额外化简，因此第 105 行的 divf 与源码 candidate.py:498 的 out = acc / l_new[:, None] 一一对应。"
+    },
+    {
+      "path": "division-instructions.json",
+      "category": "simulator",
+      "role": "定位除法指令热点与实际执行代价",
+      "finding": "core0.veccore0 与 core0.veccore1 各有两处 VDIV：PC 0x10d11b9c 调用 12 次、5208 周期、running_time_us 3.16；PC 0x10d11b8c 调用 12 次、2796 周期、running_time_us 1.69；Dtype 均为 F32，源码回溯统一指向 candidate.py:498 的 out = acc / l_new[:, None]。按 veccore 计，归一化除法累计 8004 周期、4.85us，是本窗口内向量侧最大的单条算术指令簇。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "绝对时钟资质、观测范围与流水等待比例",
+      "finding": "三份报告（cubecore0/veccore0/veccore1）的 absolute_unit_validation 均为 status verified、unit us、compared_pcs 22、matching_pcs 22、median_ratio 0.99984；raw_clock_window 约 113.983–214.129us，即约 100us 的部分窗口；veccore0 的 VECTOR event_count 422、active_ratio 0.3427、wait_ratio 0.1036；cubecore0 的 CUBE active 0.4499 / wait 0.2849、FIXP active 0.6684 / wait 0.3309；文件末尾 application_completed=false，全调用完成情况未知。各流水累计时间可重叠，这里只用于排序与定位。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "泳道归一化范围与未报告泳道",
+      "finding": "三核各自独立归一化（veccore0/1 的 VECTOR active 0.34274/0.34274、wait 0.10361/0.10361，cubecore0 的 CUBE/MTE 各有自己的分母）；区域列表含 pc_neighborhood unmapped 段（如 0x10d11034 邻域）与 source_conditional case (536,549)，未报告泳道保持未知。因此 VDIV 消失带来的向量周期增量只在该约 100us 窗口内有解释力。"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "同输入两侧设备 OpProf 绑定",
+      "finding": "candidate 为 _gqa_fwd_kernel_mix_aic，Task Duration 159.603195us、Block Dim 20、Mix Block Dim 40；reference 为 FusedInferAttentionScore…mix_aic，137.402740us；两侧同输入、同 seed 1733、同 spec_sha256。limitations 明确各流水可重叠、接口字节对应物理 HBM 字节的说法需要独立材料。"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "官方回归结果与数值阈值",
+      "finding": "case1/2/4/7 的 official_checker 全部 passed；阈值 fp16 为 9.765625e-4、bf16 为 7.8125e-3；case4 mismatch_ratio 1.3346e-2、case7 3.1789e-6，small_value 与 cancel 两类分项均 passed；nearest_representable_correctness 显示与最近可表示值比对的 mere 为 1.7577e-4/1.8327e-1 等，说明现有内核已带 FP16 截断与 BF16 输出量化误差。"
+    },
+    {
+      "path": "prior-scheduling-result.json",
+      "category": "paired_profiling",
+      "role": "上一轮 IR 交错的独立结论，用于划清本轮机制边界",
+      "finding": "attempt-059 的六语句 IR 重排在正式四项通过的前提下比原版慢 0.522%（161.913us 对 161.073us），状态为 qualified_negative_keep059；当前最佳仍是 98c75570… 源码搭配 sha256 fd6c6a63… 的原始 IR，本轮机制与那次语句重排互不重叠。"
+    },
+    {
+      "path": "installed-reciprocal-evidence.txt",
+      "category": "source_ir",
+      "role": "倒数控制点的安装证据",
+      "finding": "AscendC dav_c220 的 ReciprocalIntrinsicsImpl/Level 2 直接调用 vrec，模板约束 src/dst 同为 half 或 float；bishengir-opt --help 与二进制字符串检索显示 hivm.hir.vrec 操作名存在；该材料自身注明只确立操作名，精确语法与目标支持留待 CPU 编译确认。Triton 侧 libdevice.reciprocal 的 fp32 绑定是 __hmf_recipf。"
+    }
+  ],
+  "hypothesis": "当前后端的归一化把行分母 %75 (tensor<128x1xf32>) 以 broadcast=[1] 的 hivm.hir.vdiv 施加到整块 128x128 FP32 累加子上，对应的 VDIV 在 veccore0/1 各有两处 PC、各 12 次调用、累计 8004 周期（3.16us+1.69us）。若把倒数改到行分母的 128 个元素上做原生 FP32 向量倒数（hivm.hir.vrec），再用一次 FP32 Newton 校正 r = r*(2 - den*r) 把近似倒数的相对误差压到其平方量级，最后以广播乘法作用到累加子，则除法运算量从 16384 元素降到 128 元素，向量侧从 12×2 条整矩阵 VDIV 变为 12 条 VREC（每条约 2 个 repeat）加 12 条广播 VMUL 及常数级校正运算；VDIV 的周期簇消失，VECTOR 流水局部活跃周期与等待下降，若归一化处在关键路径上则内核时间下降约 1–4us。该机制限定分母保持 FP32、归约树、dot 精度、输出 BF16 舍入与全部其余顺序逐字不变。",
+  "alternatives": [
+    "普通 FP32 1/den 加广播乘法：源码层可表达，但组件把 arith.divf 降为同一条 VDIV，历史 048 已实测为负结果，本轮不重复。",
+    "Triton libdevice.reciprocal（fp32 绑定 __hmf_recipf）：058 实测仍然降为 VDIV，完整调用时间持平，属于已消耗的负结果，本轮不重复。",
+    "分母转 FP16 后再取倒数：缩小元素宽度可省带宽，但 060 已出现溢出回归，且改变数值语义，明确排除。",
+    "两次 Newton 校正：精度更高，代价是再 3 条 128 元素运算（UB 与时间均可忽略），但超出本轮登记的单机制范围，保留为后续待验证假设。",
+    "把广播除法改成先算 128 元素倒数再用 hivm.hir.vmul broadcast 表达（在 CVPipelining 之后的 hivm 层直接写）：该层产物属于冻结的实际低层产物，不在可编辑清单内，只作为降低路径的对照说明。",
+    "源码级改写（例如把 l_new 归一化改写为 tl.math 倒数或改 dot 分块）：触及 frozen.py，跨层且另有研究身份，本轮不做。",
+    "保持 IR 原样：若 CPU 编译判定 hivm.hir.vrec 在 BCMLIR 阶段不可承载，则按无改动交接，并把该判定记录为本机制的唯一结论。"
+  ],
+  "change": "在 ir/target/_gqa_fwd_kernel.bcmlir 的单条减法式替换：删除第 105 行 arith.divf %54, %broadcasted，改为在 %reduced（tensor<128xf32>，行分母）上插入 hivm.hir.vrec 得到 %r0（ins 单输入 + outs + 返回 tensor<128xf32>，与第 90-92 行 hivm.hir.vexp 的单元一操作数语法同形），用 linalg.fill 生成 2.0 的 tensor<128xf32> %two，按 arith.mulf %reduced, %r0 → arith.subf %two, %den_r0 → arith.mulf %r0, %newton 完成一次 FP32 Newton 校正得到 %r1，再把原第 104 行的 linalg.broadcast 输入从 %reduced 换成 %r1（输出仍写回原 %3 槽位，缓冲不变），最后第 105 行改为 arith.mulf %54, %broadcasted。函数 ABI、参数列表、特化集合、host 侧、memref 缓冲与规约树（linalg.reduce dimensions=[1]）逐字保留，其他语句、loc 与常量不动。",
+  "expected": "1) 指令替换：veccore0/veccore1 的两处 VDIV PC（0x10d11b9c、0x10d11b8c）各自 calls 12 的 VDIV 归零，同位置出现 VREC（Dtype F32，行分母 128 元素即约 2 个 repeat）与一条覆盖 128x128 的广播 VMUL（256 repeat），另加 128 元素规模的 VMUL/VSUB 各 2 条与常量填充。2) 动态轮次：tile 迭代次数、reduce 次数（12）、exp 次数、两处 matmul/fixpipe 次数与 MTE 搬运次数全部保持不变，唯一变化是归一化的运算形态。3) 周期与等待：按 division-instructions.json 的 8004 周期簇估计，VDIV 周期簇预计降到约 1000–1800 周期（VREC 加广播乘法），veccore 内 VECTOR 活跃周期下降约 3–5us；veccore0 VECTOR wait_ratio 0.1036 预计持平或小幅下降，cubecore0 的 CUBE/FIXP 比例预计在噪声内。4) 资源：UB 峰值增加三个 tensor<128xf32>（约 1.5KB），广播输出沿用原 %3 槽位，L0C/L1 与搬运字节保持不变，HBM 流量维持 8 个 KV 组重复搬运的现状。5) 端到端：case4 的 full-call 时间相比 154.8871us 基线预计下降 0.5–2.5%（约 1–4us）；若调度把归一化推到关键路径之外，则改进落在 1us 以内的噪声区，视为无收益。6) 数值：输出相对误差量级由既有 FP16 PV 截断（约 2^-11）与 BF16 输出舍入（约 2^-8）主导，本步新增误差预计不超过 1e-6。",
+  "validation": "第一步由宿主在 CPU 侧编译本轮 BCMLIR，核对 hivm.hir.vrec 在 BCMLIR 阶段可解析、可通过转换并在目标 lowering 中真实出现 VREC（这是本机制成立的前提，编译产物是唯一判据）。第二步在固定四例 1/2/4/7 上跑官方 checker 与 full-call 计时，核对 case4 相对 154.8871us 的变化方向与幅度，同时确认 case1/2/7 全部通过。第三步用模拟器与 profiling 对照 VDIV 是否消失、VREC 调用次数与周期、veccore 的 VECTOR 活跃/等待比例，并在同一约 100us 部分窗口与三核各自归一化范围内比较，保持 application_completed=false 的完成度说明。更广的机制（两次 Newton、hivm 层直接改写、源码级倒数）作为待验证假设另立调用核对。",
+  "layer_reason": "Triton 表达能力：冻结源码可用的倒数接口只有 libdevice.reciprocal（fp32 绑定 __hmf_recipf）与普通 fdiv，二者在 048/058 都已实测降到 VDIV，源码层缺一个能直接表达原生 vrec 的入口，因此源码层改写这一意图只有两条路：等待工具链补一个 extern vrec 绑定，或绕开源码在 IR 层落点；固定源码实验目的：frozen.py 保持逐字节一致，本轮只改 IR，可把四例身份、host 代码、特化集合全部固定，使测量差异唯一归因于归一化形态，同时保留完整数学语义与特殊值边界；IR 控制点：BCMLIR 第 99-105 行的 linalg.reduce + linalg.broadcast + arith.divf 是归一化的唯一定位点，行分母在这里还是 128 个元素，天然适合做一次小规模向量倒数再广播，而更下层（CVPipelining 之后）已经被合并成一条 broadcast 除法，错过了收缩运算规模的机会。同类意图在源码层表达时的替代方向：在 Triton 侧引入 vrec extern 绑定或 libdevice 原生倒数入口，配合行分母倒数加广播乘法的写法，同样保持 FP32 分母与单次 Newton 校正，这一路径作为独立研究身份待验证。",
+  "simulator_incremental_judgment": "材料只覆盖 case4 的三核部分窗口：cubecore0/veccore0/veccore1 的 raw_clock_window 约 113.983–214.129us（约 100us），绝对时钟资质为 us 且 22 个 PC 全部匹配（median_ratio 0.99984），application_completed=false，未报告泳道保持未知，各流水累计时间可重叠。据此本轮只主张可区分的局部增量：VDIV 指令簇（8004 周期、4.85us/veccore）被 VREC 加广播乘法取代，向量侧活跃周期与 VECTOR 等待出现可测的局部变化；VECTOR active_ratio 0.3427 与 idle 比例说明向量侧有约三分之二时间处于非活跃，CUBE 与 FIXP 的 active/wait（0.4499/0.2849、0.6684/0.3309）提示关键路径更多由数据搬运与 fixpipe 衔接主导，因此本轮把内核级收益记为条件性预测（0.5–2.5%，条件为归一化落在关键路径）。profiling 的 159.603195us 与 137.402740us 是两侧独立采集，分别记录各自 OpProf，本轮不把它们相减当作因果分解；candidate 与 reference 的 Block Dim 20/19 差异也保持为待验证项。",
+  "unknown": [
+    "hivm.hir.vrec 在 BCMLIR 阶段的可解析性、目标支持与真实 lowering 结果，由 CPU 编译判定。",
+    "原生 vrec 的 FP32 相对误差实测值；本轮按 2^-10 至 2^-14 假设，并用一次 Newton 校正压到其平方量级。",
+    "实测 vrec 与广播 vmul 的指令周期上限，若单条 VREC 的 repeat 周期远高于估计，收益会被抵消。",
+    "归一化是否位于设备关键路径，以及 20 block 波次下向量侧局部节省能否传导到 full-call 时间。",
+    "checker 的 small_value 与 cancel 分项在倒数近似下的实际敏感度。"
+  ]
+}

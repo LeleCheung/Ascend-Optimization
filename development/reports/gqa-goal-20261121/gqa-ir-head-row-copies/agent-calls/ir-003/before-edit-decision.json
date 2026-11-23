@@ -1,0 +1,203 @@
+{
+  "timestamp": "2026-11-21T15:44:16.050622+00:00",
+  "diagnosis": {
+    "source_sha256": "fd25f875c334f929efa8d0fab381344dfcdb901989c12b113e6ede30e537eda3",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "feedback.json",
+        "category": "evaluation",
+        "role": "正式与补测结果、当前探索分支的真实编译失败",
+        "finding": "case4 与 case7 的 candidate_error 均为 ub overflow：attempt-049 原始 IR 需 1576960 bits、可用 1572864 bits；ir-002 分组 IR 两案例均需 2097152 bits。retained best attempt-047 案例4 为 175.5726us，四案例 official_passed=true，作为验收比较起点。"
+      },
+      {
+        "path": "codex-brief.json",
+        "category": "evaluation",
+        "role": "宿主候选机制与实施约束",
+        "finding": "指定只在两份 BCMLIR 特化的输出行组循环追加 hivm.parallel_loop，保持 ExtractedLoadOrStore、循环体、ABI、源码与数学不变；实施前须证明输出迭代写地址互斥且无跨迭代数据依赖，否则按 no-change 交接。"
+      },
+      {
+        "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "当前 target(case4) 特化与标记落点",
+        "finding": "第84–98行输入拷贝循环属性为 {ExtractedLoadOrStore, hivm.parallel_loop}，源 Q 按8行分组、目的为 %alloc_4 的不相交子视图；第117–136行输出行组循环步长8，属性仅为 {ExtractedLoadOrStore}，循环体依次为地址计算、reinterpret_cast、extract_slice、broadcast、divf、truncf、materialize_in_destination。"
+      },
+      {
+        "path": "ir/case7/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "当前 case7 特化与标记落点",
+        "finding": "结构与 target 特化一致，输出行组循环步长4，输入拷贝循环同样带 hivm.parallel_loop；输出循环属性仅为 {ExtractedLoadOrStore}。两份特化差异只在头组大小、偏移常量与位置编号。"
+      },
+      {
+        "path": "compiled-readonly/diagnostic-grouped-hivm.txt",
+        "category": "source_ir",
+        "role": "当前分组 IR 实际 lower 后的 AIV 生成物",
+        "finding": "AIV 含 hivm.hir.get_sub_block_idx、compare==0，仅输出 store 被 scf.if 的 limit_sub_block_id0 守卫；p 链保留 5 个 128x256 f32 缓冲（各131072B），分母为 128x1 f32，reduce 临时缓冲 16384 f32；末尾报 ub overflow 2097152 bits 对 1572864 bits。输出广播已降为 8x1 视图上的 vdiv broadcast=[1]。"
+      },
+      {
+        "path": "compiled-readonly/diagnostic-original-hivm.txt",
+        "category": "source_ir",
+        "role": "原始 attempt-049 IR 的 lower 对照",
+        "finding": "输出循环步长1，输出循环外同样维持完整 128x256 向量链；同样生成 get_sub_block_idx 与 limit_sub_block_id0 输出守卫；报 ub overflow 1576960 bits 对 1572864 bits。"
+      },
+      {
+        "path": "memory-partition-findings.json",
+        "category": "evaluation",
+        "role": "宿主对编译中间生成物的分区观察",
+        "finding": "两份最终 AIV 都只守卫输出 store，向量 p/sum 工作未按行减半；输出广播降为 8x1 的 vdiv broadcast=[1]；原始与分组的规划峰值分别为197120B与262144B，实际峰值仍需逐缓冲活跃区间分析。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "历史保留源 attempt-047 的算子级profiling",
+        "finding": "source_sha256=3c34fd…，case4 的 reference AIC Task Duration 119.902us，Block Dim 19、Mix Block Dim 38，AIC cube ratio 均值0.298；该材料绑定历史保留源，与当前失败分支分离。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "paired_profiling",
+        "role": "热点排名用于定位候选机制",
+        "finding": "AIC 最大项为 FLOWCTRL WAIT_FLAG_DEVI 84.32us/9 calls，FIXP FIX_L0C_TO_DST 23.07us 与 17.72us、SET_FLAG 23.07us，CUBE/MTE1 等待约17.7us；AIV 最大单项62.07us、等待累计202.76us。累计指令时间可重叠，排名仅作关注度定位。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "时钟资质、观测范围与覆盖量",
+        "finding": "clock_qualification=relative_only，absolute_time_qualified=false；capture_scope 为首个到末个可见硬件事件，边界保留为 partial；raw_clock_window 128.958–228.979，单位未赋值；outside_events=20；前窗口与后窗口的覆盖量与归一化范围按 partial 解释，未报告泳道保持未知。"
+      },
+      {
+        "path": "gqa-head-row-language-evidence.txt",
+        "category": "evaluation",
+        "role": "Triton 语言能力与后端实现边界",
+        "finding": "现行后端拒绝非单位 batch 的 memref.collapse_shape 并要求327680B，属于当前实现限制；历史047 simulator 把 strided output 的 MTE3 热点定位为25.60us/8 partial calls；当前实验在 BCMLIR 内做编译修复。"
+      }
+    ],
+    "hypothesis": "输出行组循环的迭代彼此独立，可安全声明并行。case4 中 arg14 取 0,8,…,120，共16次；每次迭代只读取 %49 的行区间 [arg14, arg14+8) 与 %reduced 的 [arg14, arg14+8)，这些切片随 arg14 单调推进且互不重叠，两个来源张量在循环内只读。写入地址由 o_idx=%34+arg14 派生：%34=arg13*128 与 arg14 均为8的整数倍，故组内 o_seq=o_idx/8 恒定、o_j 取0..7，一次迭代覆盖外部 %arg5 的 [o_seq*8192, o_seq*8192+1024) 连续元素；不同 arg14 得到不同 o_seq，写区间相隔8192元素，互不重叠。case7 中步长4、%34=arg13*128 为4的倍数，组内 o_seq=o_idx/4 恒定、o_j 取0..3，写区间为 [o_seq*4096, +512)，同样互斥。循环内其余值或为循环不变量，或为本地 tensor.empty，无跨迭代读写与别名。输入拷贝循环已带 hivm.parallel_loop，输出行组循环只带 ExtractedLoadOrStore；把同一标记加到输出循环，向编译器声明其迭代可并行，使 auto-bind-sub-block 按既有合法规则选择 subblock 划分，同时保持输出数学与地址不变。",
+    "alternatives": [
+      "保持 IR 原样：若宿主 CPU 编译表明该标记带来的 UB 峰值下降未兑现，则把输出写回并行化留给独立机制，本轮按 no-change 交接原字节。",
+      "手写 subblock id 与循环区间切分：本轮约束明确排除，划分交由现有 auto-bind-sub-block 选择。",
+      "在 Triton 源码表达行分块与独立写回：源码逐字节冻结，留待解冻后的独立调用，方向是显式64行块与每块独立 store。",
+      "调整编译选项（如多缓冲或绑核策略）：具有独立研究身份，作为后续独立调用，与本轮 IR 机制分开验收。",
+      "改造输出循环外的 128x256 p 链缓冲：属于另一机制（向量工作按行减半），本轮不改循环外字节。"
+    ],
+    "change": "在 ir/target/_gqa_fwd_kernel.bcmlir 第136行与 ir/case7/_gqa_fwd_kernel.bcmlir 第136行的输出行组 scf.for 属性中，把 {ExtractedLoadOrStore} 改为 {ExtractedLoadOrStore, hivm.parallel_loop}。两份特化的循环体字节、ExtractedLoadOrStore 标记、数学、地址计算、loc 与函数 ABI 保持不变；输入拷贝循环的既有标记与第84–135行内容保持原样。",
+    "expected": [
+      "BCMLIR 侧计算指令与动态总轮次保持不变：case4 输出循环总迭代数为16（128/8），case7 为32（128/4）；若编译器按标记把迭代分配给两个 subblock，则每个 subblock 分别执行约8次与16次。",
+      "lowered AIV 的输出循环体保持同一算子序列：load、vdiv(broadcast=[1])、vcast、store；预测变化集中在循环到 subblock 的映射以及 scf.if/limit 条件的生成形式。",
+      "UB 峰值主预测：循环外的 128x256 f32 p 链由5个131072B缓冲主导峰值约262144B，输出循环标记本身触及的缓冲为8x128 f32（约4KB）级别，因此编译仍报 ub overflow 2097152 bits 对 1572864 bits。",
+      "UB 峰值替代预测：若编译器由该标记推导出按行划分的向量工作并把 p 链降到64x256（每个 f32 缓冲65536B），峰值降到196608B以内，编译通过。",
+      "等待与流水：输出路径由 subblock 0 独占 store 的结构预计改变；若迭代被划分，各 subblock 只等待自身 store 完成，串行 MTE3 store 等待下降，标量地址计算量与 cube 侧执行量保持不变。",
+      "宿主CPU重放会分别核对以上主预测与替代预测的兑现情况，并记录与预测的偏差。"
+    ],
+    "validation": "宿主先做 CPU 编译：记录 bishengir 返回码、ub overflow 位数（对照 ir-002 的 2097152/1572864）与最终 AIV。编译通过后按原四案例做正确性与计时，与 retained best attempt-047（案例4 目标175.5726us、四案例几何平均降幅43.27%）比较。同时核对两份 BCMLIR 只有该属性位变化、输出元素数学保持一致、跨迭代写地址互斥，并检查未改动行字节。",
+    "unknown": [
+      "auto-bind-sub-block 是否会把 hivm.parallel_loop 的效果扩展到循环外的128x256 p 链。",
+      "输出循环被划分后 store 守卫 limit_sub_block_id0 的实际生成形式与同步插入位置。",
+      "当前 IR 的器件运行时间与四案例正确性结果。",
+      "该标记对 AIV 侧等待占比202.76us 与 AIC 侧84.32us FLOWCTRL 等待的实际影响幅度。"
+    ],
+    "layer_reason": "Triton 表达能力：输出归一化与行组写回可以用源码的块大小与行映射表达，当前冻结源码在自动 tiling 下生成128行整体向量工作。固定源码实验目的：源码逐字节冻结，本轮通过 IR 控制点单独检验编译器对并行循环声明的反应，保持数学与 ABI，便于归因。IR 控制点：hivm.parallel_loop 是 HIVM 层已有的迭代独立属性，输入拷贝循环已经使用，输出行组循环具备同样的地址互斥与无跨迭代依赖性质，因此该属性是当前 IR 内具体且有执行成本的编译控制点。若同类意图改在源码表达，方向是显式行分块、每块独立写回并保留同等浮点精度与边界处理。",
+    "simulator_incremental_judgment": "profiling/hotspots/timeline 均绑定 attempt-047 retained source（sha256 3c34fd…），属于历史保留材料；当前失败分支没有器件性能。timeline 报告 clock_qualification=relative_only、absolute_time_qualified=false，观测为 first-to-last-visible-event 的 partial capture，raw_clock_window 128.958–228.979、单位未赋值，outside_events=20；前窗口与后窗口的覆盖量、归一化范围按 partial 解释，未报告泳道保持未知。累计指令时间允许跨流水重叠，热点排名用于定位候选机制：AIC FLOWCTRL WAIT_FLAG_DEVI 84.32us/9 calls 与 FIXP 写回类指令17–23us，AIV 等待累计202.76us，共同支持输出写回与同步是关注点；器件关键路径与带宽结论需引用独立支持材料，本轮只把更广机制排除保留为待验证假设。"
+  },
+  "diagnosis_sha256": "486ac118ff82459aa2b61a4e75b2d4ad7a79d95d8d355755ea3d7ac824a65958",
+  "evidence": [
+    {
+      "path": "feedback.json",
+      "category": "evaluation",
+      "role": "正式与补测结果、当前探索分支的真实编译失败",
+      "finding": "case4 与 case7 的 candidate_error 均为 ub overflow：attempt-049 原始 IR 需 1576960 bits、可用 1572864 bits；ir-002 分组 IR 两案例均需 2097152 bits。retained best attempt-047 案例4 为 175.5726us，四案例 official_passed=true，作为验收比较起点。",
+      "sha256": "6910a00a8e569706f6d4ffdae2890fbaf10a021a5027a7e46c54533da4e87268"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "evaluation",
+      "role": "宿主候选机制与实施约束",
+      "finding": "指定只在两份 BCMLIR 特化的输出行组循环追加 hivm.parallel_loop，保持 ExtractedLoadOrStore、循环体、ABI、源码与数学不变；实施前须证明输出迭代写地址互斥且无跨迭代数据依赖，否则按 no-change 交接。",
+      "sha256": "19598e0f30de30b6e1ed86084af5786fb3182b8cfa587f4acb8089c7dbca7e7b"
+    },
+    {
+      "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "当前 target(case4) 特化与标记落点",
+      "finding": "第84–98行输入拷贝循环属性为 {ExtractedLoadOrStore, hivm.parallel_loop}，源 Q 按8行分组、目的为 %alloc_4 的不相交子视图；第117–136行输出行组循环步长8，属性仅为 {ExtractedLoadOrStore}，循环体依次为地址计算、reinterpret_cast、extract_slice、broadcast、divf、truncf、materialize_in_destination。",
+      "sha256": "2a8107b4eaba5c3616c934338f26a5e96e1217f724fb56c879d410a5f9599311"
+    },
+    {
+      "path": "ir/case7/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "当前 case7 特化与标记落点",
+      "finding": "结构与 target 特化一致，输出行组循环步长4，输入拷贝循环同样带 hivm.parallel_loop；输出循环属性仅为 {ExtractedLoadOrStore}。两份特化差异只在头组大小、偏移常量与位置编号。",
+      "sha256": "1052c5e08b115cf99a54837089e35940b21b9c0b03671baaefb38ae999036875"
+    },
+    {
+      "path": "compiled-readonly/diagnostic-grouped-hivm.txt",
+      "category": "source_ir",
+      "role": "当前分组 IR 实际 lower 后的 AIV 生成物",
+      "finding": "AIV 含 hivm.hir.get_sub_block_idx、compare==0，仅输出 store 被 scf.if 的 limit_sub_block_id0 守卫；p 链保留 5 个 128x256 f32 缓冲（各131072B），分母为 128x1 f32，reduce 临时缓冲 16384 f32；末尾报 ub overflow 2097152 bits 对 1572864 bits。输出广播已降为 8x1 视图上的 vdiv broadcast=[1]。",
+      "sha256": "19167f78e91f64a00adabc52ee34e9c9ba512726a6f7ca61f6cfe483d346dfbb"
+    },
+    {
+      "path": "compiled-readonly/diagnostic-original-hivm.txt",
+      "category": "source_ir",
+      "role": "原始 attempt-049 IR 的 lower 对照",
+      "finding": "输出循环步长1，输出循环外同样维持完整 128x256 向量链；同样生成 get_sub_block_idx 与 limit_sub_block_id0 输出守卫；报 ub overflow 1576960 bits 对 1572864 bits。",
+      "sha256": "00d53a8d9c49950e44024f7e653dbf1f7c8f6c43fb164d9eed46436160525b99"
+    },
+    {
+      "path": "memory-partition-findings.json",
+      "category": "evaluation",
+      "role": "宿主对编译中间生成物的分区观察",
+      "finding": "两份最终 AIV 都只守卫输出 store，向量 p/sum 工作未按行减半；输出广播降为 8x1 的 vdiv broadcast=[1]；原始与分组的规划峰值分别为197120B与262144B，实际峰值仍需逐缓冲活跃区间分析。",
+      "sha256": "b5e2b8abcb05299a6cc5c7fc4b5e6dc102ba6469140153fce353a0ce356000da"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "历史保留源 attempt-047 的算子级profiling",
+      "finding": "source_sha256=3c34fd…，case4 的 reference AIC Task Duration 119.902us，Block Dim 19、Mix Block Dim 38，AIC cube ratio 均值0.298；该材料绑定历史保留源，与当前失败分支分离。",
+      "sha256": "cecc4a2287dbb4318d6be3f240c5c7d37a4fa7bb9deeca2da7bc41c4d720b2ca"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "paired_profiling",
+      "role": "热点排名用于定位候选机制",
+      "finding": "AIC 最大项为 FLOWCTRL WAIT_FLAG_DEVI 84.32us/9 calls，FIXP FIX_L0C_TO_DST 23.07us 与 17.72us、SET_FLAG 23.07us，CUBE/MTE1 等待约17.7us；AIV 最大单项62.07us、等待累计202.76us。累计指令时间可重叠，排名仅作关注度定位。",
+      "sha256": "efbb0d7cc1cb231169af2f8dd9107c6b401a53bf0090ffbbdab60bab75c8d80b"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "时钟资质、观测范围与覆盖量",
+      "finding": "clock_qualification=relative_only，absolute_time_qualified=false；capture_scope 为首个到末个可见硬件事件，边界保留为 partial；raw_clock_window 128.958–228.979，单位未赋值；outside_events=20；前窗口与后窗口的覆盖量与归一化范围按 partial 解释，未报告泳道保持未知。",
+      "sha256": "0f7146ec83e0916d404e7b62042bc2421d322e1bd0e67a3fa96f623682e22f3a"
+    },
+    {
+      "path": "gqa-head-row-language-evidence.txt",
+      "category": "evaluation",
+      "role": "Triton 语言能力与后端实现边界",
+      "finding": "现行后端拒绝非单位 batch 的 memref.collapse_shape 并要求327680B，属于当前实现限制；历史047 simulator 把 strided output 的 MTE3 热点定位为25.60us/8 partial calls；当前实验在 BCMLIR 内做编译修复。",
+      "sha256": "da1fecda802f6fed0e6e8f2e1d78ce5b5c47b8d9587ea5dd5eb55897180bdcf1"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "fd25f875c334f929efa8d0fab381344dfcdb901989c12b113e6ede30e537eda3",
+    "contract.json": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858",
+    "ir-inventory.json": "d6ff5d62d6c3a0fdae6c8b34ac7c938ce279064103bf067de1ae047800f25dda",
+    "feedback.json": "6910a00a8e569706f6d4ffdae2890fbaf10a021a5027a7e46c54533da4e87268",
+    "profiling.json": "cecc4a2287dbb4318d6be3f240c5c7d37a4fa7bb9deeca2da7bc41c4d720b2ca",
+    "hotspots.json": "efbb0d7cc1cb231169af2f8dd9107c6b401a53bf0090ffbbdab60bab75c8d80b",
+    "timeline.json": "0f7146ec83e0916d404e7b62042bc2421d322e1bd0e67a3fa96f623682e22f3a",
+    "gqa-head-row-language-evidence.txt": "da1fecda802f6fed0e6e8f2e1d78ce5b5c47b8d9587ea5dd5eb55897180bdcf1",
+    "context.json": "d07c7c29f05ff1dc757cdc97a743c06b4b5c1b379b3cc525bae38fd8e2aaaee5",
+    "diagnosis.json": "d38ae0290ed2cc547d031033ffc806fce9c0e5eed19ed79604b15995b7e5de38",
+    "codex-brief.json": "19598e0f30de30b6e1ed86084af5786fb3182b8cfa587f4acb8089c7dbca7e7b",
+    "memory-partition-findings.json": "b5e2b8abcb05299a6cc5c7fc4b5e6dc102ba6469140153fce353a0ce356000da",
+    "ir/target/_gqa_fwd_kernel.bcmlir": "2a8107b4eaba5c3616c934338f26a5e96e1217f724fb56c879d410a5f9599311",
+    "ir/case7/_gqa_fwd_kernel.bcmlir": "1052c5e08b115cf99a54837089e35940b21b9c0b03671baaefb38ae999036875",
+    "compiled-readonly/_gqa_fwd_kernel.ttir": "b940405368885e9fd449e76edd25e733822dc859e2f4933c63d2a0f6ff939edb",
+    "compiled-readonly/_gqa_fwd_kernel.ttadapter": "0dfa3181c57625c4ef4f3894f9b5cc35eba95f5df1e1cd30695f0a09f502c9fe",
+    "compiled-readonly/_gqa_fwd_kernel.bcmlir": "d4e494444fd707cd0e7a6ce95932d90e172e5f43867c64091738f48420ee667b",
+    "compiled-readonly/diagnostic-original-hivm.txt": "00d53a8d9c49950e44024f7e653dbf1f7c8f6c43fb164d9eed46436160525b99",
+    "compiled-readonly/diagnostic-grouped-hivm.txt": "19167f78e91f64a00adabc52ee34e9c9ba512726a6f7ca61f6cfe483d346dfbb"
+  },
+  "decision_tool_sha256": "2ba55ebab8be5b8a2363da657d6ee81799d4cabcdfb8e1494846aecfd1fde624"
+}

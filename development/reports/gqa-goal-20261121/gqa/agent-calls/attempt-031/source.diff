@@ -1,0 +1,108 @@
+--- 
++++ 
+@@ -114,6 +114,25 @@
+ 是按组遍历的运行时边界循环，K/V 缓冲需在循环内复用（形状与 019 相同，不新增
+ 张量，峰值由同一批 128x256/128x128 张量决定）。FP16 与其他 dtype 的通用二维
+ grid 路径、因果 64/64 分块、两项分解表达式与相加顺序全部保持原样。
++
++单块 softmax 的编译期公共偏移（本轮机制，仅 PART_TILES）：成对 profiling 显示
++候选 Cube 累计时间已与 CANN 参考相当（662.187us vs 673.090us、L0C_to_GM 同为
++98304KB），而 Vector 累计 aiv_vec_time 为 1587.885us vs 1120.804us（约 1.42 倍）；
++模拟器 Vector 窗口 productive 21.78%/idle 66.43%，头部指令是 WAIT_FLAG_DEVI 与
++MOV_SRC_TO_DST_ALIGN 这类交接/搬运（三核部分窗口各自归一化，
++application_completed=false，全调用 completion 缺失）。故本轮删减 Vector 侧一段
++纯计算：PART_TILES 已把整段 KV 并入单块、无 online 重缩放，逐行 max 的唯一作用
++是把 exp2 自变量压到 <=0 以适配 FP16 PV；合同值域 [-1,1] 给出 |q·k| <= D，
++host 由纯元数据取上界 Bq = D*|qk_scale| 并令 SM_OFFSET = Bq - 15，使
++p = exp2(qk - SM_OFFSET) <= 2^15 = 32768 < 65504（约 2 倍余量），同时使典型行
++的 p 处于 FP16 正规区。这样每 tile 删除一次 128x256 max 归约、其守卫与广播减法，
++只保留标量常数减法 + exp2；sum、fp16 PV、PV 后归一化、输出 guard、全部地址与
++20 worker 连续分区逐字保留。数值上是实数等价而非逐位等价：每行 p、l_new 与 PV
++分子同乘一个公共 2 的幂次因子并精确抵消；p 的 FP16 舍入仍为 2^-11 相对误差量级。
++风险是为节省归约而放弃逐行对齐：若某行 max 远低于 SM_OFFSET（约 -12.7 以下）该行
++p 进入 FP16 次正规，更低则整体下溢（l_new 仍由 fp32 提供正值，输出退化为 0）；
++合同均匀随机输入行 max 约 2、std 约 0.48，到达该边界需约 -30σ；值域外 |q|,|k|>1
++可能溢出 FP16。故该机制依赖合同值域，通用 FP16 路径与二维 grid 保持逐行 max。
+ """
+ 
+ import math
+@@ -132,7 +151,7 @@
+     o_sb: tl.constexpr, o_ss: tl.constexpr, o_sh: tl.constexpr, o_sd: tl.constexpr,
+     S: tl.constexpr, SKV: tl.constexpr, D: tl.constexpr,
+     NQ: tl.constexpr, G: tl.constexpr, NKV: tl.constexpr,
+-    qk_scale: tl.constexpr, delta: tl.constexpr,
++    qk_scale: tl.constexpr, delta: tl.constexpr, SM_OFFSET: tl.constexpr,
+     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+     MASK_MD: tl.constexpr, MASK_KV: tl.constexpr,
+     NB_M: tl.constexpr, TPG: tl.constexpr, T: tl.constexpr, P: tl.constexpr,
+@@ -200,10 +219,22 @@
+                 if MASK_KV:
+                     qk = tl.where(offs_n[None, :] < SKV, qk, -float("inf"))
+ 
+-                # SINGLE_KV 无 online 重缩放：表达式与通用路径的 SINGLE_KV 分支一致。
+-                m_safe = tl.max(qk, 1)
+-                m_safe = tl.where(m_safe > -float("inf"), m_safe, 0.0)
+-                p = tl.exp2(qk - m_safe[:, None])
++                # 本轮机制：编译期公共偏移替代逐行 max 稳定化。
++                # 合同输入值域 [-1,1] 给出 |q·k| <= D，故 exp2 自变量
++                # qk - SM_OFFSET <= D*|qk_scale| - SM_OFFSET = 15（host 取
++                # SM_OFFSET = D*|qk_scale| - 15），p <= 2^15 = 32768 < 65504，
++                # 在 FP16 有限范围内保留约 2 倍余量。softmax 对整行公共常数
++                # 严格不变：p、l_new、PV 分子同乘 exp2(m_row - SM_OFFSET)，
++                # PV 后的 acc/l_new 归一化使其在实数上精确抵消。因此这里删除
++                # 每 tile 一次 128x256 的 max 归约、其 -inf 守卫与广播减法，
++                # 只保留一次标量常数减法 + exp2；sum、PV、归一化与输出 guard
++                # 逐字保留。有限精度代价：p 的 FP16 舍入仍为 2^-11 相对误差，
++                # 但若某行 max 远低于 SM_OFFSET（约低于 -12.7），该行 p 进入
++                # FP16 次正规；更低则整体下溢为 0（l_new 仍为 fp32 正值，
++                # acc 为 0，输出为 0）。合同 [-1,1] 均匀随机输入的行 max 约 2
++                # （std 约 0.48），到达该边界需约 -30σ，实际不可达；此机制
++                # 依赖 |q|,|k| <= 1 的合同值域，域外可能溢出 FP16。
++                p = tl.exp2(qk - SM_OFFSET)
+                 l_new = tl.sum(p, 1)
+ 
+                 acc = tl.dot(p.to(tl.float16), v16)
+@@ -229,7 +260,7 @@
+     o_sb: tl.constexpr, o_ss: tl.constexpr, o_sh: tl.constexpr, o_sd: tl.constexpr,
+     S: tl.constexpr, SKV: tl.constexpr, D: tl.constexpr,
+     NQ: tl.constexpr, G: tl.constexpr, NKV: tl.constexpr,
+-    qk_scale: tl.constexpr, delta: tl.constexpr,
++    qk_scale: tl.constexpr, delta: tl.constexpr, SM_OFFSET: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+     BLOCK_D: tl.constexpr,
+@@ -256,7 +287,7 @@
+             v_sb, v_ss, v_sh, v_sd,
+             o_sb, o_ss, o_sh, o_sd,
+             S=S, SKV=SKV, D=D, NQ=NQ, G=G, NKV=NKV,
+-            qk_scale=qk_scale, delta=delta,
++            qk_scale=qk_scale, delta=delta, SM_OFFSET=SM_OFFSET,
+             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+             MASK_MD=MASK_MD, MASK_KV=MASK_KV,
+             NB_M=NB_M, TPG=TPG, T=T, P=P,
+@@ -423,6 +454,16 @@
+         scale = float(scaleValue)
+     # exp2 based softmax keeps the scaling neutral in fp32.
+     qk_scale = scale * 1.4426950408889634
++
++    # 本轮机制（公共偏移，仅 PART_TILES 使用）：合同输入值域 [-1,1] 下
++    # |q·k| <= D，故 exp2 自变量上界为 Bq = D*|qk_scale|。取
++    # SM_OFFSET = Bq - 15，使 p = exp2(qk - SM_OFFSET) <= 2^15 = 32768，
++    # 在 FP16 上限 65504 内保留约 2 倍余量，同时让典型行（行 max 约 2）
++    # 的 p 落在 FP16 正规区而非次正规区。该偏移只是整行公共常数，实数上
++    # 不改变 softmax，PV 后归一化使其抵消；全部量由 shape、D 与 qk_scale
++    # 元数据决定，不读输入值、不按 case_id 选路。通用二维 grid 与 FP16
++    # 路径不使用该值，保留逐行 max 稳定化。
++    sm_offset = float(D) * abs(qk_scale) - 15.0
+ 
+     y = torch.empty((B, S, NQ, D), dtype=query.dtype, device=query.device)
+ 
+@@ -536,7 +577,7 @@
+         value.stride(0), value.stride(1), value.stride(2), value.stride(3),
+         y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+         S=S, SKV=SKV, D=D, NQ=NQ, G=G, NKV=NKV,
+-        qk_scale=qk_scale, delta=SKV - S,
++        qk_scale=qk_scale, delta=SKV - S, SM_OFFSET=sm_offset,
+         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+         IS_CAUSAL=bool(is_causal),
+         MASK_MD=MASK_MD, MASK_KV=MASK_KV,

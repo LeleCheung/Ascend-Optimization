@@ -1,0 +1,122 @@
+triton/language/math.py
+190:     else:
+191:         assert False, f"Unexpected dtype {dtype}"
+192: 
+193: 
+194: @core.builtin
+195: @_add_math_2arg_docstr("fast division")
+196: def fdiv(x, y, ieee_rounding=False, _semantic=None):
+197:     ieee_rounding = core._unwrap_if_constexpr(ieee_rounding)
+198:     x = _semantic.to_tensor(x)
+199:     y = _semantic.to_tensor(y)
+200:     return _semantic.fdiv(x, y, ieee_rounding)
+201: 
+202: 
+203: @core.builtin
+204: @_check_dtype(dtypes=["fp32"])
+205: @_add_math_2arg_docstr("precise division (rounding to nearest wrt the IEEE standard)")
+206: def div_rn(x, y, _semantic=None):
+207:     x = _semantic.to_tensor(x)
+208:     y = _semantic.to_tensor(y)
+209:     x, y = core.binary_op_type_legalization(x, y, _semantic)
+210:     return core.tensor(_semantic.builder.create_precise_divf(x.handle, y.handle), x.type)
+211: 
+
+triton/language/semantic.py
+68:                               div_or_mod: bool) -> tl.dtype:
+69:         # 0) For scalars we follow semantics similar to PyTorch, namely:
+70:         # - If the scalar is of a lower or equal kind (bool < uint < int < fp),
+71:         #   it doesn't participate in the promotion
+72:         if a_is_scalar != b_is_scalar:
+73:             scalar_ty, tensor_ty = (a_ty, b_ty) if a_is_scalar else (b_ty, a_ty)
+74:             if scalar_ty.kind().value <= tensor_ty.kind().value:
+75:                 # Upcast because of 3) and 4) below!
+76:                 if div_or_mod and (tensor_ty in (tl.float16, tl.bfloat16)):
+77:                     return tl.float32
+78:                 return tensor_ty
+79: 
+80:         # 1) if one operand is double, the other is implicitly
+81:         #    converted to double
+82:         if a_ty.is_fp64() or b_ty.is_fp64():
+83:             return tl.float64
+84:         # 2) if one operand is float, the other is implicitly
+85:         #    converted to float
+86:         if a_ty.is_fp32() or b_ty.is_fp32():
+87:             return tl.float32
+88:         # 3 ) if one operand is half, the other is implicitly converted to half
+89:         #     unless we're doing / or %, which do not exist natively in PTX for fp16.
+90:         #     Supported PTX op: add, sub, mul, fma, neg, abs, min, max, tanh, ex2, setp
+91:         if a_ty.is_fp16() or b_ty.is_fp16():
+92:             if div_or_mod:
+93:                 return tl.float32
+94:             else:
+95:                 return tl.float16
+96:         # 4) return bf16 only if both operands are of bf16
+97:         if a_ty.is_bf16() and b_ty.is_bf16():
+98:             if div_or_mod:
+99:                 return tl.float32
+100:             else:
+101:                 return tl.bfloat16
+102:         if a_ty.is_bf16() or b_ty.is_bf16():
+169:     def binary_op_type_checking_impl(self, lhs: TensorTy | numbers.Number, rhs: TensorTy | numbers.Number,
+170:                                      allow_lhs_ptr=False, allow_rhs_ptr=False, arithmetic_check=True,
+171:                                      div_or_mod=False) -> Tuple[TensorTy, TensorTy]:
+172:         lhs_is_scalar = isinstance(lhs, numbers.Number)
+173:         rhs_is_scalar = isinstance(rhs, numbers.Number)
+174:         if lhs_is_scalar:
+175:             lhs_scalar = lhs
+176:             lhs = self.to_tensor(lhs)
+177:         if rhs_is_scalar:
+178:             rhs_scalar = rhs
+179:             rhs = self.to_tensor(rhs)
+180: 
+181:         # implicit typecasting
+182:         lhs_sca_ty = lhs.type.scalar
+183:         rhs_sca_ty = rhs.type.scalar
+184:         self.check_ptr_type_impl(lhs_sca_ty, rhs_sca_ty, allow_lhs_ptr)
+185:         self.check_ptr_type_impl(rhs_sca_ty, lhs_sca_ty, allow_rhs_ptr)
+186:         if arithmetic_check and not lhs_sca_ty.is_ptr() and not rhs_sca_ty.is_ptr():
+187:             ret_sca_ty = self.computation_type_impl(lhs_sca_ty, lhs_is_scalar, rhs_sca_ty, rhs_is_scalar, div_or_mod)
+188:             if (lhs_is_scalar and lhs_scalar < 0 and ret_sca_ty.is_int_unsigned()
+189:                     or rhs_is_scalar and rhs_scalar < 0 and ret_sca_ty.is_int_unsigned()):
+190:                 raise ValueError("Cannot perform a binary operation between an unsigned tensor and a negative scalar. "
+191:                                  "Perform a explicit cast on one of them.")
+192:             if ret_sca_ty.is_int():
+193:                 if lhs_is_scalar and not (ret_sca_ty.get_int_min_value() <= lhs_scalar <=
+194:                                           ret_sca_ty.get_int_max_value()):
+195:                     raise ValueError(f"Scalar {lhs_scalar} is out of range for type {ret_sca_ty}")
+196:                 if rhs_is_scalar and not (ret_sca_ty.get_int_min_value() <= rhs_scalar <=
+197:                                           ret_sca_ty.get_int_max_value()):
+198:                     raise ValueError(f"Scalar {rhs_scalar} is out of range for type {ret_sca_ty}")
+199:             lhs = self.scalar_constant(lhs_scalar, dtype=ret_sca_ty) if lhs_is_scalar else self.cast(lhs, ret_sca_ty)
+200:             rhs = self.scalar_constant(rhs_scalar, dtype=ret_sca_ty) if rhs_is_scalar else self.cast(rhs, ret_sca_ty)
+201: 
+202:         # implicit broadcasting
+286:     def truediv(self, input: TensorTy | numbers.Number, other: TensorTy | numbers.Number) -> TensorTy:
+287:         input, other = self.binary_op_type_checking_impl(input, other, False, False, True, True)
+288:         input_scalar_ty = input.type.scalar
+289:         other_scalar_ty = other.type.scalar
+290:         # float / int
+291:         if input_scalar_ty.is_floating() and other_scalar_ty.is_int():
+292:             other = self.cast(other, input_scalar_ty)
+293:         # int / float
+294:         elif input_scalar_ty.is_int() and other_scalar_ty.is_floating():
+295:             input = self.cast(input, other_scalar_ty)
+296:         # int / int (cast to tl.float32)
+297:         elif input_scalar_ty.is_int() and other_scalar_ty.is_int():
+298:             input = self.cast(input, tl.float32)
+299:             other = self.cast(other, tl.float32)
+325:     def fdiv(self, input: TensorTy | numbers.Number, other: TensorTy | numbers.Number, ieee_rounding: bool) -> TensorTy:
+326:         input_scalar_ty = input.type.scalar
+327:         other_scalar_ty = other.type.scalar
+328:         if not input_scalar_ty.is_floating() or not other_scalar_ty.is_floating():
+329:             raise TypeError("both operands of fdiv must have floating scalar type")
+330:         input, other = self.binary_op_type_checking_impl(input, other, False, False, False, True)
+331:         ret = self.builder.create_fdiv(input.handle, other.handle)
+332:         return self.tensor(ret, input.type)
+333: 
+334:     def mod(self, input: TensorTy | numbers.Number, other: TensorTy | numbers.Number) -> TensorTy:
+335:         input, other = self.binary_op_type_checking_impl(input, other, False, False, True, True)
+336:         scalar_ty = input.type.scalar
+337:         other_scalar_ty = other.type.scalar
+338:         # float % float

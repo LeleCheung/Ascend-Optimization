@@ -1,0 +1,61 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "137e585d2838f32b782c4d76af8e9036193e633a99beac9b88551f4313c90727",
+  "evidence": [
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "trigger",
+      "finding": "三核部分窗口、每核各自归一化：cubecore0 中 CUBE productive 4.74%、wait_only 18.85%、idle 76.41%；热点首位 WAIT_FLAG_DEVI 18.28us(4 calls)，次位 FIX_L0C_TO_DST 与 SET_FLAG(4.13/4.13us) 均映射 candidate.py:112 的 PV 双 dot 累加。veccore0 中 VECTOR productive 35.98%、wait_only 29.87%，MTE2 productive 21.47%；veccore0 热点首位同为 line 112 的 WAIT_FLAG_DEVI(8.46us)。application_completed=false，全调用 completion 缺失。"
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "mechanism",
+      "finding": "candidate 1024 个 block、aic_time 均值 25.48us、aic_fixpipe_ratio 0.0024、aic_scalar_time 12.53us、aic_mte2_time 3.10us；参考 Op 仅 19 个 block、均值 115.9us、fixpipe_ratio 0.486。两侧 program 数不同，逐 block 均值不可直接换算整任务关键路径；但说明每程序内固定交接与标量开销占主导，cube 计算占比极低。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "scf.for 以 step 64 沿 SKV 迭代，acc 为 64x128 f32 iter_arg；每迭代两次 PV dot：acc_90=dot(p_hi,v,acc*alpha) 与 acc_91=dot(p_lo,v,0) 后再向量乘 1/2048 相加。case4 SKV=256 故每程序 4 次迭代、8 个 PV dot、4 次 acc 重缩放与 2x4 次 L0C→UB 交接；交接次数与 KV 块数成正比。"
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "matmul ins(%96,%95) outs(%101) 的初值 %101=acc*alpha 由向量流水产生，确认每 KV 块都要把 acc 经 UB→L1 回灌成 L0C 初值；K/V 带 mask 载入被降级为 fill+subview copy，随迭代次数线性重复。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "固定四项官方 checker 全通过：case1 180.92us、case2 183.68us、case4 1378.75us（native 128.50us）、case7 194.95us；case4 为本轮目标，需优于 1378.73655us，改后四项真实变化同时保存。"
+    },
+    {
+      "path": "workspace/contract.json",
+      "category": "other",
+      "role": "background",
+      "finding": "case1/2/4/7、dtype、golden/checker sha、warmup5/trials3/iterations20 全固定；本改动不动 dtype、不动计时与判定合同。"
+    }
+  ],
+  "hypothesis": "每程序耗时由“每个 KV 块的固定交接链”主导而非算术量主导：一个 KV 块内依次是 QK dot→L0C 搬出→向量 softmax/两项分解→p_hi/p_lo 搬入 L1→两次 PV dot(其中一次以 acc*alpha 为 L0C 初值)→两次 L0C 搬出→向量合并，全部串行。沿 KV 轴每块都要付一次这套交接与 acc 回灌。因此把 KV 方向分块翻倍(64→128)，可在算术量不变的前提下，把 case2/4/7 的迭代数减半(4→2、2→1)、每程序 PV 交接与 acc 重缩放次数减半。",
+  "alternatives": [
+    "增大 BLOCK_M(64→128) 以减少程序数与 K/V 重复读取：acc 变 128x128 f32(64KB)，估算峰值 UB 远超 192KB，且因果 case1 只余单 m 块、并行度下降，先不选。",
+    "把两次 PV dot 串成单条 L0C 累加链(第二次 dot 以第一次结果作初值)以消掉一次搬出：低阶项会对齐 O(sum p|v|) 累加器舍入，破坏两项分解的设计前提，数值风险明确，本调用不改。",
+    "去掉带 mask 载入(本任务四例 SKV/D/S 均为分块整数倍，bounds 精确)：可省 fill+subview copy，但单次收益小于交接次数减半，留作后续独立机制。",
+    "调整 num_stages 开启多缓冲：需复制 K/V 缓冲，UB 余量不足，且属流水参数而非分块机制，留作后续验证。"
+  ],
+  "discriminating_observation": "若瓶颈是每 KV 块一次的 cube↔vector 交接与 acc 回灌，则把迭代数减半应使 case2(Skv=128，新分块下只需单迭代、无在线重缩放)与 case4/7 明显下降，而算术量基本不变的 case1(因果，hi<=128 亦变单迭代，但 pid_m=0 有半块被掩码的冗余计算)预计只小幅变化甚至持平；若瓶颈是算术吞吐或 HBM 带宽，则四项都几乎不动。",
+  "change": "candidate.py 中 BLOCK_D<=128 分支的 BLOCK_N 由 64 改为 128(BLOCK_M 仍 64，BLOCK_D 仍 next_pow2(D))，其余语义、两项概率分解的精度路径、store/归一化、库内 dtype 与公共入口 run(query,key,value,scaleValue,is_causal) 全部不变。",
+  "expected": "case4 1378.75us 视为首要目标，按热点与流水证据预计下降 25%~45%(约 760~1030us)；case2(Skv=128 单迭代)与 case7(Skv=256 双迭代)同向下降；case1 因因果半块冗余预计持平或 ±10%。精度路径表达式与运算顺序未改，仅 KV 轴划分与重缩放次数变化。",
+  "validation": "先 preflight --source candidate.py(编译与只读审查)，再由宿主按原合同做完整四项官方 checker + 计时；四项正确性与真实耗时同时保存，若任一项回归则以其余三项收益与该项损失一并评估。",
+  "selected_layer": "source_tiling",
+  "layer_reason": "热点与流水两路证据都落在每 KV 块一次的 cube↔vector 交接上，交接次数由 KV 分块粒度决定而非由单条指令决定；分块属 Triton 源码可直接表达的层面，且不动两项概率分解的精度路径，比对单算子 IR 提建议更可控、可立刻真机复核。",
+  "simulator_incremental_judgment": "热点证据增量：把 WAIT_FLAG_DEVI / FIX_L0C_TO_DST / SET_FLAG 精确绑定到 line 112 的 PV 双 dot 与 acc 回灌，指出受阻的具体指令与操作，而非笼统等待。流水证据增量：CUBE productive 仅 4.74% 而 wait_only 18.85%、idle 76.41%，VECTOR productive 35.98%/wait 29.87%、MTE2 productive 21.47%，给出“cube 长期空闲、向量侧也在等标志”的量级与跨流水结构，二者共同支持交接次数为主线。限制：仅三核部分窗口、每核各自归一化、application_completed=false 且全调用 completion 缺失，故不据此断言整任务耗时分摊，收益只由真机四项确认。",
+  "unknown": [
+    "BLOCK_N=128 时 UB 峰值(估算 176~208KB，上限 192KB)是否超限，需 preflight 编译结果确认。",
+    "模拟器窗口内 line 112 采样为 4 calls，无法从部分窗口反推 case4 全调用中交接的总占比。",
+    "case1 因果半块冗余与迭代减少的净效应方向未知。"
+  ]
+}

@@ -1,0 +1,70 @@
+{
+  "source_sha256": "a27f40a227126c5ffbe4e6bc1fd6e93cbb7c06d9a417091e1351785b90f0429e",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "目标内核耗时与流水构成（correct-kernel 配对采集）",
+      "finding": "_scatter_add_sort_out_kernel Task Duration 508.550171us；aiv_time 9.803us 中 vec_time 8.2279us、aiv_vec_ratio 0.8399，mte2_ratio 仅0.0705，scalar_wait_time 8.396us。说明该内核向量受限，标量主要在等待向量完成，降低向量工作量应直接缩短关键路径。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "向量指令级热点与绝对时钟资质",
+      "finding": "绝对时钟单位校验 152/152 PC 通过（us）。VGATHER 67 calls/25.33us 居首，其次 MOVEMASK 319/9.07us、VADDS 170/6.88us、VSEL 118/3.57us、VCMPV 63/3.26us、VMINS 63/1.89us、VSHR 55/1.76us、VADD 59/2.96us。这与12轮二分每轮“gather+比较+2×select+mid算术”的数量形态一致，是可见窗口内主要可优化的向量开销。窗口为部分核心窗口，指令时间可重叠、不累加。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "同核流水占用/等待（相对时钟）",
+      "finding": "VECTOR productive_ratio 0.8876、wait_only 0.0348；SCALAR wait_only_ratio 0.8223（标量等待向量）；MTE2 idle_ratio 0.9464（几乎空闲），MTE3 idle 0.9624。时钟为 relative_only、capture scope 为部分窗口。据此：向量是关键路径；追加一次4字节常量偏移标量 load 落在空闲 MTE2 上，代价低，而删除一次向量 gather 有望直接受益。"
+    },
+    {
+      "path": "lower-bound-tail-proof.json",
+      "category": "source_ir",
+      "role": "Codex 秩空间下界折叠证明（诊断贡献，独立于模拟器归因）",
+      "finding": "对全部2049个插入秩抽象穷举通过：11次比较后 rank0/1 同处区间[0,1]，rank≥2 已坍缩为[rank,rank]；第12次比较只对0/1两个秩产生信息，故末轮一般 gather 可省。已核对 frozen.py:205 键由整数派生转 f32 排序，内部键有限有序；prefix 与特殊值走独立张量不受影响。"
+    },
+    {
+      "path": "frozen.py",
+      "category": "source_ir",
+      "role": "算子数学语义与键构造（只读）",
+      "finding": "第256行 t1=dst.to(f32)*B；第266行 static_range(LOG+1)=12 轮：mid=min((lo+hi)>>1,B-1)；go=gather(keys,mid)<t1；lo=go?mid+1:lo；hi=go?hi:mid。裁剪仅影响 rank=2048 的 lo==hi 收敛值，使其 gather 落在 B-1 且 lo 保持 B。keys=B*t+lane（t≥0 整数）转 f32 后排序，有限非降。"
+    },
+    {
+      "path": "ir/586fab365d9e315e3ad89eedcf6806290aa9406eeeb142d4583a8d657dabb861/_scatter_add_sort_out_kernel.ttir",
+      "category": "source_ir",
+      "role": "实际已展开 TTIR 的搜索尾部",
+      "finding": "12轮二分已完全展开。第11轮后 lo=%lo_91、hi=%hi_92（第106-113行）；第12轮为第114-120行：mid_93=lo_91+hi_92、mid_94=shrsi、mid_95=minsi(mid_94,2047)、go_96=gather(keys_5,mid_95)、go_97=go_96<t1_10、lo_98=mid_95+1、lo_99=select(go_97,lo_98,lo_91)。标量指针 %keys 定义于第20行，可复用以读取 keys[0]。"
+    },
+    {
+      "path": "compiled-readonly/586fab365d9e315e3ad89eedcf6806290aa9406eeeb142d4583a8d657dabb861/5ba65c14593889077788732baa72e17bdb22ebda07de1fbaf16e1cb2fc19f634/_scatter_add_sort_out_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "后端实际 lowering 核对（疑似冗余是否已消除）",
+      "finding": "共14个 triton_gather 调用：loc#34 下12个对应12轮二分，其中第12轮 %104=call @triton_gather_10（第148行）仍是泛型 gather，未被后端消除；另2个为 nxt(%111,@triton_gather_11) 与 after(%116,@triton_gather_12)。首轮 mid=1024 常量（%8=linalg.fill 1024）同样仍是泛型 gather，说明后端本就不会把常量/均匀索引 gather 标量化。故“末轮 gather 冗余”在真实低层产物中仍存在，可改。"
+    },
+    {
+      "path": "lowered-inventory.json",
+      "category": "source_ir",
+      "role": "低层产物清单与冻结身份",
+      "finding": "sort_out 的 ttadapter(1c53e903…)/bcmlir(ea7e7cb3…)/npubin(582887767b190530…) 均属冻结真实编译结果；本轮仅编辑 ir-inventory 允许的 TTIR，不动这些低层产物与函数ABI。"
+    }
+  ],
+  "hypothesis": "移植 Codex 的秩坍缩结论到实际 TTIR：12轮二分中第12轮对所有插入秩均为可约简轮——rank≥2 时 lo==hi 已收敛，该轮为 no-op；仅 rank0/1 仍处区间[0,1]，其判别恰为 keys[0]<t1。因此在 TTIR 删除第12轮的 gather(keys,mid_95) 及其 mid 算术，改用一次常量偏移标量 load 取 keys[0]，构造 go_first=keys[0]<t1，并以 unresolved=(lo_11==0) 门控把 lo 前推一位：lo_99 = lo_91 + select(unresolved & go_first, 1, 0)。该式对全部2049秩与原12轮结果逐秩等价（rank0→0、rank1→1、rank≥2→lo_91、rank2048→2048），不削减任何必需比较、不改变 ABI/网格/键前缀数值/特殊值/重复键/缺席段。Codex 贡献在于秩空间证明与候选方向；本轮由我核对实际 BCMLIR 确认末轮 gather 未被后端消除，并据 profiling/hotspots/timeline 独立判断其为向量关键路径上的可省开销。",
+  "alternatives": [
+    "将首轮 mid=1024 的均匀索引 gather 改为常量偏移标量 load+splat（Codex 备选方向）。BCMLIR 已证实该 gather 亦未被标量化，属另一独立机制；为遵守“单机制”本轮不采用，避免与末轮折叠混合归因。",
+    "用 tt.gather(keys_5, 全零索引) 取 keys[0] 广播：因 BCMLIR 中首轮均匀 gather 仍是泛型 gather，无法保证降本，故不采用，改为标量 load+splat。",
+    "保持 IR 原样交接：仅在“后端已消除末轮 gather”时成立，但实测 %104=@triton_gather_10 仍为满 lane 泛型 gather，故不动手会放弃真实可省开销，非更优。"
+  ],
+  "change": "仅编辑 sort_out 的 TTIR（ir/586fab…/_scatter_add_sort_out_kernel.ttir）第114-120行：删除第12轮 %mid_93/%mid_94/%mid_95/%go_96/%go_97/%lo_98 与 lo_99 的 select，改为：%first_key=tt.load %keys（标量 f32）；%first_key_v=tt.splat；%go_first=arith.cmpf olt %first_key_v,%t1_10；%unresolved=arith.cmpi eq %lo_91,%cst；%tail_step=arith.andi %unresolved,%go_first；%tail_inc=arith.select %tail_step,%cst_1,%cst；%lo_99=arith.addi %lo_91,%tail_inc。不再使用 %hi_92（保留为死值，由DCE处理）。函数签名、constexpr、网格、指针与访问均不变。",
+  "expected": "净删1次 2048 lane 动态 VGATHER，并减少该轮 VADD/VSHR/VMINS/1×VCMPV/2×VSEL/2×MOVEMASK；新增1次常量偏移4字节标量 load（MTE2 空闲0.946、ratio0.07，可吸收）+1 splat+1 VCMPV(比较)+1 VCMPV(cmpi)+1 andi+1 VSEL+1 MOVEMASK。按 sort_out 向量受限(vec_ratio0.84)、VGATHER 为可见窗口首要向量开销，预测 sort_out 内核时间下降约2–5%，整调用延迟（sort_out≈508us/总计≈1287us）下降约1–2%，应可分辨地低于当前最佳1.282337ms；若实测无稳定下降，则该机制被否证。",
+  "validation": "语义与性能均由宿主执行：完整18-case、双方21-case补测、段独立3/3；要求 matched_ratio 1.0、atol/rtol 1e-4 与 fp32 精度不变。专项核对：rank0/1 边界、rank2047/2048、重复键 lower_bound、缺席段(end>lo 为假)、空行、特殊值前缀。对照当前最佳与历史最优1.282337ms 判定是否稳定增益；不得以文档/预检代替真实测量。",
+  "layer_reason": "缺陷位于 TTIR 已展开的12轮二分中一个可证明冗余轮，属算子内部计算结构，可在不触碰源码/编译选项/ABI/网格的前提下由 IR 级删除；且实测后端未消除该 gather，故单算子 IR 层是正确且可独立验证的修改层。",
+  "simulator_incremental_judgment": "模拟器时钟为 relative_only、capture 为部分核心窗口，绝对单位仅经152/152 PC 同址校验为 us，未报告泳道不作结论；VGATHER/MOVEMASK/VSEL 等指令时间为可重叠关注度、不可累加，BAR/WAIT 事件表明有分段同步。综合 VECTOR productive 0.8876、SCALAR wait-only 0.8223（标量等待向量）、MTE2 idle 0.9464，判断删向量工作直接受益而增小标量 load 风险低；此为增量判断，最终收益以宿主完整评测为准。",
+  "unknown": [
+    "常量偏移标量 load 的实际流水落点与是否被提升/合并尚未在真实编译后确认。",
+    "删除一轮后是否改变寄存器压力与同步(BAR)布局从而产生非线性效应，需实测。",
+    "首轮常量 gather 是否值得作为下一独立机制处理，留待本轮结果后评估。"
+  ]
+}

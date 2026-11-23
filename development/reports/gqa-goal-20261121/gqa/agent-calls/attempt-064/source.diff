@@ -1,0 +1,39 @@
+--- 
++++ 
+@@ -831,6 +831,24 @@
+             # softmax/p·v 转换 → PV dot 搬出），并删掉整段 online 重缩放。
+             # 其余形状（SKV=128 的 case2 等）仍取 128 的通用分块。
+             BLOCK_N = 256 if (SKV >= 256 and SKV % 256 == 0) else 128
++            # 本轮机制（宿主指定单变量实验 OnlytryM256on063，仅主机元数据）：
++            # 在非因果、V 为 BF16、D==BLOCK_D==128、BLOCK_N==SKV==256 且
++            # S%256==0 时把 BLOCK_M 由 128 提到 256。判据只用合法元数据
++            # （dtype、shape、causal、分块整除性），不读输入值、不按 case_id
++            # 选路。命中时 case4 的 NB_M 2->1、TPG 16->8、T 512->256，20 个
++            # worker 各约 12~13 tile，组数仍为 B*NKV=32，tile 覆盖仍为全部
++            # (b,kvh,hq,行块) 且每 (b,hq) 只写一次；每 worker 串行交接链条数
++            # 约减半，单链在 M 维承载两倍行。内核 AST、全部数学/dtype/FP16
++            # 交接、BF16 PV、FP32 分母与除法、NoOff 守卫、QK 前瞻、20 worker、
++            # num_stages=2、缓存与输出分配逐字不变。数值上 BLOCK_M 只改 tl.dot
++            # 的 M 铺排与程序/行块划分，不改变每行 softmax/PV 的归约顺序。
++            # 资源未知：raw_next 256x256 f16=128KiB、acc 256x128 f32=128KiB、
++            # Q 256x128 bf16=64KiB 叠加可能超 UB/L0C 196608B 预算；若编译失败
++            # 则如实保留，不回退、不引入额外机制。未命中的形状（case7 S=128、
++            # case2 fp16、case1 causal）保持原 BLOCK_M=128/128/64。
++            if (value.dtype == torch.bfloat16 and D == 128 and BLOCK_D == 128
++                    and BLOCK_N == 256 and SKV == 256 and S % 256 == 0):
++                BLOCK_M = 256
+     elif BLOCK_D <= 256:
+         BLOCK_M, BLOCK_N = 32, 32
+     else:
+@@ -870,8 +888,10 @@
+     NB_M = triton.cdiv(S, BLOCK_M)
+     TPG = G * NB_M
+     T = B * NKV * TPG
++    # 准入沿用父版本全部元数据条件，仅把 BLOCK_M 维由等于 128 放宽为
++    # 128 或 256（256 只会由上段严格元数据判据给出；其余条件不变）。
+     PART_TILES = ((not is_causal) and PV_SINGLE_F16 and SINGLE_KV
+-                  and BLOCK_M == 128 and BLOCK_N == 256 and BLOCK_D == 128)
++                  and BLOCK_M in (128, 256) and BLOCK_N == 256 and BLOCK_D == 128)
+     if PART_TILES:
+         P = 20 if T >= 20 else T
+         grid = (P,)

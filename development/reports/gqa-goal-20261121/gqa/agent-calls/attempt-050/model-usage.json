@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 59,
+    "duration_ms": 174276,
+    "usage": {
+      "input_tokens": 76006,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 2958208,
+      "output_tokens": 25403,
+      "output_tokens_details": {
+        "thinking_tokens": 10306
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 76006,
+        "outputTokens": 25403,
+        "cacheReadInputTokens": 2958208,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 2.4942090000000006,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 10306,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 2.4942090000000006,
+    "result": "已完成本轮修复并交接。\n\n## 核对四项实际反馈（repair-feedback.json, source fd25f87）\n- **case1 / case2（fp16）**：真实编译成功，官方 checker 全部通过（阈值不变，mere 9.36e-08 / 8.95e-08，normal/small/cancel 子项均 passed），candidate full_call_us 102.53 / 98.75。无错误、无资源溢出。\n- **case4 / case7（bf16）**：真实失败为 `MLIRCompilationError`，`_gqa_fwd_kernel` 处 `ub overflow, requires 1576960 bits while 1572864 bits available`，`resource_bytes required=197120 available=196608`，仅超 **512B**；这两项无 checker 结果、无 candidate 计时。\n\n## 由实际失败 IR 定位的原因\n`failed-ir/attempt-049` 的 TTIR/TTAdapter/BCMLIR（G=8，PART_TILES）显示：平坦行映射的 `e_row//G`、`e_row%G` 仍是 128 元素整型向量上的运行时 `divsi/remsi`，导致 Q 载入与 Out 写出被降级为 128 次逐行标量 `memref.copy`，Out 路径还多出 `1x128 f32`（正好 **512B**）暂存。对照 `actual-ir/0-...bcmlir`（047，同样 128x256 BF16 单链、但行基址为 affine `offs_m*q_ss`）：Q 是一次 strided 整块 copy、Out 是一次整块 materialize。故超预算是行索引层问题，不是 matmul/exp2/PV 层。\n\n## 选定机制（采纳 host-repair-analysis 的建议，并在 diagnosis 中单列宿主建议与我的具体修复）\n`_gqa_tile_part_body` 内，`BLOCK_M % G == 0` 时把行映射分解为\n`seq_row = t*(BLOCK_M//G) + lane//G`、`gi_row = lane%G`，lane 的序列/头地址贡献（`lane_off_q`、`lane_off_o`）提到循环外成为编译期常量向量，每 tile 只留标量基址；`G` 不整除 `BLOCK_M` 时保留 049 通用分支。取舍：\n- **精度**：零变化（地址完全相同，仅整型索引恒等改写；无新 cast、无重排）。\n- **活跃缓冲**：预期持平或下降（去掉向量 div/remsi 与逐行 1x128 暂存），但后端能否恢复整块搬运未证。\n- **交接次数 / 并行度**：不变（2 个 matmul、每 tile 一条链、P=min(20,T) 分区不变）。\n- 四项 checker、golden、dtype 选路、计时口径、已验收精度路径全部未动；保留版独立冻结。\n\n## 当前状态\n- 修改前决策已写入并记录：decision `f67850e024a34dc184812c18a25101ff`（基于 fd25f87）。\n- 修改后源码 SHA：`bb60b0354359739f69652d32765ee2aa2fcb88edaf8f23477028415820b13531`。\n- preflight 返回 **awaiting_source_review**，候选字节已保持并冻结，未做任何进一步修改。\n- **不声称**当前源码已通过编译或有任何真机收益；diagnosis.json 已更新 observations / open_questions，待外部审查后由宿主发起真实四项评测再据实判定（若 UB 仍为 197120B 则按负结果记录并换独立缓冲削减机制）。"
+  }
+}

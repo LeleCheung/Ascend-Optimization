@@ -1,0 +1,19 @@
+{
+  "source_sha256": "19f7fb238946cb9006286d4d222425d07c4ea9fc38a7d4ff85c71c72c49c584a",
+  "author": "Codex",
+  "requested_mechanism": "从已验收ir004检验下一tile FP32概率预计算：nextQK预取完成后、当前PV等待之前，计算下一块half→float、同一缩放与exp。每组首tile原位置计算，其余tile使用前一轮准备的FP32p；P的BF16转换/发送仍在对应tile原位置。为保留下一p，当前VREC结果和VMUL临时区必须移出FP32p114688..180224。保持数学、每tile操作数/精度、AIC、GM地址、所有dot、P发送与PV/输出语义；由你选择具体IR实现、首尾和同步处理。",
+  "analysis": "当前IR004真机133.3206us、kernel136.642731us均明显改善，当前模拟器三核时钟30/30。sameveccore0 nextQK收到45.485，当前PV等待至46.412，留下0.927us；后续51.112→52.594有1.482us，57.810→59.057有1.247us。下一tile half→float47.049–47.330，exp47.508–47.835，仍在PV返回以后。当前p在earlysum后已死，但VREC输出114688..114944和VMULscratch114944..116992占用p缓冲，妨碍下一FP32p跨当前归一化存活。可将reciprocal放180480..180736、VMULscratch放180736..182784（仍小于196608，32B对齐）；原den180224..180480保持。当前sum完成并保存reciprocal后才覆盖p为下一概率，当前PVraw65536、acc/output81920均独立。若有更合适的对齐地址由你论证，完整检查实际库调用scratch。",
+  "requirements": [
+    "首先Read成功读取context/profiling/hotspots/timeline/frozen.py和实际IR；只用给出的工具桥命令登记和提交。",
+    "保持当前每tile相同FP32缩放常量、VEXP、求和树、VREC、VMUL和舍入，没有近似算法变化。",
+    "G=48首块准备加T-G=464守卫前瞻，总512次half转换/缩放/exp；不得在后续循环再次计算。",
+    "初始prefill和每次prefetch分别set MTE2→V EVENT1，必须各恰好一次wait：首块入口和后续prefetch分支消费；去除后续迭代重复wait。",
+    "current QK consumed信号可以继续在MTE2完成后发，下一GM覆盖不会破坏已经载入UB的数据。",
+    "nextFP32p写114688不能覆盖currentreciprocal或VMULscratch；current VMUL和output转换均不能改写nextp；下一迭代sum才写当前den。",
+    "保留Psend原MTE3完成保护、flag1/flag3、nextreadyflag4以及PVflag0；不要提前下一P发送，避免混入第二流水机制。",
+    "逐条审查PIPE_V屏障、输入输出别名、跨迭代/组边界存活期、尾部无越界预读；AIC保持逐字节一致。",
+    "不使用新外部库函数或修改ABI，所有数学仅复用原实际调用；原官方case1/2/4/7与checker冻结。"
+  ],
+  "prediction": "试图将约0.67us每tile概率准备藏进PV等待；新增branch与资源地址可能抵消收益，后重放检验VEXP是否确实提前，真实成绩待验收。",
+  "scope": "Codex分析建议，CC/DeepSeek实际编写IR；全部历史负结果保持。"
+}

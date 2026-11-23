@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 21,
+    "duration_ms": 76209,
+    "usage": {
+      "input_tokens": 46219,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 460928,
+      "output_tokens": 12653,
+      "output_tokens_details": {
+        "thinking_tokens": 6865
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 46219,
+        "outputTokens": 12653,
+        "cacheReadInputTokens": 460928,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 0.7778839999999999,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 6865,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 0.7778839999999999,
+    "result": "已完成本轮独立实验并停在 preflight 交接边界。以下是结果摘要。\n\n## 读取与证据（本轮实际材料）\n- `workspace/current-profiling.json`：case4 父版本 `Task Duration 165.843323us`（参考 128.042557us），vector0/1 `aiv_vec_time` 均值均 53.44us，高于 waits。\n- `workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir`：第 93–95 行 `mulf(X_SCALE)` → `subf(X_OFF=0.916500807)` → `math.exp`。\n- `workspace/actual-ir/2-_gqa_fwd_kernel.ttir`：第 105–107 行同形，确认减法在 TTIR 层独立生成。\n- `workspace/candidate.py`：仅 PART_TILES 第 391 行计算 qk；host `sm_offset = D*|qk_scale|-15` 为纯元数据。\n- `workspace/contract.json`：固定 case、checker/golden、dtype 与计时合同。\n\n## 数值判据与更简表达\n- `X_SCALE = qk_scale*ln2 = scale`，D=128 默认 scale 时 `D*|X_SCALE| = sqrt(128) = 11.3137 ≤ 12`，命中判据。\n- 合同有界输入 `|q·k| ≤ D` ⇒ 指数自变量落在 `[-12,12]`：`e^-12≈6.1e-6` 仍为 FP32 正规数，`e^12≈1.6e5` 有限。**该判据只保证指数范围有限，不宣称 PV 结果 FP16 全域安全**。\n- 更简方案（host 令 `sm_offset=0`）仍会生成 128×256 `subf(0)`，不保证被折叠，且会改动 host 缓存键取值；无条件删除对更大 scale/D 不满足元数据安全，故均未采用，改用编译期 guarded 表达式保留原路径。\n\n## 修改（仅 `candidate.py`）\n`diff starter.py candidate.py` 只有两处 hunk：\n1. jit 体内新增 constexpr：\n```python\nX_ABS: tl.constexpr = X_SCALE if X_SCALE >= 0 else -X_SCALE\nNO_OFF: tl.constexpr = D * X_ABS <= 12.0\n```\n2. qk 表达式改为 compile-time 静态分支：命中走 `raw_qk * X_SCALE`，未命中保持 `raw_qk * X_SCALE - X_OFF`。\n\n去掉注释后，恢复的归一化 AST 与 056 的差异**只有这一处受保护的表达式**；`X_OFF` 定义保留但命中分支未使用；`X_ABS/NO_OFF` 是元数据常量，不产生设备指令。host、grid、20-worker 连续分区、分块、MASK、非 PART 分支、BF16 PV、QK/PV 的 FP16 交接、分母 sum 与除法全部逐字未变（无按 case_id/输入值选路）。\n\n## 预测\n- IR：PART_TILES 热路径应只剩 `mulf → math.exp`，`arith.subf` 与常量 `0.916500807` 消失；若 lowering 认为屏障独立，则同时减少该向量子操作及其后同步。\n- 数值：p/l_new/acc 整体乘 `2^15`，`acc/l_new` 抵消，实数等价；输出仅差公共因子舍入。\n- 性能：每 tile（case4 共 512 tile、每 worker 约 25–26）少一次 128×256 FP32 向量减法，期待 case4 `Task Duration` 低于保留最佳 172.10760us，并相对 056 的 160.87715us 小幅下降；case1/2/7 源码不变，真实变化由完整评测记录；原四项 checker 阈值不变。\n\n## 交接状态\n- decision 已登记：`443712dee9f04812b28703d96afc677d`（source_sha256 `1aad532b…`）。\n- preflight 返回 `awaiting_source_review`，新源码 SHA：`662015b9edecc3a76cfe60656e2441f51fcfe31483fe514d387dda21d84aa730`。\n- 保持该字节不变，交宿主只读审查与完整四项真机评测；修改后的 BCMLIR/TTIR 与成对 profiling 重放待结果反馈后更新诊断。"
+  }
+}

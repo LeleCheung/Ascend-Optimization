@@ -1,0 +1,21 @@
+--- 
++++ 
+@@ -136,9 +136,17 @@
+     y = torch.empty((B, S, NQ, D), dtype=query.dtype, device=query.device)
+ 
+     # UB budget: acc is BLOCK_M x BLOCK_D fp32, plus q/k/v/p tiles.
++    # KV 方向分块取 128：每个 KV 块固定要付一次完整交接链（QK dot 搬出、
++    # 向量 softmax 与两项分解、p_hi/p_lo 搬入 L1、两次 PV dot 其中一次以
++    # acc*alpha 作 L0C 初值、两次 L0C 搬出、向量合并），该链与算术量无关。
++    # 分块由 64 提到 128 后，case2 退化为单迭代，case4/7 迭代数 4/2 减半，
++    # 每程序 PV 交接、acc 重缩放与 K/V 装入次数同比例减半；代价是单块
++    # K/V/p 张量翻倍，UB 峰值仍须低于 192KB，且因果 case1 的 pid_m=0 会
++    # 多算半块被掩码的列（算术量约 +33%，但迭代数由 3 降到 2）。
++    # 两项概率分解的表达式与相加顺序保持不变，仅 KV 轴划分与重缩放次数变化。
+     BLOCK_D = max(16, triton.next_power_of_2(D))
+     if BLOCK_D <= 128:
+-        BLOCK_M, BLOCK_N = 64, 64
++        BLOCK_M, BLOCK_N = 64, 128
+     elif BLOCK_D <= 256:
+         BLOCK_M, BLOCK_N = 32, 32
+     else:

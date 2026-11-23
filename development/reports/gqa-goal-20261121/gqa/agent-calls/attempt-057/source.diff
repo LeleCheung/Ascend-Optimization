@@ -1,0 +1,36 @@
+--- 
++++ 
+@@ -323,6 +323,17 @@
+     LN2: tl.constexpr = 0.6931471805599453
+     X_SCALE: tl.constexpr = qk_scale * LN2
+     X_OFF: tl.constexpr = SM_OFFSET * LN2
++    # 本轮机制（编译期免偏移，仅 PART_TILES，纯元数据判据）：X_OFF 是整块统一
++    # 常数，删除它只把该 tile 的 p、l_new 与 PV 分子同乘公共因子 exp(X_OFF)，
++    # 随后 acc/l_new 归一化精确抵消。当 D*|X_SCALE|<=12 时，合同有界输入
++    # |q·k|<=D 的指数自变量被限制在 [-12,12]，e^-12 仍为 FP32 正规数、
++    # e^12≈1.6e5 有限，故不需要偏移压低上界；此判据只保证指数范围有限，
++    # 不宣称 PV 结果 FP16 全域安全。未命中（更大 scale/D）时保留原 -X_OFF 路径。
++    # 收益：每 tile 少一次 128x256 FP32 向量减法及其可能附带的屏障；
++    # 代价：p/l_new/acc 数值整体放大 2^15，FP16 交接的溢出余量相应变化，
++    # 由原四项 checker 以不变阈值判定。判据不读输入值、不按 case_id 选路。
++    X_ABS: tl.constexpr = X_SCALE if X_SCALE >= 0 else -X_SCALE
++    NO_OFF: tl.constexpr = D * X_ABS <= 12.0
+ 
+     # P <= T 时每个程序区间非空；该 guard 只为空区间（P > T）的通用正确性保留。
+     if hi > lo:
+@@ -380,7 +391,14 @@
+                 # 本轮机制（自然指数仿射折叠）：rawQK 仍先做 FP16 交接，随后用
+                 # 自然域常数做一次乘/减（raw*X_SCALE-X_OFF），由后端决定是否与
+                 # exp 的 log2e 缩放重结合成单条向量乘加；不写未经确认的 fma。
+-                qk = tl.dot(q, tl.trans(k)).to(tl.float16).to(tl.float32) * X_SCALE - X_OFF
++                raw_qk = tl.dot(q, tl.trans(k)).to(tl.float16).to(tl.float32)
++                if NO_OFF:
++                    # 元数据判据命中：去掉 -X_OFF，仅保留一次缩放乘；实数上
++                    # 等价于公共因子整体放大，归一化后抵消。
++                    qk = raw_qk * X_SCALE
++                else:
++                    # 原偏移路径逐字保留（更大 scale/D 时压低 exp 上界）。
++                    qk = raw_qk * X_SCALE - X_OFF
+ 
+                 if MASK_KV:
+                     qk = tl.where(offs_n[None, :] < SKV, qk, -float("inf"))

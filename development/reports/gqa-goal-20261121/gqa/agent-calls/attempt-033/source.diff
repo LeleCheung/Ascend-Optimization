@@ -1,0 +1,40 @@
+--- 
++++ 
+@@ -133,6 +133,16 @@
+ p 进入 FP16 次正规，更低则整体下溢（l_new 仍由 fp32 提供正值，输出退化为 0）；
+ 合同均匀随机输入行 max 约 2、std 约 0.48，到达该边界需约 -30σ；值域外 |q|,|k|>1
+ 可能溢出 FP16。故该机制依赖合同值域，通用 FP16 路径与二维 grid 保持逐行 max。
++
++FP16 rawQK 交接（本轮机制，仅 PART_TILES）：模拟器把最大的 FIXP 热点定位在
++QK→Vector 边界（FIX_L0C_TO_DST 83.49us/19 次对应 128x256 f32），而 PV 那条
++29.22us/18 次是另一处；实际 BCMLIR 中 rawQK 正以 128x256 f32 从 L0C 搬出后
++才做 qk_scale/公共偏移/exp2。故在 dot 之后先把 rawQK 舍入到 FP16 再显式扩回
++FP32，不改变 Q/K 输入精度与 dot 的 fp32 累加，仅表达「搬出用 f16」的意图：
++后端若把该转换折叠进 FIXP，QK 搬出 128KiB→64KiB、总 L0C 98304→约 65536KB；
++若仅在 UB 发生则字节不变，按真实无减少记录并交接固定源码 IR 改法。数值上
++rawQK 有符号就近舍入，|q·k| <= D = 128 不溢出 fp16，典型概率相对误差约 2e-4、
++最坏约 0.56%，合同值域 [-1,1]，由原四项 checker 以不变阈值判定。
+ """
+ 
+ import math
+@@ -214,7 +224,19 @@
+                 else:
+                     q = tl.load(q_ptrs)
+ 
+-                qk = tl.dot(q, tl.trans(k)) * qk_scale
++                # 本轮机制（PART_TILES 的 QK→Vector 交接，FP16 rawQK）：Q/K 仍为
++                # 原 BF16，tl.dot 内部仍按 FP32 累加；dot 之后先把 rawQK 就近
++                # 舍入到 FP16，再显式扩回 FP32，随后才执行原 qk_scale、编译期公共
++                # 偏移、exp2/sum、fp16 PV 与归一化，表达式其余部分逐字不变。
++                # 该舍入只由源码显式表达：后端若把 FP32→FP16 转换折叠进 FIXP
++                # （fixpipe 输出 f16），则 QK 的 L0C→Vector 搬出由 128x256 f32
++                # (128KiB) 降为 f16(64KiB)，总 L0C 搬出 98304→约 65536KB；若 cast
++                # 只落在 UB，则搬出字节与热点时间不变，属真实无减少，由修改后
++                # BCMLIR/二进制/profiling 判定。数值风险：rawQK 有符号、就近舍入
++                # 对称保号；合同 [-1,1]^128 下 |q·k| <= D = 128 不溢出 fp16，典型
++                # 概率相对误差约 2e-4、最坏约 0.56%，适用域 [-1,1]，由原四项
++                # checker 以不变阈值判定（详见 diagnosis.json）。
++                qk = tl.dot(q, tl.trans(k)).to(tl.float16).to(tl.float32) * qk_scale
+ 
+                 if MASK_KV:
+                     qk = tl.where(offs_n[None, :] < SKV, qk, -float("inf"))

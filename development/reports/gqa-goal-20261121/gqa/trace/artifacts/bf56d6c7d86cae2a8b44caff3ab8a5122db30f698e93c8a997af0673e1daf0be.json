@@ -1,0 +1,47 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "3c34fdfb6ef2aacc3b0ae8cbd0683bd22d7610ffcb388c6ef2da50d0a72c04ee",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "同一成对采集（device 7）下候选 _gqa_fwd_kernel_mix_aic 任务 174.563492us，参考 FusedInferAttentionScore 119.902397us。候选 Cube 侧已不劣：aic_cube_time 33.109us/核 < 参考 35.419us，aic_fixpipe 25.809us < 57.280us，L0C_to_GM 3276.8KB/核 < 5173.9KB；差距留在 AIV：aiv_vec_time 53.020us/核、aiv_mte2 21.86/22.36us、aiv_mte3 20.78/22.71us，且参考同样做满 vec（59.008us）却整体更快，说明候选 AIV 侧每 tile 的 FP32 逐元素链仍是可削减对象。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "第 97-101 行给出本候选 PART_TILES 的单 tile 交接：%qk_43 = truncf f32->f16（rawQK 交接）、%qk_44 = extf f16->f32、%qk_45 = arith.mulf %qk_44, %cst_1(0.127517432)、%p = arith.subf %qk_45, %cst_0(1.32223117)、%p_46 = math.exp2 %p。即 transcendental 之前有两道独立 128x256 FP32 逐元素向量操作，TTIR 中不存在 fma 或任何常量重结合。"
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "第 93-97 行在 BCMLIR 层逐字保留同一链（%50 truncf、%51 extf、%52 mulf %51,%2、%53 subf %52,%3、%54 math.exp2），且两常量先经 linalg.fill 展开成 128x256 f32 张量 %2/%3 才作为张量操作数参与运算——改造目标正是这两条张量级 mulf/subf，而非 Cube 或搬运结构。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "本源码（3c34fdfb…）保留最佳：case4 175.572600us（native 130.6631）、case1 111.56305、case2 106.28305、case7 94.68955；四项官方 checker 全部通过且阈值 0.0078125 未变（case4 mere 5.05595e-05、mare 0.007812494、max_diff 0.0009765625、mismatch_ratio 0.00183618）。本机制须在不触碰该阈值与 golden 的前提下再降 case4。"
+    }
+  ],
+  "hypothesis": "PART_TILES 每 tile 在 QK 之后、exp2 之前要对 128x256 的 FP32 rawQK 做两道独立逐元素向量操作（乘 qk_scale、减公共偏移 SM_OFFSET），AIV 已是被压满的流水。若把 softmax 自变量改写为自然指数仿射式 x = raw*X_SCALE - X_OFF，其中 X_SCALE=qk_scale*ln2、X_OFF=SM_OFFSET*ln2，则真实数值仍等价的 2^(raw*qk_scale-SM_OFFSET)：若后端把 math.exp 落实为 exp2(x*log2e)，则该 log2e 缩放可与仿射式重结合为 raw*(qk_scale) - SM_OFFSET，使 mulf+subf 折叠成一次向量乘加；若后端有原生 exp 指令而 exp2 由 exp(x*ln2) 合成，则当前形态里隐式的 ln2 乘法也可被自然指数吸收。两种情况都每 tile 少一道 128x256 FP32 向量操作（约 26 tile/worker）。",
+  "alternatives": [
+    "候选 AIV 时间主要不是逐元素算术，而是交接/对齐等待（aiv_mte2+aiv_mte3 合计约 43us/核，aiv_scalar_wait 仅 0.34us），此时删掉一道逐元素操作对 case4 无可见收益。",
+    "后端 math.exp 既非原生也不做常量重结合，被下降为 mulf(*log2e)+math.exp2，则改动后 TTIR/BCMLIR 仍是同样数量的向量操作甚至多一道，收益为零或轻微退步。",
+    "FP16 rawQK 交接后精度余量（2^-11）已使 p 的误差由截断主导，仿射折叠只改 1e-7 量级常数舍入，正确性不会成为区分量。"
+  ],
+  "discriminating_observation": "改动后 TTIR/BCMLIR 中该段是否只剩一条 128x256 FP32 乘法/乘加再加一次指数（mulf+subf 合并，或 exp2 前的 log2e 乘法消失），以及同一 case4 的 aiv_vec_time 与整调用耗时是否下降；若 IR 中仍是 mulf、subf 两条张量操作且总时不变，则假设否证。",
+  "change": "仅改 candidate.py 的 _gqa_tile_part_body（PART_TILES 分支）：在 jit 体内用局部 tl.constexpr 定义 LN2、X_SCALE=qk_scale*LN2、X_OFF=SM_OFFSET*LN2（主机与启动 ABI/缓存键不变），把 qk = dot(...).to(f16).to(f32) * qk_scale 与 exp2(qk - SM_OFFSET) 改写为 qk = raw*X_SCALE - X_OFF、p = tl.exp(qk)，MASK_KV 的 -inf 掩码保持在同一语义边界（掩码后 exp(-inf)=0）。不使用未经确认的 tl.math.fma，按“分离的自然域乘/减”书写，是否融合交由后端。",
+  "expected": "若折叠成立：每 tile 少一道 128x256 FP32 逐元素向量操作，AIV 侧 vec 时间下降，case4 整调用应低于保留最佳 175.572600us（量级受 AIV 占比约束，预计数微秒）；case1/2/4/7 的真实变化全部保留上报，case1/2/7 预期在噪声内；四项 checker 阈值 0.0078125 与 golden 不变，仍全通过。若折叠不成立：IR 操作数不变，耗时持平或轻微退步，按真实无收益记录并保留原最佳。",
+  "validation": "先 preflight --source candidate.py 走只读审查与设备预检；随后宿主做完整四项官方 checker/golden 评测与真机计时，并重新采集修改后的 TTIR/BCMLIR（核对是否出现单条乘加与 math.exp 的真实下降）与成对 profiling（aiv_vec_time、aiv_mte2/3、L0C 搬出），再回报模拟器重放。",
+  "unknown": [
+    "Ascend 后端对 math.exp 的实际下降（原生 exp 还是 exp2(x*log2e) 合成）与是否做常量重结合，主机侧源码不可见，只能由修改后实际 IR 判定。",
+    "tl.math.fma 在该后端是否可用/会被发射：本轮不采用，改用分离乘/减以免把不可用内建写进源码。"
+  ],
+  "selected_layer": "Triton 源码层（_gqa_tile_part_body 中 PART_TILES 的 QK→exp 逐元素链），不改主机、不改启动几何、不改 Cube/dot 布局、不改其他分支。",
+  "layer_reason": "成对 profiling 显示 Cube 与 L0C 搬出已优于参考、缺口在 AIV；TTIR/BCMLIR 表明缺口对应的可改对象正是这两条 128x256 FP32 张量 mulf/subf，属于后端可优化而源码可直接表达的分块内计算组织，无需改 IR 或调度。",
+  "simulator_incremental_judgment": "当前剩余歧义是编译下降层面的（math.exp 如何落到向量指令、mul+sub 是否融合），而不是时间轴上的新热点定位；父版模拟器知识已把该窗口定位在 exp2/P 交接与 FIXP，本机制只改变同一窗口内的向量操作条数，其真假直接由修改后 TTIR/BCMLIR 的算子计数与 aiv_vec_time 区分。故本轮无需新增模拟器输入；若修改后 IR 显示折叠成立但真机耗时不动，再补采模拟器时间轴以判定是否为交接/等待受限。"
+}

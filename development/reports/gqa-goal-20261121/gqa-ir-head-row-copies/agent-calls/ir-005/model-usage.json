@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 46,
+    "duration_ms": 136447,
+    "usage": {
+      "input_tokens": 64508,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1831808,
+      "output_tokens": 20397,
+      "output_tokens_details": {
+        "thinking_tokens": 9853
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 64508,
+        "outputTokens": 20397,
+        "cacheReadInputTokens": 1831808,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.7483689999999998,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 9853,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.7483689999999998,
+    "result": "已完成本轮登记与 IR 修改，状态为 `awaiting_ir_review`，文件保持当前内容等待宿主审查与完整评测。\n\n## 实际读取的材料\n- `context.json`、`contract.json`、`ir-inventory.json`、`codex-brief.json`、`memory-partition-findings.json`、`feedback.json`、`profiling.json`、`hotspots.json`、`timeline.json`、`frozen.py` 相关段\n- 实际低层产物：`ir/target/_gqa_fwd_kernel.bcmlir`、`ir/case7/_gqa_fwd_kernel.bcmlir`、`compiled-readonly/diagnostic-original-hivm.txt`、`diagnostic-grouped-hivm.txt`、`retained047-normalization.bcmlir`、`_gqa_fwd_kernel.ttir`\n\n## 关键观察\n- 原049 BCMLIR 第111–115行只有一条 `linalg.reduce`：`tensor<128x256xf32>`（`%47`，exp2 的 FP32 结果）→ `tensor<128xf32>` 零初值，`dimensions=[1]`。\n- 后端诊断给出实际 `hivm.hir.vreduce <sum>`：ins `memref<128x256xf32>`、outs `memref<128x1xf32>`、`temp_buffer memref<16384xf32>`；溢出报 `1576960 bits vs 1572864 bits`。131072B + 65536B + 512B = 197120B，与报错位数精确对应，temp 与归约行数同阶。\n- `feedback.json`：case4/case7 均因同一 UB 溢出失败；ir001 另报 `linalg.generic` 无法 legalize；ir002/003 峰值 262144B，ir004 262656B。保留最佳 047 为 175.5726us（另三例 111.56305/106.28305/94.68955us）。\n- `hotspots.json`（历史047源）：PC `0x10d11c64` MTE3 `MOV_SRC_TO_DST_ALIGN`，8次调用、42246 cycles、25.6us，指向输出写回；MTE3 active 0.6423 / wait 0.2081 / idle 0.3577。\n- `timeline.json`（historical=true）：`clock_qualification=relative_only`、`absolute_time_qualified=false`，窗口 128.958–228.979（单位未标注），22个PC对照 median_ratio 0.9998，`outside_events=20`，未报告泳道保持未知。\n\n## 本轮机制与落盘\n两个特化同构替换（同一行归约位置、同一 `#loc144`）：\n- 删除 128行单条 reduce 与其 `tensor<128xf32>` 零初始化；\n- 新增两条 `tensor.extract_slice %47[0,0]/[64,0] [64,256]` → 两条 `tensor<64xf32>` 零初始化 → 两条 `dimensions=[1]` 的 `linalg.reduce`（同一256键轴、同一零初值）；\n- 用 `tensor.empty() : tensor<128xf32>` 作目标，两次 1D `tensor.insert_slice` 按原行序装入低半 [0..63] 与高半 [64..127]，结果仍名 `%reduced`。\n\nQ 加载循环、输出拷贝循环（`%arg14` 0..127 step1）、QK/PV ieee 矩阵乘、exp2、FP16 截断、逐行 FP32 除法与 BF16 写回、函数签名与 ABI 均保持原样；`frozen.py` 哈希 `fd25f8…` 未变。\n\n## 待宿主核对的预测偏差项\n1. 两条64行归约的 temp 是否复用同一偏移（复用时峰值约164352B；不共用约196864B，仍超512B）。\n2. 2D `extract_slice` 是否零拷贝落为连续 subview；若插入显式 64KiB 物化拷贝，峰值可能回升。\n3. 64行归约 outs 形状与 `insert_slice` 的 UB 内拷贝形式。\n4. VECTOR 侧新增两次小拷贝的实际耗时增量，以及编译通过后与 175.5726us 的比较。"
+  }
+}

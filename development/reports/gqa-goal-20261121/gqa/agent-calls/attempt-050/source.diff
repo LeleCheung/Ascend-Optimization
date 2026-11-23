@@ -1,0 +1,87 @@
+--- 
++++ 
+@@ -151,6 +151,21 @@
+ 若仅在 UB 发生则字节不变，按真实无减少记录并交接固定源码 IR 改法。数值上
+ rawQK 有符号就近舍入，|q·k| <= D = 128 不溢出 fp16，典型概率相对误差约 2e-4、
+ 最坏约 0.56%，合同值域 [-1,1]，由原四项 checker 以不变阈值判定。
++
++平坦行映射的编译期 lane 分解（本次修复机制，仅 PART_TILES 且 BLOCK_M%G==0）：
++四项合同反馈显示 FP16 的 case1/case2 已编译并通过官方 checker，而 BF16 的
++case4/case7 在同一 kernel 上以 "ub overflow, requires 1576960 bits while
++1572864 bits available" 失败（resource_bytes 197120B vs 196608B，仅超 512B）。
++实际失败 TTIR/BCMLIR 定位到行归属：e_row = t*BLOCK_M + lane 之后的 e_row//G、
++e_row%G 仍是 128 元素整型向量上的运行时 divsi/remsi，ttadapter 因此把 Q 载入
++与 Out 写出展开成 128 次逐行标量 memref.copy（Out 另有 1x128 f32 = 512B 暂存），
++而 047 的 affine 行基址（标量 splat + 常量向量）编译为整块 strided copy。故在
++BLOCK_M%G==0 时显式使用 e//G = t*(BLOCK_M//G) + lane//G、e%G = lane%G，把
++lane 的序列/头地址贡献提到循环外成为常量向量，每 tile 只剩标量基址；G 不整除
++BLOCK_M 时保留原通用映射。地址、行归属、掩码、tile 尺寸、20 worker 分区、
++QK/softmax/PV/归一化表达式与顺序、FP16 两项分解路径全部不变；只是整型索引
++重写，精度逐位不受影响（实数上地址完全相同）。代价/风险：后端若不把
++「标量+常量向量」重新识别成整块搬运，UB 峰值不降、编译仍失败，则按负结果记录。
+ 
+ PART_TILES 分母 sum 与 PV 的语句序（本轮机制）：BCMLIR/TTIR 显示 FP32 分母
+ 归约排在 p 的 FP16 截断与 PV 矩阵乘之前，而两者并无数据依赖；033 的模拟器
+@@ -303,6 +318,24 @@
+     offs_n = tl.arange(0, BLOCK_N)
+     offs_e = tl.arange(0, BLOCK_M)
+ 
++    # 本轮修复机制（仅 PART_TILES 的平坦行索引，算术不动）：把查询头最快行映射
++    # 分解成「标量 tile 基址 + 编译期 lane 偏移」。实际失败 TTIR/BCMLIR 显示
++    # e_row = t*BLOCK_M + lane 之后的 e_row//G、e_row%G 仍是对 128 元素整型向量的
++    # 运行时 divsi/remsi，ttadapter 因此把 Q 载入与 Out 写出降级为 128 次逐行标量
++    # memref.copy（Out 还带 1x128 f32 暂存），BF16 特化 UB 需求 197120B 超出
++    # 196608B 预算 512B。BLOCK_M % G == 0 时行号分解可精确改写为
++    #   seq_row = t*(BLOCK_M//G) + lane//G,  gi_row = lane%G
++    # 故 lane//G、lane%G 及其地址贡献在循环外一次算好，是循环不变量（常量向量化
++    # 后即 arith.constant dense），每个 tile 只剩一个标量 splat 加法；这与已验证
++    # 编译的 affine 行基址（标量 + 常量向量）同形，可避免逐行标量搬运与其暂存
++    # 缓冲。地址、行归属、掩码与全部浮点表达式逐字不变；G 不整除 BLOCK_M 时保留
++    # 原通用映射（下方逐行 e//G、e%G 分支）。
++    if BLOCK_M % G == 0:
++        lane_seq = offs_e // G
++        lane_gi = offs_e % G
++        lane_off_q = lane_seq * q_ss + lane_gi * q_sh
++        lane_off_o = lane_seq * o_ss + lane_gi * o_sh
++
+     # P <= T 时每个程序区间非空；该 guard 只为空区间（P > T）的通用正确性保留。
+     if hi > lo:
+         g_lo = lo // TPG
+@@ -347,10 +380,20 @@
+                 # FP32 求和与 PV 内积顺序均按行独立，仅 M 维铺排与行地址变化，逐行结果一致；
+                 # 适用范围内 G>0、BLOCK_M%G==0（本合同的 G=8/4 与 BLOCK_M=128 都满足），
+                 # TPG/T/P/grid 与组内 tile 覆盖总数不变（组内平坦行数 = S*G，tile 数 = NB_M*G）。
+-                e_row = t * BLOCK_M + offs_e
+-                seq_row = e_row // G
+-                gi_row = e_row % G
+-                row_q = seq_row * q_ss + gi_row * q_sh
++                # 本轮修复：BLOCK_M % G == 0 时只用标量 tile 基址加循环外的
++                # lane 常量偏移（e//G = t*(BLOCK_M//G) + lane//G，e%G = lane%G）；
++                # 否则保持原通用映射。
++                if BLOCK_M % G == 0:
++                    seq_base = t * (BLOCK_M // G)
++                    seq_row = seq_base + lane_seq
++                    row_q = seq_base * q_ss + lane_off_q
++                    row_o = seq_base * o_ss + lane_off_o
++                else:
++                    e_row = t * BLOCK_M + offs_e
++                    seq_row = e_row // G
++                    gi_row = e_row % G
++                    row_q = seq_row * q_ss + gi_row * q_sh
++                    row_o = seq_row * o_ss + gi_row * o_sh
+                 q_ptrs = Q + b * q_sb + kvh * G * q_sh + row_q[:, None] + offs_d[None, :] * q_sd
+                 if MASK_MD:
+                     q = tl.load(q_ptrs, mask=(seq_row[:, None] < S) & (offs_d[None, :] < D), other=0.0)
+@@ -424,9 +467,9 @@
+                 # 依赖选路，不改测试与阈值。
+                 out = acc / l_new[:, None]
+ 
+-                # 输出沿用同一平坦行归属：行偏移按 o_ss/o_sh 重算（与 Q 同构但独立），
+-                # 写回地址仍散回原 BSND 坐标，每行只写一次、无重叠。
+-                row_o = seq_row * o_ss + gi_row * o_sh
++                # 输出沿用同一平坦行归属：row_o 已在上面的行归属分支中按 o_ss/o_sh
++                # 算出（静态分支为标量基址 + lane 常量偏移），写回地址仍散回原 BSND
++                # 坐标，每行只写一次、无重叠。
+                 o_ptrs = Out + b * o_sb + kvh * G * o_sh + row_o[:, None] + offs_d[None, :] * o_sd
+                 if MASK_MD:
+                     tl.store(o_ptrs, out.to(Out.dtype.element_ty),

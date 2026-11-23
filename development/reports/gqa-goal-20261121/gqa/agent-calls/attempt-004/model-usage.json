@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 40,
+    "duration_ms": 131737,
+    "usage": {
+      "input_tokens": 50372,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1216640,
+      "output_tokens": 21007,
+      "output_tokens_details": {
+        "thinking_tokens": 7788
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 50372,
+        "outputTokens": 21007,
+        "cacheReadInputTokens": 1216640,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.3853550000000001,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 7788,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.3853550000000001,
+    "result": "已按“单一机制”完成本轮修改与交接。摘要如下。\n\n## 证据（本轮实际读取）\n- **成对 profiling（`workspace/current-profiling.json`，源码 23d73229）**：case4 共 512 program，每 program `aic_cube_total_instr_number=6`（= 每 KV 块 3 次 matmul × 2 次迭代）；`L0C_to_GM` 每 program **384KiB**、合计 196608KiB，而 CANN 仅 98304KiB（差值恰为第二次 PV 的输出量）；`aic_cube_time` 2.02us/program vs `aic_scalar_wait_id1` **11.79us/program**——墙钟由跨核交接链条数主导，而非 cube 算术。\n- **实际 TTIR（`actual-ir/2-_gqa_fwd_kernel.ttir`）**：`scf.for` 0..256 step 128 共 2 次迭代，循环体内 3 个 `tt.dot`：QK（bf16×bf16→f32）、`dot(p_hi,v,acc*alpha)`、`dot(p_lo,v,零初值)` + `mulf 1/2048` + `addf`。\n- **实际 BCMLIR（`actual-ir/0-…bcmlir`）**：同循环 3 个 `linalg.matmul`，第三个 `outs(%3=0)` 后接矢量乘加合并 → 每次迭代真实多出一次 128×128 f32（64KiB）的 L0C 搬出与矢量合并。\n- **评测（`previous-result.json`）**：保留版 case1/2/4/7 = 165.96 / 154.95 / **472.46045** / 156.68us；case4 精度 mean_diff 7.36e-8、max_diff 4.88e-4、small_value 与 cancel 均为 0，BF16 阈值 0.0078125；CANN 自身 mean_diff 4.97e-5 仍通过（仅记录该 checker 行为，不当作新方案必然通过的证明）。\n- **历史（`host-repair-analysis.json`，background）**：拼接/广播式合并两项 PV（join 生成末轴步长 2 的 3D 张量）曾 UB 855552B>196608B 编译失败，故本轮避开任何 join/cat/广播复制。\n\n## 机制（已实现，唯一一处）\n仅当 `value.dtype == torch.bfloat16`（host 只用 **dtype 元数据** 生成 `PV_SINGLE_F16` constexpr，不读输入值、不看 case_id）时：\n`acc = acc*alpha[:,None] + tl.dot(p.to(tl.float16), v.to(tl.float16))`，**单次 fp16×fp16、fp32 累加**替代两条 bf16 dot。每 KV 块 3→2 个 matmul、L0C 384→256KiB/program，并去掉零初值 dot、1/2048 缩放与一次矢量合并；无 join/cat，UB 占用低于原两项版本。\nFP16 及其他 dtype 保持原两项分解**逐字不变**（表达式与相加顺序不变），分块 128/128 与 64/64、grid、QK bf16、softmax、mask、输出 dtype、公共入口 `run` 均不动。\n\n## 明确的数值风险与适用范围\n这是**近似而非等价**：p 的 fp16 舍入为 2^-11 相对误差（单项 bf16 为 2^-9，故仍优于未分解 bf16，但低于两项 bf16 的 2^-18）；V 在 |v|≥2^-14 时 bf16→fp16 精确，|v|<2^-14 落 fp16 次正规（绝对误差 ≤3e-8），|v|>65504 会溢出——后者超出合同 [-1,1] 输入域，仅作为范围限制记录。验收完全交给原官方 checker/原阈值（FP16 0.0009765625、BF16 0.0078125）与 small_value/cancel/normal 判定。\n\n## 交接\n- 决策已登记：`decision_id=29601a4946584a4da0bad8324e8c8aa8`（绑定修改前源码 23d73229）。\n- 修改后源码 SHA：**fb1233ed36410fed5adc7c210b0a4247f9ebc4ed54461feeffd450ec679003a6**。\n- `preflight` 返回 **awaiting_source_review**，现阶段保持字节不变，交接宿主只读路径/地址边界审查与完整四项真机评测（case1/2/4/7）。\n- 模拟器增量判断已写入诊断：现有 profiling+TTIR/BCMLIR 足以提出并可证伪该机制，但删链后 wait_id1 的降幅与是否出现新同步热点必须由**修改后**的新采集判定，旧 IR 重放无区分力，故本轮不声明模拟器增量贡献；修改后仍按宿主流程对新源码重放。\n\n预期方向：case4 `cube 6→4`、`L0C 384→256KiB/program`、墙钟下降（乐观区间约 380–430us，真机定）；case7 同路径同步下降；case1/case2 走 FP16 原路径，预计耗时与精度不变。若四项中任一 BF16 判定失败，保留完整反馈后再定位（p 舍入 vs V 次正规/溢出）并更换机制。"
+  }
+}

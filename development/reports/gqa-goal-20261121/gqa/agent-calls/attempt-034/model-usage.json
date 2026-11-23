@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 25,
+    "duration_ms": 72850,
+    "usage": {
+      "input_tokens": 60596,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 916480,
+      "output_tokens": 11576,
+      "output_tokens_details": {
+        "thinking_tokens": 4085
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 60596,
+        "outputTokens": 11576,
+        "cacheReadInputTokens": 916480,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.0506199999999999,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 4085,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.0506199999999999,
+    "result": "Preflight returned `awaiting_source_review`; I keep the candidate bytes unchanged and hand off.\n\n## 本轮实验（从 031 独立）：PART_TILES 内先发概率/PV、后做分母归约\n\n**证据（修改前已登记，decision_id `64b40b1c5e114a4f8ab7e2a3de42a7b9`，源码 SHA `e7fad4d8…`）**\n- `actual-ir/2-_gqa_fwd_kernel.ttir`：`math.exp2 L102 → tt.reduce L103 → arith.truncf p→f16 L108 → tt.dot(p16,v16) L109`。\n- `actual-ir/0-_gqa_fwd_kernel.bcmlir`：`math.exp2 %57 → linalg.reduce L102 → truncf %58 L107 → linalg.matmul(PV) L108`；`%reduced` 与 `%59` 只在 L112 的 `divf` 处汇合，data dependence 上互相独立。\n- 同核时间顺序（宿主登记）：VEXP 129.258→129.585us，VADD/VCADD 归约 129.590→130.173us，之后才 VCONV 130.175→130.264us 与概率 MTE3 写 130.265→131.977us；第二条 tile 次序相同。\n- 模拟器（部分窗口，`application_completed=false`、`relative_only`）：Vector productive 18.19%/wait 12.43%、Cube productive 9.89%/wait 20.36%、MTE3 37.09%。**增量判断**：热点指令（WAIT_FLAG_DEVI、输出 MTE3）本身是同步/搬运，不给出可隐藏量；真正增量是同核逐指令区间把归约定位在 p16 转换与概率发送之前——属顺序证据，比例不能换算为 us，收益只由完整四项计时判定。\n\n**改法（只动 `_gqa_tile_part_body`）**\n```\np = tl.exp2(qk - SM_OFFSET)\np16 = p.to(tl.float16)      # 原 p.to(tl.float16) 的显式命名\nacc = tl.dot(p16, v16)      # 先发出概率/PV\nl_new = tl.sum(p, 1)        # 仍对原 FP32 p 归约，独立分母\nl_safe = ...\n```\nrawQK FP32、全部算术表达式、地址、20 worker 连续分区、组内 K/V 复用与 host 判据（PART_TILES/PV_SINGLE_F16/SINGLE_KV）逐字不变，因此 `acc` 与 `l_new` 取值逐位等同，仅交给后端按 C/V 调度尝试重叠。命中该分支的合同 case 为 case4、case7；case1（因果 64/64）与 case2（BLOCK_N=128 不满足 PART_TILES）源码路径不变，作回归。\n\n**代价/风险（已写入文件头与诊断）**：p 的 live range 跨过 p16 与 PV dot（FP32 p 128KiB + p16 64KiB 同时存活），缓冲复用不足可能触及 196608B UB 预算而编译失败；若后端把 reduce 重排回 conv 之前，或为保 p 存活插入额外拷贝/同步，则收益被抵消甚至退步。\n\n**验证**：当前候选 SHA 已变为 `56377c5c6e7137d741a10df3633ba7cd5596562d57baf7e1cdda21158f1a624c`。请宿主进行只读路径/地址边界审查并做完整四项真机评测（官方 checker、golden、dtype 与计时合同不变），随后重放并采集修改后 IR 与成对 profiling/模拟器：核对新 TTIR/BCMLIR 中 reduce 是否位于 truncf 与 PV matmul 之后、同核 trace 中 VCONV/概率 MTE3 是否先于 VADD/VCADD、Cube PV 的 WAIT_FLAG 位置是否前移，并保留全调用 completion 缺失。判定线：case4 < 205.28415us 且 case1/2/4/7 无真实退步；若源码顺序被后端抹平，则按诊断中的交接项固定源码 IR 调度位置，不再重复同类顺序试验。\n\n完整结果与修改后重放反馈回来后，我据真实数据继续更新诊断并推进下一机制。"
+  }
+}

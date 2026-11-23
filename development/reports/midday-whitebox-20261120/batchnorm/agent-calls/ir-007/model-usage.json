@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 63,
+    "duration_ms": 394192,
+    "usage": {
+      "input_tokens": 77337,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 4678400,
+      "output_tokens": 62887,
+      "output_tokens_details": {
+        "thinking_tokens": 45764
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 77337,
+        "outputTokens": 62887,
+        "cacheReadInputTokens": 4678400,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 4.29806,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 45764,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 4.29806,
+    "result": "已完成本轮交接：`submit` 返回 `awaiting_ir_review`，文件保持不变，等待宿主审查与完整评测。\n\n## 本轮读取的实际材料\n`context.json`、`profiling.json`、`hotspots.json`、`timeline.json`、`ir-inventory.json`、`lowered-inventory.json`、`frozen.py`、`feedback.json`、`codex-brief.json`、`prior-ir006-formal/supplements/stability/post-mechanism/instructions`、`count-uniformity-probe.json`、`prior-count-post-mechanism.json`，以及 `ir/…ttir` 与 `compiled-readonly/…ttadapter|.bcmlir|.npubin` 的实际内容。\n\n## 新增观察（本轮首次记录）\n1. **同一保留版内，MTE2 每次搬运约 390 cycle 的固定代价可由长度—代价关系量化**：统计流 4KiB 片 64 次×约 424 cycle（27 154 cycle，16.46us），1024 分支 32KiB 片 8 次×约 675 cycle。按字节效率相差约 5 倍（9.7B/cycle 对 48B/cycle）。\n2. **bcmlir 证明后端不重分块**：统计循环在两份低层产物中仍是 `memref.copy … memref<8x128xf32, strided<[?,1]>>`（第 62/78 行），输出宽路为 `memref<8x256xf32>`；后端 UB 分配只有 6 个、按片双缓冲，说明疑似冗余既未消除也不占大 UB。\n3. **ir-006 的失败原因被定位到“作用在输出流”**：其 MTE2 event 436→316、active 0.877→0.829、VECTOR wait 0.395→0.319，而读取反增 268→292KiB，墙钟不变。因此“减少搬运次数”只有在字节不增的冷读流（统计流第一遍）才可能兑现。\n4. **ir-005 计数标量化的负结果被确认有量化依据**：`cnt += 1` 的 VADDS 只有 5 184 cycle/3.14us，统计循环的每轮向量工作本就不大，代价集中在装载。\n5. 绝对时钟资质：`absolute_unit_validation` 33/33、median_ratio 1.000548、`absolute_time_qualified=true`；窗口仅覆盖 core0.veccore0 的 2 个程序实例（原始跨度 38.405us），未报告泳道保持未知。\n\n## 本轮机制（单算子 IR）\n统计阶段新增运行期特化 `scf.if (spatial_dim % 512 == 0)`：then 分支用 **8×512 片**跑同一套 Welford delta 递推与两段式合并公式（32→8 轮、行长 512B→2KiB），else 分支逐字保留原 8×128 路径；两分支只汇合 `(mean, inv_std, var)` 三个 f32。为统一类型，把 `n=batch*spatial` 两条标量计算上提到 if 之前。输出阶段、running 状态、weight/bias 分支、20 参数 ABI 与 `frozen.py` 全部未动。\n\n**已登记的可判伪预测**：MTE2 装载指令 33→9/程序、aiv_mte2_time 12.76→8.5–9.5us、MTE2 active 0.877→0.72–0.79、VECTOR wait 0.395→0.25–0.31、统计流读取 132→144KiB（主动接受的 +12KiB）；若 MTE2 指标按预测改善而墙钟不动，则与 ir-006 同向，下一轮转向依赖链/同步机制。\n\n## Codex 贡献与偏差\n采纳 Codex 的“先量化每轮次代价再定变换、为所有合法输入保留回退与零迭代/单 tile 语义”的方法与其证据清单；但其候选方向（剥离输出末轮预取、加宽输出片）经 ir-006 实测已否证，本轮把落点改到从未被单独加宽的统计流，并把尾步排空降级为后续小步（仅省 12KiB/268KiB，低于 ABBA 噪声）。\n\n## 待验证假设\nMTE2 占用是否真为墙钟限制项、8×512 是否被后端保持为单条 MTE2 指令、UB 双缓冲峰值是否在实机预算内（否则退回 8×256 属同一机制的小特化，需另行登记），以及“统计流冷读、输出流局部性好”尚无直接计数支持。"
+  }
+}

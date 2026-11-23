@@ -1,0 +1,62 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "19f7fb238946cb9006286d4d222425d07c4ea9fc38a7d4ff85c71c72c49c584a",
+  "experiment": "OnlytryM256on063",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "mechanism",
+      "finding": "case4 候选 kernel 150.383011us；20 程序，cube_time 均值 33.11us、aic_mte1_time 24.32us、fixpipe 21.47us，而 GM_to_L1 总计 55296KB、L0C_to_GM 总计 49152KB。总 MMAD 2048 条。墙钟由每程序跨核交接链数量主导，而非算术量。"
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "trigger",
+      "finding": "三核部分窗口各自归一化、application_completed=false（全调用 completion 缺失）：Cube productive 19.6%/wait 39.3%/idle 41.1%，FIXP productive 36.4%/wait 40.7%，MTE1 wait 43.1%；Vector productive 28.1%/idle 65.6%。热点在跨核同步/交接与搬运，说明减少每 worker 的交接链条数比单链算术更可能有效。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "PART_TILES 主体按 BLOCK_M 常量铺 tl.arange 与 dot 的 M 维；BLOCK_M 只改变 dot M 铺排、Q 载入行数与程序/组内 tile 数，softmax/PV/归一化表达式与 dtype 交接不变，故 M 128->256 是纯几何/元数据变化。"
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "background",
+      "finding": "BCMLIR 保持一深度 QK 前瞻、FP16 rawQK 交接、BF16 PV 与 FP16 PV 结果交接、FP32 分母归约与除法；增大 BLOCK_M 不改变这些语句与 dtype，仅放大每次 dot/交接的 M 维。"
+    },
+    {
+      "path": "workspace/context-brief.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "旧 053 在早期 FP16 PV 输入、FP32 PV 结果结构下 M256 因 UB 197120B 超过 196608B 失败；当前已删除 V->FP16 转换并把 PV 结果窄化为 FP16，资源图改变，旧失败不直接外推，但峰值必须真实编译核对。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "保留最佳为父版本 146.0561us（kernel 150.383011us），四项 checker 已通过；本轮目标 case4 低于该值且其余三项真实变化同存。"
+    }
+  ],
+  "hypothesis": "把非因果 BF16、D=BLOCK_D=128、BLOCK_N=SKV=256、S%256==0 的 PART_TILES 路径 BLOCK_M 由 128 提到 256：case4 的 tile 数与程序分布由 T=512（每 worker 25~26 链）降为 T=256（每 worker 12~13 链），在总 MMAD 2048、K/V 组载入次数（32 组）与全部数学/交接不变的前提下，减少每 worker 需串行等待的跨核交接链条数，从而缩短 kernel 墙钟。",
+  "alternatives": [
+    "仅改 num_stages 而不改 BLOCK_M（已由父版本 num_stages=2 覆盖，无进一步信息）",
+    "改变 softmax/PV 的 dtype 或计算顺序（会引入新的数值风险，且宿主指定本轮为纯 tiling/元数据单变量实验，不做）",
+    "调整 20 worker 分区 P（属另一机制，且会改变组载入与负载分布，本轮不改）"
+  ],
+  "discriminating_observation": "若 BLOCK_M=256 真实编译成功且 case4 kernel 时间下降（相对 150.383011us），而 case1/2/7 因 BLOCK_M 路径未变（64/128/128）时间与精度保持，则支持“减少交接链条数”假设；若编译因 UB/L0C 超 196608B 失败或时间不降，则记录为无收益/不可行，且不引入回退或额外机制。",
+  "change": "仅改 candidate.py 的 run() 主机元数据：在非因果且 value.dtype==bfloat16、D==128、BLOCK_D==128、BLOCK_N==256、SKV==256、S%256==0 时把 BLOCK_M 由 128 提到 256；并把 PART_TILES 准入由 BLOCK_M==128 放宽为 BLOCK_M in (128,256)。内核/helper AST、全部数学、FP16 交接、BF16 PV、FP32 sum/除法、NoOff 守卫、一深度 QK 前瞻、20 worker、num_stages=2、缓存键与输出分配全部逐字不变。fkey/tail/打包元数据已含 BLOCK_M、NB_M、TPG、T、P，已审计快路径一致。",
+  "expected": "case4：NB_M 2->1，TPG 16->8，T 512->256，P 仍 20，每 worker 12~13 tile；组数仍 32，tile 覆盖精确且无额外 tail QK。预期组内交接链条数约减半，kernel 时间下降。case7（S=128，S%256!=0）保持 BLOCK_M=128；case2（fp16）与 case1（causal）路径不变，其耗时与精度应逐位保持。",
+  "validation": "先 preflight --source candidate.py（awaiting_source_review 后保持字节交接），随后由宿主只读审查并跑完整四项官方 checker（阈值不变）+ 真机计时；比对 case4 相对 146.0561us 的变化与 case1/2/4/7 的真实差异，并核对实际编译资源峰值是否超 196608B。缓存/快路径以 fkey 含 BLOCK_M 保证身份唯一。",
+  "selected_layer": "host_launch_metadata_and_tiling",
+  "layer_reason": "宿主指定保持 kernel/helper AST 与全部数学不变，本轮机制只能落在 run() 的常量几何选择（BLOCK_M）与 PART_TILES 准入；BLOCK_M 作为 constexpr 进入 fkey/tail 与编译身份，无需改内核结构。",
+  "simulator_incremental_judgment": "模拟器增量判断：Cube 窗口 productive 19.6%/wait 39.3%/idle 41.1% 与 FIXP wait 40.7%、MTE1 wait 43.1%，指向跨核交接/同步等待而非算术饱和；增大 BLOCK_M 减少每 worker 交接链数但不改变单链内重叠能力，故预期是减少链条开销的排序性假设，收益仍须真机确认。模拟器为部分窗口、各自归一化且 application_completed=false，全调用 completion 缺失，仅用于热点与流水排序，不作为因果贡献证明。",
+  "unknown": [
+    "BLOCK_M=256 时 raw_next 256x256 f16=128KiB、acc 256x128 f32=128KiB、Q 256x128 bf16=64KiB 与两 256x256 f32 QK 累加器叠加，UB/L0C 峰值可能超 196608B 导致编译失败；旧 053 的 197120B 失败是不同 dtype 结构，不能直接外推",
+    "单链在 M 维翻倍后 fixpipe/MTE/向量段延迟可能上升，抵消链条数减半的收益",
+    "T=256 在 P=20 下 12~13 tile 的组尾不均衡可能带来轻微负载波动",
+    "若后端不把 q_n/raw_next 提前，则退回串行次序，时间可能无变化"
+  ]
+}

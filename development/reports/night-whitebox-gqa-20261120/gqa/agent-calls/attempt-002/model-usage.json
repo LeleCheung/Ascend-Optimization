@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 51,
+    "duration_ms": 135370,
+    "usage": {
+      "input_tokens": 30704,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 905216,
+      "output_tokens": 22225,
+      "output_tokens_details": {
+        "thinking_tokens": 12420
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 30704,
+        "outputTokens": 22225,
+        "cacheReadInputTokens": 905216,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.161753,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 12420,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.161753,
+    "result": "修复决策已记录并落盘，preflight 返回 `awaiting_source_review`，现保持字节交接。\n\n## 已核对的实际失败与 UB 需求\n\n| case | dtype / attrs | 结果 | 真实错误 |\n|---|---|---|---|\n| 1 | fp16, causal, B2 S128 Nq32 Nkv8 D128 | 编译失败 | `ub overflow, requires 1851904 bits (231488 B) while 1572864 bits (196608 B) available` |\n| 2 | fp16, non-causal, B2 S128 Nq48 Nkv4 | checker 通过（阈值 1/1024, mare 9.66e-4） | — |\n| 4 | bf16, non-causal, B4 S256 Nq64 Nkv8（目标 case） | checker 通过（1/128） | — |\n| 7 | bf16, cross, B2 Sq128 Skv256 Nq32 | checker 通过（1/128） | — |\n\n实际 IR 对照给出了机制而非猜测：\n- `3-_gqa_fwd_kernel.bcmlir`（因果 fp16）在同一 64/128/128 分块下多出循环内 `tensor<64x128xi32>` 因果索引临时量及 `64x1xi32 / 128xi32` 掩码临时量；\n- `0-`（fp16 非因果）与 `6-`（bf16 非因果）没有这些临时量 → 超限是**因果编译分支特有**，且超出的 ~34.9KB ≈ 一个 64×BLOCK_N 缓冲，与 BLOCK_N 线性相关。\n\n## 所选资源修复机制\n\n分块按 `is_causal` 分流（`kernel_tiling_ub_budget` 层）：D≤128 时 `BLOCK_M=64`，非因果 `BLOCK_N=128` 不变，**因果取 `BLOCK_N=64`**。所有与 BLOCK_N 相关的缓冲（k/v、qk、p、p_hi、p_lo、因果索引临时量）减半，峰值估算 ~149.6KB / 196.6KB（余量 ~47KB）。kernel 体、mask 语义、两项概率分解表达式与相加顺序、dtype、grid 维度、checker/golden/计时口径全部未动。\n\n预期取舍（已写入诊断）：case1 每程序 KV 迭代 2→3，PV 交接链与 acc 重缩放 **+50%**，被掩码列减少使向量 softmax 元素 **−25%**、K/V 装入列数同减，**并行度不变**（grid 仍 2×64）；三个非因果 case 的分块与性能路径完全不变，收益保留在 case2/4/7、case1 预期与保留版持平。\n\n## 交接状态\n\n- 修改前决策已记录：`decision_id=50ad8174a0a34ea89e3755a6d5c923ee`（绑定修改前源码 `f8e9efce…`）\n- 诊断文件：`workspace/diagnosis.json`（含 selected_layer、layer_reason、simulator_incremental_judgment=未使用模拟器、6 条 evidence（evaluation/source_ir）、假设、改法、预测、验证、未知项、post_edit_state）\n- 当前候选源码 SHA：`247091f353b9877d40603d725176b8b1d2418e828d4129da85c413e7f533f524`\n- 编辑后 preflight：`awaiting_source_review` → 保持字节不变，等待外部只读路径/地址边界审查\n- **未声明**该源码已通过编译或有真机收益；下一次完整四项评测应验证：case1 不再报 ub overflow 且官方 checker 通过、case2/4/7 结果与现有反馈一致、四项延迟与 grid/迭代次数如预测。"
+  }
+}

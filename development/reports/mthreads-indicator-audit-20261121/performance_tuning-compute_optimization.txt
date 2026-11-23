@@ -1,0 +1,223 @@
+编程指南 性能优化 计算优化 文档版本 v5.2.0 最新 当前正在查看最新版本。 切换版本 选择文档版本 ✓ v5.2.0 最新 v5.1.0 v4.3.x v3.1.0 版本说明 版本说明 本页总览 计算优化 
+ 计算优化核心原则 
+ 辩证看待占用率：高占用率不等于高性能 
+ 最大化指令级并行：隐藏延迟，保持计算单元忙碌 
+ 消除线程束分化：避免线程束内分支发散 
+ 利用线程束专用化（specialization）：流水线并行优化 
+ 
+ 
+ 占用率优化 ​ 
+ 占用率定义 ​ 
+ GPU 上的 占用率 指的是一个流多处理器（Multiprocessor）的活跃线程束数量与该流多处理器最大支持的线程束数量之比： 
+ 占用率 = 活跃线程束数量 流多处理器最大线程束数量 \text{占用率} = \frac{\text{活跃线程束数量}}{\text{流多处理器最大线程束数量}} 占用率 = 流多处理器最大线程束数量 活跃线程束数量 ​ 
+ 其中： 
+ 
+ 活跃线程束 ：流多处理器上同时被调度执行的线程束 
+ 流多处理器最大线程束数量 ：由线程束调度器决定（硬件固定） 
+ 活跃线程束数量 ：由内核硬件资源使用量限制 
+ 
+ 影响占用率的资源限制 ​ 
+ 资源类型 说明 影响 寄存器数量 每线程分配的寄存器数 寄存器过多 → 占用率下降 共享内存 每线程块使用的共享内存 共享内存过大 → 占用率下降 
+ 高占用率的优势 ​ 
+ 高占用率带来的性能优势 ： 
+ 
+ 确保总有足够的活跃线程束切换，隐藏长延迟操作 
+ 提供足够高的全局内存访问并发数 
+ 提高内存带宽利用率 
+ 确保每个流多处理器上有足够多线程，平衡负载 
+ 
+ 辩证看待占用率 ​ 
+ 并不是所有应用都需要高占用率！ 
+ 结合屋顶模型（Roofline Model）分析： 
+ 应用类型 特征 占用率策略 理由 内存瓶颈 计算/访存比低 高占用率 需要足够高的访存并发数，将延迟瓶颈转化为带宽瓶颈 计算瓶颈 计算/访存比高 低占用率也可 充分的指令级并行带来高计算单元利用率，追求高占用率反而降低性能 
+ 案例分析 ： 
+ // 计算瓶颈场景：矩阵乘法 // 高占用率策略（错误） __shared__  float  tileA [ 8 ] [ 8 ] ;     // 小分块 __shared__  float  tileB [ 8 ] [ 8 ] ; // 结果：计算/访存比降  低，性能变差 // 低占用率策略（正确） __shared__  float  tileA [ 32 ] [ 32 ] ;    // 大分块 __shared__  float  tileB [ 32 ] [ 32 ] ; // 结果：计算/访存比高，计 算单元利用率高，性能好 
+ 占用率调优 ​ 
+ # 使用 Moore Perf Compute 分析占用率 mcu  --metrics  occupancy,sm_throughput  -o  report ./application # 关键指标 # - sm__average_warp_execution_efficiency: 线程束有效执行比例 # - sm__active_warps.pct: 流多处理器上活跃线程束比例 
+ 
+ 消除线程束分化 ​ 
+ 线程束分化原理 ​ 
+ 在 MT GPU 中： 
+ 
+ 一个线程束包含 32 个线程 
+ 线程束共享同一个程序计数器（PC，Program Counter） 
+ 单指令多线程（SIMT）模型允许线程执行不同路径 
+ 线程束分化 ：线程束内线程执行不同分支路径 
+ 
+ 线程束分化的代价 ： 
+ 
+ GPU 串行执行各分支路径 
+ 为每个线程设置活跃掩码 
+ 非活跃线程的计算单元闲置 
+ 总执行时间 ≈ 各分支时间之和 
+ 
+ 产生线程束分化的场景 ​ 
+ // ❌ 条件分支导致线程束分化 __global__  void   divergentKernel ( float *  data ,   int  threshold )   {      int  tid  =  threadIdx . x  +  blockIdx . x  *  blockDim . x ;           if   ( data [ tid ]   >  threshold )   {    // 线程束内线程可能走不同分支         data [ tid ]   =  data [ tid ]   *   2.0f ;    // 任务 A      }   else   {         data [ tid ]   =  data [ tid ]   /   2.0f ;    // 任务 B      } } // 假设 threshold=100，线程束内 31 个线程 data>100，1 个线程 data<=100 // 结果：GPU 先执行任务 A（31 线程活跃），再执行任务 B（1 线程活跃） // 计算单元利用率：50%（平均） 
+ 消除线程束分化的方法 ​ 
+ 方法 1：使用三元表达式 
+ // ✅ 使用三元表达式（编译器优化为谓词指令） __global__  void   noDivergentKernel ( float *  data ,   int  threshold )   {      int  tid  =  threadIdx . x  +  blockIdx . x  *  blockDim . x ;           float  val  =  data [ tid ] ;     data [ tid ]   =   ( val  >  threshold )   ?   ( val  *   2.0f )   :   ( val  /   2.0f ) ; } // 编译器生成谓词指令，避免显式分支 
+ 方法 2：重新设计算法 
+ // ❌ 并行规约中的线程束分化（低效） for   ( int  stride  =   1 ;  stride  <   8 ;  stride  *=   2 )   {      if   ( tid  %   ( 2   *  stride )   ==   0 )   {    // 线程束内分支分化         smem [ tid ]   +=  smem [ tid  +  stride ] ;      }      __syncthreads ( ) ; } // ✅ 优化后的并行规约（减少分化） for   ( int  stride  =   4 ;  stride  >   0 ;  stride  /=   2 )   {      if   ( tid  <  stride )   {    // 线程束内线程执行相同路径         smem [ tid ]   +=  smem [ tid  +  stride ] ;      }      __syncthreads ( ) ; } // 前几轮无分化，仅最后一轮有分化 
+ 线程束分化检查清单 ​ 
+ 
+ 
+   条件分支是否在线程束级别一致？ 
+ 
+ 同一线程束的线程是否走相同分支 
+ 使用  threadIdx.x < threshold  而非  threadIdx.x % N == 0 
+ 
+ 
+ 
+   是否可使用三元表达式？ 
+ 
+ 简单条件判断使用  ? :  替代  if-else 
+ 
+ 
+ 
+   循环边界是否对齐线程束？ 
+ 
+ 确保循环次数为线程束大小的倍数 
+ 
+ 
+ 
+ 
+ 指令级并行（Instruction Level Parallelism） ​ 
+ 指令级并行原理 ​ 
+ 指令级并行 是指通过指令流水线技术，让多条指令重叠执行，提升处理器吞吐量。 
+ GPU 流水线关键阶段： 
+ 取指 → 译码 → 发射 → 执行 → 写回 
+ 数据冒险 ： 
+ 
+ 写后读（RAW）：真依赖，指令 B 依赖指令 A 的结果 
+ 长延迟指令（如访存）导致流水线停顿 
+ 
+ 最大化指令级并行的策略 ​ 
+ 策略 1：穿插无关指令 
+ // ❌ 数据依赖导致流水线停顿 float  val  =  global_data [ tid ] ;    // 长延迟访存 float  result  =  val  *   2.0f ;        // 必须等待访存完成 // ✅ 穿插无关指令隐藏延迟 float  val1  =  global_data [ tid ] ; float  val2  =  global_data [ tid  +   1 ] ;    // 无关指令 float  val3  =  global_data [ tid  +   2 ] ;    // 无关指令 float  result1  =  val1  *   2.0f ;    // 此时 val1 已就绪 
+ 策略 2：循环展开（以通用矩阵乘法 GEMM 为例） 
+ // ❌ 循环形式：依赖上一次迭代结果 // 每次迭代必须等待上一次完成，ILP 低 for   ( int  k  =   0 ;  k  <  K ;  k ++ )   {     c [ 0 ] [ 0 ]   +=  a [ k ]   *  b [ k ] ;     c [ 0 ] [ 1 ]   +=  a [ k ]   *  b [ k  +   1 ] ;      // ... } // ✅ 循环展开：一次性展开所有迭代 // 无数据依赖，可重排指令顺序，ILP 高 float  a [ 4 ] ;    // 假设 K=4 float  b [ 4 ] ; // i = 0 行 c [ 0 ] [ 0 ]   +=  a [ 0 ]   *  b [ 0 ] ; c [ 0 ] [ 1 ]   +=  a [ 0 ]   *  b [ 1 ] ; c [ 0 ] [ 2 ]   +=  a [ 0 ]   *  b [ 2 ] ; c [ 0 ] [ 3 ]   +=  a [ 0 ]   *  b [ 3 ] ; // i = 1 行 c [ 1 ] [ 0 ]   +=  a [ 1 ]   *  b [ 0 ] ; c [ 1 ] [ 1 ]   +=  a [ 1 ]   *  b [ 1 ] ; c [ 1 ] [ 2 ]   +=  a [ 1 ]   *  b [ 2 ] ; c [ 1 ] [ 3 ]   +=  a [ 1 ]   *  b [ 3 ] ; // i = 2 行 c [ 2 ] [ 0 ]   +=  a [ 2 ]   *  b [ 0 ] ; c [ 2 ] [ 1 ]   +=  a [ 2 ]   *  b [ 1 ] ; c [ 2 ] [ 2 ]   +=  a [ 2 ]   *  b [ 2 ] ; c [ 2 ] [ 3 ]   +=  a [ 2 ]   *  b [ 3 ] ; // i = 3 行 c [ 3 ] [ 0 ]   +=  a [ 3 ]   *  b [ 0 ] ; c [ 3 ] [ 1 ]   +=  a [ 3 ]   *  b [ 1 ] ; c [ 3 ] [ 2 ]   +=  a [ 3 ]   *  b [ 2 ] ; c [ 3 ] [ 3 ]   +=  a [ 3 ]   *  b [ 3 ] ; 
+ 要点 ：循环展开后，无数据依赖的指令可被硬件乱序执行，提高指令级并行度（ILP）。 
+ 矩阵乘法中的指令级并行优化 ​ 
+ 以下示例展示了一个高度优化的 GEMM kernel，包含多种 ILP 优化技术： 
+ // GEMM kernel with advanced ILP optimization // Key optimizations: vectorized load, double buffering, software pipelining # define   BLOCK_X   16 # define   BLOCK_Y   16 # define   TILE_K   16 # define   WPTN   8      // Wires per thread N # define   WPTM   8      // Wires per thread M __global__  void   gemm_kernel_NN (      const   float *  __restrict__ A ,      const   float *  __restrict__ B ,     float4 *  __restrict__ C ,      float  alpha ,   float  beta ,      int  M ,   int  N ,   int  K ) {      // 双缓冲共享内存     __shared__ float4 smem_a [ 2 ] [ TILE_K  *   32 ] ;     __shared__ float4 smem_b [ 2 ] [ TILE_K  *   32 ] ;           // 线程索引      int  tx  =  threadIdx . x  %   16 ;      int  ty  =  threadIdx . x  /   16 ;      int  tx4  =  threadIdx . x  %   4 ;      int  ty4  =  threadIdx . x  /   4 ;           // 指针设置      const   float *  pA  =  A  +  K  *   128   *  blockIdx . y  +  ty4  *  K  +  tx4  *   4 ;      const   float *  pB  =  B  +   128   *  blockIdx . x  +   ( threadIdx . x  /   4 )   *  N  +  tx4  *   4 ;     float4 *  pC  =  C  +   128   *  blockIdx . y  *  N  /   4   +   128   *  blockIdx . x ;           // 边界检查      bool  valid_ld_a  =   ( ( blockIdx . y  *   128   +  ty4 )   <  M )   &&   ( ( tx4  *   4 )   <  K ) ;      bool  valid_ld_b  =   ( ( blockIdx . x  *   128   +  tx4  *   4 )   <  N )   &&   ( ( threadIdx . x  /   4 )   <  K ) ;           // 向量化加载     float4 ldg_a  =  valid_ld_a  ?   * ( const  float4 * ) pA  :   make_float4 ( 0 , 0 , 0 , 0 ) ;     float4 ldg_b  =  valid_ld_b  ?   * ( const  float4 * ) pB  :   make_float4 ( 0 , 0 , 0 , 0 ) ;           // 初始化累加器     float4 c [ WPTM ] [ 2 ]   =   {   {   make_float4 ( 0 , 0 , 0 , 0 )   }   } ;           // 主循环：软件 流水线      int  i  =   0 ;      do   {          // 将数据写入共享内存         smem_a [ 0 ] [ ty  *   16   +  tx ]   =  ldg_a ;         smem_b [ 0 ] [ ( threadIdx . x  /   4 )   *   32   +  tx  *   4 ]   =  ldg_b ;          __syncthreads ( ) ;                   // 预取下一轮数据         i  +=   16 ;         valid_ld_a  =  valid_ld_a  &&   ( ( tx4  *   4   +  i )   <  K ) ;         valid_ld_b  =  valid_ld_b  &&   ( ( ( threadIdx . x  /   4 )   +  i )   <  K ) ;         ldg_a  =  valid_ld_a  ?   * ( const  float4 * ) ( pA  +  i )   :   make_float4 ( 0 , 0 , 0 , 0 ) ;         ldg_b  =  valid_ld_b  ?   * ( const  float4 * ) ( pB  +  i  *  N )   :   make_float4 ( 0 , 0 , 0 , 0 ) ;                   // 从共享内存加载到寄存器         float4 reg_a [ 2 ]   =   {  smem_a [ 0 ] [ ty  *   16 ] ,  smem_a [ 0 ] [ ty  *   16   +   16 ]   } ;         float4 reg_b [ 2 ]   =   {  smem_b [ 0 ] [ ( tx * 4 )   *   32 ] ,  smem_b [ 0 ] [ ( tx * 4   +   8 )   *   32 ]   } ;                   // 循环展开的矩阵乘累加          # pragma   unroll          for   ( int  k  =   0 ;  k  <  TILE_K ;  k ++ )   {             c [ 0 ] [ 0 ] . x  +=  reg_a [ k  %   2 ] [ 0 ] . x  *  reg_b [ k  %   2 ] [ 0 ] . x ;             c [ 0 ] [ 0 ] . y  +=  reg_a [ k  %   2 ] [ 0 ] . x  *  reg_b [ k  %   2 ] [ 0 ] . y ;             c [ 0 ] [ 1 ] . x  +=  reg_a [ k  %   2 ] [ 0 ] . x  *  reg_b [ k  %   2 ] [ 1 ] . x ;             c [ 0 ] [ 1 ] . y  +=  reg_a [ k  %   2 ] [ 0 ] . x  *  reg_b [ k  %   2 ] [ 1 ] . y ;              // ... 更多累加 (已展开)          }                   __syncthreads ( ) ;      }   while   ( i  <  K ) ;           // 写入结果     pC [ ty  *   32   +  tx ]   =  c [ 0 ] [ 0 ] ; } 
+ 关键 ILP 优化技术 ： 
+ 技术 作用 向量化加载 使用  float4  每次读取 16B 双缓冲 计算与访存并行 软件流水线 预取下一轮数据 循环展开 完全展开内层循环 寄存器复用 数据保持在寄存器中 
+ 
+ 线程束专用化（specialization）（流水线并行） ​ 
+ 线程束专用化（specialization）原理 ​ 
+ 线程束专用化 （specialization）是一种流水线并行优化技巧： 
+ 
+ 将线程束划分为不同角色（访存、计算、调度） 
+ 不同角色独立调度 
+ 角色间形成生产者 - 消费者关系 
+ 各硬件功能单元并行执行 
+ 
+ 优势 ： 
+ 
+ 寄存器压力降低（每线程束只关注单一任务） 
+ 指令调度压力卸载到硬件 
+ 天然指令级并行 
+ 
+ 线程束专用化（specialization）的硬件支持 ​ 
+ 特性 作用 MT GPU 支持 张量内存引擎（TME） 异步数据搬运 ✅ 支持 异步屏障 （Async Barrier） 灵活同步机制 ✅ 支持 寄存器重配置 动态分配寄存器 🔜 未来支持 
+ 基于异步屏障（Async Barrier）的协作模式 ​ 
+ 不要把  barrier_acquire() 、 barrier_wait()  或  tme_async_copy()  这类伪函数
+写成可运行 kernel。MP31 的真实实现应使用 MTCC pipeline 的 producer/consumer
+状态机：producer acquire empty stage，发起对应 TME load 并记录准确的
+transaction bytes，arrival 后由 consumer wait full phase，计算完成后 release
+stage。 
+ 线程束专用化（specialization）协作示意图 ​ 
+ 
+ 
+ 性能优化检查清单 ​ 
+ 占用率优化 ​ 
+ 
+ 
+   寄存器使用是否合理？ 
+ 
+ 避免过度使用局部变量 
+ 权衡占用率与寄存器压力 
+ 
+ 
+ 
+   共享内存是否适度？ 
+ 
+ 每线程块不超过 48KB（留出余量） 
+ 平衡分块大小与占用率 
+ 
+ 
+ 
+   线程块大小是否合适？ 
+ 
+ 推荐：256-1024 线程/线程块 
+ 确保线程束数量为整数 
+ 
+ 
+ 
+ 线程束分化消除 ​ 
+ 
+ 
+   条件分支是否线程束级一致？ 
+ 
+ 使用  threadIdx.x < N  而非  threadIdx.x % N == 0 
+ 
+ 
+ 
+   是否可使用三元表达式？ 
+ 
+ 简单条件使用  ? :  替代  if-else 
+ 
+ 
+ 
+   循环边界是否对齐？ 
+ 
+ 确保循环次数为 32 的倍数 
+ 
+ 
+ 
+ 指令级并行 ​ 
+ 
+ 
+   是否穿插无关指令？ 
+ 
+ 长延迟操作后插入独立指令 
+ 
+ 
+ 
+   是否使用循环展开？ 
+ 
+ #pragma unroll  或手动展开 
+ 
+ 
+ 
+   计算与访存是否重叠？ 
+ 
+ 软件流水线设计 
+ 
+ 
+ 
+ 线程束专用化（specialization） ​ 
+ 
+ 
+   是否适合流水线并行？ 
+ 
+ 计算密集型 Kernel 可考虑 
+ 
+ 
+ 
+   Async Barrier 是否正确使用？ 
+ 
+ 确保生产者 - 消费者同步正确 
+ 
+ 
+ 
+   TME 是否充分利用？ 
+ 
+ 异步数据搬运减少寄存器压力 
+ 
+ 
+ 
+ 
+ 实战案例：矩阵乘法优化对比 ​ 
+ 基础版本（无优化） ​ 
+ // ❌ 无优化：低指令级并行，低占用率 __global__  void   matMulNaive ( float *  A ,   float *  B ,   float *  C ,   int  N )   {      int  row  =  blockIdx . y  *  blockDim . y  +  threadIdx . y ;      int  col  =  blockIdx . x  *  blockDim . x  +  threadIdx . x ;           float  sum  =   0.0f ;      for   ( int  k  =   0 ;  k  <  N ;  k ++ )   {         sum  +=  A [ row  *  N  +  k ]   *  B [ k  *  N  +  col ] ;      }     C [ row  *  N  +  col ]   =  sum ; } // 问题：每次迭代都访问全局内存，指令级并行极低 

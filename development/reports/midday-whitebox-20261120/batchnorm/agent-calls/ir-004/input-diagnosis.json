@@ -1,0 +1,93 @@
+{
+  "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "正式与补测结果、当前最佳与必须超过的门槛",
+      "finding": "本轮候选（输出趟两级预取）27/27 PASSED，两套补测各 36/36；目标用例 batch_norm_with_update_functional-timing-7 延迟 39.317790us（reference 28.091074us，speedup 0.71446），最差用例 timing-8 为 45.445362us。保留版复测 timing-7=39.458217us，历史保留最佳 39.261332us（original_verification 记录二进制 41483d74… 与预期一致）。因此本轮收益必须以 timing-7 < 39.261332us 判定，两级预取方向已被证伪（39.3178 未超过 39.2613）。"
+    },
+    {
+      "path": "prior-explorations.json",
+      "category": "source_ir",
+      "role": "历史机制归因与资源条件（避免重复、区分UB失败条件）",
+      "finding": "ir-004（只把归一化/输出趟由 8x128 加宽到 8x256，统计趟不动）得到当前最佳 39.261332us；ir-005 与本次的 ir-002 都属“预取深度”机制，未超过最佳。ir-002/ir-003 的统计趟加宽到 8x512 在 lowering 阶段失败：需要 UB 10485760 bits=1310720 字节，可用仅 1572864 bits=196608 字节——那是带 reshape(8x512→8x4x128)+tt.reduce(axis=1) 分块合并且保留 m 循环携带状态的重写；而 ir-004 只改纯流式输出分支，UB 未溢出。结论：加宽“流式输出分支”与加宽“带归约合并的统计分支”资源条件不同，前者是低占用可落地路径。"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "每 block 占时、波次量化与流水占比（本机制的成本证据）",
+      "finding": "candidate basic: Task Duration 39.880798us、Block Dim 64、freq 1650MHz；ArithmeticUtilization/PipeUtilization 逐 block 均值 aiv_time=19.289365us（min 16.826/max 21.810）、aiv_total_cycles=31827，即 64 个 block 两两串行落在 32 个 AIV 上（2×19.29≈38.6us≈任务时长），单核无剩余并行度，唯一可行方向是压单 block 时间。单 block：aiv_mte2_time=12.758us(ratio 0.665)、aiv_vec_time=9.515us(0.497)、aiv_mte3_time=2.903us(0.151)、aiv_scalar_time=4.645us(0.237)、aiv_scalar_vector_stall_time=9.125us（参考侧仅 3.800us）；aiv_mte2_active_bw=20.06GB/s，参考侧 48.84GB/s（0.41×）；ResourceConflict aiv_mte2_wait_ratio=0.843（参考 0.319）。搬运量 GM_to_UB=268KB/block、UB_to_GM=128.5KB/block，说明瓶颈不是总字节数，而是每次搬运的同步/描述符开销与几何（行内连续段长度）。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "指令级热点：同步与 DMA 命令而非算术",
+      "finding": "core0.veccore0 top_instructions 全为同步/搬运：BAR(VECTOR) 5 条 PC 各 calls=64、running_time 18.36~18.58us；WAIT_FLAG(MTE2) calls=64 17.93us；SET_FLAG(MTE2→VEC) 16.38us；MOV_SRC_TO_DST_ALIGN(MTE2, XD:X22=0x2000 即 8KB) 64 calls 16.42us；MTE3 侧 WAIT_FLAG/MOV_SRC_TO_DST_ALIGN 各 32 calls。算术指令未进前 16。instruction_calls_by_pipeline：MTE2=451、MTE3=114、VECTOR=1898、SCALAR=6998（每核 2 个 block，即单 block 约 48 个 tile 迭代 → 每迭代约 73 条标量指令 + 一套 BAR/FLAG 同步）。区域累计时间按材料说明仅作关注度排序、可重叠，不能相加解释为耗时。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "窗口资质、观测范围与流水互等的解释",
+      "finding": "只报告 core0.veccore0；raw_clock_window 185.793→224.198（38.4us，与任务时长 39.88us 同量级），clock_qualification=relative_only、absolute_time_qualified=false，interpretation 明确“common trace clock；仅显式 WAIT/BAR；不给全核时长与依赖停顿归因”。该核 MTE2 active 0.877/wait 0.237、VECTOR active 0.906/wait 0.395、MTE3 active 0.402：两遍数据在同一窗口内相互等待而非带宽饱和，与 profiling 的 mte2_wait_ratio 0.843 一致；未报告泳道按对称假设不作因果推断。"
+    },
+    {
+      "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+      "category": "source_ir",
+      "role": "实际 TTIR 中的具体结构：输出趟已有 256 分支、统计趟仍 128",
+      "finding": "唯一 EVEN 特化（无任何掩码/where/select）。统计趟（第47-93行）以 tensor<8x128> 瓦片、n_num_steps=cdiv(spatial,128)=32 次迭代；归一化/输出趟在 %spatial_wide(spatial%256==0) 守卫下有 8x256 流式分支（第160-220行，n 步 16 次，单步预取 + minsi 钳位、每元素次序 subf→mulf(weight)→mulf(inv_std)→addf(bias)），假分支保留 8x128（第222-273行）。输出分支无归约、无跨迭代依赖、结果只经 tt.store 落盘，因此瓦片宽度是该分支内部纯结构参数，可再加宽而不触碰任何 ABI、向量形状以外的语义。"
+    },
+    {
+      "path": "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "后端实际产物核对：疑似冗余是否已被后端消除",
+      "finding": "按 lowered-inventory.json 的符号核对到实际 bcmlir：第204-205行把 final_mean 的 8x256 fill 提到内层循环外（后端已做该外提），但第236-241行 weight/inv_std/bias 三个 linalg.fill 仍在内层 n 步循环内、且 %53 就是同一 tensor<8x256xf32>，即这三个循环不变量广播未外提——是一条独立的、本诊断不主张的潜在机制（已列入 alternatives，避免与瓦片加宽混算）。同文件确认输出分支为纯流式：每迭代一次搬运+一次 matrialize_in_destination 写回，无归约。低层产物保持冻结，不改。"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "paired_profiling",
+      "role": "宿主（Codex）证据分析与候选方向，本轮采纳/未采纳的归属",
+      "finding": "Codex 定位到三点：(1) 两级预取方向已证伪（本阶段复测 39.458217us > 历史 39.261332us），要求重新核对保留版成本；(2) 怀疑 weight／inv_std／bias 广播仍在每轮形成 linalg.fill，要求确认其在 BCMLIR 与模拟器窗口中的成本并评估外提；(3) 若继续扩大输出分块，必须先说明资源条件与此前统计分块 UB 失败（1310720B>196608B）的区别。本轮按 (1)(3) 选择输出趟瓦片继续加宽（纯流式、无归约，资源条件与失败案例不同），(2) 经核对确认仍在内层循环（见 bcmlir 证据），但收益量级远小于瓦片加宽，列为下一轮独立机制，不与本轮混算。"
+    },
+    {
+      "path": "lowered-inventory.json",
+      "category": "source_ir",
+      "role": "冻结低层产物与只允许编辑的范围",
+      "finding": "ttadapter(bd1b88a7…)、bcmlir(12c88ec8…)、npubin(41483d74…，与 feedback.original_verification 期望二进制一致) 均为 ir-004 实际编译产物，符号 batch_norm_with_update_kernel、ast_sha256=5c1607c0… 与 ir-inventory 一致。本轮只编辑清单允许的 ir/*.ttir，其余材料与源码保持冻结。"
+    }
+  ],
+  "hypothesis": "保留版 ir-004 的剩余成本不是浮点运算也不是总字节数，而是每个 tile 迭代固定付出的搬运几何与同步序列：单 block 19.289us 内 aiv_mte2 忙 12.758us 而 mte2_active_bw 仅 20.06GB/s（参考侧 48.84GB/s）、mte2_wait_ratio 0.843，top 指令全是 BAR/WAIT_FLAG/SET_FLAG 与 8KB/4KB 的 MOV_SRC_TO_DST_ALIGN；指令计数显示每核 48 个 tile 迭代配 451 条 MTE2、1898 条 VECTOR、6998 条 SCALAR。ir-004 已把归一化/输出趟从 8x128（行内连续 512B、16 次迭代）加宽到 8x256（行内 1KB、16 次迭代，原为 32 次），并把任务时长从 44.9us 量级降到 39.26us；该分支是纯流式（无归约、无跨迭代依赖、结果只落 tt.store），瓦片宽度是它内部的结构常量，后端不会自行改写。因此本轮把该分支再按同一机制加宽一档到 8x512（行内连续 2KB、n 步 16→8，单核同步序列与描述符数近似再减半），保留原 8x256 与原 8x128 两级回退分支，谓词用运行时 remsi/minsi/cmpi 守卫 spatial%512==0，元素级运算次序与次序依赖完全不变（subf→mulf(weight)→mulf(inv_std)→addf(bias)，单步预取、minsi 钳位、feat/batch stride 指针算术、写回地址与顺序逐项对应）。",
+  "alternatives": [
+    {
+      "name": "把 weight/inv_std/bias 三个循环不变量 fill 提到输出趟内层循环外",
+      "assessment": "BCMLIR 第236-241行实证仍在循环内，属真实可改缺陷；但每个 fill 只有 8x256=2048 元素，每 block 约 16 次×3 次 ≈ 0.5us 量级，远小于瓦片加宽的迭代削减，且与瓦片加宽会互相污染归因，故留作独立一轮。"
+    },
+    {
+      "name": "统计趟加宽（8x128→8x256/8x512）+ 车道对 Welford 合并",
+      "assessment": "统计趟是 32 次迭代、4KB 瓦片，是更大的同步开销来源；但历史 ir-002/ir-003 的 8x512 方案 lowering 需求 1310720B > 可用 196608B，合并用的 reshape+tt.reduce(axis=1) 与循环携带状态是溢出根源。若要做必须改成扁平 reshape(→4096) 单轴归约或双分支复制收尾，风险与本轮不同、不能同轮混入。"
+    },
+    {
+      "name": "UB 缓存第一遍输入、消除归一化段的第二次 GM 读取",
+      "assessment": "理论省 128KB/block（约 33% 读流量），但需 32 个 tensor<8x128> 同时存活（128KB UB）加暂存，接近 192KB 上限；在统计分块已出现 1.31MB 分配的前提下，UB 溢出风险最高，且无法预估后端是否会落盘，暂不选择。"
+    },
+    {
+      "name": "继续加深预取（两级/三级 lookahead）",
+      "assessment": "已由 ir-005 与本次 ir-002 两轮实测证伪（39.3178us、39.4582us），且 mte2_wait_ratio 0.843 说明问题在命令几何与同步而非预取深度不足，不再重复。"
+    },
+    {
+      "name": "改编译选项（num_stages/multibuffer/enable_ubuf_saving）或重写冻结源码",
+      "assessment": "分别属于编译选项研究与源码重写研究身份，且源码与清单冻结；本轮不采用。"
+    }
+  ],
+  "change": "只编辑 ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir 的归一化/输出段（原第160-166行守卫区与其后分支包裹），不改统计趟、两次 tt.reduce、final_mean/inv_std、running 统计、weight/bias 空指针 scf.if、常量 8/128/EVEN 与函数 ABI：(1) 在既有 %spatial_wide(%%256) 守卫前新增 %c511/%c512 常量、%spatial_rem_x=arith.remsi(spatial_dim,512)、%spatial_wide_x=arith.cmpi eq 0、%n_num_steps_x=divsi(spatial_dim+511,512)、%tile_lane_x=tt.make_range(0,512)；(2) 新增 scf.if %spatial_wide_x 真分支：与 8x256 分支逐项同构的纯流式输出循环——同一 prologue 单瓦片载入、同一 minsi 钳位单步预取（步长 512）、同一元素次序 arith.subf→arith.mulf(weight)→arith.mulf(inv_std)→arith.addf(bias)、同一 tt.store；只有瓦片类型由 8x256 变 8x512、步长常量 256→512、迭代上界取 %n_num_steps_x，新 SSA 名统一加 _x 后缀；(3) 假分支整体保留原有 scf.if %spatial_wide（8x256 与 8x128 两级回退，逐字节不变），只在其外层补一个右花括号。不引入掩码、不引入新的归约/reshape、不改变任何地址算术与写回顺序、不触碰 ABI。",
+  "expected": "可测预测（timing-7：batch=8, feat=64, spatial=4096，m_num_steps=1、BLOCK_M=8）：(1) 单 block 输出趟迭代 16→8，每迭代的行内连续段 1KB→2KB，单 block 的 MTE2 命令数、BAR/WAIT_FLAG/SET_FLAG 序列与 SCALAR 地址计算次数近似再减半；(2) 单 block aiv_time 从 19.289us 降到约 17.3~18.3us（按 ir-004 每削减 1 次迭代 ≈0.175us/block 的标定，8 次迭代 ≈1.4us，±0.5us），任务时长（两波串行）从 39.26~39.88us 降到约 35.5~37.5us，即 timing-7 正式延迟低于当前最佳 39.261332us；(3) 每元素向量算子次数、GM_to_UB/UB_to_GM 字节数（268KB/128.5KB per block）不变，aiv_mte2_active_bw 应上升，aiv_vec_ratio 基本不变；(4) spatial%512!=0 的形状（含其余 timing 用例）走原 8x256/8x128 分支，指令与数值逐字节同前，不应出现任何正确性或其它用例回退；(5) 输出逐元素次序未变，correctness 用例误差应与保留版一致（<1e-3 量级）。",
+  "validation": "宿主侧：TTIR 可解析 → CPU lowering（UB 占用须 < 196608B，本分支预计 ~64-96KB）→ 二进制生成；完整 27 项正式评测 + 两套 36 项补测；目标 timing-7 用 ABBA 复测与历史保留 39.261332us 对比；核对实际 ttadapter/bcmlir 中新 8x512 分支的搬运与同步计数是否下降、其余分支是否逐字节等价；核对冻结源码、清单、context 与证据的 sha256 不变。",
+  "layer_reason": "缺陷位于实际 TTIR 的瓦片形状常量与由它决定的循环次数/搬运几何（constexpr 形状已冻结进 IR 的 tensor<8x128>/tensor<8x256> 与常量 8/128/256），这是源码层 heuristics 与后端都不会自动改写的编译期结构选择；后端已把掩码、i1 载体与计数选择全部消除，但不会自行把流式分支的瓦片再加宽。因此局部编译变换是本缺陷的唯一合适层；源码冻结且不改编译选项，Triton 亦可表达同类意图（加宽 BLOCK_N），故层选择为 single_operator_ir。",
+  "simulator_incremental_judgment": "窗口资质按材料解释：timeline.json 仅 core0.veccore0、clock_qualification=relative_only、absolute_time_qualified=false，占用率是在同一 trace 时钟上的窗口分数，且 interpretation 声明只有显式 WAIT/BAR、无全核时长与依赖停顿归因；故不把 active/wait 分数换算成绝对耗时，也不把热点区域累计时间（instruction_time_sum）相加当作耗时。与 CSV 的对照价值在于一致性与方向：窗口 raw span 185.793→224.198（38.4us）≈ 任务时长，与“64 个 block 在 32 个 AIV 上两波串行、单 block 19.289us”一致；MTE2 active 0.877/wait 0.237、VECTOR active 0.906/wait 0.395 与 CSV 的 mte2_wait_ratio 0.843、scalar_vector_stall 9.125us 同向，指向每 tile 的搬运几何与同步序列而非带宽饱和或算术。未报告的核心/泳道按对称假设只用于方向判断，不作为因果或收益数值依据；收益只以正式重放与 ABBA 为准。",
+  "unknown": [
+    "8x512 分支的实际 UB 分配是否仍显著低于 196608B（此前统计分支溢出 1310720B 的根因在 reshape/reduce 合并，本分支为纯流式，仍以 lowering 结果为判据）",
+    "同核两波串行是否为 DVPP 固定调度（32 AIV）还是受 block 数影响；若为 40 AIV，则波次内 24/40 的尾巴也可能存在，但单 block 时间的改善对该情况同样有效",
+    "timing-8（45.4us）等其余形状的 spatial 是否满足 512 整除，若满足也会受益，但不作为本轮收益来源"
+  ]
+}

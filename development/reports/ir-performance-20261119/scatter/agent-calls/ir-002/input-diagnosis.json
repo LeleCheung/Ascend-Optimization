@@ -1,0 +1,66 @@
+{
+  "source_sha256": "a27f40a227126c5ffbe4e6bc1fd6e93cbb7c06d9a417091e1351785b90f0429e",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "候选/参考两侧逐 kernel 实测时长分解，确定投入方向",
+      "finding": "候选侧只有两个 task：_scatter_add_sort_key_kernel Task Duration 778.695557us 与 _scatter_add_sort_out_kernel 507.990173us，两者之和 1286.7us 与 context.json 中 target_latency_ms=1.2823ms 一致，说明该形状的耗时全部落在这两个 sort 路径 kernel 上；参考侧为 LinearIndex 35.200703us + ScatterElementsV2 3330.046875us + TensorMove 16.380327us = 3381.6us。sort_out 单独占候选 39.6%，且它与 sort_key 用相同 grid=(rows,)、逐行独立，因此任一 kernel 的跨 lane 访存减少都会直接进入总时延。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "sort_key 的热点区域、流水占用与等待/空闲口径",
+      "finding": "报告只覆盖 _scatter_add_sort_key_kernel（core0.veccore0）。source_loop 224-229（即 tl.static_range(LOG) 的分段扫描体）instruction_time_sum 105.73us、wait_instruction_time_sum 96.71us、trace_interval_union 12.04us，占该核 15.42us 观测窗口的 78%，是最大区域；top_instructions 前列为 line 228/229 的 BAR（VECTOR，5.5-5.6us）与 line 229 的 WAIT_FLAG（SCALAR，5.6us）。流水口径：VECTOR active_ratio 0.9405、idle 0.0595（productive 0.9194），SCALAR wait_only_ratio 0.717 而 productive 仅 0.027，MTE2 idle_ratio 0.958（121.199us 之后到 133.198us 完全空闲）、MTE3 idle 0.778。即在观测窗口内该核被向量跨 lane 操作与显式 BAR/WAIT 占满，全局访存早已结束，等待与空闲属于同步口径而非访存饥饿。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "模拟器观测范围与绝对时钟资质，界定能/不能从模拟器得到的结论",
+      "finding": "relative-timeline 只有一条 report，kernel=_scatter_add_sort_key_kernel，时间轴为 window_fraction（capture_start 0.0 / capture_end 1.0，capture_scope 明示为首个到末个可见硬件事件的局部窗口）；hotspots 中同一窗口的绝对时钟为 117.7750015258789→133.19800744578242us，只有 15.42us，远小于 profiling 的 778.70us。故模拟器给出的是局部窗口内的相对占用与显式 WAIT/BAR，不能当作 kernel 总时长；覆盖范围不含 sort_out，sort_out 的结论只能由 profiling 支撑。unit_validation 已用 16 个同 PC 对照校验单位为 us。"
+    },
+    {
+      "path": "ir/586fab365d9e315e3ad89eedcf6806290aa9406eeeb142d4583a8d657dabb861/_scatter_add_sort_out_kernel.ttir",
+      "category": "source_ir",
+      "role": "本次拟修改的实际 TTIR，逐行核对 gather 与常量",
+      "finding": "该特化是 EVEN=true / ncols=B=2048 / LOG=11（ir-inventory 常量 B=2048、LOG=11）。二分会话被完全展开为 12 个探针 gather：第一个 `%go = tt.gather %keys_5[%mid]` 的索引 %mid 是 `arith.constant dense<1024> : tensor<2048xi32>`，对每个 lane 恒等于 B/2，是编译期常量索引；其后 11 个探针 (mid_15…mid_95) 才是数据相关索引。此外还有 %nxt（1 次 gather 取 lo 的右移）与 %after（1 次 gather 取 prefix），共 14 次 gather。常量索引探针本质是一次广播（同一地址的同一元素），不需要逐元素跨 lane 搬移。"
+    },
+    {
+      "path": "compiled-readonly/586fab365d9e315e3ad89eedcf6806290aa9406eeeb142d4583a8d657dabb861/5ba65c14593889077788732baa72e17bdb22ebda07de1fbaf16e1cb2fc19f634/_scatter_add_sort_out_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "核对疑似冗余是否在后端已消除（只读）",
+      "finding": "lowering 后仍是 14 个 `@triton_gather*` 调用，与 TTIR 一一对应，没有折叠。第一个探针明确保留为 `%17 = call @triton_gather(%13, %8, ...)`，其中 %8 是 `linalg.fill ins(%c1024_i32)`（常量 1024 向量），%13 是 reinterpret_cast+memref.copy 装入 UB 的 keys 行。也就是说「索引向量为编译期常量」这一可被编译器（broadcast 化）消除的跨 lane 搬移，在 bcmlir 阶段仍然存在；keys/prefix 的 load 已只是 memref.copy，说明该 kernel 的可见成本集中在 gather 链而不是布局转换。该目录与 npubin 保持冻结，不作修改。"
+    },
+    {
+      "path": "compiled-readonly/f9d15572f3b2d1abd9da76be0b6be12e3fe36dc97a489155b495a3bf417039a2/fc561f504f133796c7bdcd3d814d999e527c417037b1e9c24f7f7288f118b087/_scatter_add_sort_key_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "另一 kernel 的 gather 计数与 TTIR→bcmlir 保真度对照，支撑代价模型",
+      "finding": "sort_key 的 bcmlir 保留 22 个 `@triton_gather*`（1 次 sv 重排 + 11 轮各 2 次：previous_target/previous_sum），与 TTIR 的 22 个 tt.gather 严格 1:1，且 sort 只是一次 `@triton_sort` 调用、idx/src 的 load 只是 memref.copy。于是两个 kernel 的实测时长可用 gather 数解释：778.70/22≈35.4us、507.99/14≈36.3us，残差仅数 us，说明「每减少 1 次 2048 宽 gather ≈ 省 35us」是可检验的线性预测，也说明本形状不是被 HBM 带宽或 sort 本身限制。"
+    },
+    {
+      "path": "lowered-inventory.json",
+      "category": "source_ir",
+      "role": "低层产物范围与符号核对",
+      "finding": "清单只登记 _scatter_add_sort_key_kernel 与 _scatter_add_sort_out_kernel 的 ttadapter/bcmlir/npubin（ast_sha256 分别是 f9d15572…/586fab36…），与 ir-inventory 的两个特化符号一致，没有其他 kernel；这些低层产物保持冻结，本次只编辑 ir/ 下清单允许的两个 .ttir。"
+    }
+  ],
+  "hypothesis": "sort_out 的第一个二分探针用 2048 宽的逐元素 tt.gather 去读一个对所有 lane 相同的常量下标 B/2 元素，这是「编译期常量索引的 gather 应被折成标量加载 + 广播」这一类本该由编译器完成的优化；本后端在 bcmlir 阶段并未折叠（仍为 @triton_gather(%13, %8)），因此每次 launch 的白白付出一次性跨 lane 搬移 2048 个 f32/行。按 profiling 给出的「每 gather ≈35-36us」线性关系，去掉这一次跨 lane 搬移预计节省约 35us。Codex 的宿主分析（codex-brief.json，本轮读取时中文已因编码丢失为 ?，仅英文键与结构可读：hypothesis 指向 IR 层面 kernel 级缺陷、observations 提到 kernel 与 BAR、predicted 预期在 FP32 语义不变下优于 a27f40a2、limitation 指出只覆盖单个 kernel）判断方向一致：应针对 sort 路径 kernel 内可消除的跨 lane/同步成本，而非改编译选项或重写源码；具体实现（哪一个 gather、如何等价改写）由本轮对实际 TTIR 与 bcmlir 的核对后选定。",
+  "alternatives": [
+    "退役冗余的第 12 个二分探针：区间初值为 [0,B)、hi 独占，11 轮后 hi-lo=1 即已收敛（lo==hi 时 clamp 后的更新恒为恒等），第 12 轮 (mid_95) 在 LO 上严格是 no-op，可去掉 1 次数据相关 gather。同样是「每 1 次 gather ≈35us」的量级，但属于算法冗余删除，与本次的「常量索引应广播化」是两个可独立验证的机制，留待下一次调用单独落盘，避免一次改动混两种机制。",
+    "把 sort_key 分段扫描的 11 次 previous_target gather 去掉（例如把 target 判等改成边界标志的 runid 比较，或把 target 与 sum 打包成 i64 单次 gather）：估计可省 385us 量级，收益最大，但 runid 方案仍需每轮一次移位 gather（净收益为 0），i64 打包会把跨 lane 字节数翻倍、且不清楚 i64 gather 在该后端是否等价可用，属于高风险猜想，本轮不作为首次验证对象。",
+    "把 sort_key 的分段前缀改为全局 cumsum，再在 sort_out 用 C[end-1]-C[lo-1] 求每段和：可整段删掉 11 轮×2 次 gather，但两个大偏和相减引入相消误差，2048 宽随机数据的偏和量级可达 1e2，最坏 ulp 误差可能接近 atol=1e-4，且 required_matched_ratio=1.0 要求全元素命中，违背「保持浮点精度要求」，不采用。",
+    "把 whole 改成单 kernel 或改编译器选项/重写源码：前者会改函数 ABI 与启动结构（本轮禁止，且不属于 TTIR 层），后者属于另外一个研究身份，不在本次单算子 IR 续接范围内。"
+  ],
+  "change": "只编辑 ir/586fab365d9e315e3ad89eedcf6806290aa9406eeeb142d4583a8d657dabb861/_scatter_add_sort_out_kernel.ttir：把第一个探针 `%go = tt.gather %keys_5[%mid]`（%mid = dense<1024> 常量索引）改为「用 keys_ptr + base + 1024 做一次标量 tt.load，再 tt.splat 成 tensor<2048xf32>」，其余 11 个数据相关探针、%nxt、%after、mask/EVEN 分支、存储与全部算术完全不动。函数签名/ABI、参数、grid 语义不变；不引入新常量以外的任何计算，不触碰源文件、清单、lowered 产物。",
+  "expected": "语义：新读到的标量就是同一地址 keys[row*B + 1024] 上的同一 f32 位模式（原 gather 也是从该行的 1024 号元素取值后广播到所有 lane），比较 (keys[1024] < dst*B) 的结果逐位相同，lo/hi 后续演进、delta、out=inp+delta 的浮点运算顺序与次数完全不变，因此数值结果应与当前最佳逐元素一致（不依赖测试数据）。性能：sort_out 少 1 次 2048 宽跨 lane gather，按其 14 次 gather 对应 507.99us 的实测线性关系，预测 sort_out 约降至 472-474us，总时延由 ~1282us 降至 ~1247us（降幅约 2.5-2.8%），target_speedup 由 2.68 量级升到 2.71 量级；由于只有落入 sorted-segment 路径（256<ncols<=4096）的 timing 用例受影响，预期 geo_mean 提升幅度小于该单例降幅。若实测无变化，则说明 npubin 阶段已把常量索引 gather 折成广播，本轮应记录这一点并转向下一个机制（退役第 12 个探针）。",
+  "validation": "由宿主执行完整 KGS 与配对性能评测：1) 数值：scatter_add-timing-8 及其余 7 个 timing 用例的 atol=1e-4/rtol=1e-4/required_matched_ratio=1.0 必须全部通过，且与当前最佳逐元素比对应为完全一致（本改动不改变任何浮点运算）；2) 编译：两个特化应仍能编译并产出与被冻结 npubin 相同符号的 kernel（本改动只影响 sort_out 的 TTIR）；3) 性能：对比 profiling 中 _scatter_add_sort_out_kernel 的 Task Duration 是否按预测下降约 35us 量级、总时延是否低于 1.2823ms，并检查 _scatter_add_sort_key_kernel 时长不应变差；4) 若可再取 bcmlir，应确认 triton_gather 计数由 14 变为 13、且首次探针变为标量 load + splat。",
+  "layer_reason": "选 single_operator_ir 而非改源码或编译选项：缺陷（常量索引的 2048 宽跨 lane gather）在 TTIR 文本中可直接定位且可等价改写，frozen.py 必须逐字节冻结，改源码会同时改变 AST 哈希、特化集合与全部低层产物身份；改编译选项属于另一研究身份且无法保证 abi/语义不变。本次改动只涉及被清单允许的 ir/*.ttir 内的一个机制，便于宿主把「跨 lane gather 计数」作为唯一自变量做完整评测。",
+  "simulator_incremental_judgment": "模拟器本轮给出的增量证据是：观测窗口 15.42us（绝对时钟 117.775→133.198us）只覆盖 sort_key 的一次局部窗口，VECTOR productive_ratio 0.9194、idle 0.0595，SCALAR wait_only_ratio 0.717 而 productive 0.027，MTE2 在 121.199us 后完全空闲（idle 0.958），top_instructions 是 line 228/229 的 BAR/WAIT_FLAG。由此可判定该 kernel 在窗口内被向量跨 lane 操作与显式同步占满、不是访存受限，支持「减少跨 lane 搬移次数」这一方向；但窗口只是局部相对视图，既不能当 kernel 总时长（profiling 的 778.70us 才是），也不覆盖 sort_out，因此对 sort_out 的预测改用 profiling 两 kernel 的 gather 计数线性关系（35-36us/gather）来表述，并明确该预测依赖「常量索引 gather 未在 npubin 阶段被折叠」这一尚待实测确认的前提。"
+  ,
+  "unknown": [
+    "npubin 阶段是否已把常量索引 gather 折叠为广播（bcmlir 阶段未折叠，二进制不可读，只能由实测时延确认）",
+    "标量 tt.load 会在 MTE2 上引入 1 次单字加载；由 hotspots 中 MTE2 idle_ratio 0.958 判断有余量，但其对 sort_out 的影响未在模拟器中直接观测",
+    "geo_mean 的其余 timing 用例是否走同一 sorted-segment 路径（只有 256<ncols<=4096 的用例受影响）"
+  ]
+}

@@ -1,0 +1,80 @@
+{
+  "schema": "hgkda.trace-decision/v1",
+  "id": "22696f1b75604a1bbcf81a52192ba152",
+  "recorded_at": "2026-11-21T10:31:35.289523+00:00",
+  "round_id": "attempt-021",
+  "input_source": {
+    "path": "trace/sources/2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113.py",
+    "sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113"
+  },
+  "evidence": [
+    {
+      "reference": {
+        "path": "trace/evidence/a51d25c213334998df0121dd713006da21f4ee8898816ebf51f3d117d64f7415.json",
+        "sha256": "a51d25c213334998df0121dd713006da21f4ee8898816ebf51f3d117d64f7415"
+      },
+      "original": {
+        "path": "workspace/current-profiling.json",
+        "sha256": "a51d25c213334998df0121dd713006da21f4ee8898816ebf51f3d117d64f7415"
+      },
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4 候选内核 257.645us、Block Dim 128；每程序 vector0 aiv_vec_time 12.636us 与 aiv_scalar_wait_time 11.514us 同量级，cube aic_fixpipe_time 5.499us；vector0 UB_to_GM 224KiB/程序、GM_to_UB 416KiB/程序。PV 之后的归一化/写回矢量阶段不是可忽略尾部，且 L0C_to_GM 768KiB/程序说明 PV 累加器确实经 L0C 搬出。",
+      "source_sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/2f728cc3540c8e13a4d3bde9599b74a501bb32a8ef392376fca1634616a9efa7.json",
+        "sha256": "2f728cc3540c8e13a4d3bde9599b74a501bb32a8ef392376fca1634616a9efa7"
+      },
+      "original": {
+        "path": "workspace/simulator-evidence.json",
+        "sha256": "2f728cc3540c8e13a4d3bde9599b74a501bb32a8ef392376fca1634616a9efa7"
+      },
+      "category": "simulator",
+      "role": "mechanism",
+      "finding": "cube 窗口 FIXP productive 0.329 为各流水最高，热点含 FIX_L0C_TO_DST(Dst:OUT, 10.7us、4 次) 与其配对 WAIT_FLAG(5.64/4.72us)；vector 窗口含 VDIV 8 次、VSEL 16 次、VCONV 10 次、VMULS 8 次；application_completed=false，cube/vector 各自归一化的部分窗口，不能当作全调用耗时或依赖停顿归因。",
+      "source_sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/3872e0b7e8321c12da290bbec07142d727dcd444fefc9d5afd78f81e606dd8b8.ttir",
+        "sha256": "3872e0b7e8321c12da290bbec07142d727dcd444fefc9d5afd78f81e606dd8b8"
+      },
+      "original": {
+        "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+        "sha256": "3872e0b7e8321c12da290bbec07142d727dcd444fefc9d5afd78f81e606dd8b8"
+      },
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "PV 为 %acc_45 = tt.dot(truncf(p), v16)（128x256x128）；其后才出现 l_safe 比较/选择、broadcast、arith.divf(128x128 fp32)、按 l_new>0 的 cmp/select、truncf 到 bf16 与 tt.store。归一化与零行保护整体位于 PV 结果读出之后，是独立的 post-PV 向量段。",
+      "source_sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113"
+    },
+    {
+      "reference": {
+        "path": "trace/evidence/e0db022b3d86900a082e45fc5a6404302b5645dc6603580e3ca4f892f52b9a8f.json",
+        "sha256": "e0db022b3d86900a082e45fc5a6404302b5645dc6603580e3ca4f892f52b9a8f"
+      },
+      "original": {
+        "path": "workspace/previous-result.json",
+        "sha256": "e0db022b3d86900a082e45fc5a6404302b5645dc6603580e3ca4f892f52b9a8f"
+      },
+      "category": "evaluation",
+      "role": "background",
+      "finding": "父版本完整四项实测：case4 full_call 262.27775us（trials 262.2967/261.98475/262.27775），native 128.9496us；case1 187.5727、case2 181.0167、case7 178.68615us；四项官方 checker 与补充阈值均通过。",
+      "source_sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113"
+    }
+  ],
+  "hypothesis": "持久程序分支里 PV 的 128x256 权重先按未归一化 p 转为 fp16 并 dot，再对 128x128 的 fp32 PV 累加器做行除法与零行 select；该后处理在 FIXP 把 L0C 搬出之后仍需矢量参与。若把同一行分母 l_new 的归一化前移到权重上（p/l_safe 之后再转 fp16），PV 结果本身就是输出值，理论上可由一次 L0C→输出 dtype 的直接转换写回，省掉 post-PV 的 128x128 fp32 除法、broadcast 比较与 select，并可能让编译器把 truncf+store 融进 FIXP 输出路径。",
+  "change": "仅改 _gqa_persist_kv_body 的 PV 归一化：保持 p = exp2(qk - m_safe) 与 l_new = sum(p) 的 FP32 表达式不变；由 l_new 计算带保护的 l_safe（l_new>0 取 l_new，否则取 1），计算 FP32 的 p/l_safe，再把零行保护施加到归一化权重（l_new>0 保留 p/l_safe，否则置 0），随后才把权重转成 FP16 做原来的单次 PV dot。PV 结果直接转 Out dtype，用原 store 地址与掩码写回，删除 post-PV 的除法与 where。非持久回退内核（含原 FP16 两项 PV 与非持久分支）逐字不变；不增加缓冲、启动或编译选项，不改 IR 结构。",
+  "expected": "case4 目标：完整调用低于保留最佳 262.27775us；case7 走同一持久分支，允许真实变化（归一化前移但同属一次 128x256 矢量除法范围）；case1（因果 64/64 非持久）与 case2（fp16 两项分解非持久）源码路径逐字未变，应只表现为测量噪声。收益候选来自删除 PV 后 128x128 fp32 除法/broadcast/select，以及可能的 FIXP 直接输出融合；代价是把 128x128 的后除法换成 128x256 的权重除法（元素数翻倍），若编译器不做直接输出融合则净收益可能为负。",
+  "validation": "先 preflight --source candidate.py 做只读路径与地址边界审查，随后宿主用原官方四项 checker、原 golden（sha256 保持）、原 warmup/trials/iterations、原 seed 与阈值做完整真机四项评测；不以局部测试替代。任何一项精度或性能反馈回退都保留源码与证据并记录。",
+  "alternatives": [
+    "保留 post-PV 除法，只把除法改成 128 元素倒数再乘 128x128：会改变舍入点，且仍在 PV 结果读出后引入完整的 128x128 向量乘法，收益上限低于消除该段。",
+    "保留 p 的 fp16 转换而不归一化，改在 PV 后以 fp32 累加器写出：不改变现有 IR 结构，无法区分‘向量后处理’与‘PV 交接’两个机制，不作为本轮实验。",
+    "先尝试减少 KV/程序数或提高占用率：属已验收的 headgroup/persistent 层，本轮宿主已指定只动 PV 归一化位置，保持其余结构不变。"
+  ],
+  "discriminating_observation": "修改后实际 TTIR 中 PV dot 之后不再出现 128x128 arith.divf 与按 l_new 的 select；truncf 直接作用于 PV 结果。BCMLIR/成对 profiling 与模拟器可区分两种结局：若 truncf+store 落到 FIXP 的 L0C→OUT 融合路径，应看到 post-PV 矢量读写与额外交接减少、case4 完整耗时低于 262.27775us；若仍走矢量输出，则 PV 后只是换了一次 128x256 除法，耗时可能持平或回退，按实际 IR/profile 记录负结果。",
+  "author": "agent",
+  "attribution_status": "author_claim_not_causal_proof"
+}

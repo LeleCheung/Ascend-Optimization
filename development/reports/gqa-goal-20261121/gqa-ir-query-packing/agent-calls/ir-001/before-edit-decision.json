@@ -1,0 +1,207 @@
+{
+  "timestamp": "2026-11-21T10:55:46.195773+00:00",
+  "diagnosis": {
+    "source_sha256": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "任务总量与波次基线（candidate.basic 与 reference.basic 字段）",
+        "finding": "候选 _gqa_fwd_kernel_mix_aic 的 Task Duration 为 257.645142us，Block Dim 128、Mix Block Dim 256；同文件参考侧 FusedInferAttentionScore 为 127.142540us、Block Dim 19。两侧 program 数不同，故只作总量与波次背景。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "逐 program AIC 时间构成（candidate.tables 的 PipeUtilization.csv/cube0：aic_time、aic_cube_time、aic_mte1/2/3_time、aic_fixpipe_time、aic_scalar_time）",
+        "finding": "128 个 block 的 aic_time 均值 35.390us（min 32.352、max 39.988）；其中 aic_cube_time 恒为 5.173us，aic_mte1_time 3.933us，aic_mte2_time 6.026us（min 4.261、max 9.447），aic_fixpipe_time 5.499us（min 5.016、max 6.156），aic_scalar_time 18.011us。矩阵计算占每 program 时间约 15%，Q 载入与输出搬运（mte2+fixpipe）合计约 11.5us，占每 program 时间约 33%。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "逐 program AIV 时间构成与 DMA 效率（candidate.tables 的 PipeUtilization.csv/vector0：aiv_time、aiv_vec_time、aiv_mte2_time、aiv_mte3_time、aiv_scalar_time）",
+        "finding": "aiv_time 均值 36.161us；aiv_vec_time 恒为 12.636us；aiv_mte2_time 均值 3.967us、active_bw 103.51GB/s；aiv_mte3_time 均值 3.021us、active_bw 72.55GB/s；aiv_scalar_time 12.789us。每 program 的 AIV 自身指令合计约 32us，接近 aiv_time，说明 program 内为串行工作而非纯等待。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "DMA 粒度对照（comparison 段 Memory.csv/vector0/bytes_per_mte2 条目）",
+        "finding": "候选每条 mte2 指令平均搬运 15213.71B，参考侧为 31996.99B；候选的搬运粒度约为参考的一半，与 BCMLIR 中 128 行×256B 分段视图一致。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "simulator",
+        "role": "AIC 流水占用与等待排序（reports 中 core0.cubecore0 的 timeline.pipelines 段）",
+        "finding": "CUBE active 0.3226（productive 0.1036）、FIXP active 0.5400（productive 0.3290）、MTE2 active 0.2015（productive 0.1943）、FLOWCTRL active 0.9100 而 productive 约 6.1e-05、wait_only 0.9099。AIC 的忙时间集中在 FIXP 与 MTE2，跨核等待几乎全部落在 FLOWCTRL。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "simulator",
+        "role": "累计等待与写回热点排序（reports 中 core0.cubecore0 的 top_instructions 前五项）",
+        "finding": "WAIT_FLAG_DEVI(FLOWCTRL) 4 次调用累计 37.27us，另一条 WAIT_FLAG_DEVI 累计 16.37us；FIX_L0C_TO_DST(FIXP) 4 次调用累计 10.70us 与 5.43us，SET_FLAG(FIXP) 10.70us。累计时间可重叠，仅用于定位候选机制。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "simulator",
+        "role": "AIV 侧写回与向量占用（reports 中 core0.veccore0 的 timeline.pipelines 与 top_instructions 段）",
+        "finding": "MTE3 active 0.3668（productive 0.2293、wait_only 0.1375、35 个事件）、MTE2 active 0.1691（47 个事件）、VECTOR active 0.4388（productive 0.2525）。MOV_SRC_TO_DST_ALIGN(MTE3, Src:UB Dst:OUT) 4 次调用累计 7.26us；MOV_OUT_TO_L1_MULTI_ND2NZ(MTE2) 2 次累计 4.58us、4 次累计 2.40us。写回指令是本核上排名靠前的搬运热点。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "模拟器窗口资质与覆盖（三个 reports 的 timeline.clock_qualification、raw_clock_window、outside_events 与 absolute_unit_validation 段）",
+        "finding": "三个报告的 clock_qualification 均为 relative_only、absolute_time_qualified 为 false；cube 报告原始窗口 137.08099365234375–186.1719971895218（unit 为 unassigned），vec0 窗口 137.08200073242188–186.45100586116314，各自把首末可见事件归一化到 0..1，outside_events 均为 20。绝对单位只由 absolute_unit_validation 用 22 个 PC 的中位比值 1.00113 校准，不构成关键路径度量。"
+      },
+      {
+        "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "被选中的具体编译缺陷（第 84-86 与 119-121 行，target_marker strides: [8192, 1]）",
+        "finding": "Q 与 Out 的视图写作 memref<128x128xbf16, strided<[8192, 1]>>：128 行、每行 128 个 bf16 连续（256B），行跨度 8192 个元素。memref.copy 与 materialize_in_destination 直接作用在该视图上，每个 tile 的载入与写出被切成 128 个 256B 段。"
+      },
+      {
+        "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "缺陷来源：program 内坐标映射（第 68-83 行的第 t 轮坐标算术）",
+        "finding": "循环第 t 轮取 hq=kvh*8+hg*2+t/2、序列段 s=128*(t%2)，即每 program 覆盖 2 个 query 头×256 序列。相邻两行在 GM 中相差 8 个头（1024 个元素），因此同 tile 的 128 行没有可合并的连续段，编译器只能在 8192 跨度的行上逐行发起 256B 搬运。"
+      },
+      {
+        "path": "q-row-packing-language-evidence.txt",
+        "category": "source_ir",
+        "role": "后端可用的零拷贝视图算子（配合 ir/target/_gqa_fwd_kernel.bcmlir 第 113、116 行现有 expand_shape/collapse_shape 观察）",
+        "finding": "同一份已编译 BCMLIR 中 tensor.expand_shape 与 tensor.collapse_shape 出现在现有写法里并成功落到本产物；背景证据记录源层 attempt-020 的 tensor.reshape 在重写阶段报 LLVM unexpected op。此产物可直接比较两类视图写法。"
+      },
+      {
+        "path": "feedback.json",
+        "category": "paired_profiling",
+        "role": "验收比较起点（formal_result.cases 中 case_id 为 4 的条目）",
+        "finding": "保留 019 的 case4 候选 262.27775us，原 472.46045us，官方 checker 通过；四项几何平均降幅 4.3812%，conditional_stability 中候选中位 261.0295us 对原 270.5725us。本实验以此为起点比较。"
+      }
+    ],
+    "hypothesis": "当前 BCMLIR 把 program 内坐标定为 2 个 query 头×256 序列，Q/Out 只能写成 128 行×128 列、行跨度 8192 的视图，每个 tile 的载入与写出固定切成 128 个 256B 段。同一 KV 组内 8 个 query 头在 GM 中本就连续（头跨度 128 个元素，8×128=1024 个元素=2048B），编译器缺少合并依据只是因为坐标映射把它们拆到了不同 program 的不同轮次。把每 program 的坐标改成 8 个 query 头×64 序列（hg 解释为序列分区 seqbase=hg*64，第 t 轮覆盖 16 个序列×8 个头的 128 行）后，Q/Out 视图成为 16x8x128、跨度 [8192,128,1]，头维度自然连续，每个 tile 的分段数由 128 降到 16，段长由 256B 升到 2048B；program 数、字节总量、K/V 外提、逐行数学表达式全部保持，矩阵与 softmax 的行局部性使这一重排只改变行的存放位置。",
+    "alternatives": [
+      "源层用二维连续段载入加 tensor.reshape 表达有序重排（attempt-020）：已观察到该写法在后端重写阶段报 LLVM unexpected op，且源层改动会更换源码身份；本轮固定 frozen.py，故只在 IR 控制点选取后端已支持的视图算子（历史背景，未采用）。",
+      "把 scf.for 体内为数不多的循环不变标量地址运算提到循环外：AIC scalar 时间 18.011us 占每 program 的约一半，但这些整数指令条数很少，预测收益小于 DMA 分段机理，留作独立研究身份（延期）。",
+      "改变 program 数或分工（例如 256/64 个 program、按序列切块）：会改变设备波次与启动配置，属于另一研究身份；本轮保持 128 program 与原 ABI，使比较只落在视图分段这一机制上（延期）。",
+      "进一步外提或共享 K/V 载入：019 已把整段 K 载入与 V 的 fp16 转换提到 query-tile 循环之外，本产物中 K/V 视图为 256x128、跨度 [1024,1]，与本轮 Q/Out 分段机制相互独立（已具备，未改动）。"
+    ],
+    "change": "只编辑 ir/target/_gqa_fwd_kernel.bcmlir 的 case4 特化函数体，一处机制：program 内坐标重排加二维连续段的 Q/Out 视图。(1) 循环体内新增 %c16_i32/%c64_i32/%c1024_i32 三个常量，把第 t 轮的序列基址写成 sbase=hg*64+t*16，Q/Out 偏移写成 b*2097152 + kvh*1024 + (hg*64+t*16)*8192，删去原 t/2、t%2 的头与序列拆分。(2) Q 的 memref.reinterpret_cast 由 sizes [128,128]、strides [8192,1] 改为 sizes [16,8,128]、strides [8192,128,1]，memref.copy 目标 alloc 改为 memref<16x8x128xbf16>，随后用 tensor.collapse_shape [[0,1],[2]] 得到 tensor<128x128xbf16> 供原有 linalg.matmul 使用。(3) Out 的 reinterpret_cast 同样改为 16x8x128 跨度 [8192,128,1]，arith.truncf 之后用 tensor.expand_shape [[0,1],[2]] output_shape [16,8,128] 得到与目标同形的张量，再交给原有的 bufferization.materialize_in_destination。K/V 视图、转置、两个 matmul、FP32 max/exp2/sum、除法与 guard 选择、scf.for 轮次（4）、program 数（128）、函数签名与 ABI 全部保持原样。",
+    "expected": "逐项预测如下。(1) 视图与指令：Q 与 Out 视图由 128x128 跨度 [8192,1] 变为 16x8x128 跨度 [8192,128,1]，每个 tile 的 Q 载入与 Out 写出分段数由 128 降到 16、段长由 256B 升到 2048B；tensor.collapse_shape 与 tensor.expand_shape 为有序零拷贝视图，预测不新增搬运指令。(2) 动态轮次：scf.for 仍为 4 次，program 数仍为 128，每 program 的 matmul 仍为 8 次（4 轮×2），K/V 载入仍为每 program 各 1 次，L0C 写出总量仍为每 program 4×128×128 个 f32。(3) 字节总量：每 program Q 载入 131072B、Out 写出 131072B、K/V 各 65536B，全任务 GM 搬运字节与 019 相同。(4) 搬运时间：预测 aic_mte2_time 由 6.026us 降到 5.0–5.8us，aic_fixpipe_time 由 5.499us 降到 3.6–5.0us；预测 aiv_mte3_time 由 3.021us 降到 2.3–2.9us，aiv_mte2_time 由 3.967us 降到 3.2–3.8us；预测 aiv_mte3_active_bw 由 72.55GB/s 上升。(5) 等待与资源：预测 vec 报告 MTE3 的 wait_only 比例由 0.1375 下降，AIC 的 FLOWCTRL 累计等待（37.27us 与 16.37us 两条 WAIT_FLAG_DEVI）变化幅度小于搬运项，aiv_vec_time 12.636us 与 aic_cube_time 5.173us 保持不变。(6) 逐 program 时间与总延迟：预测 aic_time/aiv_time 均值由 35.390us/36.161us 降到 34.0–35.6us 区间，case4 总延迟由 262.27775us 下降 1%–4%（约 252–260us），四项几何平均降幅维持在 4.38% 以上。(7) 偏差记录：若分段数按要求降到 16 而 aic_fixpipe_time、aiv_mte3_time 无对应下降，则 DMA 分段这一机制在本核上被证伪，剩余主因为 program 内 AIV 串行与跨核 ping-pong；若编译阶段拒绝 3D 跨度视图或有序 collapse/expand，则记录后端视图能力边界。(8) 未改动项：case1/case2/case7 的特化与全部源码字节不变，其数值与延迟按原编译结果沿用，逐项重放只用于确认无回归。",
+    "validation": "先由宿主对编辑后的 BCMLIR 做 CPU 编译，确认 3D 跨度视图与 collapse/expand 视图通过；再在固定 case1/2/4/7 上跑官方 checker（commit 12180ce7、golden c86aaa0b、contract 30323415）与 full-call 计时，与保留 019 的 case4 262.27775us、四项几何平均 4.3812% 对照。性能侧核对本次登记的逐项预测：aic_fixpipe_time、aic_mte2_time、aiv_mte3_time、aiv_mte2_time 的逐 block 均值，MTE3 wait_only 比例，aiv_vec_time 与 aic_cube_time 的恒定性，program 数与轮次数。所有权核对：128 个 program 覆盖 b(4)×kvh(8)×hg(4)，序列由 hg 分区 4×64=256 唯一覆盖，头由 kvh 组 8×8=64 唯一覆盖，每行 (b,hq,s) 只被写一次。若总分向好但幅度落在 262us 附近，则用 conditional_stability 的三次重复中位数判定方向。",
+    "layer_reason": {
+      "triton_expressibility": "源层可以用二维连续段指针载入再加有序重排来表达同一布局，背景分支 attempt-020 已试过以 tensor.reshape 实现并观察到后端重写阶段报 LLVM unexpected op；在 Triton 里改成分段载入则要改写循环结构并更换源码身份。本条机制在源码层有表达路径，代价是后端支持不确定，因此改在 IR 控制点用同一产物内已验证可用的 collapse/expand 视图算子落地。",
+      "fixed_source_experiment_purpose": "本轮固定 frozen.py 逐字节不变，源码身份保持 2a98e3e0，使比较只落在编译产物形状上；所有浮点表达式、矩阵尺寸、K/V 外提与每 program 4 个 query tile 的数量级都保持不变，只重排独立 query 行及其输出位置，因此数值语义可逐行对照。",
+      "ir_control_point": "BCMLIR 中的 memref.reinterpret_cast 的 sizes/strides 与 tensor.collapse_shape/expand_shape 正是决定 DMA 分段的控制点；linalg.matmul、arith.maxnumf/exp2/addf 与 guard 选择保持原样，改动面限于视图与坐标算术，便于逐项核对预测。"
+    },
+    "simulator_incremental_judgment": "模拟器三个报告均为 relative_only、absolute_time_qualified 为 false，各流水比例以本核首末可见事件归一化到 0..1，cube 窗口 137.081–186.172、vec0 窗口 137.082–186.451（unit 为 unassigned），outside_events 均为 20；绝对单位仅由 22 个 PC 的中位比值 1.00113 校准，因此本轮只把热点累计时间用于候选机制排序，把跨核等待作为独立支持材料，而不据此计算关键路径或带宽结论。据此判断：AIC 侧 FIXP 与 MTE2 的忙时间合计约 11.5us、占每 program 35.390us 的约三分之一，AIV 侧 MTE3 productive 比例 0.2293 且写回指令进入本核搬运热点前列，两处共同指向 Q/Out 视图的 256B 分段；这与 bytes_per_mte2 候选 15213.71B 对参考 31996.99B 的粒度差距方向一致。未报告泳道（AIC 侧 MTE3 空闲等）保持未知，等长窗口内 AIC 与 AIV 的等待重叠关系留待后续材料。因此本轮增量判断为：先消除 256B 分段这一有执行成本的编译缺陷，剩余主因（program 内 AIV 串行与跨核 ping-pong）保留为待验证假设。",
+    "unknown": [
+      "3D 跨度视图与 tensor.collapse_shape/expand_shape 在本后端的具体落地形式（是否退化为额外 UB 拷贝）需由编译产物确认。",
+      "分段数下降能否真正转化为 fixpipe 与 MTE3 时间下降，取决于 DMA 引擎每段固定开销占比。",
+      "AIC 与 AIV 的等待重叠在未报告泳道上未量化，跨核 ping-pong 的权重保留为待验证假设。"
+    ]
+  },
+  "diagnosis_sha256": "1d5ab3c4622257718b0cd114587c8d2373f6f9bef75a529a0d27e4da646009c4",
+  "evidence": [
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "任务总量与波次基线（candidate.basic 与 reference.basic 字段）",
+      "finding": "候选 _gqa_fwd_kernel_mix_aic 的 Task Duration 为 257.645142us，Block Dim 128、Mix Block Dim 256；同文件参考侧 FusedInferAttentionScore 为 127.142540us、Block Dim 19。两侧 program 数不同，故只作总量与波次背景。",
+      "sha256": "69e5acb628d09675c4c333f008d651f0c49fc467975789ecf7283eacc16a1256"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "逐 program AIC 时间构成（candidate.tables 的 PipeUtilization.csv/cube0：aic_time、aic_cube_time、aic_mte1/2/3_time、aic_fixpipe_time、aic_scalar_time）",
+      "finding": "128 个 block 的 aic_time 均值 35.390us（min 32.352、max 39.988）；其中 aic_cube_time 恒为 5.173us，aic_mte1_time 3.933us，aic_mte2_time 6.026us（min 4.261、max 9.447），aic_fixpipe_time 5.499us（min 5.016、max 6.156），aic_scalar_time 18.011us。矩阵计算占每 program 时间约 15%，Q 载入与输出搬运（mte2+fixpipe）合计约 11.5us，占每 program 时间约 33%。",
+      "sha256": "69e5acb628d09675c4c333f008d651f0c49fc467975789ecf7283eacc16a1256"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "逐 program AIV 时间构成与 DMA 效率（candidate.tables 的 PipeUtilization.csv/vector0：aiv_time、aiv_vec_time、aiv_mte2_time、aiv_mte3_time、aiv_scalar_time）",
+      "finding": "aiv_time 均值 36.161us；aiv_vec_time 恒为 12.636us；aiv_mte2_time 均值 3.967us、active_bw 103.51GB/s；aiv_mte3_time 均值 3.021us、active_bw 72.55GB/s；aiv_scalar_time 12.789us。每 program 的 AIV 自身指令合计约 32us，接近 aiv_time，说明 program 内为串行工作而非纯等待。",
+      "sha256": "69e5acb628d09675c4c333f008d651f0c49fc467975789ecf7283eacc16a1256"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "DMA 粒度对照（comparison 段 Memory.csv/vector0/bytes_per_mte2 条目）",
+      "finding": "候选每条 mte2 指令平均搬运 15213.71B，参考侧为 31996.99B；候选的搬运粒度约为参考的一半，与 BCMLIR 中 128 行×256B 分段视图一致。",
+      "sha256": "69e5acb628d09675c4c333f008d651f0c49fc467975789ecf7283eacc16a1256"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "AIC 流水占用与等待排序（reports 中 core0.cubecore0 的 timeline.pipelines 段）",
+      "finding": "CUBE active 0.3226（productive 0.1036）、FIXP active 0.5400（productive 0.3290）、MTE2 active 0.2015（productive 0.1943）、FLOWCTRL active 0.9100 而 productive 约 6.1e-05、wait_only 0.9099。AIC 的忙时间集中在 FIXP 与 MTE2，跨核等待几乎全部落在 FLOWCTRL。",
+      "sha256": "9c3c2cc35e4b0c64e5ffb863f9cded01f545a7aecbfa13667a466d3890d6f5aa"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "累计等待与写回热点排序（reports 中 core0.cubecore0 的 top_instructions 前五项）",
+      "finding": "WAIT_FLAG_DEVI(FLOWCTRL) 4 次调用累计 37.27us，另一条 WAIT_FLAG_DEVI 累计 16.37us；FIX_L0C_TO_DST(FIXP) 4 次调用累计 10.70us 与 5.43us，SET_FLAG(FIXP) 10.70us。累计时间可重叠，仅用于定位候选机制。",
+      "sha256": "9c3c2cc35e4b0c64e5ffb863f9cded01f545a7aecbfa13667a466d3890d6f5aa"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "AIV 侧写回与向量占用（reports 中 core0.veccore0 的 timeline.pipelines 与 top_instructions 段）",
+      "finding": "MTE3 active 0.3668（productive 0.2293、wait_only 0.1375、35 个事件）、MTE2 active 0.1691（47 个事件）、VECTOR active 0.4388（productive 0.2525）。MOV_SRC_TO_DST_ALIGN(MTE3, Src:UB Dst:OUT) 4 次调用累计 7.26us；MOV_OUT_TO_L1_MULTI_ND2NZ(MTE2) 2 次累计 4.58us、4 次累计 2.40us。写回指令是本核上排名靠前的搬运热点。",
+      "sha256": "9c3c2cc35e4b0c64e5ffb863f9cded01f545a7aecbfa13667a466d3890d6f5aa"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "模拟器窗口资质与覆盖（三个 reports 的 timeline.clock_qualification、raw_clock_window、outside_events 与 absolute_unit_validation 段）",
+      "finding": "三个报告的 clock_qualification 均为 relative_only、absolute_time_qualified 为 false；cube 报告原始窗口 137.08099365234375–186.1719971895218（unit 为 unassigned），vec0 窗口 137.08200073242188–186.45100586116314，各自把首末可见事件归一化到 0..1，outside_events 均为 20。绝对单位只由 absolute_unit_validation 用 22 个 PC 的中位比值 1.00113 校准，不构成关键路径度量。",
+      "sha256": "3e592e77d23a31278e191adec58dd4fc6c9e27e92e10bf03ad6917846dfc632e"
+    },
+    {
+      "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "被选中的具体编译缺陷（第 84-86 与 119-121 行，target_marker strides: [8192, 1]）",
+      "finding": "Q 与 Out 的视图写作 memref<128x128xbf16, strided<[8192, 1]>>：128 行、每行 128 个 bf16 连续（256B），行跨度 8192 个元素。memref.copy 与 materialize_in_destination 直接作用在该视图上，每个 tile 的载入与写出被切成 128 个 256B 段。",
+      "sha256": "3f0752b87549d3622671e660efcd63cee0d4e7286e342001b1b25900e878f4a7"
+    },
+    {
+      "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "缺陷来源：program 内坐标映射（第 68-83 行的第 t 轮坐标算术）",
+      "finding": "循环第 t 轮取 hq=kvh*8+hg*2+t/2、序列段 s=128*(t%2)，即每 program 覆盖 2 个 query 头×256 序列。相邻两行在 GM 中相差 8 个头（1024 个元素），因此同 tile 的 128 行没有可合并的连续段，编译器只能在 8192 跨度的行上逐行发起 256B 搬运。",
+      "sha256": "3f0752b87549d3622671e660efcd63cee0d4e7286e342001b1b25900e878f4a7"
+    },
+    {
+      "path": "q-row-packing-language-evidence.txt",
+      "category": "source_ir",
+      "role": "后端可用的零拷贝视图算子（配合 ir/target/_gqa_fwd_kernel.bcmlir 第 113、116 行现有 expand_shape/collapse_shape 观察）",
+      "finding": "同一份已编译 BCMLIR 中 tensor.expand_shape 与 tensor.collapse_shape 出现在现有写法里并成功落到本产物；背景证据记录源层 attempt-020 的 tensor.reshape 在重写阶段报 LLVM unexpected op。此产物可直接比较两类视图写法。",
+      "sha256": "82883deef12a30274a873fcfbbdc042175339c0b7430f5d83b2352e647ee766d"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "验收比较起点（formal_result.cases 中 case_id 为 4 的条目）",
+      "finding": "保留 019 的 case4 候选 262.27775us，原 472.46045us，官方 checker 通过；四项几何平均降幅 4.3812%，conditional_stability 中候选中位 261.0295us 对原 270.5725us。本实验以此为起点比较。",
+      "sha256": "1059aa282cdc9ec679766a5bb58d5ac10a93e8e7ea21c8189e0e3f88dfc8155a"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "2a98e3e0c1b1bf631f88c0d613b98d4532bb6273fccf4441291dda87fe749113",
+    "contract.json": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858",
+    "ir-inventory.json": "b890c63368cd39fb251bb86ffb4cefc87b1b4f3fd128d71c4a563db67142bf7a",
+    "feedback.json": "1059aa282cdc9ec679766a5bb58d5ac10a93e8e7ea21c8189e0e3f88dfc8155a",
+    "profiling.json": "69e5acb628d09675c4c333f008d651f0c49fc467975789ecf7283eacc16a1256",
+    "hotspots.json": "9c3c2cc35e4b0c64e5ffb863f9cded01f545a7aecbfa13667a466d3890d6f5aa",
+    "timeline.json": "3e592e77d23a31278e191adec58dd4fc6c9e27e92e10bf03ad6917846dfc632e",
+    "q-row-packing-language-evidence.txt": "82883deef12a30274a873fcfbbdc042175339c0b7430f5d83b2352e647ee766d",
+    "context.json": "e7724d34505daf6b6118512416fd05a81769d97b42422c990a5fd5a778007d20",
+    "diagnosis.json": "bff2c89a1c04ecada9fea1f9dd6213ed9717c5b0c405e8b5e120cdefc43cbff4",
+    "codex-brief.json": "8cdd7a719fa52a5be5927aada040a3bbbfdcbc260e2a1ba39956bbee59586916",
+    "ir/target/_gqa_fwd_kernel.bcmlir": "3f0752b87549d3622671e660efcd63cee0d4e7286e342001b1b25900e878f4a7",
+    "compiled-readonly/_gqa_fwd_kernel.ttir": "3872e0b7e8321c12da290bbec07142d727dcd444fefc9d5afd78f81e606dd8b8",
+    "compiled-readonly/_gqa_fwd_kernel.ttadapter": "cdcbbfad8ec97625f2e5743ec02932455f698bc4ffe8f09563a3abf9dc84c252",
+    "compiled-readonly/_gqa_fwd_kernel.bcmlir": "3f0752b87549d3622671e660efcd63cee0d4e7286e342001b1b25900e878f4a7"
+  },
+  "decision_tool_sha256": "5bef69abbe2d24d40092eade140c6c5d68f831185dbcc5e7930d535926348208"
+}

@@ -1,0 +1,79 @@
+{
+  "source_sha256": "0af5d533afea8f4be88e1fd6e0fc4a6ba76fae9a8b1478f7c4b93247fe7ec070",
+  "selected_layer": "single_operator_ir",
+  "layer_reason": "只允许编辑 ir/ 内已登记的 TTIR；源码(frozen.py)、编译选项、ABI、launch grid 全部冻结。本轮机制是编译器的循环不变量代码外提缺失，属于单算子 IR 层可独立修复的编译缺陷，不是源码重写、也不是改编译选项。当前 IR 为保留原版(sha256 3924918d…8854)，与 ir-inventory 登记的原件一致。",
+  "evidence": [
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "同输入设备 OpProf：候选 512 program，单 program 的流水占比与字节量",
+      "finding": "candidate basic: Task Duration 40.020802us, Block Dim 512。每 program read_main_memory_datas 48.625KB、write_main_memory_datas 48.0KB（≈最小流量，无重复读写）。每 program aiv_mte2_instructions=25、aiv_mte3_instructions=7、aiv_mte2_time=1.824us(ratio mean 0.618)、aiv_mte3_time=0.909us(0.317)、aiv_vec_time=0.741us(0.259)、aiv_scalar_time=0.945us(0.314)、aiv_total_cycles mean 4892(≈2.97us/block)。MTE2 是唯一接近饱和的流水，读侧每指令≈1.95KB，与参考实现(310 instr/620.9KB)同一粒度，说明 128B 行并不是本轮可改的瓶颈。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "单核相对流水线窗口：判定关键资源与各流水 wait/idle 归属",
+      "finding": "窗口 capture_duration 9.74us（相对时间，仅首末可见事件，不含启动前后空闲）。MTE2 active_ratio 0.924、productive 0.892、idle 0.076；MTE3 active 0.865 但 productive 仅 0.264、wait 0.777；VECTOR active 0.907 但 productive 仅 0.111、wait 0.797；SCALAR active 0.049，SCALARLDST(辅助泳道) active 0.132。即 MTE2 是唯一高产出流水，VECTOR/MTE3 的“active”大部分是等待，未被报告的 ALL/FLOWCTRL/CACHEMISS 泳道按辅助泳道解释、未当作关键路径。",
+      "interpretation": "绝对时钟资质：该窗口是相对占位，不可当作 62.8us 的绝对分解；结论只用于比较同一窗口内各流水的忙碌/等待结构与排序。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "区域级关注度：循环体与 bias 载入段的指令与等待分布",
+      "finding": "source_loop(源码 109-170) 252 instructions、instruction_time_sum 104.51us、wait_instruction_time_sum 39.81us、trace_interval_union 9.071us（占窗口 93%），流水为 FLOWCTRL/MTE2/MTE3/SCALAR/VECTOR；source_conditional(源码 94-102，即 3 次 bias 载入) 仅 18 instructions 却 trace_interval_union 1.030us（窗口 10.6%），largest_instruction 1.02us，流水只有 MTE2+SCALAR。解释按材料限定：累计指令时间只作排序，但 bias 段以小指令量占据约十分之一窗口，说明它是一条串行的小传输+scalar 前置段。"
+    },
+    {
+      "path": "compiled-readonly/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/f67d9cdb9f445d242714897e48f68b992534a9c144549743ff721f2556ce6136/_transform_bias_rescale_qkv_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "按符号核对后端实际产物：哪些疑似冗余已消除、哪些没有",
+      "finding": "已消除：TTIR 里 64x64 指针张量的 splat/broadcast/addptr 全部塌缩为 memref.reinterpret_cast + memref.copy，实际只有 3 次 tile 载入 + 3 次 bias 载入 + 3 次 materialize_in_destination 存储（与 ir006-lowering-mechanism 记录的 copy_count 6、materialization 3 一致），不存在逐元素地址运算残留。未消除：scf.for 循环体内仍保留 %broadcasted(q_bias f32)、%broadcasted_10(k_bias f16)、%broadcasted_11(v_bias f16)、%38 = linalg.fill(scale_factor) 以及 tensor.empty；这些量与循环无关（bias 在循环外只载入一次），却每轮重新物化成 64x64 tile（f32 16KB×2 + f16 8KB×2）。"
+    },
+    {
+      "path": "compiled-readonly/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/f67d9cdb9f445d242714897e48f68b992534a9c144549743ff721f2556ce6136/_transform_bias_rescale_qkv_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "低层 ttadapter 复核同一缺失：scalar 段与向量段在循环内的重复",
+      "finding": "ttadapter 中 scf.for(0..2) 体内仍出现 tensor.expand_shape/extf/broadcast(q_bias)、linalg.broadcast(k_bias/v_bias)、linalg.fill(scale_factor)；循环外只有 3 次 memref.copy(64xf16 bias)。即 LICM 未发生，每 program 重复计算一轮不变量。"
+    },
+    {
+      "path": "lowered-inventory.json",
+      "category": "source_ir",
+      "role": "低层产物身份冻结范围",
+      "finding": "ttadapter sha256 6955cc56…、bcmlir 8557bfc1…、npubin 92cc78be… 均登记为只读冻结；本轮只编辑 ir-inventory 列出的 TTIR，不改动这些实际低层产物。"
+    },
+    {
+      "path": "ir006-formal-result.json",
+      "category": "paired_profiling",
+      "role": "历史候选的正式结果（几何改动方向的反证）",
+      "finding": "status PASSED、21/21、abs_err 0.0，但 timing-2 latency 0.094184119ms（比保留原版 62.860936us 慢 50%），worst_workload_uuid 正是 transform_bias_rescale_qkv-timing-2；说明相邻 head 加宽/3D 输出的几何改动在本算子上是明确退步，不宜重复。"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "宿主正式/补测反馈与保留基线",
+      "finding": "retained_parent original IR 62.860936us；ir001 前载六次载入 63.029us、ir003 四 32x64 tile 63.516us、ir006 94.184us，均无收益。要求从已恢复的保留原版出发，并超过 62.860936us 与历史 62.837203us。"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "source_ir",
+      "role": "Codex 对失败几何与不变量方向的分析（宿主证据分析贡献）",
+      "finding": "Codex 记录：ir006 加宽输入行但输出变 3D 步进写、延迟升到 94.184us；ir001 两个 64x64 tile 仍是两个独立 tile 运算无收益；保留原版为 2D 连续 64-half 行写。其备选方向之一“检查原循环内不变量的 q-bias 扩展/broadcast 与 scale fill，若仍留在实际 BCMLIR 内，则外提是独立的低风险机制”——本轮实测 bcmlir/ttadapter 证实这些不变量确实仍在 scf.for 内，故选用该方向；其 128x64 单 tile 主推方向由我判定为不选（见 alternatives）。"
+    }
+  ],
+  "hypothesis": "实际低层产物证明编译器没有把与 GROUP 循环无关的张量物化外提：bias 在循环外只载入一次，但 q_bias 的 expand/extf/broadcast(f32)、k_bias/v_bias 的 broadcast(f16) 以及 scale_factor 的 splat 每轮循环都重新物化成 64x64 tile。按 UB 字节估算，每轮因此多写 16KB(f32 q bias) + 8KB + 8KB + 16KB(f32 scale fill) ≈ 48KB，而每个 program 的有效 tile 流量才 48KB 读 + 48KB 写；2 轮循环等于把这份不变量做两遍。VECTOR 处在 MTE2 载入与 MTE3 存储之间的依赖链上（timeline: VECTOR active 0.907 但 productive 仅 0.111、wait 0.797），因此缩短依赖链上的向量/UB 物化可直接缩短每 program 的实际耗时，而不是只减少可与 MTE2 重叠的旁路工作。",
+  "alternatives": [
+    "128 行单次 tile（Codex 主推）：把两轮 64x64 合并为一次 128x64，去掉循环，但会消灭“第二轮载入与第一轮计算/存储重叠”的机会；ir001 已用前载六次载入做过等价尝试且 63.029us 无收益，故不选。",
+    "把 3 次 64-element bias 载入合并为一次 [3,64] 步进拷贝：可把 bias 段 MTE2 指令从 3 降到 1，但本方言无法在不引入切片/重排的情况下把 [3,64] 拆回 3 个 64-vector（tt.split 只切末维、192 也非 2 的幂），强行改写会引入新的向量搬运，收益不确定，暂不选。",
+    "相邻 head 加宽输入行(64->128)+3D 输出：ir006 正式结果 94.184us，明确退步，不重复。",
+    "减少字节/跳过读取：input 与 output 每 program 已是 48.625KB/48.0KB 的最小流量，无冗余可删。",
+    "保持 IR 不变并登记无改动：bcmlir/ttadapter 显示不变量仍在循环内且 VECTOR 有 0.741us/program 的可归因时间，因此不属于“后端已消除”的情形，不选 no-change。"
+  ],
+  "change": "只编辑 ir/ca6c05a0…/_transform_bias_rescale_qkv_kernel.ttir，做一次循环不变量外提：在 scf.for 之前新增 %qb_e/%qb_f/%qb_b（q_bias 的 expand_dims→extf f32→broadcast[64,64]）、%kb_e/%kb_b、%vb_e/%vb_b（k/v bias 的 expand_dims→broadcast[64,64] f16）、%scale_t（scale_factor 的 64x64 f32 splat）；删除循环体内对应的 expand_dims/extf/broadcast/splat，循环内只保留 extf(q_val)、addf、mulf、truncf、addf、addf 及三次存储。复用既有 #loc115… #loc123 调试位置，不新增符号、不改函数签名/参数、不改 grid、不改 num_stages=2、不改任何 stride 或地址表达式，不改变 k/v 的 f16 加法与 q 的“f32 加 bias→f32 乘 scale→一次 f16 截断”的舍入顺序。",
+  "expected": "预测（可测、可否证）：(1) 每 program 的 aiv_vec_time 从 0.741us 降到约 0.60–0.65us，UB 写入减少约 48KB/program（2 轮各减一半不变量物化）；(2) 每 program 的 aiv_total_cycles / block 墙钟从 ~4892 cycle(2.97us) 降到约 2.8–2.9us；(3) timing-2 延迟应从 62.860936us 降到约 60.5–62.5us（1–4%），最佳情形接近 60us。若 VECTOR 已被 MTE2 完全掩盖，则 aiv_vec_time 会下降而延迟不变——这将被判为“无收益但仍可作为不变量外提的基线事实”。语义预测：21 个 correct 用例与两个 48 用例应保持 abs_err/rel_err 为 0（逐元素操作顺序不变，仅删除重复的同一值物化）。",
+  "validation": "由宿主执行：TTIR 可解析并可编译(含 UB 上限，新增约 48KB 常驻 tile 后估计 164KB/196608B)；21 个完整用例 + 两个 48 用例补测；与保留原版及历史 62.837203us 的正式计时对比；并核对实际 BCMLIR 中 scf.for 体内是否真的不再出现 linalg.broadcast/linalg.fill（用于判定预测 (1) 是否成立）。本轮不把文档、预检或建议当作收益结果。",
+  "simulator_incremental_judgment": "模拟器窗口是单核首末可见事件的相对时间（9.74us，capture_scope 明示不含启动前后空闲），因此只作同窗口内的结构与排序证据：MTE2 active 0.924/productive 0.892 是关键资源，VECTOR(productive 0.111/wait 0.797) 与 MTE3(productive 0.264/wait 0.777) 的活跃大部分是等待，SCALARLDST(693 事件)、CACHEMISS(16)、ALL/FLOWCTRL 属未报告/辅助泳道，按材料解释为辅助信息而不计入关键路径。热点与等待/空闲均为核心输入：source_loop 占窗口 93%、其 wait_instruction_time_sum 39.81us 与 source_conditional 的 1.03us 一起说明串行小传输与循环内重复物化都有执行成本。由于绝对时钟不可得，本轮不宣称绝对加速比，只声明机制与可测预测，真实收益由宿主正式计时裁决。",
+  "unknown": [
+    "后端在把不变量 tile 提升为循环内常驻后，是否仍保持 multibuffer=true 的双缓冲装载（若被迫降级为单缓冲，可能抵消收益）。",
+    "新增约 48KB 常驻 UB 是否触发编译器拒绝或额外的缓冲复用/插入同步，需以实际 BCMLIR 与编译结果核对。",
+    "VECTOR 的 0.741us/program 中有多少真正落在 block 墙钟的关键依赖链上，仍只能由正式计时判定。"
+  ]
+}

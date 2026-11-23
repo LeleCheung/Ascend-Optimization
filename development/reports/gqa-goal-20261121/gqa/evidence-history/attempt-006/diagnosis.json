@@ -1,0 +1,53 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "23d7322958578d08372dfd9f830f7dc251c4235aa34e7bacf8a3cacdcee90afc",
+  "evidence": [
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4 候选 Task Duration 467.709us，512 program（BM128）。每 program aic_cube_time 2.02us、aic_scalar_wait_id1 11.79us（总6034us）而 cube 仅1033us；aic_mte2 3.36us、fixpipe 2.99us、vector vec 6.32us。参考实现 19 块、每块 cube 35.5us、vec 59us，说明候选墙钟主要耗在 cube 等待跨核交接，而非算术/搬运吞吐。"
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "case4 BCMLIR：scf.for arg12=0..256 step 128（BLOCK_N=128，2 次迭代）。循环体内为 linalg.matmul(QK, outs %3) → softmax → truncf/extf/subf/mulf 得 p_hi、p_lo → matmul(PV_hi, outs=acc*alpha) 与 matmul(PV_lo, outs=%3 零初值) 各一次，共 3 个 matmul/迭代、6 个/program。每个 matmul 输出为 128x128 f32=64KiB，故 L0C_to_GM 每 program 384KiB，与 profiling 完全一致。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "TTIR 中循环为 scf.for %n0 = 0 to 256 step 128，q/k/v 均为 tensor<128x128xbf16>，qk/p 为 tensor<128x128xf32>；几何已全部编译期常量化、无运行时掩码，确认当前源码即 BM128/BN128 版。每 KV 块一次 QK 与两次 PV 是两个独立 L0C 累加结果，需两次 L0C 搬出与两次 cube/vector 握手。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "已验收四项：case4 full_call 472.46045us；官方 checker 全通过（BF16 MER 0.0、mismatch 125/8388608、small/cancel/normal 均 pass）。case1/2/7 亦通过。证明当前两项概率分解精度路径在四项上可接受，本轮只改分块、保留该表达式与相加顺序。"
+    },
+    {
+      "path": "workspace/context-brief.json",
+      "category": "other",
+      "role": "background",
+      "finding": "宿主续接要求：对非因果 BF16 且 BLOCK_D<=128 的 metadata 路径，BM 保持 128、BN 由 128 提到 256；其余路径不变。目标 case4 超过 472.46045us，其他三项真实变化同时保存；不得按 case_id/输入值选路。"
+    }
+  ],
+  "hypothesis": "case4/7 的 SKV=256，当前 BN=128 必须两轮 KV 迭代，每轮都完整付一次 QK→vector softmax/两项分解→两次 PV→L0C 搬出的跨核交接链（每链手算 aic_scalar_wait_id1 约 5.9us/program·迭代）。将非因果 BF16、BLOCK_D<=128 的 BLOCK_N 提到 256，使 SKV=256 单轮覆盖全部 KV：每 program matmul 执行 3 次（QK 128x256 + PV_hi 128x256 + PV_lo 128x256）而非 6 次，交接链 2→1，L0C→GM 由 384KiB 降到约 256KiB（QK 128KiB + 两次 PV 各 64KiB），而总 matmul FLOPs、grid、Q 行复用数不变。墙钟由 per-program 交接链数主导，故预计 case4/7 明显下降。",
+  "alternatives": [
+    "把 p_hi 与 p_lo 沿列拼成 128x256、V 沿行复制成 256x128 再做单次 PV：可把每轮 matmul 由 3 降 2，但上一轮实测 BF16 峰值 UB 需求 855552B、超出 196608B 预算，且需 join/复制/reshape 暂不可用；本轮不采用。",
+    "单次 fp32 PV（V 精确转 fp32、p 不分解）：精度最好且省一次 dot，但依赖 cube fp32 matmul 吞吐，未在本轮证据中确认，风险不可控。",
+    "保留 BN128 改 BM256：M 维增大受 UB 限制且 S=256 时程序数已无更多可减，收益不清。"
+  ],
+  "discriminating_observation": "若机制成立：新 IR 中 case4/7 的 scf.for 退化为单次（0..256 step 256）或循环可折叠，matmul 指令数 per program 由 6 降为 3，L0C_to_GM 由 384KiB 降到约 256KiB，aic_scalar_wait_id1 与 Task Duration 同向下降。若实际 UB 峰值超 196608B，则编译/lowering 直接报资源不足（这本身即为区分性负结果，按真实失败交接）。若编译通过但交接链未减少（如编译器仍把 256 拆成两个 128 子块并保留两次握手），则时间不降。",
+  "change": "仅改 run() 的分块 metadata：在 BLOCK_D<=128 分支中新增 dtype 元数据判据 is_bf16=query.dtype==torch.bfloat16；因果仍 BM64/BN64，非因果非 BF16（fp16 case2）仍 BM128/BN128，非因果 BF16（case4/7）取 BM128/BN256。kernel 计算 AST、两项概率分解 p_hi/p_lo 表达式与 acc 相加顺序、掩码判据全部不变。dtype 与 shape 均为合法元数据，不读输入值、不按 case_id 选路。",
+  "expected": "case4：KV 迭代 2→1，每 program matmul 6→3、L0C→GM 384→约256KiB、交接链减半，预计 full_call 由 472.46us 明显下降；case7 同为 BF16/SKV256，同向下降；case1（因果）与 case2（fp16）分块不变、预期时间基本不变。代价：BF16 非因果单 program 的 k/v/qk/p 缓冲按 BN 翻倍，存在 UB 峰值逼近/超出 196608B 的风险，由真实编译与 lowering 实测判定；程序数、总 K/V 搬运量不变。",
+  "validation": "1) preflight 编译；2) 原完整四项官方 checker（身份 12180ce7，阈值不变）验证 case1/2/4/7 精度；3) 四项真机 full_call 计时与当前 472.46045us 对比；4) 修改后重放 paired profiling 与实际 IR，核对 matmul 指令数、L0C→GM、aic_scalar_wait_id1 及 UB 峰值。",
+  "selected_layer": "host_side_tiling_metadata",
+  "layer_reason": "证据显示瓶颈是每 program 的跨核交接链数量而非算术/搬运吞吐；交接链数由 KV 迭代数决定，而迭代数是纯 metadata 分块量，可在 host 侧按合法 shape/dtype 元数据选择，无需改 kernel 计算体，改动面最小且数值结构可保持不变。",
+  "simulator_incremental_judgment": "本轮剩余歧义是：BN=256 单逻辑块的 UB 峰值是否超 196608B、以及切 wider N 后真实 matmul 指令数与交接链是否如预测减少。这些均可由本轮提供的成对 profiling、TTIR/BCMLIR 与真实编译/评测直接区分；宿主保留此前模拟器知识，当前无新的模拟器专属问题需要输入，故本轮不新增模拟器数据。修改后仍按要求做模拟器重放，与真机结果一并回归。",
+  "unknown": [
+    "BN=256 时 BF16 非因果路径的实际 UB 峰值（是否 <=196608B）",
+    "编译器是否把 128x256 QK/PV 保留为单次 handoff，或将 N 再切分为两个 128 子块"
+  ]
+}

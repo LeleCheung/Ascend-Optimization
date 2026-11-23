@@ -1,0 +1,215 @@
+{
+  "timestamp": "2026-11-21T17:54:24.078244+00:00",
+  "diagnosis": {
+    "source_sha256": "98c755709dd428d0955bfc11a666b679f5afdc412ecb441e1c094568a3805661",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "ir/target.hivm.mlir",
+        "category": "source_ir",
+        "role": "本次唯一可编辑 HIVM（清单登记的 _gqa_fwd_kernel_mix_aiv 特化）",
+        "finding": "第415-468行为归一化数据流：%56=0x180224（64x1 行和，reduce 输出），vrec_1d_float(%cast_41=0x180224 行和, %cast_42=0x114688 倒数, %cast_43=0 长哑 scratch) 在429行写出原始倒数；437行 vmul_1d_float(src0=0x180224, src1=0x114688, dst=0x180224)、444行 vmuls_vs_1d_float(-1.0)、451行 vadds_vs_1d_float(+2.0)、459行 vmul_1d_float(0x114688 x 0x180224 -> dst=0x114688) 构成一次 Newton 修正；460行 expand_shape(%66, 0x114688, 64xf32 -> 64x1) 供468行 vmul_2d_float 广播到 64x128 输出。Newton 的最终目的地址与原始 vrec 目的地址同为 0x114688。"
+      },
+      {
+        "path": "ir/target.hivm.mlir",
+        "category": "source_ir",
+        "role": "buffer 地址、别名与跨迭代生存期核对",
+        "finding": "0x114688 的 64xf32 区间 [114688,114944) 是 P 矩阵缓冲 [114688,180224) 的首段；P 在该段最后消费者为420行 enablevc_reduce_sum_ar_float（424行 pipe_barrier[PIPE_V] 之后 vrec 才开始写），bf16 副本已在391行写入 gm 供 Cube 使用。多播临时缓冲 %69=0x114944（512xf32 -> [114944,116992)）与原始倒数区间相邻且无重叠；广播输出 0x81920（64x128xf32 = [81920,114688)）同样止于 0x114688。0x180224 在 Newton 中被当作原地 scratch 覆写，说明其后无消费者。"
+      },
+      {
+        "path": "native-reciprocal-mechanism.json",
+        "category": "paired_profiling",
+        "role": "候选版实际机器指令与每调用归一化成本",
+        "finding": "veccore0/veccore1 上 VDIV 消失、VREC 出现（pc 0x10d11b88，15 calls，0.19us）；Newton 分解为两条 VMUL（0x10d11c6c 2.7us、0x10d11c68 1.46us）+ VMULS 0.21us + VADDS 0.20us + 两条小 VMUL 0.22us；归一化指令每调用累计约 0.346667us。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "paired_profiling",
+        "role": "向量核热点与时序口径",
+        "finding": "veccore0 source_neighborhood 邻域 282 条指令、累计指令时间 445.07us、其中等待 278.16us，largest 72.99us；BAR(PIPE:V) 15 calls/17.06us；veccore1 同构（445.68us，等待 278.71us）。等待主要来自 CUBE/FIXP 握手，累计时间为可重叠口径。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "同输入两侧设备 OpProf",
+        "finding": "候选 _gqa_fwd_kernel_mix_aic Task Duration 158.223160us、Block Dim 20/40；同输入参考 FusedInferAttentionScore 128.662567us；两侧同 spec_sha256，案例为 bf16 B4S256Nq64Nkv8D128 非因果。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "模拟器窗口绝对时钟资质与泳道覆盖",
+        "finding": "三核绝对时钟资质 verified（veccore0/1 各 31/31、cubecore0 22/22，median_ratio 约 1.0）；veccore1 VECTOR 活跃 0.3358、等待 0.1020、空闲 0.6642，706 个事件；窗口按 PC 记录 15 次调用。未报告泳道保持未知，空闲/等待比例仅形成假设。"
+      },
+      {
+        "path": "current-ir002-result.json",
+        "category": "paired_profiling",
+        "role": "当前 IR002 的正式与条件稳定性结果",
+        "finding": "原四项通过，target 155.79715us、kernel 158.22316us；条件交错 A 中位 155.83015、B 候选中位 155.1969us，两个候选区块未一致更快，收益未确认，保留 059（154.8871us）为比较锚点。"
+      },
+      {
+        "path": "compiled-readonly/vrec-before-decompose.mlir",
+        "category": "source_ir",
+        "role": "后端早期阶段与最终 HIVM 的对照",
+        "finding": "早期 CV 流水阶段为 %77=vrec(%collapsed) outs(%74) 后接 %78/%79/%81 三条 vmul Newton 与 %82 广播乘；最终 HIVM 将 vrec 落为原生调用并把 Newton 逐条保留为 vrec/vmul/vmuls/vadds 调用，说明本轮可利用的真实控制点位于 HIVM 调用序列。"
+      },
+      {
+        "path": "frozen.py",
+        "category": "source_ir",
+        "role": "被保持的数学语义（第498行附近）",
+        "finding": "out = acc / l_new[:, None]，其中 l_new = tl.sum(p, 1)、p = tl.exp(qk)、acc 为 PV 结果；冻结注释明确保留 FP32 分母求和与 FP32 逐元素除法，且域内 l_new 有限严格为正（下界约 1.25e-3，上界约 8.4e6），故 1/l_new 的倒数形式在合同值域内等价表达归一化。"
+      },
+      {
+        "path": "codex-brief.json",
+        "category": "paired_profiling",
+        "role": "Codex 的宿主证据分析与候选方向",
+        "finding": "Codex 归纳：原生 VREC 已确认、VDIV 消失；归一化每调用 0.404167->0.346667us 属可重叠指令成本；提出下一独立机制为去掉 Newton 直接用原生 FP32 VREC，维持 FP32 正有限分母与原 QK/PV 交接限制。"
+      }
+    ],
+    "hypothesis": "归一化中的 FP32 VREC 已由硬件单指令提供，随后的一次 Newton-Raphson（mul、mul(-1)、add(2)、mul 共四条 Vector 调用与三条 pipe_barrier）把硬件近似倒数修正到接近精确倒数。合同值域内 l_new 为有限正数、输出最终转 bf16（阈值 2^-10/2^-7），原始 VREC 的相对误差与 bf16 量化误差同量级或更小，因此可把广播归一化乘直接接到 vrec 在 0x114688 的原始输出，删除仅服务于 Newton 的四条向量调用及其后三条屏障，降低每轮 Vector 发射与同步开销，长度不变的 Cube 主链保持不变。",
+    "alternatives": [
+      {
+        "direction": "保留 Newton 但合并 2-s*r 的标量乘加",
+        "reason_not_selected": "现有 HIVM 已把 -1 乘与 +2 加拆为 VMULS/VADDS，两条标量指令各自带屏障；合并不改变调用数，收益更小。"
+      },
+      {
+        "direction": "在 Triton 源码层用 libdevice reciprocal/编译期标志改变除法重写",
+        "reason_not_selected": "本轮限定单算子 IR 层验证，源码保持逐字节冻结；源码表达方向记录为后续可替代路径。"
+      },
+      {
+        "direction": "只对 bf16 输出路径做精度降级、对 f16 案例保留 Newton",
+        "reason_not_selected": "属于输入相关选路，本轮禁止；固定原四项统一由 checker 判定。"
+      },
+      {
+        "direction": "进一步删除归一化广播、改为融合到 vcast/store 的逐元素乘",
+        "reason_not_selected": "属另一独立机制（布局/融合），留待单独调用与独立证据。"
+      }
+    ],
+    "change": "两处小范围编辑，均在 ir/target.hivm.mlir 的 _gqa_fwd_kernel_mix_aiv 内：(1) 删除437、444、451、459行的四条 Newton 调用及其对应的 pointer_cast/memref.cast（430-436、438-443、445-450、452-458行）以及439、446、453行三条 pipe_barrier[PIPE_V]；(2) 把460行 expand_shape 的操作数由 %66 改为 %58（同一 0x114688、同一 64xf32 形状，指向 vrec 原始输出）。保留424行 vrec 前的 pipe_barrier[PIPE_V]、431行 vrec 后的 pipe_barrier[PIPE_V]、429行 vrec 调用本身、463行广播前的 pipe_barrier[PIPE_V]，保留全部 FLAG/WAIT 配对、gm workspace 视图、Cube/FIXP 代码与函数签名。",
+    "expected": [
+      "指令：每轮删除 vmul_1d_float 两条（原437、459行）与 vmuls_vs_1d_float、vadds_vs_1d_float 各一条，共 4 条 Vector 调用；保留 vrec_1d_float、expand_shape、vmul_2d_float 各一条。",
+      "动态轮次：窗口内每 PC 调用次数维持 15（与当前 IR002 同覆盖），迭代次数、tile 划分和 Cube/FIXP 波次保持不变；Predict 动态 Vector 指令总数按每轮 4 条、15 轮/PC 递减约 60 条/core。",
+      "等待：删除的三条 pipe_barrier[PIPE_V] 与四条调用消除其内部指令依赖串行，预测 VECTOR 泳道活跃/等待占比小幅下降；WAIT_FLAG_DEVI（CUBE/FIXP 握手，约 105us 累计）预测基本不变，端到端关键路径由 Cube 主链主导。",
+      "资源与地址：无新 buffer、无地址变动；原始倒数仍驻 0x114688 [114688,114944)，与多播 scratch 0x114944 无重叠；0x180224 行和缓冲在 vrec 之后转为死值；跨迭代顺序由 V 管顺序执行与既有 FLAG 配对保证。",
+      "归一化成本：按 native-reciprocal-mechanism.json 的每调用 CSV 口径，归一化 Vector 累计约 0.346667us 降至约 0.29us 量级（再去掉 VREC 0.19us/15 中的 Newton 部分与屏障开销），对应 kernel 时间预测变化在 1% 以内、目标 case 可能在条件稳定性的可分辨幅度附近。",
+      "数值：原始 FP32 VREC 相对误差直接进入 out = acc * r，预测 case2/case7 官方 mere（当前 1.88e-4/1.59e-4，阈值 9.77e-4）增加与 VREC 相对误差同量级的份额；case4（阈值 7.8125e-3，当前 4.08e-4）余量更大。存在超阈失败风险，最终以原四项 checker 判定。"
+    ],
+    "validation": "步骤：(1) HIVM 可解析并独立续编译 success；(2) 原四项固定输入（seed 1733、既有 checker 阈值）逐项运行，记录官方 mere/mare/max_diff 与通过状态；(3) 条件交错 A（当前 IR002 二进制）与 B（本轮二进制）各两区块，核对是否两块一致更快；(4) 反汇编/模拟器核对：VDIV 仍缺、VREC 保留、Newton 的 VMUL/VMULS/VADDS 计数从 15 次/PC 降至 0，并核对 barrier 与 FLAG 配对数不变；(5) 与 059 的 154.8871us 独立比较锚点对齐。任一项与预测不符时记录偏差，不将文档预检当作收益结果。",
+    "layer_reason": "Triton 表达能力：源码层写 acc / l_new 表达精确除法，Triton-ASCEND 只能把它降到 VDIV 或 libdevice 倒数接口，无法直接指定“硬件 VREC 且跳过 Newton”的特定降级组合；源码改写会同时改变其他案例与语义身份。固定源码实验目的：本轮以逐字节冻结源码为不变量，隔离单一机器指令序列变化，便于把观测差异归因到归一化倒数实现。IR 控制点：最终 HIVM 中 vrec_1d_float、vmul_1d_float、vmuls_vs_1d_float、vadds_vs_1d_float 与广播 vmul_2d_float 均以显式调用呈现，目的/源地址可见，因此可在保持函数 ABI、Cube 代码与事件配对的前提下精确删除死 Newton 并重定向操作数。",
+    "simulator_incremental_judgment": "模拟器增量判断：三核绝对时钟资质 verified（veccore 31/31、cubecore 22/22），本轮沿用同一绝对时钟口径；窗口覆盖为每 PC 15 次调用，当前 IR002 与 059 的 12 次调用覆盖不同，动态总次数比较须按每调用 CSV 归一化后再乘 15；未报告泳道（如 idle 细分与 MTE3 明细）保持未知；VECTOR 活跃 0.3358、等待 0.1020、空闲 0.6642 说明向量核存在大量非生产时间，删除 Newton 只能减少向量发射与相邻屏障的串行段，预测增量小于 Cube/FIXP 主导的等待量，需以独立正式测量确认。",
+    "unknown": [
+      "硬件 FP32 VREC 的实际相对误差上限（安装头文件只给出 vrec 原语，无精度规格）",
+      "原始倒数在 bf16 输出量化下的误差是否仍在原四项 checker 阈值内",
+      "删除 Newton 后 Vector 屏障减少是否引入任何后端插入的隐式同步差异",
+      "条件稳定性协议对该量级（<1%）收益的检出能力"
+    ]
+  },
+  "diagnosis_sha256": "d32366b9b5c9c448979c970e7a38e68736e5f31bdefca0fe4eab6beb70a53468",
+  "evidence": [
+    {
+      "path": "ir/target.hivm.mlir",
+      "category": "source_ir",
+      "role": "本次唯一可编辑 HIVM（清单登记的 _gqa_fwd_kernel_mix_aiv 特化）",
+      "finding": "第415-468行为归一化数据流：%56=0x180224（64x1 行和，reduce 输出），vrec_1d_float(%cast_41=0x180224 行和, %cast_42=0x114688 倒数, %cast_43=0 长哑 scratch) 在429行写出原始倒数；437行 vmul_1d_float(src0=0x180224, src1=0x114688, dst=0x180224)、444行 vmuls_vs_1d_float(-1.0)、451行 vadds_vs_1d_float(+2.0)、459行 vmul_1d_float(0x114688 x 0x180224 -> dst=0x114688) 构成一次 Newton 修正；460行 expand_shape(%66, 0x114688, 64xf32 -> 64x1) 供468行 vmul_2d_float 广播到 64x128 输出。Newton 的最终目的地址与原始 vrec 目的地址同为 0x114688。",
+      "sha256": "18027f92e83fb676083bd2d126db4bf9f698c087869d484441bc414b22f37cd7"
+    },
+    {
+      "path": "ir/target.hivm.mlir",
+      "category": "source_ir",
+      "role": "buffer 地址、别名与跨迭代生存期核对",
+      "finding": "0x114688 的 64xf32 区间 [114688,114944) 是 P 矩阵缓冲 [114688,180224) 的首段；P 在该段最后消费者为420行 enablevc_reduce_sum_ar_float（424行 pipe_barrier[PIPE_V] 之后 vrec 才开始写），bf16 副本已在391行写入 gm 供 Cube 使用。多播临时缓冲 %69=0x114944（512xf32 -> [114944,116992)）与原始倒数区间相邻且无重叠；广播输出 0x81920（64x128xf32 = [81920,114688)）同样止于 0x114688。0x180224 在 Newton 中被当作原地 scratch 覆写，说明其后无消费者。",
+      "sha256": "18027f92e83fb676083bd2d126db4bf9f698c087869d484441bc414b22f37cd7"
+    },
+    {
+      "path": "native-reciprocal-mechanism.json",
+      "category": "paired_profiling",
+      "role": "候选版实际机器指令与每调用归一化成本",
+      "finding": "veccore0/veccore1 上 VDIV 消失、VREC 出现（pc 0x10d11b88，15 calls，0.19us）；Newton 分解为两条 VMUL（0x10d11c6c 2.7us、0x10d11c68 1.46us）+ VMULS 0.21us + VADDS 0.20us + 两条小 VMUL 0.22us；归一化指令每调用累计约 0.346667us。",
+      "sha256": "35d6caea8fe956e96f217737ebf30d9c810ae65cbac815811981bb2fe0af5d45"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "paired_profiling",
+      "role": "向量核热点与时序口径",
+      "finding": "veccore0 source_neighborhood 邻域 282 条指令、累计指令时间 445.07us、其中等待 278.16us，largest 72.99us；BAR(PIPE:V) 15 calls/17.06us；veccore1 同构（445.68us，等待 278.71us）。等待主要来自 CUBE/FIXP 握手，累计时间为可重叠口径。",
+      "sha256": "deafa3e79eeccc4f32d7950267341741e1830d5a78f1b3d578657e804ca00f37"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "同输入两侧设备 OpProf",
+      "finding": "候选 _gqa_fwd_kernel_mix_aic Task Duration 158.223160us、Block Dim 20/40；同输入参考 FusedInferAttentionScore 128.662567us；两侧同 spec_sha256，案例为 bf16 B4S256Nq64Nkv8D128 非因果。",
+      "sha256": "bb8a58b03cd05d66ebcfdbfcab763315b21632a3ef3e9f6903a52b7bcbe30330"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "模拟器窗口绝对时钟资质与泳道覆盖",
+      "finding": "三核绝对时钟资质 verified（veccore0/1 各 31/31、cubecore0 22/22，median_ratio 约 1.0）；veccore1 VECTOR 活跃 0.3358、等待 0.1020、空闲 0.6642，706 个事件；窗口按 PC 记录 15 次调用。未报告泳道保持未知，空闲/等待比例仅形成假设。",
+      "sha256": "6b4bd5868b436a17ba53311ab25d56ecaea9768dea66bfa7a86729b3e37c2351"
+    },
+    {
+      "path": "current-ir002-result.json",
+      "category": "paired_profiling",
+      "role": "当前 IR002 的正式与条件稳定性结果",
+      "finding": "原四项通过，target 155.79715us、kernel 158.22316us；条件交错 A 中位 155.83015、B 候选中位 155.1969us，两个候选区块未一致更快，收益未确认，保留 059（154.8871us）为比较锚点。",
+      "sha256": "8d4fa3ac17cf6bc9244b721a448f7084e6b9927bcfc9b2d47bf713e959835126"
+    },
+    {
+      "path": "compiled-readonly/vrec-before-decompose.mlir",
+      "category": "source_ir",
+      "role": "后端早期阶段与最终 HIVM 的对照",
+      "finding": "早期 CV 流水阶段为 %77=vrec(%collapsed) outs(%74) 后接 %78/%79/%81 三条 vmul Newton 与 %82 广播乘；最终 HIVM 将 vrec 落为原生调用并把 Newton 逐条保留为 vrec/vmul/vmuls/vadds 调用，说明本轮可利用的真实控制点位于 HIVM 调用序列。",
+      "sha256": "16d49722976560a319829f0a23fb0ca8d98fc7c5631c0990e641a70a4e0ff866"
+    },
+    {
+      "path": "frozen.py",
+      "category": "source_ir",
+      "role": "被保持的数学语义（第498行附近）",
+      "finding": "out = acc / l_new[:, None]，其中 l_new = tl.sum(p, 1)、p = tl.exp(qk)、acc 为 PV 结果；冻结注释明确保留 FP32 分母求和与 FP32 逐元素除法，且域内 l_new 有限严格为正（下界约 1.25e-3，上界约 8.4e6），故 1/l_new 的倒数形式在合同值域内等价表达归一化。",
+      "sha256": "98c755709dd428d0955bfc11a666b679f5afdc412ecb441e1c094568a3805661"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "paired_profiling",
+      "role": "Codex 的宿主证据分析与候选方向",
+      "finding": "Codex 归纳：原生 VREC 已确认、VDIV 消失；归一化每调用 0.404167->0.346667us 属可重叠指令成本；提出下一独立机制为去掉 Newton 直接用原生 FP32 VREC，维持 FP32 正有限分母与原 QK/PV 交接限制。",
+      "sha256": "4d770b2f3a0f83d61014da42bd28748732ce33fc339f79840c8f53eb31d91da5"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "98c755709dd428d0955bfc11a666b679f5afdc412ecb441e1c094568a3805661",
+    "contract.json": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858",
+    "ir-inventory.json": "2cb16f5c4d4087e47e5ba666c319e99a6da2d825349c789636a77729c88c5053",
+    "feedback.json": "856de0e06a136fa05cc105a036a497991664cf896e07feed466ba2cb65df24f6",
+    "profiling.json": "bb8a58b03cd05d66ebcfdbfcab763315b21632a3ef3e9f6903a52b7bcbe30330",
+    "hotspots.json": "deafa3e79eeccc4f32d7950267341741e1830d5a78f1b3d578657e804ca00f37",
+    "timeline.json": "6b4bd5868b436a17ba53311ab25d56ecaea9768dea66bfa7a86729b3e37c2351",
+    "installed-reciprocal-evidence.txt": "86370a5c6ff93e03b7b04a6e15de4a927a6922ec8322dc0f972502524b6bcf10",
+    "context.json": "0bbbcea0e08a1b57d0e50de92bc681c8c2540aa0d16eeaff60eb957381f56861",
+    "diagnosis.json": "68bbecd4d6ef8c386519dba4293940fde96547446100e8dd1cf436747b32122c",
+    "codex-brief.json": "4d770b2f3a0f83d61014da42bd28748732ce33fc339f79840c8f53eb31d91da5",
+    "division-instructions.json": "c10796fd6653b72765e9617d878c1e8a157675cd3eb98b933a440a7566b888c8",
+    "prior-scheduling-result.json": "4cb91763b1230ed3c80e5f9ee9091daa958e32f1838960aa56eaedb7c70f39c8",
+    "native-lowering-review.json": "cfdea4a0051c689a70287d4d3597096bb94c29c231261d6be064e0aaf631008f",
+    "original-resume-result.json": "dc0750b8c071b3f952f9005e0ab7f324177e06a05b4992b7cf1706f44e3f15f7",
+    "native-reciprocal-mechanism.json": "35d6caea8fe956e96f217737ebf30d9c810ae65cbac815811981bb2fe0af5d45",
+    "current-ir002-result.json": "8d4fa3ac17cf6bc9244b721a448f7084e6b9927bcfc9b2d47bf713e959835126",
+    "current-ir002-compile.json": "c10ccfb4d7282d72f6f7f84eeccf11d9a2b6cc2d5b43edc8050cc5421edd111c",
+    "ir/target.hivm.mlir": "18027f92e83fb676083bd2d126db4bf9f698c087869d484441bc414b22f37cd7",
+    "ir/target/_gqa_fwd_kernel.bcmlir": "ae1194bbd06db270cb07da7fda7e26054873e007d80305c2f504dc0b4a127ce4",
+    "compiled-readonly/_gqa_fwd_kernel.ttir": "47d7d4032bee5f8b02650f7930329db8e3fe7535d9bc118d1c006cef2be116d9",
+    "compiled-readonly/_gqa_fwd_kernel.ttadapter": "7baa69025a03de424599dfef862da8caba4c1bc6ce472e86a2c25d9f15551e3f",
+    "compiled-readonly/_gqa_fwd_kernel.bcmlir": "810ba7cfb69fa55572bb2b331f3cb65c6bf8c4cbffba735601930c0ee8f652b8",
+    "compiled-readonly/current-cvpipelining.mlir": "33a2d3df731e612cc0e55c66d280b19ab6d7d86dc5df078bf4201792fb2396ac",
+    "compiled-readonly/vrec-before-decompose.mlir": "16d49722976560a319829f0a23fb0ca8d98fc7c5631c0990e641a70a4e0ff866",
+    "compiled-readonly/vrec-after-decompose.mlir": "2a07aa85972f23cb13dd0ee70e2e80b19f8d15b43948a60977c7829d63490db9",
+    "public-source/EltWise1D.cpp": "adeefa4bb642711ecc76df257f8217fd91398e52453426e4f8736c5a973fa773",
+    "public-source/EltWise2D.cpp": "84f63673a9662d96e0ecd6f8dd78467dfe5e6e1daa529e50163d1d9ae74a312e",
+    "public-source/hivm-op-decompose.mlir": "104b8f583e8a163892c2ce0ad9785237eb7ba43eb201feedd5ef2fd6f11c951a",
+    "public-source/HIVMDecomposeOp.cpp": "2fd26ffb92eb0fc6c8dfd6e424b5874be32582773b28063cb49adec68dc9bbb0",
+    "public-source/HIVMToStandard.cpp": "8c8654126e129d88cc0d73c8c28f9886bade5f67ce1619e9d3cc2a9038fd4d60",
+    "public-source/sources.json": "3433abc1a23aedb7494cd225ea96a45b5b0708dad5b55232402b2e92d09f7d6e",
+    "public-source/tree-query.json": "27bab0976fa7ab2ae66ac9914488cba4bb4f22c8efbe6618f8a7e8d0e6bfdb6d"
+  },
+  "decision_tool_sha256": "2ba55ebab8be5b8a2363da657d6ee81799d4cabcdfb8e1494846aecfd1fde624"
+}

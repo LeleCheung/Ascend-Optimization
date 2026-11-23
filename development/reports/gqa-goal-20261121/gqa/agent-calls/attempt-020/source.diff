@@ -1,0 +1,162 @@
+--- 
++++ 
+@@ -72,6 +72,35 @@
+ dot operand pair are larger than the previous 128/128 tiling, so the compile may
+ hit the UB/L0C budget; the causal path keeps 64/64 and is untouched.
+ 
++Two-dimensional row packing on the retained persistent path (this round's
++mechanism): the persistent body already gives one program per (batch, shared KV
++head) with 32 programs, single-block K/V and one handoff chain per tile, so what
++is left inside a tile is the Q load and the output store pattern.  The actual
++TTIR shows both as single 128x128 block transfers with a row multiplier of 8192
++elements and unit column stride, i.e. 128 segments of 256B at 16KB row distance
++per tile, and the simulator windows of case4 put the largest non-wait cost on
++those copies (veccore MTE3 UB->OUT B16, 16 calls, 37.11/37.15us, plus a second
++15.58/14.96us group; Cube idle 66.3%, VEC idle 59.8%).  Because the G query
++heads sharing one KV head are adjacent in BSND and their 128 channels are
++contiguous, one tile can instead cover SL = BLOCK_M/G sequence positions times
++those G heads and the Q tile becomes a pure 2D [SL, G*128] block whose rows are
++G*128 consecutive elements: the tile's segment count drops from BLOCK_M to SL
++(8x fewer for case4/case7) at unchanged bytes.  An ordered (row-major) reshape
++to [BLOCK_M, BLOCK_D] feeds the unchanged QK / fp32 softmax / single fp16 PV, and
++the output takes the inverse reshape and the same 2D store layout.  Row r of the
++reshaped tile is (sequence sl = r // G, head gi = r % G), so every output row is
++the same (b, s, hq, :) row as before and accumulates the same KV products in the
++same order; only the tile's row order and thus the DMA segmentation changes.
++This is a distinct lowering from the failed 3D [SL, G, D] attempt: no 3D tensor,
++no join/transpose and no scratch buffer -- one 2D load, one reshape in, one
++reshape out.  The predicate is metadata-only (persistent path, actual D == 128,
++G a power of two dividing 128, S divisible by SL and by BLOCK_M, and sd == 1 /
++sh == BLOCK_D for Q and Out), so the causal case1, the G=12 case2 and the
++generic fallback keep their code paths verbatim.  Risks kept open: the reshape
++may lower to a real layout conversion (an extra UB tile, near the 196608B
++budget) or be rejected by the backend; the official four-case checker and the
++post-change IR decide.
++
+ Compile-time geometry specialisation (earlier, retained mechanism): shape, stride,
+ head counts, scale and the causal offset are passed as tl.constexpr, because
+ they are legal input *metadata*, never input values.  The actual TTIR showed
+@@ -110,6 +139,7 @@
+     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr,
+     MASK_MD: tl.constexpr, MASK_KV: tl.constexpr,
+     NB_M: tl.constexpr,
++    Q_PACK2D: tl.constexpr, SL: tl.constexpr, QC: tl.constexpr,
+ ):
+     """每 (batch, 共享 KV 头) 一程序的持久化复用体。
+ 
+@@ -118,6 +148,11 @@
+     全部 query tile。逐 tile 的 QK、FP32 softmax、单次 fp16 PV 与归一化写出
+     表达式与通用路径逐字一致，只有 K/V 的载入与转换从每 tile 一次降为每程序一次。
+     hq = kvh*G + gi 与行块 mb 是本程序的显式坐标，对 (b,hq,row-block) 的写出所有权唯一。
++
++    Q_PACK2D 时（本轮机制，判据全部来自元数据，见 run()）改为二维行打包：
++    一个 tile 是 SL 个序列位置 × G 个共享 query 头，Q 与输出按 [SL, G*BLOCK_D]
++    的纯二维块搬入/搬出，再用行主序 reshape 与原 [BLOCK_M, BLOCK_D] 算术衔接。
++    原逐 tile 遍历在打包分支之后逐字保留，供未命中判据的形状使用。
+     """
+     pid = tl.program_id(0)
+     b = pid // NKV
+@@ -144,6 +179,54 @@
+     else:
+         v = tl.load(v_ptrs)
+     v16 = v.to(tl.float16)
++
++    # ---- 本轮机制：二维行打包（Q_PACK2D，仅在持久路径内） ----
++    # 同一序列位置下，共享 KV 头 kvh 拥有的 G 个 query 头在 BSND 中相邻，
++    # 头内 D 个通道连续，故列下标 c = gi*BLOCK_D + d 在内存中逐元素连续
++    # （判据含 q_sh==o_sh==BLOCK_D、q_sd==o_sd==1，见 run()）。因此一个 tile
++    # 取 SL=BLOCK_M/G 个序列位置 × G 个共享头，Q 可作一块 [SL, G*BLOCK_D]
++    # 纯二维搬运：每行 G*BLOCK_D 个连续元素，行间仍用 q_ss 跨步，不打散成
++    # BLOCK_M 段。之后按行主序 reshape 成 [BLOCK_M, BLOCK_D]（行号
++    # r = sl*G + gi）交给逐字未改的 QK、FP32 softmax、单次 fp16 PV 与归一化；
++    # 输出做同一 reshape 的逆变换，用同样的二维布局写出。段数由每 tile 的
++    # BLOCK_M 段（每段 BLOCK_D 个元素）降为 SL 段（每段 G*BLOCK_D 个元素），
++    # 搬运字节数、matmul 次数、L0C 搬出与程序数均不变。
++    # t 遍历 G*NB_M = S/SL 个 tile：seq_base=t*SL，头组固定为 kvh*G，
++    # 合起来恰好覆盖本程序全部 (s, hq) 一次，写出所有权唯一。
++    # 判据已含 SKV%BLOCK_N==0、D==BLOCK_D、S%BLOCK_M==0，故 MASK_KV/MASK_MD
++    # 恒假：原循环里两处可证恒真的掩码分支在这里不出现，载入/写出的取值不变。
++    if Q_PACK2D:
++        offs_c = tl.arange(0, QC)
++        offs_sl = tl.arange(0, SL)
++        q_head = (kvh * G) * q_sh   # 头组 gi=0 的通道起点（头间连续）
++        o_head = (kvh * G) * o_sh
++        for t in range(0, G * NB_M):
++            seq0 = t * SL
++            q2_ptrs = (Q + b * q_sb + q_head
++                       + (seq0 + offs_sl)[:, None] * q_ss
++                       + offs_c[None, :])
++            q2 = tl.load(q2_ptrs)
++            q = tl.reshape(q2, (BLOCK_M, BLOCK_D))
++
++            qk = tl.dot(q, tl.trans(k)) * qk_scale
++
++            m_safe = tl.max(qk, 1)
++            m_safe = tl.where(m_safe > -float("inf"), m_safe, 0.0)
++            p = tl.exp2(qk - m_safe[:, None])
++            l_new = tl.sum(p, 1)
++
++            acc = tl.dot(p.to(tl.float16), v16)
++
++            l_safe = tl.where(l_new > 0.0, l_new, 1.0)
++            out = acc / l_safe[:, None]
++            out = tl.where(l_new[:, None] > 0.0, out, 0.0)
++
++            o2 = tl.reshape(out.to(Out.dtype.element_ty), (SL, QC))
++            o2_ptrs = (Out + b * o_sb + o_head
++                       + (seq0 + offs_sl)[:, None] * o_ss
++                       + offs_c[None, :])
++            tl.store(o2_ptrs, o2)
++        return
+ 
+     # 扁平遍历 G*NB_M 个 query tile；显式坐标保证每个 (hq, mb) 只写一次。
+     for t in range(0, G * NB_M):
+@@ -203,6 +286,7 @@
+     SINGLE_KV: tl.constexpr,
+     PERSIST_KV: tl.constexpr,
+     NB_M: tl.constexpr,
++    Q_PACK2D: tl.constexpr, SL: tl.constexpr, QC: tl.constexpr,
+ ):
+     # 本轮机制：每 (batch, 共享 KV 头) 一程序的持久复用分支。仅在
+     # BF16 非因果 SINGLE_KV D128 的原 128/256 分块下启用（见 run()），
+@@ -220,6 +304,7 @@
+             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+             MASK_MD=MASK_MD, MASK_KV=MASK_KV,
+             NB_M=NB_M,
++            Q_PACK2D=Q_PACK2D, SL=SL, QC=QC,
+         )
+         return
+ 
+@@ -473,6 +558,24 @@
+         grid = (B * NKV,)
+     else:
+         grid = (triton.cdiv(S, BLOCK_M), B * NQ)
++
++    # 二维行打包判据（本轮机制）：只在持久路径内、且下列条件全部为元数据性质时
++    # 启用——非因果持久分支已在 PERSIST_KV 内；实际 D==128（BLOCK_D 只是补齐宽度）；
++    # G 为 2 的幂且整除 BLOCK_M，使 SL=BLOCK_M/G 既整除 S、又能铺满 tile；
++    # Q/Out 的头-通道连续（sd==1、sh==BLOCK_D），使 gi*BLOCK_D+d 成为连续列偏移。
++    # S % BLOCK_M == 0 保证 tile 数与 G*NB_M 相等（S/SL）且无行掩码；
++    # 不读任何输入值、不按 case_id 选路。未命中时走下面逐字保留的原持久/通用路径。
++    Q_PACK2D = False
++    SL = 1
++    QC = BLOCK_D
++    if (PERSIST_KV and D == 128 and BLOCK_D == 128 and G >= 1
++            and (G & (G - 1)) == 0 and G <= 128 and (128 % G) == 0):
++        if S % (128 // G) == 0 and S % BLOCK_M == 0:
++            if (query.stride(3) == 1 and query.stride(2) == BLOCK_D
++                    and y.stride(3) == 1 and y.stride(2) == BLOCK_D):
++                Q_PACK2D = True
++                SL = 128 // G
++                QC = G * BLOCK_D
+     _gqa_fwd_kernel[grid](
+         query, key, value, y,
+         query.stride(0), query.stride(1), query.stride(2), query.stride(3),
+@@ -488,6 +591,7 @@
+         SINGLE_KV=SINGLE_KV,
+         PERSIST_KV=PERSIST_KV,
+         NB_M=NB_M,
++        Q_PACK2D=Q_PACK2D, SL=SL, QC=QC,
+         num_warps=1, num_stages=1,
+     )
+     return y

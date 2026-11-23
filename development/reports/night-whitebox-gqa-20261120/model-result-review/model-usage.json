@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 59,
+    "duration_ms": 98963,
+    "usage": {
+      "input_tokens": 71345,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1170944,
+      "output_tokens": 16897,
+      "output_tokens_details": {
+        "thinking_tokens": 10187
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 71345,
+        "outputTokens": 16897,
+        "cacheReadInputTokens": 1170944,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.364622,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 10187,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.364622,
+    "result": "已用 Read 完整读取 `complete-results.json`（8291 行）；仅只读，未编辑任何候选、诊断或调度文件，未生成/修改目标实现，未引入新测试、ABBA 或搜索预算。以下为回传确认。\n\n## 1. 两项已验收 IR 目标 shape\n\n- **GroupNorm**（固定 FP32 [8,64,64,64]，groups=8）\n  - 原 IR：24.812 μs → 改后：23.734 μs，目标 shape 耗时 −4.34%（1.0313×）；27/27 通过。\n  - 全合同候选耗时几何平均：ratio 1.000854，即**下降约 0.085%**；其余 27 个正式 AST 二进制一致。\n- **回填 / value_selecting**（固定 FP32 output [8192,8192]，dim=1）\n  - 原 IR：187.771 μs → 改后：183.792 μs，目标 shape 耗时 −2.12%（5.8942×）；96/96 通过。\n  - 全合同候选耗时几何平均：ratio 0.997451，即**上升约 0.26%**（负向，已单独保留）。\n\n## 2. 回填 ir-003 相对已保留 ir-002 的负结果\n\n- ir-002（已保留）：target timing-14 = **183.792 μs**，speedup 5.8942×。\n- ir-003：同一 target timing-14 = **184.797 μs**，speedup 5.8636×。\n- 即目标 shape **慢 1.005 μs，约 +0.55%**；虽然 ir-003 的 96 项整体 geo_mean 为 3.2886（ir-002 为 3.2280），但按“固定目标 shape”判据不采纳，保留 ir-002。\n\n## 3. GQA 修复版（repaired_candidate）\n\n四项官方 checker 均 `passed: true`，补充 allclose 均 true；各 case 真实 full-call 耗时与 checker 差异：\n\n- **case1**（causal，float16）：**179.097 μs**；官方 checker 通过，mismatch 2/1,048,576。\n- **case2**（非因果，float16）：**181.334 μs**；通过，mismatch 5/1,572,864。\n- **case4**（非因果，bfloat16）：**784.638 μs**；通过，mismatch 125/8,388,608。\n- **case7**（非因果，bfloat16）：**176.232 μs**；通过，mismatch 11/1,048,576。\n\n注意：candidate 级 `official_formula_pass` 为 false，但**官方 checker 四项全部通过**，属阈值内差异。\n\n**case4 相对原保留版改善**：原保留版 1378.750 μs → 修复版 784.638 μs，**降低 594.112 μs（−43.09%，约 1.757×）**。\n\n**机制**：case1 为因果场景，资源修复后**恢复因果分块**，从而消除原始失败版的编译 UB 溢出；case2/4/7 三个非因果场景沿用**更宽 KV 分块**。原始失败版 case4 已变快（791.857 μs），但 **case1 因 UB 溢出编译失败**（requires 1,851,904 bits > 1,572,864 bits）；修复版四 case 完整通过。\n\n## 4. 证据范围（不外推官方全 20 项）\n\n- **物理 UB 估计**：失败版 case1 的 1,851,904 bits vs 1,572,864 bits 是**编译期静态估计**（超约 279,040 bits，≈34.9 KiB，约 1.18×）；GroupNorm 记录亦明确“物理 UB 峰值与 spill 未独立量化”，不能当作实测峰值。\n- **部分窗口证据**：GroupNorm 模拟器为部分窗口，时钟核验 verified、改后 41/44 PC 匹配（3 个局部差异保留）、原版 21/21，两窗口分别归一化，application 未完成；回填为改后 10/12 PC 匹配、改前 26/29，application 未完成。均属窗口级重放证据。\n- **GQA 后模拟器仍在采集**：`current_postcapture_status = collecting_simulator`，parent_cases_passed=4；**机制兑现按后续重放决定**。GQA 范围亦明确为“explicit official case subset”，不代表完整 CANNBench 验收或排行榜全 20 项。\n\n## 建议（单列）\n\n建议后续研究把“按 `is_causal` 选择因果分块 / 非因果宽 KV 分块”的分块策略做成带 **UB 预算静态校验**（以 1,572,864 bits 为上限）的机制，并在 GQA 模拟器完整窗口重放后再判定机制兑现——仅作研究建议，不在本轮改动实现。"
+  }
+}

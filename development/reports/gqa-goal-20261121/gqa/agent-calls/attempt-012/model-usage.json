@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 26,
+    "duration_ms": 56945,
+    "usage": {
+      "input_tokens": 32803,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 411776,
+      "output_tokens": 8902,
+      "output_tokens_details": {
+        "thinking_tokens": 3025
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 32803,
+        "outputTokens": 8902,
+        "cacheReadInputTokens": 411776,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 0.5924529999999999,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 3025,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 0.5924529999999999,
+    "result": "Preflight returned `awaiting_source_review` with new source SHA; bytes are now frozen for host review.\n\n## 本轮机制与交接\n\n**父版本身份**：`source_sha256=762464829451...`（attempt-011，目标 case4 784.47310μs，保留最佳 006=328.44680μs）。\n\n**证据驱动的诊断**（已读实际 IR）：\n- `actual-ir/5-_gqa_v_cast_f16_kernel.ttir`：源地址含 `arith.divsi/arith.remsi %cst(=128)`（`(offs_c//D)*v_sh+(offs_c%D)*v_sd`），对 `offs_c` **非仿射**。\n- `actual-ir/3-_gqa_v_cast_f16_kernel.bcmlir`：读端降成两层 `scf.for`（16×1024）内的 `memref<1xbf16>` **逐元素标量 load**（每 program 16K 次，全调用约 1.05M 次），而写端已是整块 `materialize_in_destination` 连续写。\n- `current-profiling.json`：主算子 `_gqa_fwd_kernel` 仅 317.886μs，与整调用 784.47μs 之间约 **466μs 落在主 kernel 之外**，与预处理标量化一致。\n\n**改动（仅 candidate.py）**：\n1. 新增纯 Triton `_gqa_v_cast_f16_flat_kernel`：一维线性 `offs=pid*BLOCK+arange`、仅 N 边界 mask、逐元素 `bf16→f32→f16` 连续 load/store，offs 唯一所有权。\n2. `run()` 中当 `PV_SINGLE_F16 && SINGLE_KV` 且 `value.is_contiguous()` 时走 flat 快路径；非连续输入**保留原二维 strided kernel 回退**。选路只依据连续性元数据，不读输入值、不看 case_id。\n\n**保持不变的边界**：scratch 形状/内容与逐元素位型、主 attention AST、M/N、dtype 路径、launch 选项、公共入口 `run`、checker/golden/dtype/计时合同。\n\n**数值风险**：每个 V 元素仍经相同两次舍入（bf16→f32→f16），与父版本位型一致；`|v|≥2^-14` 精确、更小落 fp16 次正规、`|v|>65504` 溢出（超出 [-1,1] 合同域，记录为范围限制）。由原完整四项 checker 验收，阈值不变。\n\n**诊断已登记**：`decision_id=1dd7bb112fbe4f4390346a1764e47728`。\n\n**验证与下一步**：`preflight` 通过语法/合规预检并返回 `awaiting_source_review`（SHA `54938a18...`）。现保持字节不变，交宿主做只读路径/地址边界审查，再完成**完整四项真机 checker + 整调用计时**（目标 case4 < 328.44680μs，case1/2/7 真实变化同时记录），随后对新 IR 做模拟器重放，核对读端是否已连续块化以判别本假设。"
+  }
+}

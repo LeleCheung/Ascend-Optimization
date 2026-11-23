@@ -1,0 +1,59 @@
+--- 
++++ 
+@@ -14,7 +14,11 @@
+ K/V head hq // G directly.
+ 
+ Query-row reuse (retained, non-causal only): BLOCK_M stays 64 for
+-the causal path and rises to 128 otherwise, so a program keeps the loaded K/V
++the causal path and rises to 128 otherwise (an independent resource experiment
++further raises it to 256 only for the BF16 non-causal, SKV 256-multiple,
++S 256-multiple geometry, keeping the kernel AST and the early V conversion
++unchanged; whether the compiler accepts that M tile is measured, not assumed),
++so a program keeps the loaded K/V
+ tiles for 128 query rows instead of 64.  The paired profiling of case4 showed
+ 1.09us of aic_cube_time against 9.15us of aic_scalar_wait_id1 per program over
+ 1024 programs of 64x128 tiles, and the simulator windows put Cube at 7.90%
+@@ -351,6 +355,12 @@
+     # 重缩放 -> 一次 k=256 归约），不再有中间 fp32 重缩放；每行仍按同一 j 顺序
+     # 累加同一组乘积，是否仍在阈值内由原四项 checker 判定。BF16 单次 fp16 PV
+     # 把概率精度由 2^-18 降到 2^-11（近似，非等价），适用输入域见文件头说明。
++    # PV 计算类型选路：只用 V 的 dtype 元数据（合法元数据，不读输入值、不看
++    # case_id）。BF16 输入走单次 fp16 PV（已验收机制），其余 dtype 保持两项分解。
++    # 提前到分块选择之前，因为本轮的 BM256 资源实验只允许在 BF16 非因果几何上
++    # 触发；判定本身与父版本逐字相同。
++    pv_single_f16 = value.dtype == torch.bfloat16
++
+     BLOCK_D = max(16, triton.next_power_of_2(D))
+     if BLOCK_D <= 128:
+         # 保留机制：非因果沿 query 行方向由 64 提到 128。
+@@ -379,6 +389,17 @@
+             # softmax/p·v 转换 → PV dot 搬出），并删掉整段 online 重缩放。
+             # 其余形状（SKV=128 的 case2 等）仍取 128 的通用分块。
+             BLOCK_N = 256 if (SKV >= 256 and SKV % 256 == 0) else 128
++            # 本轮宿主指定的独立资源实验：仅把 BF16 非因果、SKV 为 256 整数倍
++            # 且 S 能被 256 整除的几何（即 008 测过的 BM256/BN256 组合）的
++            # query 行分块由 128 提到 256；kernel AST、算术、早置 V 组织、精度
++            # 与回退元数据全部保持父版本。收益若成立来自 program/交接链数再减半
++            # （case4 512->256），代价是 q/qk/p/acc 与预取 V tile 的峰值缓冲按 M
++            # 翻倍，008 在同一组合下实测 UB 230912B>196608B、CC 262144B>131072B；
++            # 009 的早置 V 是否改变实际 UB 分配，只能由修改后的编译诊断判定。
++            # 判据只用 shape/dtype/causal 元数据；S 的整除条件表示加大后的 M
++            # tile 必须整块覆盖行，不产生半块行浪费，不按 case_id 或数值选路。
++            if pv_single_f16 and BLOCK_N == 256 and S % 256 == 0:
++                BLOCK_M = 256
+     elif BLOCK_D <= 256:
+         BLOCK_M, BLOCK_N = 32, 32
+     else:
+@@ -390,10 +411,8 @@
+     MASK_MD = not ((S % BLOCK_M == 0) and (D == BLOCK_D))
+     MASK_KV = not ((SKV % BLOCK_N == 0) and (D == BLOCK_D))
+ 
+-    # PV 计算类型选路：只用 V 的 dtype 元数据（合法元数据，不读输入值、不看
+-    # case_id）。BF16 输入走单次 fp16 PV（本轮机制，见内核注释与文件头），
+-    # 其余 dtype 保持两项分解。设备内没有按数值分支。
+-    PV_SINGLE_F16 = value.dtype == torch.bfloat16
++    # PV 计算类型选路沿用上面提前算出的 pv_single_f16（同一 dtype 元数据判定）。
++    PV_SINGLE_F16 = pv_single_f16
+ 
+     # 单块 KV 判据：整段 KV 恰好落在一个 BLOCK_N 块内且非因果（因果仍需按
+     # hi 提前收束）。满足时循环只有一轮，内核走无 online 重缩放的路径；对

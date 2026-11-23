@@ -1,0 +1,79 @@
+--- 
++++ 
+@@ -164,6 +164,68 @@
+     %n_num_steps_w0 = arith.addi %spatial_dim, %c255_i32 : i32
+     %n_num_steps_w = arith.divsi %n_num_steps_w0, %c256_i32 : i32
+     %tile_lane_w = tt.make_range {end = 256 : i32, start = 0 : i32} : tensor<256xi32>
++    %c511_i32 = arith.constant 511 : i32
++    %c512_i32 = arith.constant 512 : i32
++    %spatial_rem_x = arith.remsi %spatial_dim, %c512_i32 : i32
++    %spatial_wide_x = arith.cmpi eq, %spatial_rem_x, %c0_i32 : i32
++    %n_num_steps_x0 = arith.addi %spatial_dim, %c511_i32 : i32
++    %n_num_steps_x = arith.divsi %n_num_steps_x0, %c512_i32 : i32
++    %tile_lane_x = tt.make_range {end = 512 : i32, start = 0 : i32} : tensor<512xi32>
++    scf.if %spatial_wide_x {
++      %var_x = tt.splat %final_mean_13 : f32 -> tensor<8x512xf32>
++      scf.for %m_step_x = %c0_i32 to %m_num_steps_4 step %c1_i32  : i32 {
++        %batch_offset_x = arith.muli %m_step_x, %c8_i32 : i32
++        %batch_lane_x = tt.make_range {end = 8 : i32, start = 0 : i32} : tensor<8xi32>
++        %batch_base_x = tt.splat %batch_offset_x : i32 -> tensor<8xi32>
++        %batch_off_x = arith.addi %batch_base_x, %batch_lane_x : tensor<8xi32>
++        %in_feat_off_x = arith.muli %input_feat_stride, %feat_pid : i32
++        %in_base_x = tt.addptr %input_pointer, %in_feat_off_x : !tt.ptr<f32>, i32
++        %batch_off_e_x = tt.expand_dims %batch_off_x {axis = 1 : i32} : tensor<8xi32> -> tensor<8x1xi32>
++        %in_bstride_x = tt.splat %input_batch_stride : i32 -> tensor<8x1xi32>
++        %in_roff_x = arith.muli %in_bstride_x, %batch_off_e_x : tensor<8x1xi32>
++        %in_base_s_x = tt.splat %in_base_x : !tt.ptr<f32> -> tensor<8x1x!tt.ptr<f32>>
++        %in_rptr_x = tt.addptr %in_base_s_x, %in_roff_x : tensor<8x1x!tt.ptr<f32>>, tensor<8x1xi32>
++        %out_feat_off_x = arith.muli %output_feat_stride, %feat_pid : i32
++        %out_base_x = tt.addptr %output_pointer, %out_feat_off_x : !tt.ptr<f32>, i32
++        %out_bstride_x = tt.splat %output_batch_stride : i32 -> tensor<8x1xi32>
++        %out_roff_x = arith.muli %out_bstride_x, %batch_off_e_x : tensor<8x1xi32>
++        %out_base_s_x = tt.splat %out_base_x : !tt.ptr<f32> -> tensor<8x1x!tt.ptr<f32>>
++        %out_rptr_x = tt.addptr %out_base_s_x, %out_roff_x : tensor<8x1x!tt.ptr<f32>>, tensor<8x1xi32>
++        %lane_e_x = tt.expand_dims %tile_lane_x {axis = 0 : i32} : tensor<512xi32> -> tensor<1x512xi32>
++        %in_ptr_b_x = tt.broadcast %in_rptr_x : tensor<8x1x!tt.ptr<f32>> -> tensor<8x512x!tt.ptr<f32>>
++        %lane_b_x = tt.broadcast %lane_e_x : tensor<1x512xi32> -> tensor<8x512xi32>
++        %in_ptr_x = tt.addptr %in_ptr_b_x, %lane_b_x : tensor<8x512x!tt.ptr<f32>>, tensor<8x512xi32>
++        %curr_in_x = tt.load %in_ptr_x : tensor<8x512x!tt.ptr<f32>>
++        %carry_x = scf.for %n_step_x = %c0_i32 to %n_num_steps_x step %c1_i32 iter_args(%carry_in_x = %curr_in_x) -> (tensor<8x512xf32>)  : i32 {
++          %sp_off_x = arith.muli %n_step_x, %c512_i32 : i32
++          %sp_off_s_x = tt.splat %sp_off_x : i32 -> tensor<512xi32>
++          %sp_lane_x = arith.addi %sp_off_s_x, %tile_lane_x : tensor<512xi32>
++          %nx_step_x = arith.addi %n_step_x, %c1_i32 : i32
++          %last_step_x = arith.subi %n_num_steps_x, %c1_i32 : i32
++          %nx_clamp_x = arith.minsi %nx_step_x, %last_step_x : i32
++          %nx_off_x = arith.muli %nx_clamp_x, %c512_i32 : i32
++          %nx_off_s_x = tt.splat %nx_off_x : i32 -> tensor<512xi32>
++          %nx_lane_x = arith.addi %nx_off_s_x, %tile_lane_x : tensor<512xi32>
++          %nx_lane_e_x = tt.expand_dims %nx_lane_x {axis = 0 : i32} : tensor<512xi32> -> tensor<1x512xi32>
++          %nx_lane_b_x = tt.broadcast %nx_lane_e_x : tensor<1x512xi32> -> tensor<8x512xi32>
++          %nx_ptr_x = tt.addptr %in_ptr_b_x, %nx_lane_b_x : tensor<8x512x!tt.ptr<f32>>, tensor<8x512xi32>
++          %nx_in_x = tt.load %nx_ptr_x : tensor<8x512x!tt.ptr<f32>>
++          %out_v_x = arith.subf %carry_in_x, %var_x : tensor<8x512xf32>
++          %w_b_x = tt.splat %6 : f32 -> tensor<8x512xf32>
++          %out_m1_x = arith.mulf %w_b_x, %out_v_x : tensor<8x512xf32>
++          %is_b_x = tt.splat %inv_std_21 : f32 -> tensor<8x512xf32>
++          %out_m2_x = arith.mulf %out_m1_x, %is_b_x : tensor<8x512xf32>
++          %b_b_x = tt.splat %9 : f32 -> tensor<8x512xf32>
++          %out_add_x = arith.addf %out_m2_x, %b_b_x : tensor<8x512xf32>
++          %sp_lane_e_x = tt.expand_dims %sp_lane_x {axis = 0 : i32} : tensor<512xi32> -> tensor<1x512xi32>
++          %out_ptr_b_x = tt.broadcast %out_rptr_x : tensor<8x1x!tt.ptr<f32>> -> tensor<8x512x!tt.ptr<f32>>
++          %sp_lane_b_x = tt.broadcast %sp_lane_e_x : tensor<1x512xi32> -> tensor<8x512xi32>
++          %out_ptr_x = tt.addptr %out_ptr_b_x, %sp_lane_b_x : tensor<8x512x!tt.ptr<f32>>, tensor<8x512xi32>
++          tt.store %out_ptr_x, %out_add_x : tensor<8x512x!tt.ptr<f32>>
++          scf.yield %nx_in_x : tensor<8x512xf32>
++        }
++      }
++    } else {
+     scf.if %spatial_wide {
+       %var_w = tt.splat %final_mean_13 : f32 -> tensor<8x256xf32>
+       scf.for %m_step_w = %c0_i32 to %m_num_steps_4 step %c1_i32  : i32 {
+@@ -271,6 +333,7 @@
+         scf.yield %next_input_63 : tensor<8x128xf32> loc(#loc122)
+       } loc(#loc252)
+     } loc(#loc88)
++    }
+     }
+     tt.return loc(#loc123)
+   } loc(#loc)

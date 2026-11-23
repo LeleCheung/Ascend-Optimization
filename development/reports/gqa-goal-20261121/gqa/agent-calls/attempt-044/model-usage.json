@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 36,
+    "duration_ms": 108480,
+    "usage": {
+      "input_tokens": 63761,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1126272,
+      "output_tokens": 18546,
+      "output_tokens_details": {
+        "thinking_tokens": 6529
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 63761,
+        "outputTokens": 18546,
+        "cacheReadInputTokens": 1126272,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.3455910000000002,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 6529,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.3455910000000002,
+    "result": "已完成本轮独立实验的源码修改与交接，字节冻结在 preflight 状态。\n\n## 本轮机制\n仅改 `candidate.py` 的 `_gqa_tile_part_body`（PART_TILES 分支）：\n\n1. 组交集 `[t0,t1)` 外为 t0 预取一次 `raw_next = dot(q, trans(K)).to(fp16)`；\n2. 循环首 `raw = raw_next`，在 `t+1 < t1` 守卫下、于本 tile `exp2` 之前发出下一 tile 的 QK；\n3. 本 tile 严格保留 038 顺序：`qk=raw.to(f32)*qk_scale` → `p=exp2(qk-SM_OFFSET)` → `p16` → FP32 PV dot → 同一 FP32 p 的 FP32 sum → 原归一化/guard/store。\n\n未改：host `run()`、通用二维 grid 内核、掩码判据、20 worker floor 连续分区/TPG/NB_M 映射、grid、num_stages=1 与 ops_reorder、原 checker/golden/dtype/计时合同。PV 输出未收窄，raw QK 以 FP16 循环携带。\n\n## 已登记的修改前证据与判断（diagnosis.json，decision_id d9900f02…）\n- `current-profiling.json`：038 case4 全调用 190.58165μs、真机 kernel 174.043488μs；每程序 cube 33.109μs / vec 64.684μs / scalar_wait 27.423μs，L0C_to_GM 3276.8KB。\n- `simulator-evidence.json`：038 三核部分窗口（各自归一化、`application_completed=false`、全调用 completion 缺失）Cube `WAIT_FLAG_DEVI` 86.84μs/10、Vector 67.83μs+22.50μs/10，两侧头部都是 FLOWCTRL 等待；MTE2 近 idle，故等待属跨核交接而非取数。\n- `actual-ir/2-_gqa_fwd_kernel.ttir`：确认 038 的 `dot→truncf f16→extf→scale→sub→exp2→p16→PV dot→reduce sum` 语句序，且循环体内无独立下一 tile QK。\n- `prior-lookahead.py`（042，sha 89ddf96a…）：前瞻调度已被真机接受的实现来源。\n- `context-brief.json` / `previous-result.json`：042 原四项通过、全调用 190.8117μs、真机 kernel 176.403534μs（优于其 033 父版本 191.023819μs），但 **042 的修改后重放仍 pending，实际重叠尚未确认**。\n\n## 循环不变量与存储寿命\n进入第 t 次迭代时 `raw_next = round_f16(dot(q(t), trans(K_group)))`；基础为 t0 预取，t+1<t1 时改写为 t+1 值，尾部不发 QK。每组 QK 次数仍为 `t1-t0`，尾部不额外 QK、不越界读。`raw_next` 为 64KiB 循环携带 f16；UB 峰值（叠加 q_next 与 p）可能超 196608B，L0C 中 QK 128KiB 与 PV 64KiB 可能同时活跃而重新串行化——该情形无收益但不改结果。\n\n## 预期与验证\n- 预期：case4 全调用 < 190.58165μs、kernel < 174.043μs；PART_TILES 覆盖的 case7 同时受益；case1/2 不走该分支预期不变；每 tile 算术与相加顺序逐字不变，预期输出逐位不变。\n- 验证：原完整四项 checker/golden 与计时合同不变；需修改后模拟器重放归因重叠。\n\n## 交接状态\n`preflight` 返回 `awaiting_source_review`，当前源码 SHA-256 = `b7e04e6446a9d71c1d63346913e171747a07816f986afd8c0d409ab2673e6458`。请宿主执行只读路径/地址边界审查后，按原合同做完整四项真机评测并反馈结果与修改后重放。"
+  }
+}

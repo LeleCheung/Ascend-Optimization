@@ -1,0 +1,35 @@
+--- 
++++ 
+@@ -150,11 +150,29 @@
+     # 峰值估算约 150KB。代价仅限 case1：每程序 KV 迭代 2->3，PV 交接与
+     # acc 重缩放次数 +50%，被掩码列减少令向量 softmax 元素 -25%，grid 与
+     # 并行度不变；非因果三个 case 的分块与性能路径不变。
+-    # 两项概率分解的表达式与相加顺序保持不变，仅 KV 轴划分与重缩放次数变化。
++    #
++    # 本轮机制（交接次数而非算术量）：case4 的每 program 成本由
++    # “3 次 L0C->workspace->UB 交接 x 轮数”主导（L0C_to_GM 192KiB、
++    # GM_to_UB 192KiB、Cube 每 program 等待 10.08us），而 SKV<=256 的非因果
++    # case 完全可以一轮覆盖。故非因果把 BLOCK_N 提到 min(256, next_pow2(SKV))：
++    # case4/7 变成单轮 256 列，交接 6->3 次、acc 重缩放与两次 PV 的向量合并
++    # 各减半。为遵守 UB 上限（因果 231488B 的实测失败），把 BLOCK_M 同步减半
++    # 到 32，使所有随 M×N 增长的张量仍是 8192 个元素，与当前可编译配置同量级。
++    # 代价：grid 与并发的 program 数翻倍（case4 1024->2048），每个 program 仍
++    # 完整装入其 KV 头，K/V 的 GM->L1 装入量约翻倍（MTE2 当前非瓶颈）；
++    # BLOCK_M=32 使每次 dot 的 M 维变短。case2 的 SKV=128 仍取 BLOCK_N=128 /
++    # BLOCK_M=64，与原分块一致，可作为不受机制影响的对照。
++    # 两项概率分解的表达式、相加顺序与 dtype 保持不变；数值差异仅来自在线
++    # softmax 由“两段 128 列 + 一次重缩放”合并为“一段 256 列”，max/sum 仍是
++    # fp32 归约，重缩放由 2 次减为 1 次，误差不增。
+     BLOCK_D = max(16, triton.next_power_of_2(D))
+     if BLOCK_D <= 128:
+-        BLOCK_M = 64
+-        BLOCK_N = 64 if is_causal else 128
++        if is_causal:
++            BLOCK_M, BLOCK_N = 64, 64
++        else:
++            kv_extent = triton.next_power_of_2(SKV)
++            BLOCK_N = min(256, max(64, kv_extent))
++            BLOCK_M = 64 if BLOCK_N <= 128 else 32
+     elif BLOCK_D <= 256:
+         BLOCK_M, BLOCK_N = 32, 32
+     else:

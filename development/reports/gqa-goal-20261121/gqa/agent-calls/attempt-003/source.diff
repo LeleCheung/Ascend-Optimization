@@ -1,0 +1,179 @@
+--- 
++++ 
+@@ -13,7 +13,24 @@
+ KV heads are never materialised to N_q heads: each program indexes the shared
+ K/V head hq // G directly.
+ 
+-Query-row reuse (this round's mechanism, non-causal only): BLOCK_M stays 64 for
++KV-head-grouped query rows (this round's mechanism, non-causal only): a program
++now owns 128 logical query rows laid out as (BLOCK_M / G) sequence positions x G
++query-heads that share one KV head, instead of one head's 128 sequence rows.  In
++BSND these G heads are contiguous after the T=0 axis (q_sh == D, q_sd == 1), so
++the Q tile is loaded as [SL, G, D] with SL*G = BLOCK_M contiguous head segments
++and reshaped to the dot's [BLOCK_M, D]; Out is reshaped back and stored in the
++same [SL, G, D] form.  The actual TTIR/BCMLIR of the frozen parent showed the Q
++load and Out store as strided [128,128] copies with row stride 8192, i.e. 128
++segments of 256B each; grouping by shared KV head widens each segment to G*256B
++(case4 2048B, case2/7 1024B) and cuts the segment count 8x/4x.  Program count
++(case4 512), per-program query-row count (128), the three tl.dot calls, the K/V
++load count and both PV precision terms are unchanged -- only the Q/Out row
++ordering and thus their DMA segmentation change.  Correctness is unaffected:
++each output row still maps to a unique (b, s, hq, :) and accumulates the same KV
++blocks in the same j order with the same alpha rescaling and the same two-term
++probability split.
++
++Query-row reuse (previous round's mechanism, non-causal only): BLOCK_M stays 64 for
+ the causal path and rises to 128 otherwise, so a program keeps the loaded K/V
+ tiles for 128 query rows instead of 64.  The paired profiling of case4 showed
+ 1.09us of aic_cube_time against 9.15us of aic_scalar_wait_id1 per program over
+@@ -62,7 +79,8 @@
+     v_sb: tl.constexpr, v_ss: tl.constexpr, v_sh: tl.constexpr, v_sd: tl.constexpr,
+     o_sb: tl.constexpr, o_ss: tl.constexpr, o_sh: tl.constexpr, o_sd: tl.constexpr,
+     S: tl.constexpr, SKV: tl.constexpr, D: tl.constexpr,
+-    NQ: tl.constexpr, G: tl.constexpr,
++    NQ: tl.constexpr, G: tl.constexpr, NKV: tl.constexpr,
++    BH: tl.constexpr, SL: tl.constexpr, NSG: tl.constexpr,
+     qk_scale: tl.constexpr, delta: tl.constexpr,
+     BLOCK_M: tl.constexpr,
+     BLOCK_N: tl.constexpr,
+@@ -70,24 +88,45 @@
+     IS_CAUSAL: tl.constexpr,
+     MASK_MD: tl.constexpr,
+     MASK_KV: tl.constexpr,
++    PACKED: tl.constexpr,
+ ):
+     pid_m = tl.program_id(0)
+     pid_bh = tl.program_id(1)
+ 
+-    b = pid_bh // NQ
+-    hq = pid_bh % NQ
+-    kvh = hq // G          # shared KV head; no materialisation of G copies
+-
+-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+     offs_d = tl.arange(0, BLOCK_D)
+ 
+-    # MASK_MD 为假表示 grid 恰好覆盖 S 行且 D == BLOCK_D，行/通道掩码可证恒真：
+-    # 直接无掩码载入，省掉 64 宽比较、128 宽比较及其 and（取值不变，见文件头说明）。
+-    q_ptrs = Q + b * q_sb + hq * q_sh + offs_m[:, None] * q_ss + offs_d[None, :] * q_sd
+-    if MASK_MD:
+-        q = tl.load(q_ptrs, mask=(offs_m[:, None] < S) & (offs_d[None, :] < D), other=0.0)
+-    else:
+-        q = tl.load(q_ptrs)
++    if PACKED:
++        # 打包路径：一个 program 覆盖 SL 个序列位置 × BH 个共享同一 KV 头的
++        # query-head（SL*BH == BLOCK_M）。BSND 中该头子组在 D 维之后连续，
++        # 故 Q 以 [SL, BH, D] 连续头段载入，再 reshape 成 dot 的 [BLOCK_M, D]，
++        # 每段大小 BH*D 个元素而非单头 D 个；Out 反向 reshape 后写回。
++        hsub = pid_bh % NSG
++        t = pid_bh // NSG
++        kvh = t % NKV
++        b = t // NKV
++        h0 = kvh * G + hsub * BH
++        offs_s = pid_m * SL + tl.arange(0, SL)
++        offs_g = tl.arange(0, BH)
++        q_ptrs3 = (Q + b * q_sb + h0 * q_sh
++                   + offs_s[:, None, None] * q_ss
++                   + offs_g[None, :, None] * q_sh
++                   + offs_d[None, None, :] * q_sd)
++        # S % SL == 0 且 D == BLOCK_D 时该 tile 恰好覆盖合法行/通道，无需掩码。
++        q = tl.reshape(tl.load(q_ptrs3), (BLOCK_M, BLOCK_D))
++        offs_m = tl.arange(0, BLOCK_M)  # 打包路径非因果，仅保持形状一致
++    else:
++        b = pid_bh // NQ
++        hq = pid_bh % NQ
++        kvh = hq // G          # shared KV head; no materialisation of G copies
++
++        offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
++        # MASK_MD 为假表示 grid 恰好覆盖 S 行且 D == BLOCK_D，行/通道掩码可证恒真：
++        # 直接无掩码载入，省掉 64 宽比较、128 宽比较及其 and（取值不变，见文件头说明）。
++        q_ptrs = Q + b * q_sb + hq * q_sh + offs_m[:, None] * q_ss + offs_d[None, :] * q_sd
++        if MASK_MD:
++            q = tl.load(q_ptrs, mask=(offs_m[:, None] < S) & (offs_d[None, :] < D), other=0.0)
++        else:
++            q = tl.load(q_ptrs)
+ 
+     k_base = K + b * k_sb + kvh * k_sh
+     v_base = V + b * v_sb + kvh * v_sh
+@@ -165,12 +204,22 @@
+     out = acc / l_safe[:, None]
+     out = tl.where(l_i[:, None] > 0.0, out, 0.0)  # all-masked rows -> zeros
+ 
+-    o_ptrs = Out + b * o_sb + hq * o_sh + offs_m[:, None] * o_ss + offs_d[None, :] * o_sd
+-    if MASK_MD:
+-        tl.store(o_ptrs, out.to(Out.dtype.element_ty),
+-                 mask=(offs_m[:, None] < S) & (offs_d[None, :] < D))
+-    else:
+-        tl.store(o_ptrs, out.to(Out.dtype.element_ty))
++    if PACKED:
++        # 行序 row = s*BH + g 与 Q 载入的 [SL, BH, D] 一致，写回地址对每个
++        # (b, s, hq, d) 唯一；(S%SL==0, D==BLOCK_D) 下无需掩码。
++        o_ptrs3 = (Out + b * o_sb + h0 * o_sh
++                   + offs_s[:, None, None] * o_ss
++                   + offs_g[None, :, None] * o_sh
++                   + offs_d[None, None, :] * o_sd)
++        out3 = tl.reshape(out.to(Out.dtype.element_ty), (SL, BH, BLOCK_D))
++        tl.store(o_ptrs3, out3)
++    else:
++        o_ptrs = Out + b * o_sb + hq * o_sh + offs_m[:, None] * o_ss + offs_d[None, :] * o_sd
++        if MASK_MD:
++            tl.store(o_ptrs, out.to(Out.dtype.element_ty),
++                     mask=(offs_m[:, None] < S) & (offs_d[None, :] < D))
++        else:
++            tl.store(o_ptrs, out.to(Out.dtype.element_ty))
+ 
+ 
+ def run(query, key, value, scaleValue=-1.0, is_causal=False):
+@@ -209,6 +258,10 @@
+     # 本轮在此之上只改非因果的 BLOCK_M（64->128），见下方说明。因果/非因果
+     # BLOCK_N 分流、两项概率分解表达式与相加顺序均保持不变。
+     # 收益或代价都必须由完整四项真机评测判定，本注释不据此改写结论。
++    # 本轮机制（在 BLOCK_M=128 之上）：把同一 KV 头的 G 个 query-head 与
++    # BLOCK_M/G 个序列位置打包进一个 program，Q/Out 由「128 段×256B」变为
++    # 「SL 段×G*256B」，只改 Q/Out 访存分段；program 数、K/V 次数、三次数 dot
++    # 与两项概率分解表达式/相加顺序均不变，每个 (b,s,hq,d) 输出地址唯一。
+     # 数值风险说明：BLOCK_M 只改变 tl.dot 的 M 维铺排与程序数，每行输出仍按同一
+     # j 顺序累加同一组 KV 块、同一 alpha 重缩放与同一两项分解，QK 归约维仍是
+     # D=BLOCK_D、PV 归约维仍是每块 BLOCK_N 列，故累加序列不变，预计精度不变。
+@@ -241,18 +294,39 @@
+     MASK_MD = not ((S % BLOCK_M == 0) and (D == BLOCK_D))
+     MASK_KV = not ((SKV % BLOCK_N == 0) and (D == BLOCK_D))
+ 
+-    grid = (triton.cdiv(S, BLOCK_M), B * NQ)
++    # 按共享 KV 头打包 query 行的纯元数据门控（不读输入值、不看 case_id）：
++    # 仅非因果、D 与分块一致、且 Q/Out 的 D 维连续（stride(3)==1）且头 stride
++    # 等于 D（同 KV 头的相邻 query-head 连续）时启用。BH 取能整除 G 与 BLOCK_M、
++    # 且使 SL=BLOCK_M//BH 整除 S 的最大 2 的幂（≤16）；否则保留单头 128 行路径。
++    PACKED = False
++    BH, SL, NSG = 1, BLOCK_M, 1
++    if (not is_causal and BLOCK_D <= 128 and D == BLOCK_D
++            and query.stride(3) == 1 and query.stride(2) == D
++            and y.stride(3) == 1 and y.stride(2) == D):
++        for _cand in (16, 8, 4, 2):
++            if G % _cand == 0 and BLOCK_M % _cand == 0 and S % (BLOCK_M // _cand) == 0:
++                BH = _cand
++                SL = BLOCK_M // _cand
++                NSG = G // _cand
++                PACKED = True
++                break
++
++    if PACKED:
++        grid = (S // SL, B * NKV * NSG)
++    else:
++        grid = (triton.cdiv(S, BLOCK_M), B * NQ)
+     _gqa_fwd_kernel[grid](
+         query, key, value, y,
+         query.stride(0), query.stride(1), query.stride(2), query.stride(3),
+         key.stride(0), key.stride(1), key.stride(2), key.stride(3),
+         value.stride(0), value.stride(1), value.stride(2), value.stride(3),
+         y.stride(0), y.stride(1), y.stride(2), y.stride(3),
+-        S=S, SKV=SKV, D=D, NQ=NQ, G=G,
++        S=S, SKV=SKV, D=D, NQ=NQ, G=G, NKV=NKV,
++        BH=BH, SL=SL, NSG=NSG,
+         qk_scale=qk_scale, delta=SKV - S,
+         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+         IS_CAUSAL=bool(is_causal),
+-        MASK_MD=MASK_MD, MASK_KV=MASK_KV,
++        MASK_MD=MASK_MD, MASK_KV=MASK_KV, PACKED=PACKED,
+         num_warps=1, num_stages=1,
+     )
+     return y

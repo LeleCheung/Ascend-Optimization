@@ -1,0 +1,39 @@
+--- 
++++ 
+@@ -14,8 +14,10 @@
+ K/V head hq // G directly.
+ 
+ Query-row reuse (retained, non-causal only): BLOCK_M stays 64 for
+-the causal path and rises to 128 otherwise, so a program keeps the loaded K/V
+-tiles for 128 query rows instead of 64.  The paired profiling of case4 showed
++the causal path and rises to 128 otherwise, except the explicitly requested
++BM256 compilation experiment, which raises it to 256 only for non-causal BF16
++with D <= 128 and S >= 256 (case4); every other path keeps 128, so a program
++keeps the loaded K/V tiles for 128 query rows instead of 64.  The paired profiling of case4 showed
+ 1.09us of aic_cube_time against 9.15us of aic_scalar_wait_id1 per program over
+ 1024 programs of 64x128 tiles, and the simulator windows put Cube at 7.90%
+ productive / 33.27% wait / 58.83% idle with the top instructions being
+@@ -268,8 +270,21 @@
+         # 估算约 192KB、逼近 196608B 预算，故非因果才用；因果分支若回到
+         # BLOCK_N=128 会重新引入 BLOCK_N 线性相关的索引临时量，实测峰值曾达
+         # 231488B，故因果仍取 64/64，其编译与数值路径不变。
+-        BLOCK_M = 64 if is_causal else 128
+-        BLOCK_N = 64 if is_causal else 128
++        # 本轮独立实验（宿主指定 BM256 编译实验）：只把「非因果 + BF16 + D<=128
++        # + S>=256」的宿主 BLOCK_M 由 128 提到 256，BLOCK_N 恒 128，内核计算 AST
++        # 不变。目标 case4 的 program 数 512→256、交接链 1024→512，每链服务
++        # 256 行；总 K/V 搬运预计按 program 数下降，总 L0C→GM 量级不变。
++        # 代价：Q/Out/acc 的 M 维翻倍（acc fp32 达 256x128），可能超出 UB 预算
++        # 而编译失败——该真实失败按宿主指令保留为实验结果，不用估算取消。
++        # 较短 S 的 FP16(case2 S=128)、BF16(case7 S=128) 与因果路径逐字保留。
++        if is_causal:
++            BLOCK_M, BLOCK_N = 64, 64
++        else:
++            BLOCK_N = 128
++            if value.dtype == torch.bfloat16 and D <= 128 and S >= 256:
++                BLOCK_M = 256
++            else:
++                BLOCK_M = 128
+     elif BLOCK_D <= 256:
+         BLOCK_M, BLOCK_N = 32, 32
+     else:

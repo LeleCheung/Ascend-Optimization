@@ -1,0 +1,142 @@
+{
+  "timestamp": "2026-11-20T04:11:56.004057+00:00",
+  "diagnosis": {
+    "source_sha256": "a27f40a227126c5ffbe4e6bc1fd6e93cbb7c06d9a417091e1351785b90f0429e",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "确定两个候选算子的真机耗时占比，判断应改哪个符号",
+        "finding": "candidate侧（同保留IR字节）kernel_profiles：_scatter_add_sort_key_kernel Task Duration 777.835571us（Block Dim 2048，1650MHz），_scatter_add_sort_out_kernel 489.669800us；两者合计1267.5us，与feedback中scatter_add-timing-8的父版latency 1262.722303us相差0.4%，说明这两个kernel几乎构成全部耗时。sort_out占约38.7%，是可独立优化的第二热点。reference侧为ScatterElementsV2 3321.8us+LinearIndex 33.5us+TensorMove 18.6us。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "simulator",
+        "role": "提供sort_out实际二进制的流水与指令成本排序，确认哪条流水是产能瓶颈",
+        "finding": "report为_scatter_add_sort_out_kernel|core0.veccore0，instruction_calls_by_pipeline：SCALAR 3066、VECTOR 1270、MTE2 32、MTE3 4、FLOWCTRL 6、ALL 2。top_instructions前16项全部是VECTOR的BAR（6038/6018/5846/3971/3883/3791…cycles）与SCALAR的WAIT_FLAG（detail为PIPE:VEC,TRIGGERPIPE:SCALAR,FLAGID:7，6052/3738 cycles）。即被观测到的“最高代价”是VCU同步点，其上游由VECTOR流水产能决定；8个region全部为unmapped（source_lines=[0]），无源码行归因，限制项也声明这些区间不可累加为总耗时。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "按流水给出占用/等待/空闲，区分“等待”是标量计算还是向量背压",
+        "finding": "sort_out在core0.veccore0的窗口：VECTOR active 0.9007、productive 0.8686、wait_only 0.0320、largest_idle 0.0084；SCALAR active 0.7841，但productive仅0.0031、wait_only 0.7810（几乎全是对VEC的WAIT_FLAG）；MTE2 productive 0.0521、MTE3 0.0119、SCALARLDST 0.1230、CACHEMISS 0.0011、ALL仅2个事件。结论：sort_out是向量流水产能受限（productive 86.9%），标量口与搬运口都有大量余量，所以削减VECTOR上的实际工作（而不是削减标量指令）才是有效方向。"
+      },
+      {
+        "path": "compiled-readonly/586fab365d9e315e3ad89eedcf6806290aa9406eeeb142d4583a8d657dabb861/_scatter_add_sort_out_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "核对疑似冗余是否在后端已被消除（按lowered-inventory清单核验符号）",
+        "finding": "后端未消除：第62行 %17 = call @triton_gather(%13, %8, %c0_i32)，其中 %8 = linalg.fill ins(%c1024_i32) outs(%2 : tensor<2048xi32>) 是全常量1024的索引张量。也就是说2048个lane同读keys[1024]的首个二分探测仍走一次性generic gather；同时第145行 %100 = memref.load %reinterpret_cast[%c0] 证明“标量load+广播”路径在该kernel内已存在且被后端接受（即已折叠的尾步）。共13个triton_gather（10个数据相关二分+1个首探测（%17）+%110 nxt gather+%115 after gather）。"
+      },
+      {
+        "path": "ir/586fab365d9e315e3ad89eedcf6806290aa9406eeeb142d4583a8d657dabb861/_scatter_add_sort_out_kernel.ttir",
+        "category": "source_ir",
+        "role": "定位可改的具体IR缺陷与其代价",
+        "finding": "共13处tt.gather：二分循环LOG+1=12轮中前11轮为tt.gather（%go/%go_16/%go_24/%go_32/%go_40/%go_48/%go_56/%go_64/%go_72/%go_80/%go_88），第12轮已被折叠为 %first_key = tt.load %keys + tt.splat；另有%nxt_102、%after_107两处数据相关gather。第1轮索引 %mid = dense<1024>（对全部lane恒定），第2轮索引 %mid_15 = minsi((%lo_12+%hi)>>1,2047) 在 go_11 为真/假时恒为1536/512（初值lo=0/hi=2048），即索引取值集合只有{512,1536}。这两轮都在对2048×4B的UB张量做与实际信息量（1个或2个元素）完全不成比例的generic gather。"
+      },
+      {
+        "path": "ir/f9d15572f3b2d1abd9da76be0b6be12e3fe36dc97a489155b495a3bf417039a2/_scatter_add_sort_key_kernel.ttir",
+        "category": "source_ir",
+        "role": "登记同一机制在另一个符号上的更大同类冗余，作为下一机制候选（本次不改）",
+        "finding": "sort_key共23处tt.gather：1处数据相关sv gather + 11轮×2处 partner=gather(…, maximum(lane-(1<<shift),0)) 的编译期常量仿射索引gather；其bcmlir中对应22个triton_gather全部保留（%35/%36/%44/%45/…/%125/%126），后端未把常量索引gather强度削减为移位读。该符号占777.8us（61.3%），是比sort_out更大的同类缺陷，但替换需引入cumsum/前缀扫描会改变fp32求和结合次序，故本轮不作为首次落盘机制。"
+      },
+      {
+        "path": "lowered-inventory.json",
+        "category": "source_ir",
+        "role": "确认低层产物冻结范围与本次只编辑TTIR的边界",
+        "finding": "清单给出两个符号的ttadapter/bcmlir/npubin（sort_out bcmlir sha256 88d088a11150fa56dd179906964bdd419c6d307703d94d2ab0592992bd7626f1，npubin 06dd8d1949fd7a151b789ed860304f7726127c663dd2bad33364975c0fe5c01e）指向ir-002保留编译态，均为只读核对对象；允许编辑的只有ir/*.ttir。"
+      }
+    ],
+    "hypothesis": "sort_out的二分开头两轮探测使用了对全部lane恒定（第1轮）或仅取2个值（第2轮）的索引，却各发射一次2048元素generic gather；后端（bcmlir的fill(1024)索引）没有把它折叠成标量广播。kernel为VECTOR产能受限（productive 86.9%），因此每减一次generic gather即等量削减VECTOR工作。把第1轮替换为标量load keys[base+1024]+tt.splat，把第2轮替换为两个标量load keys[base+512]/keys[base+1536]+一次tensor select（索引由%go_11决定），与已验收的尾步折叠（tt.load %keys + tt.splat）属同一机制。三处标量load地址均为编译期常量、互不依赖，且MTE2仅5.2%、SCALARLDST 12.3%占用，可与%keys_5/%prefix_8的搬运重叠；后续9轮仍用原gather，lo/hi推进与第12轮折叠尾步完全不变。",
+    "alternatives": [
+      "先改sort_key的22处常量仿射索引gather（占61.3%耗时，潜在收益更大）：需用cumsum+cummax/关联扫描重写分段前缀和，把22次gather降到约2次，但会改变fp32累加结合次序，且依赖该后端cumsum/cummax的实际lowering质量，风险与验证面都大于本次，登记为下一机制。",
+      "继续折叠第3轮（索引集合{256,768,1280,1792}，4个标量load+3层select）：与本次同机制但更多标量load与select，且第3轮load的地址必须等go_11/go_17才能选值，重叠窗口更小，收益/风险比低于前两轮，留待本轮结果确认后再扩展。",
+      "用tt.cumsum+cummax重写sort_out的二分定位：这不是局部消除而是重写搜索，属于另一研究身份。",
+      "仅改编译选项（如enable_auto_vectorize_v2、num_stages）：属独立研究身份，且不针对本处已证实的逐元素gather冗余。",
+      "把%nxt_102与%after_107两处数据相关gather也消掉：索引依赖lo/end的真实数据，不能用标量广播替代，本次不动。"
+    ],
+    "change": "只编辑ir/586fab…/…_scatter_add_sort_out_kernel.ttir：(1) 在%keys_5之后新增三个i32常量1024/512/1536与三次标量tt.load（keys+1024、keys+512、keys+1536）及对应tt.splat，使三个地址常量load在最前发射；(2) 删除首轮 %go = tt.gather %keys_5[%mid]，%go_11 改为 arith.cmpf olt, <keys[1024]的splat>, %t1_10；(3) 删除 %go_16 = tt.gather %keys_5[%mid_15]，改为 %go_16 = arith.select %go_11, <keys[1536]的splat>, <keys[512]的splat>，%go_17不变。保留 %mid（仍用于%hi）与 %mid_15（仍用于%lo_18/%lo_19/%hi_20）。函数签名、constexpr、ABI、其余9轮gather、尾步折叠、nxt/after gather与store全部不变。",
+    "expected": "TTIR中sort_out的tt.gather从13降到11；重编译后bcmlir中triton_gather从13降到11，首个uniform fill(1024)索引gather消失，memref.load从1处增至4处（都是同row 4B常量偏移）。实测预测：sort_out约489.7us，按每行（489.669800us÷(2048块/40核≈51.2波)≈9.56us/行）与每generic gather约0.4~0.6us/行的量级，去除2次gather净省约0.6~1.0us/行，即约31~51us；扣掉3次标量load/2次splat/1次select的少量补充（MTE2与SCALARLDST余量足），预测总latency由1262.722us降到约1200~1232us（-2.5%~-5%），scatter_add-timing-8单点speedup由2.7217升到约2.79~2.86；structure上VECTOR流水instruction calls应下降，SCALAR的productive仍应接近0（不变成标量受限）。若sort_out实测无明显变化，则说明该处gather在二进制层被合并/极廉价，本轮判断被推翻，改为登记证据并转向sort_key的常量索引gather。",
+    "validation": "宿主执行：frozen.py（sha256 a27f40a2…）与清单、context、证据保持冻结；TTIR可解析后CPU编译，比对bcmlir的triton_gather数13→11并核对新增memref.load；跑完整18项KGS（9正确性+9时间）、双方各21项补测与3项分段独立性；与父版ABBA比较，并做修改后双分析（profiling+模拟器重放）。语义核验要点：keys_5 = load(keys_ptr+base+dst) 为无mask整行精确加载，故 keys_5[1024]=keys_ptr[base+1024]、keys_5[512]/[1536]同理，标量load取到的是同一地址同一fp32位型；第1轮后 lo/hi 与 %mid_15∈{512,1536} 的取值与原来逐位相同，故整个二分的lo、end、delta与输出逐位不变。EVEN/非EVEN路径、特殊值、别名（keys/prefix只读、out与inp不重叠由run层保证）均未触碰。",
+    "layer_reason": "缺陷是单个kernel内部、与数据结构无关的局部冗余：同一保留IR里已验收的折叠尾步就是同一机制的现成模板，改动局限在一个tt.func体内11行，不改签名/常量/内存布局，因此属于单算子IR层；任何上层（驱动、拷贝、布局）改动都无法消除这次逐lane gather。",
+    "simulator_incremental_judgment": "clock与范围说明：timeline的time_unit为fraction、capture_start/end为0/first-to-last可见事件（capture_scope明示partial capture boundaries preserved），说明窗口是部分捕获、时间轴为窗口内相对时钟，不能当作绝对时长或全kernel占用；ALL泳道只有2个事件、ALL/CACHEMISS/FLOWCTRL标记为auxiliary_trace_lane，属于未报告/辅助泳道，不参与归因。热点top_instructions里的WAIT_FLAG(SCALAR,PIPE:VEC,FLAGID:7)与VECTOR BAR阶梯与SCALAR的productive 0.0031、wait_only 0.7810一致地说明它们是VCU同步等待而非标量计算成本，因此本轮增量必须落在VECTOR产能上：减少每行的generic gather数正是直接削减VECTOR busy时间的做法，可测增量应体现在sort_out的VECTOR instruction calls与task duration，以及总latency在同一配对窗口内下移；若VECTOR productive不降而latency不降，则判定该gather在二进制层已被廉价实现，寄存器证据推翻本次假设。",
+    "unknown": [
+      "无法在本地编译/运行，generic gather在二进制层每行的实际cycle成本只能由0.4~0.6us/行量级估计，真实值待重编译后的bcmlir与真机数据核验。",
+      "后端是否会把三处常量标量load合并或进一步下沉尚不可见（低层产物冻结），若合并为一次搬运则收益只增不减。",
+      "sort_key中22处常量仿射索引gather的真实成本未知，若本次收益确认则可作为下一轮更大目标。"
+    ]
+  },
+  "evidence": [
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "确定两个候选算子的真机耗时占比，判断应改哪个符号",
+      "finding": "candidate侧（同保留IR字节）kernel_profiles：_scatter_add_sort_key_kernel Task Duration 777.835571us（Block Dim 2048，1650MHz），_scatter_add_sort_out_kernel 489.669800us；两者合计1267.5us，与feedback中scatter_add-timing-8的父版latency 1262.722303us相差0.4%，说明这两个kernel几乎构成全部耗时。sort_out占约38.7%，是可独立优化的第二热点。reference侧为ScatterElementsV2 3321.8us+LinearIndex 33.5us+TensorMove 18.6us。",
+      "sha256": "8286f873118b6a8b6b9755a394002e8e3c6931c739e7866ab77506e7f69678d6"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "提供sort_out实际二进制的流水与指令成本排序，确认哪条流水是产能瓶颈",
+      "finding": "report为_scatter_add_sort_out_kernel|core0.veccore0，instruction_calls_by_pipeline：SCALAR 3066、VECTOR 1270、MTE2 32、MTE3 4、FLOWCTRL 6、ALL 2。top_instructions前16项全部是VECTOR的BAR（6038/6018/5846/3971/3883/3791…cycles）与SCALAR的WAIT_FLAG（detail为PIPE:VEC,TRIGGERPIPE:SCALAR,FLAGID:7，6052/3738 cycles）。即被观测到的“最高代价”是VCU同步点，其上游由VECTOR流水产能决定；8个region全部为unmapped（source_lines=[0]），无源码行归因，限制项也声明这些区间不可累加为总耗时。",
+      "sha256": "4fb959f7ea67886179d1d74b34f66a5ab60bab2b3c12d2f18f6e5fd2bc5385f9"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "按流水给出占用/等待/空闲，区分“等待”是标量计算还是向量背压",
+      "finding": "sort_out在core0.veccore0的窗口：VECTOR active 0.9007、productive 0.8686、wait_only 0.0320、largest_idle 0.0084；SCALAR active 0.7841，但productive仅0.0031、wait_only 0.7810（几乎全是对VEC的WAIT_FLAG）；MTE2 productive 0.0521、MTE3 0.0119、SCALARLDST 0.1230、CACHEMISS 0.0011、ALL仅2个事件。结论：sort_out是向量流水产能受限（productive 86.9%），标量口与搬运口都有大量余量，所以削减VECTOR上的实际工作（而不是削减标量指令）才是有效方向。",
+      "sha256": "51c4e7298c3e8fc5ef588dc883fa4165eb1e9493949ae0199fa7a1a7a7dfd57b"
+    },
+    {
+      "path": "compiled-readonly/586fab365d9e315e3ad89eedcf6806290aa9406eeeb142d4583a8d657dabb861/_scatter_add_sort_out_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "核对疑似冗余是否在后端已被消除（按lowered-inventory清单核验符号）",
+      "finding": "后端未消除：第62行 %17 = call @triton_gather(%13, %8, %c0_i32)，其中 %8 = linalg.fill ins(%c1024_i32) outs(%2 : tensor<2048xi32>) 是全常量1024的索引张量。也就是说2048个lane同读keys[1024]的首个二分探测仍走一次性generic gather；同时第145行 %100 = memref.load %reinterpret_cast[%c0] 证明“标量load+广播”路径在该kernel内已存在且被后端接受（即已折叠的尾步）。共13个triton_gather（10个数据相关二分+1个首探测（%17）+%110 nxt gather+%115 after gather）。",
+      "sha256": "88d088a11150fa56dd179906964bdd419c6d307703d94d2ab0592992bd7626f1"
+    },
+    {
+      "path": "ir/586fab365d9e315e3ad89eedcf6806290aa9406eeeb142d4583a8d657dabb861/_scatter_add_sort_out_kernel.ttir",
+      "category": "source_ir",
+      "role": "定位可改的具体IR缺陷与其代价",
+      "finding": "共13处tt.gather：二分循环LOG+1=12轮中前11轮为tt.gather（%go/%go_16/%go_24/%go_32/%go_40/%go_48/%go_56/%go_64/%go_72/%go_80/%go_88），第12轮已被折叠为 %first_key = tt.load %keys + tt.splat；另有%nxt_102、%after_107两处数据相关gather。第1轮索引 %mid = dense<1024>（对全部lane恒定），第2轮索引 %mid_15 = minsi((%lo_12+%hi)>>1,2047) 在 go_11 为真/假时恒为1536/512（初值lo=0/hi=2048），即索引取值集合只有{512,1536}。这两轮都在对2048×4B的UB张量做与实际信息量（1个或2个元素）完全不成比例的generic gather。",
+      "sha256": "2590a86abfb953baa06f9079f9b45a8e88a9a059f521dff76b6df7cf5f760164"
+    },
+    {
+      "path": "ir/f9d15572f3b2d1abd9da76be0b6be12e3fe36dc97a489155b495a3bf417039a2/_scatter_add_sort_key_kernel.ttir",
+      "category": "source_ir",
+      "role": "登记同一机制在另一个符号上的更大同类冗余，作为下一机制候选（本次不改）",
+      "finding": "sort_key共23处tt.gather：1处数据相关sv gather + 11轮×2处 partner=gather(…, maximum(lane-(1<<shift),0)) 的编译期常量仿射索引gather；其bcmlir中对应22个triton_gather全部保留（%35/%36/%44/%45/…/%125/%126），后端未把常量索引gather强度削减为移位读。该符号占777.8us（61.3%），是比sort_out更大的同类缺陷，但替换需引入cumsum/前缀扫描会改变fp32求和结合次序，故本轮不作为首次落盘机制。",
+      "sha256": "002d8972ccd89ca2b2bb0f5f3266f8b7298335ca52fca3cbd87f9a79213ee5d2"
+    },
+    {
+      "path": "lowered-inventory.json",
+      "category": "source_ir",
+      "role": "确认低层产物冻结范围与本次只编辑TTIR的边界",
+      "finding": "清单给出两个符号的ttadapter/bcmlir/npubin（sort_out bcmlir sha256 88d088a11150fa56dd179906964bdd419c6d307703d94d2ab0592992bd7626f1，npubin 06dd8d1949fd7a151b789ed860304f7726127c663dd2bad33364975c0fe5c01e）指向ir-002保留编译态，均为只读核对对象；允许编辑的只有ir/*.ttir。",
+      "sha256": "c1ba39fe8aedb21c58b1987e74ae1bd39152e7c46de5cff37484b62d322a07c5"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "a27f40a227126c5ffbe4e6bc1fd6e93cbb7c06d9a417091e1351785b90f0429e",
+    "ir-inventory.json": "993008d676f13e876b12466cc3931f4962c5f47adc5b070fb292eaefa8bd0ec4",
+    "lowered-inventory.json": "c1ba39fe8aedb21c58b1987e74ae1bd39152e7c46de5cff37484b62d322a07c5",
+    "profiling.json": "8286f873118b6a8b6b9755a394002e8e3c6931c739e7866ab77506e7f69678d6",
+    "hotspots.json": "4fb959f7ea67886179d1d74b34f66a5ab60bab2b3c12d2f18f6e5fd2bc5385f9",
+    "timeline.json": "51c4e7298c3e8fc5ef588dc883fa4165eb1e9493949ae0199fa7a1a7a7dfd57b",
+    "context.json": "a496f9fa0bad786ed3163afb7200a62b07d8f4975928b901acce992ec06d7b6b",
+    "diagnosis.json": "7bffe53b52c24849aa848798893b3fdf25769a2df57135da1b34f92073eaa927",
+    "feedback.json": "693c6f9f21598f037563d1e9ebd5bd53f4cafa00eac4df3b69f6abd3cf595192",
+    "codex-brief.json": "62403aca7a07a67aa15735d7acf4ae3506b451bf49236d8efc29b4d02e93d51a",
+    "baseline-result.json": "b380af12f00f27b485c42f4541298c4c9644e04bd60a3138e052816f65895358",
+    "ir/f9d15572f3b2d1abd9da76be0b6be12e3fe36dc97a489155b495a3bf417039a2/_scatter_add_sort_key_kernel.ttir": "002d8972ccd89ca2b2bb0f5f3266f8b7298335ca52fca3cbd87f9a79213ee5d2",
+    "ir/586fab365d9e315e3ad89eedcf6806290aa9406eeeb142d4583a8d657dabb861/_scatter_add_sort_out_kernel.ttir": "2590a86abfb953baa06f9079f9b45a8e88a9a059f521dff76b6df7cf5f760164",
+    "compiled-readonly/f9d15572f3b2d1abd9da76be0b6be12e3fe36dc97a489155b495a3bf417039a2/_scatter_add_sort_key_kernel.ttadapter": "8e6cde5aece24ee0fc02de0459f5acc51a7ecaebb1c74c973652e11264e08e5a",
+    "compiled-readonly/f9d15572f3b2d1abd9da76be0b6be12e3fe36dc97a489155b495a3bf417039a2/_scatter_add_sort_key_kernel.bcmlir": "d43f96d30af1d9c19dd74d56027b0454e93b1ef218bc77d343d4a8619f0d05a3",
+    "compiled-readonly/f9d15572f3b2d1abd9da76be0b6be12e3fe36dc97a489155b495a3bf417039a2/_scatter_add_sort_key_kernel.npubin": "33f91db57f9413d47041932a543edaa9b5a496f62fd9c470aca995811b0595bf",
+    "compiled-readonly/586fab365d9e315e3ad89eedcf6806290aa9406eeeb142d4583a8d657dabb861/_scatter_add_sort_out_kernel.ttadapter": "9c0d24345d97622cd95c8157be93e9c647e258cddb3a735f99ca240ced09e63d",
+    "compiled-readonly/586fab365d9e315e3ad89eedcf6806290aa9406eeeb142d4583a8d657dabb861/_scatter_add_sort_out_kernel.bcmlir": "88d088a11150fa56dd179906964bdd419c6d307703d94d2ab0592992bd7626f1",
+    "compiled-readonly/586fab365d9e315e3ad89eedcf6806290aa9406eeeb142d4583a8d657dabb861/_scatter_add_sort_out_kernel.npubin": "06dd8d1949fd7a151b789ed860304f7726127c663dd2bad33364975c0fe5c01e"
+  },
+  "decision_tool_sha256": "8921af9e4e185c5bc42beee9f2483048a866002c48bc31e6c5129fda44362a28"
+}

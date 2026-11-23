@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 67,
+    "duration_ms": 311955,
+    "usage": {
+      "input_tokens": 83552,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 3560192,
+      "output_tokens": 60752,
+      "output_tokens_details": {
+        "thinking_tokens": 45900
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 83552,
+        "outputTokens": 60752,
+        "cacheReadInputTokens": 3560192,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 3.716656,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 45900,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 3.716656,
+    "result": "已提交 `awaiting_ir_review`，本轮只改动了清单允许的 `ir/target.hivm.mlir`，`frozen.py`、context、证据与清单保持原字节。\n\n## 登记与实现\n\ndecision 桥已记录诊断（sha256 `b0291f6d…7701a0`），随后仅对该机制落盘以下编辑（`_gqa_fwd_kernel_mix_aiv` 函数体，AIC 函数、私有函数声明、主机函数逐字节未动）：\n\n1. 新增常量 `180480`、`180736`。\n2. `vrec_1d_float` 目标由 `114688`（64xf32）迁到 `180480`；`vmul_2d_float` 临时区由 `114944`（512xf32）迁到 `180736`。原 `l_new` 缓冲 `180224..180480` 保持不动，因此 `114688..180224` 的 FP32 概率缓冲在跨迭代期间完整让给下一块概率。\n3. 迭代入口的 `MTE2→V EVENT1` 等待移入 `%is_first` 分支；`half→float`、同一常量 `0.0883883461` 的 `vmuls`、`vexp` 三项一并移入该分支，非首块直接消费上一轮准备好的 FP32p。\n4. 预取块内 `sync_block_set flag2` 之后、当前 PV 的 `sync_block_wait flag0` 之前，新增：`MTE2→V EVENT1` 等待、`PIPE_V` 屏障、`vcast(qk_hi→114688)`、屏障、`vmuls`、屏障、`vexp`。全部落在 `arg11+1<块尾` 的守卫内，块尾 tile 跳过。\n\nP 的 bf16 转换（32768 区）与 MTE3 发送、`flag0/1/2/3/4` 的 set/wait 位置与次数保持不变；新增 V 工作排在 `flag1`(P 已发) 与 `flag2`(QK 已消费) 之后，AIC 的跨核等待点未被后移。\n\n## 事件与别名核对（实际 IR 计数）\n\n- `MTE2→V EVENT1`：set 在初始 prefill 1 次 + 每次 prefetch 1 次；wait 在 `%is_first` 1 次 + 每次 prefetch 1 次，逐块配对相等。\n- 概率缓冲读者为 P 的 bf16 转换与 FP32 求和树（均在预取块之前，同一 V 流水按序），写者为本轮前瞻，读写序成立。\n- `32768..65536` 区仍是 qk_hi 与 P 的 bf16 共用：前瞻读 qk_hi 发生在 P 转换写该区之前（V 序），MTE2 覆写在 `MTE3→MTE2` 等待之后，WAR 链经 P 发送传递。\n- 全函数 `pointer_cast` 扫描确认 `180480..182784` 原先无任何引用，最高地址由 `180480` 升到 `182784`，两段起点均为 256B 对齐；`114944` 常量保留为未用。\n\n## 新增观察\n\n- veccore0 的热点材料只有一条大归并区域（源码 593–600，累计 473.01us、其中等待 240.87us），其余 PC 邻域合计低于 1.4us 且多为 unmapped：本核的细粒度时序只能取自单 PC 时间线，热点仅提供排序。\n- 当前 IR 中 reduce 的 scratch 复用 `0..32768`（与 qk_lo 同址），`l_new` 紧贴概率缓冲尾部 `180224`，这是 `vrec` 目标原先只能落在 `114688` 的结构原因。\n- ir-004 已经消除了 ir-003 的 sum/VREC 后置：示例窗口里 sum 41.380–41.931us 与 reciprocal 41.932–41.945us 发生在 P 发送与 nextQK 等待期间；剩余 0.927/1.482/1.247us 的空白期正是本轮填入的位置。\n\n## 预测与验收口径\n\n每 tile 的 `vcast/vmuls/vexp` 调用数保持各 1 次、总次数等于 tile 数（首块 1 次 + 每个 has_next 1 次），新增每 tile 至多 3 条 `PIPE_V` 屏障与 1 条 V 侧等待（等待时长为 0）；预测 PV 标量等待 `id0` 单 tile 缩短约 0.3–0.65us，20 块×约 26 tile 的聚合上限 8–16us。宿主可逐项核对：概率区间是否从 47.049–47.835us 移入 PV 就绪等待窗口、`id0` 是否缩短、`180480/180736` 是否被使用、`114688..180224` 在归一化期间是否被改写、AIC 与 GM/L0C 字节是否不变。窗口为同核部分区间、`application_completed=false`，绝对时钟只在同核内比较，动态区间计数仅覆盖该窗口。\n\nCodex 的证据分析（0.927us 间隙、别名阻塞、迁移地址与每块一次等待的约束）已记入 evidence 的 `codex-brief.json` 条目，具体 IR 实现与本轮全部别名/事件审查由本次调用完成。"
+  }
+}

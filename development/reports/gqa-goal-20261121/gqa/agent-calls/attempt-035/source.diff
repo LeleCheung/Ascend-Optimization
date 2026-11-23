@@ -1,0 +1,28 @@
+--- 
++++ 
+@@ -570,6 +570,17 @@
+     else:
+         P = 1
+         grid = (triton.cdiv(S, BLOCK_M), B * NQ)
++
++    # 本独立实验（仅启动元数据）：PART_TILES 路径把 launch num_stages 由 1
++    # 提到 2，交由 triton-ascend 后端自动多缓冲（auto multi-buffer）把下一
++    # tile 的 MTE2 搬运与当前 tile 的 Cube/Vector 段重叠，针对当前 trace 中
++    # 占主导的跨 tile 复用等待（aiv_scalar_wait 约 1128us、CUBE/MTE2 空闲
++    # 约 70%/88%）；其余路径保持 num_stages=1。kernel 函数体、数值表达式、
++    # 中间 dtype、stride、grid 与 worker 分区逐字不变，手工 IR 修改数量为 0。
++    # 代价/风险：K/V/Q 双份缓冲抬高 UB 峰值，且内层每 tile 仅重新载入
++    # 32KiB 的 Q，可被隐藏的搬运量有限；实际收益、执行产物是否改变及 UB
++    # 是否超限，均以修改后完整四项评测与重放分析为准，此处不预设结论。
++    launch_stages = 2 if PART_TILES else 1
+     _gqa_fwd_kernel[grid](
+         query, key, value, y,
+         query.stride(0), query.stride(1), query.stride(2), query.stride(3),
+@@ -585,6 +596,6 @@
+         SINGLE_KV=SINGLE_KV,
+         PART_TILES=PART_TILES,
+         NB_M=NB_M, TPG=TPG, T=T, P=P,
+-        num_warps=1, num_stages=1,
++        num_warps=1, num_stages=launch_stages,
+     )
+     return y

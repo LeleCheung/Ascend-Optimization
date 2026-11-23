@@ -1,0 +1,206 @@
+--- 
++++ 
+@@ -157,6 +157,109 @@
+ import torch
+ import triton
+ import triton.language as tl
++
++# ---------------------------------------------------------------------------
++# 主机发射缓存（本轮机制，host-only；不改任何 @triton.jit AST 与算术）
++# ---------------------------------------------------------------------------
++# 目标：暖调用不再重复执行 dynamic_func 绑定、specialize_impl、compute_cache_key、
++# apply_compile_options 与 launch_metadata 构造，而是在首次普通 JIT 调用（恰好
++# 一次计算）后，按静态特化身份复用真实 CompiledKernel 的 NPULauncher、function
++# 与 packed_metadata。每次调用仍由当前 query/key/value 和每次新分配的 y 重建
++# 完整 42 槽启动 ABI（含 constexpr 占位），并动态读取当前 NPU device 与 raw
++# stream；不缓存张量、指针、stream 或输出。任一守卫不满足即回退普通 JIT。
++try:  # 运行时钩子/调试状态以当前 Triton knobs 为准；导入失败则永久走普通 JIT。
++    from triton import knobs as _gqa_rt_knobs
++except Exception:  # pragma: no cover - 仅在运行时接口缺失时触发
++    _gqa_rt_knobs = None
++
++_GQA_LAUNCH_FAST = {}
++_GQA_LAUNCH_FAST_MAX = 32
++_GQA_MISSING = object()
++_GQA_HOST_PROBE = {
++    "done": False,      # 是否已探测运行时原始查询接口
++    "ok": False,        # 当前运行时是否支持该快路径
++    "stream_fn": None,  # 动态 stream 查询函数对象（可缓存）
++    "stream_mode": None,  # 1: 带 device；0: 无参
++    "device_fn": None,  # 动态 device 查询函数对象（可缓存）
++}
++
++
++def _gqa_host_probe():
++    """一次性探测当前运行时是否提供原始 stream/device 查询；失败则停用快路径。"""
++    probe = _GQA_HOST_PROBE
++    if probe["done"]:
++        return probe["ok"]
++    probe["done"] = True
++    try:
++        import torch_npu
++
++        c = torch_npu._C
++        stream_fn = getattr(c, "_npu_getCurrentRawStreamNoWait", None)
++        if stream_fn is None:
++            return False
++        probe["stream_fn"] = stream_fn
++        probe["device_fn"] = getattr(c, "_npu_getDevice", None)
++        probe["ok"] = True
++    except Exception:
++        probe["ok"] = False
++    return probe["ok"]
++
++
++def _gqa_host_device_stream(fallback_device):
++    """读取当前 device 与当前 raw stream；只返回本次的值，绝不登记缓存。"""
++    if not _gqa_host_probe():
++        return None
++    probe = _GQA_HOST_PROBE
++    try:
++        dfn = probe["device_fn"]
++        device = dfn() if dfn is not None else fallback_device
++        if device is None:
++            return None
++        sfn = probe["stream_fn"]
++        mode = probe["stream_mode"]
++        if mode is None:
++            # 首次按真实 device 探测调用约定；两种形式都不改变设备状态。
++            try:
++                stream = sfn(device)
++                probe["stream_mode"] = 1
++            except TypeError:
++                stream = sfn()
++                probe["stream_mode"] = 0
++        elif mode == 1:
++            stream = sfn(device)
++        else:
++            stream = sfn()
++        return device, stream
++    except Exception:
++        # 运行时查询失败时停用快路径，后续调用走普通 JIT。
++        probe["ok"] = False
++        return None
++
++
++def _gqa_host_guards_ok():
++    """活动钩子、编译/调试模式与全局值不变性的逐次校验。"""
++    try:
++        rt = _gqa_rt_knobs.runtime
++        if rt.debug or getattr(rt, "interpret", False):
++            return False
++        enter = getattr(rt, "launch_enter_hook", None)
++        exit_ = getattr(rt, "launch_exit_hook", None)
++        if enter is None or exit_ is None:
++            return False
++        # HookChain 容器始终存在；按 .calls 判活动性，空链不构成采集/分析模式。
++        if getattr(enter, "calls", None) or getattr(exit_, "calls", None):
++            return False
++    except Exception:
++        return False
++    fn = _gqa_fwd_kernel
++    if fn.debug or fn.pre_run_hooks:
++        return False
++    missing = _GQA_MISSING
++    for (name, _), (val, gdict) in fn.used_global_vals.items():
++        if gdict.get(name, missing) != val:
++            return False
++    return True
++
+ 
+ 
+ @triton.jit
+@@ -611,12 +714,51 @@
+     else:
+         P = 1
+         grid = (triton.cdiv(S, BLOCK_M), B * NQ)
+-    _gqa_fwd_kernel[grid](
+-        query, key, value, y,
++    grid_0 = grid[0]
++    grid_1 = grid[1] if len(grid) > 1 else 1
++    grid_2 = grid[2] if len(grid) > 2 else 1
++
++    # 静态特化身份：连续布局下 stride 由 shape 唯一决定；键覆盖 device、dtype、
++    # shape、几何/分块、实际 16B 对齐类与 grid，非连续或查询失败时不走快路径。
++    device = None
++    fkey = None
++    if (query.is_contiguous() and key.is_contiguous() and value.is_contiguous()
++            and _gqa_host_guards_ok()):
++        found = _gqa_host_device_stream(query.device.index)
++        if found is not None:
++            device, stream = found
++            align = (query.data_ptr() % 16 == 0, key.data_ptr() % 16 == 0,
++                     value.data_ptr() % 16 == 0, y.data_ptr() % 16 == 0)
++            fkey = (device, query.dtype, key.dtype, value.dtype,
++                    B, S, NQ, D, SKV, NKV, G, qk_scale, sm_offset,
++                    BLOCK_M, BLOCK_N, BLOCK_D, bool(is_causal),
++                    MASK_MD, MASK_KV, PV_SINGLE_F16, SINGLE_KV, PART_TILES,
++                    NB_M, TPG, T, P, grid_0, grid_1, grid_2, align,
++                    query.device.index)
++            entry = _GQA_LAUNCH_FAST.get(fkey)
++            if entry is not None:
++                (kern, launcher, func, packed, tail, jit_cache, jit_key,
++                 _cached_dev, _cached_qdev) = entry
++                # 失效校验：仅当 JIT 缓存仍持有同一已编译产物时才直接发射；
++                # 否则回退普通 JIT 重新编译，尊重 invalid-cache 条件。
++                if jit_key is None or jit_cache.get(jit_key) is kern:
++                    # 完整 42 槽 ABI：当前 grid/stream/function/packed + 当前
++                    # 张量与本次新分配的 y + 不可变 constexpr 尾部；无活动
++                    # 钩子时以 Py_None 跳过空 HookChain 的 Python 调用。
++                    launcher(grid_0, grid_1, grid_2, stream, func, packed,
++                             None, None, None,
++                             query, key, value, y, *tail)
++                    return y
++
++    # 普通 JIT 路径：每个静态身份的首调用（恰好一次计算），以及全部回退场景。
++    strides = (
+         query.stride(0), query.stride(1), query.stride(2), query.stride(3),
+         key.stride(0), key.stride(1), key.stride(2), key.stride(3),
+         value.stride(0), value.stride(1), value.stride(2), value.stride(3),
+         y.stride(0), y.stride(1), y.stride(2), y.stride(3),
++    )
++    kernel = _gqa_fwd_kernel.run(
++        query, key, value, y, *strides,
+         S=S, SKV=SKV, D=D, NQ=NQ, G=G, NKV=NKV,
+         qk_scale=qk_scale, delta=SKV - S, SM_OFFSET=sm_offset,
+         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+@@ -627,5 +769,39 @@
+         PART_TILES=PART_TILES,
+         NB_M=NB_M, TPG=TPG, T=T, P=P,
+         num_warps=1, num_stages=1,
++        grid=grid, warmup=False,
+     )
++
++    # 登记快路径：只复用本次普通 JIT 真实返回、且仍位于 JIT 缓存中的产物。
++    # compile-only 下首调用未执行计算，故不登记；活动钩子/调试场景同样不登记。
++    if fkey is not None and kernel is not None:
++        try:
++            launcher = kernel.run  # 初始化句柄，取得 NPULauncher 与 function
++            if not getattr(launcher, "compile_only", False):
++                cache = _gqa_fwd_kernel.device_caches.get(device)
++                if cache is not None:
++                    kcache = cache[0]
++                    jit_key = None
++                    for k, v in kcache.items():
++                        if v is kernel:
++                            jit_key = k
++                            break
++                    if jit_key is not None:
++                        tail = strides + (
++                            S, SKV, D, NQ, G, NKV,
++                            qk_scale, SKV - S, sm_offset,
++                            BLOCK_M, BLOCK_N, BLOCK_D, bool(is_causal),
++                            MASK_MD, MASK_KV, PV_SINGLE_F16, SINGLE_KV,
++                            PART_TILES, NB_M, TPG, T, P,
++                        )
++                        if len(_GQA_LAUNCH_FAST) >= _GQA_LAUNCH_FAST_MAX:
++                            _GQA_LAUNCH_FAST.clear()
++                        _GQA_LAUNCH_FAST[fkey] = (
++                            kernel, launcher, kernel.function,
++                            kernel.packed_metadata, tail, kcache, jit_key,
++                            device, query.device.index,
++                        )
++        except Exception:
++            # 登记失败只影响后续走普通 JIT，不改变本次已完成的唯一计算。
++            pass
+     return y

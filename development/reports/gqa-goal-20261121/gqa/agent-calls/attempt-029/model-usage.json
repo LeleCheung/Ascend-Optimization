@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 33,
+    "duration_ms": 112401,
+    "usage": {
+      "input_tokens": 50884,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 925184,
+      "output_tokens": 19013,
+      "output_tokens_details": {
+        "thinking_tokens": 6145
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 50884,
+        "outputTokens": 19013,
+        "cacheReadInputTokens": 925184,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.1923369999999998,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 6145,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.1923369999999998,
+    "result": "已完成机制实现并登记决策，`preflight` 返回 `awaiting_source_review`（候选字节保持 `2ffb6f61…`）。\n\n## 本轮机制（唯一）：20 常驻 worker 连续 tile 分区\n\n**决策记录**：`decision_id 452dfc55…`（绑定修改前源码 SHA `2a98e3e0…`，即 019 保留父版本；记录文件在 `trace/decisions/`）。\n\n**证据（本轮实际读取）**\n- `workspace/current-profiling.json`：候选 Block Dim=128、Task 257.645us，L0C_to_GM 768KB/程序、GM_to_L1 512KB/程序；参考 19 程序、Block Dim=19 完成同一份 2048 条 cube 指令 → 程序数/K-V 重复载入是可疑项。\n- `workspace/actual-ir/2-_gqa_fwd_kernel.ttir`：K/V 的 256×128 load 与 `v16 = extf+truncf` 在 `scf.for t=0..4` 之外各一次；循环体内每 tile 为 `tt.dot`(QK,128×256 f32)、exp2 softmax、`truncf`→f16、`tt.dot`(PV,128×128 f32)、divf 归一化 + store。\n- `workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir`：K/V 各一个 `memref.alloc 256x128xbf16` 在循环外；QK `outs` 128×256 f32、PV `outs` 128×128 f32，Q 每 tile 128×128 copy。\n\n**实现**（仅改 `PART_TILES` 分支，取代 headgroup 所有权）\n- 元数据：`TPG = G*NB_M`、`T = B*NKV*TPG`（case4=512、case7=64）、`P = min(20, T)`、`grid=(P,)`。\n- 内核：`lo=floor(pid*T/P)`、`hi=floor((pid+1)*T/P)`；外层 `for grp in [lo//TPG, (hi-1)//TPG]` 逐 KV 组载入 K 并把 V 一次性转 fp16；内层 `for t in [max(lo,grp*TPG), min(hi,(grp+1)*TPG))` 逐 tile，`gi=t//NB_M, mb=t%NB_M, hq=kvh*G+gi`。floor 区间首尾相接 ⇒ 全部 T 个 tile 唯一覆盖、每 (b,hq,行块) 只写一次。\n- 每 tile 表达式、相加顺序、单次 FP16 PV、FP32 softmax、PV 后归一化、BSND 写回与 019 逐字相同（无跨 tile 归约，故浮点结果应逐位可对齐）；FP16 与其他 dtype 的二维 grid 通用路径、因果 64/64、两项分解全部未动。无按 case_id/输入值选路，host 仅分辨率、分配输出与启动。\n\n**活跃缓冲风险**：K/V 张量形状与 019 相同（各 64KiB），只是位置从\"循环外一次\"变为\"外层组循环内复用\"；峰值仍由 128×256 f32 qk/p + 128×256 f16 p + 128×128 f32 acc 决定，不新增张量。未知项已记入 diagnosis：后端是否把组循环内的 `memref.alloc` 提升复用（否则多一次拷贝开销）、每 worker 25~26 条串行交接链的隐藏能力、case7 T=64 时组边界错位是否吃掉固定开销。\n\n## 交接\n候选字节自 preflight 起未再变更（`source_sha256 = 2ffb6f6125d0b2ea3a06593661b9bba034a3df04040ec4610de4b0a982aaab9f`）。请宿主完成只读路径/地址边界审查并跑原完整四项真机评测（case1/2/4/7、原 golden 与 checker `863f6862…`、原阈值）。判别性观测：修改后应有 Block Dim=20、case4 GM_to_L1 由 65536KB 降至约 6.5MB 量级、cube 指令总数与 L0C 总量不变；若耗时降到 262.27775us 以下且交通确实下降则机制成立，若交通下降而耗时未降，则瓶颈转为每 worker 串行交接链，下一轮应转向并行度/链交错方向。"
+  }
+}

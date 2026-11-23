@@ -1,0 +1,97 @@
+--- 
++++ 
+@@ -13,11 +13,17 @@
+ KV heads are never materialised to N_q heads: each program indexes the shared
+ K/V head hq // G directly.
+ 
+-本轮的 PV 归约轴合并（仅 bf16，见循环内注释）：每轮 KV 的 dot 输出由
+-QK + 两次 PV 降为 QK + 一次 PV，减少了由 profiling 观测到的、随交接链
+-主导墙钟的 L0C 搬出/fixpipe/跨核握手次数；两项概率分解仍完整保留，
+-只是改在同一 fp32 累加器中交错求和，数值风险由完整四项 checker 验收。
+-fp16 路径的两次 dot 形态保持不变。
++PV 精度路径（本轮修复后，两种 dtype 一致）：每轮 KV 仍做两次 PV dot
++（p_hi 与经 ×2048 预缩放的残差 p_lo），两项概率分解与相加顺序保持不变。
++上一轮曾尝试把两项沿归约轴用 tl.join/broadcast/reshape 拼成一次 dot（仅
++bf16），实测 case4/case7 在 candidate.py:64 报 ub overflow（required
++855552B > available 196608B），实际 TTIR 显示 join 生成 128x128x2、
++reshape 成 128x256，V 广播成 128x2x128 再 reshape 成 256x128，这 4 个
++2N 宽张量无法在 UB 内与 p_hi/p_lo/v 复用；而同一尝试中 fp16 的普通两次
++dot（128/128/128）可以编译。故本轮删除该拼接表达，恢复普通两次 dot，
++代价是每 KV 块多一次 L0C 搬出/fixpipe/跨核握手（QK+1 -> QK+2 次 PV），
++精度路径与已验收父版一致。单次 dot 合并若要保留，需另找不产生交错/复制
++布局的操作数构造方式，并重新以实际编译资源值验证。
+ 
+ Query-row reuse (earlier mechanism, non-causal only): BLOCK_M stays 64 for
+ the causal path and rises to 128 otherwise, so a program keeps the loaded K/V
+@@ -76,7 +82,6 @@
+     IS_CAUSAL: tl.constexpr,
+     MASK_MD: tl.constexpr,
+     MASK_KV: tl.constexpr,
+-    MERGE_PV: tl.constexpr,
+ ):
+     pid_m = tl.program_id(0)
+     pid_bh = tl.program_id(1)
+@@ -163,31 +168,9 @@
+         # against the O(sum_j p_j |v_j|) accumulator; V is an exact input, so
+         # only p is split.  Everything stays strict Triton.
+         p_hi = p.to(v.dtype)
+-        if MERGE_PV:
+-            # 本轮机制（仅 bf16）：把概率高低两项沿 PV 的归约轴交错合并成一次 dot。
+-            # p 的两项按列交错（tl.join 新增的末维展平），V 相应重复成两行
+-            # （[:, None, :] 广播后展平），于是 dot 的每个归约坐标 j 上
+-            # p_hi[j]*v[j] 与 p_lo[j]*v[j] 相邻累加，语义与原来的
+-            # tl.dot(p_hi,v) + tl.dot(p_lo,v)/2048 一致。
+-            # bf16 指数范围与 fp32 相同，残差 (p-p_hi) 直接转 bf16 不会下溢，
+-            # 故省掉原来的 ×2048 预缩放及随后对整块 PV 输出的 ×(1/2048)；
+-            # 两项仍完整保留，残差相对误差仍是 2^-9，总误差 ~2^-18 p。
+-            # 数值风险：高低项现在交错进入同一个 fp32 累加器，求和顺序与原
+-            # 「先累加高项、再单独累加低项后相加」不同，差异量级为
+-            # O(u_fp32 * sum_j p_j|v_j|)，远低于 2^-18 分裂误差，需完整四项
+-            # 官方 checker 确认。收益：每轮 KV 的 dot 输出 3->2，少一次
+-            # L0C 搬出/fixpipe 与跨核握手；代价：join/reshape 的 UB 内布局复制。
+-            p_lo = (p - p_hi.to(tl.float32)).to(v.dtype)
+-            p_cat = tl.reshape(tl.join(p_hi, p_lo), (BLOCK_M, 2 * BLOCK_N))
+-            v_cat = tl.reshape(
+-                tl.broadcast_to(v[:, None, :], (BLOCK_N, 2, BLOCK_D)),
+-                (2 * BLOCK_N, BLOCK_D),
+-            )
+-            acc = acc * alpha[:, None] + tl.dot(p_cat, v_cat)
+-        else:
+-            r1 = (p - p_hi.to(tl.float32)) * 2048.0
+-            p_lo = r1.to(v.dtype)
+-            acc = acc * alpha[:, None] + tl.dot(p_hi, v) + tl.dot(p_lo, v) * (1.0 / 2048.0)
++        r1 = (p - p_hi.to(tl.float32)) * 2048.0
++        p_lo = r1.to(v.dtype)
++        acc = acc * alpha[:, None] + tl.dot(p_hi, v) + tl.dot(p_lo, v) * (1.0 / 2048.0)
+         m_i = m_safe
+ 
+     l_safe = tl.where(l_i > 0.0, l_i, 1.0)
+@@ -235,7 +218,8 @@
+     # 两项概率分解的表达式与相加顺序保持不变，仅 KV 轴划分与重缩放次数变化。
+     #
+     # 上一轮（已验收，774.8852us）改动只在编译期几何特化与可证冗余掩码消除上；
+-    # 本轮在此之上只改非因果的 BLOCK_M（64->128），见下方说明。因果/非因果
++    # 本轮在此之上只改非因果的 BLOCK_M（64->128），见下方说明；另按本轮编译
++    # 失败反馈删除了 bf16 的拼接式单 PV dot，恢复普通两次 dot。因果/非因果
+     # BLOCK_N 分流、两项概率分解表达式与相加顺序均保持不变。
+     # 收益或代价都必须由完整四项真机评测判定，本注释不据此改写结论。
+     # 数值风险说明：BLOCK_M 只改变 tl.dot 的 M 维铺排与程序数，每行输出仍按同一
+@@ -269,9 +253,6 @@
+     # 合法 grid 下恒真，可以整段删除；否则内核走原来的通用掩码分支，语义不变。
+     MASK_MD = not ((S % BLOCK_M == 0) and (D == BLOCK_D))
+     MASK_KV = not ((SKV % BLOCK_N == 0) and (D == BLOCK_D))
+-    # 仅 bf16 采用合并 PV dot（见内核注释）。dtype 是合法输入元数据，
+-    # 不涉及 case_id 或数值选路；fp16 的两次 dot 精度路径保持不变。
+-    MERGE_PV = (query.dtype == torch.bfloat16)
+ 
+     grid = (triton.cdiv(S, BLOCK_M), B * NQ)
+     _gqa_fwd_kernel[grid](
+@@ -284,7 +265,7 @@
+         qk_scale=qk_scale, delta=SKV - S,
+         BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+         IS_CAUSAL=bool(is_causal),
+-        MASK_MD=MASK_MD, MASK_KV=MASK_KV, MERGE_PV=MERGE_PV,
++        MASK_MD=MASK_MD, MASK_KV=MASK_KV,
+         num_warps=1, num_stages=1,
+     )
+     return y

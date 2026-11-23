@@ -1,0 +1,212 @@
+{
+  "timestamp": "2026-11-21T15:49:29.561086+00:00",
+  "diagnosis": {
+    "source_sha256": "fd25f875c334f929efa8d0fab381344dfcdb901989c12b113e6ede30e537eda3",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "feedback.json",
+        "category": "evaluation",
+        "role": "当前IR的正式验收状态与两次编译失败量级",
+        "finding": "顶层status为target_compile_failed；case4与case7的原文错误为ub overflow, requires 1576960 bits while 1572864 bits available（即197120B对196608B，超出512B）；ir002与ir003的output结果均报requires 2097152 bits（262144B，超出65536B）；ir001 output报failed to legalize operation linalg.generic。三组结果共用同一源码身份fd25f875，当前分支保持逐字节冻结，target延迟一栏为空，比较起点取context.retained_best的attempt-047 case4 175.5726us。"
+      },
+      {
+        "path": "context.json",
+        "category": "evaluation",
+        "role": "本轮证据模式、保留最佳与可编辑边界",
+        "finding": "evidence_mode为compile-repair，editable_ir_stage为bcmlir，target_marker为%c8192_i32；parent_invocation为ir-003，parent_ir给出ir/target 796f05c2与ir/case7 9d3e7578两份哈希，与工作区两份待修IR对应；retained_best为attempt-047（源码3c34fdfb）四例合格，case4 candidate 175.5726us、case1 111.5631us、case2 106.2831us、case7 94.6896us。"
+      },
+      {
+        "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "case4特化的实际BCMLIR输出归一化位置",
+        "finding": "PV结果%49为tensor<128x128xf32>（outs(%5)零初值），行分母%reduced为tensor<128xf32>；输出循环scf.for %arg14 = 0 to 128 step 8内先算出%o_view（8x128 bf16 GM，strides[128,1]），再用%o_slice=extract_slice %49[%arg14,0][8,128]{DiscreteMemAccess}、%o_den=extract_slice %reduced[%arg14][8]{DiscreteMemAccess}、linalg.broadcast 8->8x128、arith.divf、arith.truncf到8x128xbf16，最后materialize_in_destination落到%o_view；该循环带{ExtractedLoadOrStore, hivm.parallel_loop}。归一化链条位于按G=8分组的存储循环内部。"
+      },
+      {
+        "path": "ir/case7/_gqa_fwd_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "case7特化的同构位置",
+        "finding": "结构与case4一致，分组步长为%c4，%o_view为4x128 bf16，切片与broadcast同为4行（%o_den为tensor<4xf32>），地址常量%c4096_i32/%c512_i32对应Nkv=8、D=128、Skv=256的行映射；输出循环同样带{ExtractedLoadOrStore, hivm.parallel_loop}，归一化链条同样位于分组存储循环内。两份特化函数签名与参数列表逐字相同。"
+      },
+      {
+        "path": "compiled-readonly/diagnostic-grouped-hivm.txt",
+        "category": "source_ir",
+        "role": "分组版最终AIV的UB分配与vdiv/vcast形态",
+        "finding": "最终AIV在输出循环内为每组分配%alloc_25 memref<8x128xf32,ub>（4096B，承接GM到UB的1024xf32 load）、%alloc_29 memref<8x128xf32,ub>（4096B，vdiv输出）、%alloc_30 memref<64xf32,ub>（256B，vdiv temp_buffer）、%alloc_31 memref<8x128xbf16,ub>（2048B，vcast输出），四项合计10496B；hivm.hir.vdiv的操作数是%expand_shape产生的8x1视图并带broadcast=[1]，vcast后由scf.if {limit_sub_block_id0}守卫store。PV结果%43位于GM工作区memref<128x128xf32>，行分母累积%alloc_21为128x1xf32、%alloc_22为16384xf32。"
+      },
+      {
+        "path": "compiled-readonly/diagnostic-original-hivm.txt",
+        "category": "source_ir",
+        "role": "原始逐行版对照的低层形态",
+        "finding": "原始049逐行版在输出循环内为每行分配1x128xf32的load缓冲与1x128xf32的vdiv输出、32B temp_buffer、1x128xbf16的vcast输出，vdiv标量操作数来自%collapse_shape_23[%arg12]的memref.load；store同样由scf.if {limit_sub_block_id0}守卫，循环属性仅{ExtractedLoadOrStore}。该版所需1576960 bits与分组版2097152 bits均为实际规划结果。"
+      },
+      {
+        "path": "compiled-readonly/retained047-normalization.bcmlir",
+        "category": "source_ir",
+        "role": "整张量归一化在该后端可编译的既有实例",
+        "finding": "attempt-047（源码3c34fdfb）的实际BCMLIR在行循环内以linalg.broadcast(%reduced:128xf32 -> outs %4:128x128xf32, dimensions=[1])、arith.divf %56, %broadcasted（整128x128 fp32）、arith.truncf到128x128xbf16，随后单条materialize_in_destination落到128x128 strided GM视图；该模块编译通过并成为保留最佳。整张量broadcast+除+cast在本case形态上有既往成功先例。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "paired_profiling",
+        "role": "047历史窗口的MTE3输出store与归一化等待排序",
+        "finding": "该材料source_sha256为3c34fdfb，属历史047版本。AIV窗口内MTE3的MOV_SRC_TO_DST_ALIGN（pc 0x10d11c64）calls=8、running_time_us=25.6、detail为Src:UB,Dst:OUT,Dtype:B16，source_stack指向candidate.py:409的tl.store；同窗口FLOWCTRL的WAIT_FLAG_DEVI（pc 0x10d11588）calls=9、84.32us，source_stack指向candidate.py:402的out = acc / l_new[:, None]。归一化与输出store在热点排序里同属尾部关注区，累计指令时间按流水重叠，仅用于定位候选机制。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "窗口覆盖、绝对时钟资质与AIV流水占用口径",
+        "finding": "每核capture_scope为First to last visible hardware event，display_time_unit为window_fraction、capture_start 0.0与capture_end 1.0，即归一化范围为观测窗口自身；clock_qualification为relative_only、absolute_time_qualified为false，raw_clock_window为128.958~228.979且unit标为unassigned，absolute_unit_validation以22个非同步PC比例中位0.99980核对us量纲。AIV窗口MTE3的event_count=67、productive_ratio=0.4350、wait_ratio=0.2066、idle_ratio=0.3584，interpretation声明只统计显式WAIT/BAR，空区间仅描述观测窗口。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "历史对照的算子级时长与块维度",
+        "finding": "该材料spec.source为attempt-047、source_sha256为3c34fdfb。reference的FusedInferAttentionScore Task Duration为119.902us、Block Dim 19、Mix Block Dim 38；candidate的_gqa_fwd_kernel_mix_aic为174.563us、Block Dim 20、Mix Block Dim 40，aiv_time(us)均值111.725。历史向量时间在总量中的占比与本次IR的UB规划属不同口径，逐项用时留给宿主重放核对。"
+      },
+      {
+        "path": "memory-partition-findings.json",
+        "category": "source_ir",
+        "role": "编译器pass诊断对UB分区与冗余消除的判断",
+        "finding": "两份最终AIV均含128x256 FP32概率缓冲与128x1行分母，get_sub_block_idx与compare==0的守卫仅覆盖输出store且带limit_sub_block_id0，store之前的向量p/sum工作未见按行减半；分组输出的broadcast被落实为8x1视图加vdiv broadcast=[1]；输入拷贝循环已有ExtractedLoadOrStore与hivm.parallel_loop，分组输出循环只有ExtractedLoadOrStore。原始内存失败197120B与分组262144B均为实际规划结果。"
+      },
+      {
+        "path": "codex-brief.json",
+        "category": "evaluation",
+        "role": "宿主证据分析与本轮限定的候选方向",
+        "finding": "Codex分析指出ir003的并行标注未改变UB，源码049的分组输出循环把PV行load与标量/张量归一化放进每轮迭代，而047的实际BCMLIR把整128x128的broadcast/除法/cast放在affine store之前并可编译；据此提出恢复整张量归一化表达式同时保留head-fast分组scatter地址，提示潜在代价是64KiB FP32与32KiB BF16整张量中间量，并要求用实际AIV分区与UB核对。"
+      }
+    ],
+    "hypothesis": "分组输出循环把一次整张量逐元素链拆成G行子块，并在带DiscreteMemAccess的extract_slice上引入GM到UB的子块load；后端为此在每轮迭代同时保留子块f32输入、f32除法输出、temp_buffer与bf16输出，规划出的峰值比可用UB高65536B（262144B对196608B）。把源码本就存在的整张量语义（out = acc / l_new[:, None] 后一次转Out dtype）恢复到分组存储循环之外，让归一化与cast成为循环前的一条纯整张量逐元素链，存储循环只做已归一化bf16切片的落位；该形态在attempt-047的实际BCMLIR中已有可编译先例，预期令编译器对逐元素链做单次tile或在PV工作区上就地复用，从而去掉带DiscreteMemAccess的子块load与除法缓冲并发占用，使AIV规划需求回落到196608B以内。",
+    "alternatives": [
+      "保持当前IR不动：ir002与ir003的实测需求均为262144B，按现状提交的编译结果继续失败，本轮无收益。",
+      "只把truncf提出循环而保留子块divf：除法链仍在分组循环内，%alloc_25/%alloc_29的并发占用保留，UB回收量最多2048B，小于65536B缺口。",
+      "把归一化进一步提到行步循环之外（每行块只算一次）：超出本轮登记的机制范围，且行步循环内的PV按16或4行粒度重算，需要另行论证数值与地址身份。",
+      "回到049的逐行store并削掉512B：可行方向，但放弃分组连续地址，MTE3的8行连续写回收益一并放弃，且需单独登记。",
+      "用近似倒数或改变行归约顺序降低向量代价：违反本轮保持全部数学精度的约束，已排除。",
+      "在源码层表达同一整张量形态：本轮源码逐字节冻结，源码改动属于独立研究身份。"
+    ],
+    "change": "仅编辑ir-inventory列出的两份BCMLIR，改动限定在各自行步循环内的输出存储循环前后，函数签名、参数、ABI与特化常量保持不变。1) 在%reduced归约之后、分组存储循环之前新增tensor.empty() : tensor<128x128xf32>、linalg.broadcast(%reduced, dimensions=[1])到128x128、arith.divf %49, 该broadcast（整128x128 fp32）、arith.truncf到tensor<128x128xbf16>（整张量一次cast）。2) 分组存储循环体内的%o_slice改为对整张量bf16结果做extract_slice[%arg14,0][G,128][1,1]，去掉%o_den、%o_den_b、%o_den_2d、%o_div、%o_tr与两处DiscreteMemAccess，直接materialize_in_destination该bf16切片到同一%o_view（case4为8x128，case7为4x128，地址表达式%o_seq/%o_base/%o_j/%o_head/%o_off/%o_addr逐字保留）。3) 保留分组步长（case4为%c8、case7为%c4）、{ExtractedLoadOrStore, hivm.parallel_loop}属性、Q分组拷贝循环、K/V载入、两次linalg.matmul的input_precision=ieee、exp2前后的truncf/extf、FP32行归约顺序与mulf/subf常量，以及全部输入行映射常量。",
+    "expected": [
+      "指令变化：分组存储循环内的linalg.broadcast、arith.divf、arith.truncf不再随迭代展开，改为循环外单条整张量vdiv与单条整张量vcast；存储循环仅剩UB到GM的bf16切片写回，对应hivm.hir.store的条数与分组数一致（case4每行步16条、case7每行步32条），单条长度由Gx128个bf16保持（case4 1024个、case7 512个）。",
+      "指令变化：GM到UB的子块f32 load与带broadcast=[1]的8x1视图操作数从输出循环中消失，取而代之的是PV工作区到UB的整128x128 f32读取一次，按后端tile策略可能展开为多次load。",
+      "动态轮次：每个行步迭代内的逐元素除法与cast元素数由Gx128升为128x128，case4约16倍（1024到16384）、case7约32倍（512到16384）；分组存储写回的元素总数保持不变，仍为每行步G行乘已存行数。",
+      "等待与资源：预期AIV规划需求从262144B下降，目标为不超过196608B；同时预期store之前不再出现守卫到limit_sub_block_id0之外的子块归一化，MTE3写回仍为分组连续访问，历史窗口里25.60us/8calls的MTE3关注点所对应的地址形态得到保留。",
+      "可测偏差：若编译再次报2097152 bits或更高，说明整张量中间量与概率缓冲并发存活，机制在liveness上未兑现，需要在下一调用改为子块级复用或行步外层hoist。",
+      "可测偏差：若需求降到1572864 bits以内但case4/case7的延迟显著高于175.5726us与94.6896us这两个历史参考，说明整张量逐元素链的重复计算代价超过UB回收收益。"
+    ],
+    "validation": "宿主先用bishengir-compile对case4与case7各跑一次，记录required bits与available bits、生成的AIV函数中输出循环的load/vdiv/vcast/store分布，并按预期逐项核对：整张量vdiv/vcast是否出现于循环外、存储循环store条数与元素长度、循环内是否残留子块f32缓冲。若编译通过，再跑固定四例case1/2/4/7的官方checker与full-call计时，与retained_best（case4 175.5726us、case7 94.6896us、四例几何平均降幅43.27%）比较；同时核对输出与改动前的数值一致性（逐元素同一FP32除法后同一bf16舍入），并核对源码frozen.py与ir-inventory外文件哈希不变。",
+    "layer_reason": "Triton表达能力：源码第425行已写成out = acc / l_new[:, None]再在第432/435行一次转Out dtype并带掩码store，整张量归一化加一次cast在Triton层面本来就是源码的表达方式；分组归一化是后端把store下沉时形成的产物，恢复整张量表达式恰好回到源码语义，Triton层面无需新增表达能力。固定源码实验目的：本轮源码sha256为fd25f875并保持逐字节冻结，源码层的任何改写都会改变实验身份并使编译修复与源码收益两类结论混淆，因此把可测变量限定在BCMLIR的归一化位置与切片形态。IR控制点：两份BCMLIR的行步循环内存在确定的控制点，即%reduced之后的整张量broadcast/divf/truncf插入位与分组存储循环内的extract_slice+materialize_in_destination，改动只触及该点与随之失效的%o_den系链条，函数ABI、特化常量、地址表达式与其余算子逐字保留；同一意图若要在源码表达，可写成在tl.store之前先完成out.to(Out.dtype)并复用同一out张量，属于源码身份的独立实验，留给另一次调用。",
+    "simulator_incremental_judgment": "profiling.json、hotspots.json与timeline.json均绑定历史源码3c34fdfb（attempt-047），本轮的当前IR因编译失败没有设备数据，故这些材料只用于机制定位，不产生当前候选的延迟结论。窗口资质方面，绝对时钟为relative_only、absolute_time_qualified为false，raw_clock_window 128.958~228.979的unit标为unassigned，us量纲由22个非同步PC的比例中位0.99980核对；覆盖量为每核首个到最后一个可见硬件事件，归一化范围为window_fraction[0,1]，未报告泳道保持未知。热点排序按流水累计时间给出，各流水可重叠：MTE3的MOV_SRC_TO_DST_ALIGN 25.60us/8calls与FLOWCTRL的WAIT_FLAG_DEVI 84.32us/9calls指向输出写回与归一化邻域，用于确认分组连续写回这一形态值得保留。本轮改动带来的增量判断限于编译规划量与指令形态：预测AIV需求回落到196608B以内、循环外出现整张量vdiv/vcast、存储循环store条数不变；动态总次数的比较需在执行覆盖核对后进行，当前IR没有可用的执行覆盖，相关带宽与关键路径结论留待宿主重放与独立材料支持。"
+  },
+  "diagnosis_sha256": "0d6c3725c4a329c88edc22f8abaa3027f3282795b326eca4aa9a256c816b0bce",
+  "evidence": [
+    {
+      "path": "feedback.json",
+      "category": "evaluation",
+      "role": "当前IR的正式验收状态与两次编译失败量级",
+      "finding": "顶层status为target_compile_failed；case4与case7的原文错误为ub overflow, requires 1576960 bits while 1572864 bits available（即197120B对196608B，超出512B）；ir002与ir003的output结果均报requires 2097152 bits（262144B，超出65536B）；ir001 output报failed to legalize operation linalg.generic。三组结果共用同一源码身份fd25f875，当前分支保持逐字节冻结，target延迟一栏为空，比较起点取context.retained_best的attempt-047 case4 175.5726us。",
+      "sha256": "07b508b7925c7ce01e5543ba1beb1b45e788aa5f79ac6515adc7c5855df2bef6"
+    },
+    {
+      "path": "context.json",
+      "category": "evaluation",
+      "role": "本轮证据模式、保留最佳与可编辑边界",
+      "finding": "evidence_mode为compile-repair，editable_ir_stage为bcmlir，target_marker为%c8192_i32；parent_invocation为ir-003，parent_ir给出ir/target 796f05c2与ir/case7 9d3e7578两份哈希，与工作区两份待修IR对应；retained_best为attempt-047（源码3c34fdfb）四例合格，case4 candidate 175.5726us、case1 111.5631us、case2 106.2831us、case7 94.6896us。",
+      "sha256": "57bcf95c10b306d5343654ae660200cfa2ac564b9a6adc5cd740a5e2da418534"
+    },
+    {
+      "path": "ir/target/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "case4特化的实际BCMLIR输出归一化位置",
+      "finding": "PV结果%49为tensor<128x128xf32>（outs(%5)零初值），行分母%reduced为tensor<128xf32>；输出循环scf.for %arg14 = 0 to 128 step 8内先算出%o_view（8x128 bf16 GM，strides[128,1]），再用%o_slice=extract_slice %49[%arg14,0][8,128]{DiscreteMemAccess}、%o_den=extract_slice %reduced[%arg14][8]{DiscreteMemAccess}、linalg.broadcast 8->8x128、arith.divf、arith.truncf到8x128xbf16，最后materialize_in_destination落到%o_view；该循环带{ExtractedLoadOrStore, hivm.parallel_loop}。归一化链条位于按G=8分组的存储循环内部。",
+      "sha256": "796f05c2527ccd5bac98dbca102c0130485d06f60cff493d7ac3343025cddc96"
+    },
+    {
+      "path": "ir/case7/_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "case7特化的同构位置",
+      "finding": "结构与case4一致，分组步长为%c4，%o_view为4x128 bf16，切片与broadcast同为4行（%o_den为tensor<4xf32>），地址常量%c4096_i32/%c512_i32对应Nkv=8、D=128、Skv=256的行映射；输出循环同样带{ExtractedLoadOrStore, hivm.parallel_loop}，归一化链条同样位于分组存储循环内。两份特化函数签名与参数列表逐字相同。",
+      "sha256": "9d3e757875c620ff6e8aa46f7f500f9741f2e8d46eb452e7b46b6f29daf18bb5"
+    },
+    {
+      "path": "compiled-readonly/diagnostic-grouped-hivm.txt",
+      "category": "source_ir",
+      "role": "分组版最终AIV的UB分配与vdiv/vcast形态",
+      "finding": "最终AIV在输出循环内为每组分配%alloc_25 memref<8x128xf32,ub>（4096B，承接GM到UB的1024xf32 load）、%alloc_29 memref<8x128xf32,ub>（4096B，vdiv输出）、%alloc_30 memref<64xf32,ub>（256B，vdiv temp_buffer）、%alloc_31 memref<8x128xbf16,ub>（2048B，vcast输出），四项合计10496B；hivm.hir.vdiv的操作数是%expand_shape产生的8x1视图并带broadcast=[1]，vcast后由scf.if {limit_sub_block_id0}守卫store。PV结果%43位于GM工作区memref<128x128xf32>，行分母累积%alloc_21为128x1xf32、%alloc_22为16384xf32。",
+      "sha256": "19167f78e91f64a00adabc52ee34e9c9ba512726a6f7ca61f6cfe483d346dfbb"
+    },
+    {
+      "path": "compiled-readonly/diagnostic-original-hivm.txt",
+      "category": "source_ir",
+      "role": "原始逐行版对照的低层形态",
+      "finding": "原始049逐行版在输出循环内为每行分配1x128xf32的load缓冲与1x128xf32的vdiv输出、32B temp_buffer、1x128xbf16的vcast输出，vdiv标量操作数来自%collapse_shape_23[%arg12]的memref.load；store同样由scf.if {limit_sub_block_id0}守卫，循环属性仅{ExtractedLoadOrStore}。该版所需1576960 bits与分组版2097152 bits均为实际规划结果。",
+      "sha256": "00d53a8d9c49950e44024f7e653dbf1f7c8f6c43fb164d9eed46436160525b99"
+    },
+    {
+      "path": "compiled-readonly/retained047-normalization.bcmlir",
+      "category": "source_ir",
+      "role": "整张量归一化在该后端可编译的既有实例",
+      "finding": "attempt-047（源码3c34fdfb）的实际BCMLIR在行循环内以linalg.broadcast(%reduced:128xf32 -> outs %4:128x128xf32, dimensions=[1])、arith.divf %56, %broadcasted（整128x128 fp32）、arith.truncf到128x128xbf16，随后单条materialize_in_destination落到128x128 strided GM视图；该模块编译通过并成为保留最佳。整张量broadcast+除+cast在本case形态上有既往成功先例。",
+      "sha256": "1b8c41e573a25dec78d755766ef9228cae5f3f5204d00ef3353b67f77d9cc5cb"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "paired_profiling",
+      "role": "047历史窗口的MTE3输出store与归一化等待排序",
+      "finding": "该材料source_sha256为3c34fdfb，属历史047版本。AIV窗口内MTE3的MOV_SRC_TO_DST_ALIGN（pc 0x10d11c64）calls=8、running_time_us=25.6、detail为Src:UB,Dst:OUT,Dtype:B16，source_stack指向candidate.py:409的tl.store；同窗口FLOWCTRL的WAIT_FLAG_DEVI（pc 0x10d11588）calls=9、84.32us，source_stack指向candidate.py:402的out = acc / l_new[:, None]。归一化与输出store在热点排序里同属尾部关注区，累计指令时间按流水重叠，仅用于定位候选机制。",
+      "sha256": "efbb0d7cc1cb231169af2f8dd9107c6b401a53bf0090ffbbdab60bab75c8d80b"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "窗口覆盖、绝对时钟资质与AIV流水占用口径",
+      "finding": "每核capture_scope为First to last visible hardware event，display_time_unit为window_fraction、capture_start 0.0与capture_end 1.0，即归一化范围为观测窗口自身；clock_qualification为relative_only、absolute_time_qualified为false，raw_clock_window为128.958~228.979且unit标为unassigned，absolute_unit_validation以22个非同步PC比例中位0.99980核对us量纲。AIV窗口MTE3的event_count=67、productive_ratio=0.4350、wait_ratio=0.2066、idle_ratio=0.3584，interpretation声明只统计显式WAIT/BAR，空区间仅描述观测窗口。",
+      "sha256": "0f7146ec83e0916d404e7b62042bc2421d322e1bd0e67a3fa96f623682e22f3a"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "历史对照的算子级时长与块维度",
+      "finding": "该材料spec.source为attempt-047、source_sha256为3c34fdfb。reference的FusedInferAttentionScore Task Duration为119.902us、Block Dim 19、Mix Block Dim 38；candidate的_gqa_fwd_kernel_mix_aic为174.563us、Block Dim 20、Mix Block Dim 40，aiv_time(us)均值111.725。历史向量时间在总量中的占比与本次IR的UB规划属不同口径，逐项用时留给宿主重放核对。",
+      "sha256": "cecc4a2287dbb4318d6be3f240c5c7d37a4fa7bb9deeca2da7bc41c4d720b2ca"
+    },
+    {
+      "path": "memory-partition-findings.json",
+      "category": "source_ir",
+      "role": "编译器pass诊断对UB分区与冗余消除的判断",
+      "finding": "两份最终AIV均含128x256 FP32概率缓冲与128x1行分母，get_sub_block_idx与compare==0的守卫仅覆盖输出store且带limit_sub_block_id0，store之前的向量p/sum工作未见按行减半；分组输出的broadcast被落实为8x1视图加vdiv broadcast=[1]；输入拷贝循环已有ExtractedLoadOrStore与hivm.parallel_loop，分组输出循环只有ExtractedLoadOrStore。原始内存失败197120B与分组262144B均为实际规划结果。",
+      "sha256": "b5e2b8abcb05299a6cc5c7fc4b5e6dc102ba6469140153fce353a0ce356000da"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "evaluation",
+      "role": "宿主证据分析与本轮限定的候选方向",
+      "finding": "Codex分析指出ir003的并行标注未改变UB，源码049的分组输出循环把PV行load与标量/张量归一化放进每轮迭代，而047的实际BCMLIR把整128x128的broadcast/除法/cast放在affine store之前并可编译；据此提出恢复整张量归一化表达式同时保留head-fast分组scatter地址，提示潜在代价是64KiB FP32与32KiB BF16整张量中间量，并要求用实际AIV分区与UB核对。",
+      "sha256": "359ad8264f46f13af5e62520e370e49ad809dfcc529a963047a49b047ad61759"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "fd25f875c334f929efa8d0fab381344dfcdb901989c12b113e6ede30e537eda3",
+    "contract.json": "30323415a3ca3a313a4c31947b60d302fc9fc7251201ce18a32c17104a4cf858",
+    "ir-inventory.json": "d6ff5d62d6c3a0fdae6c8b34ac7c938ce279064103bf067de1ae047800f25dda",
+    "feedback.json": "07b508b7925c7ce01e5543ba1beb1b45e788aa5f79ac6515adc7c5855df2bef6",
+    "profiling.json": "cecc4a2287dbb4318d6be3f240c5c7d37a4fa7bb9deeca2da7bc41c4d720b2ca",
+    "hotspots.json": "efbb0d7cc1cb231169af2f8dd9107c6b401a53bf0090ffbbdab60bab75c8d80b",
+    "timeline.json": "0f7146ec83e0916d404e7b62042bc2421d322e1bd0e67a3fa96f623682e22f3a",
+    "gqa-head-row-language-evidence.txt": "da1fecda802f6fed0e6e8f2e1d78ce5b5c47b8d9587ea5dd5eb55897180bdcf1",
+    "context.json": "57bcf95c10b306d5343654ae660200cfa2ac564b9a6adc5cd740a5e2da418534",
+    "diagnosis.json": "d38ae0290ed2cc547d031033ffc806fce9c0e5eed19ed79604b15995b7e5de38",
+    "codex-brief.json": "359ad8264f46f13af5e62520e370e49ad809dfcc529a963047a49b047ad61759",
+    "memory-partition-findings.json": "b5e2b8abcb05299a6cc5c7fc4b5e6dc102ba6469140153fce353a0ce356000da",
+    "ir/target/_gqa_fwd_kernel.bcmlir": "796f05c2527ccd5bac98dbca102c0130485d06f60cff493d7ac3343025cddc96",
+    "ir/case7/_gqa_fwd_kernel.bcmlir": "9d3e757875c620ff6e8aa46f7f500f9741f2e8d46eb452e7b46b6f29daf18bb5",
+    "compiled-readonly/_gqa_fwd_kernel.ttir": "b940405368885e9fd449e76edd25e733822dc859e2f4933c63d2a0f6ff939edb",
+    "compiled-readonly/_gqa_fwd_kernel.ttadapter": "0dfa3181c57625c4ef4f3894f9b5cc35eba95f5df1e1cd30695f0a09f502c9fe",
+    "compiled-readonly/_gqa_fwd_kernel.bcmlir": "d4e494444fd707cd0e7a6ce95932d90e172e5f43867c64091738f48420ee667b",
+    "compiled-readonly/diagnostic-original-hivm.txt": "00d53a8d9c49950e44024f7e653dbf1f7c8f6c43fb164d9eed46436160525b99",
+    "compiled-readonly/diagnostic-grouped-hivm.txt": "19167f78e91f64a00adabc52ee34e9c9ba512726a6f7ca61f6cfe483d346dfbb",
+    "compiled-readonly/retained047-normalization.bcmlir": "1b8c41e573a25dec78d755766ef9228cae5f3f5204d00ef3353b67f77d9cc5cb"
+  },
+  "decision_tool_sha256": "2ba55ebab8be5b8a2363da657d6ee81799d4cabcdfb8e1494846aecfd1fde624"
+}

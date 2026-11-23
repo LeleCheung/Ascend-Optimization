@@ -1,0 +1,73 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "a9756361d5c9adae8f98c2d8b169b16ab1782fa48d96db4d1e3967d08b28002c",
+  "selected_layer": "host_launch_option:num_stages (only PART_TILES and BLOCK_M==256 -> 1; PART_TILES BLOCK_M==128 keeps 2; other paths stay 1)",
+  "layer_reason": "本次四项原合同里唯一失败是 case4 编译期资源超限（ub 294912B>196608B，cc 262144B>131072B），其余 case1/2/7 已通过官方 checker 且有计时。失败日志的 cc 需求 262144B 恰为 L0C 容量 131072B 的 2 倍，而 case4 IR 的 QK tt.dot 输出正是 tensor<256x256xf32>=262144B；同源码同 num_stages=2 的 case7（PART_TILES、BLOCK_M=128）其 QK 输出 tensor<128x256xf32>=131072B 恰好等于 L0C 且成功编译，说明 num_stages=2 并未对该 QK dot 输出做双缓冲。因此可在不触碰内核 AST、精度、dtype、QK 前瞻、20 worker 与缓存/输出分配的前提下，用唯一合规的单变量（M256 分支 num_stages 2->1）做可逆判别实验：若仍报 cc 262144B，则确认是单块 256x256 fp32 dot 输出本身 2 倍超 L0C，num_stages 无法解决；若 cc 降到 131072B 并编译通过，则说明后端确存在多缓冲放大。宿主已在 host-repair-analysis.json 明确选择此可逆诊断实验，并禁止换块尺寸/去前瞻/改精度阈值。",
+  "simulator_incremental_judgment": "本次未使用模拟器。context-brief 的 current_simulator 为 null，原版 simulator-evidence.json/full 仅作为历史背景，不标为本候选观测，也不据此声明任何因果或收益；本决策只依据当前失败反馈 repair-feedback.json 与 attempt-064 实际失败 IR。",
+  "host_suggestion": "host-repair-analysis.json（同源码 a97563…）：只改宿主 num_stages，令 M256 PART_TILES 的 num_stages=1，M128 PART_TILES 保持 2、其余通用路径保持 1；保持 064 的 M256 准入判据、kernel/helper AST、QK 前瞻、全部数学/dtype/精度阈值、20 worker、cache/输出分配逐字不变；单变量编译缓冲实验；若仍超限保留真实错误供下一独立研究；不得改回 M128、不得改变 PART 准入，若认为不值得实施则 no-change 而不提交恢复版。",
+  "my_repair": "采纳宿主的最小可逆单变量实验，并把它明确当作区分『单块 256x256 fp32 dot 输出本身超 L0C』与『后端对 128 行子块做双缓冲放大』的判别步，而不是已证明能修复。只把发射选项改为 num_stages=(2 if (PART_TILES and BLOCK_M == 128) else 1)，同步修正两处相关注释文字；不换块尺寸、不去前瞻、不改任何数学/dtype/阈值/降噪序、不改 grid/P/worker、不改 cache 与输出分配、不改 kernel/helper AST。理由：IR 只能证明 256x256 fp32 单张量尺寸等于 cc 需求，不能证明后端内部是否把 256x256 切成 128 行；真实编译反馈是唯一判据，且该改动可逆、成本低，符合性能优先下不省略验证的要求。",
+  "evidence": [
+    {
+      "path": "workspace/repair-feedback.json",
+      "category": "evaluation",
+      "role": "trigger",
+      "finding": "四项原合同已全部返回：case1 fp16 通过（mere 9.36e-8/mare 9.70e-4<9.77e-4）、case2 fp16 通过（mare 9.66e-4）、case7 bf16 通过（mare 7.81e-3 阈值 7.81e-3 恰好不超），仅 case4 编译失败；case4 UB required 294912B > 196608B、cc required 262144B > 131072B，无设备重放。"
+    },
+    {
+      "path": "workspace/failed-ir/attempt-064/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "trigger",
+      "finding": "case4（bf16，B4S256）TTIR：QK tt.dot %q(256x128 bf16) x trans(K)(128x256 bf16) -> tensor<256x256xf32>；PV tt.dot p_bf(256x256 bf16) x v(256x128 bf16) -> tensor<256x128xf32>；并含 extf/mulf/exp 后的 256x256xf32 向量与 reduce。M=256 是造成最大活跃张量的直接量。"
+    },
+    {
+      "path": "workspace/failed-ir/attempt-064/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "case4 BCMLIR：linalg.fill/linalg.matmul 作用于 tensor<256x256xf32>（%1/%2）与 tensor<256x128xf32>（%4），QK 结果 truncf 到 256x256xf16 作 iter_args 携带；单张量 256x256xf32=262144B 恰等于报错 cc required 262144B，即 2 倍 L0C 131072B。IR 本身无 multi-buffer 标记，无法从 IR 直接读出后端流水缓冲份数。"
+    },
+    {
+      "path": "workspace/failed-ir/attempt-064/5-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "disambiguation",
+      "finding": "case7（bf16，S128，PART_TILES，BLOCK_M=128，同源码同 num_stages=2）成功编译：其 QK tt.dot 输出 tensor<128x256xf32>=131072B，恰好等于 L0C 容量。该对照表明 num_stages=2 并未把 QK dot 输出缓冲放大成 2 倍；据此推断 case4 的 cc 262144B 是单块 256x256xf32 dot 输出本身，而非双缓冲倍乘。"
+    },
+    {
+      "path": "workspace/failed-ir/attempt-064/11-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "background",
+      "finding": "case2（fp16，BLOCK_M=128，非 PART，num_stages=1）QK 输出 tensor<128x128xf32>=65536B；说明非 PART 路径与 PART 的 M128 路径资源均远低于 L0C，失败与 M=256 强相关。"
+    },
+    {
+      "path": "workspace/host-repair-analysis.json",
+      "category": "other",
+      "role": "background",
+      "finding": "宿主（Codex）给出的可逆诊断方向与禁止项（见 host_suggestion 字段）；这是宿主建议而非独立观测到的设备机制。"
+    }
+  ],
+  "hypothesis": "case4 的唯一失败是 BLOCK_M=256 使 QK dot 输出 tensor<256x256xf32> 单块达到 262144B，等于 L0C(131072B) 的 2 倍，并使 256x256xf32 的 extf/exp 向量同时活跃在 UB 中（报错 ub 需求 288KB>192KB）；case1/2/7 因 BLOCK_M<=128 未触发。两种后端子机制未定：(A) 单块 256x256 fp32 dot 输出本身 2 倍超 L0C，任何 num_stages 都无法装下；(B) 后端把 256x256 内部切成 128 行子块（131072B/块）并因 num_stages=2 做双缓冲而叠成 262144B。case7 在同 num_stages=2 下 cc 恰为 131072B，倾向 (A)，但仍需真实编译判定。",
+  "alternatives": [
+    "(A) 单块 256x256 fp32 QK dot 输出本身 262144B > L0C，num_stages=1 无效；",
+    "(B) 后端内部 128 行切分且 num_stages=2 双缓冲放大到 262144B，num_stages=1 可降为 131072B。"
+  ],
+  "discriminating_observation": "保持 M256 准入与全部 AST/数学不变，仅把 M256 PART_TILES 的 num_stages 由 2 改为 1 后重编译 case4：若 cc required 仍为 262144B（ub 仍 294912B），支持 (A)，num_stages 不是可用杠杆；若 cc 降到 131072B 并使 case4 编译通过、UB 落到 196608B 以内，支持 (B)。",
+  "change": "仅改宿主发射选项：num_stages=(2 if (PART_TILES and BLOCK_M == 128) else 1)（原为 2 if PART_TILES else 1），并更新两处相关注释文字。内核/helper AST、BLOCK_M=256 准入判据、QK 前瞻、全部数学/dtype/FP16-BF16 交接/分母与除法/阈值、20 worker 分区、grid/P、num_warps、cache 登记与输出分配逐字不变。BLOCK_M 已在 fkey 中，num_stages 是其确定函数，缓存身份仍一一对应。",
+  "prediction": "IR 与 case7 对照倾向 (A)：num_stages=1 后 case4 极可能仍以同一 ub/cc overflow 失败（cc 262144B、ub 294912B），至少 cc 不会落到 131072B；即该单变量实验预计不能使 case4 编译通过。若 (B) 成立则 case4 可编译，随后才进入精度与计时评测。",
+  "expected": "若 (B)：case4 编译通过，cc required 131072B、UB <= 196608B，四项 checker/计时可测；若 (A)：case4 仍编译失败并保留真实 ub/cc 错误供下一独立研究（下一步真实修复是回 BLOCK_M=128 或在内核内把 QK dot 拆成 128 行块，二者均需宿主批准，本次不实施）。",
+  "tradeoffs": {
+    "precision": "不变。num_stages 只影响编译期流水/多缓冲与发射重叠，不改变源码 dtype、累加、归约顺序、除法/分母与 checker 阈值；已验收的 FP16 QK 交接、BF16 PV、FP16 acc 交接、删分母守卫等路径逐字保留。",
+    "active_buffers": "预期可能减少循环携带缓冲（raw_next/q_n/K/V）的多缓冲份数；但不保证降低单块 256x256xf32 QK dot 输出尺寸——这正是本实验要判定的未知。",
+    "handoff_count": "不变。K/V/q 载入次数、QK/PV dot 次数、L0C↔UB↔L1 交接链数与 grid 程序数均不变；仅后端是否让相邻链重叠可能改变。",
+    "parallelism": "不变。P=20 常驻 worker、grid=(20,)、每 worker 的连续 tile 区间与 TPG/T/NB_M 全部不变；减少流水重叠可能降低单链阻塞隐藏，属潜在性能代价。"
+  },
+  "validation": "改后用 sha256sum 记录新源码身份；工具桥 preflight 返回 awaiting_source_review 后保持字节不变并交接；由宿主对四项原合同（case1/2/4/7，同 checker/golden/dtype/计时口径）重新编译与完整评测，重点核对 case4 的 resource_errors 与编译是否从失败转为成功，并核对 case1/2/7 无回归。",
+  "unknown": [
+    "后端是否把 case4 的 256x256 dot 在 L0C 内切成 128 行子块，以及 num_stages=2 是否对该子块做双缓冲（IR 不可见）。",
+    "num_stages=1 是否降低 raw_next/q_n 等循环携带缓冲的双缓冲导致 UB 下降。",
+    "若 case4 编译通过，其性能与精度是否仍满足原合同（当前无设备重放，不能预判收益）。",
+    "若确认 (A)，唯一真实修复为回 BLOCK_M=128 或内核内拆分 QK dot，均属换块/改 AST，需宿主另行批准，本次不实施。"
+  ],
+  "observations": [],
+  "unresolved": [
+    "(A)/(B) 判别待改后真实编译反馈；case4 当前无任何真机计时或精度结论。"
+  ]
+}

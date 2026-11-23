@@ -1,0 +1,36 @@
+--- 
++++ 
+@@ -424,7 +424,8 @@
+     # exp2 based softmax keeps the scaling neutral in fp32.
+     qk_scale = scale * 1.4426950408889634
+ 
+-    y = torch.empty((B, S, NQ, D), dtype=query.dtype, device=query.device)
++    # 输出分配延后到 PART_TILES 判定之后（见下方），以便只有分区分支使用
++    # 非连续的物理 stride；本处只保留纯元数据计算。
+ 
+     # UB budget: acc is BLOCK_M x BLOCK_D fp32, plus q/k/v/p tiles.
+     # KV 方向分块取 128：每个 KV 块固定要付一次完整交接链（QK dot 搬出、
+@@ -529,6 +530,23 @@
+     else:
+         P = 1
+         grid = (triton.cdiv(S, BLOCK_M), B * NQ)
++
++    # 本轮机制（仅 PART_TILES 的输出物理 stride）：逻辑 shape/dtype 仍是 BSND，
++    # 但物理按 BNSD 连续分配，使每个 (b, hq) 的 S x D 输出连续。当前 BCMLIR
++    # 里输出 reinterpret_cast 为 128x128、strides[8192,1]，单个输出 tile 被写成
++    # 128 条 256B、行距 16KiB 的不连续段；模拟器把 UB→OUT 的
++    # MOV_SRC_TO_DST_ALIGN 热点（16 次 57.72us，与同位置 SET_FLAG/
++    # WAIT_FLAG_DEVI 重叠）定位到源码输出 stride 参数行。改成 BNSD 物理后同一
++    # tile 变为一段连续 32KiB，内核仍按 Out.stride 元数据原样寻址，因此不需要
++    # 任何 transpose 或复制阶段。代价与风险：返回张量非连续
++    # (is_contiguous()=False)，逻辑索引与数值不变、物理 span 仍为 B*S*NQ*D。
++    # 非 PART_TILES 的 fallback 继续用原 torch.empty 与原逻辑输出。
++    if PART_TILES:
++        y = torch.empty_strided((B, S, NQ, D), (NQ * S * D, D, S * D, 1),
++                                dtype=query.dtype, device=query.device)
++    else:
++        y = torch.empty((B, S, NQ, D), dtype=query.dtype, device=query.device)
++
+     _gqa_fwd_kernel[grid](
+         query, key, value, y,
+         query.stride(0), query.stride(1), query.stride(2), query.stride(3),

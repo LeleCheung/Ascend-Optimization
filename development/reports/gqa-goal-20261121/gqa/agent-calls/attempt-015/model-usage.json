@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 47,
+    "duration_ms": 92229,
+    "usage": {
+      "input_tokens": 34539,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1057920,
+      "output_tokens": 15016,
+      "output_tokens_details": {
+        "thinking_tokens": 3823
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 34539,
+        "outputTokens": 15016,
+        "cacheReadInputTokens": 1057920,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.0770550000000003,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 3823,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.0770550000000003,
+    "result": "已完成本轮修复并交接。\n\n## 真实失败原因（已核对）\n- `SPLIT_QK` 判据（`candidate.py:437-439`）原先只查**填充宽度** `BLOCK_D == 128`。而 `BLOCK_D = next_power_of_2(D)`，所以真实 `D∈65..127` 时也会得到 `BLOCK_D==128`。\n- 一旦这样的元数据进入 split 分支，其中 `k_lo/k_hi` 是**无掩码**的 128 宽载入，会读到真实通道 `D..127` 之外；与此同时 `MASK_KV` 为真（`D != BLOCK_D`），但 `kv_mask` 只在普通 QK 分支定义 → split 分支还引用了未定义的 `kv_mask`。\n- 合同四项 case 1/2/4/7 的 D 全部为 128，所以这是**潜在越界/无效分支洞**，不改变四项现有数值路径。\n\n## 选择的修复机制（最小改动）\n- `SPLIT_QK` 增加真实 `D == 128`（保留 `BLOCK_D == 128`），使分支实际满足 `D==BLOCK_D==128`、`SKV==BLOCK_N==256`、`S%BLOCK_M==0`，从而 `MASK_KV` 与 `MASK_MD` 均可证为假。\n- 同步修正 `EXACT_UNGUARDED` 的适用范围注释。\n- **未改动**：kernel AST、有序 QK 拼接、guard、算术、V scratch 处理、BLOCK_M/N/D 选路、dtype 路径、launch geometry。\n\n## 取舍\n- **精度**：四项 D=128 选路不变，算术与舍入顺序原样 → 预期逐元素一致（仍以四项官方 checker 为准）。\n- **活跃缓冲**：判据是编译期 Python 元数据；不新增分配、不改缓冲。\n- **交接次数**：program 数、每程序 KV 链数、2 次 matmul split 均不变。\n- **并行度**：grid/launch 几何不变。\n- 代价仅是关闭一个对 65≤D<128 非因果 bf16 SKV256 形状的越界/无效编译洞，对已评测几何零成本。\n\n## 记录与交接\n- 修改前已用 Edit 写 `diagnosis.json`（`selected_layer=host_metadata_specialization_predicate`，含证据/evaluation+source_ir、假设、改法、预测、验证、未知项，并分别记录 `host_suggestion` 与 `agent_repair`）。\n- 工具桥 `decision --record diagnosis.json` 已记录：`decision_id=5e78aa68245c4079836caa1b6283ef9b`。\n- 修改后 `preflight` 返回 **`awaiting_source_review`**，`source_sha256=e643746721391d655d976c1b1f19cbb7cde254ff7a7864aa08aaa03edb3286cc`。\n- 已按要求**保持候选字节不变并交接**；未声称本源码已通过编译或存在真机收益（当前候选尚无设备评测）。证据未引用模拟器为当前观测。"
+  }
+}

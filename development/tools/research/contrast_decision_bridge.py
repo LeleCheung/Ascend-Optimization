@@ -51,7 +51,7 @@ def main():
                     if block.get('type')=='tool_result' and not block.get('is_error',False):succeeded.add(block.get('tool_use_id'))
             assert reads&succeeded,'simulator report must be successfully read before decision'
         else:
-            assert not any(e['category']=='simulator' for e in d.get('evidence',[])),'control arm has no simulator evidence'
+            assert not any(e['category']=='simulator' for e in d.get('evidence',[])),'this invocation supplies no simulator report'
         from hgkda.runtime.trace import record_decision, emit
         result=record_decision(c,d)
         emit(c,'research_layer_decision',selected_layer=d['selected_layer'],layer_reason=d['layer_reason'],

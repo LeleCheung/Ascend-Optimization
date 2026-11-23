@@ -1,0 +1,87 @@
+{
+  "source_sha256": "d3fe5725c97805090f88b1c81705d1c3545c3d98017f3de780f95f0660545fa7",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "候选侧 PipeUtilization.csv/vector0：每块流水占用与时长基线",
+      "finding": "候选 _gn_kernel：Task Duration 17.580351us、Block Dim 64；每块 aiv_time 均值 8.1633us，aiv_vec_time 3.2143us(ratio 0.408)、aiv_mte2_time 4.4892us(ratio 0.562)、aiv_mte3_time 2.1374us(ratio 0.270)、aiv_scalar_time 2.0005us；搬运与计算流水时间之和 9.84us 已超过 aiv_time 8.16us，说明有部分重叠但远未饱和。"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "候选侧 ResourceConflictRatio.csv/vector0：停滞与 UB 冲突口径定位",
+      "finding": "aiv_vec_wait_ratio 0.518、aiv_mte2_wait_ratio 0.790、aiv_mte3_wait_ratio 0.257；aiv_vec_total_cflt_ratio 仅 0.113，故 VECTOR 约一半时间的占用来自显式同步等待。"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "参考侧 PipeUtilization.csv/vector0 与 Memory.csv/vector0：同访存量下的重叠上限参照",
+      "finding": "参考 GroupNormSilu 15.060us、32 块；每块 aiv_time 13.101us 处理 65536 元素，aiv_mte2_time 8.323us + aiv_vec_time 5.782us = 14.11us 约等于 aiv_time 13.10us，即该实现把 GM→UB 搬运与向量计算几乎完全重叠；按每 32768 元素归一 ref 约 6.55us/块，候选 8.163us/块，候选慢约 25%。"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "两侧 Memory.csv/vector0：排除冗余搬运量与带宽上限假设",
+      "finding": "候选每块 read_main_memory_datas 256.5KB(2 遍×128KB)、write 128.25KB、GM_to_UB 256KB；参考每块 513.4KB/256.4KB(每块 2 组)；全核总量读 16416KB vs 16427KB、写 8208KB vs 8208KB，完全一致。GM_to_UB_bw_usage_rate 仅约 14%。故差距不来自多余拷贝或带宽，而来自搬运与计算串行。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "reports/core0.veccore0 的 regions 与 top_instructions：停滞指令定位（归一化同核窗口，仅作关注度排序）",
+      "finding": "第二段循环区（源 63-64 行）累计 60.93us、其中等待 31.83us：顶层指令为 WAIT_FLAG(VEC 等 MTE2 flag0) 6.60us、WAIT_FLAG(MTE2 等 MTE3 flag1) 6.14us、WAIT_FLAG(MTE3 等 VEC) 5.10us、BAR(VEC) 6.89us/5.20us/5.10us、MOV_SRC_TO_DST_ALIGN(UB→OUT) 7.27us；第一段循环区（源 32-40 行）累计 32.73us、等待 16.78us，含 WAIT_FLAG(MTE2 等 VEC flag1) 3.96us、BAR(VEC) 5.2us/5.1us、GM→UB MOV 4.45us。每段循环体只有一份 16KB 载入与紧随其后的消费，说明载入缓冲被单缓冲复用。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "reports/core0.veccore0/pipelines：流水占用/等待/空闲比例与观测范围",
+      "finding": "窗口内 VECTOR active_union 0.887、wait_only 0.475、productive 0.412；MTE2 active 0.859、wait_only 0.309、productive 0.550；MTE3 productive 0.486、wait_only 0.017；SCALARLDST productive 0.180(1654 事件)。clock_qualification 为 relative_only、absolute_time_qualified=false，仅作同核归一化比较，不反推绝对关键路径。"
+    },
+    {
+      "path": "ir/32338e32f17895728e74ac654bc8e1eef3b815e2f7524a5aeb087319f1656f38/_gn_kernel.ttir",
+      "category": "source_ir",
+      "role": "待修改的实际 TTIR（本特化常量 HW=4096, CG=8, BLOCK=4096, CS=4096, SS=1, G=8, COUNT=32768, EVEN=true）",
+      "finding": "两段 scf.for 各自 8 轮，轮内只有单个 tt.load(tensor<4096xf32>=16KB) 紧接向量消费；SSA 上不存在第二个同时在飞的载入缓冲，也没有跨轮预取，因此 MTE2 与 VECTOR 只能交替。"
+    },
+    {
+      "path": "compiled-readonly/32338e32f17895728e74ac654bc8e1eef3b815e2f7524a5aeb087319f1656f38/92d715f24c64dc874f85ed2070f20dec8712797dad708788abf0033ee1200a33/_gn_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "疑似冗余的后端核对（冻结产物；同目录 _gn_kernel.bcmlir 一并核对）",
+      "finding": "载入已直接 lower 为 memref.alloc + memref.copy(GM→UB)，源码中的 .to(tl.float32) 与后续转换已被消除，没有多余 cast/中间拷贝；第二段循环把同一 16KB 载入缓冲继续用给 linalg.fill 广播与输出临时量，形成单一缓冲的写后读（WAR）依赖，正对应观测到的 WAIT_FLAG(MTE2 等 MTE3)。故这里不存在未被消除的冗余拷贝，真正的缺陷是缓冲组织/调度。"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "paired_profiling",
+      "role": "宿主（Codex）证据分析贡献与待查方向",
+      "finding": "Codex 指出应检查 vector waits 与 MTE2/MTE3 同步、以及“拷贝组织”，并要求先核对实际低层产物。本诊断据此逐条核对：等待确实以 VECTOR↔MTE2 与 MTE2↔MTE3 成对 WAIT_FLAG 出现（见 hotspots/timeline），而“冗余拷贝”一部分已被后端消除（.to(fp32) 无 cast、无多余中间拷贝），另一部分是缓冲组织问题（单缓冲复用导致 WAR）。据此把机制收窄为“手工软件流水/多缓冲”，删拷贝方向已被后端自身消除而关闭。"
+    }
+  ],
+  "hypothesis": "该内核的主要成本落在单缓冲载入/消费依赖造成的串行化：每轮 16KB GM→UB 搬运完成后 VECTOR 才能开始，VECTOR 用完同一缓冲后下一次搬运才能发起（WAIT_FLAG(VEC←MTE2)、WAIT_FLAG(MTE2←MTE3)、WAIT_FLAG(MTE2←VEC) 成对出现，aiv_mte2_wait_ratio 0.790、aiv_vec_wait_ratio 0.518）。参考实现以完全相同的读写量（每 32768 元素 256KB 读 + 128KB 写）做到 mte2_time+vec_time≈aiv_time 的近满重叠，每块 6.55us 对候选 8.16us。若在 TTIR 里把两段通道循环手工展开成直线代码并做成深度 1 的软件流水（先发起下一通道搬运，再消费当前通道；第二段再让输出临时缓冲交替），使任意时刻都有一次 MTE2 在飞、且载入缓冲与输出临时缓冲不共享，则可把每块时间压到 max(MTE2, VECTOR, MTE3) 量级（约 4.5~6us），而不改变任何访存量与算术顺序。",
+  "alternatives": [
+    "保持 IR 原样交接：可解释为“编译器未做循环流水/多缓冲”的可优化点，但预期无性能收益，仅作为基线记录。",
+    "消除第二遍 X 重读（把 8 个通道块常驻 UB 供第二段复用）：能把每块 MTE2 量从 256KB 降到 128KB，但参考实现同样读两遍（513.4KB/块），说明收益来自调度而非搬运量；且 8×16KB=128KB 常驻加上累加器 32KB 与输出临时/广播临时会逼近 UB 上限，存在溢写或编译失败风险，留作后续待验证假设。",
+    "只展开第二段循环（累计 60.93us、等待 31.83us）：聚焦更强但第一段同样有 16.78us 等待，预计只能拿到约一半收益。",
+    "通过编译选项（num_stages/add_auto_scheduling/multibuffer 相关开关）求解：属于“单纯改编译选项”的独立研究身份，且本轮编译选项与产物冻结，不采用。",
+    "合并两遍、改以 8192/16384 宽载入并调整规约树：会改变 fp32 归约结合顺序，违反精度保持要求，不采用。",
+    "改写源码（例如在源层手工双缓冲）：源码冻结，且属源码重写身份，本轮不可选。"
+  ],
+  "change": "只改 ir/32338e32.../_gn_kernel.ttir 的函数体（不触碰其余文件、不动 tt.func 签名/参数表 ABI、不改常量值）：把第一段（累加）与第二段（应用）两个 scf.for 展开为 8 个通道的直线 SSA 序列，形成深度 1 的软件流水：先发起通道 k 与 k+1 的 tt.load，消费通道 k 后立刻发起通道 k+2 的 tt.load，使每一时刻有一份 GM→UB 搬运在飞且两个载入缓冲同时活跃；第二段在通道 k+1 计算完成后再发出通道 k 的 tt.store，令输出临时缓冲也交替使用，避免 MTE3→VECTOR 的写后读冲突。逐通道算术（accs/accq 顺序 0..7、a=rstd*W、b2=B-mean*a、x*a+b2）与操作类型、次序、fp32 精度完全保持；广播仍用 tt.splat，规约仍是两个 tt.reduce(axis=0) 且操作数分别指向展开后的 accs/accq 值。不改网格、不改常量，故访存量与输出数值预期逐位一致。该改法只对本特化常量（CG=8、HW=BLOCK=4096、CS=4096、SS=1、EVEN=true）成立。",
+  "expected": [
+    "动态轮次：每程序两段通道循环各 8 轮（共 16 轮）降为 0 轮直线代码；每程序 16 条 16KB 的 GM→UB 大块搬运指令数不变（访存量不变）；每程序 MTE3 store 8 条与 MEAN/RSTD 2 条不变；标量系数载入 8 条 W + 8 条 B 不变。",
+    "等待：预计 WAIT_FLAG(VEC 等 MTE2) 累计由 6.60us 降至 2us 以下（首块仍需等一次，其余被前一块搬运隐藏）；WAIT_FLAG(MTE2 等 MTE3 flag1) 由 6.14us 降至接近 0（两个载入缓冲 + 两个输出临时缓冲消除 WAR）；WAIT_FLAG(MTE2 等 VEC) 由 3.96us 降至接近 0。对应 aiv_vec_wait_ratio 0.518→≤0.30、aiv_mte2_wait_ratio 0.790→≤0.50、aiv_mte3_wait_ratio 0.257→≤0.20。",
+    "资源/流水：aiv_mte2_time 4.49us 基本不变（可能与 VECTOR 重叠后略降），aiv_vec_time 3.21us 基本不变或略升（向量指令数与类型不变，少掉循环内地址重算），aiv_scalar_time 2.00us 明显下降（循环控制与逐轮地址计算消失）；每块 aiv_time 由 8.163us 降至 5.0~6.5us。UB 峰值由约 48KB 升至 ≤80KB（2×16KB 载入 + 2×16KB 输出临时 + 32KB 累加器 + 广播临时），应仍在 UB 容量内、不触发溢写或编译失败。",
+    "端到端：Task Duration 由 17.58us 降至约 11~13us；若主机封装开销（当前约 24us）不变，单次调用延迟由约 41.5us 降至约 35~37us，对参考的 timing-7 速度比由 1.02 升至约 1.13~1.20。两波次结构（64 块 / 32 核）不变。",
+    "数值：预测输出与当前候选逐元素完全一致（同一 fp32 运算序列与顺序，无重结合、无精度改变）；正确性 18 例的 abs/rel 误差不应变化。",
+    "可证伪条件：若 aiv_vec_wait_ratio 与 aiv_mte2_wait_ratio 未下降、或 aiv_time 未降低、或后端把展开后的直线代码退回成额外的 memref.copy/spill（GM_to_UB_datas 超过 256KB/块），则本机制不成立。"
+  ],
+  "validation": "按 validation-policy.json：复用固定完整合同（27 个正式用例：18 正确性 + 9 时序）与既有 42 例补测，不新增例行诊断；SHA 与身份由工具自动记录。宿主先跑当前原始 IR 完整评测（original_ir_validation_run，context 标注 original_ir_validation_pending）作为验收比较起点，再评测本候选。ABBA 仅在“增益与观测噪声同量级/测量矛盾/设备状态异常”时按需选用——本候选预测单次延迟下降约 5-6us，远大于当前 0.98~1.02 的速度比噪声带，先按单次正式结果判断，若出现与预测方向相反的观测再补 ABBA。必须核对的落地判据：(1) 编译通过且产生与当前一致的签名/网格，无 UB 溢出告警；(2) 18 例正确性逐例误差与当前候选不劣化（预期完全一致），特别注意 correctness-10（当前 abs_err 2.44e-4）与 correctness-11；(3) 从 profiling 核对每块 read_main_memory_datas 仍约 256KB、write 约 128KB（证明没有靠增删搬运取巧）；(4) 从 PipeUtilization/ResourceConflictRatio 核对 wait ratio 与 aiv_time 的变化方向与幅度；(5) 只对本特化常量成立：若宿主会把该 TTIR 复用到不同形状的特化，需先确认其他特化由源码另行编译，否则必须拒绝应用。KGS 完整性与数值语义由宿主复核后运行，本诊断不代表收益结论。",
+  "layer_reason": "Triton 表达能力：源码中“先载入、再消费”的写法在 Triton 里只能得到一个逻辑缓冲，是否多缓冲/预取完全依赖后端调度；Triton 无法在语言层表达“让下一次搬运提前在飞”，因此该机制在源码层不可表达，只能在 IR 层通过展开与指令顺序把并行的载入 SSA 值显式化。固定源码实验目的：frozen.py 逐字节冻结，且 .to(tl.float32)/布局转换在后端产物中已被消除（ttadapter 直接 alloc+copy），说明源码侧已无“多余转换/拷贝”可删，剩余空间只在于调度组织，这正需要一个不改数值、不改宿主封装的固定源码对照实验。IR 控制点：TTIR 里的 tt.load/tt.splat/tt.addptr/tt.reduce 顺序决定后端插入 SET_FLAG/WAIT_FLAG 的位置与缓冲复用，把两次载入提到同一位置即可强制两个独立缓冲并让搬运与向量计算重叠；同时保持 tt.func ABI、常量与 tt.reduce 结构不变，风险可控。若该意图要回到源码表达，方向是：在源层把通道循环按 2 展开并显式分离两份 xf 变量（届时可让编译器自己决定缓冲），或改用更大 BLOCK 配合 tl.multiple_of 提示——但前者属源码重写、后者会改变归约宽度影响精度，本轮均不采用。",
+  "simulator_incremental_judgment": "前窗口（本轮）：覆盖单一核心 core0.veccore0 的已完成捕获，窗口为归一化 fraction（clock_qualification=relative_only、absolute_time_qualified=false），绝对时钟仅在同 PC 对照下被验证过单位一致性，故只做同核比例比较，不据此推导绝对关键路径。归一化范围用当前窗口的 VECTOR/MTE2/MTE3 active/wait/productive 比例（0.887/0.475/0.412；0.859/0.309/0.550；0.486/0.017），并用 paired_profiling 的每块 aiv_time 8.163us 与 Task Duration 17.58us 作为独立交叉支持。动态总次数比较：本轮使用“每程序 8 轮×2 段”的静态结构加 pp 的每块搬运量 256KB 交叉核对执行覆盖，不把 hotspots 的累计指令时间当作总耗时。未报告的泳道（如 L1/L2、数据流细节、其它核心与本核未捕获区间）保持未知，不从汇总比例反推空泡。后窗口（改后）：需在同一核心/同一用例下重放，逐项核对 (a) 每块 read/write 字节不变；(b) aiv_vec_wait_ratio、aiv_mte2_wait_ratio 下降幅度；(c) 每块 aiv_time 与 Task Duration 下降 2us 以上；(d) 是否出现新的 spill/额外 memref.copy 泳道活动。若实际观测与前窗口预测方向不一致，则视为机制被证伪，转回第二遍载入消除或仅第二段展开的假设。",
+  "unknown": [
+    "后端对完全展开的直线内核是否仍应用 auto_blockify / 多缓冲分配：若它按 liveness 只分配一份载入缓冲，则重叠不会出现，需再引入显式的两缓冲轮换（例如把两段主体拆成奇偶两组 SSA 名字）。",
+    "UB 容量上限与 shared_mem_dynamic_size 221184 的实际口径未知，峰值 ≤80KB 的估计基于 192KB UB 假设；若实际预算更小会触发溢写。",
+    "参考实现 15.06us 使用 32 块（每块 2 组），候选 64 块两波次；该并行度差异属宿主布局与网格，本轮不动，故端到端最多只能接近而非超过参考的单波次结构。",
+    "hotspots 的累计指令时间与等待时间为同核归一化窗口内的重叠口径，不作因果或关键路径证明。"
+  ]
+}

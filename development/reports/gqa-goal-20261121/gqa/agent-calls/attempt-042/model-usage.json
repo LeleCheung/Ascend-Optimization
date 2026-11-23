@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 35,
+    "duration_ms": 146235,
+    "usage": {
+      "input_tokens": 77118,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1378560,
+      "output_tokens": 23854,
+      "output_tokens_details": {
+        "thinking_tokens": 13194
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 77118,
+        "outputTokens": 23854,
+        "cacheReadInputTokens": 1378560,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.67122,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 13194,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.67122,
+    "result": "已完成本轮独立实验并停在验收边界。摘要：\n\n**已读证据**\n- `skills/hgkda/SKILL.md`、`task.json`、`contract.json`、`context-brief.json`、`starter-provenance.json`、`current-profiling.json`、`simulator-evidence.json`（含三核部分窗口）、`knowledge.json`（`records` 为空）、`previous-result.json`（case1 201.71765us、官方 checker 记录）、实际 IR 三件（`0-_gqa_fwd_kernel.bcmlir`、`2-…ttir` 全文）。\n- 父版本身份 99e77cb… 与 current-profiling/simulator/starter-provenance 一致；`decision --record` 返回的 `source_sha256` 也确认为该父版本。\n\n**机制（只做一件事）**：PART_TILES 内层 tile 循环的一深度 QK 前瞻\n- 每个非空 KV 组交集 `[t0,t1)` 先为 `t0` 预取一次 FP16 raw QK；循环体内先 `raw = raw_next`，再在 `t+1 < t1` 的条件块里发下一个 QK，之后才执行 `raw.to(f32)*qk_scale`、公共偏移、`exp2`、`sum`、FP16 P×V（FP32 输出）、原归一化/guard/写出。\n- 不变量：进入第 t 次迭代时 `raw_next = round_f16(q(t)·K_group)`；每组 QK 次数仍为 `t1-t0`（尾部不发、无越界读），同一 tile 的表达式与相加顺序逐字不变，故预期输出逐位不变。\n- 未改：Q/K 输入 BF16、dot FP32 累加+父版本 FP16 舍入、worker20 连续分区、host 派发/元数据、通用二维 grid、因果 64/64、FP16 两项分解、PV 精度、无 rowinverse/naturalexp/布局改动。\n- 风险已写入注释与诊断：多 64KiB 循环携带 f16 + 32KiB 提前 q、UB/L0C 峰值可能触发重新串行化、条件块内 mmad 的接受性（退路为夹持索引的无条件预取）。\n\n**登记**：`decision --record diagnosis.json` → `05d85afb56d14dedb869fb9579cb9571`；随后仅用 Edit 修改 `candidate.py`（含中文机制/风险注释），`diagnosis.json` 追加修改后观测与未验证项。\n\n**状态**：`preflight` 返回 `awaiting_source_review`，新源码 SHA `89ddf96a0922c1f724e5ee07e7eecfe37aada52e35dd9625dd866e1b4635cb07`，候选字节已冻结。交接宿主：只读路径与地址边界审查 → 完整四项真机评测（case1/2/4/7，原 checker/golden/dtype/计时合同不变），并回采修改后实际 IR、成对 profiling 与模拟器窗口以判定是否真发生 Cube/Vector 重叠（需 case4 < 196.15815μs 才算收益）。"
+  }
+}

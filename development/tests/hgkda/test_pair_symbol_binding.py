@@ -4,6 +4,13 @@ from hgkda.runtime.collect_pair import resolve_collected_symbol, partition_profi
 
 
 class PairSymbolBindingTests(unittest.TestCase):
+    def test_mixed_core_tasks_require_explicit_known_type(self):
+        vector={'name':'scatter','task_type':'KERNEL_MIX_AIV'}
+        cube={'name':'matmul','task_type':'KERNEL_MIX_AIC'}
+        self.assertEqual(partition_profile_tasks([vector,cube]),([vector,cube],[]))
+        with self.assertRaises(ValueError):
+            partition_profile_tasks([{'task_type':'KERNEL_MIX_UNKNOWN'}])
+
     def test_dma_preserved_separately_from_core_metrics(self):
         compute={'name':'bn','task_type':'KERNEL_AIVEC'}
         dma={'name':'MEMCPY_ASYNC','task_type':'SDMA_SQE'}

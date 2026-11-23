@@ -1,0 +1,63 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "e7fad4d8519526ea1731371e47d7ddb1417300145d28d14f4dca49bffbabee9b",
+  "evidence": [
+    {
+      "path": "workspace/context-brief.json",
+      "category": "simulator",
+      "role": "disambiguation",
+      "finding": "宿主登记的同核逐指令时间顺序（同一 Vector0、同一 tile）：VEXP 129.257996→129.584996us，随后 sum 链 VADD 129.589996→129.696996、VADD 129.591003→129.791003、VADD 129.792007→129.880007、VCADD 129.880005→130.173005，之后才是 p→FP16 VCONV 130.175003→130.264003 与概率 MTE3 写 130.264999→131.976999；第二条 tile 次序相同。即分母归约（约 0.58us）实占在概率转换与 PV 供数之前。"
+    },
+    {
+      "path": "workspace/simulator-evidence.json",
+      "category": "simulator",
+      "role": "mechanism",
+      "finding": "部分窗口、application_completed=false、clock_qualification=relative_only。Vector0 流水 productive 18.19%/wait 12.43%/idle 69.38%，MTE3 productive 37.09%；Cube0 productive 9.89%/wait 20.36%/idle 69.75%。Vector 热点为 WAIT_FLAG_DEVI 93.19us(19 次) 与 MTE3 MOV_SRC_TO_DST_ALIGN 61.75us(18 次，输出写)，Cube 热点为 WAIT_FLAG_DEVI 212.16us(19 次)。说明归约处在 Vector 串行链上，但窗口比例不可换算为全调用耗时。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "PART_TILES tile 内顺序：line 102 math.exp2 → line 103 tt.reduce(axis=1) 求 l_new → line 108 arith.truncf p→f16 → line 109 tt.dot(p16, v16)。源码语句顺序被前端原样保留，归约在 PV 之前。"
+    },
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "同一顺序在 BCMLIR 中仍成立：line 101 math.exp2 %57 → line 102 linalg.reduce %57 → line 107 truncf p→f16 %58 → line 108 linalg.matmul(PV)。且 %59(matmul 结果) 与 %reduced 在 line 112 divf 处汇合，二者在数据依赖上互相独立。"
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "background",
+      "finding": "候选 case4 205.624us/CANN 128.963us；cube 累计 aic_cube_time 662.187us 已与参考 675.011us 相当，L0C_to_GM 同为 98304KB；Vector 累计 aiv_vec_time 1201.784us 对 1121.526us；aiv_scalar_wait_time 1128.04us 对 30.21us。算术与搬出量已对齐，剩余差距在 Vector 侧。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "保留最佳四项全调用：case1 190.58315us、case2 189.22615us、case4 205.28415us、case7 178.30565us，四项 checker 全通过；本轮目标 case4 < 205.28415us 且其余三项无真实退步。"
+    }
+  ],
+  "hypothesis": "PART_TILES 的 tile 内，fp32 分母归约 l_new=tl.sum(p,1) 与 PV（p16 = p.to(fp16) → acc=tl.dot(p16,v16)）在数据依赖上互相独立，只共同汇合于 out=acc/l_safe。当前源码把归约写在 PV 之前，前端 IR 与真机同核顺序都照此排列：每 tile 先付约 0.58us 的 VADD/VCADD 归约，才发出 p16 转换（VCONV）与概率 MTE3 发送，Cube 的 PV 因而被挡在归约之后等待。若把 l_new 移到 PV dot 之后、l_safe 之前，tile 内表达顺序变为 exp2 → p16 转化/概率发送 → PV dot 发起 → FP32 分母归约，归约即可与 Cube 的 PV 计算及概率搬运重叠，由后端实际的 C/V 调度决定隐藏程度。",
+  "alternatives": [
+    "把 sum 改成对 p16 归约：被本实验约束明确禁止，且改变数值表达式（FP16 归约累加精度与树形不同），不采用。",
+    "用 tl.dot(p16, ones) 之类再发一个 matmul 求分母：会新增一次 cube→vector 交接链，与 case4 已证墙钟跟交接链条数矛盾，不采用。",
+    "保持源码，靠 num_stages/流水参数让编译器自动重排：现有 IR 与同核 trace 表明后端未重排，且该层会改动整条流水与缓冲，风险大于单条语句位移，不采用。",
+    "改动归约实现（如分块两次归约以减少链长）：属另一个机制，本轮不做，仅在本实验判定后另行评估。"
+  ],
+  "discriminating_observation": "若归约确实被移出关键路径：修改后的 TTIR/BCMLIR 中 tt.reduce/linalg.reduce 应出现在 p→f16 truncf 与 PV matmul 之后；同核 trace 中同一 tile 的 VCONV/概率 MTE3 写应早于 VADD/VCADD 归约链，Cube 的 PV WAIT_FLAG 位置相应前移。若后端把 reduce 重排回 exp2 之后、conv 之前，或为保持 p live 而插入额外 barrier/拷贝，则同核顺序不变，耗时不变或退步——此时应按交接建议固定源码 IR 调度位置，而不是重复同类顺序试验。",
+  "change": "仅修改 PART_TILES 复用体 _gqa_tile_part_body：删除 PV 前的 l_new=tl.sum(p,1)，显式命名 p16 = p.to(tl.float16)，写 acc = tl.dot(p16, v16)，随后再写 l_new = tl.sum(p, 1)，最后 l_safe 及其后逻辑逐字不变。p 的归约对象仍是原 FP32 p（不允许对 p16 归约），rawQK FP32、qk_scale、SM_OFFSET、地址、20 worker 连续分区、组内 K/V 复用、PV_SINGLE_F16/SINGLE_KV 判据、host 与 fallback 全部不动。",
+  "expected": "case4 与 case7（唯一命中 PART_TILES 的两个合同 case）的全调用时间下降，理想情形下每 tile 隐藏约 0.55~0.6us 的向量归约，实际由 Cube/Vector 重叠程度决定；case1/case2 不进入该分支，源码路径不变，期望数值逐位一致，仅作回归。总调用仍有 SCF 循环、概率发送与输出写等串行部分，因此不预期达到归约时间的全额。",
+  "validation": "1) 先 preflight 只读审查；2) 完整四项真机评测，精度阈值与官方 checker/golden 身份不变，四项必须全通过；3) 修改后重放并采集成对 profiling/模拟器：核对新 TTIR/BCMLIR 中 reduce 是否在 truncf 与 PV matmul 之后，核对同核 trace 中 p16 转换/概率发送是否先于 sum、Cube PV 的等待位置，并保留 application_completed=false 的全调用 completion 缺失；4) 与 205.28415us 比较，仅以真实全调用计时判定收益，模拟器比例不作耗时证据。",
+  "selected_layer": "source_ir（Triton 源码语句顺序，经前端决定 tile 内 IR 发射序）",
+  "layer_reason": "031 的 TTIR/BCMLIR 与源码语句一一对应（exp2→reduce→truncf→dot），同核 trace 也按此序出现，说明当前顺序不是后端调度意外而是源码顺序直接决定；因此在源码语句顺序层做一个可评测评的最小位移，既不改变分块/布局/表达式，也可由下游 IR 直接判定是否生效。",
+  "simulator_incremental_judgment": "热点：Vector 顶项为 WAIT_FLAG_DEVI 93.19us(19 次) 与输出 MTE3 61.75us(18 次)，Cube 顶项为 WAIT_FLAG_DEVI 212.16us(19 次)，峰值指令本身是同步/搬运，不直接给出可隐藏量；本实验的增量来自宿主登记的同核逐指令区间把归约（VADD/VCADD，约 0.58us/tile）定位在 VCONV 与概率 MTE3 之前，属顺序证据。流水：Vector productive 18.19%/wait 12.43%、Cube productive 9.89%/wait 20.36%、MTE3 productive 37.09%，说明归约与概率发送共享同一条 Vector 串行链、Cube 处于等待；但窗口为三核部分窗口且 application_completed=false、relative_only，不能把比例折算成 us，全调用 completion 缺失保留，收益只由完整四项计时判定。",
+  "live_range_and_ub_risk": "把归约移到 PV dot 之后，FP32 p（128x256 = 128KiB）的 live range 必须跨过 p16 转换与 PV dot 发射，p16（64KiB）也同时存活，另有 v16（64KiB）与 acc（128x128 fp32 = 64KiB）；相较原顺序无法在 p16 产生后立即释放 p。若编译器无法复用缓冲，编译期 UB 峰值可能超 196608B 预算而编译失败；缓解方式是该修改只在 PART_TILES 体内，失败可原样回退，且分块尺寸不改。另需注意后端动态 C/V 流水可能在 pass 中把 reduce 重排回 conv 之前，或为避免 p 被覆盖而插入额外拷贝/同步，这两类都会抵消收益甚至退步。",
+  "unknown": [
+    "后端 dynamic_cv_pipeline 是否保留源码中 reduce 相对 truncf/PV 的位置（需修改后 TTIR/BCMLIR 判定）。",
+    "归约与 Cube PV 的实际重叠度，以及是否为保持 p live 增加额外的 UB 拷贝或同步。",
+    "UB 峰值是否在新 live range 下仍低于 196608B 预算（编译结果判定）。",
+    "case7 每 worker 2 个 tile，链更短，收益绝对值可能小于 case4。"
+  ]
+}

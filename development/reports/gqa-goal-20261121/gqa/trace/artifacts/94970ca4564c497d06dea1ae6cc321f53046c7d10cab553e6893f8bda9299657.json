@@ -1,0 +1,49 @@
+{
+  "schema_version": "hgkda.diagnosis/v1",
+  "source_sha256": "54938a1847cb731bbe37e35cf9a4ec442aef377c87dd6bdc55eb30dd3603997f",
+  "evidence": [
+    {
+      "path": "workspace/actual-ir/0-_gqa_fwd_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "第85-88行：V 由 memref<?xf16> 重解释为 memref<256x128xf16, strided<[1024,1]>> 再 memref.copy 到连续 L1 缓冲。行跨度为1024元素（=NKV*D=8*128），即同一 KV 头的256行在物理上被其余7个头的128元素行隔开，每次只能搬256B的有效行；K 同构（strided<[1024,1]>），Q/Out 为8192。若 scratch 改为每头连续[B,NKV,SKV,D]，该 copy 的行跨度为128元素，256x128 成为整块连续64KiB。"
+    },
+    {
+      "path": "workspace/actual-ir/2-_gqa_fwd_kernel.ttir",
+      "category": "source_ir",
+      "role": "mechanism",
+      "finding": "第55-56、58-64、85-89行：v_base 复用 k_base 的批偏移，v_ptrs 用 %k_ptrs_24（常量1024）作序列轴步长、用 %k_ptrs_28（offs_d）作通道轴；V 的 stride 元数据在编译期固化进指针张量，说明改物理布局即可改变主 kernel 的 V 取块粒度，无需改任何算术 AST。"
+    },
+    {
+      "path": "workspace/current-profiling.json",
+      "category": "paired_profiling",
+      "role": "trigger",
+      "finding": "case4 候选主 kernel 317.806366us，512 program；cube0 aic_mte2_instructions 5/程序、GM_to_L1 224KiB/程序；vector0/1 各 7 次 mte2、96KiB/程序。主 kernel 仍远慢于 CANN 参考 124.162483us，V 的跨头交错取块是剩余的搬运组织开销之一。全调用口径 346.69590us 高于保留最佳 328.44680us。"
+    },
+    {
+      "path": "workspace/previous-result.json",
+      "category": "evaluation",
+      "role": "background",
+      "finding": "012（当前父版本）case4 全调用 346.6959us、case7 283.77035us；006 保留最佳 case4 328.4468us。case1/2/4/7 均 measured，官方四项 checker 通过。本轮目标 case4 < 328.4468us，其余三项保持真实变化。"
+    }
+  ],
+  "hypothesis": "BF16 非因果 SINGLE_KV 路径上，V scratch 仍是原 BSND 交错布局，主 kernel 每个 program 的 V 载入被行跨度1024元素打断成256段256B小搬运；把同一预热预处理的输出改为每头物理连续 [B,NKV,SKV,D]，只改变 scratch 物理布局与传入主 kernel 的逻辑 stride（v_ss:1024->128，v_sh:128->32768），主 attention 的 QK/softmax/PV 算术、M128/N256 分块、精度表达式与输出写出全部不变，预期降低 V 的 DMA 组织开销与主 kernel 等待。",
+  "alternatives": [
+    "只改主 kernel 的 V 取块顺序（先行后通道分块）而不改物理布局，无法消除跨头间隔，不选。",
+    "让主 kernel 直接从原 V 以 strided 方式读并去掉 scratch，等于回到逐 program 重复 bf16->f32->f16 转换，012 已证伪（会把转换和向量准备链放回每个 program），不选。",
+    "为 Q/K 也做重排或增加 Q/K repack 阶段，超出本次隔离实验范围且可能引入新的 launch/流量，不选。",
+    "改变 M/N 分块或 PV 精度分解，属于另一机制，本轮保持原样以隔离访问布局变量。"
+  ],
+  "discriminating_observation": "若收益来自 V 取块布局而非预处理本身，则主 kernel 的 BCMLIR 中 V 的 memref.copy 应从 strided<[1024,1]> 变为 strided<[128,1]>（连续整块），且主 kernel 时间下降幅度大于新增预处理相对原 flat 转换的时间增量；若主 kernel 时间基本不变，则说明该 copy 的组织开销不是当前墙钟主导项，应撤回并另寻机制。",
+  "change": "在 candidate.py 新增 Triton 预处理 kernel _gqa_v_cast_f16_headmajor_kernel：grid=(cdiv(SKV,BLOCK_R), B*NKV)，program 标量 pid_h=b*NKV+h 只做一次整除/取模得到 batch 与头，向量轴仅为序列行块 offs_j 与通道 offs_d；按原 V 的真实 stride（v_sb/v_ss/v_sh/v_sd）载入 [BLOCK_R, BD] 瓦片，唯一地写到物理连续 [B,NKV,SKV,D] fp16 scratch（dst 偏移 pid_h*SKV*D+offs_j*D+offs_d）。host 对该路径分配 (B,NKV,SKV,D) fp16 scratch，并向主 kernel 传逻辑 stride (v_sb, v_ss=128, v_sh=32768, v_sd=1)。原 flat/strided BSND 路径保留：非连续输入继续走二维 strided kernel，连续但 D 非 2 的幂时继续走 flat kernel；主 kernel 源码、分块、精度与输出不变。BLOCK_R 取 8192//BD（case4 为64，128 program，每 program 16KiB 元素），兼顾 UB（约64KiB）与并行度。",
+  "expected": "case4 主 kernel 的 V memref.copy 变为 strided<[128,1]> 连续64KiB，主 kernel 时间下降；新增预处理的总读写元素数与 012 flat 相同（约2MiB读+2MiB写），但读端由完全连续变为每256B行跨2048B，可能有小幅回退；全调用净收益需超过预处理增量。目标 case4 < 328.4468us。case1/2/7 不命中该路径（case1 因果、case2 SKV=128 非单块、case7 同样命中则该机制也适用）应按各自实测记录真实变化。",
+  "validation": "预检后交宿主只读审查与完整四项真机评测：原官方 checker、golden、输入输出 dtype 与计时合同不变，精度阈值保持。检查 case1/2/4/7 全调用时间与官方四项 checker；保留条件为 case4 低于 328.4468us 且四项全部通过。修改后仍用工具桥采集并重放实际 IR，核对 V copy 的 strided 跨度。",
+  "selected_layer": "access_layout",
+  "layer_reason": "现有 BCMLIR 已直接显示 V copy 的物理行跨度1024，主 kernel 算术与分块已验证；改变 scratch 物理布局只需重写预热预处理与 stride 元数据，属于访问布局层，可用最小改动隔离验证，无需触碰数值表达式或编译器选项。",
+  "simulator_incremental_judgment": "当前剩余歧义是：V 连续化后主 kernel 节省的搬运组织时间是否大于预处理的额外成本。本轮输入包含当前成对 profiling 与实际 TTIR/BCMLIR，宿主保留此前模拟器知识；该问题由完整四项真机全调用计时直接判定，新增模拟器输入无法区分预处理与主 kernel 的净收益，故本轮不新增模拟器输入，仅按要求在修改后重放实际 IR。",
+  "unknown": [
+    "编译器是否把 strided<[128,1]> 的 256x128 copy 合并为单段连续搬运（需修改后 IR 确认）。",
+    "预处理读端 256B/2048B 跨步是否带来明显额外时间。",
+    "case7 同为 BF16 非因果 SINGLE_KV，可能同样受益；其真实变化需实测记录。"
+  ]
+}

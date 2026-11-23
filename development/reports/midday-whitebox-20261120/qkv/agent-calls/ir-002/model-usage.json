@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 68,
+    "duration_ms": 674343,
+    "usage": {
+      "input_tokens": 103780,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 3730176,
+      "output_tokens": 102024,
+      "output_tokens_details": {
+        "thinking_tokens": 80243
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 105196,
+        "outputTokens": 110694,
+        "cacheReadInputTokens": 3877248,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 5.231954,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 80243,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 5.231954,
+    "result": "`awaiting_ir_review` 已返回，本轮文件保持现状结束（`frozen.py`、inventories、context、evidence 与 `compiled-readonly/` 全部未动）。\n\n## 本轮新观察（承接上一轮提交）\n\n**读取与核对**\n- `feedback.json`：保留基线 21/21、geo_mean 1.645464、timing-2 = 0.063257576 ms；ir-001（QKV→KVQ 写序）0.063651644 未保留，其 MTE2 1.809911→1.678384 改善但 MTE3 1.154888→1.196779、scalar 1.009835→1.027134 反噬，AIV 3.072685→3.126787 —— 说明\"只动访存次序不动事务几何\"可换来一侧收益但被另一侧吃掉。\n- `prior-explorations.json`：ir-001 unroll 0.063029、ir-002 no-change roofline、ir-003 4×32+stages3 0.063516、ir-004/005 配对头部（空结果）、ir-006 去 `allow_reorder` 0.094184（大幅回退）、ir-007 LICM 0.063038、ir-008 去循环 [128,64] 0.063666。\n- `lowered-inventory.json` + `compiled-readonly/` 的 `bcmlir`/`ttadapter`（按符号 `_transform_bias_rescale_qkv_kernel`）：3 个出循环 `memref<64xf16>` bias alloc+copy、循环内 3 个 strided `memref.copy`、3 个 `materialize_in_destination`、`scf.for 0 to 2 {tt.num_stages = 2}` 均原样保留 —— 后端**没有**做 copy 合并或提升，所以上一轮怀疑的\"冗余已被后端消掉\"不成立，控制点确实落在 TTIR。\n\n**判定依据（来自 `profiling.json`，绑定 512 个候选 block 的实测范围）**\n- `aiv_mte2_time 1.8099us + aiv_mte3_time 1.1549us = 2.9648us`，占 `aiv_total_cycles 3.0727us` 的 96.5% ⇒ 读写共享同一 DMA 引擎串行化，重叠类改动（ir-001/003/007/008）落进噪声是必然。\n- 字节侧已到下限：读 24576KB + 192KB bias，写 24576KB，无可删。\n- 读侧 27.24 GB/s（命中 75.3%）对写侧 45.06 GB/s（命中 0%）的差距只能来自事务几何：128B innermost run、6144B 步长。\n\n**已登记机制（diagnosis sha `4d16bc20…`）**\n读突发 128B→256B：pid 重映射为 (batch, head_pair, seq_group)，每 program 处理**2 个相邻 head**、[32,128] tile；写侧用 `tt.reshape [32,128]→[32,2,64]` + `tt.trans {order = array<i32: 1, 0, 2>}` 把 head 轴换到最外，再以 `[2,32,64]` 存出，保持每个 head 的 GM 写仍是连续 4KB —— 这正是绕开 ir-004/005/006（strided 3D store → 0.094184）失败模式的关键，也是有别于 ir-006 的独立机制。ABI、签名、constexpr 均未改；循环与 `tt.num_stages = 2` 保留；UB 占用 131840 B（含 staging 180992 B）< 196608 B。\n\n**已显式排除并留作未验证假设**：Q/K/V 三体联合 3D 传输（TTIR 无对非末位 3 元轴的 slice/split，且 Q 需 f32 opmath、K/V 为 f16，舍入语义不可合并）；4-head 加宽；纯 option/grid 改动；上一轮全部重叠类编辑。\n\n**可测预测**：目标 ≤ 0.0595 ms；MTE2 1.81→约 1.3 us，active_bw 27.24→约 35–37 GB/s，MTE3 指令 7→约 13，vec 0.7393→0.80–0.90 us，总 cycles 5069.93→约 4300–4600；字节与轮次不变。失效判据（突发未真正加宽 / `tt.trans` 低效 / MTE3 描述符膨胀吃掉收益）已写入 diagnosis。\n\n**Codex 贡献**：提供了 `profiling`/`hotspots` 的 lane 级归因与\"读写共用 DMA 引擎\"这一约束，并给出\"联合 Q/K/V 传输\"方向；该方向经 TTIR 能力核对后被否，改由本次相邻 head 加宽 + UB 内 head 轴置换落地。"
+  }
+}

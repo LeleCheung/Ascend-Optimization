@@ -1,0 +1,114 @@
+{
+  "source_sha256": "d3fe5725c97805090f88b1c81705d1c3545c3d98017f3de780f95f0660545fa7",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "目标case的AIV每block服务时间与占比",
+      "finding": "native_group_norm-timing-7候选块均值为 aiv_time=8.163us、aiv_mte2_time=4.489us(占比0.562)、aiv_vec_time=3.214us(0.408)、aiv_mte3_time=2.137us(0.270)；每block GM→UB输入256KiB对应约58GB/s，MTE2为最长单向服务，构成该block的可压缩主项。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "paired_profiling",
+      "role": "源码循环热点与流水等待排序",
+      "finding": "第二遍历(candidate-source.py 60-68行)累计指令时间60.93us、等待31.83us，为最大热点；第一遍历(32-40行)32.73us/16.78us；全核MTE2 active_union=0.859且VECTOR wait_union=0.475、productive=0.412，说明第二遍重复读入及其等待占主要关注度；流水累计时间可重叠，仅作候选定位。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "同核窗口覆盖、绝对时钟资质与未报告泳道",
+      "finding": "core0.veccore0窗口原始时钟106.712→122.475us(15.76us)，clock_qualification=relative_only；absolute_unit_validation=verified(单位us，21/21个非同步PC比值中位1.00000001)；空区间仅描述观测窗内空闲，未报告泳道保持未知。"
+    },
+    {
+      "path": "ir/32338e32f17895728e74ac654bc8e1eef3b815e2f7524a5aeb087319f1656f38/_gn_kernel.ttir",
+      "category": "source_ir",
+      "role": "待优化TTIR的实际循环与加载结构",
+      "finding": "第一 scf.for %ci=0..8 内每次 tt.load 4096xf32 并累加 accs/accq；第二 scf.for %ci=0..8 对同一只读 %X 再次 tt.load 4096xf32 并写OUT；统计与归一化两遍各下发8次输入加载。"
+    },
+    {
+      "path": "compiled-readonly/32338e32f17895728e74ac654bc8e1eef3b815e2f7524a5aeb087319f1656f38/92d715f24c64dc874f85ed2070f20dec8712797dad708788abf0033ee1200a33/_gn_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "后端实际下降核对疑似冗余",
+      "finding": "ttadapter每个循环体各含 memref.reinterpret_cast %X + memref.alloc + memref.copy 4096xf32：第一循环8次、第二循环8次，合计16次拷贝、每program 262144B；shared_mem_dynamic_size=221184B。疑似重复读入在后端保留。"
+    },
+    {
+      "path": "compiled-readonly/32338e32f17895728e74ac654bc8e1eef3b815e2f7524a5aeb087319f1656f38/92d715f24c64dc874f85ed2070f20dec8712797dad708788abf0033ee1200a33/_gn_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "bcmlir同构核对",
+      "finding": "bcmlir与ttadapter一致：两个 scf.for 各含 memref.copy from %arg2(X) 4096xf32，第二遍输入拷贝完整存在，未由后端消除。"
+    },
+    {
+      "path": "lowered-inventory.json",
+      "category": "source_ir",
+      "role": "冻结低层产物身份",
+      "finding": "ttadapter(sd95e2..)、bcmlir(bba08a..)、npubin(869321..)均绑定 ast 32338e32..；这些低层产物冻结只读，编辑仅限 ir-inventory 列出的TTIR。"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "source_ir",
+      "role": "宿主证据分析贡献",
+      "finding": "Codex量化两遍输入搬运256KiB/program、MTE2服务4.489us、向量3.214us，指出ir001的CPU产物仍保留16次输入拷贝，并建议评估跨统计保留首遍输入；同时要求以实际下降核对物理live-range与221184B共享内存预算。"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "当前正式与补测结果及竞品状态",
+      "finding": "完整合同27项与双42补测通过；timing-7原24.812us、ir001候选24.109us(+2.9%)，原二进制未变case的时间漂移最高2.81%，稳定性待定；ir001仍属pending竞品，本轮从恢复的原始IR出发。"
+    },
+    {
+      "path": "context.json",
+      "category": "source_ir",
+      "role": "版本身份与起点约束",
+      "finding": "输入为qualified_compiler_original_ir，源SHA固定；current_search_parent为原始IR并保留ir001竞品；目标为超过当时可用的合格最佳。"
+    },
+    {
+      "path": "validation-policy.json",
+      "category": "simulator",
+      "role": "验收与补测策略",
+      "finding": "固定完整合同与既有双42补测；ABBA按测量疑点选用；模拟器在改动前后重放，SHA由工具自动记录。"
+    }
+  ],
+  "hypothesis": "第二遍归一化循环对同一只读 %X 重新发起GM→UB拷贝，这一重复搬运由TTIR把输入加载放在第二个循环内造成；在TTIR中把首遍8个channel的4096xf32输入展开为8个可区分的张量并跨统计保留，在第二遍直接复用，可让每program输入搬运由262144B降为131072B，保持累加与归一化的逐元素运算顺序不变，从而压缩MTE2服务与VECTOR对输入等待。",
+  "alternatives": [
+    "ir-001：展开双循环并重排预取/写回，CPU产物仍保留16次输入拷贝；该机制与本轮不同，作为保留中的竞品证据。",
+    "保持IR原样：若CPU下降显示127KiB保留量使UB超预算，则按no-change交接。",
+    "仅预取或重排第二遍加载：可减少等待，拷贝次数仍为16，重复搬运保留。",
+    "改变BLOCK或特化参数以减少搬运：会改动ABI与形状覆盖，本轮放弃。",
+    "合并mean/rstd标量store：无独立执行成本，收益不可测。"
+  ],
+  "change": "在单一特化 ir/32338e32.../_gn_kernel.ttir 中，把第一与第二 channel 循环展开为直线代码：第一遍按 ci=0..7 顺序加载 x0..x7 并保持原有 accs/accq 累加顺序；第二遍复用 x0..x7，仅加载每channel的 W/B 标量，按原有 a=rstd*w、b2=B-mean*a、y=x*a+b2 顺序计算并写OUT；同时把 OUT+cb 基址提出循环仅计算一次。函数签名、constexpr特化常量、指针参数与启动契约保持原样。",
+  "expected": {
+    "instructions": [
+      "GM→UB输入 memref.copy(4096xf32) 每program由16次降为8次。",
+      "动态输入搬运字节每program由262144降为131072，64个program合计由16MiB降为8MiB。",
+      "两个8次迭代 scf.for 的循环控制被直线代码替代，SCALAR索引与分支指令计数下降。",
+      "向量算术保持8×(addf,mulf,addf)+2次tt.reduce+8×(mulf,addf)，指令条数基本不变。",
+      "MTE3输出写仍为每program 8×16KiB，保持2.137us/block量级。"
+    ],
+    "dynamic_rounds": [
+      "动态输入拷贝轮次每program 16→8。",
+      "归约轮次2保持；每channel 4096元素的向量轮次保持8个channel。",
+      "跨64个program的总输入拷贝轮次由1024降为512，比较时须核对执行覆盖一致。"
+    ],
+    "waits": [
+      "VECTOR对输入MTE2的等待下降，预测全核VECTOR wait_union由0.475向0.35–0.42区间移动。",
+      "MTE2 wait_union由0.393下降，MTE2 idle_union上升（工作量减半）。",
+      "每block aiv_time预测由8.163us降至5.0–6.5us；向量服务3.214us成为新下界附近的主项。"
+    ],
+    "resources": [
+      "统计与归约间新增8×4096xf32=131072B的UB保留live-range，叠加accs/accq 32768B。",
+      "预测峰值UB约176–192KiB；当前shared_mem_dynamic_size=221184B，须由CPU下降确认物理分配可容纳且无Spill。",
+      "若下降报告UB溢出或插入额外阻塞同步，则本机制失效并转no-change或另登记。"
+    ],
+    "performance_prediction": "目标timing-7的设备段预测缩短约2–4us（24.812us基线的候选侧），即约21–23us；该数字为机制级预测，需宿主完整评测兑现并核对偏差。"
+  },
+  "validation": "先做CPU下降：核对输入memref.copy为8次、每program 131072B、无UB溢出、无新增跨流水阻塞同步；语义上逐元素运算顺序与FP32结果保持逐位一致，正确性abs/rel误差应保持基线值。通过后运行固定27完整合同与既有双42补测；formal目标按timing-7比较，当增益与2.8%噪声同量级时沿用既有ABBA疑点流程。源文件、清单、context与compiled-readonly保持冻结。",
+  "layer_reason": "Triton表达能力：源码可表达‘首遍结果留存复用’，例如在第一循环把每channel的load结果收进列表、在第二循环按索引复用；本线frozen.py冻结，因此把同一意图放到IR验证其独立身份。固定源码实验目的：保持源码、ABI、编译选项与全部回退特化不变，隔离‘跨阶段复用只读输入’这一单一机制，使其与ir001的展开/预取机制可独立比较。IR控制点：TTIR中两个scf.for对同一%X各发8次tt.load，在此层展开并保留张量，直接改变后端memref.copy数量与UB live-range，属于编译器本可通过跨循环复用来消除、但实际下降保留的具体冗余。",
+  "simulator_incremental_judgment": "改动前窗口记录：core0.veccore0覆盖106.712–122.475us(15.76us)，归一化为窗口占比，absolute_unit_validation为us且21/21 PC一致，未报告泳道保持未知。改动后须在同一core重放并分别记录覆盖量与归一化范围；只有当两侧执行覆盖一致时才比较动态总拷贝次数（预测1024→512）。热点排名用于定位第二遍历机制，设备波次与带宽结论仍引用独立profiling材料；流水累计时间可重叠，按重叠服务解释。",
+  "unknown": [
+    "CPU下降后8个保留张量的物理UB分配与峰值占用待确认。",
+    "第二遍消除是否引入额外同步等待，需在下降产物与重放中核对。",
+    "目标latency中宿主开销与设备段的占比需由重放分别量化。"
+  ]
+}

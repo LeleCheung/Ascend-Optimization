@@ -1,0 +1,67 @@
+{
+  "source_sha256": "a0e1e0d687176b904af29fbac46b505a7ccd8fe76fc0ea6add1ccad350ab1110",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "确认本特化实际调用的形状、dtype、分支与网格，界定缺陷只出现在 2x 快路径",
+      "finding": "目标 case 为 4x32x128x128 fp16 -> 256x256、align_corners=false，reciprocal_scale_h/w 均为 0.5，必走 upsample_bilinear2d_2x_kernel；由 select_2x_tile(128,128,128) 得 BLOCK_I=16、BLOCK_J=128，grid=(cdiv(128,128), cdiv(128,16), 128)=(1,8,128)=1024 个程序，即每程序 16 行 x 128 列输入 tile、产生 32 行 x 256 列输出。comparator 的 target_latency_ms=0.16574，是本轮要对标的最佳口径。"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "定位有执行成本的编译缺陷：哪些指令、哪些源码行、多少调用次数",
+      "finding": "本核窗口 10.191us 内 MTE2 event_count=211、active_union=3.659us、productive=3.632us、idle_ratio=0.641；VECTOR active_union=6.267us（wait_only 2.499us）、SCALAR active_union=3.126us（wait_only 2.117us）。top_instructions 里最贵的是 MOV_SRC_TO_DST_ALIGN calls=16 running 0.91us，归属 candidate-source.py:235 的 `ml = tl.load(ptr_i + off_m + jl, mask=m_l, other=0.0)`，同一行还有 MOV_SPR_XN(MOV_PAD_VAL) calls=17 running 0.91us，以及行 235 上的 WAIT_FLAG/BAR 各 0.73us；candidate-source.py:291 的 `pl` 加载另有 MOV_SRC_TO_DST_ALIGN calls=16 running 0.58us。即 16 次/加载的搬运 = 行平移 tile 被拆成逐行 copy，并逐行写 pad 值。"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "确认流水等待/空闲结构与同步代价，避免把重叠时间当因果",
+      "finding": "同核 capture_start=127.391us、capture_end=137.582us、capture_duration=10.191us；MTE2 有 23 段 idle（最大 1.725us），MTE3 只有 6 个事件且 wait_union=0.823us，VECTOR 130 段 idle、SCALAR 大量 wait_only。说明逐行搬运不仅自身耗时，还通过 WAIT_FLAG/BAR 与向量流水交替，属可观测的执行成本，但各流水可重叠，故只作关注度与方向判据，不重建关键路径。"
+    },
+    {
+      "path": "lowered-inventory.json",
+      "category": "source_ir",
+      "role": "确认冻结的最佳真实编译产物身份，用于核对疑似冗余在后端是否已消除",
+      "finding": "唯一的特化 ast_sha256=f85be7a4… 对应 ttadapter(42585B)/bcmlir(41297B)/npubin(17112B)，符号 upsample_bilinear2d_2x_kernel；这些低层产物由冻结源码的真实编译得到，本轮保持只读，只改 TTIR。"
+    },
+    {
+      "path": "compiled-readonly/f85be7a40348b16a3bb9f96d42d0385a8950cc3aea4e930615c06704c5b53127/701603f4b6c35707f115d4fd5713a02ae909607c67057c2a6af937d6976066f9/upsample_bilinear2d_2x_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "核对后端对每个 stencil 加载的实际降级方式，判定缺陷是行索引仿射性还是列偏移",
+      "finding": "行平移的三个 m 行加载（ml/mc/mr，#loc108/#loc126/#loc128）和三个 p 行加载（pl/pc/pr）都被降成 `scf.for %arg14 = 0 to 16` 的 16 次 `memref.copy` 1x128 行拷贝，循环体里每次重算 `subi/addi` 后用 `arith.maxsi/minsi` 钳位行号；而中心行 cl/cc/cr（#loc105/#loc101/#loc107）是单次 16x128、strides=[IW,1] 的 strided copy（带 length 化的尾部 fill）。两者列结构相同、只有行索引是否仿射不同，故冗余未被后端消除，根因是 maxsi/minsi 使行映射非仿射。"
+    },
+    {
+      "path": "ir/f85be7a40348b16a3bb9f96d42d0385a8950cc3aea4e930615c06704c5b53127/upsample_bilinear2d_2x_kernel.ttir",
+      "category": "source_ir",
+      "role": "核对当前实际 TTIR（父候选 ir-001 已改）与冻结原件的差异，确认越界点",
+      "finding": "当前文件 sha256=ef36c752…，不同于 inventory 记录的 original_sha256=1c76b49e…：父候选去掉了 `arith.maxsi %im_17, 0` 与 `arith.minsi %ip, IH-1`，使 im=ii-1、ip=ii+1 变仿射，并用 row_has_m/row_has_p 的 arith.select 复原边界值；但六个行平移加载的 mask 仍是旧的 %m_l_42/%m_c_40/%m_r_44（只含 row_ok&in_col&has_l/has_r），于是 nc=0 且 ii=0 时地址 base-1-IW、以及 nc=NC-1 且 ii=IH-1 时越过平面末尾的地址仍会被真正读写。ir-review 的拒绝结论与此一致（decision=rejected_memory_safety）。"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "source_ir",
+      "role": "记录 Codex 的证据分析贡献及其可核对程度",
+      "finding": "Codex 指出 BCMLIR 里 stencil 加载是 scf.for+memref.copy 的 16 行结构、tile 是 16x128、并给出只看 IR/汇编不足以重建动态次数的限制，这一结构判断与我在 bcmlir 中核到的一致，构成我的根因假设起点。但本工作区副本的中文字段已被替换为 '?'（hypothesis/observations 不可复原），且其引用的 Vector 3.204us / MTE2 2.963us / Scalar 3.288us 在 hotspots.json 中检索不到（现报告是 active_union VECTOR 6.267 / MTE2 3.659 / SCALAR 3.126），故我所有量化结论只锚定当前 hotspots/timeline 与 bcmlir。"
+    }
+  ],
+  "hypothesis": "缺陷是行平移到 stencil 加载的行索引非仿射：冻结最佳 IR 用 arith.maxsi(ii-1,0)/arith.minsi(ii+1,IH-1) 钳位行号，后端因此无法把 16x128 tile 表达成一个 strided 区域，只能逐行 1x128 memref.copy 并在每行重写 pad 值（MTE2 每加载 16 次搬运 + 17 次 MOV_SPR_XN，行 235 单行就占 0.91+0.91+0.73+0.73+0.73us 的关注度）。父候选 ir-001 正确地判断应让行号仿射，却把边界保护一起删掉，造成真实的越界读写（被 ir-review 拒绝）。本轮把保护从'索引钳位'搬到'掩码谓词'：行平移的 m 行加载加 row_ok&row_has_m 谓词、p 行加载加 row_ok&row_has_p 谓词，六组加载各自仍是仿射的 16 行 x128 列区间（起始行为标量、行数为区间长度），而被谓词关掉的通道正好是 arith.select 链本来就用 mc/cc 覆盖的通道，因此数值逐位不变。这样后端可把六个加载各折成一次 strided tile 搬运，同时任何地址都落在 [base_i, base_i+IH*IW) 内。",
+  "alternatives": [
+    "回退到清单 frozen 钳位 IR（original_sha256=1c76b49e…）：安全，但等于放弃行仿射，没有任何改进，只能作为兜底。",
+    "只把 three 个 m/p 行加载 mask 换成 row 谓词而不动其它：与主方案相同但不去讨论 pad 值通道，收益更小。",
+    "去掉所有 masked load 的 other=0.0（掩码通道值均被 select 覆盖或被 store 掩掉）：可消掉 MOV_SPR_XN/MOV_PAD_VAL 的逐行 pad 写入，但同时引入'未定义值'的语义面，留作下一轮独立机制。",
+    "按 pid_j/pid_i 用 scf.if 做'内部 tile 快路径 + 边界钳位慢路径'：本 case 只有 1 个列块（BLOCK_J=IW=128），列边界在每个程序都出现，程序级分支无法消除，且手写 scf.if 体量大、解析/验证风险高，暂不采用。",
+    "把 tile 摊平成一维连续加载（行距恰等于行宽时 16x128 窗口本是一段连续内存）：需要硬编码 BLOCK_J==IW，语义面收窄且改动面大，暂不采用。"
+  ],
+  "change": "仅编辑 ir/f85be7a4…/upsample_bilinear2d_2x_kernel.ttir：(1) 把 %row_has_m_2d/%row_has_m_b/%row_has_p_2d/%row_has_p_b 的定义前移到六个行平移加载之前；(2) 新增 6 个 arith.andi，得到 %m_l_42_rowm=%m_l_42&%row_has_m_b、%m_c_40_rowm、%m_r_44_rowm、%m_l_42_rowp、%m_c_40_rowp、%m_r_44_rowp；(3) 把 ml/mc/mr 三个加载的 mask 换成 *_rowm、pl/pc/pr 三个加载的 mask 换成 *_rowp。不动 im/ip 的仿射偏移、不动任何插值算术、不动 select 链、不动函数签名与常量，其它 op 一律保持原样。",
+  "expected": "可测预测：每个程序的 MTE2 tile 搬运事件从约（6 个行平移加载 x16 行 + 3 个中心行加载）≈99 次降为约 9 次，行 235/291 的 MOV_SRC_TO_DST_ALIGN calls 由 16 降为 1 量级、MOV_SPR_XN(MOV_PAD_VAL) 明显减少，MTE2 event_count/active_union 低于当前 211/3.659us；SCALAR 侧逐行重算的 maxsi/minsi 消失。代价是 6 个 16x128 逻辑与 + 6 个 select（VECTOR 侧约 1.6 万 lane 级运算，预计 <0.1us 量级，小于 MTE2 的节省）。输出与当前最佳应逐位一致（只改了掩码通道与丢弃通道的来源）。",
+  "validation": "宿主编译后应核：bcmlir 中 ml/mc/mr/pl/pc/pr 六个 stencil 加载不再是 `scf.for … 16 次 memref.copy 1x128` 的逐行结构，而是单次 strided copy（strides=[IW,1]）；MTE2 event_count 与 active_union 下降、top_instructions 里 calls=16 的 MOV_SRC_TO_DST_ALIGN 归一；数值上与当前最佳 bit-exact（不只 atol/rtol 内），因为它不改变任何存活通道的运算序列；边界安全需覆盖 IH/IW 非 16/128 整除、NC=1、IH=1 的最小 case，确认无低于 base 或越过 NC*IH*IW 的访问。任何文档、预检或本次诊断都不当作收益结果。",
+  "layer_reason": "成本落点在 TTIR->后端降级的选择上：同一份 TTIR 里中心行 cl/cc/cr 与行平移 m/p 行的列结构、mask 结构、算术完全相同，唯一差异是行索引经过 maxsi/minsi 还是仿射，后端因此给出'单次 strided copy'与'16 次逐行 copy+pad 写入'两种完全不同的降级。这既不是源码算法问题（frozen.py 必须保持逐字节一致，且源码的 max/min 本身就确保了安全），也不是编译选项问题（钳位是 IR 语义事实，开任何选项都不会把非仿射映射变仿射）。只能在 IR 层把'安全'从索引钳位改为掩码谓词，故 selected_layer=single_operator_ir。",
+  "simulator_incremental_judgment": "模拟器材料按单核窗口解释：capture_duration=10.191us 只覆盖本核首个至末个可见事件，绝对时钟 127.391~137.582us 不带资质，不能跨次比较；MTE2 idle_ratio 0.641、SCALAR wait_only 2.117us、VECTOR wait_only 2.499us 说明时间大量落在等待/空闲，各流水可重叠，不能据此重建关键路径，也不能把 10.191us 当作整网耗时。本改动的判据是结构性的、增量的：MTE2 的 event 数与 calls=16 的逐行搬运是否归一，以及 SCALAR 逐行 maxsi/minsi 是否消失；不假设整体时延按 MTE2 节省量线性下降。",
+  "unknown": [
+    "后端是否能把 row_ok&row_has_m（区间 [1,IH)）折成'起始行 + 行数'从而发出单次 strided copy；若它仍按谓词逐通道处理，则六个加载可能维持逐行结构，只剩标量与 pad 值部分的收益甚至无收益。",
+    "把 pad 值来源（other=0.0）保留后，掩码关闭通道仍会产生 fill+select 指令，是否与行拷贝合并未被证实。",
+    "本特化只覆盖 fp16/PACK16 分支；非 PACK16 路径（tl.interleave）不在本 case 的编译产物内，本轮不对其作任何声称。",
+    "宿主是否会为本 IR 重新特化出其它常量组合（其它 IH/IW 是否整除 16/128）未知，故边界安全需用最小 shape 单独验证。"
+  ]
+}

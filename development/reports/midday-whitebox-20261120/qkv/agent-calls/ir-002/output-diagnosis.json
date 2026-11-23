@@ -1,0 +1,104 @@
+{
+  "source_sha256": "0af5d533afea8f4be88e1fd6e0fc4a6ba76fae9a8b1478f7c4b93247fe7ec070",
+  "selected_layer": "single_operator_ir",
+  "evidence": [
+    {
+      "path": "ir/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttir",
+      "category": "source_ir",
+      "role": "被检视的实际 TTIR（EXACT=true、BLOCK_S=BLOCK_D=64、GROUP=2 的特化），本轮唯一允许编辑的对象",
+      "finding": "第30-44行：只有 %c0/%c1/%c2/%c64/%c128 五个常量；pid 解码为 seq_group=pid%num_groups、rest=pid/num_groups、head=rest%num_heads、batch=rest/num_heads；列偏移 in_cols=%head*%head_dim+offs_s(64) 同时用于输入与 bias。第45-104行 scf.for %i=0..2 {tt.num_stages=2}：每轮 3 次 tt.load（q_in_20，及以 splat(hidden_dim)/splat(v_shift) addptr 得到的 k/v），Q 走 extf→addf(f32 bias)→mulf(scale)→truncf，K/V 走 f16 addf，然后 3 次 tt.store。即一个程序 = 1 个 head × 128 行（两轮 64 行），每轮每条 load 的 GM 连续段只有 BLOCK_D=64 个 f16 = 128B，行距 stride_qkv_s=3072 元素(6144B)。",
+      "sha256_observed": "3924918d3cd31a2593550101e20ec9d7ef61d9f8cfb0aec29e53b8a8cb4d8854"
+    },
+    {
+      "path": "compiled-readonly/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "冻结的实际低层产物，核对拷贝/分配/循环是否已被后端消除",
+      "finding": "后端原样保留：循环外 3 条 memref.alloc()+memref.copy（bias，各 memref<64xf16>，即 3 次 128B GM→UB）；循环内每轮 3 条 memref.copy 从 memref<64x64xf16, strided<[%stride_qkv_s,1]>> 进入独立 alloc（第59/68/74行），另有 3 条 bufferization.materialize_in_destination 以 strides<[%stride_out_s,1]> 写出（第97/99/101行，stride_out_s=64 时整块 8KB 连续）。共 6 次分配 + 6 次拷贝 + 1 个 scf.for，未合并、未外提、未把 3 条输入搬运折成更宽的突发；Q 路径的 extf/linalg.fill(scale)/mulf/truncf 与两处 linalg.broadcast 全部保留在循环体内。",
+      "sha256_observed": "8557bfc1c8ec73b02598c4d567fe0a72642fe4bc7da54ce373f0cb9c89ef5b1f"
+    },
+    {
+      "path": "compiled-readonly/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttadapter",
+      "category": "source_ir",
+      "role": "同一次编译的 TTAdapter 低层形式，确认地址/布局与前一步一致",
+      "finding": "输入以 memref.reinterpret_cast %qkv_ptr sizes:[64,64] strides:[%stride_qkv_s,1] 表示（第59/68/74行），输出以 sizes:[64,64] strides:[%stride_out_s,1] 表示（第97/99/101行）；bias 为 sizes:[64] strides:[1]（第32/39/45行）。说明后端的访存几何完全由 TTIR 的 tile 形状决定：读取内维恒为 64 元素(128B)，写回内维在 stride_out_s=64 时为 8KB 连续。低层没有任何把相邻 head 的列段合并进同一事务的结构。",
+      "sha256_observed": "6955cc56bbce81b4976cbcea6f6dccdeedb322e6af379fb8d17dd7a942042a0c"
+    },
+    {
+      "path": "lowered-inventory.json",
+      "category": "source_ir",
+      "role": "低层产物清单身份核对（只读、保持冻结）",
+      "finding": "清单登记 ttadapter 6955cc56…、bcmlir 8557bfc1…、npubin 92cc78be…，ast_sha256 均为 ca6c05a0…，与 context.json 的 expected_binaries 一致；本轮只据此确认我读取的是当前最佳的真实编译结果，未改动这些产物。",
+      "sha256_observed": "8557bfc1c8ec73b02598c4d567fe0a72642fe4bc7da54ce373f0cb9c89ef5b1f"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "候选与参考的成对算子级计数；本轮管线时间与指令数的定量依据",
+      "finding": "候选 512 个 block、参考 40 个 block。候选逐 block 均值：aiv_total_cycles 5069.93（3.0727us）、aiv_mte2_time 1.8099us（ratio 0.5901、active_bw 27.24GB/s、12800 条即 25 条/block）、aiv_mte3_time 1.1549us（ratio 0.3908、active_bw 45.06GB/s、3584 条即 7 条/block）、aiv_vec_time 0.7393us（0.2486）、aiv_scalar_time 1.0098us（0.3252，其中 scalar_mte2_stall 0.2355）；等待侧 mte2_wait 0.4985、mte3_wait 0.5798、vec_wait 0.5154。搬运字节 GM_to_UB 24768KB、UB_to_GM 24576KB、read_main_memory 24896KB、write_main_memory 24576KB，与理论最小（输入 24576KB+全部 512 程序各 3×128B bias=192KB、输出 24576KB）逐字节吻合，读写均无放大；读 L2 命中率 75.3%、写命中率 0%。关键算术：1.8099+1.1549=2.9648us，已达 aiv_total 3.0727us 的 96.5%，即读 DMA 与写 DMA 在本核上几乎完全串行，而 VEC(0.7393) 与 SCALAR(1.0098) 被压在其下。参考侧同为最小字节但 mte2 active_bw 30.82GB/s、读命中率仅 1.0%，说明 27.24GB/s 不是数据量或缓存命中问题。",
+      "sha256_observed": "2d30e38e5d9a5d7ce28f258e7a26d5c82ed0adf8ef2d09d33f6a6e88d77289b9"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "逐指令/逐区域热点与流水有效、等待、空闲占用（单核部分窗口）",
+      "finding": "8 个 pc_neighborhood 区域全部 file=unmapped、source_lines=[0]，无 PC→源码映射，只能按流水/指令族定位。top_instructions 以同步与搬运为主：MTE3 的 BAR 4.79us(3 次)、VECTOR 的 BAR 4.75/4.66/4.50us(各 3 次)、ALL 的 BAR 3.04us(1 次)；MTE2 的三条 MOV_SRC_TO_DST_ALIGN 分别为 4.15us(2 次, XD=0x4280,XT=0x1780)、3.69us(2 次, XD=0x2280)、2.86us(3 次, XD=0x280)，各自伴随 SET_FLAG/WAIT_FLAG(id 24/22/20/18)。泳道：MTE2 active 0.859/idle 0.141、MTE3 active 0.811/wait 0.674、VECTOR active 0.864/wait 0.744、SCALAR active 0.057。三条搬运指令的累计时间不叠加、也不能当作关键路径，但“读搬运 + 其配对 SET/WAIT 是窗口内最大的单一指令族、而写/向量泳道长期 wait”与 profiling 的串行结论一致。",
+      "sha256_observed": "63c0e722d6f04147c706b0bbaa15dcc3d8ccf4d7ae80f61bbf140bd07d65f85f"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "相对时间轴（窗口分数）与观测范围",
+      "finding": "core0.veccore0，capture_scope 为“首个到末个可见硬件事件”，time_unit=fraction，capture 0..1 对应 raw_window 110.488→118.879（8.391 单位、unit=unassigned）；ALL/FLOWCTRL/CACHEMISS 是 auxiliary_trace_lane（ALL 仅 1 个事件、active 0.0001，不能当作核占用或核空闲）。硬件执行泳道结构：MTE2 idle 0.141 且 idle 段以 [0.7046,0.7493] 与 [0.9391,1.0] 为主；MTE3 idle 0.189（17 段）；SCALAR idle 0.943；窗口内 MTE2 几乎持续有动作、计算/写回泳道大部分时间在等待。该窗口是部分覆盖（未含应用完成），本诊断只用其相对结构，不做“窗口占比=关键路径”或“绝对时钟=核函数时长”的推断。",
+      "sha256_observed": "6c08d8c9066a65317f255058b5406e8acf19b8e27db45e1f7b5786c69a8faca5"
+    },
+    {
+      "path": "frozen.py",
+      "category": "source_ir",
+      "role": "冻结源码：tile/UB 预算与特化条件",
+      "finding": "_TILE_BYTES=8192、block_d=next_pow2(head_dim)=64、block_s=4096/64=64、exact=(block_d==head_dim and seq_len%block_s==0)、group=2（num_seq_blocks=8 为偶数）、num_groups=cdiv(8,2)=4、grid=batch*num_heads*num_groups=8*16*4=512。注释给出的 UB 账目为 12*16384 被拒（230144B>196608B）、12*8192+2*8192+768=115456B 被接受，说明当前预算正是为 num_stages=2 的 12 个 tile 缓冲付出的；因此任何把单个 tile 从 8KB 加宽到 16KB 的改法必须同时把每个 tile 的元素数保持不变（否则 12*16384 会超限）。源码冻结，无法在源码层表达布局。",
+      "sha256_observed": "0af5d533afea8f4be88e1fd6e0fc4a6ba76fae9a8b1478f7c4b93247fe7ec070"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "本轮实际正式与补测结果、以及上一轮（ir-001）的保留判定",
+      "finding": "保留基线：21/21 通过、geo_mean 1.645464、timing-2 0.063257576ms；上一轮 ir-001（QKV→KVQ 写出顺序）21/21 与两份 48/48 全通过但目标 0.063651644ms 更慢，未保留（retained=unchanged-ir），post_mechanism 结论为“实际 lowering 只改写出顺序，6 拷贝/6 分配/1 循环不变；MTE2 1.809911→1.678384 改善但 MTE3 1.154888→1.196779、Scalar 1.009835→1.027134 变差，完整调用未获益”。即只重排写出顺序不能改变 DMA 事务几何，本轮不再重复。",
+      "sha256_observed": "fb64d08a0794a921ef5cc0e59ad71c7e074009da62734fdd98fd0afc7aab624c"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "source_ir",
+      "role": "宿主（Codex）的证据分析与候选方向",
+      "finding": "Codex 归纳：当前保留 TTIR 的目标特化无 masked load；两次 64×64 循环分别读 Q/K/V，bias 是循环外三次 64 元素读取；原 IR 与 KVQ 版都是 6 copy/6 alloc/1 循环，单纯改写出顺序已负结果；局部窗口 MTE2 active 0.859、VECTOR wait 0.744、MTE3 wait 0.674。其假设要求核对“现有 Q/K/V 分离读取与 bias 广播在最终产物中的搬运几何、布局和同步开销”，评估同一输入多个分量的联合搬运/布局传播/合法地址简化能否减少实际命令与等待。本诊断采纳该方向的搬运几何部分（读侧事务宽度），但按实际 IR 独立选定具体实现，并否决其“Q/K/V 三分量联合搬运”的字面形式（语义与可表达性不允许，见 alternatives）。",
+      "sha256_observed": "n/a (host brief, read in place)"
+    },
+    {
+      "path": "prior-explorations.json",
+      "category": "paired_profiling",
+      "role": "历史机制与实测结果，用于排除重复方向并为本轮假设提供依据",
+      "finding": "已完成并保留的负/中性结果：ir-001 展开+六载入前置 0.063029ms、ir-003 4×32 行+num_stages=3 0.063516ms、ir-006 配对头 [32,128]+[32,2,64] 三维 store（allow_reorder 修复后）0.094184ms（min_speedup 0.974，强烈退步）、ir-007 循环不变式(4 处 broadcast/fill)外提 0.063038ms、ir-008 去循环 [128,64] 单 tile 0.063666ms；ir-002 判定屋顶线且不落地。其中 ir-006 的退步与本轮机制直接相关：它把读加宽到 256B 但把写变成 strides<[stride_out_s,stride_out_h,1]> 的 128B 分段写。",
+      "sha256_observed": "n/a (read in place)"
+    }
+  ],
+  "hypothesis": "本核的读 DMA 与写 DMA 共用同一搬运引擎：逐 block 均值 aiv_mte2_time 1.8099us 与 aiv_mte3_time 1.1549us 之和 2.9648us 已占 aiv_total_cycles 折算 3.0727us 的 96.5%，因此该算子每程序的时间基本等于“读事务时间 + 写事务时间”，VEC(0.7393us) 与 SCALAR(1.0098us) 全部被压在下面（这也解释了为何展开、加深流水、去循环、外提不变量这些“重叠/同步”类改法在 ir-001/003/007/008 全部落在噪声内）。在字节数已达理论最小（读 24768KB、写 24576KB）的前提下，唯一还能降低读事务时间的是提高单次突发宽度：当前读取内维固定为 BLOCK_D=64 个 f16=128B，行距 6144B，读 active_bw 仅 27.24GB/s，而写出以 8KB 连续块达到 45.06GB/s，两者比值 1.65 与突发宽度比同量级，且参考实现字节相同、读命中率仅 1.0% 仍有 30.82GB/s，说明限制来自事务几何而非缓存或数据量。把每个程序覆盖的列从 1 个头(64 列)加宽到相邻 2 个头(128 列)、同时把行数从 128 减到 64，可以在每程序元素数、tile 字节(8KB)、UB 账目、grid(512) 与总字节完全不变的情况下，把 GM 读突发由 128B 提升到 256B、每个 block 的读事务数由 6×64=384 降到 6×32=192。ir-004/005/006 曾试过同一读加宽却强烈退步(94.184us)，其原因是加宽后输出被写成 strides<[stride_out_s,stride_out_h,1]>，把原本 8KB 连续的写拆成 128B 分段；本轮机制的关键差别是在写回前用 tt.reshape[32,128]→[32,2,64] 与 tt.trans(order=[1,0,2]) 把 head 轴换到最外层，使每个 head 的 [32,64] 块在 UB 与 GM 两侧都连续（4KB），从而只改动读事务宽度而不改动写几何。由于 VEC 只占 0.7393us/25%，把这次重排放在向量流水上可与 DMA 重叠，不进入 96.5% 的串行链。",
+  "alternatives": [
+    "保持 IR 原样并登记“无可行低风险改法”：理由是读/写字节已达理论最小、各流水在部分窗口中的结构也未见后端遗留的冗余同步；但 1.8099+1.1549=2.9648us≈总时长这一串行结构说明读事务宽度仍是可测的成本项，且 27.24GB/s 明显低于写侧 45.06GB/s，故本轮不选保持。",
+    "把同一行的 Q/K/V 三段（列偏移 0/hidden_dim/2*hidden_dim）联合成一次三维拷运（Codex 字面方向）：不可行。(a) 融合后必须沿分量轴切分才能分别写入三个独立输出张量，而 TTIR 没有对非末位分量轴的 slice/split（tt.split 只作用于末位长度 2 的轴，3 个分量无法表达）；(b) Q 需要 f16→f32 加法-缩放-单次舍入，K/V 是 f16 加法，融合成一条逐元素算子会改变舍入语义（f32 中转后截断与直接 f16 加法在双舍入边界不同），违反“保持浮点精度语义”。因此该方向的字节与命令都省不了，只会在 K/V 切分处引入新风险。",
+    "只加宽读、把输出写成 [32,2,64] 三维 affine strides<[stride_out_s,stride_out_h,1]>：即 ir-004/005/006 的已实测退步(0.094184ms，min_speedup 0.974)，原因分析见 hypothesis；作为负结果保留，不重复。",
+    "更多头加宽（4 头/512B 突发，行列同步减半）：机制同源但把风险放大到 4 路重排与 2KB 连续写，先以 2 头为单步受控实验；若本轮成立再作为独立机制推进。",
+    "重叠/同步类改法（展开前置载入、更深多缓冲、去循环单 tile、循环不变式外提）：ir-001/003/007/008 实测均落在 ±0.5% 噪声内，且与本轮“读+写串行、只能改事务宽度”的解释一致，不重复。",
+    "修改 num_stages 或其它编译选项、改 grid、改启动映射：属编译选项/调度而非具体缺陷修复，且 grid 冻结，不采用。"
+  ],
+  "change": "只编辑 ir/ca6c05a0a6ae321b102c29f10aef7305abab64a202e3bb0e935f69d30fffac32/_transform_bias_rescale_qkv_kernel.ttir（frozen.py、清单、context、证据与 compiled-readonly 全部保持冻结；函数签名/参数顺序/ABI/常量集合一律不动），单一机制＝“读突发加宽到 2 个相邻头，并用 UB 内的 head 轴换序保持逐头连续写回”：1) 解码改为 %num_blocks=%num_groups*2（本特化=num_seq_blocks=8）、%seq_group=%pid%num_blocks、%rest=%pid/num_blocks、%num_pairs=%num_heads/2、%head_pair=%rest%num_pairs、%batch=%rest/%num_pairs，故 pid=batch*(num_heads/2)*num_blocks+head_pair*num_blocks+seq_group 为双射，程序数仍为 batch*num_heads*num_groups=512；2) %seq_base=%seq_group*64（原为 *128），列基址 %pair_col=%head_pair*128 取代 %head*%head_dim；3) tile 由 [64,64] 改为 [32,128]（%offs_s 改 32 元、新增 64 元 %offs_d 与 128 元 %offs_c），循环仍为 scf.for 0..2 步 1、tt.num_stages=2，每轮 %offs_rows=%seq_base+%i*32，两轮共覆盖 seq_base+[0,64) 行；4) bias 由 3×64 元改为 3×128 元（q/k/v 仍以 0/hidden_dim/2*hidden_dim 位移区分，bias 的 stride_bias=1），循环外各载入一次；5) 计算图逐元素不变：Q 为 extf→broadcast(f32 bias)→addf→splat(scale)→mulf→truncf，K/V 为 f16 broadcast+addf，张量形状仅由 64x64 变为 32x128；6) 写回前把每个结果 tt.reshape 32x128→32x2x64（省略 allow_reorder，保持行主序拆内层维）再 tt.trans{order=array<i32:1,0,2>}→2x32x64，用三维地址 ([0,1]*stride_out_h + rows*stride_out_s + d，基址 batch*stride_out_b+head_pair*2*stride_out_h) 写出，使每个 head 的 32×64 块在 GM 上成为 4KB 连续写。覆盖证明：num_heads 带 tt.divisibility=16 故 num_pairs 与 /2 均整数；EXACT=true 蕴含 seq_len%64==0 且 group=2 蕴含 num_seq_blocks 为偶数、num_groups=num_seq_blocks/2，故 %num_blocks=num_seq_blocks、%seq_group 覆盖全部 64 行块；列上 head_pair 最大 = num_pairs-1，故 pair_col+128 = num_heads*head_dim = hidden_dim，Q 段恰好铺满 [0,hidden_dim)，K/V 段落在 [hidden_dim,2*hidden_dim) 与 [2*hidden_dim,3*hidden_dim)，与原 IR 逐元素一一对应，无越界、无别名变化、无掩码（仍走 EXACT 无 mask 路径）。",
+  "expected": "目标 transform_bias_rescale_qkv-timing-2 由 0.0632576ms 降到 ≤0.0595ms（约 ≥6%）；若读事务宽度假设成立则更强（读时间减半时约 0.054–0.056ms）。逐项预测：(1) 指令：每 block 的 MTE2 指令数保持约 25（3 bias + 6 tile 载入），但每次 tile 载入的描述符由 64 行×128B 变 32 行×256B，读事务数 384→192；每 block 的 MTE3 指令数由 7 增到约 13（6 次 store 各 2 个连续 4KB 段），写事务总字节不变 48KB。(2) 动态轮次：程序数仍 512、每程序 2 轮、每轮每分量 8192 字节，总读写字节不变（GM_to_UB≈24768KB、UB_to_GM≈24576KB）。(3) 等待与资源：aiv_mte2_time 1.8099→约 1.3us（±0.15）、aiv_mte2_active_bw 27.24→约 35–37GB/s、aiv_mte2_wait_ratio 0.4985→约 0.40 或更低；aiv_mte3_time 1.1549→约 1.15–1.25us（描述符变多、字节不变，允许小幅变差）；aiv_vec_time 0.7393→约 0.80–0.90us（新增 reshape/trans 的 UB 重排），即每 block 的 (mte2+mte3) 由 2.9648 降到约 2.5us、aiv_total_cycles 5069.93→约 4300–4600、每 block aiv_time 3.0727→约 2.65–2.8us；UB 请求 12*8192+2*16384+768=131840B，若 trans 需额外暂存再加 49152B 仍为 180992B<196608B。(4) 数值：21 项正式与两份 48 项补测逐位不变（abs_err/rel_err 仍 0），Q 仍为 f32 加 bias→f32 乘 scale→一次 f16 舍入，K/V 仍为 f16 加法。(5) 失败判据（须据实记录）：若编译拒绝 tt.trans、或后端把 trans 物化成额外整块 UB 拷贝使 aiv_vec_time 明显上升（或 UB 超限），则本机制在本后端不可行，应回退；若 MTE2 时间不降而 MTE3 时间上升，则说明读带宽不受突发宽度限制。",
+  "validation": "宿主复核后运行完整 21 项与两份 48 项补测，逐项比较 timing-1/2/4/5/7/8、geo_mean 与 min_speedup，确认 21/21 与 48/48 全通过且 abs_err/rel_err 仍为 0；核对新 bcmlir：tile 应为 memref<32x128xf16>、输入 copy 的 strides 为 <[%stride_qkv_s,1]>、输出 store 三维且每 head 的 dest 为 stride_out_s=64 的连续 4KB、分配仍 6 次、循环仍 1 个；核对 profiling 的 aiv_mte2_time/active_bw、aiv_mte3_time/instructions、aiv_vec_time 与 aiv_total_cycles 是否落在 expected 区间；并对保留基线做同批 ABBA 对照以区分测量漂移。文档、预检与本诊断不作为收益结论。",
+  "layer_reason": "Triton 表达能力：源码层能表达 tile 形状与“相邻两头”的映射，但源码已冻结且改写源码属另一研究身份；在 IR 层可用 tt.reshape 与 tt.trans 精确表达“head 轴换序以保持逐头连续写回”，这是源码里无法单独控制、而 TTIR 可控的编译变换。固定源码实验目的：frozen.py 与低层产物冻结，只考察编译器在同一数学语义下如何处理 tile/突发几何，从而把“读事务宽度是否限制本核”这一机制与源码重写、编译选项改动区分开。IR 控制点：tile 形状（BLOCK_D 从 64 到 128）、pid→(batch,head_pair,seq_group) 映射、输入/输出地址的仿射形式、写回前的 reshape/trans，全部集中在同一个 TTIR 文件，可做最小范围 Edit 且不触碰函数 ABI；同类意图若要在源码表达，应改为源码层“程序覆盖相邻 2 头 + 输出前 reshape/trans 的等价写法”，属独立身份，本轮不做。",
+  "simulator_incremental_judgment": "资质与范围：hotspots/timeline 的 core0.veccore0 窗口是“首个到末个可见硬件事件”的绝对时间区间 110.488→118.879（unit=unassigned，application_completed=false），时钟校验在同 PC、非 Scalar、非同步指令上 median_ratio≈0.9995，可以用于相对结构，但不能把窗口比例当成核函数时长或总耗时，也不能与 63.257576us 端到端延迟相减；每个窗口的动态总量与占比独立归一化，不跨窗口相加。未报告/辅助泳道：ALL、FLOWCTRL、CACHEMISS 为 auxiliary_trace_lane（ALL 仅 1 个事件、active 0.0001），其 idle_ratio≈0.9999 不代表核空闲，本诊断不使用。可增量采信：MTE2 active 0.859 且窗口内几乎持续有搬运、MTE3/VECTOR 长期 wait(0.674/0.744)、最大单一指令族是 MTE2 搬运与其 SET/WAIT 配对，这支持“节奏由搬运动作决定”；但“读+写串行占 96.5%”这一更强的结论来自 profiling 的逐 block 均值（1.8099+1.1549 对 3.0727），不来自部分窗口，也没有把重叠的流水累计时间当作关键路径。等待/空闲作为核心输入：mte2_wait 0.4985、mte3_wait 0.5798、vec_wait 0.5154 与 scalar_mte2_stall 0.2355 一起说明 CPU 侧发射并不饥饿、等待集中在对 DMA 的依赖上，因此本轮改“事务宽度”而非“同步次数”。超范围保留为待验证：设备波次与尾波（512/40≈12.8 波）只由 profiling 的 block 数与 grid 推出，本轮不改 grid，故不据此做结论；带宽结论引用 profiling 的 active_bw 与字节数（两侧独立、字节相同），不引用窗口占比。",
+  "unknown": [
+    "tt.trans(order=[1,0,2]) 在本安装的 Ascend 后端是否被支持，以及它被降为“store 的跨步源描述符”还是“额外一次 UB 重排拷贝”",
+    "后端是否会把 [32,128] 载入的相邻 2 个头的 128B 段识别为一次 256B 突发（编译器可能仍按 128B 段发事务）",
+    "写回由每 store 1 个连续段变 2 个 4KB 段后 MTE3 指令数与时间的实际增量",
+    "trans 是否需要额外 UB 暂存：131840B 基础上再 +49152B 仍在上限内，但后端若同时保留双缓冲可能逼近 196608B",
+    "该映射依赖 num_heads 偶数（来自本特化 tt.divisibility=16）与 num_groups=num_seq_blocks/2（来自 group=2 的启用条件）；若宿主以不同运行时标量复用同一缓存二进制，需核对这两个前提"
+  ]
+}

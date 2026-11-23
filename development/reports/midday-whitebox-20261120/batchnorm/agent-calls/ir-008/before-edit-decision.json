@@ -1,0 +1,241 @@
+{
+  "timestamp": "2026-11-20T08:17:28.546281+00:00",
+  "diagnosis": {
+    "source_sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+    "selected_layer": "single_operator_ir",
+    "evidence": [
+      {
+        "path": "context.json",
+        "category": "source_ir",
+        "role": "身份与比较基准",
+        "finding": "source_sha256=b8d4d4a2…b2f56，candidate_layer=TTIR，source_edit_allowed=false；比较目标是 timing-7 的历史结果 0.0392613ms（0.7174x，参考 0.0281645ms），本轮一切候选必须与该已记录测量范围对齐比较。"
+      },
+      {
+        "path": "frozen.py",
+        "category": "source_ir",
+        "role": "语义与计数定义来源",
+        "finding": "统计趟为双层 scf 结构：外层 m_step 遍历 cdiv(batch_dim,BLOCK_M)，内层 n_step 遍历 cdiv(spatial_dim,BLOCK_N)；EVEN 路径无掩码，每轮执行 `cnt += 1`（标量增量写入 BLOCK_M×BLOCK_N 的张量），因此每个车道的计数恒等于内层动态迭代次数 n_num_steps；收尾 `final_mean = sum(mean*cnt)/(batch_dim*spatial_dim)`、`var = sum(var+cnt*(mean-final_mean)^2)/(batch_dim*spatial_dim)`，输出趟为 `(x-mean)*weight*inv_std+bias`。源码逐字节冻结。"
+      },
+      {
+        "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+        "category": "source_ir",
+        "role": "当前候选实际文本（ir-007 输出）",
+        "finding": "文件 sha256=86578fe5…b222f2，即 ir-007 的 statistics512 候选：统计段被包在 `scf.if %stats_wide`（spatial%512==0）内，真分支为 tensor<8x512> 的 Welford+cnt，假分支为原 tensor<8x128> 实现，输出段仍为 8x256 宽分支 + 8x128 兜底。文件第 344 行的兜底输出 `arith.subf %curr_input_53, %var` 引用了只在 else 区域定义的 %var，原生 MLIR 解析报 use of undeclared SSA value name，整体不可解析。"
+      },
+      {
+        "path": "prior-ir007-review.json",
+        "category": "source_ir",
+        "role": "上一轮失败定位",
+        "finding": "原生命中解析在 candidate 344:46 失败（prior-ir007-syntax.json 与 prior-ir007-parse.log 记录 npu_initialized=false、status=native_parse_failed、use of undeclared SSA value name，未进入任何设备评测）；宿主结论为 SSA 作用域逃逸，要求先登记再修复，并强调统计加宽会改变车道划分与浮点归约分组、且历史上该方向有编译失败。"
+      },
+      {
+        "path": "prior-statistics-ub-failure.json",
+        "category": "source_ir",
+        "role": "统计加宽方向的后端约束",
+        "finding": "夜间 ir-003 的两条统计加宽候选均 lowering_failed：`ub overflow, requires 10485760 bits while 1572864 bits available`（可再用 UB=192KiB，需求约为其 6.7 倍），bishengir-compile 直接返回 1，位于 ConvertLinalgIRToBinary 阶段。"
+      },
+      {
+        "path": "prior-explorations.json",
+        "category": "paired_profiling",
+        "role": "历史候选与稳定性结论",
+        "finding": "ir-001（cnt 标量化试验）geo_mean 1.8269、timing-7 45.17us 无收益；ir-002/ir-003（统计 8x512 加宽及合并）lowering_failed；ir-004（仅输出趟 8x256 加宽）timing-7 39.261us 为当前最佳；ir-005（统计内层前瞻深度 2）lowering_review_passed 但 result=null，从未获得正式结果；ir-006（输出 8x1024）正式 target 33.54us 但 ABBA 中位数 36.51→36.66 判为无差异。该文还记录 MTE2 每核仅 20GB/s、GM_to_UB 268KB，说明 MTE2 不是带宽受限而是描述符/指令效率受限。"
+      },
+      {
+        "path": "feedback.json",
+        "category": "paired_profiling",
+        "role": "正式/补测结果与保留规则",
+        "finding": "完整正式 27/27 PASSED（geo_mean 1.9053，min 0.7063 在 timing-8；timing-7 0.7092 @39.458us），原始二进制逐字节复现 41483d74…；ABBA 四块中位数 36.5119us vs 候选 36.6575us（ratio 0.9960）未通过分离判据，宿主保留 8x256 父版，并明确要求“Continue a new hypothesis using simulator-confirmed duplicate last preload costs”，同时更正 MTE2(0.877) 低于 VECTOR(0.906)、重叠泳道不能判定排他关键路径，且 ir006 失败只约束输出加宽、尾部排空与更宽统计仍属未验证。latest_syntax_rejection 再次登记 ir-007 的 SSA 失败。"
+      },
+      {
+        "path": "hotspots.json",
+        "category": "simulator",
+        "role": "泳道占用与热点指令（父版 ir-004）",
+        "finding": "用法 shape=[8,64,64,64]（batch=8, feat=64, spatial=4096）；VECTOR event_count 1865、active 0.9061、wait_only 0.3884、productive 0.5177；MTE2 active 0.8774、wait_only 0.2360；MTE3 active 0.4021；SCALARLDST 0.1849；SCALAR 0.0840。指令调用合计 VECTOR 1898、SCALAR 6998、MTE2 451、MTE3 114、FLOWCTRL 338。热点头部为 4 条 BAR(PIPE:VEC，累计各约 8.3us，调用 28~29) 与一条 MTE2 WAIT_FLAG 7.98us、MOV_SRC_TO_DST_ALIGN(MTE2) 7.23us/28 次，即每轮 Welford 迭代夹 4 条屏障加一次 8×512B 跨行小段搬运。"
+      },
+      {
+        "path": "timeline.json",
+        "category": "simulator",
+        "role": "窗口资质与覆盖范围",
+        "finding": "窗口 time_unit=fraction、capture_scope=First to last visible hardware event on this core（partial capture boundaries preserved），interpretation 明示“explicit WAIT/BAR only；No full-kernel duration or dependency-stall attribution”，clock_qualification=relative_only、absolute_time_qualified=false；同一窗口的 absolute_unit_validation 以 33 个 PC 对齐得到 median_ratio 1.000548（unit=us），因此只把该窗口用于同核相对比较，不做跨轮绝对时钟结论。"
+      },
+      {
+        "path": "profiling.json",
+        "category": "paired_profiling",
+        "role": "每 program 资源时间（父版）",
+        "finding": "34 行有效样本：aiv_time 均值 18.4296us、aiv_total_cycles 30408.8；aiv_vec_time 10.5164us（ratio 0.5420，其中 fp32 0.5014、misc 0.0405、int32 记为 0）；aiv_mte2_time 8.9975us（0.4770，active_bw 48.8GB/s）；aiv_mte3_time 3.2975us（0.1733）；aiv_scalar_time 4.7515us（0.2570）。vec+mte2+mte3=22.8us 明显大于 aiv_time 18.43us 但仅约 1.1us 重叠，说明 VECTOR 与 MTE2 近乎串行，单趟向量工作量的减少可以近似 1:1 传导到时间。"
+      },
+      {
+        "path": "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.bcmlir",
+        "category": "source_ir",
+        "role": "后端是否已消除疑似冗余（实际低层产物，冻结）",
+        "finding": "该 bcmlir（父版 8x128/8x256 的真实编译产物，sha256=12c88ec8…）第 53/65 行把计数作为 loop-carried 张量：`%11:3 = scf.for … iter_args(%arg27 f32, %arg28 f32, %arg29 tensor<8x128xi32>)`、`%61:4 = scf.for … iter_args(…, %arg33 tensor<8x128xi32>, …)`；内层每轮仍有 `%75 = arith.addi %arg33, %3 : tensor<8x128xi32>`，循环外仍有 `%12 = arith.sitofp %11#2 : tensor<8x128xi32> to tensor<8x128xf32>`。即后端并未把该归纳变量强度削弱为标量，冗余在 lowering 之后依然存在，可从 TTIR 侧消除。"
+      },
+      {
+        "path": "lowered-inventory.json",
+        "category": "source_ir",
+        "role": "符号与产物核对",
+        "finding": "清单登记 3 个低层产物（compiled-readonly/ 内 ttadapter bd1b88a7…、bcmlir 12c88ec8…、npubin 41483d74…），均属符号 batch_norm_with_update_kernel、ast_sha256=5c1607c0…，与 ir-inventory.json 的唯一特化条目一一对应；本轮只编辑该特化的 TTIR，低层产物与函数 ABI 保持冻结。"
+      },
+      {
+        "path": "codex-brief.json",
+        "category": "paired_profiling",
+        "role": "Codex 的宿主证据分析与候选方向",
+        "finding": "Codex 贡献：(a) 认定 ir-007 的阻塞项是输出兜底行引用 else 区域 %var 的 SSA 越界，要求先登记再修；(b) 更正 MTE2 active 0.877 低于 VECTOR 0.906、重叠泳道不构成排他关键路径；(c) 指出两次不同尺寸搬运支持成本假设、390 cycle 固定开销拟合未验证；(d) 提醒统计加宽有历史 UB 失败。本轮采纳 (a)(b)(d) 的判断，但不采纳“修复后继续 statistics512”的路线：见 alternatives 第 1 条，512 统计分支本身已被 ir-002/ir-003 的 UB 证据阻断，单独修 SSA 只会把一个预期 lowering 失败的候选交回队列。"
+      }
+    ],
+    "hypothesis": "当前 TTIR（父版 8x128/8x256 结构）统计趟内层循环把每车道样本计数当作 tensor<8x128xi32> 的 loop-carried 归纳变量：每轮一条 i32 张量加法、循环外一次 i32→f32 张量转换，并额外占用一个 4KB 的 UB 缓冲（bcmlir 中确认为 %arg33/%75/%12）。但在 EVEN 特化下该循环无掩码，内层动态迭代固定为 n_num_steps=cdiv(spatial_dim,128)，所有车道样本数恒等，故计数恒等于 n_num_steps，张量形态是纯冗余：它把一个循环不变量当成张量状态来回搬运。把计数改为标量 splat 后，(1) 统计内层每轮 tensor<8x128> 逐元素算子由 7 个降为 6 个（-14%），统计趟张量指令占全核约 224/288，整体约 -11%；(2) 统计循环 loop-carried UB 缓冲由 2×f32+1×i32 降为 2×f32，少一个 4KB×(multibuffer) 缓冲与相应依赖/屏障配对；(3) 循环外 i32→f32 张量转换被一次标量 sitofp + 一次 splat 取代。由于 profiling 显示 VECTOR(10.52us) 与 MTE2(9.00us) 在 18.43us 内只有约 1.1us 重叠（近乎串行），减少向量侧工作量应能近似 1:1 传导到核时间。该变换对任意形状都是取值恒等的（车道计数精确等于 n_num_steps，整数精确），因此不引入任何浮点分组或精度变化。",
+    "alternatives": [
+      "继续 ir-007 的统计瓦片 128→512 加宽（只修 %var→%stat_mean 的 SSA）：ir-002/ir-003 在该方向已实测 ub overflow（需要 10485760 bits vs 可用 1572864 bits），且当前候选同时携带 8x512 真分支与 8x128 假分支，UB 与缓冲区总量更大，按现有后端约束预期同样 lowering 失败；本轮排除，保留为“后端具备自动分块或更大 UB”时的待验证方向。",
+      "消除 minsi 钳位造成的末块重复 preload（统计趟与输出趟各多 1 次搬运，约占每 program MTE2 命令 2/67≈3%）：需在循环体内引入条件 load（scf.if 或谓词写回），可能破坏现有调度并新增屏障，收益上界较小，留作后续独立调用（宿主规则也把它列为下一候选）。",
+      "统计内层预取深度 2（ir-005 同方向）：profiling 显示 MTE2 每 tile 约 0.085us 远小于 VECTOR 每 tile 约 0.26us，串行化更可能来自每轮 4 条显式 BAR/WAIT 而非前瞻不足，且 ir-005 从未取得正式结果，本轮不选。",
+      "输出趟把 `(x-mean)*weight*inv_std+bias` 折叠为 `(x-mean)*(weight*inv_std)+bias`：可再省 1 个向量算子（约 16 条/program），但改变浮点结合次序，需单独论证数值契约，本轮不选。",
+      "用 Σx/Σx² 一次性矩替代 Welford 递推：张量算子可近乎减半，但存在大均值下的灾难性抵消，违反保持特殊值/精度语义的要求，明确排除。"
+    ],
+    "change": "两段编辑，均在同一份 TTIR 内，不改函数 ABI、参数、常量映射与输出趟布局：(1) 撤销已被后端 UB 证据阻断的 statistics512 分支——删除 `scf.if %stats_wide` 守卫（%c511_i32/%c512_i32/%stats_rem/%stats_wide 四个标量与 if 头）、其 8x512 真分支整体、`} else {` 与对应右花括号，使统计段回到 ir-004/ir-006 已验证的 tensor<8x128> 单一路径，并把产出值正式命名为 %stat_mean/%stat_is/%stat_var（原 else 尾部 yield 已被下游这 7 处引用），这同时消除 %var 的 SSA 作用域逃逸（%var 重新由本区域可见的定义产生）；(2) 计数标量化：删除 `%cnt = dense<0> : tensor<8x128xi32>` 与 `%cst_1 = dense<1> : tensor<8x128xi32>`，外层循环 iter_args 由 (mean,var,cnt) 改为 (mean,var)，内层循环由 (mean,var,cnt,curr) 改为 (mean,var,curr)，删除每轮 `%cnt_65 = arith.addi %cnt_52, %cst_1`，循环后 `%final_mean = arith.sitofp %cnt_7#2 : tensor<8x128xi32>` 改为 `%cnt_f = arith.sitofp %n_num_steps_6 : i32 to f32` 加 `%final_mean = tt.splat %cnt_f : f32 -> tensor<8x128xf32>`，保持 %final_mean 名字与下游全部用法（%final_mean_8、%var_15）不变。",
+    "expected": [
+      "指令：统计内层每轮 tensor<8x128> 逐元素算子 7→6（删除 `arith.addi` i32 张量自增）；新 bcmlir/ttadapter 中应不再出现 `arith.addi … : tensor<8x128xi32>` 与 `arith.sitofp … : tensor<8x128xi32> to tensor<8x128xf32>`，改出现一次标量 sitofp 与一次 fill/splat；输出趟指令序列不变。",
+      "动态轮次：统计内层动态迭代数不变（每 m 分块 32 次，本用例 m_num_steps=1），输出通道 16 次不变；每 program 张量逐元素指令总数由 288（32×7+16×4）降为 256，降幅约 11%；MTE2 命令数与搬运字节不变（仍 33 次 4KB + 17 次 8KB 量级）。",
+      "等待：VECTOR wait_only 0.3884 与 MTE2 wait_only 0.2360 预期同向小幅下降（少一个 loop-carried 缓冲意味着少一处生产者/消费者配对）；若每轮 4 条 BAR 因缓冲数下降而减少，则下降更明显，反之 BAR 数不变时仅由指令减少贡献。",
+      "资源：统计循环 loop-carried UB 缓冲由 3 个（2×f32 8x128 + 1×i32 8x128）降为 2 个，单缓冲 4KB，multibuffer 下等效释放约 8KB UB；不改变向量/总 UB 预算判定，不应触发 ub overflow。",
+      "时间：profiling 每 program aiv_vec_time 10.52us → 预测 9.3–10.0us，aiv_time 18.43us → 17.3–18.1us（约 -3%~-6%）；据此 timing-7 正式延迟应从 39.26us 向 37.5–38.8us 移动，ABBA 中位数应低于父版 36.51us（分离判据要求候选低于全部原始块：<36.43us）。",
+      "证伪条件：若新产物的 tensor<8x128xi32> 加法/转换仍在、或 aiv_vec_time 与 VECTOR 指令计数未下降、或正式 timing-7 延迟 ≥39.26us 且 ABBA 无分离，则本机制在此目标上无效，登记为已排除假设。",
+      "数值：预测与父版逐位相同（每车道计数精确等于 n_num_steps，整数精确；Welford 递推次序、归约 reshop 与输出乘加次序均未改动），correctness 各工作负载 abs/rel 应为 0 或与父版记录完全一致。"
+    ],
+    "validation": "宿主审查后执行：原生 MLIR 解析与固定 CPU 编译（对照 captured_original 保留 IR）；完整 KGS（27 正确性 + 计时）与正式评测，重点核对 timing-7 延迟是否低于 39.2613us 当前最佳；ABBA 四块三 trial 稳定性与 post-mechanism 双次分析；实际 bcmlir/UB 复核，确认 tensor<8x128xi32> 加法与张量 sitofp 消失、统计循环 iter_args 降为 3 个、无 ub overflow；补测覆盖 batch_dim>8（多分块）、batch_dim 非 8 倍数、spatial_dim 非 128 倍数的兜底形状，确认计数标量化在非本用例形状下也逐位一致。本轮文档、预检与预测不作为收益结论。",
+    "layer_reason": "Triton 表达能力：源码里的 `cnt += 1`（frozen.py 统计趟内层）是广播式标量增量，张量化后必然产生一个 BLOCK_M×BLOCK_N 的计数器张量；在本算子抽象层内无法要求 Triton 把它降成标量而不触犯“计数是张量”的类型约定，源码又逐字节冻结，因此只能在 TTIR 里把这个循环不变量重新写成标量 splat——这正是编译器本应做（但实测未做）的强度削弱。固定源码实验目的：保持 frozen.py 与 kernel 符号/ABI/常量映射不变，使本轮唯一变量是“同一数学映射的 IR 表达”，从而把观测到的耗时变化归因到 IR 层冗余，而不与 autotune 常量或源码重写混淆。IR 控制点：TTIR 中 `scf.for` 的 iter_args 列表、`arith.constant dense<…> : tensor<8x128xi32>` 与循环后的 `arith.sitofp` 是这条冗余的唯一定义处，改动局部且不动任何计算图；同族意图若将来可在源码表达，应写成“用循环上界推导计数（tl.full(n_num_steps)）而不用 tensor 累加器”，那属于源码重写身份，本轮不具备该权限。",
+    "simulator_incremental_judgment": "模拟器窗口是单核（core0.veccore0）相对时间轴，以首末可见事件归一化为 fraction，interpretation 明确只含显式 WAIT/BAR、不给出整核时长与依赖停顿归因，clock_qualification=relative_only（absolute_time_qualified=false），因此本轮只用它做同核相对比较：hotspots 中 VECTOR active 0.906、wait_only 0.388，MTE2 active 0.877、wait_only 0.236，二者重叠比例高，不据此断言排他关键路径，只把“每轮 4 条 BAR + 每轮一次 8×512B 小段搬运 + 向量等待数据”作为候选机制定位；未报告的其余泳道（其他 core、未出现的 trace lane）保持未知，CACHEMISS(0.0013)/ALL 等辅助泳道不计入空闲结论。增量结论由 profiling 支撑：VECTOR 10.52us 与 MTE2 9.00us 之和明显超过 aiv_time 18.43us 而重叠仅约 1.1us，说明两条流水近乎串行，删除统计趟约 11% 的向量逐元素指令应近似等量反映到核时间。动态总次数的比较已核对执行覆盖：profiling 仅 34 行有效样本、窗口为部分覆盖，故不把窗口比例当作总时间，也不把单次窗口对比当作跨轮绝对收益。",
+    "unknown": [
+      "统计内层每轮 4 条 BAR 的确切来源（缓冲复用、pipeline stage 还是 UB 依赖）未定，删除一个 loop-carried 缓冲是否使 BAR 数下降无法从现有材料预判。",
+      "aiv_vec_int32_ratio 在全部 34 行均为 0，i32 张量加法的耗时究竟落在 fp32 还是 misc 分类不明，删除后向量时间下降幅度可能小于按指令数推算的 11%。",
+      "输出趟 8x256 分支与统计趟串行执行的相对占比只能由 vec+mte2 之和与 aiv_time 的差间接推断，缺少源码级 PC 到循环的完整映射。"
+    ]
+  },
+  "diagnosis_sha256": "f8bfc779c812d6a8f9ce007b33c1b4a6b0625e9220aa08ed76ebc46d998fdf49",
+  "evidence": [
+    {
+      "path": "context.json",
+      "category": "source_ir",
+      "role": "身份与比较基准",
+      "finding": "source_sha256=b8d4d4a2…b2f56，candidate_layer=TTIR，source_edit_allowed=false；比较目标是 timing-7 的历史结果 0.0392613ms（0.7174x，参考 0.0281645ms），本轮一切候选必须与该已记录测量范围对齐比较。",
+      "sha256": "315c5dc119a610d7bbcb9434e912f03c6502b87ab92aa3211dd64fd6ab7f9cec"
+    },
+    {
+      "path": "frozen.py",
+      "category": "source_ir",
+      "role": "语义与计数定义来源",
+      "finding": "统计趟为双层 scf 结构：外层 m_step 遍历 cdiv(batch_dim,BLOCK_M)，内层 n_step 遍历 cdiv(spatial_dim,BLOCK_N)；EVEN 路径无掩码，每轮执行 `cnt += 1`（标量增量写入 BLOCK_M×BLOCK_N 的张量），因此每个车道的计数恒等于内层动态迭代次数 n_num_steps；收尾 `final_mean = sum(mean*cnt)/(batch_dim*spatial_dim)`、`var = sum(var+cnt*(mean-final_mean)^2)/(batch_dim*spatial_dim)`，输出趟为 `(x-mean)*weight*inv_std+bias`。源码逐字节冻结。",
+      "sha256": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56"
+    },
+    {
+      "path": "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir",
+      "category": "source_ir",
+      "role": "当前候选实际文本（ir-007 输出）",
+      "finding": "文件 sha256=86578fe5…b222f2，即 ir-007 的 statistics512 候选：统计段被包在 `scf.if %stats_wide`（spatial%512==0）内，真分支为 tensor<8x512> 的 Welford+cnt，假分支为原 tensor<8x128> 实现，输出段仍为 8x256 宽分支 + 8x128 兜底。文件第 344 行的兜底输出 `arith.subf %curr_input_53, %var` 引用了只在 else 区域定义的 %var，原生 MLIR 解析报 use of undeclared SSA value name，整体不可解析。",
+      "sha256": "86578fe59dd0a96a9b597be1e42e1ef83fdef9a7eabda3f5924259da09b222f2"
+    },
+    {
+      "path": "prior-ir007-review.json",
+      "category": "source_ir",
+      "role": "上一轮失败定位",
+      "finding": "原生命中解析在 candidate 344:46 失败（prior-ir007-syntax.json 与 prior-ir007-parse.log 记录 npu_initialized=false、status=native_parse_failed、use of undeclared SSA value name，未进入任何设备评测）；宿主结论为 SSA 作用域逃逸，要求先登记再修复，并强调统计加宽会改变车道划分与浮点归约分组、且历史上该方向有编译失败。",
+      "sha256": "f56f6086629e09e7cac9c88de1b29cf38aaf017054dd98b82ece9d5e5f932aad"
+    },
+    {
+      "path": "prior-statistics-ub-failure.json",
+      "category": "source_ir",
+      "role": "统计加宽方向的后端约束",
+      "finding": "夜间 ir-003 的两条统计加宽候选均 lowering_failed：`ub overflow, requires 10485760 bits while 1572864 bits available`（可再用 UB=192KiB，需求约为其 6.7 倍），bishengir-compile 直接返回 1，位于 ConvertLinalgIRToBinary 阶段。",
+      "sha256": "37ba56f57b88374cfaaf38007e23007683a33cacf2bf088ba58aaec8df1ee015"
+    },
+    {
+      "path": "prior-explorations.json",
+      "category": "paired_profiling",
+      "role": "历史候选与稳定性结论",
+      "finding": "ir-001（cnt 标量化试验）geo_mean 1.8269、timing-7 45.17us 无收益；ir-002/ir-003（统计 8x512 加宽及合并）lowering_failed；ir-004（仅输出趟 8x256 加宽）timing-7 39.261us 为当前最佳；ir-005（统计内层前瞻深度 2）lowering_review_passed 但 result=null，从未获得正式结果；ir-006（输出 8x1024）正式 target 33.54us 但 ABBA 中位数 36.51→36.66 判为无差异。该文还记录 MTE2 每核仅 20GB/s、GM_to_UB 268KB，说明 MTE2 不是带宽受限而是描述符/指令效率受限。",
+      "sha256": "1489e937f90923da4aa5b9a6a5afce721e927ea93207d7614fe4d3294644a701"
+    },
+    {
+      "path": "feedback.json",
+      "category": "paired_profiling",
+      "role": "正式/补测结果与保留规则",
+      "finding": "完整正式 27/27 PASSED（geo_mean 1.9053，min 0.7063 在 timing-8；timing-7 0.7092 @39.458us），原始二进制逐字节复现 41483d74…；ABBA 四块中位数 36.5119us vs 候选 36.6575us（ratio 0.9960）未通过分离判据，宿主保留 8x256 父版，并明确要求“Continue a new hypothesis using simulator-confirmed duplicate last preload costs”，同时更正 MTE2(0.877) 低于 VECTOR(0.906)、重叠泳道不能判定排他关键路径，且 ir006 失败只约束输出加宽、尾部排空与更宽统计仍属未验证。latest_syntax_rejection 再次登记 ir-007 的 SSA 失败。",
+      "sha256": "9b7b5995f500b3367dd552d6c58789194a589a25d4b8f5c66cd5deb071cecba2"
+    },
+    {
+      "path": "hotspots.json",
+      "category": "simulator",
+      "role": "泳道占用与热点指令（父版 ir-004）",
+      "finding": "用法 shape=[8,64,64,64]（batch=8, feat=64, spatial=4096）；VECTOR event_count 1865、active 0.9061、wait_only 0.3884、productive 0.5177；MTE2 active 0.8774、wait_only 0.2360；MTE3 active 0.4021；SCALARLDST 0.1849；SCALAR 0.0840。指令调用合计 VECTOR 1898、SCALAR 6998、MTE2 451、MTE3 114、FLOWCTRL 338。热点头部为 4 条 BAR(PIPE:VEC，累计各约 8.3us，调用 28~29) 与一条 MTE2 WAIT_FLAG 7.98us、MOV_SRC_TO_DST_ALIGN(MTE2) 7.23us/28 次，即每轮 Welford 迭代夹 4 条屏障加一次 8×512B 跨行小段搬运。",
+      "sha256": "f2005872cd677b8e5940668f313222bd29f882f510b3ad98c8f5add992d6b16c"
+    },
+    {
+      "path": "timeline.json",
+      "category": "simulator",
+      "role": "窗口资质与覆盖范围",
+      "finding": "窗口 time_unit=fraction、capture_scope=First to last visible hardware event on this core（partial capture boundaries preserved），interpretation 明示“explicit WAIT/BAR only；No full-kernel duration or dependency-stall attribution”，clock_qualification=relative_only、absolute_time_qualified=false；同一窗口的 absolute_unit_validation 以 33 个 PC 对齐得到 median_ratio 1.000548（unit=us），因此只把该窗口用于同核相对比较，不做跨轮绝对时钟结论。",
+      "sha256": "6777e8aaa5ec9a379af0b23450fe327545dea7a74a9803c25409d48f4798f263"
+    },
+    {
+      "path": "profiling.json",
+      "category": "paired_profiling",
+      "role": "每 program 资源时间（父版）",
+      "finding": "34 行有效样本：aiv_time 均值 18.4296us、aiv_total_cycles 30408.8；aiv_vec_time 10.5164us（ratio 0.5420，其中 fp32 0.5014、misc 0.0405、int32 记为 0）；aiv_mte2_time 8.9975us（0.4770，active_bw 48.8GB/s）；aiv_mte3_time 3.2975us（0.1733）；aiv_scalar_time 4.7515us（0.2570）。vec+mte2+mte3=22.8us 明显大于 aiv_time 18.43us 但仅约 1.1us 重叠，说明 VECTOR 与 MTE2 近乎串行，单趟向量工作量的减少可以近似 1:1 传导到时间。",
+      "sha256": "a4cf9f718f9c58cb50a2e038ef4328449c1188ce0296a733b3b7005b3d3d46d2"
+    },
+    {
+      "path": "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.bcmlir",
+      "category": "source_ir",
+      "role": "后端是否已消除疑似冗余（实际低层产物，冻结）",
+      "finding": "该 bcmlir（父版 8x128/8x256 的真实编译产物，sha256=12c88ec8…）第 53/65 行把计数作为 loop-carried 张量：`%11:3 = scf.for … iter_args(%arg27 f32, %arg28 f32, %arg29 tensor<8x128xi32>)`、`%61:4 = scf.for … iter_args(…, %arg33 tensor<8x128xi32>, …)`；内层每轮仍有 `%75 = arith.addi %arg33, %3 : tensor<8x128xi32>`，循环外仍有 `%12 = arith.sitofp %11#2 : tensor<8x128xi32> to tensor<8x128xf32>`。即后端并未把该归纳变量强度削弱为标量，冗余在 lowering 之后依然存在，可从 TTIR 侧消除。",
+      "sha256": "12c88ec8a1907c3d149bbddc4e0a22c0a4528f8643463d0b92069123d570413c"
+    },
+    {
+      "path": "lowered-inventory.json",
+      "category": "source_ir",
+      "role": "符号与产物核对",
+      "finding": "清单登记 3 个低层产物（compiled-readonly/ 内 ttadapter bd1b88a7…、bcmlir 12c88ec8…、npubin 41483d74…），均属符号 batch_norm_with_update_kernel、ast_sha256=5c1607c0…，与 ir-inventory.json 的唯一特化条目一一对应；本轮只编辑该特化的 TTIR，低层产物与函数 ABI 保持冻结。",
+      "sha256": "4945c33cae9b73c84e863e67c7d33e54cb8fdd74fa50003c86f71cc029944028"
+    },
+    {
+      "path": "codex-brief.json",
+      "category": "paired_profiling",
+      "role": "Codex 的宿主证据分析与候选方向",
+      "finding": "Codex 贡献：(a) 认定 ir-007 的阻塞项是输出兜底行引用 else 区域 %var 的 SSA 越界，要求先登记再修；(b) 更正 MTE2 active 0.877 低于 VECTOR 0.906、重叠泳道不构成排他关键路径；(c) 指出两次不同尺寸搬运支持成本假设、390 cycle 固定开销拟合未验证；(d) 提醒统计加宽有历史 UB 失败。本轮采纳 (a)(b)(d) 的判断，但不采纳“修复后继续 statistics512”的路线：见 alternatives 第 1 条，512 统计分支本身已被 ir-002/ir-003 的 UB 证据阻断，单独修 SSA 只会把一个预期 lowering 失败的候选交回队列。",
+      "sha256": "3a91a59c28acb6ca1070de97611150de5390647cf31ff040c16a503c1a400851"
+    }
+  ],
+  "input_files": {
+    "frozen.py": "b8d4d4a2c07dabfc308e94412d0b5c219eb56ee4c7dc5358016e0eb2782b2f56",
+    "ir-inventory.json": "01565e88b83cbf813628c2653d351ee4c7b3845394b2b690b0c8351c0eef26e6",
+    "lowered-inventory.json": "4945c33cae9b73c84e863e67c7d33e54cb8fdd74fa50003c86f71cc029944028",
+    "profiling.json": "a4cf9f718f9c58cb50a2e038ef4328449c1188ce0296a733b3b7005b3d3d46d2",
+    "hotspots.json": "f2005872cd677b8e5940668f313222bd29f882f510b3ad98c8f5add992d6b16c",
+    "timeline.json": "6777e8aaa5ec9a379af0b23450fe327545dea7a74a9803c25409d48f4798f263",
+    "context.json": "315c5dc119a610d7bbcb9434e912f03c6502b87ab92aa3211dd64fd6ab7f9cec",
+    "diagnosis.json": "99f5358a90d0ab8981f4c7f62af16a4d3e1f772be34b48601510527e93507126",
+    "feedback.json": "9b7b5995f500b3367dd552d6c58789194a589a25d4b8f5c66cd5deb071cecba2",
+    "codex-brief.json": "3a91a59c28acb6ca1070de97611150de5390647cf31ff040c16a503c1a400851",
+    "prior-explorations.json": "1489e937f90923da4aa5b9a6a5afce721e927ea93207d7614fe4d3294644a701",
+    "count-uniformity-probe.json": "9b4c0d6c838a440bf98e0e526d6ad0324f25e33fd92d6c39052f57698701f34a",
+    "prior-count-post-mechanism.json": "f8068b52105e55b0cbd46435a7b0c370d46d2a40be365b3d434a385d3af657ee",
+    "prior-ir006-formal.json": "be9d764a5b510f031b86ac8fd7df43e6e18b664664d9dae1d463f833ee791b9a",
+    "prior-ir006-supplements.json": "90287d5b81d4b33131c1655fb8e550a41cbcf5b776a8da3fc19f20cc378d2be8",
+    "prior-ir006-stability.json": "f0a1e07816a7044c42f90b27b8c3ebb58737db06b35254489b0fcd27531cded6",
+    "prior-ir006-post-mechanism.json": "0c977a0ae5cf8f095d64ed4816bc74bfd835a768cb5196da6b21321230cd42e4",
+    "prior-ir006-profiling.json": "323399a29f83d8f2f2eb693d73613e00247c3fa26e64ff2a1fa42ca2bde35097",
+    "prior-ir006-hotspots.json": "f39104aa05eb5eb0d849aa88467eea9596fd822eb7d5934ebff4fb579b78d655",
+    "prior-ir006-instructions.json": "0158c6f528e058e06629c746cf8ebbfe648869521f75aa91a5d492d93fea4de5",
+    "prior-ir007-syntax.json": "393c56259fb02cd18de4545f9af22adbb5b6dd045b47c84380ef63d694a577ae",
+    "prior-ir007-parse.log": "48a06075b4308241c4bc201d39e58e8e50677081b9082d4b9fe70fddc2581ea9",
+    "prior-ir007-review.json": "f56f6086629e09e7cac9c88de1b29cf38aaf017054dd98b82ece9d5e5f932aad",
+    "prior-statistics-ub-failure.json": "37ba56f57b88374cfaaf38007e23007683a33cacf2bf088ba58aaec8df1ee015",
+    "ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir": "86578fe59dd0a96a9b597be1e42e1ef83fdef9a7eabda3f5924259da09b222f2",
+    "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttadapter": "bd1b88a7c7163074a7b0026087ee561101736a094dcfeeb4661df562285ee719",
+    "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.bcmlir": "12c88ec8a1907c3d149bbddc4e0a22c0a4528f8643463d0b92069123d570413c",
+    "compiled-readonly/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.npubin": "41483d746ba67cd3456434ea7d176386cbe6e987f3ab56d360d1baf5935be5fe",
+    "prior-ir006-readonly/ir/5c1607c0fdfd9696b32e07f7ff6f3af343bbf4b3d7c0346acbc068234ec75508/batch_norm_with_update_kernel.ttir": "aeee84eb74064681644250b20d0dbfe4bf5dd14b09e62e10f27e6cc28a1ec81a",
+    "prior-ir006-readonly/lowered/batch_norm_with_update_kernel.ttadapter": "99ae2168d0f7185e457fa7e3411d8ad048b50e870994e19c765ca07887e7b351",
+    "prior-ir006-readonly/lowered/batch_norm_with_update_kernel.bcmlir": "3080c1d3ed61734a53dcbf24db88c8cde11eb7829981c84f7b95faf00eb9a08f"
+  },
+  "decision_tool_sha256": "7aec090daf3f1657c751a165b382859745b7735db4acd9465970a4fadd3bf1ab"
+}

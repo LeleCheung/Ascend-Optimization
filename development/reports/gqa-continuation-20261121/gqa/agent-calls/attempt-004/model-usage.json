@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 35,
+    "duration_ms": 244146,
+    "usage": {
+      "input_tokens": 61957,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 2062848,
+      "output_tokens": 40243,
+      "output_tokens_details": {
+        "thinking_tokens": 26719
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 61957,
+        "outputTokens": 40243,
+        "cacheReadInputTokens": 2062848,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 2.347284,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 26719,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 2.347284,
+    "result": "已完成本轮机制实现并到达验收边界。以下是交接摘要。\n\n## 本轮机制（已登记决策 `081074dd…`，修改前）\n**编译期几何特化 + 可证冗余掩码消除**（`selected_layer`: kernel_source + 主机元数据）\n\n- 依据：`actual-ir/2-…ttir` 显示 shape/stride/D/NQ/G 全部残留为运行时标量——循环上界是 `%SKV`，每 KV 迭代重算 `n_mask`（cmpi/andi/广播）、`qk` 的越界 select，并用运行时 stride 现算 128×128 指针张量；模拟器对应 924/880/807 个 SCALARLDST 事件、MOVEMASK 74、MOVK/MOV_XD_IMM/INSERT_XD 大量常量搬移。\n- 改法：stride、S/SKV/D/NQ/G/qk_scale/delta 改为 `tl.constexpr`；宿主仅用合法元数据算出 `MASK_MD`、`MASK_KV`，为假时 Q/Out 无掩码存取、K/V 无掩码载入并删除恒真的 `qk` 越界 select。四个固定 case 均满足整除，因果掩码保留。\n- **数值风险为零**：删掉的掩码在精确 grid 下恒真，不改变任何载入值；分块、迭代数、grid、在线 softmax、两项概率分解表达式与相加顺序、`acc` 重缩放、L0C 交接结构全部不动。代价是每（shape/stride/分块）组合多一份特化编译。\n\n## 判别性观测（重放时核对）\n新 TTIR 应无 `n_mask` 比较/掩码 and/qk 掩码 select，k/v 指针为常量步长偏移，非因果循环上界变常量（case4=256、2 次迭代），VECTOR/MOVEMASK、VSEL 与标量常量搬移计数下降，而 **L0C→GM 仍为 192KiB/program**。若 IR 落实而 case4 不变，则判定该段不在关键路径，下一机制转为「两项 PV 合并到同一 L0C 累加器」（已写入 alternatives，含需额外 GM→UB→L1 的 V 副本代价）。\n\n## 交接状态\n- `preflight` → `awaiting_source_review`，`source_sha256 = d59c1ca7f3d2a8bd16c9a33bbeecb8b6b0205623174958f83959f0e2da5818fc`，候选字节已冻结，未再做任何修改。\n- 请宿主执行只读路径与地址边界审查，随后跑固定四项正式评测（官方 checker/golden、dtype、warmup5/trials3/iterations20 合同不变）与修改后重放。验收判据：四项 checker 全通过、case4 低于 784.63765 μs、case1/2/7 无真实退步；否则回退到 `247091f3…` 并保留本次为负例。\n- 诊断已补记 `implementation_note`（`MASK_*` 与 `EVEN_*` 布尔极性等价说明）和 `handoff_state`（冻结 SHA 与待办）。"
+  }
+}

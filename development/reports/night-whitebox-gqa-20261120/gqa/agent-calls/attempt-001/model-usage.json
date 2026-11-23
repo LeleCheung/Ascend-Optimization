@@ -1,0 +1,51 @@
+{
+  "returncode": 0,
+  "result": {
+    "subtype": "success",
+    "is_error": false,
+    "num_turns": 46,
+    "duration_ms": 171938,
+    "usage": {
+      "input_tokens": 60990,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 1316992,
+      "output_tokens": 25741,
+      "output_tokens_details": {
+        "thinking_tokens": 17768
+      },
+      "server_tool_use": {
+        "web_search_requests": 0,
+        "web_fetch_requests": 0
+      },
+      "service_tier": "standard",
+      "cache_creation": {
+        "ephemeral_1h_input_tokens": 0,
+        "ephemeral_5m_input_tokens": 0
+      },
+      "inference_geo": "",
+      "iterations": [],
+      "speed": "standard",
+      "fallback_credit": null
+    },
+    "modelUsage": {
+      "deepseek-flash": {
+        "inputTokens": 60990,
+        "outputTokens": 25741,
+        "cacheReadInputTokens": 1316992,
+        "cacheCreationInputTokens": 0,
+        "webSearchRequests": 0,
+        "costUSD": 1.6069709999999997,
+        "contextWindow": 200000,
+        "maxOutputTokens": 32000,
+        "thinkingTokens": 17768,
+        "cacheCreationEphemeral5mInputTokens": 0,
+        "cacheCreationEphemeral1hInputTokens": 0,
+        "canonicalModel": "deepseek-flash",
+        "provider": "firstParty",
+        "costBasis": "unknown"
+      }
+    },
+    "total_cost_usd": 1.6069709999999997,
+    "result": "Preflight returned `awaiting_source_review` — I am holding the bytes and handing off.\n\n## 本轮机制（已实现，等待只读审查与四项真机评测）\n\n**选定机制**：KV 方向分块翻倍（`BLOCK_N` 64→128，`BLOCK_M` 仍 64，`BLOCK_D` 仍 `next_pow2(D)`），不触碰两项概率分解的表达式与相加顺序。\n\n**证据分工（模拟器）**\n- 热点证据增量：cube0 首位热点 `WAIT_FLAG_DEVI` 18.28µs 与次位 `FIX_L0C_TO_DST`/`SET_FLAG` 4.13µs 均绑定到 `candidate.py:112` 的 PV 双 dot 累加；veccore0 首位热点同为该行 8.46µs —— 指出受阻的是具体交接指令，而非笼统等待。\n- 流水证据增量：CUBE productive 仅 4.74%（wait_only 18.85%、idle 76.41%），VECTOR productive 35.98%/wait 29.87%、MTE2 productive 21.47% —— 给出\"cube 长期空闲同时向量侧也在等标志\"的量级与跨流水结构。\n- 限制已保留：三核部分窗口、每核各自归一化、`application_completed=false`，全调用 completion 缺失，故不据此分摊整任务耗时。\n\n**改法与代价**：交接链次数 ∝ KV 块数。case2(Skv=128) 退化为单迭代；case4/7 迭代 4/2→2/1，每程序 8→4 个 PV dot、4→2 次 acc 回灌与重缩放、K/V 装入减半。代价：单块 K/V/p 张量翻倍（估算 UB 峰值 176–208KB，192KB 上限，preflight 已通过编译即说明未超限），case1 的 `pid_m=0` 多算半块被掩码列（算术 +33%，迭代 3→2）。\n\n**未纳入本调用**：BLOCK_M=128（UB 超限且因果并行度下降）、PV 单链 L0C 累加（低阶项会对齐大累加器舍入，明确数值风险）、去 mask 载入、`num_stages` 多缓冲（UB 余量不足）；已写入 `alternatives` 与 `unknown`。\n\n**交接状态**\n- `decision_id`: `64b5bc7ba33c4779b886426587fec84c`（修改前登记，绑定 source `137e585d…`）\n- 修改后候选：`source_sha256 = f8e9efce09653a20f7eff8419a2e62defc93c5a6a06b113c73935883490f615a`，字节保持不变\n- 仅修改 `candidate.py` 与 `diagnosis.json`；公共入口、dtype、checker/golden、计时合同未动；设备计算仍全部为 Triton\n\n请宿主对 `f8e9efce…` 执行只读路径与地址边界审查，并按原合同做完整四项正确性+计时（预期 case4 由 1378.75µs 降至约 760–1030µs，case2/case7 同向下降，case1 持平或 ±10%），把四项真实变化与修改后重放反馈回来以继续优化。"
+  }
+}
