@@ -10,3 +10,5 @@
 - 机器地址和SSH配置留在外部配置，原始未跟踪证据和活动运行不因同步清除。
 
 仓库外的 0_HGKDA_docs/BAAI-reports/06_work 保存最终演讲者与提交版。后续新增研究页单独设计并同步一份到仓库报告目录。
+
+Linux 隔离目录复查：research 共58项，5项旧夹具 error，与 Windows 缺少 compiler-verification.json/context.json 的失败一致；fcntl相关测试在 Linux 可导入。软件测试与历史真机实验分开记录。
