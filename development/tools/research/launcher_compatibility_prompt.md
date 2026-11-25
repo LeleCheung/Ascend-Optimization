@@ -1,7 +1,18 @@
-加载 skills/hgkda/SKILL.md，阅读 task.json、context-brief.json 和当前 performance-feedback.json。
+Load skills/hgkda/SKILL.md and read task.json, context-brief.json, and performance-feedback.json.
 
-本次是现有严格Triton交付的兼容性恢复，尚不是性能优化。正式评测在当前设备环境报错：生成launcher收到Python整数地址，访问参数Tensor.size()时失败。PyTorch/CANN补充检查已经通过，说明不应同时重写数学公式或分块算法。
+Restore compatibility of an existing strict Triton delivery before performance work.
+Current formal evaluation failed because the generated launcher received Python integer
+pointers and called Tensor.size(). PyTorch/CANN checks passed; preserve math and tiling.
 
-请检查当前 candidate.py 的缓存launcher调用，将指针参数按当前launcher接口传入本次调用的真实张量对象。保持设备kernel、标量实参顺序、分块、精度、缓存键、当前stream查询和冷启动只执行一次的语义。不得将整数伪装成张量或依据评测环境走不同计算路径；不得调用其他后端代算。先阅读上下文里的runtime API摘录，不探测宿主设备环境。
+Inspect cached launcher calls in candidate.py and supply actual current-call Tensor
+objects where the current ABI requires them. Preserve device kernels, scalar argument
+order, tiling, precision, cache keys, current-stream queries, and single cold execution.
+Do not disguise pointers as tensors, change compute by evaluation environment, or use
+other backends. Read supplied runtime API excerpts without probing host devices.
 
-只用Edit修改 candidate.py、diagnosis.json。具体改动前通过工具桥decision登记本轮输入SHA、错误证据、兼容性假设、预期与验证。候选必须由你生成，宿主Codex只作审查与调度。修改后调用工具桥preflight；若返回awaiting_source_review，保存诊断后返回，交由宿主审查，不循环重试。不要编写探测脚本，不改合同、工具或知识包。当前仅修复此机制，真实性能恢复在完整结果回来后继续。
+Use only Edit on candidate.py/diagnosis.json. Register input SHA, failure evidence,
+compatibility hypothesis, expectation, and validation before edits. You generate the
+candidate; Codex reviews/schedules. Call bridge preflight after the change; at
+awaiting_source_review preserve diagnosis and hand off without retry loops. No probe
+scripts or contract/tool/knowledge edits. Repair only this mechanism, then continue
+performance recovery after full results.

@@ -1,4 +1,4 @@
-"""连续运行记录保留失败、无修改和修改前证据，不自动追认归因。"""
+"""Continuous traces retain failures, unchanged rounds, and pre-change evidence without retrospective attribution."""
 import hashlib
 import importlib.util
 import json

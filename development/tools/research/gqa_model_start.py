@@ -76,13 +76,13 @@ def main():
         kind='frozen_retained_gqa' if prior_retained else 'qualified_gqa_exploration',
         source_sha256=digest, prior_best_source_provided=prior_retained,
         origin=str(observation / 'retained-parent.json'), observation=str(observation)))
-    save(workspace / 'knowledge.json', dict(records=[], scope='当前源码与实际测量证据；按记录保留历史两项残差精度结构。'))
+    save(workspace / 'knowledge.json', dict(records=[], scope='Current source and measured evidence; preserve the recorded historical two-part residual precision structure.'))
     if include_simulator:
         original = read(observation / 'simulator-parent/summary.json')
         assert original['source_sha256'] == digest and original['reports']
         assert all(r['absolute_unit_validation']['status'] == 'verified' for r in original['reports'])
         simulator = dict(original, reported_status=original['status'], status='qualified_observation',
-            capture_scope='各核的公共时钟观测窗口分别归一化，application_completed记录应用完成状态；真机完整调用独立计时。')
+            capture_scope="Normalize each core's common-clock window independently. application_completed records completion; full-call hardware timing is separate.")
         save(workspace / 'simulator-evidence.json', simulator)
     save(workspace / 'current-profiling.json', dict(source_sha256=digest,
         comparison=read(observation / 'paired-parent/comparison.json')))
@@ -98,8 +98,8 @@ def main():
     target_us = next(r['candidate_timing']['full_call_us'] for r in result['cases'] if r['case_id'] == 4)
     selection_path = run / 'selection.json'
     best_us = read(selection_path)['target_latency_us'] if selection_path.exists() else target_us
-    host_analysis = ('结合当前热点、各流水窗口与实际IR选择下一项具体机制；'
-                     '分别核对交接、访存、计算和缓冲资源的代价。')
+    host_analysis = ('Use current hotspot regions, pipeline windows, and actual IR to choose one concrete mechanism; '
+                     'assess handoff, movement, computation, and buffer costs separately.')
     requested_mechanism = None
     if args.host_analysis:
         analysis = read(args.host_analysis)
@@ -128,7 +128,7 @@ def main():
         previous_result='previous-result.json', current_target_us=target_us,
         retained_best_target_us=best_us, observation_parent_was_retained=prior_retained,
         parent_post_observation_status=state['status'],
-        scope='固定case1/2/4/7，官方checker与golden身份沿原合同；原始对照与本轮续接独立。',
+        scope='Fix case1/2/4/7 and original checker/golden identities; keep initial comparison and continuation separate.',
         host_analysis=host_analysis))
     config.update(package=str(package), paired_directory=str(observation / 'paired-parent'),
         active_source='candidate.py', context_kind='performance_continuation',
@@ -142,21 +142,21 @@ def main():
             sha256=sha(workspace / 'simulator-evidence.json'))
     save(run / 'config.json', config)
     save(run / 'controller-state.json', dict(status='prepared'))
-    prompt = f'''继续优化CANNBench Level4 GQA。当前观察父版本{target_us:.5f}μs，保留最佳{best_us:.5f}μs；父版本身份见starter-provenance.json。先读取skills/hgkda/SKILL.md、task.json、contract.json、context-brief.json、previous-result.json、current-profiling.json、simulator-evidence.json、candidate.py及相关实际IR。固定case1/2/4/7、原checker、golden、输入输出dtype和计时合同；目标case4耗时低于保留最佳{best_us:.5f}μs，其他三项真实变化同时保存。当前概率计算结构沿父版本；调整中间dtype或计算顺序须事前明确数值风险与适用输入范围，由原完整四项checker验收，精度阈值保持。
-模拟器为三个核的部分窗口，Cube和Vector各自归一化；明确热点和流水各自增加的判断，保留全调用completion缺失。选一个具体机制。Triton可表达的分块、布局和计算组织优先修改源码；发现单算子生成缺陷时在diagnosis中交接IR建议，本调用仅允许修改candidate.py与diagnosis.json。
-修改前用Edit填写diagnosis.json，字段包含source_sha256、evidence(path/category/role/finding)、hypothesis、alternatives、discriminating_observation、change、expected、validation、selected_layer、layer_reason、simulator_incremental_judgment。证据路径使用workspace/文件名，category按paired_profiling/simulator/source_ir/evaluation分类。实际成功读取当前模拟器后，调用桥decision --record diagnosis.json登记，再改源码。仅用Edit编辑候选；Bash只调用工具桥。设备计算全部严格Triton，host仅分配、元数据和启动；禁止按case_id或输入值选路、输出缓存和外部后端计算。公共入口与原候选保持。
-实现一个可评测机制后调用preflight --source candidate.py；收到awaiting_source_review后保持字节并交接宿主只读审查及完整四项真机评测。完整结果与修改后重放随后反馈。生成不设总轮数、工具或时间预算，此处交接属于验收边界。新增诊断和注释使用专业中文，简明记录实际收益与代价。
+    prompt = f'''Continue optimizing CANNBench Level4 GQA. Observed parent: {target_us:.5f} us; retained best: {best_us:.5f} us; see starter-provenance.json for parent identity. First read skills/hgkda/SKILL.md, task.json, contract.json, context-brief.json, previous-result.json, current-profiling.json, simulator-evidence.json, candidate.py, and relevant actual IR. Fix case1/2/4/7, checker, golden, I/O dtypes, and timing contract; target case4 below retained best {best_us:.5f} us, recording all other case changes. Preserve the parent's probability structure. Before changing intermediate dtype/order, state numerical risks and input scope; use the original four-case checker and unchanged tolerances.
+Simulation covers partial windows on three cores; Cube/Vector normalize independently. State incremental hotspot/pipeline findings and retain missing full-call completion. Choose one mechanism. Prefer Triton for expressible tiling, layout, and computation; hand off concrete compiler defects as IR suggestions in diagnosis. Edit only candidate.py and diagnosis.json.
+Before source edits, use Edit to fill diagnosis.json: source_sha256, evidence(path/category/role/finding), hypothesis, alternatives, discriminating_observation, change, expected, validation, selected_layer, layer_reason, simulator_incremental_judgment. Evidence paths use workspace/<filename>; categories are paired_profiling/simulator/source_ir/evaluation. After successfully reading current simulation, register through bridge decision --record diagnosis.json before source edits. Use Edit for candidate edits; Bash only invokes the bridge. All device computation uses strict Triton; host only allocates, handles metadata, and launches. No case_id/input-value dispatch, output caching, or external compute. Preserve the public entry point.
+After one evaluable mechanism, call preflight --source candidate.py. At awaiting_source_review preserve bytes and hand off host read-only review/full four-case hardware evaluation. Full results and post-change replay follow. No total round/tool/time budget; this handoff is an acceptance boundary. Write new diagnoses/comments in concise English, recording observed benefits and costs.
 '''
     if not include_simulator:
-        prompt = prompt.replace('、simulator-evidence.json', '')
+        prompt = prompt.replace(', simulator-evidence.json', '')
         prompt = prompt.replace(
-            '模拟器为三个核的部分窗口，Cube和Vector各自归一化；明确热点和流水各自增加的判断，保留全调用completion缺失。',
-            '本调用提供当前成对profiling与实际IR，当前假设由这些材料及源码分析提出。宿主保留此前模拟器知识，此轮属于实际续接；工具增量仅按本轮实际输入记录。修改后仍开展模拟器重放。')
+            'Simulation covers partial windows on three cores; Cube/Vector normalize independently. State incremental hotspot/pipeline findings and retain missing full-call completion.',
+            'This invocation supplies current paired profiling and actual IR; hypotheses use these and source analysis. The host retains prior simulator knowledge as continuation background. Attribute incremental tools only to actual inputs; collect post-change simulation as well.')
         prompt = prompt.replace(
-            '实际成功读取当前模拟器后，调用桥decision --record diagnosis.json登记，再改源码。',
-            '实际成功读取当前profiling、相关TTIR与BCMLIR后，调用桥decision --record diagnosis.json登记，再改源码。simulator_incremental_judgment明确当前剩余歧义及本轮无需新增模拟器输入的理由；evidence仅引用本轮实际提供和读取的材料。')
+            'After successfully reading current simulation, register through bridge decision --record diagnosis.json before source edits.',
+            'After successfully reading current profiling and related TTIR/BCMLIR, register through bridge decision --record diagnosis.json before source edits. simulator_incremental_judgment states remaining ambiguity and why no fresh simulator input is needed; cite only supplied/read evidence.')
     if requested_mechanism:
-        prompt += '\n本调用由宿主明确指定的独立实验：' + requested_mechanism + '\n'
+        prompt += '\nHost-specified independent experiment for this invocation: ' + requested_mechanism + '\n'
     prompt_path = run / (args.invocation + '-prompt.md')
     prompt_path.write_text(prompt, encoding='utf8')
     command = [sys.executable, '-m', 'hgkda.runtime.agent_runner', '--config', str(run / 'config.json'),

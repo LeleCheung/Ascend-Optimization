@@ -1,4 +1,4 @@
-"""区分验收达标与性能优先搜索的停止条件。"""
+"""Distinguish acceptance thresholds from performance-first search stop conditions."""
 import importlib.util
 import json
 from pathlib import Path

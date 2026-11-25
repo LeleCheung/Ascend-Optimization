@@ -15,8 +15,8 @@ def sync(root, target):
     meeting = root / 'development/reports/group-meeting-20261119'
     svg_path = meeting / 'research-routes.svg'
     svg = svg_path.read_text(encoding='utf8')
-    assert '继续模拟器重放' in svg and '新产物' in svg
-    assert '固定源码，修改后编译并继续重放' in svg
+    assert 'Continue simulator replay' in svg and 'New artifacts' in svg
+    assert 'Fixed source; compile changes and continue replay' in svg
     original = target.read_bytes()
     backup = target.with_name(target.stem + '.before-replay-20261120.html')
     if not backup.exists():

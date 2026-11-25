@@ -1,12 +1,18 @@
-# 指标与统计表
+# Hardware metrics and statistics
 
-| 文件 | 用途 |
+| File | Purpose |
 | --- | --- |
-| [指标比较-综合最终版.xlsx](指标比较-综合最终版.xlsx) | 当前汇报使用的跨厂商指标主表 |
-| [统计数据.xlsx](统计数据.xlsx) | 昇腾规格与指标依据，保留其他厂商数据 |
-| [archive/指标比较-1122.xlsx](archive/指标比较-1122.xlsx) | 小组 1122 原始底稿 |
-| [archive/指标比较-1121.xlsx](archive/指标比较-1121.xlsx) | 小组 1121 历史版本 |
+| [hardware-metrics-comparison.xlsx](hardware-metrics-comparison.xlsx) | Final cross-vendor metric comparison |
+| [hardware-statistics.xlsx](hardware-statistics.xlsx) | Ascend specifications/evidence with other vendor data retained |
+| `archive/` | Original team spreadsheets from November 21/22 |
 
-2026-11-23 从仓库根目录原字节迁入。只整理位置，不重算或覆盖表内成绩。
-对应依据见 [指标比较](../reports/indicator-comparison-20261121/README.md) 与 [昇腾统计](../reports/ascend-statistics-20261120/README.md)。
-汇报目录中的 Excel 是展示副本，维护入口以本目录为准。报告和冻结日志中的历史路径保留。
+Workbook contents and bytes are unchanged. The [November 23 map](relocation-20261123.json)
+preserves the move from repository root; the [November 24 map](../manifests/engineering-relocations-20261124.json)
+records English names for the two current workbooks. Historical spreadsheet identifiers
+remain exact in these maps. Presentation workbooks are display copies; this directory
+is the maintenance location.
+
+Evidence: [metric comparison](../reports/indicator-comparison-20261121/README.md) and
+[Ascend statistics](../reports/ascend-statistics-20261120/README.md). Frozen reports/logs
+retain historical paths. Resolve them with `python -m development.tools.maintenance.resolve_path
+--path <historical-repository-path>`.

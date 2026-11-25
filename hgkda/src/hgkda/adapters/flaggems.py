@@ -1,4 +1,4 @@
-"""解析 FlagGems 原生测试结果；不把进程成功退出当作算子验收通过。"""
+"""Parse native FlagGems test results; process success alone does not establish operator acceptance."""
 import math
 
 
@@ -26,4 +26,4 @@ def summarize(summary, operator, returncode):
                 skipped_accuracy_cases=accuracy.get('skipped', 0),
                 scope='upstream_selected_operator_tests_and_core_benchmark',
                 pr_ready=False,
-                note='仅报告目标仓库所选算子的原生测试；不替代关联回归、CI、代码评审或KGS验收。')
+                note='Reports native tests for selected operators in the target repository; related regressions, CI, code review, and KGS acceptance remain separate.')

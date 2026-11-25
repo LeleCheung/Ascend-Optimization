@@ -1,9 +1,16 @@
-# 按算子类型选择机制
+# Operator types and candidate experiments
 
-- 逐元素与原地：检查连续快路径、分块和每 program 工作量；保留非连续输入、尾部、特殊值与别名。超越函数结合实际 IR 检查类型扩展、稳定公式和 UB 存活区间。
-- 归约与扫描：检查归约轴、转置、块间通信与确定性。改变累加精度或顺序后，完整数值复测，不只验证小输入。
-- 索引、散射与采样：检查索引边界、stride、重复索引、写冲突与原子更新。初始化和布局转换属于候选完整调用。
-- 矩阵乘与融合：先确认计算路径，再比较面板复用、K 分块、缓冲占用、同步及尾处理。源码层面复用不保证编译后搬运下降。
-- 复制：参考可能使用 DMA，候选必须使用 Triton。区分启动、地址计算、设备搬运与分配，避免从单侧比例推断参考路径。
+- Pointwise/in-place: inspect launch paths, program coverage, address calculation,
+  tails, and special values. Actual IR may reveal unrolling, broadcasting, or UB allocation.
+- Reduction/scan: establish axes, transposes, strides, and associativity. Changes in
+  accumulation order or precision need numerical checks beyond small inputs.
+- Indexing/scatter/sampling: check boundaries, strides, repeated indices, write conflicts,
+  atomics, initialization, and layout conversions across every candidate path.
+- Matrix/fused kernels: verify the compute path, then inspect panel reuse, K tiling,
+  buffer occupancy, synchronization, and tails. Source-level reuse need not reduce actual traffic.
+- Copy: references may use DMA; candidates must use Triton. Inspect alignment, address
+  calculation, and device/host dispatch, not just total latency.
 
-每项修改给出证据、机制假设、预期指标变化和验证方式。小规模区分性实验用于判断机制，完整候选用于验证交付效果；两者结果不能互相替代。
+Each change records evidence, mechanism, expected metric direction, and validation.
+Targeted small experiments can distinguish mechanisms; they cannot replace complete
+acceptance or hide poor performance on larger cases.

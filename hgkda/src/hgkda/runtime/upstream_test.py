@@ -1,4 +1,4 @@
-"""在显式提供的外部 FlagGems 工作分支运行原生测试，保留独立验收证据。"""
+"""Run native tests in an explicitly supplied external FlagGems worktree and preserve separate acceptance evidence."""
 import argparse
 from datetime import datetime, timezone
 import hashlib
@@ -23,14 +23,14 @@ def save(path,value):
 
 def snapshot(repo, expected, allowed):
     def git(*args):return subprocess.check_output(['git','-C',str(repo),*args]).decode('utf8').strip()
-    assert git('rev-parse','HEAD')==expected,'目标仓库commit发生变化'
+    assert git('rev-parse','HEAD')==expected,'Target repository commit changed'
     changed=set(filter(None,git('diff','--name-only','--no-renames','HEAD').splitlines()))
     untracked=set(filter(None,git('ls-files','--others','--exclude-standard').splitlines()))
-    assert changed.union(untracked).issubset(allowed),'外部工作区存在未声明修改: '+str(changed.union(untracked)-set(allowed))
+    assert changed.union(untracked).issubset(allowed),'External worktree contains undeclared changes: '+str(changed.union(untracked)-set(allowed))
     for name,want in allowed.items():
         path=(repo/name).resolve()
         assert path.is_relative_to(repo) and name.startswith('src/flag_gems/') and path.is_file()
-        assert sha(path)==want,'接入文件身份改变: '+name
+        assert sha(path)==want,'Integration-file identity changed: '+name
     return dict(commit=expected,changed=sorted(changed),untracked=sorted(untracked),files=allowed,
                 runner_sha256=sha(repo/'tools/run_tests.py'),
                 diff=subprocess.check_output(['git','-C',str(repo),'diff','--binary','HEAD']).decode('utf8'))
@@ -42,7 +42,7 @@ def main(argv=None):
     a=p.parse_args(argv);c=read(a.config)
     repo=Path(c['repository']).resolve();out=Path(c['output']).resolve()
     assert re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]*',c['operator'])
-    assert not out.is_relative_to(repo),'输出必须放在外部工作区之外'
+    assert not out.is_relative_to(repo),'Output must be outside the external worktree'
     before=snapshot(repo,c['upstream_commit'],c['integration_files'])
     source=Path(c['delivery_source']);assert sha(source)==c['delivery_sha256']
     assert c['expected_function_source'] in c['integration_files']
@@ -50,7 +50,7 @@ def main(argv=None):
     admit((repo/c['expected_function_source']).read_bytes().decode('utf8'),review)
     assert isinstance(c['device'],int) and c['device']>=0
     out.mkdir(parents=True,exist_ok=False)
-    # 上游使用pytest命令；固定其解释器，避免意外调用另一虚拟环境。
+    # Upstream uses pytest; pin its interpreter to avoid accidentally selecting another environment.
     bin_dir=out/'bin';bin_dir.mkdir()
     pytest_entry=bin_dir/'pytest'
     pytest_entry.write_text('#!'+c['python']+'\nimport pytest\nraise SystemExit(pytest.console_main())\n',encoding='utf8')
@@ -78,11 +78,11 @@ def main(argv=None):
         fcntl.flock(lock,fcntl.LOCK_EX)
         code=execute('import-probe',[c['python'],Path(__file__).with_name('upstream_probe.py'),
              '--repository',repo,'--operator',c['operator'],'--output',out/'import.json'])
-        assert code==0,'导入验证失败，见import-probe.log'
+        assert code==0,'Import verification failed; see import-probe.log'
         imported=read(out/'import.json');assert imported['source']==c['expected_function_source']
         assert imported['source_sha256']==c['integration_files'][imported['source']]
         if c.get('require_kgs_entrypoint'):
-            assert imported['kgs_same_entrypoint'] is True,'KGS要求run与算子导出绑定同一函数对象'
+            assert imported['kgs_same_entrypoint'] is True,'KGS run and operator export must bind to the same function object'
         mode=c.get('mode','scheduler')
         if mode=='operator-files':
             assert c.get('accuracy_files') and c.get('benchmark_files')
@@ -101,11 +101,11 @@ def main(argv=None):
         expected_cases=read(c['expected_accuracy_cases_from'])
         actual_cases=read(out/'upstream'/c['operator']/'accuracy_result.json')
         result['same_accuracy_case_set']=set(expected_cases)==set(actual_cases)
-        assert result['same_accuracy_case_set'],'精确文件运行丢失或更换了原选定用例'
+        assert result['same_accuracy_case_set'],'Explicit-file run lost or changed the originally selected cases'
     for name,want in c['integration_files'].items():assert sha(repo/name)==want
-    # 上游脚本可能创建日志；只允许原先声明的源码补丁，测试和配置不变。
+    # Upstream scripts may create logs; allow only declared source patches while keeping tests/configuration unchanged.
     after_diff=subprocess.check_output(['git','-C',str(repo),'diff','--binary','HEAD']).decode('utf8')
-    assert after_diff==before['diff'],'运行中已跟踪源码或测试发生变化'
+    assert after_diff==before['diff'],'Tracked source or tests changed during execution'
     result.update(returncode=code,upstream_commit=c['upstream_commit'],delivery_sha256=c['delivery_sha256'],
                   import_identity=imported,finished_at=datetime.now(timezone.utc).isoformat())
     save(out/'result.json',dict(schema_version='hgkda.result/v1',operation='upstream-test',status='completed',result=result))

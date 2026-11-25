@@ -1,4 +1,4 @@
-"""执行方法迁移中的单项宿主操作；只改调度元数据，不写入候选源码。"""
+"""Execute one host action for method transfer, modifying scheduling metadata without writing candidate source."""
 import argparse
 import hashlib
 import json
@@ -34,7 +34,7 @@ def main():
     else:
         digest=sha(source)
         review=run/'source-reviews'/(digest+'.json')
-        assert review.exists(),'缺少当前源码的只读审查记录'
+        assert review.exists(),'Missing read-only review record for current source'
         if a.action=='preflight':
             command=[sys.executable,str(tools/'agent_tools.py'),'--config',str(a.config),'preflight','--source',str(source)]
         elif a.action=='evaluate':

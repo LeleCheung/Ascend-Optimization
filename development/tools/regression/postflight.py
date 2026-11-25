@@ -1,4 +1,4 @@
-"""等待固定回归结束，核验并汇总证据，再串行执行未完成的官方参考资格探测。"""
+"""Wait for a fixed regression, audit and summarize evidence, then run pending official-reference qualification probes serially."""
 import argparse
 from datetime import datetime, timezone
 import fcntl
@@ -37,7 +37,7 @@ def main():
     repository = Path(read(run/'plan.json')['repository'])
     receipt = run/'postflight-state.json'
     if receipt.exists():
-        raise FileExistsError('已有收尾任务身份，禁止重复启动')
+        raise FileExistsError('An existing postflight identity prevents duplicate startup')
     state = dict(pid=os.getpid(),started_at=datetime.now(timezone.utc).isoformat(),status='waiting_for_regression')
     save(receipt,state)
     try:
@@ -47,11 +47,11 @@ def main():
                 assert current['completed'] == current['expected']
                 break
             if current['status'] == 'requires_attention':
-                raise RuntimeError('原队列需要处理，不跳过未知任务进入下一阶段')
+                raise RuntimeError('Original queue needs attention; do not skip unresolved jobs')
             time.sleep(10)
         with args.lock.open('a') as lock:
             fcntl.flock(lock,fcntl.LOCK_EX)
-            assert (run/'service-stop.json').exists(), '等待原控制器停止本批服务并释放锁'
+            assert (run/'service-stop.json').exists(), 'Wait for the original controller to stop this batch service and release its lock'
             state['status'] = 'auditing'
             save(receipt,state)
 
@@ -59,7 +59,7 @@ def main():
                 with (run/(label+'.log')).open('xb') as output:
                     result = subprocess.run(command,stdout=output,stderr=subprocess.STDOUT,cwd=repository)
                 if result.returncode:
-                    raise RuntimeError(label+'失败，查看对应原始日志')
+                    raise RuntimeError(label+'Failed; inspect the corresponding raw log')
 
             execute('postflight-audit',[sys.executable,str(repository/'tools/regression/audit.py'),
                      '--run-directory',str(run),'--output',str(run/'audit-final.json')])
@@ -77,7 +77,7 @@ def main():
                  checker_sha256=hashlib.sha256(snapshot.read_bytes()).hexdigest(),
                  catalog_sha256=hashlib.sha256(original).hexdigest(),
                  original_catalog=str(args.catalog),device=args.device,container=args.container,
-                 purpose='回归结束后探测CANN官方Expm1精度模式；不修改候选，不计为完整验收'))
+                 purpose='Probe official CANN Expm1 precision modes after regression; preserve candidates and keep this separate from full acceptance'))
             state['status'] = 'probing_official_reference'
             save(receipt,state)
             for mode in ['default','high_precision']:

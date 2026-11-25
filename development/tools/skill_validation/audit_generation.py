@@ -1,4 +1,4 @@
-"""核对方法包、起点及模型生成轨迹；不运行模型或改写候选源码。"""
+"""Audit method bundles, starting sources, and model generation logs without running models or changing candidates."""
 import argparse
 import ast
 import hashlib
@@ -12,7 +12,7 @@ def read(path):return json.loads(Path(path).read_bytes())
 
 
 def starter_identity(workspace):
-    """区分上游原字节起点与已生成候选，不能把后者表述为从零重生成。"""
+    """Distinguish byte-exact upstream starts from generated candidates; the latter are not generation from scratch."""
     provenance=read(workspace/'starter-provenance.json')
     kind=provenance.get('kind','upstream')
     expected=(provenance['source_sha256'] if kind=='existing_generated_candidate' else provenance['upstream_sha256'])
@@ -24,19 +24,19 @@ def starter_identity(workspace):
 
 
 def initial_context_identity(call):
-    """核对调用前实际提供的知识、源码和方法身份，避免仅核对配置声明。"""
+    """Verify actual knowledge, source, and method inputs before invocation, beyond configuration declarations."""
     path=call/'initial-context.json'
     if not path.exists():return dict(status='not_recorded_legacy_call')
     context=read(path);provenance=read(call/'source-provenance.json')
-    assert context['source_sha256']==provenance['input_sha256'],'调用初始上下文不属于输入源码'
-    assert context['method_manifest_sha256']==sha(call/'method-manifest.json'),'调用初始上下文不属于本次方法'
-    assert read(call/'initial-knowledge.json')['mechanisms']==context['mechanisms'],'调用初始知识与上下文不同'
+    assert context['source_sha256']==provenance['input_sha256'],'Initial context does not belong to the input source'
+    assert context['method_manifest_sha256']==sha(call/'method-manifest.json'),'Initial context does not belong to this method'
+    assert read(call/'initial-knowledge.json')['mechanisms']==context['mechanisms'],'Initial knowledge differs from the context'
     return dict(status='verified',source_sha256=context['source_sha256'],
                 method_manifest_sha256=context['method_manifest_sha256'],knowledge_sha256=sha(call/'initial-knowledge.json'))
 
 
 def verify_development_method_read(path, config, method):
-    """开发实验可读取已冻结方法工具；不允许外部候选或冻结重生成越界读取。"""
+    """Development may read frozen method tools; reject out-of-scope external candidates or frozen regeneration reads."""
     if config['phase']!='development':return None
     package=Path(config['package']).resolve();target=Path(path).resolve()
     if not target.is_relative_to(package):return None
@@ -48,7 +48,7 @@ def verify_development_method_read(path, config, method):
 
 
 def frozen_source_continuity(ordered,starter_sha,workspace):
-    """允许原字节起点文件初始化，拒绝任何未由模型轨迹解释的源码迁移。"""
+    """Allow byte-exact source initialization; reject source transitions unexplained by model logs."""
     previous=None
     for row in ordered:
         source=row['candidate_replay']
@@ -58,13 +58,13 @@ def frozen_source_continuity(ordered,starter_sha,workspace):
             assert initialization['source_sha256']==initialization['candidate_sha256']==starter_sha
             assert initialization['implementation_changed'] is False
         else:assert source['candidate_existed']==(previous is not None)
-        assert source['input_sha256']==(previous or starter_sha),'调用之间出现无法解释的源码变化'
+        assert source['input_sha256']==(previous or starter_sha),'Unexplained source change between invocations'
         previous=source.get('output_sha256')
     if previous is not None:assert sha(workspace/'candidate.py')==previous
 
 
 def legacy_shell_replacement(command,text):
-    """静态重放旧开发日志中的常量替换；不执行shell或Python代码。"""
+    """Replay constant replacements from historical logs statically without executing shell/Python code."""
     match=re.fullmatch(r"python - <<'EOF'\n(.*?)\nEOF\ngrep -n [^\n]+ candidate\.py",command,re.S)
     if not match:return None
     tree=ast.parse(match.group(1)).body
@@ -78,12 +78,12 @@ def legacy_shell_replacement(command,text):
     if not isinstance(value,ast.Call) or ast.unparse(value.func)!='s.replace' or value.keywords:return None
     if len(value.args)!=2 or not all(isinstance(arg,ast.Constant) and isinstance(arg.value,str) for arg in value.args):return None
     before,after=(arg.value for arg in value.args)
-    assert text is not None and before and before in text,'旧shell编辑不匹配调用快照'
+    assert text is not None and before and before in text,'Historical shell edit does not match the invocation snapshot'
     return text.replace(before,after)
 
 
 def replay_candidate(call,workspace,tools,results,allow_legacy_shell=False):
-    """由成功的Write/Edit重放候选字节，核对记录的调用前后快照。"""
+    """Replay successful Write/Edit operations and verify recorded input/output source snapshots."""
     path=call/'source-provenance.json'
     if not path.exists():return dict(status='not_recorded_legacy_call')
     provenance=read(path)
@@ -101,18 +101,18 @@ def replay_candidate(call,workspace,tools,results,allow_legacy_shell=False):
         if target.resolve()!=(workspace/'candidate.py').resolve():continue
         if tool['name']=='Write':text=payload['content']
         else:
-            assert text is not None,'候选尚未创建却执行Edit'
+            assert text is not None,'Edit occurred before the candidate was created'
             before,after=payload['old_string'],payload['new_string']
-            assert before and before in text,'Edit旧文本与调用快照不一致'
+            assert before and before in text,'Edit old text differs from the invocation snapshot'
             if payload.get('replace_all',False):text=text.replace(before,after)
             else:
-                assert text.count(before)==1,'非全量Edit旧文本并不唯一'
+                assert text.count(before)==1,'Non-global Edit old text is not unique'
                 text=text.replace(before,after,1)
         count+=1
     if 'output_sha256' in provenance:
         assert text is not None
         digest=hashlib.sha256(text.encode('utf8')).hexdigest()
-        assert digest==provenance['output_sha256']==sha(call/'output-source.py'),'模型工具记录无法重放输出源码'
+        assert digest==provenance['output_sha256']==sha(call/'output-source.py'),'Model tool records cannot reconstruct output source'
     else:assert text is None and not (call/'output-source.py').exists()
     return dict(status='verified',candidate_write_actions=count,legacy_shell_replacements=shell_count,**provenance)
 
@@ -123,7 +123,7 @@ def audit(run):
     for item in method['files']:
         assert sha(package/item['path'])==item['sha256'],item['path']
         if item['path'].startswith('skills/hgkda/'):
-            assert sha(workspace/item['path'])==item['sha256'],'运行中的skill被修改'
+            assert sha(workspace/item['path'])==item['sha256'],'Skill changed during execution'
     starter=starter_identity(workspace)
     calls=[];writes=[];outside_reads=[]
     for call in sorted((run/'agent-calls').iterdir()):
@@ -154,12 +154,12 @@ def audit(run):
             runner_sha256=invocation['runner_sha256'],tool_bridge_sha256=invocation['tool_bridge_sha256'],tools=len(tools),
             candidate_replay=replay_candidate(call,workspace,tools,results,allow_legacy_shell=config['phase']=='development'),
             initial_context=initial_context_identity(call)))
-    assert not any(row['success'] and not row['method_tool_identity'] for row in outside_reads),'模型成功读取了未核验的workspace外文件，须审查信息来源'
+    assert not any(row['success'] and not row['method_tool_identity'] for row in outside_reads),'Model successfully read an unverified file outside the workspace; review its information source'
     frozen_budget=None
     if config['phase']=='frozen':
         frozen_budget=read(run/'frozen-budget.json')
         assert len(calls)<=frozen_budget['maximum_model_calls']
-        assert len({row['prompt_sha256'] for row in calls})==1,'冻结调用使用了不同提示词'
+        assert len({row['prompt_sha256'] for row in calls})==1,'Frozen invocation used a different prompt'
         assert config['maximum_preflight_sources']==frozen_budget['maximum_preflight_sources']
         assert config['maximum_formal_sources']==frozen_budget['maximum_formal_sources']
         for call in (run/'agent-calls').iterdir():
@@ -169,7 +169,7 @@ def audit(run):
                 assert invocation['context_settings'][key]==frozen_budget[key]
             assert invocation['model']==read(run/'model-settings.json')['model']
         assert all(row['candidate_replay']['status']=='verified' for row in calls)
-        assert all(row['initial_context']['status']=='verified' for row in calls),'冻结调用缺少初始上下文身份原件'
+        assert all(row['initial_context']['status']=='verified' for row in calls),'Frozen invocation lacks an initial-context identity artifact'
         ordered=sorted(calls,key=lambda row:row['started_at'])
         frozen_source_continuity(ordered,starter['starter_sha256'],workspace)
         assert len(list(run.glob('formal-*/plan.json')))<=frozen_budget['maximum_formal_sources']
@@ -179,7 +179,7 @@ def audit(run):
         starter_kind=starter['kind'],prior_best_source_provided=starter.get('prior_best_source_provided',False),
         method_files=len(method['files']),model_calls=calls,model_write_actions=writes,
         outside_read_attempts=outside_reads,frozen_budget_verified=frozen_budget,
-        scope='核对原件及已记录的Read/Write/Edit/Bash调用；不将调用日志视作文件系统隔离证明')
+        scope='Audit originals and recorded Read/Write/Edit/Bash calls; tool logs are not proof of filesystem isolation')
 
 
 def main():

@@ -1,4 +1,4 @@
-"""CANNBench官方GQA子集的起点评测；官方误差指标与额外allclose分开。"""
+"""Evaluate the official CANNBench GQA subset, separating official error metrics from extra allclose checks."""
 import argparse
 import hashlib
 import importlib.util
@@ -17,7 +17,7 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--contract',type=Path,required=True);p.add_argument('--candidate',type=Path)
     p.add_argument('--output',type=Path,required=True);p.add_argument('--reference-only',action='store_true')
-    p.add_argument('--precision-floor-only',action='store_true',help='仅在CPU核验输出dtype的最近可表示值能否通过固定公式')
+    p.add_argument('--precision-floor-only',action='store_true',help='CPU-only check of whether the nearest representable output dtype values satisfy the fixed formula')
     a=p.parse_args();assert not a.output.exists()
     import torch
     torch.set_num_threads(1)

@@ -1,4 +1,4 @@
-"""多kernel调用的真机中间输入快照与目标模拟器回放协调器。"""
+"""Coordinate hardware intermediate-input snapshots and target simulator replay for multi-kernel calls."""
 import argparse
 from datetime import datetime, timezone
 import fcntl

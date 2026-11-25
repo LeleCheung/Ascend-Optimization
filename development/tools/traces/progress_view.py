@@ -46,7 +46,7 @@ def improving(row):
 
 
 def clean_prose(value):
-    for old,new in [('\u4e0d\u7b49\u4e8e','需区分于'),('\u4e0d\u662f','有别于'),('\u4e0d\u80fd\u8bc1\u660e','仍需验证')]:
+    for old,new in [('\u4e0d\u7b49\u4e8e','Distinguish from'),('\u4e0d\u662f','Distinct from'),('\u4e0d\u80fd\u8bc1\u660e','Requires validation')]:
         value=value.replace(old,new)
     return value
 
@@ -86,8 +86,8 @@ def update_catalog(root, png=False):
                 target=(origin/href).resolve()
                 return 'href="'+os.path.relpath(target,folder).replace('\\','/')+'"'
             page=re.sub(r'href="([^"]+)"',relocate,page)
-            page=page.replace('<p><a href="mainline.png">','<p><a href="../index.html">返回总览</a> <a href="delivery-history.html">原交付历史</a> <a href="mainline.png">',1)
-            page=page.replace('<summary>轮次映射与原始记录</summary>','<summary>轮次映射与原始记录</summary><p>'+html.escape(replacement['scope'])+'</p>')
+            page=page.replace('<p><a href="mainline.png">','<p><a href="../index.html">Overview</a> <a href="delivery-history.html">Original delivery history</a> <a href="mainline.png">',1)
+            page=page.replace('<summary>Round mapping and original records</summary>','<summary>Round mapping and original records</summary><p>'+html.escape(replacement['scope'])+'</p>')
             (folder/'index.html').write_text(page,encoding='utf8')
             figures.append(chart.replace('<svg ','<svg style="display:block;width:100%;height:auto" ',1))
             records.append(dict(operator=row['operator'],replacement=replacement,
@@ -98,12 +98,12 @@ def update_catalog(root, png=False):
         page=re.sub(r'<svg\b.*?</svg>',lambda _:chart,page,count=1,flags=re.S)
         # Keep a single figure in the active page; evidence remains available on demand.
         page=re.sub(r'<p><a href="method-history.svg">.*?</a></p>','',page)
-        page=page.replace('主图数值：重算值与原始成绩','完整数值：重算值与原始成绩')
-        page=page.replace('已接通部分片段，虚线处仍待核实。横向滚动查看全部节点；换参考不算代码优化。',
-            '主图展示最佳性能进展；具体源码继承和方法复用保留在完整证据中。')
-        page=page.replace('已找到根到交付的版本来历。横向滚动查看全部节点；换参考不算代码优化。',
-            '原生起点与版本记录已绑定；主图展示最佳性能进展。')
-        page=page.replace('<div class="viewport">','<p>实线展示最佳进展；下降与复测记录保留在详情。标题保留交付成绩。</p><div class="viewport">',1) if '实线展示最佳进展' not in page else page
+        page=page.replace('Main-view values: recalculated and raw scores','All values: recalculated and raw scores')
+        page=page.replace('Some segments connected; dashed links remain unverified. Scroll for all nodes; reference switches are not code optimization.',
+            'Main view shows best progress; evidence retains source ancestry and method reuse.')
+        page=page.replace('Root-to-delivery ancestry located. Scroll for all nodes; reference switches are not code optimization.',
+            'Native start and versions are bound; main view shows best progress.')
+        page=page.replace('<div class="viewport">','<p>Solid lines show best progress; regressions/repeats stay in details. Titles retain delivery scores.</p><div class="viewport">',1) if 'Solid lines show best progress' not in page else page
         (folder/'index.html').write_text(clean_prose(page),encoding='utf8')
         figures.append(chart.replace('<svg ','<svg style="display:block;width:100%;height:auto" ',1))
         records.append(dict(operator=row['operator'],displayed_ids=[e['id'] for e in view['display_events']],
@@ -123,17 +123,17 @@ def update_catalog(root, png=False):
     cards.sort(key=lambda c:(ranks.get(card_operator(c),len(ranks)),original_ranks[card_operator(c)]))
     it=iter(cards);index=re.sub(card_pattern,lambda _:next(it),index,flags=re.S)
     records.sort(key=lambda r:(ranks.get(r['operator'],len(ranks)),original_ranks[r['operator']]))
-    index=index.replace('仅原生起点允许显示失败叉号。','实线保留最佳进展，下降点收进详情。')
-    index=index.replace('已接通部分片段，虚线处仍待核实','最佳性能进展；方法复用与源码来源见详情')
-    index=index.replace('>方法来源占比</a>','>历史方法来源占比</a>')
-    index=index.replace('≈：历史耗时重算；交付终点：CANN实测。实线保留最佳进展，下降点收进详情。',
-        '交付与后续研究进展。≈：历史耗时重算；实线维护最佳版本，虚线展示下降探索。具体测量范围见各图详情。')
+    index=index.replace('Only native starts may use failure crosses.','Solid lines retain best progress; regressions stay in details.')
+    index=index.replace('Some segments connected; dashed links remain unverified','Best progress; method reuse/source ancestry in details')
+    index=index.replace('>Method-source share</a>','>Historical method-source share</a>')
+    index=index.replace('Approximate historical recalculations; measured delivery endpoints. Solid lines retain best progress; regressions stay in details.',
+        'Delivery and later research progress. Approximate historical recalculations; solid lines retain best versions, dashed lines exploration. Each chart preserves its measurement scope.')
     if 'upsample_bilinear2d' in overrides:
         index=re.sub(r'<p><a href="../native-upsample-contrast-20261118/index.html">.*?</a></p>','',index)
     elif 'native-upsample-contrast-20261118/index.html' not in index:
-        index=index.replace('<div class="cards">','<p><a href="../native-upsample-contrast-20261118/index.html">上采样 · 模拟器实验轨迹</a></p><div class="cards">',1)
+        index=index.replace('<div class="cards">','<p><a href="../native-upsample-contrast-20261118/index.html">Upsampling | simulator experiments</a></p><div class="cards">',1)
     if '../group-meeting-20261119/index.html' not in index:
-        index=index.replace('<div class="cards">','<p><a href="../group-meeting-20261119/index.html">四项模拟器案例 · 固定输入曲线与组会材料</a></p><div class="cards">',1)
+        index=index.replace('<div class="cards">','<p><a href="../group-meeting-20261119/index.html">Four simulator cases | fixed-input curves and meeting materials</a></p><div class="cards">',1)
     (out/'index.html').write_text(clean_prose(index),encoding='utf8')
     save(out/'progress-presentation.json',dict(policy='strictly improving measured milestones; original evidence unchanged',operators=records))
     if png:export_check(out)
@@ -148,16 +148,16 @@ def upsample_compact_history(root):
     native=read(out/'evidence/native-result.json')
     native_target=next(x for x in native['per_workload'] if x['uuid']=='upsample_bilinear2d-timing-1')
     events=[dict(round=0,score=native_target['speedup'],method='',source='native',sha=data['arms']['with-simulator'][0]['input_sha256'])]
-    for n,method in [(5,'连续访存＋连续写回'),(6,'二维分块，扩大搬运'),(8,'边界钳制加载')]:
+    for n,method in [(5,'Contiguous reads/writeback'),(6,'2-D tiling; larger transfers'),(8,'Clamped boundary loads')]:
         row=rows[f'round-{n:02d}'];events.append(dict(round=n,score=score(row),method=method,source='paired' if n==6 else 'sim',sha=row['output_sha256'],decisions=row['decisions']))
     w,h=1600,950;xs=[180,570,990,1400];y=lambda s:720-s*470
     parts=[f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">',
            f'<rect width="{w}" height="{h}" fill="{BG}"/>','<g font-family="Microsoft YaHei,sans-serif">',
-           text(52,66,'upsample_bilinear2d',42),text(52,115,f'保留 {score(final):.3f}× CANN',30,GREEN)]
-    for k,(cat,label) in enumerate([('paired','Profiling'),('knowledge','知识／经验'),('ir','源码／IR'),('sim','模拟器')]):
+           text(52,66,'upsample_bilinear2d',42),text(52,115,f'Retain {score(final):.3f}× CANN',30,GREEN)]
+    for k,(cat,label) in enumerate([('paired','Profiling'),('knowledge','Knowledge / experience'),('ir','Source / IR'),('sim','Simulator')]):
         x=1080+(k%2)*250;yy=55+(k//2)*40
         parts += [f'<path d="M{x} {yy}h24" stroke="{COLORS[cat]}" stroke-width="3"/>',text(x+32,yy+8,label,23,COLORS[cat])]
-    parts.append(text(52,220,'目标用例 · 相对 CANN 加速比',27))
+    parts.append(text(52,220,'Target case | CANN speedup',27))
     for value in [0,.2,.4,.6,.8,1]:
         parts += [f'<path d="M150 {y(value)}H1500" stroke="#ded7c9"/>',text(125,y(value)+9,f'{value:.1f}×',25,anchor='end')]
     for i,j,dashed in [(0,1,False),(1,2,False),(2,3,True)]:
@@ -165,16 +165,16 @@ def upsample_compact_history(root):
         parts.append(f'<path class="exploration" d="M{xs[i]} {y(events[i]["score"])}L{xs[j]} {y(events[j]["score"])}" stroke="{GREEN}" stroke-width="3.5" fill="none"{style}/>')
     for i,event in enumerate(events):
         x=xs[i];yy=y(event['score'])
-        detail=f'源码 {event["sha"]}。'
-        if i==0:detail+='原生完整18/24通过；此处显示目标用例的局部测量。'
-        else:detail+='修改前读取模拟器及profiling，源码／IR用于确定修改位置。'+json.dumps(event['decisions'],ensure_ascii=False)
+        detail=f'Source {event["sha"]}。'
+        if i==0:detail+='Native full contract passed 18/24; display target-case partial measurement.'
+        else:detail+='Simulation/profiling read before edits; source/IR identifies change locations.'+json.dumps(event['decisions'],ensure_ascii=False)
         parts.append('<g><title>'+html.escape(clean_prose(detail))+'</title>')
         if i==0:parts.append(f'<path d="M{x-9} {yy-9}L{x+9} {yy+9}M{x-9} {yy+9}L{x+9} {yy-9}" stroke="#b84c42" stroke-width="4"/>')
         else:parts.append(f'<circle cx="{x}" cy="{yy}" r="10" fill="{GREEN}" stroke="{BG}" stroke-width="3"/>')
         parts.append(text(x,yy-22,f'{event["score"]:.3f}×',28,anchor='middle'))
-        parts.append(text(x,865,['原生 FlagGems','第5轮','第6轮 · 保留','第8轮 · 探索'][i],26,anchor='middle'))
+        parts.append(text(x,865,['Native FlagGems','Round 5','Round 6 | retained','Round 8 | exploration'][i],26,anchor='middle'))
         parts.append('</g>')
-    for x,yy,lines,source in [(570,740,['连续访存＋连续写回'],'sim'),(990,265,['二维分块，扩大搬运'],'paired'),(1400,545,['边界钳制加载','标量化退步'],'sim')]:
+    for x,yy,lines,source in [(570,740,['Contiguous reads/writeback'],'sim'),(990,265,['2-D tiling; larger transfers'],'paired'),(1400,545,['Clamped boundary loads','Scalarization regression'],'sim')]:
         for k,line in enumerate(lines):parts.append(text(x,yy+36*k,line,28,COLORS[source],anchor='middle'))
     parts.append('</g></svg>');chart='\n'.join(parts)
     (out/'mainline.svg').write_text(chart,encoding='utf8')
@@ -182,7 +182,7 @@ def upsample_compact_history(root):
         retained_source=rows['round-06']['output_sha256'],branch_via='round-07 numerical failure, preserved in full evidence',
         attribution='Round 5 and 8: simulator disambiguation. Round 6: profiling trigger with simulator mechanism support. Other evidence retained in node tooltips.'))
     css='body{margin:24px;background:#fff7e8;color:#1b2434;font:22px/1.6 "Microsoft YaHei",sans-serif}svg{width:100%;height:auto;display:block}a{color:#276980;text-decoration:none;padding:8px 14px;background:#eee7d9;border-radius:8px}p{margin:12px 0}'
-    page=f'<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>上采样 · 优化轨迹与方法来源</title><style>{css}</style><p><a href="mainline.png">PNG</a> <a href="mainline.svg">SVG</a> <a href="details.html">完整对照与证据</a></p>'+chart+'<p>实线：最佳进展；虚线：保留的探索分支。颜色表示方法来源，节点均为设备kernel修改。</p></html>'
+    page=f'<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Upsampling | progress and guidance</title><style>{css}</style><p><a href="mainline.png">PNG</a> <a href="mainline.svg">SVG</a> <a href="details.html">Full comparison/evidence</a></p>'+chart+'<p>Solid: best progress; dashed: retained exploration. Colors show guidance; nodes are device-kernel changes.</p></html>'
     (out/'details.html').write_bytes((out/'index.html').read_bytes()) if not (out/'details.html').exists() else None
     (out/'index.html').write_text(page,encoding='utf8')
     return out
@@ -192,21 +192,21 @@ def upsample_attempt_history(root):
     out=root/'development/reports/native-upsample-contrast-20261118'
     data=read(out/'trace-inventory.json');rows=data['arms']['with-simulator']
     target=lambda r:next(x['speedup'] for x in r.get('timings',[]) if x['uuid']=='upsample_bilinear2d-timing-1')
-    labels=[('原生','FlagGems','ir'),('连续邻域','加载','sim'),('多行','分块','sim'),('一维向量','写回','ir'),
-            ('通用路径','展平','ir'),('连续访存','连续写回','sim'),('二维分块','扩大搬运','paired'),('两个FP16','打包写回','sim'),('边界钳制','加载','sim')]
-    statuses=['完整未通过','自动调优受阻','编译失败','编译失败','入口冲突','完整通过','完整通过','数值失败','性能退步']
+    labels=[('Native','FlagGems','ir'),('Contiguous neighbors','Load','sim'),('Multi-row','Tiling','sim'),('1-D vectors','Writeback','ir'),
+            ('Generic path','Flatten','ir'),('Contiguous reads','Contiguous writeback','sim'),('2-D tiling','Larger transfers','paired'),('Two FP16 values','Packed writeback','sim'),('Boundary clamp','Load','sim')]
+    statuses=['Full contract failed','Autotuning blocked','Compilation failed','Compilation failed','Entry-point conflict','Full contract passed','Full contract passed','Numerical failure','Performance regression']
     w,h=2200,1140;xs=[160+235*i for i in range(9)];y=lambda v:700-v*450
     parts=[f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}">',
            f'<rect width="{w}" height="{h}" fill="{BG}"/>','<g font-family="Microsoft YaHei,sans-serif">',
-           text(52,66,'upsample_bilinear2d',44),text(52,120,'最佳版本：尝试6 · 0.790× CANN',32,GREEN)]
-    for k,(cat,label) in enumerate([('paired','Profiling'),('knowledge','知识／经验'),('ir','源码／IR'),('sim','模拟器')]):
+           text(52,66,'upsample_bilinear2d',44),text(52,120,'Best: attempt 6 | 0.790x CANN',32,GREEN)]
+    for k,(cat,label) in enumerate([('paired','Profiling'),('knowledge','Knowledge / experience'),('ir','Source / IR'),('sim','Simulator')]):
         x=1650+(k%2)*250;yy=55+(k//2)*42
         parts += [f'<path d="M{x} {yy}h26" stroke="{COLORS[cat]}" stroke-width="3"/>',text(x+36,yy+9,label,25,COLORS[cat])]
-    parts.append(text(52,220,'目标用例 · 相对 CANN 加速比',28))
+    parts.append(text(52,220,'Target case | CANN speedup',28))
     for v in [0,.2,.4,.6,.8,1]:
         parts += [f'<path d="M130 {y(v)}H2130" stroke="#ded7c9"/>',text(110,y(v)+9,f'{v:.1f}×',26,anchor='end')]
-    parts.append(text(720,410,'尝试1–4：实现探索与修复',32,'#596170',anchor='middle'))
-    parts.append(text(720,455,'性能结果从尝试5开始',28,'#596170',anchor='middle'))
+    parts.append(text(720,410,'Attempts 1-4: exploration/repair',32,'#596170',anchor='middle'))
+    parts.append(text(720,455,'Performance results start at attempt 5',28,'#596170',anchor='middle'))
     native=read(out/'evidence/native-result.json');ns=next(x['speedup'] for x in native['per_workload'] if x['uuid']=='upsample_bilinear2d-timing-1')
     x=xs[0];yy=y(ns)
     parts += [f'<path d="M{x-10} {yy-10}L{x+10} {yy+10}M{x-10} {yy+10}L{x+10} {yy-10}" stroke="#b84c42" stroke-width="4"/>',
@@ -222,32 +222,32 @@ def upsample_attempt_history(root):
                            retained_attempt=best[0] if best else None,retained_score=best[1] if best else None,
                            method=labels[n],status=statuses[n],decisions=row['decisions']))
         parts.append('<g><title>'+html.escape(clean_prose(json.dumps(events[-1],ensure_ascii=False)))+'</title>')
-        parts.append(text(xs[n],835,f'尝试{n}',30,anchor='middle'))
+        parts.append(text(xs[n],835,f'Attempt {n}',30,anchor='middle'))
         if actual is None:
             parts.append(f'<circle class="failed-attempt" cx="{xs[n]}" cy="755" r="9" fill="{BG}" stroke="#92908a" stroke-width="3"/>')
         parts.append('</g>')
     coords=' '.join(f'{xs[n]},{y(value)}' for n,value,_ in kept)
     parts.append(f'<polyline class="retained-best" points="{coords}" fill="none" stroke="{GREEN}" stroke-width="4"/>')
     for n,value,retained_round in kept:
-        parts.append(f'<circle class="retained-node" cx="{xs[n]}" cy="{y(value)}" r="10" fill="{GREEN}"><title>尝试{n}后保留尝试{retained_round}的版本：{value:.6f}× CANN</title></circle>')
+        parts.append(f'<circle class="retained-node" cx="{xs[n]}" cy="{y(value)}" r="10" fill="{GREEN}"><title>Attempt {n} retains attempt {retained_round} version: {value:.6f}× CANN</title></circle>')
     for n in [5,6]:parts.append(text(xs[n],y(target(rows[n-1]))-27,f'{target(rows[n-1]):.3f}×',29,anchor='middle'))
-    parts.append(text((xs[7]+xs[8])/2,y(target(rows[5]))-32,'持续保留版本6',30,GREEN,anchor='middle'))
+    parts.append(text((xs[7]+xs[8])/2,y(target(rows[5]))-32,'Retain version 6',30,GREEN,anchor='middle'))
     for n in [7,8]:
         yy=755 if n==7 else y(target(rows[7]))
         parent=events[n-1]['parent_attempt']
         parent_y=755 if parent==7 else y(target(rows[parent-1]))
-        parts.append(f'<path class="exploration-branch" d="M{xs[parent]} {parent_y}L{xs[n]} {yy}" fill="none" stroke="{GREEN}" stroke-width="3" stroke-dasharray="10 9"><title>源码继承：尝试{parent} → 尝试{n}；空心点位于无成绩区</title></path>')
+        parts.append(f'<path class="exploration-branch" d="M{xs[parent]} {parent_y}L{xs[n]} {yy}" fill="none" stroke="{GREEN}" stroke-width="3" stroke-dasharray="10 9"><title>Source ancestry: attempt {parent} -> attempt {n}; hollow nodes have no valid score</title></path>')
     parts.append(f'<circle cx="{xs[8]}" cy="{y(target(rows[7]))}" r="10" fill="{GREEN}"/>')
     parts.append(text(xs[8],y(target(rows[7]))-25,f'{target(rows[7]):.3f}×',29,anchor='middle'))
-    parts.append(text(xs[0],835,'原生起点',30,anchor='middle'))
+    parts.append(text(xs[0],835,'Native start',30,anchor='middle'))
     for n,(a,b,cat) in enumerate(labels):
         parts.extend([text(xs[n],885,a,29,COLORS[cat],anchor='middle'),text(xs[n],923,b,29,COLORS[cat],anchor='middle'),
                       text(xs[n],975,statuses[n],26,GREEN if n in [5,6] else '#87524a',anchor='middle')])
     for event in events:
         n=event['attempt']; parent=event['parent_attempt']
-        origin='原生' if parent==0 else f'尝试{parent}'
-        parts.append(text(xs[n],1020,f'基于{origin}',25,'#596170',anchor='middle'))
-    parts.append(text(52,1095,'8次生成尝试 · 3个完整通过版本（5、6、8） · 当前保留版本6',28))
+        origin='Native' if parent==0 else f'Attempt {parent}'
+        parts.append(text(xs[n],1020,f'based on {origin}',25,'#596170',anchor='middle'))
+    parts.append(text(52,1095,'8 generation attempts | 3 full passes (5,6,8) | retained version 6',28))
     parts.append('</g></svg>');chart='\n'.join(parts)
     (out/'mainline.svg').write_text(chart,encoding='utf8')
     save(out/'mainline-presentation.json',dict(scope='all eight generation attempts; source lineage and retained best shown separately',events=events,
@@ -255,7 +255,7 @@ def upsample_attempt_history(root):
          missing_score_policy='failed attempts have no performance coordinate; markers placed in an unscored band',
          retained_source=rows[5]['output_sha256']))
     css='body{margin:24px;background:#fff7e8;color:#1b2434;font:22px/1.6 "Microsoft YaHei",sans-serif}svg{width:100%;height:auto;display:block}a{color:#276980;text-decoration:none;padding:8px 14px;background:#eee7d9;border-radius:8px}'
-    page=f'<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>upsample_bilinear2d · 完整尝试与最佳保留</title><style>{css}</style><p><a href="mainline.png">PNG</a> <a href="mainline.svg">SVG</a> <a href="details.html">完整证据</a></p>'+chart+'<p>实线：当前最佳合格版本；虚线：探索版本的源码接续。空心点位于无成绩区。颜色表示主要判断依据。<br>横轴记录8次生成尝试；编译、接口与数值修复保留各自记录。尝试3回到尝试1继续，尝试8接续尝试7；当前最佳仍为尝试6。</p></html>'
+    page=f'<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>upsample_bilinear2d | full attempts and retained best</title><style>{css}</style><p><a href="mainline.png">PNG</a> <a href="mainline.svg">SVG</a> <a href="details.html">Full evidence</a></p>'+chart+'<p>Solid: qualified best; dashed: exploratory ancestry. Hollow nodes have no scores. Color denotes primary guidance.<br>X-axis counts eight generation attempts, retaining compile/interface/numerical repairs. Attempt 3 returns to 1; attempt 8 follows 7; best remains attempt 6.</p></html>'
     (out/'index.html').write_text(page,encoding='utf8');return out
 
 
@@ -264,7 +264,7 @@ def upsample(root):
     rows=read(out/'trace-inventory.json')['arms']['with-simulator']
     target=lambda r:next(x['speedup'] for x in r['timings'] if x['uuid']=='upsample_bilinear2d-timing-1')
     selected=[5,6,8]
-    methods=[('连续访存＋连续写回','sim'),('二维分块，扩大搬运','paired'),('边界钳制加载','sim')]
+    methods=[('Contiguous reads/writeback','sim'),('2-D tiling; larger transfers','paired'),('Clamped boundary loads','sim')]
     events=[]
     for display_round,(attempt,(method,category)) in enumerate(zip(selected,methods),1):
         row=rows[attempt-1]
@@ -283,7 +283,7 @@ def upsample(root):
                 retained=row['retained']))
     from .research_progress import write_report
     presentation=dict(operator='upsample_bilinear2d',metric='kgs_full_contract_geo_mean',
-        scope='KGS全合同性能几何平均，相对CANN，profiler计时。原生起点18/24，缺少有效全合同成绩，失败标记无纵轴数值。单用例成绩、方法来源及原始记录保留在事件详情。',
+        scope='Full KGS geometric-mean speedup versus CANN with profiler timing. Native start passed 18/24 without a valid full-contract score; its failure mark has no Y value. Details preserve per-case scores, guidance, and originals.',
         events=[dict(label='FlagGems',qualified=False,score=None)]+[
             dict(**e,label=f'V{e["display_round"]}',qualified=True) for e in events])
     write_report(presentation,out)

@@ -1,4 +1,4 @@
-"""CANN任务别名必须绑定唯一实测符号；不凭名称选择第一条记录。"""
+"""CANN task aliases must bind unique observed symbols, not the first name match."""
 import importlib.util
 from pathlib import Path
 import unittest
@@ -6,7 +6,7 @@ import unittest
 ROOT=Path(__file__).resolve().parents[3]
 spec=importlib.util.spec_from_file_location('collect_pair',ROOT/'hgkda/src/hgkda/runtime/collect_pair.py')
 module=importlib.util.module_from_spec(spec)
-# 采集仅在服务器执行；离线只加载纯函数时避免导入Linux文件锁。
+# Collection runs on the server; load only pure functions offline without Linux file-lock imports.
 import sys,types
 if sys.platform=='win32':
     previous=sys.modules.get('fcntl');sys.modules['fcntl']=types.ModuleType('fcntl')

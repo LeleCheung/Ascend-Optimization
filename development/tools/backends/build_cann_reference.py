@@ -1,4 +1,4 @@
-"""在匹配的 CANN/PyTorch NPU 环境重建示例参考宿主桥。"""
+"""Rebuild the example reference host bridge in a matching CANN/PyTorch NPU environment."""
 import argparse
 import hashlib
 import json
@@ -36,7 +36,7 @@ def main():
                   architecture=platform.machine(),reference_api='aclnnInplaceMuls',candidate_backend='Triton')
     (output/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n',encoding='utf8')
     print(json.dumps({'status':'built','reference_directory':str(output),
-                      'next':'将新参考目录用于新合同快照，并重新打包请求；不覆盖旧证据'}))
+                      'next':'Use the new reference directory for a new contract snapshot and repack the request; preserve prior evidence'}))
 
 
 if __name__=='__main__':main()

@@ -1,4 +1,4 @@
-"""启动诊断拒绝其他源码的反馈和轨迹，并排除重复派生时间。"""
+"""Launch diagnosis rejects other-source feedback/traces and excludes duplicated derived time."""
 import hashlib
 import importlib.util
 import json

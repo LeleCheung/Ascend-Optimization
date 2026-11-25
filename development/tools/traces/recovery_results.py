@@ -34,17 +34,17 @@ def main():
         rows = []
         for r in group['measurements']:
             fixed = r['fixed_cann']
-            score = f"{fixed['score']:.3f}×" if fixed else '未通过'
+            score = f"{fixed['score']:.3f}×" if fixed else 'Failed'
             gain = f"{r['candidate_gain']:.3f}×" if fixed else '—'
             original = f"{r['geo_mean']:.3f}×" if r.get('geo_mean') else '—'
-            label = '交付源码复测' if r['baseline'] else '后续候选'
-            rows.append(f'<tr><td>{label}</td><td><code>{r["source_sha256"][:12]}</code></td><td>{original}</td><td>{score}</td><td>{gain}</td><td>{"全部通过" if r["full_passed"] else "未通过"}</td></tr>')
-        sections.append('<h2>'+html.escape(group['operator'])+'</h2><table><tr><th>版本</th><th>源码</th><th>当次CANN</th><th>固定CANN</th><th>相对本轮起点</th><th>完整检查</th></tr>'+''.join(rows)+'</table>')
-    page='''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>本轮恢复与优化</title>
+            label = 'Delivered-source repeat' if r['baseline'] else 'Later candidate'
+            rows.append(f'<tr><td>{label}</td><td><code>{r["source_sha256"][:12]}</code></td><td>{original}</td><td>{score}</td><td>{gain}</td><td>{'All passed' if r["full_passed"] else 'Failed'}</td></tr>')
+        sections.append('<h2>'+html.escape(group['operator'])+'</h2><table><tr><th>Version</th><th>Source</th><th>Paired CANN</th><th>Fixed CANN</th><th>Relative to run start</th><th>Full checks</th></tr>'+''.join(rows)+'</table>')
+    page="""<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Current recovery/optimization</title>
 <style>body{max-width:1200px;margin:32px auto;padding:0 20px;background:#fff7e8;color:#1b2434;font:20px/1.7 "Microsoft YaHei",sans-serif}h1{font-size:34px}h2{font-size:26px;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}td,th{padding:10px;border-bottom:1px solid #ded7c9;text-align:left}a{color:#276980}code{font-size:17px}table{display:block;overflow:auto}</style>
-<p><a href="index.html">返回26项轨迹</a> · <a href="recovery-results.json">逐case数据</a></p><h1>本轮恢复与优化</h1>
-<p>同一完整合同、walltime计时。固定CANN列使用本轮起点的逐case参考耗时重算；相对起点列直接比较候选耗时。这样消除参考分母变化，但仍不能消除跨时刻测量波动。</p>
-<p>旧交付版保留。本页完整展示本轮已完成的正式评测，包括无效与负收益候选，不将同源码复测算成新增优化。</p>'''+''.join(sections)+'</html>'
+<p><a href="index.html">Back to 26-operator traces</a> · <a href="recovery-results.json">Per-case data</a></p><h1>Current recovery/optimization</h1>
+<p>Same full contract, 、walltime timing。Fixed CANN column uses starting per-case reference timings；The relative-to-start column compares candidate times directly。This removes reference-denominator changes，while retaining cross-time measurement variation。</p>
+<p>Prior delivery remains intact。This page retains all completed formal evaluations，including invalid/negative candidates，same-source repeats are separate from new optimization。</p>"""+''.join(sections)+'</html>'
     (out / 'recovery.html').write_text(page, encoding='utf8')
     print(json.dumps(dict(operators=len(summaries), measurements=sum(len(g['measurements']) for g in summaries))))
 

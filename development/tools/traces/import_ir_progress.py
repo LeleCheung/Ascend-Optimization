@@ -160,7 +160,7 @@ def import_case(reports, operator, folder, method, story, attribution, historica
         assert request_contract(measured / 'request.json') == contract
         event_id = phase + '/' + operator + '/' + name
         case = next(row for row in result['per_workload'] if row['uuid'] == target)
-        event = dict(label=('同源码保留IR复测' if continuation else '同源码原IR复测') if transition else 'IR性能续接 ' + invocation,
+        event = dict(label=('Same-source retained-IR repeat' if continuation else 'Same-source original-IR repeat') if transition else 'IR performance continuation ' + invocation,
             source_sha256=source, parent_source_sha256=source, ir_sha256=ir_sha,
             parent_ir_sha256=original_sha, selected_layer='remeasurement' if transition else 'single_operator_ir',
             qualified=True, measurement_event_id=event_id, parent_measurement_event_id=parent_id,
@@ -172,12 +172,12 @@ def import_case(reports, operator, folder, method, story, attribution, historica
                 num_workloads=result['num_workloads'], supplementary=None if transition else checks))
         if transition:
             event.update(measurement_transition=True, same_protocol_remeasurement=True,
-                measurement_transition_label='同源码复测',
-                measurement_note='同一Triton源码，本轮原IR覆盖的完整复测；同合同计时的测量变化单列。')
+                measurement_transition_label='Same-source repeat',
+                measurement_note='Full same-source original-IR reevaluation; record same-contract timing variation separately.')
         else:
             event.update(method=method, attribution=attribution, category='sim', location='ir',
                 original_evidence_category='ir',
-                presentation_attribution_policy='2026-11-20用户确认：持续模拟器重放指导的IR修改使用橙色；IR层使用独立节点形状，其他贡献留在详情。',
+                presentation_attribution_policy='Confirmed 2026-11-20: simulator-guided IR changes are orange with a distinct IR shape; other contributions remain in details.',
                 measurement_bridge_event_id=parent_id,
                 selection=(run / 'selection.json').relative_to(reports).as_posix())
             if selection.get('simulator_replay'):
@@ -200,14 +200,14 @@ def import_case(reports, operator, folder, method, story, attribution, historica
             continue
         measured = read(reports / event['replay']['result'])
         conversion = rebase(latest, measured)
-        conversion['scope'] = '共同CANN参考下的逐case实测耗时重算；原始配对成绩单列。'
+        conversion['scope'] = 'Recalculate measured per-case candidate times using a common CANN reference; retain original paired scores separately.'
         event.update(score=conversion['score'], geo_mean=conversion['score'], conversion=conversion,
             target_case_speedup=anchor[target] / event['latency_ms'],
             cann_anchor=dict(kind='accepted IR evaluation per-case reference', cases=anchor),
             score_is_rebased=index != len(data['events']) - 1)
     data.update(ir_case_story=story, scope=data['scope'] +
-        ' IR续接保持Triton源码一致，同实现复测归入详情；IR节点保存完整合同、补测、真实继承路径及测量记录。')
-    data.setdefault('history_links', []).append(dict(label='IR完整验收与测量记录',
+        ' IR continuation keeps Triton source fixed; repeats stay in details. IR nodes preserve full contracts, checks, actual ancestry, and measurements.')
+    data.setdefault('history_links', []).append(dict(label='IR acceptance and measurement records',
         href='../' + phase + '/' + operator + '/selection.json'))
     write_report(data, output)
     return data
@@ -218,15 +218,15 @@ def main():
     parser.add_argument('--root', type=Path, default=Path.cwd())
     args = parser.parse_args()
     import_case(args.root / 'development/reports', 'batchnorm', 'batchnorm-simulator-20261118',
-        'IR输出分块加宽\n8×128 → 8×256',
-        '源码预取与分块优化 → 固定源码修改输出IR → 42.955降至39.261 μs',
-        '修改前模拟器局部窗口提供同步节奏线索；Codex结合实际IR、低层产物与UB失败反馈提出输出加宽方向，CC／DeepSeek登记并修改IR。完整真机评测与ABBA验证收益；修改前局部窗口与修改后完整窗口分别解释。')
+        'Widen IR output tiles\n8x128 -> 8x256',
+        'Source prefetch/tiling -> fixed-source output IR -> 42.955 to 39.261 us',
+        'Pre-change simulator windows suggest synchronization timing; Codex combines actual IR, lowering, and UB failures to propose wider output. CC/DeepSeek registers/edits IR. Full hardware evaluation and ABBA confirm gains; before/after window scopes remain separate.')
     reports = args.root / 'development/reports'
     if (reports / 'ir-performance-20261119/upsample/selection.json').exists():
         import_case(reports, 'upsample', 'native-upsample-contrast-20261118',
-            'IR边界选择先做\nFP16选择后扩展',
-            '源码打包写回 → 固定源码缩窄边界选择IR → 真机继续提速',
-            'Codex建议检查打包及布局成本；模型根据profiling、模拟器热点和真实低层产物，选择把边界选择放到FP16扩展之前。实际BCMLIR确认select与切片缩窄，完整设备结果与交错复测验证收益；各模拟器窗口分别解释。',
+            'Select boundaries before expansion\nFP16 select then extend',
+            'Packed source writeback -> narrower fixed-source IR boundary select -> hardware gain',
+            'Codex suggests packing/layout investigation. The model uses profiling, hotspot regions, and actual lowering to move boundary select before FP16 extension. BCMLIR confirms narrower select/slices; full evaluation and interleaving confirm gain. Preserve window scopes.',
             historical_roots=('native-upsample-contrast-20261118/evidence/with-simulator',
                               'upsample-performance-20261118/evidence'))
     scatter_selection = reports / 'ir-performance-20261119/scatter/selection.json'

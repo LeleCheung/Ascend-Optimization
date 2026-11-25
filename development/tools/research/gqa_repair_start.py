@@ -59,9 +59,9 @@ def main():
         result=str(args.review_feedback if review_feedback else result_path),
         result_sha256=sha(args.review_feedback if review_feedback else result_path), cases=failures,
         source_review=review_feedback, complete_formal_result=None if review_feedback else result,
-        host_correction=('源代码审查发现适用范围问题，当前候选尚未设备评测；修复后沿原四项验收。'
-            if review_feedback else '实际preflight只交接源码审查；编译、资源与正确性结果由本次四项执行给出。')
-            + '此前双分析按原source_sha256保留为历史背景。'))
+        host_correction=('Source review found an applicability problem; the current candidate is not device-evaluated. Repair under the original four-case contract.'
+            if review_feedback else 'Actual preflight only hands off source review; this four-case execution supplies compilation, resources, and correctness results.')
+            + 'Prior dual analysis retains its original source_sha256 as historical background.'))
     folder = workspace / 'failed-ir' / args.previous
     folder.mkdir(parents=True, exist_ok=True)
     artifacts = []
@@ -78,19 +78,19 @@ def main():
         current_profiling=None, current_simulator=None,
         preserved_best_source_sha256=read(run / (
             'selection.json' if (run / 'selection.json').exists() else 'retained-parent.json'))['source_sha256'],
-        historical_evidence='current-profiling.json与simulator-evidence.json保留原版身份，当前失败候选尚无设备重放。'))
-    prompt = '''修复当前GQA未保留候选。读取task.json、contract.json、context-brief.json、repair-feedback.json、candidate.py及必要的实际失败IR。四项原合同结果已全部返回；先核对每项真实编译、资源或数值错误。保持四项checker、golden、dtype、计时口径及当前已验收精度路径。请选择一个针对实际失败原因的具体修复机制，明确其对精度、活跃缓冲、交接次数和并行度的取舍。原保留版独立冻结，修复沿当前失败源码明确接续。
-原版profiling和模拟器仅为历史背景。本次决策以当前失败反馈和实际IR为依据，evidence使用evaluation/source_ir类别；无需重读原版模拟器，不将其标为当前候选观测。不要声称当前源码已通过编译或存在真机收益。用Edit写diagnosis.json，包含selected_layer、layer_reason、simulator_incremental_judgment及证据、假设、改法、预测、验证与未知项，调用工具桥decision --record diagnosis.json后才编辑candidate.py。全部候选修复由你完成，host仅分配、元数据和启动，设备计算严格Triton。工具桥preflight返回awaiting_source_review后保持字节并交接。无总轮数、工具或时间预算，完整四项反馈后继续研究。
-'''
+        historical_evidence='current-profiling.json and simulator-evidence.json retain original identities; this failed candidate has no device replay.'))
+    prompt = """Repair the current unretained GQA candidate. Read task.json, contract.json, context-brief.json, repair-feedback.json, candidate.py, and necessary actual failed IR. All original four-case results have returned; inspect each actual compilation/resource/numerical error. Preserve checker, golden, dtypes, timing scope, and accepted precision paths. Choose one concrete repair addressing observed failure, with tradeoffs in precision, live buffers, handoff count, and parallelism. The retained best remains separately frozen; explicitly continue the failed source.
+Original profiling/simulation are historical background. Base decisions on current failure feedback and actual IR with evaluation/source_ir categories; do not label old simulation as current-source observation. Do not claim current compilation or hardware gains. Use Edit to write diagnosis.json including selected_layer, layer_reason, simulator_incremental_judgment, evidence, hypothesis, change, prediction, validation, and unknowns. Register through bridge decision --record diagnosis.json before editing candidate.py. You implement all repairs; host only allocates, handles metadata, and launches; device computation is strict Triton. At awaiting_source_review preserve bytes and hand off. No total round/tool/time budget; continue after full four-case feedback.
+"""
     if review_feedback:
-        prompt = prompt.replace('四项原合同结果已全部返回；先核对每项真实编译、资源或数值错误。',
-            '当前候选尚未设备评测，源代码审查反馈已返回；先核对真实地址、分支与适用条件问题，保留该验收阶段。')
-        prompt = prompt.replace('及必要的实际失败IR', '及审查引用的相关IR')
+        prompt = prompt.replace('All original four-case results have returned; inspect each actual compilation/resource/numerical error.',
+            'Current candidate has not been device-evaluated; source review returned. Inspect actual addresses, branches, and applicability while preserving this acceptance stage.')
+        prompt = prompt.replace('and necessary actual failed IR', 'and relevant IR cited by the review')
     if args.host_analysis:
         analysis = read(args.host_analysis)
         assert analysis['source_sha256'] == sha(source)
         save(workspace / 'host-repair-analysis.json', analysis)
-        prompt += '\n修改前还需读取host-repair-analysis.json，分别记录宿主建议和你的具体修复。\n'
+        prompt += '\nAlso read host-repair-analysis.json before edits; separately record host suggestions and your concrete repair.\n'
     prompt_path = run / (args.invocation + '-prompt.md')
     prompt_path.write_text(prompt, encoding='utf8')
     command = [sys.executable, '-m', 'hgkda.runtime.agent_runner', '--config', str(run / 'config.json'),

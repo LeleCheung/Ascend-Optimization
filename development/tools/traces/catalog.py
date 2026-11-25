@@ -1,4 +1,4 @@
-"""从既有交付与冻结账本摘要生成26项图册；缺失轨迹不补造轮次。"""
+"""Generate a 26-operator atlas from deliveries and frozen ledgers without inventing missing rounds."""
 import argparse
 import html
 import json
@@ -12,29 +12,29 @@ from .index import save
 from .render import draw, CSS
 
 
-# 展示选线及简短中文方法。原始计划、来源和成绩仍逐条保留在catalog.json。
+# Display selections and short English methods; catalog.json retains original plans, sources, and scores.
 SELECTIONS = {
- 'selu_':('c3e781', [('直接启动精简宿主路径','host','probe'),('固定网格流式循环','device','probe')]),
- 'rad2deg_':('b20dea', [('预绑定编译后启动器','host','probe'),('按规模调整分块','device','probe'),('保留输入精度计算','device','ir')]),
- 'uniform':('20d459', [('向量化 Philox 与状态访问','mixed','probe'),('缓存编译后直接启动','host','paired')]),
- 'value_selecting_reduction_backward':('d9428d', [('固定网格流式回填梯度','mixed','unknown')]),
- 'scatter_add':('42950a', [('排序分段归约','device','knowledge'),('将查找移至片上','device','probe')]),
- 'upsample_bilinear2d':('c34839', [('错位全局读取改为片上 gather','device','knowledge'),('缓存形状与启动配置','host','knowledge'),('去除冗余掩码：未提升','device','probe')]),
- '_conj_physical':('62faff',[('预绑定编译后启动器','host','probe'),('简化输出分配路径','host','probe'),('增加安全回退：退步','host','unknown')]),
- 'negative_':('033b6a',[('直接启动已编译 kernel','host','probe'),('每个 program 处理64KB','device','paired')]),
- 'xlogy_scalar_tensor':('016df1',[('缓存启动计划与输出分配','host','probe')]),
- 'nan_to_num_':('0af95a',[('简化启动参数','host','probe'),('区分大小输入路径','mixed','probe'),('单阶段多块循环','device','probe'),('原精度计算尝试：未提升','device','ir')]),
- 'cross_out':('023367',[('重组索引与邻居访问','device','probe'),('扩大可驻留分块','device','probe'),('简化启动与修复边界','mixed','probe'),('扩大32位数据分块','device','ir')]),
- 'hardshrink_backward':('e0a716',[('固定网格无掩码循环','device','probe'),('简化启动与单块特化','mixed','probe'),('只让尾块执行边界处理','device','probe')]),
- 'subtract_':('dcd20c',[('直接启动已编译 kernel','host','probe')]),
- 'native_group_norm':('092021',[('缓存启动与合并分配','host','unknown'),('缩减启动参数：仍退步','host','probe')]),
+ 'selu_':('c3e781', [('Direct launch; simpler host path','host','probe'),('Fixed-grid streaming loop','device','probe')]),
+ 'rad2deg_':('b20dea', [('Prebind compiled launcher','host','probe'),('Size-dependent tiling','device','probe'),('Preserve input precision','device','ir')]),
+ 'uniform':('20d459', [('Vectorize Philox/state access','mixed','probe'),('Cache direct compiled launch','host','paired')]),
+ 'value_selecting_reduction_backward':('d9428d', [('Fixed-grid streaming gradient writeback','mixed','unknown')]),
+ 'scatter_add':('42950a', [('Sorted segmented reduction','device','knowledge'),('Move lookup on chip','device','probe')]),
+ 'upsample_bilinear2d':('c34839', [('On-chip gather replaces misaligned global reads','device','knowledge'),('Cache shapes/launch configuration','host','knowledge'),('Remove redundant masks: no gain','device','probe')]),
+ '_conj_physical':('62faff',[('Prebind compiled launcher','host','probe'),('Simplify output allocation','host','probe'),('Add safe fallback: regression','host','unknown')]),
+ 'negative_':('033b6a',[('Direct compiled-kernel launch','host','probe'),('64 KB per program','device','paired')]),
+ 'xlogy_scalar_tensor':('016df1',[('Cache launch plan/output allocation','host','probe')]),
+ 'nan_to_num_':('0af95a',[('Simplify launch arguments','host','probe'),('Separate small/large-input paths','mixed','probe'),('Single-stage multi-tile loop','device','probe'),('Original-precision experiment: no gain','device','ir')]),
+ 'cross_out':('023367',[('Reorganize indexing/neighbors','device','probe'),('Larger resident tiles','device','probe'),('Simplify launch/repair boundaries','mixed','probe'),('Larger 32-bit tiles','device','ir')]),
+ 'hardshrink_backward':('e0a716',[('Fixed-grid unmasked loop','device','probe'),('Simplify launch/single-tile specialization','mixed','probe'),('Tail-only boundary handling','device','probe')]),
+ 'subtract_':('dcd20c',[('Direct compiled-kernel launch','host','probe')]),
+ 'native_group_norm':('092021',[('Cache launch/combine allocation','host','unknown'),('Fewer launch arguments: regression','host','probe')]),
  'log2_':('ddeb4e',[]),
- 'fix':('a2d5ed',[('固定网格多块循环：退步','device','probe'),('调整流水与启动回退','mixed','probe'),('修正启动参数数量','host','ir')]),
- 'round_out':('009743',[('流式循环与舍入简化','device','probe'),('双阶段流水尝试','device','probe'),('扩大16位分块：未提升','device','probe')]),
- 'special_round_out':('cec136',[('缓存直接启动路径','host','probe'),('简化 FP32 舍入','device','ir'),('16位舍入尝试：失败','device','ir')]),
- 'special_xlogy_':('a754ce',[('缓存网格与启动参数','host','probe'),('精简宿主查找与查询','host','probe')]),
- 'hardswish':('1c3071',[('连续块去除掩码','device','probe'),('缩减小输入启动开销','host','paired'),('原精度向量运算：退步','device','ir')]),
- 'fmod_tensor_':('aca31f',[('精简宿主元数据处理','host','probe')]),
+ 'fix':('a2d5ed',[('Fixed-grid multi-tile loop: regression','device','probe'),('Adjust pipeline/launch fallback','mixed','probe'),('Repair launch argument count','host','ir')]),
+ 'round_out':('009743',[('Streaming loop/simpler rounding','device','probe'),('Two-stage pipeline experiment','device','probe'),('Larger 16-bit tiles: no gain','device','probe')]),
+ 'special_round_out':('cec136',[('Cache direct launch path','host','probe'),('Simplify FP32 rounding','device','ir'),('16-bit rounding: failure','device','ir')]),
+ 'special_xlogy_':('a754ce',[('Cache grid/launch arguments','host','probe'),('Simplify host lookup/queries','host','probe')]),
+ 'hardswish':('1c3071',[('Unmask contiguous tiles','device','probe'),('Reduce small-input launch cost','host','paired'),('Original-precision vector math: regression','device','ir')]),
+ 'fmod_tensor_':('aca31f',[('Simplify host metadata','host','probe')]),
 }
 
 
@@ -61,12 +61,12 @@ def make_catalog(root, output):
                 assert req['implementation']['sources'][0]['content'].encode('utf8')==source
                 result=read(base/'evaluation/result.json')
                 points.append(dict(id=op+':repair-'+str(n),score=result['geo_mean'],source_sha256=digest(source),
-                    method='修复前' if n==0 else '调整低精度计算与分块',
+                    method='Before repair' if n==0 else 'Adjust low-precision math/tiling',
                     result=(base/'evaluation/result.json').relative_to(root).as_posix(),review=review))
-            view=dict(id='mainline',session=op,title=op+' 优化轨迹',subtitle='相对 CANN · 同合同修复前后',ylim=[0,1.1],
-                annotations=[dict(point=2,method='调整低精度计算与分块',color='ir',position=[750,285],arrow=[1200,325])],
+            view=dict(id='mainline',session=op,title=op+' optimization trace',subtitle='Relative to CANN | same-contract repair',ylim=[0,1.1],
+                annotations=[dict(point=2,method='Adjust low-precision math/tiling',color='ir',position=[750,285],arrow=[1200,325])],
                 nodes=[dict(point=1,location='mixed'),dict(point=2,location='device')],
-                line_status='下图：交付版本修复过程')
+                line_status='Below: delivery repair')
             record=dict(operator=op,kind='verified_delivery_repair',points=points,view=view,
                         history=archived['historical_rounds'],gap=None,selected_source=[str(b.relative_to(root)) for b in bases])
         elif op=='log10_':
@@ -83,11 +83,11 @@ def make_catalog(root, output):
             points=[]
             for n,p in enumerate(points_raw):
                 points.append(dict(id=op+':round-'+str(p['round']),score=p['evaluation'].get('geo_mean'),
-                    source_sha256=p.get('source_sha256'),method='本批起点' if n==0 else labels[n-1][0],raw=p))
+                    source_sha256=p.get('source_sha256'),method='Batch start' if n==0 else labels[n-1][0],raw=p))
             high=max(p['score'] or 0 for p in points)*1.16
             high=max(.5,math.ceil(high*10)/10)
             annotations=[]
-            # 最多4个方法箭头；位置来自版式模板，不取代原始方法记录。
+            # At most four method arrows; template positions do not replace original method records.
             for i,label in enumerate(labels[:4],2):
                 placements={1:([220,285],[540,325]),2:([930,285],[1210,325]),3:([220,775],[540,730]),4:([930,775],[1200,730])}
                 if len(labels)==1:position,arrow=[550,285],[950,325]
@@ -95,23 +95,23 @@ def make_catalog(root, output):
                 annotations.append(dict(point=i,method=label[0],color=label[2],position=position,arrow=arrow))
             legend=['paired','sim','knowledge','probe','ir']
             if any(a['color']=='unknown' for a in annotations):legend=['paired','sim','knowledge','probe','unknown']
-            gap='仅找到1次正式测量，优化过程记录待补' if len(points)==1 else None
-            view=dict(id='mainline',session=op,title=op+' 优化轨迹',subtitle='历史 KGS 参考 · 本批 '+str(len(points))+' 次正式评测',
-                ylim=[0,high],annotations=annotations,legend=legend,gap=gap,x_label='本批正式评测顺序',plot_bottom=650 if len(labels)>2 else 745,
+            gap='Only one formal measurement located; optimization history incomplete' if len(points)==1 else None
+            view=dict(id='mainline',session=op,title=op+' optimization trace',subtitle='Historical KGS reference | batch '+str(len(points))+' formal evaluations',
+                ylim=[0,high],annotations=annotations,legend=legend,gap=gap,x_label='Formal evaluation order in this batch',plot_bottom=650 if len(labels)>2 else 745,
                 nodes=[dict(point=1,location='mixed')]+[dict(point=i,location=label[1]) for i,label in enumerate(labels,2)])
-            if op=='_conj_physical':view['subtitle']='历史参考可能含 CPU 回退 · 本批 '+str(len(points))+' 次正式评测'
+            if op=='_conj_physical':view['subtitle']='Historical reference may include CPU fallback | batch '+str(len(points))+' formal evaluations'
             svg=draw(dict(evaluations=[dict(p,session_id=op) for p in points],sessions=[dict(id=op,counts={})]),view)
             ledger=next(l for l in archived['ledger_files'] if l['sha256'].startswith(prefix))
             record=dict(operator=op,kind='saved_ledger_attempt_order',selected_source=ledger,points=points,view=view,
                 history=archived['historical_rounds'],gap=gap,
-                relation_note='按同一原始账本正式轮次展示；未逐编辑恢复的关系不声称直接源码继承。')
+                relation_note='Show formal rounds from one original ledger; unverified edit ancestry remains unresolved.')
         else:
             result=read(root/'operators'/op/'evidence/retained/evaluation/result.json')
-            points=[dict(id=op+':retained-evaluation',score=result['geo_mean'],method='已交付源码回归',source_sha256=archived['delivery_source_sha256'])]
-            gap='已保存交付结果；原优化轮次记录待补'
-            view=dict(id='mainline',session=op,title=op+' 记录缺口',subtitle='相对 CANN · 当前保留版测量',
+            points=[dict(id=op+':retained-evaluation',score=result['geo_mean'],method='Delivered-source regression',source_sha256=archived['delivery_source_sha256'])]
+            gap='Delivery results retained; optimization rounds incomplete'
+            view=dict(id='mainline',session=op,title=op+' record gap',subtitle='Relative to CANN | retained measurement',
                 ylim=[0,max(1.,math.ceil(result['geo_mean']*1.3*10)/10)],annotations=[],gap=gap,
-                x_label='保留版测量（不冒充优化过程）',nodes=[dict(point=1,location='mixed')])
+                x_label='Retained measurement (not optimization history)',nodes=[dict(point=1,location='mixed')])
             svg=draw(dict(evaluations=[dict(p,session_id=op) for p in points],sessions=[dict(id=op,counts={})]),view)
             record=dict(operator=op,kind='delivery_snapshot_only',points=points,view=view,history=[],gap=gap,
                 selected_source='operators/'+op+'/evidence/retained/evaluation/result.json')
@@ -129,24 +129,24 @@ def make_catalog(root, output):
         view=record['view']
         view['delivery']=record['delivery']
         view['result_only']=len(points)==1
-        if view['result_only']:view['title']=op+' 交付结果'
+        if view['result_only']:view['title']=op+' delivery result'
         elif not view.get('line_status'):
-            view['line_status']='下图：独立重生成实验' if op=='log10_' else '下图：历史优化片段'
+            view['line_status']='Below: independent regeneration' if op=='log10_' else 'Below: historical optimization segment'
         svg=draw(dict(evaluations=[dict(p,session_id=view['session']) for p in points],sessions=[dict(id=view['session'],counts={})]),view)
         directory=output/op;directory.mkdir(parents=True,exist_ok=True)
         (directory/'mainline.svg').write_text(svg,encoding='utf8')
         record.update(current_cann_score=selected['cann_score'],historical_simulator_files=len(archived['simulator_files']))
         if op=='_conj_physical':
-            record['reference_limitation']='历史参考路径可能包含CPU回退；该批巨大比值不代表相对原生CANN的加速，不能与当前CANN分数比较。'
+            record['reference_limitation']='Historical references may include CPU fallback; large ratios are separate from native-CANN speedup and current CANN scores.'
         save(directory/'trace.json',record)
         details=html.escape(json.dumps(record,ensure_ascii=False,indent=2))
-        (directory/'index.html').write_text('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><style>'+CSS+'</style><main>'
-            '<p><a href="../index.html">返回26项总览</a>　<a href="mainline.png">PNG</a>　<a href="mainline.svg">SVG</a>　<a href="trace.json">轨迹数据</a></p>'
-            +'<figure>'+svg+'</figure><details><summary>评测口径与图例说明</summary><p>'+html.escape(record['view']['subtitle'])+'</p><p>纵轴为该实验参考实现耗时÷候选耗时，沿用原始KGS统计口径。横轴只编号本图展示的已评测版本，不是全部模型调用次数。Profiling包含成对采集、宿主剖析和运行探测；代码分析表示记录中直接引用源码或实际编译IR，不能据此推断整轮未使用其他工具。颜色保留主要记录类别，不证明独立因果贡献。</p></details>'
-            +'<p><a href="../../../../'+html.escape(record['delivery']['source'])+'">当前交付源码</a> · <a href="../../../../'+html.escape(record['delivery']['result'])+'">交付评测原件</a></p>'
+        (directory/'index.html').write_text('<!doctype html><html lang="en"><meta charset="utf-8"><style>'+CSS+'</style><main>'
+            '<p><a href="../index.html">26-operator overview</a> | <a href="mainline.png">PNG</a> | <a href="mainline.svg">SVG</a> | <a href="trace.json">Trace data</a></p>'
+            +'<figure>'+svg+'</figure><details><summary>Measurement scope and legend</summary><p>'+html.escape(record['view']['subtitle'])+'</p><p>Y-axis is reference time divided by candidate time under original KGS statistics. X-axis numbers displayed evaluated versions, not all model calls. Profiling includes paired collection, host profiling, and probes; code analysis records source/IR references without excluding other tools. Colors retain primary recorded categories, not independent causal contributions.</p></details>'
+            +'<p><a href="../../../../'+html.escape(record['delivery']['source'])+'">Current delivered source</a> | <a href="../../../../'+html.escape(record['delivery']['result'])+'">Delivery artifacts</a></p>'
             +('<p class="note">'+html.escape(record['gap'])+'</p>' if record['gap'] else '')
             +('<p class="note">'+html.escape(record['reference_limitation'])+'</p>' if record.get('reference_limitation') else '')
-            +'<details><summary>选线、全部已收集历史和原始计划</summary><pre>'+details+'</pre></details></main></html>',encoding='utf8')
+            +'<details><summary>Selection, collected history, and original plans</summary><pre>'+details+'</pre></details></main></html>',encoding='utf8')
         rows.append(record)
     assert len(rows)==26
     result=dict(schema='hgkda.trace-catalog/v1',operators=rows,source=dict(path=matrix_path.relative_to(root).as_posix(),sha256=digest(matrix_path.read_bytes())),
@@ -156,26 +156,26 @@ def make_catalog(root, output):
     for r in rows:
         op=r['operator']
         cards.append('<article><h2><a href="'+op+'/index.html">'+html.escape(op)+'</a></h2><a href="'+op+'/index.html"><img loading="lazy" src="'+op+'/mainline.svg"></a><p>'
-            +('优化过程待补' if r['gap'] else '<a href="'+op+'/index.html">查看详细记录</a>')+'</p></article>')
-    (output/'index.html').write_text('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>26项算子优化轨迹</title><style>'+CSS+
-        'section{display:grid;grid-template-columns:repeat(auto-fit,minmax(540px,1fr));gap:24px}article{border:1px solid #cec7b8;padding:12px;border-radius:8px}img{width:100%}article h2{font-size:24px;overflow-wrap:anywhere}</style><main><h1>26项算子优化轨迹</h1><p>每项展示一条主要优化过程，点击查看完整记录。</p><p><a href="catalog.json">轨迹数据</a>　<a href="../operator-traces-history-20261116/index.html">更多历史轨迹</a></p><section>'+''.join(cards)+'</section></main></html>',encoding='utf8')
-    notes=['# 26项优化轨迹图册','',
-           '[打开图册](index.html) · [完整数据索引](catalog.json) · [版式及链接检查](presentation-check.json)','',
-           '22项有多个展示节点，4项以交付结果卡展示。hardswish_out已从回归／修复目录恢复同合同两点；log2_保留早期单点在数据中，图面展示当前交付结果。','',
-           '每图选择同一原始账本的一条主要尝试线；log10使用已恢复的连续主线。账本尝试顺序不等于逐次源码直接继承。不同参考、合同、起点和批次不拼接。每项HTML展开区及trace.json保存全部已收集历史与原计划；主线节点少不代表该算子总共只优化了这些轮次。','',
-           '箭头颜色表示记录中的判断依据类别，节点形状表示修改位置。来源不明保留待核验；历史归类、模型声明和工具共现不能证明独立因果。缺失轨迹及历史参考限制保留在对应页面。','',
-           '| 算子 | 主线节点 | 已收集历史记录 | 范围 |','| --- | ---: | ---: | --- |']
+            +('Optimization history incomplete' if r['gap'] else '<a href="'+op+'/index.html">Detailed records</a>')+'</p></article>')
+    (output/'index.html').write_text('<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>26-operator traces</title><style>'+CSS+
+        'section{display:grid;grid-template-columns:repeat(auto-fit,minmax(540px,1fr));gap:24px}article{border:1px solid #cec7b8;padding:12px;border-radius:8px}img{width:100%}article h2{font-size:24px;overflow-wrap:anywhere}</style><main><h1>26-operator traces</h1><p>One main sequence per operator; open complete records for details.</p><p><a href="catalog.json">Trace data</a> | <a href="../operator-traces-history-20261116/index.html">More historical traces</a></p><section>'+''.join(cards)+'</section></main></html>',encoding='utf8')
+    notes=['# 26-operator trace atlas','',
+           '[Open atlas](index.html) | [Full data](catalog.json) | [Layout/link checks](presentation-check.json)','',
+           '22 operators have multiple displayed nodes; four have delivery-result cards. hardswish_out has two same-contract repair points. log2_ retains its early single point in data while showing the delivery result.','',
+           'Each chart selects a main attempt from one ledger; log10 uses recovered ancestry. Attempt order is separate from direct source inheritance. Keep references/contracts/starts/batches distinct; HTML details and trace.json retain all collected history/plans. Display counts do not equal total optimization rounds.','',
+           'Arrow colors show recorded guidance and node shapes show changed objects. Unknown provenance remains unverified. Historical categories, model statements, and tool co-occurrence do not prove independent causality. Keep missing-history/reference scope in details.','',
+           '| Operator | Main nodes | Collected records | Scope |','| --- | ---: | ---: | --- |']
     for row in rows:
-        notes.append('| ['+row['operator']+']('+row['operator']+'/index.html) | '+str(len(row['points']))+' | '+str(len(row['history']))+' | '+(row.get('gap') or '已保留选线与历史来源')+' |')
-    notes+=['','## 重建','',
+        notes.append('| ['+row['operator']+']('+row['operator']+'/index.html) | '+str(len(row['points']))+' | '+str(len(row['history']))+' | '+(row.get('gap') or 'Selection and historical provenance retained')+' |')
+    notes+=['','## Rebuild','',
             '```powershell','python -m development.tools.traces.catalog --output development/reports/operator-traces-26-20261116 --png','```','',
-            'SVG／JSON仅需Python标准库；PNG及版式检查需要可选Playwright和Edge。图例缩小为24像素置于右上角，仅显示本图使用的类别；原始参考口径与记录数量保留在详情及JSON。Profiling合并展示成对采集、宿主剖析和运行探测，原始分类不改写。方法标注不相互重叠，曲线不用阶梯转角。','']
+            'SVG/JSON use the standard library; PNG/layout checks optionally use Playwright/Edge. Compact 24-pixel top-right legends show used categories only. Details/JSON retain reference scopes/counts. Profiling combines paired collection, host profiling, and probes without rewriting original categories. Avoid annotation overlap and step-shaped curves.','']
     (output/'README.md').write_text('\n'.join(notes),encoding='utf8')
     print(json.dumps(result['counts']))
 
 
 def export_and_check(output):
-    """导出可截图的26张PNG，检查文本边界、方法标注重叠及本地链接。"""
+    """Export 26 PNGs and check text boundaries, overlapping annotations, and local links."""
     from playwright.sync_api import sync_playwright
     checks=[]
     with sync_playwright() as p:
@@ -208,7 +208,7 @@ def export_and_check(output):
 
 def main():
     p=argparse.ArgumentParser(description=__doc__);p.add_argument('--root',type=Path,default=Path.cwd());p.add_argument('--output',type=Path,required=True)
-    p.add_argument('--png',action='store_true',help='使用可选Playwright/Edge导出并验证PNG')
+    p.add_argument('--png',action='store_true',help='Export and validate PNG with optional Playwright/Edge')
     a=p.parse_args();make_catalog(a.root.resolve(),a.output.resolve())
     if a.png:export_and_check(a.output.resolve())
 

@@ -1,4 +1,4 @@
-"""只读提取本机Triton后端启动接口及版本；不生成或执行目标算子实现。"""
+"""Read local Triton launch interfaces and versions without generating or executing target implementations."""
 import argparse
 import hashlib
 import inspect
@@ -28,7 +28,7 @@ def main():
         records.append(dict(module=module.__name__,path=str(path),sha256=hashlib.sha256(raw).hexdigest(),
              excerpts=[dict(line=i+1,text=lines[i]) for i in sorted(selected)]))
     result=dict(torch=torch.__version__,triton=triton.__version__,sources=records,
-        scope='当前运行环境的只读接口事实；不包含目标算子候选实现，ABI仍需当前候选预检')
+        scope='Read-only interface facts from the current environment; no target implementation is included, and the current candidate still needs ABI preflight')
     from triton.runtime.jit import JITFunction
     callables=[]
     for function in [JITFunction.run,JITFunction.__getitem__]:

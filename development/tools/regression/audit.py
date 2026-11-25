@@ -1,4 +1,4 @@
-"""离线核验独立回归的源码、合同、请求、逐 case 结果及两侧补测。"""
+"""Audit regression source, contracts, requests, per-case results, and both supplementary checks offline."""
 import argparse
 from collections import Counter
 import copy
@@ -20,7 +20,7 @@ def sha(path):
 
 
 def relocate_job(job, original_run, local_run, dependency_roots=None):
-    """只在内存映射归档位置，保留原始请求、合同及身份文件的字节。"""
+    """Map archive paths in memory while preserving raw request, contract, and identity bytes."""
     root = PurePosixPath(original_run)
     assert root.is_absolute() and '..' not in root.parts
     roots=[(root,local_run)]
@@ -32,10 +32,10 @@ def relocate_job(job, original_run, local_run, dependency_roots=None):
 
     def local(value):
         path = PurePosixPath(value)
-        assert path.is_absolute() and '..' not in path.parts, '原件路径不规范'
+        assert path.is_absolute() and '..' not in path.parts, 'Non-canonical artifact path'
         for prefix,target in roots:
             if path.is_relative_to(prefix):return str(target.joinpath(*path.relative_to(prefix).parts))
-        raise ValueError('未声明的归档依赖：'+value)
+        raise ValueError('Undeclared archive dependency: '+value)
 
     mapped = copy.deepcopy(job)
     for name in ['source', 'review', 'archive', 'request']:
@@ -47,7 +47,7 @@ def relocate_job(job, original_run, local_run, dependency_roots=None):
 
 
 def inspect_transfer_manifest(run):
-    """核验传输清单的全部原件，包含不直接参与分数重算的二进制与编译产物。"""
+    """Verify every transfer artifact, including binaries and compiler outputs not used in score reconstruction."""
     path = run/'transfer-manifest.json'
     if not path.exists():path=run/'pull-manifest.json'
     manifest=read(path if path.exists() else run/'export-manifest.json')
@@ -56,22 +56,22 @@ def inspect_transfer_manifest(run):
     for item in manifest:
         relative = PurePosixPath(item['path'])
         assert not relative.is_absolute() and '..' not in relative.parts
-        assert relative.as_posix() not in names, '传输清单含重复路径'
+        assert relative.as_posix() not in names, 'Duplicate paths in transfer manifest'
         names.add(relative.as_posix())
         path = run.joinpath(*relative.parts)
         assert path.resolve().is_relative_to(run.resolve())
-        assert path.stat().st_size == item['bytes'], '传输原件长度改变：'+item['path']
-        assert sha(path) == item['sha256'], '传输原件身份改变：'+item['path']
+        assert path.stat().st_size == item['bytes'], 'Transferred artifact length changed: '+item['path']
+        assert sha(path) == item['sha256'], 'Transferred artifact identity changed: '+item['path']
     return len(names)
 
 
 def inspect_formal(result, expected_cases):
-    """从完整 case 记录重算计数、计时比值和几何平均。"""
+    """Reconstruct case counts, timing ratios, and geometric mean from full records."""
     cases = result['per_workload']
-    assert Counter((case['uuid'], case['phase']) for case in cases) == Counter(expected_cases), '正式 case 缺失或多出'
+    assert Counter((case['uuid'], case['phase']) for case in cases) == Counter(expected_cases), 'Formal cases are missing or unexpected'
     assert result['num_workloads'] == len(expected_cases)
     assert result['num_passed'] == sum(case['status'] == 'PASSED' for case in cases)
-    assert result['server_backend'] == 'npu', '实际后端发生变化'
+    assert result['server_backend'] == 'npu', 'Actual backend changed'
     timing = [case for case in cases if case['phase'] == 'timing']
     positive = all(all(isinstance(case.get(key), (float,int)) and math.isfinite(case[key]) and case[key] > 0
                        for key in ['speedup','latency_ms','reference_latency_ms']) for case in timing)
@@ -79,7 +79,7 @@ def inspect_formal(result, expected_cases):
         for case in timing:
             assert math.isclose(case['speedup'],case['reference_latency_ms']/case['latency_ms'],rel_tol=1e-9)
         geo_mean = math.exp(sum(math.log(case['speedup']) for case in timing)/len(timing))
-        assert math.isclose(result['geo_mean'],geo_mean,rel_tol=1e-9), '几何平均无法由逐 case 重建'
+        assert math.isclose(result['geo_mean'],geo_mean,rel_tol=1e-9), 'Cannot reconstruct geometric mean from per-case records'
     else:
         geo_mean = None
     full = (result['status'] == 'PASSED' and result['num_passed'] == result['num_workloads']
@@ -89,18 +89,18 @@ def inspect_formal(result, expected_cases):
 
 
 def inspect_job(job, run):
-    """证据完整性与验收结论分开：性能未过线不是证据损坏。"""
+    """Separate evidence integrity from acceptance: a below-threshold score is not corrupted evidence."""
     root = run/'operators'/job['operator']
-    assert sha(job['source']) == job['source_sha256'], '候选字节身份改变'
+    assert sha(job['source']) == job['source_sha256'], 'Candidate byte identity changed'
     source = Path(job['source']).read_bytes().decode('utf8')
     review = read(job['review'])
     admit(source, review)
     gate = read(root/'gate.json')['result']
     assert gate['source_sha256'] == job['source_sha256'] and gate['admission'] == 'review_bound'
-    assert 'sha256:'+sha(job['archive']) == job['bundle_id'], '合同包身份改变'
+    assert 'sha256:'+sha(job['archive']) == job['bundle_id'], 'Contract archive identity changed'
     request = read(job['request'])
     submitted = read(root/'evaluation/request.json')
-    assert submitted == request, '正式请求不等于准备计划'
+    assert submitted == request, 'Formal request differs from preparation plan'
     assert submitted['implementation']['sources'][0]['content'] == source
     assert submitted['binding']['bundle_id'] == job['bundle_id']
     assert submitted['settings'] == job['settings']
@@ -110,14 +110,14 @@ def inspect_job(job, run):
     checks = {}
     expected_cases = []
     for kind, spec in job['checks'].items():
-        assert sha(spec['checker']) == spec['checker_sha256'], '检查器身份改变'
+        assert sha(spec['checker']) == spec['checker_sha256'], 'Checker identity changed'
         for name, digest in spec['contract_sha256'].items():
-            assert sha(Path(spec['leaf'])/name) == digest, '合同文件身份改变：'+name
+            assert sha(Path(spec['leaf'])/name) == digest, 'Contract file identity changed: '+name
         value = read(root/(kind+'.json'))
         assert value['source_sha256'] == job['source_sha256']
         assert value['checker_source']['sha256'] == spec['checker_sha256']
-        assert value['total'] == spec['previous_total'], '固定补测数量发生变化'
-        assert len(value['cases']) == value['total'], '补测逐项记录不齐全'
+        assert value['total'] == spec['previous_total'], 'Fixed supplementary-check count changed'
+        assert len(value['cases']) == value['total'], 'Supplementary per-case records are incomplete'
         assert sum(bool(case['passed']) for case in value['cases']) == value['passed']
         checks[kind] = dict(status=supplement_status(job['operator'], value, job['source_sha256']),
                             passed=value['passed'], total=value['total'])
@@ -140,9 +140,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run-directory',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
-    parser.add_argument('--original-run-directory',help='异机归档中的原始Linux运行目录；只在内存映射路径')
-    parser.add_argument('--verify-transfer',action='store_true',help='同时核验transfer/pull-manifest.json中的全部原件')
-    parser.add_argument('--dependency-map',type=Path,help='显式原始Linux依赖根到本机归档根的JSON映射；不修改原件')
+    parser.add_argument('--original-run-directory',help='Original Linux run directory in a cross-host archive; map paths in memory only')
+    parser.add_argument('--verify-transfer',action='store_true',help='Also verify all artifacts in transfer/pull-manifest.json')
+    parser.add_argument('--dependency-map',type=Path,help='Explicit JSON mapping from original Linux dependency roots to local archive roots; preserve originals')
     args = parser.parse_args()
     if args.output.exists():
         raise FileExistsError(args.output)
@@ -152,14 +152,14 @@ def main():
     transfer_files = inspect_transfer_manifest(run) if args.verify_transfer else None
     dependencies={key:(args.dependency_map.parent/value).resolve() for key,value in read(args.dependency_map).items()} if args.dependency_map else None
     assert not plan['errors'] and len(plan['jobs']) == plan['expected']
-    assert state['status'] == 'completed', '队列仍在运行，不能生成最终核验'
+    assert state['status'] == 'completed', 'Queue is still running; final verification cannot be generated'
     rows = []
     errors = []
     for job in plan['jobs']:
         try:
             mapped = relocate_job(job,args.original_run_directory,run,dependencies) if args.original_run_directory else job
             row = inspect_job(mapped,run)
-            assert state['operators'][job['operator']]['accepted'] == row['accepted'], '控制器验收与原件重算不一致'
+            assert state['operators'][job['operator']]['accepted'] == row['accepted'], 'Controller acceptance differs from raw-artifact reconstruction'
             rows.append(row)
         except Exception as error:
             errors.append(dict(operator=job['operator'],error=type(error).__name__+': '+str(error)))
@@ -167,7 +167,7 @@ def main():
                  evidence_verified=not errors,expected=plan['expected'],verified=len(rows),
                  accepted=sum(row['accepted'] for row in rows),rows=rows,errors=errors,
                  transfer_files_verified=transfer_files,
-                 scope='离线核验本次真实新入口回归；不提交设备任务，不替代运行时后端审查')
+                 scope='Offline audit of an actual fresh-entry regression; no device submission or substitute for runtime backend review')
     args.output.write_text(json.dumps(value,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
     print(json.dumps({key:value[key] for key in ['evidence_verified','expected','verified','accepted','errors']}))
     return bool(errors)

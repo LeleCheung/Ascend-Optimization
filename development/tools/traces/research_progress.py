@@ -36,7 +36,7 @@ def milestones(data):
             labels[str(index)] = data.get('baseline_axis_label', 'FlagGems')
         else:
             progress_round += 1
-            labels[str(index)] = '第' + str(progress_round) + '轮'
+            labels[str(index)] = 'Round ' + str(progress_round) + ''
     return dict(policy='measured best progress; remeasurements hidden; full events preserved',
         displayed_indices=selected, detail_indices=hidden, axis_labels=labels)
 
@@ -66,19 +66,19 @@ def render(data):
         out.append(f'<marker id="tip-{cat}" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0 0L6 3L0 6Z" fill="{color}"/></marker>')
     out += ['</defs><g font-family="Microsoft YaHei,Noto Sans CJK SC,sans-serif">',
             text(52, 62, data['operator'], min(42,(width-650)/(len(data['operator'])*.58))),
-            text(52, 112, ('固定shape ' if data.get('metric') == 'fixed_case_cann_speedup' else '全用例几何平均 ')+f'{max(valid):.3f}× CANN', 30, GREEN)]
-    for k, (cat, label) in enumerate([('paired','Profiling'),('knowledge','知识／经验'),('ir','源码／编译分析'),('sim','模拟器')]):
+            text(52, 112, ('Fixed shape ' if data.get('metric') == 'fixed_case_cann_speedup' else 'All-case geometric mean ')+f'{max(valid):.3f}× CANN', 30, GREEN)]
+    for k, (cat, label) in enumerate([('paired','Profiling'),('knowledge','Knowledge / experience'),('ir','Source / compiler analysis'),('sim','Simulator')]):
         x, yy = width - 520 + k % 2 * 255, 55 + k // 2 * 40
         out += [f'<path d="M{x} {yy}h23" stroke="{COLORS[cat]}" stroke-width="3"/>', text(x+32, yy+8, label, 23, COLORS[cat])]
-    for k,(location,label) in enumerate([('device','设备kernel'),('host','宿主侧'),
-                                       ('mixed','两者都有'),('ir','IR层'),('baseline','起点')]):
+    for k,(location,label) in enumerate([('device','Device kernel'),('host','Host'),
+                                       ('mixed','Mixed'),('ir','IR'),('baseline','Start')]):
         x=width-640+k%3*205; yy=145+k//3*40
         mark=(f'<circle cx="{x+10}" cy="{yy}" r="8" fill="#92908a"/>'
               if location=='baseline' else node_shape(x+10,yy,location,8))
         out += [mark,text(x+32,yy+8,label,23)]
     if data.get('optimization_loop'):
         out.append(text(52,225,data['optimization_loop'],24,COLORS['sim']))
-    out.append(text(52,320,'加速比'+('（对数刻度）' if logarithmic else ''),27))
+    out.append(text(52,320,'Speedup'+('(log scale)' if logarithmic else ''),27))
     if data.get('compact') and data.get('shape'):
         out.append(text(52,260,data['shape']+' · '+data.get('case',''),25))
     for tick in ticks:
@@ -88,7 +88,7 @@ def render(data):
     for i, event in enumerate(events[1:], 1):
         score = event['score']
         if best is None:
-            out.append(f'<path class="source-lineage" d="M{xs[i-1]} 785L{xs[i]} {y(score)}" fill="none" stroke="{GREEN}" stroke-width="3.5"><title>源码演进连线；失败起点无性能数值</title></path>')
+            out.append(f'<path class="source-lineage" d="M{xs[i-1]} 785L{xs[i]} {y(score)}" fill="none" stroke="{GREEN}" stroke-width="3.5"><title>Source evolution; failed start has no performance value</title></path>')
             best=score
             continue
         out.append(f'<path class="retained-best" d="M{xs[i-1]} {y(best)}L{xs[i]} {y(max(best,score))}" fill="none" stroke="{GREEN}" stroke-width="3.5"/>')
@@ -99,7 +99,7 @@ def render(data):
     for i, event in enumerate(events):
         x, yy = xs[i], y(event['score']) if event['score'] is not None else 785
         if event['score'] is None:
-            out += [f'<path d="M{x-9} {yy-9}L{x+9} {yy+9}M{x-9} {yy+9}L{x+9} {yy-9}" stroke="#b84c42" stroke-width="4"/>',text(x,yy-25,'未通过',27,anchor='middle'),text(x,label_y,data.get('baseline_axis_label', 'FlagGems'),25,anchor='middle')]
+            out += [f'<path d="M{x-9} {yy-9}L{x+9} {yy+9}M{x-9} {yy+9}L{x+9} {yy-9}" stroke="#b84c42" stroke-width="4"/>',text(x,yy-25,'Failed',27,anchor='middle'),text(x,label_y,data.get('baseline_axis_label', 'FlagGems'),25,anchor='middle')]
             continue
         out += ['<g><title>'+html.escape(json.dumps(event,ensure_ascii=False))+'</title>',
                 (f'<circle cx="{x}" cy="{yy}" r="9" fill="#92908a" stroke="{BG}" stroke-width="2"/>' if i==0 else node_shape(x,yy,event.get('location','device'),9)),
@@ -138,25 +138,25 @@ def write_report(data, output):
     chart=render(data);(a.output/'mainline.svg').write_text(chart,encoding='utf8')
     (a.output/'mainline-presentation.json').write_text(json.dumps(data,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
     css='body{margin:24px;background:#fff7e8;color:#1b2434;font:20px/1.6 "Microsoft YaHei",sans-serif}svg{width:100%;height:auto;display:block}a{color:#276980;text-decoration:none;padding:8px 14px;background:#eee7d9;border-radius:8px}details{margin-top:18px}table{border-collapse:collapse;width:100%;font-size:17px}td,th{padding:9px;border-bottom:1px solid #ded7c9;text-align:left}code{overflow-wrap:anywhere}'
-    detail=['<details><summary>轮次映射与原始记录</summary><p>'+html.escape(data['scope'])+'</p>'
-        '<p>图中轮次为最佳进展编号；原始事件与筛选映射分别保存。</p>']
+    detail=['<details><summary>Round mapping and original records</summary><p>'+html.escape(data['scope'])+'</p>'
+        '<p>Chart rounds are best-progress indices; preserve original events and selection mapping separately.</p>']
     if data.get('historical_presentation'):
-        detail.append('<p><a href="'+html.escape(data['historical_presentation'],quote=True)+'">统一复测前的全部历史成绩</a></p>')
+        detail.append('<p><a href="'+html.escape(data['historical_presentation'],quote=True)+'">All historical scores before unified reevaluation</a></p>')
     for link in data.get('history_links', []):
         detail.append('<p><a href="'+html.escape(link['href'],quote=True)+'">'+html.escape(link['label'])+'</a></p>')
-    detail.append('<table><tr><th>记录</th><th>图中加速比</th><th>候选耗时μs</th><th>源码／IR身份</th><th>结果</th></tr>')
+    detail.append('<table><tr><th>Record</th><th>Chart speedup</th><th>Candidate us</th><th>Source / IR identity</th><th>Result</th></tr>')
     for event in data['events']:
-        score=f'{event["score"]:.6f}×' if event.get('score') is not None else '无有效成绩'
+        score=f'{event["score"]:.6f}×' if event.get('score') is not None else 'No valid score'
         latency=f'{event["latency_ms"]*1000:.3f}' if event.get('latency_ms') is not None else '—'
         replay=event.get('replay',{});result=replay.get('result')
-        link='<a href="../'+html.escape(result,quote=True)+'">原始结果</a>' if result else '完整记录中保存'
+        link='<a href="../'+html.escape(result,quote=True)+'">Original result</a>' if result else 'Retained in full records'
         identity=html.escape(event.get('source_sha256',''))
         if event.get('ir_sha256'):
             identity+='</code><br>IR <code>'+html.escape(event['ir_sha256'])
         detail.append('<tr><td>'+html.escape(event['label'])+'</td><td>'+score+'</td><td>'+latency+'</td><td><code>'+
             identity+'</code></td><td>'+link+'</td></tr>')
     detail.append('</table></details>')
-    page='<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'+html.escape(data['operator'])+'</title><style>'+css+'</style><p><a href="mainline.png">PNG</a> <a href="mainline.svg">SVG</a> <a href="mainline-presentation.json">完整记录</a></p>'+chart+''.join(detail)+'</html>'
+    page='<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'+html.escape(data['operator'])+'</title><style>'+css+'</style><p><a href="mainline.png">PNG</a> <a href="mainline.svg">SVG</a> <a href="mainline-presentation.json">Full records</a></p>'+chart+''.join(detail)+'</html>'
     (a.output/'index.html').write_text(page,encoding='utf8')
     from playwright.sync_api import sync_playwright
     with sync_playwright() as pw:

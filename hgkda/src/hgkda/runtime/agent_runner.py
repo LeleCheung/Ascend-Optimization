@@ -1,7 +1,8 @@
-"""让宿主模型加载运行目录内的独立 skill；不重采集、不执行正式评测。"""
+"""Let the host model load an isolated run-local skill without recapturing data or running formal evaluation."""
 import argparse
 from datetime import datetime, timezone
 import hashlib
+from importlib.resources import files as resource_files
 import json
 import os
 from pathlib import Path
@@ -19,7 +20,7 @@ def save(path, value):
 
 
 def target_met(workspace, digest):
-    """只接受绑定当前字节、已完成正式评测及补测的终止反馈。"""
+    """Accept stop feedback only when bound to current bytes with complete formal and supplementary results."""
     from hgkda.artifacts import unwrap
     for name in ['next-performance-feedback.json', 'performance-feedback.json']:
         path=workspace/name
@@ -68,7 +69,7 @@ def main():
     (call/'input-source.py').write_bytes(active_input.read_bytes())
     diagnosis=workspace/'diagnosis.json'
     if diagnosis.exists():(call/'input-diagnosis.json').write_bytes(diagnosis.read_bytes())
-    # 旧诊断保存为原件；给每轮提供短空模板，避免模型不断编辑膨胀的历史文档。
+    # Preserve prior diagnoses; give each round a short empty template instead of an ever-growing history document.
     save(diagnosis,dict(schema_version='hgkda.diagnosis/v1',source_sha256=hashlib.sha256(active_input.read_bytes()).hexdigest(),evidence=[],hypothesis='',
                         change='',expected='',validation='',unknown=[]))
     if config.get('method_manifest'):(call/'method-manifest.json').write_bytes(Path(config['method_manifest']).read_bytes())
@@ -76,8 +77,8 @@ def main():
     call_config['trace_round_id']=args.invocation
     if config.get('method_manifest'):call_config['method_manifest']=str(call/'method-manifest.json')
     save(call/'config.json',call_config)
-    # 模型阶段固定本次方法身份；开发控制器后续切换run/config不会改变活动调用。
-    # workspace固定路径同时保持冻结阶段各次调用提示词逐字相同。
+    # Freeze method identity for this model invocation; later controller run/config switches do not change it.
+    # Stable workspace paths also keep frozen-stage invocation prompts byte-identical.
     execution_config=workspace/'agent-config.json'
     save(execution_config,call_config)
     config=call_config
@@ -86,7 +87,7 @@ def main():
     supplied_best=read(provenance_path).get('prior_best_source_provided',False) if provenance_path.exists() else False
     if config.get('context_kind')=='operator_transfer':
         from hgkda.runtime.transfer_context import build
-        # 宿主预先刷新，避免模型漏调context后误读上一方法包／源码的残留上下文。
+        # Refresh on the host first to prevent stale context if the model omits the context command.
         brief=build(config)
         save(call/'initial-context.json',brief)
         (call/'initial-knowledge.json').write_bytes((workspace/'knowledge.json').read_bytes())
@@ -102,55 +103,41 @@ def main():
          required_supplementary_each=config['job']['checks']['supplementary']['previous_total'], tool_command=tool_command,
          tool_actions=dict(context=tool_command+' context',
                            preflight=tool_command+' preflight --source '+str(workspace/'candidate.py')),
-         environment='宿主仅运行工具桥；设备依赖由桥接器在容器内调用，不在宿主venv探测Triton',
-         initial_evidence_policy='原始起点含目标设备非Triton回退时，先由模型建立合规候选，再采集其IR及成对profiling；不以缺失采集阻塞初始适配',
+         environment='Host runs only the tool bridge; device dependencies run in the container, with no Triton probing in the host virtual environment',
+         initial_evidence_policy='If the original starter has a non-Triton device fallback, the model must first build a compliant candidate, then capture IR and paired profiling; missing captures do not block initial adaptation',
          feedback_file=('next-performance-feedback.json' if (workspace/'next-performance-feedback.json').exists()
                         else 'performance-feedback.json'),
-         optimization_stop=('性能优先：不因验收阈值、默认轮数、时间或cost结束搜索；模型调用返回后宿主继续取证、评测与优化'
+         optimization_stop=('Performance first: acceptance thresholds, default rounds, time, or cost do not end search; after model return the host continues evidence collection, evaluation, and optimization'
                             if config.get('optimization_policy','performance_first')=='performance_first'
-                            else '达到用户明确指定的目标及补测后结束'),
+                            else 'Stop after the explicit user goal and supplementary checks are satisfied'),
          generation_limits=dict(max_turns=args.max_turns or None, timeout_seconds=generation_timeout),
          public_entrypoint=config.get('public_entrypoint', 'run; arguments follow contract.json'),
-         candidate_file='candidate.py',device_probe='工具桥仅预检候选实现，不执行任意测试脚本；不要提交starter.py或probe脚本',
+         candidate_file='candidate.py',device_probe='Tool bridge preflights candidate implementations only, not arbitrary test scripts; do not submit starter.py or probe scripts',
          current_best_source_read_allowed=supplied_best,phase=config.get('phase','development'),
          method_manifest_sha256=(hashlib.sha256(Path(config['method_manifest']).read_bytes()).hexdigest() if config.get('method_manifest') else None),
          experiment_goal=config.get('experiment_goal'),
          starter_provenance=read(workspace/'starter-provenance.json') if (workspace/'starter-provenance.json').exists() else None,
-         target=config.get('generation_target','固定合同下持续提高相对CANN及逐case性能；验收阈值不是默认搜索停止条件')))
-    prompt = '''加载并遵循 skills/hgkda/SKILL.md，任务见 task.json。只在当前工作目录读取和写入，不读取历史最佳源码或其他实验目录，不使用其他agent。
-宿主已按当前源码与本次固定方法刷新上下文，先读取context-brief.json、contract.json和knowledge.json，并核对源码身份。工具桥context可重新整理证据；用法已在task.json完整给出，不浏览工具实现、help或workspace外的方法清单，这些由宿主校验。已有候选时直接围绕失败反馈修改，不重复探索环境。按task.json中的算子和合同，从starter.py或当前candidate.py生成并优化candidate.py，公共入口run(A)，其余辅助函数单下划线命名。
-所有设备计算、布局处理和回退严格Triton，CANN仅为参考。原始starter可能含非Triton后端，必须由你自行改写，不得保留。Codex不直接修补候选，你负责全部候选实现及编译/语义修复。
-依据已落盘workflow与知识，输出diagnosis.json：证据、机制假设、修改、预期、验证与未知项。缺失采集保留未知，不虚构IR或性能。
-本任务首先验证历史方法能否迁移。对知识中已有成功结构，先核对当前候选是否真正落实了适用规模、载荷大小、循环特化和启动路径；存在明显缺项时优先补齐并验证。不同几何配置的失败不能否定尚未实现的历史方法，也不能仅凭不同dtype耗时相近就断言通用数学已标量化。已有编译或语义失败时先完成最小修复，不同时引入新优化机制。
-diagnosis.json已重置为本轮短空模板，旧诊断由宿主保存，不要尝试恢复或逐项修订历史长文档。只填本轮必要字段与证据摘要，控制在约2000个汉字内；不复制完整历史或整段IR。源码注释说明当前实现即可，不持续追加已被取代的长篇实验叙述。优先小范围Edit，单次修改保持必要范围。优先完成候选和短诊断并立即调用预检，避免在文档修订上耗尽轮次。读取IR先根据kernel符号、循环、拷贝及缓冲分配定位必要片段，不连续读取整份大文件。Bash权限拒绝后不换解释器重复尝试；不探测宿主numpy等环境，设备测试只走工具桥。
-已有正确候选时，本次只实现一个可独立验证的性能机制，不同时重写所有布局与启动路径。优先用Edit落盘小改动，再完善同一机制并交接预检；下一次根据完整性能反馈选择后续机制。
-运行时接口的可读摘录路径见context-brief.json的runtime_api.path；优先读取摘录与当前反馈，已有验证且本次未改变的ABI不反复扫描。先落盘最小必要修订，避免把全部轮次消耗在重复读取和诊断说明上。
-只编写candidate.py和diagnosis.json，使用Edit工具修改这两个已有文件；本宿主没有Write工具，不要调用它。初始candidate.py仅是固定FlagGems起点的原字节副本，入口及实现仍由你改写；后续调用则继续当前生成候选。不要使用Bash的heredoc、cat、printf等写文件命令。长实现拆为多次小修改，每次处理一个机制，避免单次重写超过模型输出上限；已有正确布局路径时优先保留它。candidate.py只包含算子实现，不混入输入构造、PyTorch对照、测试或探测脚本。不要预检starter.py，不编写或预检probe脚本；设备环境由工具桥管理，不能自行探测宿主venv或容器。
-完成后调用工具桥preflight --source <当前目录candidate.py>，在Bash工具的timeout参数设置600000，不在命令前加timeout包装器。若返回awaiting_source_review，保持当前候选不变并结束本次调用，等待外部只读审查；不要为绕过审查另写源码或反复提交。按失败信息修改新源码，不重复同源码测试。达到task.json的预检要求后返回，供宿主正式KGS评测；这只是模型调用边界，不是优化结束。新写的注释与诊断使用专业中文。
-若已有performance-feedback.json或next-performance-feedback.json，优先检查其源码身份与逐case损失，性能未达标继续修改。不得声称预检通过即达到性能目标。正式结果由宿主反馈，不能自行提交或捏造。
-若绑定当前源码的正式结果已达任务阈值且全部所需补测通过，保留candidate.py原字节，仅在diagnosis.json记录结论并结束；不为追求更高分无条件再改源码。
-工具桥命令：'''+tool_command
+         target=config.get('generation_target','Continuously improve relative-to-CANN and per-case performance under the fixed contract; acceptance is not the default search stop condition')))
+    prompt = resource_files('hgkda').joinpath('data/prompts/agent.md').read_text(encoding='utf-8')+tool_command
     if args.prompt_file:
-        prompt = args.prompt_file.read_text(encoding='utf8')+'\n工具桥命令：'+tool_command
+        prompt = args.prompt_file.read_text(encoding='utf8')+'\nTool bridge commands:'+tool_command
     if config.get('experiment_goal'):
-        prompt=prompt.replace('若绑定当前源码的正式结果已达任务阈值且全部所需补测通过，保留candidate.py原字节，仅在diagnosis.json记录结论并结束；不为追求更高分无条件再改源码。',
-            '本轮是task.json中experiment_goal明确指定的针对性方法实验：已有达标状态不替代一次新修改及预测验证。只改变该问题对应的一个机制，保留其他已验证路径；完成后交接只读审查和正式评测。')
-        prompt=prompt.replace('初始candidate.py仅是固定FlagGems起点的原字节副本，入口及实现仍由你改写；后续调用则继续当前生成候选。',
-            '本轮起点来源见task.json的starter_provenance；已有正确候选时从其原字节继续小范围修改，不冒充从上游重新生成。')
+        prompt=prompt.replace('If formal results bound to current source meet the task threshold and all required supplementary checks pass, preserve candidate.py bytes, record the conclusion in diagnosis.json, and stop; do not change source unconditionally for a higher score.',
+            'This round is the targeted method experiment specified by experiment_goal in task.json: prior acceptance does not replace a new change and prediction check. Change only its mechanism, retain other validated paths, then hand off for read-only review and formal evaluation.')
+        prompt=prompt.replace('Initially candidate.py is an exact copy of the fixed FlagGems starter; you must rewrite its entry point and implementation. Later invocations continue the generated candidate.',
+            'See starter_provenance in task.json for the starting source; when a correct candidate exists, continue from its exact bytes with small changes rather than claiming fresh upstream generation.')
     if supplied_best:
-        prompt=prompt.replace('不读取历史最佳源码或其他实验目录','只读取本工作区明确提供的交付源码和证据，不读取其他实验目录')
-        prompt=prompt.replace('初始candidate.py仅是固定FlagGems起点的原字节副本，入口及实现仍由你改写；后续调用则继续当前生成候选。',
-                              '初始candidate.py来自明确提供的既有交付版本；保留来源，不将修改表述为从上游从零生成。')
-    prompt=prompt.replace('公共入口run(A)，','公共入口及参数遵循contract.json，')
+        prompt=prompt.replace('do not read historical best source or other experiment directories','Read only delivery source and evidence explicitly provided in this workspace; do not read other experiment directories')
+        prompt=prompt.replace('Initially candidate.py is an exact copy of the fixed FlagGems starter; you must rewrite its entry point and implementation. Later invocations continue the generated candidate.',
+                              'Initial candidate.py comes from an explicitly supplied delivery version; preserve provenance and do not describe edits as generation from upstream from scratch.')
+    prompt=prompt.replace('public entry point run(A),','follow contract.json for the public entry point and arguments,')
     if config.get('optimization_policy','performance_first')=='performance_first':
-        prompt=prompt.replace('若绑定当前源码的正式结果已达任务阈值且全部所需补测通过，保留candidate.py原字节，仅在diagnosis.json记录结论并结束；不为追求更高分无条件再改源码。',
-            '验收达标只是保留候选的条件，不是搜索终点。继续依据逐case损失、编译结果和硬件证据寻找更高性能，保留已验证最佳，失败或短期停滞时换假设、方法或修改层次。')
-        prompt+='\n性能优先策略：不因默认轮数、耗时、cost或已达验收线停止优化。每次交接审查与完整评测只是阶段边界；宿主应根据真实反馈继续调用。保留每个候选的源码与证据，不为减少调用次数省略验证。\n'
-    prompt += '''\n开始一个具体修改前，先把当前源码SHA、引用证据、假设、改法、预期变化及验证方式写入diagnosis.json，
-再调用工具桥decision --record diagnosis.json，保存修改前决策。证据项包含path、category、role、finding；
-category取paired_profiling/simulator/source_ir/roofline/knowledge/evaluation/probe/other，role取trigger/disambiguation/mechanism/background。
-没有使用模拟器就不填模拟器；读过多个工具不自动声明因果贡献。编译失败、退步及保持源码不变也保留记录。
-每个机制可对应多次小编辑，不要求每次文本替换都重新写长分析；正式结果后更新诊断中的观测与未决问题。\n'''
+        prompt=prompt.replace('If formal results bound to current source meet the task threshold and all required supplementary checks pass, preserve candidate.py bytes, record the conclusion in diagnosis.json, and stop; do not change source unconditionally for a higher score.',
+            'Acceptance qualifies a candidate for retention but does not end search. Continue using per-case losses, compiled output, and hardware evidence; preserve the validated best and change hypotheses, methods, or modification levels after failures or temporary stagnation.')
+        prompt+='\nPerformance-first policy: do not stop for default rounds, elapsed time, cost, or prior acceptance. Each review/full-evaluation handoff is a stage boundary; the host continues from real feedback. Preserve source and evidence for every candidate and never skip validation to save calls.\n'
+    prompt += """
+Before each concrete change, record current source SHA, referenced evidence, hypothesis, proposed edit, expected effects, and validation in diagnosis.json. Then run tool-bridge decision --record diagnosis.json to persist the pre-change decision. Evidence items contain path, category, role, and finding. category is paired_profiling/simulator/source_ir/roofline/knowledge/evaluation/probe/other; role is trigger/disambiguation/mechanism/background. Do not claim simulator use when it was absent; reading multiple tools does not establish causality. Preserve compile failures, regressions, and unchanged-source outcomes. One mechanism can span several small edits without lengthy analysis per replacement; update observations and unresolved questions after formal results.
+"""
     (workspace/'prompt.md').write_text(prompt, encoding='utf8')
     (call/'prompt.md').write_text(prompt, encoding='utf8')
     configuration = read(args.model_settings)
@@ -159,13 +146,13 @@ category取paired_profiling/simulator/source_ir/roofline/knowledge/evaluation/pr
     environment = dict(os.environ)
 
     environment.update({key: str(value) for key, value in configuration.get('env', {}).items()})
-    # 仅修正本次子进程继承的1%压缩阈值，不改宿主全局设置。
+    # Adjust only the inherited 1% compaction threshold for this subprocess, leaving host-global settings untouched.
     environment['CLAUDE_AUTOCOMPACT_PCT_OVERRIDE'] = '80'
     environment['CLAUDE_CODE_MAX_OUTPUT_TOKENS'] = str(output_tokens)
     environment['MAX_THINKING_TOKENS'] = str(thinking_tokens)
     if 'ANTHROPIC_API_KEY' not in environment and environment.get('ANTHROPIC_AUTH_TOKEN'):
         environment['ANTHROPIC_API_KEY'] = environment['ANTHROPIC_AUTH_TOKEN']
-    # 显式settings优先于用户settings.env；避免启动时再次恢复旧的1%值。
+    # Explicit settings override user settings.env so launch cannot restore the old 1% value.
     save(call/'runtime-settings.json', dict(env={
          'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE': '80', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS': str(output_tokens),
          'MAX_THINKING_TOKENS': str(thinking_tokens)}))

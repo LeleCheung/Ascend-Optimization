@@ -1,4 +1,4 @@
-"""持久记录运行事件和修改前决策；不执行候选或推断工具因果贡献。"""
+"""Persist run events and pre-change decisions without executing candidates or inferring causal tool contributions."""
 import argparse
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -66,13 +66,13 @@ def emit(config, kind, **fields):
     event = dict(schema='hgkda.trace-event/v1', id=event_id, recorded_at=now(), kind=kind,
                  operator=config.get('operator', config.get('job', {}).get('operator')),
                  round_id=config.get('trace_round_id'), parent_round_id=config.get('trace_parent_round_id'), **fields)
-    # 每个事件独立创建，不共享追加文件；模型预检与宿主并行不会截断彼此记录。
+    # Create events independently instead of sharing an append file, preventing parallel model/host truncation.
     immutable(run / 'trace/events' / (event_id + '.json'), event)
     return event
 
 
 def record_decision(config, document):
-    """在修改前绑定当前源码及明确引用的证据，归因仍为作者声明。"""
+    """Bind current source and explicit evidence before editing; attribution remains an author claim."""
     run = Path(config['run_directory'])
     source = source_snapshot(config)
     assert source and document.get('source_sha256') == source['sha256'], 'decision source is not current source'
@@ -90,7 +90,7 @@ def record_decision(config, document):
             assert entry['sha256'] == ref['sha256'], 'evidence file changed'
         if entry.get('source_sha256'):
             assert entry['role'] == 'background' or entry['source_sha256'] == source['sha256'], 'stale evidence source'
-        # 有结构化绑定时核对文件本身，不能只相信模型填写的源码身份。
+        # Verify actual files for structured bindings instead of trusting model-supplied source identity.
         bound = None
         if path.suffix == '.json':
             payload = read(path)
@@ -114,7 +114,7 @@ def record_decision(config, document):
                     assert not bound or bound == source['sha256'], ('evidence artifact belongs to another source; '
                         'historical comparisons must use role=background with their actual source_sha256, '
                         'not trigger/mechanism evidence for the current candidate')
-        # 上下文、知识和候选路径后续可能覆盖；决策必须引用当时的实际字节。
+        # Context, knowledge, and candidate paths may be overwritten later; decisions must reference the bytes used then.
         raw=path.read_bytes()
         assert hashlib.sha256(raw).hexdigest()==ref['sha256'],'evidence changed while recording'
         frozen=run/'trace/evidence'/(ref['sha256']+path.suffix)
@@ -151,7 +151,7 @@ def artifacts(config, source, round_id, extra_paths=()):
     for item in extra_paths:
         path = Path(item)
         paths += list(path.glob('*.json')) if path.is_dir() else [path]
-    # workspace是可变文件：每次事件保存一份字节快照，而不是引用会变化的路径。
+    # workspace is mutable: snapshot bytes for each event instead of referencing a changing path.
     refs = []
     for path in dict.fromkeys(paths):
         if not path.is_file():
@@ -162,7 +162,7 @@ def artifacts(config, source, round_id, extra_paths=()):
             immutable_bytes(copy, raw, allow_existing=True)
             refs.append(dict(original=path.relative_to(run).as_posix(), **reference(copy, run)))
         elif path.name=='agent-events.jsonl':
-            # 嵌套工具返回时宿主模型仍在向日志追加；保存前缀长度与前缀SHA。
+            # The host model may still append logs when nested tools return; save prefix length and prefix SHA.
             raw=path.read_bytes()
             refs.append(dict(path=path.relative_to(run).as_posix(),sha256=hashlib.sha256(raw).hexdigest(),
                              prefix_bytes=len(raw),scope='append-only model stream prefix'))
@@ -207,7 +207,7 @@ def action_trace(config, action, round_id=None, extra_paths=()):
 
 
 def traced_main(function, action, argv=None):
-    """现有命令的薄封装；设备动作、退出异常和候选字节保持原有行为。"""
+    """Thin wrapper preserving device actions, abnormal exits, and candidate bytes of existing commands."""
     argv = list(sys.argv[1:] if argv is None else argv)
     def option(flag):
         for index, token in enumerate(argv):

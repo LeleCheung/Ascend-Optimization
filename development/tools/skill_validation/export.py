@@ -1,4 +1,4 @@
-"""在试验完成后筛选可复现原件、核对凭据未混入，并压缩导出；不复制缓存。"""
+"""Export reproducible originals after completion, checking for credentials and excluding caches."""
 import argparse
 import hashlib
 import json
@@ -15,7 +15,7 @@ def main():
     parser.add_argument('--run-directory', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--credential-settings', type=Path, required=True,
-                        help='只在内存比对凭据，不输出或归档设置文件')
+                        help='Compare credentials in memory only; do not output or archive settings files')
     args = parser.parse_args()
     run = args.run_directory.resolve()
     assert not args.output.exists()
@@ -32,10 +32,10 @@ def main():
     records = []
     for path in sorted(files):
         raw = path.read_bytes()
-        assert not any(secret in raw for secret in secrets), '原件包含凭据，停止导出；未输出凭据内容'
+        assert not any(secret in raw for secret in secrets), 'Artifact contains credentials; export stopped without disclosing their contents'
         records.append(dict(path=path.relative_to(run).as_posix(), bytes=len(raw),
                             sha256=hashlib.sha256(raw).hexdigest()))
-    # 参考profile链接由导出程序保存为相对链接，解压后仍在本次原件内。
+    # Export preserves reference-profile links as relative paths within the extracted evidence.
     manifest = dict(files=records, file_count=len(records), total_bytes=sum(r['bytes'] for r in records),
                     credential_scan='passed_exact_values_not_recorded',
                     source_run=str(run), excluded=sorted(EXCLUDE),

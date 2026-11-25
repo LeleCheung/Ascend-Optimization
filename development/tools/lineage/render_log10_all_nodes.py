@@ -10,7 +10,7 @@ BASE = ROOT / "development/reports/operator-traces-history-20261116"
 WIDTH, HEIGHT = 3200, 2000
 INK, GREEN = "#1b2434", "#168358"
 COLORS = {"P": "#2368b1", "S": "#c55a18", "I": "#7852a6", "E": "#168358", "?": "#455269"}
-LABELS = {"P": "成对profiling", "S": "模拟器＋IR", "I": "源码／IR", "E": "专项探测", "?": "来源待核验"}
+LABELS = {"P": 'Paired profiling', "S": 'Simulator + IR', "I": 'Source / IR', "E": 'Targeted probe', "?": 'Source unverified'}
 
 
 def text(x, y, value, size=30, weight=700, anchor="start", color=INK, extra=""):
@@ -43,20 +43,20 @@ def main():
     assert len(points) == 28 and all(p["score"] is not None for p in points)
     # Replace coarse keyword summaries with the actual recorded changes.
     overrides = {
-        2: "直接启动＋扩大分块",
-        4: "预绑定启动，精简调用",
-        6: "按地址缓存启动参数",
-        7: "每program处理多块",
-        9: "扩大载荷＋双块预读",
-        12: "加入启动缓存（未命中）",
+        2: 'Direct launch + larger tiles',
+        4: 'Prebind launch and simplify calls',
+        6: 'Cache launch arguments by address',
+        7: 'Multiple tiles per program',
+        9: 'Larger payload + double prefetch',
+        12: 'Add launch cache (miss)',
     }
     for p in points:
         p["action"] = overrides.get(p["global_index"], p["action"])
     x0, x1, top, bottom = 135, 3060, 790, 1250
     xs = [x0+i*(x1-x0)/27 for i in range(28)]
     sy = lambda value: bottom - value/1.0*(bottom-top)
-    short_names = ["10.21 · 首批", "10.22 · 成对", "10.22 · 分块", "10.29 · 新目标",
-                   "11.10 · 独立开发", "11.10 · 冻结重生成", "11.10 · 模拟器修订"]
+    short_names = ['10.21 first batch', '10.22 paired', '10.22 tiling', '10.29 new target',
+                   '11.10 independent development', '11.10 frozen regeneration', '11.10 simulator revision']
     fills = ["#e7edf5", "#e3eff8", "#e3f0df", "#eee6f5", "#e3eff8", "#e3f0df", "#fbe8d6"]
     defs = ['<defs>']
     for key, color in COLORS.items():
@@ -64,13 +64,13 @@ def main():
         defs.append(f'<marker id="arrow-{safe_key}" markerWidth="12" markerHeight="10" refX="11" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L12 5 L0 10 Z" fill="{color}"/></marker>')
     defs.append('</defs>')
     parts = ['<svg xmlns="http://www.w3.org/2000/svg" width="3200" height="2000" viewBox="0 0 3200 2000" role="img" aria-labelledby="title description">',
-             '<title id="title">log10_：全部28条评测，方法与evidence箭头</title>',
-             '<desc id="description">七个批次的28条真实正式评测在同一图面展示，21次后续修改用箭头标明方法和证据来源类别；不同批次之间断开连线。</desc>',
+             '<title id="title">log10_: all 28 evaluations with method/evidence arrows</title>',
+             '<desc id="description">All 28 formal evaluations from seven batches; 21 change arrows show methods and evidence categories. Separate batches are disconnected.</desc>',
              ''.join(defs), '<rect width="3200" height="2000" fill="#fff7e8"/>',
              '<g font-family="Microsoft YaHei, Noto Sans CJK SC, Arial, sans-serif">',
              text(70, 65, "SEARCH TRAJECTORIES", 30, 800),
-             text(70, 145, "log10_：28条评测全部展示", 58, 800),
-             text(70, 198, "箭头：优化方法 ＋ evidence来源类别", 34)]
+             text(70, 145, 'log10_: all 28 evaluations', 58, 800),
+             text(70, 198, 'Arrows: method + evidence category', 34)]
     for i, key in enumerate(["P", "S", "I", "E", "?"]):
         x = 1430 + i*340
         label = f"{key} {LABELS[key]}"
@@ -85,7 +85,7 @@ def main():
         parts.append(f'<rect x="{left:.2f}" y="740" width="{right-left:.2f}" height="530" fill="{fills[bi]}"/>')
         headings.append(f'<rect x="{left:.2f}" y="685" width="{right-left:.2f}" height="45" fill="#fff7e8"/>')
         headings.append(text((left+right)/2, 716, short_names[bi], 28, 800, "middle"))
-        reference = "CANN" if batch["reference"] == "CANN" else "本批KGS参考"
+        reference = "CANN" if batch["reference"] == "CANN" else 'Batch KGS reference'
         headings.append(f'<rect x="{left+4:.2f}" y="740" width="{right-left-8:.2f}" height="35" fill="{fills[bi]}"/>')
         headings.append(text((left+right)/2, 766, reference, 25, 700, "middle"))
         if start:
@@ -143,32 +143,32 @@ def main():
         parts.append(text(xx, yy+38 if i%2 else yy-24, f"{p['score']:.3f}", 28, 800, "middle"))
         parts.append(text(xx, 1308, f"{i+1:02}", 29, 800, "middle"))
         if p["local_index"] == 0:
-            parts.append(text(xx, 1340, "起点", 23, 700, "middle"))
+            parts.append(text(xx, 1340, 'Start', 23, 700, "middle"))
         previous = (xx,yy)
     parts.extend(headings)
     parts.extend(annotation_labels)
-    parts += [text(70, 1960, "横轴：已收集评测编号01—28；批次间不连线，分别使用各自参考。", 30), '</g></svg>']
+    parts += [text(70, 1960, 'X-axis: collected evaluations 01-28; disconnected batches use their own references.', 30), '</g></svg>']
     svg = BASE / "log10-all-28.svg"
     svg.write_text("\n".join(parts), encoding="utf-8")
     (BASE / "log10-all-28.json").write_text(json.dumps(dict(points=points, annotations=annotation_records,
                                                           point_count=28, arrow_count=len(annotation_records)),
                                                      ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
-    page = '''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>log10_ · 28节点优化轨迹</title><style>
+    page = """<!doctype html><html lang="en"><meta charset="utf-8"><title>log10_ · 28-node optimization trace</title><style>
 body{margin:0;background:#fff7e8;font-family:"Microsoft YaHei",sans-serif;color:#1b2434}nav{display:flex;gap:20px;align-items:center;padding:16px 28px;position:sticky;top:0;background:#fff7e8;z-index:2}button,a{font:inherit;font-size:20px}button{padding:8px 20px;background:#fffdf8;border:1px solid #9da5ad;border-radius:10px;cursor:pointer}a{color:#2368b1}main{overflow:auto}img{display:block;width:100%;max-width:none}</style>
-<nav><strong>28个节点 · 21个方法／evidence箭头</strong><button onclick="zoom(1)">适应宽度</button><button onclick="zoom(2)">放大2倍</button><a href="log10-all-28.svg" download>SVG</a><a href="log10-all-28.png" download>PNG</a></nav><main><img id="trace" src="log10-all-28.svg" alt="log10全部28次评测及方法和证据箭头"></main><script>function zoom(n){document.getElementById('trace').style.width=(100*n)+'%'}</script></html>'''
+<nav><strong>28 nodes · 21 method/evidence ／evidence arrows</strong><button onclick="zoom(1)">Fit width</button><button onclick="zoom(2)">Zoom 2x</button><a href="log10-all-28.svg" download>SVG</a><a href="log10-all-28.png" download>PNG</a></nav><main><img id="trace" src="log10-all-28.svg" alt="log10 all 28 evaluations with method/evidence arrows"></main><script>function zoom(n){document.getElementById('trace').style.width=(100*n)+'%'}</script></html>"""
     (BASE / "log10-all-28.html").write_text(page,encoding="utf-8")
     gallery=BASE / "index.html"
     if gallery.exists():
         content=gallery.read_text(encoding="utf-8")
         marker='<!-- all-log10-link -->'
         if marker not in content:
-            content=content.replace('<nav>', '<p>'+marker+'<a href="log10-all-28.html">log10_：在同一张图上查看全部28个节点及方法／evidence箭头</a></p><nav>', 1)
+            content=content.replace('<nav>', '<p>'+marker+'<a href="log10-all-28.html">log10_: all 28 nodes and method/evidence arrows in one view</a></p><nav>', 1)
             gallery.write_text(content,encoding="utf-8")
     index=BASE / "README.md"
     if index.exists():
         content=index.read_text(encoding="utf-8")
         if 'log10-all-28.html' not in content:
-            content=content.replace('\n\n', '\n\n[log10_完整28节点总图（方法与evidence箭头）](log10-all-28.html) · [PNG](log10-all-28.png) · [SVG](log10-all-28.svg)\n\n', 1)
+            content=content.replace('\n\n', '\n\n[log10_ complete 28-node view with method/evidence arrows](log10-all-28.html) | [PNG](log10-all-28.png) | [SVG](log10-all-28.svg)\n\n', 1)
             index.write_text(content,encoding="utf-8")
     print(f"Wrote {svg}: {len(points)} points, {len(annotation_records)} method/evidence arrows.")
 

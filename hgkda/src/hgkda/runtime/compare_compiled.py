@@ -1,4 +1,4 @@
-"""逐项核验实际IR是否变化，仅移除调试位置，不推断二进制或性能等价。"""
+"""Compare actual IR item by item, stripping debug locations only; do not infer binary or performance equivalence."""
 import argparse
 import hashlib
 import json
@@ -22,7 +22,7 @@ def without_locations(line):
                     elif current==')':depth-=1
                 inner_escape=(current=='\\' and not inner_escape)
                 index+=1
-            assert depth==0,'调试位置表达式未闭合'
+            assert depth==0,'Unclosed debug-location expression'
             escaped=False
             continue
         out.append(char);escaped=(char=='\\' and not escaped);index+=1
@@ -40,10 +40,10 @@ def normalized(text):
 
 def compare(left,right):
     results=[]
-    assert left['cases']==right['cases'],'捕获的case或执行路径不同，不能按位置比较'
-    assert len(left['entries'])==len(right['entries']),'实际编译产物数量不同'
+    assert left['cases']==right['cases'],'Captured cases or execution paths differ and cannot be compared positionally'
+    assert len(left['entries'])==len(right['entries']),'Actual compiled artifact counts differ'
     for index,(a,b) in enumerate(zip(left['entries'],right['entries'])):
-        assert a['symbol']==b['symbol'],'内核顺序或名称不同'
+        assert a['symbol']==b['symbol'],'Kernel order or names differ'
         for kind in ['ttir','bcmlir']:
             pair=[]
             for entry in [a,b]:
@@ -56,7 +56,7 @@ def compare(left,right):
                                 left_normalized_sha256=digests[0],right_normalized_sha256=digests[1]))
     return dict(left_source_sha256=left['source_sha256'],source_sha256=right['source_sha256'],
         all_normalized_ir_equal=bool(results) and all(row['equal'] for row in results),
-        comparisons=results,scope='按同序实际捕获比较TTIR和bcmlir，仅去除#loc定义及位置引用；不视作二进制或性能等价证明')
+        comparisons=results,scope='Compare TTIR and bcmlir from actual captures in the same order, stripping only #loc definitions/references; this does not prove binary or performance equivalence')
 
 
 def main():

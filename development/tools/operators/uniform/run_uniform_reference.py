@@ -1,4 +1,4 @@
-"""回归结束后核验 CANN 随机参考组合，并经独立 CLI 完成一次正式评测。"""
+"""Verify the composed CANN random reference after regression, then perform one full evaluation through the independent CLI."""
 import argparse
 import fcntl
 import hashlib
@@ -50,7 +50,7 @@ def main():
         while True:
             previous=read(args.regression_run/'state.json')
             if previous['status']=='requires_attention':
-                raise RuntimeError('原正式评测任务未解决，不进入下一阶段')
+                raise RuntimeError('Original formal evaluation is unresolved; do not advance')
             audit=args.regression_run/'audit-final.json'
             postflight=args.regression_run/'postflight-state.json'
             if audit.exists() and postflight.exists() and read(postflight)['status'] in ['completed','requires_attention']:
@@ -89,14 +89,14 @@ def main():
         random_checker=root/'random-checker.py'
         random_checker.write_bytes((args.archive_project/'tools/profiling/hgkda/check-endurance.py').read_bytes())
         assert sha(random_checker)==prior['random_details']['checker_sha256']
-        # 保持冻结检查器的默认依赖布局，不改写其源码；正式控制器不需要额外私有参数。
+        # Preserve the frozen checker's default dependency layout and source; the formal controller needs no extra private arguments.
         shutil.copyfile(random_checker,root.parent/'check-endurance.py')
 
         def execute(label,command):
             with (run/(label+'.log')).open('xb') as output:
                 result=subprocess.run(list(map(str,command)),cwd=args.repository,stdout=output,stderr=subprocess.STDOUT)
             if result.returncode:
-                raise RuntimeError(label+' 返回 '+str(result.returncode))
+                raise RuntimeError(label+' returned '+str(result.returncode))
 
         def device(label,command):
             environment=dict(ASCEND_RT_VISIBLE_DEVICES=str(args.device),PYTHONDONTWRITEBYTECODE='1',
@@ -128,7 +128,7 @@ def main():
             state['status']='qualifying_reference';save(state_path,state)
             if args.reuse_reference_run:
                 old=args.reuse_reference_run
-                assert not (old/'operators/uniform/evaluation').exists(), '有过正式提交时必须先查询原任务'
+                assert not (old/'operators/uniform/evaluation').exists(), 'Query the original task before proceeding after any formal submission'
                 for name in ['definition.json','oracle.py','correctness.jsonl','timing.jsonl']:
                     assert (catalog/name).read_bytes()==(old/'operators/uniform/supplementary-catalog'/name).read_bytes()
                 assert sha(checker)==sha(old/'operators/uniform/supplementary-checker.py')
@@ -139,7 +139,7 @@ def main():
                     shutil.copyfile(old/'operators/uniform'/name,root/name)
                 save(run/'qualification-reuse.json',dict(original_run=str(old),
                      reference_qualification_sha256=sha(run/'reference-qualification.json'),
-                     reason='上批仅合同上传目录不合规；未提交正式评测；二进制、源码、输入及检查器身份相同'))
+                     reason='Prior batch had only a noncompliant contract-upload directory and no formal submission; binary/source/input/checker identities are unchanged'))
             else:
                 device('qualify-reference',[checker,'--operator','uniform','--leaf',catalog,
                       '--source',built['reference'],'--uniform-checker',random_checker,
@@ -182,7 +182,7 @@ def run(self,from_=0.,to=1.,*,generator=None):
             save(root/'request.json',request)
             checks={}
             for kind,folder in [('supplementary',catalog),('cann_supplementary',cann)]:
-                # 原检查器把扩展随机检查的默认路径作为启动参数；冻结为当前批次的同字节依赖。
+                # The original checker passes an extended random-check path; pin a byte-identical dependency for this batch.
                 checks[kind]=dict(checker=str(checker),checker_sha256=sha(checker),leaf=str(folder),
                      previous_total=prior['total'],previous_passed=prior['passed'],
                      contract_sha256={name:sha(folder/name) for name in
@@ -194,7 +194,7 @@ def run(self,from_=0.,to=1.,*,generator=None):
             save(run/'plan.json',dict(schema_version='hgkda.regression/v1',repository=str(args.repository),
                  index_sha256=sha(args.repository/'development/experiments/index.json'),expected=1,jobs=[job],errors=[],compatibility_files=[],
                  reference_qualification=dict(path=str(run/'reference-qualification.json'),sha256=sha(run/'reference-qualification.json')),
-                 policy='原严格Triton候选和测试合同；新增原生Uniform+Clamp参考；所有必要适配开销计入完整调用'))
+                 policy='Original strict Triton candidate/contract with a native Uniform+Clamp reference; include all required adaptation overhead in full-call timing'))
         state['status']='formal_evaluation';save(state_path,state)
         execute('formal-controller',[sys.executable,args.repository/'tools/regression/run.py',
                '--plan',run/'plan.json','--container',args.container,'--device',args.device,'--port',args.port,

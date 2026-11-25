@@ -1,4 +1,4 @@
-"""汇总独立回归原件；不触发设备评测，不覆盖历史验收索引。"""
+"""Summarize regression artifacts without device evaluation or overwriting historical acceptance indexes."""
 import argparse
 import csv
 import hashlib
@@ -37,7 +37,7 @@ def main():
                 path = Path(record['path'])
                 if hashlib.sha256(path.read_bytes()).hexdigest() != record['sha256']:
                     integrity_errors.append(dict(operator=job['operator'], artifact=key,
-                                                 error='原件 SHA 与状态记录不一致'))
+                                                 error='Artifact SHA differs from status record'))
         result_path = run/'operators'/job['operator']/'evaluation/result.json'
         if result_path.exists():
             result = read(result_path)
@@ -64,16 +64,16 @@ def main():
                 reasons.append(current['error'])
             elif evaluation:
                 if evaluation.get('status')!='PASSED' or evaluation.get('num_passed')!=evaluation.get('num_workloads'):
-                    reasons.append('完整评测未通过')
+                    reasons.append('Full evaluation did not pass')
                 if evaluation.get('is_hack') is not False:
-                    reasons.append('完整评测审查未通过')
+                    reasons.append('Full evaluation review did not pass')
                 for key in extras:
                     if not extras[key] or extras[key]['status']!='passed':
-                        reasons.append(('PyTorch' if key=='supplementary' else 'CANN')+'语义补测未通过')
+                        reasons.append(('PyTorch' if key=='supplementary' else 'CANN')+'Semantic supplementary checks did not pass')
                 if evaluation.get('geo_mean') is not None and evaluation['geo_mean']<=.8:
-                    reasons.append('相对 CANN 未超过 0.8×')
+                    reasons.append('CANN speedup did not exceed 0.8x')
             if not reasons:
-                reasons.append('验收证据不完整')
+                reasons.append('Acceptance evidence is incomplete')
         rows.append(dict(operator=job['operator'],group=job['group'],order=job['order'],
              source_sha256=job['source_sha256'],previous_cann_score=job['previous_cann_score'],
              cann_score=evaluation.get('geo_mean'),evaluation=evaluation,
@@ -94,18 +94,18 @@ def main():
             status=state['status'],expected=plan['expected'],completed=sum(r['terminal'] for r in rows),
             accepted=sum(r['accepted'] for r in rows),rows=rows,per_case=per_case,evidence=evidence,
             integrity_errors=integrity_errors,
-            scope='单次新入口回归结果；历史列是拆分前已记录结果，不以两个加速比分数之比宣称实现提速')
+            scope='Single fresh-entry regression; historical columns retain pre-split results, without inferring candidate improvement from score ratios')
     args.output.write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
     with args.output.with_suffix('.csv').open('x', newline='', encoding='utf-8-sig') as output:
         columns = ['operator','uuid','phase','status','candidate_ms','cann_ms','speedup','abs_err','rel_err']
         writer = csv.DictWriter(output, fieldnames=columns)
         writer.writeheader()
         writer.writerows(per_case)
-    table = ['# 独立 HG-KDA 固定候选回归', '',
-             f"状态：{result['status']}；已处理 {result['completed']}/{result['expected']}；本轮达标 {result['accepted']} 项。", '',
-             '候选源码、原输入、容差和计时参数固定；本轮每项一次完整 KGS 正式评测，原补测独立执行。', '',
-             '加速比为完整调用的几何平均；CANN 参考类型含原生单接口及已审核的同语义组合，逐项保存在 JSON 的 reference_kind 字段中。', '',
-             '| 算子 | 拆分前相对 CANN | 本轮相对 CANN | 完整评测 | PyTorch 语义补测 | CANN 语义补测 | 本轮状态 |',
+    table = ['# Independent HG-KDA fixed-candidate regression', '',
+             f"Status: {result['status']}; processed {result['completed']}/{result['expected']}; accepted this run {result['accepted']} operators.", '',
+             'Candidate source, inputs, tolerances, and timing parameters are fixed; one full KGS evaluation per operator plus independent original supplementary checks.', '',
+             'Speedup is the geometric mean of full-call timings. CANN references include native interfaces and reviewed semantic compositions; reference_kind records each scope in JSON.', '',
+             '| Operator | Historical vs CANN | Current vs CANN | Full evaluation | PyTorch semantic checks | CANN semantic checks | Status |',
              '| --- | ---: | ---: | --- | --- | --- | --- |']
     def extra(record):
         return '—' if not record else str(record['passed'])+'/'+str(record['total'])+' '+record['status']
@@ -113,7 +113,7 @@ def main():
         value = row['evaluation']
         score = '—' if row['cann_score'] is None else format(row['cann_score'],'.3f')+'×'
         full = '—' if not value else str(value.get('num_passed'))+'/'+str(value.get('num_workloads'))
-        status = '达标' if row['accepted'] else '；'.join(row['acceptance_reasons']) or row['status']
+        status = 'accepted' if row['accepted'] else '；'.join(row['acceptance_reasons']) or row['status']
         previous = '—' if row['previous_cann_score'] is None else format(row['previous_cann_score'],'.3f')+'×'
         table.append('| '+ ' | '.join(['`'+row['operator']+'`',previous,
                      score,full,extra(row['supplementary']),extra(row['cann_supplementary']),
@@ -121,7 +121,7 @@ def main():
     args.output.with_suffix('.md').write_text('\n'.join(table)+'\n',encoding='utf8')
     print(json.dumps({k:result[k] for k in ['status','expected','completed','accepted']}))
     if integrity_errors:
-        raise RuntimeError('原件身份核验失败，详见 integrity_errors')
+        raise RuntimeError('Artifact identity verification failed; see integrity_errors')
 
 
 if __name__ == '__main__':

@@ -1,4 +1,4 @@
-"""核验宿主缓存的实际 Triton 编译产物、动态输入地址及冷启动和热启动语义。"""
+"""Verify cached Triton compilation artifacts, dynamic input addresses, and cold/warm launch semantics."""
 import argparse
 import hashlib
 import importlib.util
@@ -33,7 +33,7 @@ def main():
             allowed = {'aten.empty', 'aten.empty_like', 'aten.empty_strided', 'aten.alias',
                        'aten.detach', 'aten.view', 'aten.as_strided', 'aten.slice', 'aten.select'}
             if '.'.join(name.split('.')[:2]) not in allowed:
-                raise RuntimeError('候选调用了非元数据ATen入口：'+name)
+                raise RuntimeError('Candidate called a non-metadata ATen entry point: '+name)
             return function(*args, **(kwargs or {}))
     torch.set_num_threads(1)
     spec = importlib.util.spec_from_file_location('_unary_host_candidate', args.source)
@@ -70,7 +70,7 @@ def main():
             if args.include_stream_tail:
                 workloads.append((1048579, 'streaming-tail'))
             for count, layout in workloads:
-                # 每次重新分配输入；第二次调用使用新stream，避免缓存旧地址或旧stream。
+                # Allocate fresh inputs each call; use a new stream on the second call to detect cached addresses/streams.
                 for attempt in range(2):
                     stream = torch.npu.Stream()
                     with torch.npu.stream(stream):
@@ -100,7 +100,7 @@ def main():
     result = dict(status='verified', source_sha256=sha(args.source),
                   checker_sha256=sha(__file__), cases=rows, entries=list(entries.values()),
                   host_cache=stats,
-                  scope='实际运行捕获的Triton编译对象；与逐路径源码审查及冻结语义检查共同使用，不替代硬件任务trace')
+                  scope='Captured actual Triton compiled objects; combine with path review and frozen semantic checks, not as a replacement for hardware traces')
     (args.output/'verification.json').write_text(json.dumps(result, ensure_ascii=False, indent=2)+'\n', encoding='utf8')
     print(json.dumps(dict(status=result['status'], cases=len(rows), kernels=sorted(symbols), host_cache=stats)))
 

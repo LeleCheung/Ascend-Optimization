@@ -1,4 +1,4 @@
-"""续接paired阶段失败的IR采集，保留原始日志及已完成侧。"""
+"""Resume IR collection after paired-stage failure, preserving logs and completed sides."""
 import argparse
 from datetime import datetime, timezone
 import os

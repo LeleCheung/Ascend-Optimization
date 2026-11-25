@@ -1,4 +1,4 @@
-"""补测当前候选的小/大输入调用和真机任务轨迹，并记录实际编译启动器接口。"""
+"""Probe small/large candidate calls, device task traces, and the actual compiled-launcher interface."""
 import argparse
 import hashlib
 import importlib.util
@@ -60,7 +60,7 @@ def main():
         for case in selected:
             for side,fn in [('candidate',candidate.run),('reference',oracle.run)]:
                 inputs=oracle.gen_inputs(case,'npu:0')
-                # 记录钩子只在预热期间启用，正式诊断计时恢复原调度器。
+                # Enable recording hooks only during warmup; restore the original scheduler for diagnostic timing.
                 JITFunction.run=capture if side=='candidate' else original
                 for _ in range(5):fn(**inputs)
                 JITFunction.run=original
@@ -93,7 +93,7 @@ def main():
         save(args.output/'traces.json',traces)
     save(args.output/'probe.json',dict(source_sha256=hashlib.sha256(args.source.read_bytes()).hexdigest(),
         measurements=measurements,compiled=list(entries.values()),
-        scope='独立诊断窗口；submit包含Python提交及可能的背压，wall包含同步，不作为正式KGS成绩。设备本体从任务轨迹另行统计，不用wall减submit推算。'))
+        scope='Separate diagnostic window: submit includes Python submission and possible backpressure; wall includes synchronization. Neither is a formal KGS score. Measure device work from task traces separately, not wall minus submit.'))
     print(json.dumps(dict(cases=len(selected),measurements=[{k:r[k] for k in ['case','side','submit_us','wall_us']} for r in measurements])))
 
 

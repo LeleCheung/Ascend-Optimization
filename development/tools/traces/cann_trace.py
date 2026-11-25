@@ -1,4 +1,4 @@
-"""固定CANN参考重算与有效候选摘要；保留原始成绩、无效点和探索分支。"""
+"""Reconstruct fixed-CANN-reference progress while retaining raw scores, invalid nodes, and exploratory branches."""
 import argparse
 import ast
 import collections
@@ -33,7 +33,7 @@ def gmean(values):
 
 
 def rebase(anchor,result):
-    """使用固定CANN逐case参考耗时，避免总加速比比值混入候选复测波动。"""
+    """Use fixed per-case CANN timing to avoid mixing candidate repeat variation into aggregate score ratios."""
     def cases(d):
         rows=[x for x in d['per_workload'] if x.get('phase')=='timing']
         mapped={case_id(x['uuid']):x for x in rows}
@@ -52,7 +52,7 @@ def rebase(anchor,result):
         rows.append(dict(case=name,cann_anchor_ms=numerator,historical_candidate_ms=denominator,ratio=ratio))
     return dict(score=gmean(x['ratio'] for x in rows),cases=rows,
                 formula='exp(mean(log(CANN_anchor_reference_ms / historical_candidate_ms)))',
-                scope='固定参考下的历史耗时重算；不是同一时刻重新进行的CANN评测')
+                scope='Historical timings recalculated with fixed reference; not a new simultaneous CANN evaluation')
 
 
 def normalize(row,root,linkdata,evidence,latencies,inventory):
@@ -76,7 +76,7 @@ def normalize(row,root,linkdata,evidence,latencies,inventory):
             negative.setdefault(check['source_sha256'],[]).append(str(path.relative_to(root)))
     manifest=read(current/'manifest.json')
     bad=manifest['versions'].get('historical_noncompliant',{}).get('source',{}).get('sha256')
-    if bad:negative[bad]=['历史版本已认定不符合严格Triton约束']
+    if bad:negative[bad]=['Historical version is known to violate strict Triton constraints']
     for doc in docs:
         o=doc['data']
         if not isinstance(o,dict):continue
@@ -205,7 +205,7 @@ def normalize(row,root,linkdata,evidence,latencies,inventory):
                   conversions=conversions,excluded=excluded,moved_exploration=moved,static_screen=scan,
                   anchor=dict(path=anchor_path,sha256=hashlib.sha256((root/anchor_path).read_bytes()).hexdigest(),
                               settings=settings,timing_spec=contract,score=row['delivery']['cann_score']),
-                  view_policy='有效交付进展摘要；换算、筛选与探索分支显式保存，不宣称是控制器原始逐轮轨迹')
+                  view_policy="Qualified delivery-progress summary with explicit conversions, selection, and branches; not the controller's raw round trace")
     return extend_recovery(result,root,anchor)
 
 
@@ -219,7 +219,7 @@ def extend_recovery(row,root,anchor):
         raw=path.read_bytes();assert hashlib.sha256(raw).hexdigest()==transfer['document']
         doc=json.loads(raw);parent=doc.get('parent_source_sha256') or doc.get('parent_sha256')
         row['method_transfer']=dict(**transfer,parent_sha256=parent,source_sha256=doc['source_sha256'],
-            evidence=str(path.relative_to(root)),scope='供体源码到迁移版本的显式继承；不证明前一同名算子版本是其父版本')
+            evidence=str(path.relative_to(root)),scope='Explicit donor-source inheritance; does not establish the previous same-name operator as parent')
         target=doc['source_sha256']
         if transfer.get('continuation_document'):
             continuation=base/'links-v9/artifacts'/(transfer['continuation_document']+'.json')
@@ -252,7 +252,7 @@ def extend_recovery(row,root,anchor):
             if connection['kind']=='unresolved' and events[connection['end']]['source_sha256'] in targets:
                 connection.update(kind='documented_method_switch',source_inheritance=False,
                                   proof=row['method_transfer'],
-                                  explanation='性能进展中的方案切换；代码父版本来自供体，并非前一同名版本')
+                                  explanation='Method switch in performance history; code parent is the donor, not the previous same-name version')
     selection_file=base/'recovery-selections.json'
     choice=read(selection_file).get(row['operator']) if selection_file.exists() else None
     if not choice:return row
@@ -295,20 +295,20 @@ def extend_recovery(row,root,anchor):
 
 
 REASONS={
-    'formal_failure':'正式评测未通过',
-    'repeated_baseline':'重复基线，不是后续优化',
-    'independent_regeneration_branch':'独立重生成分支',
-    'independent_comparison_arm':'独立对照组，不能串入本线',
-    'failed_check_or_known_noncompliant':'补充检查失败／已知不合规',
-    'admission_rejected':'提交审查拒绝',
-    'path_review_pending':'路径审查待补，不认定已违规',
-    'ledger_without_per_case_times':'账本缺少逐case耗时，保留原始记录',
-    'timing_contract_not_matched':'性能用例未完成同一性核验',
-    'measurement_settings_changed':'计时设置不一致',
-    'source_unavailable_for_screen':'送测源码未定位',
-    'missing_per_case_result':'逐case结果未定位',
-    'incomplete_case_timings':'逐case计时不完整',
-    'valid_exploration_regression':'有效探索退步，移入分支',
+    'formal_failure':'Formal evaluation failed',
+    'repeated_baseline':'Repeated baseline, not later optimization',
+    'independent_regeneration_branch':'Independent regeneration branch',
+    'independent_comparison_arm':'Independent control arm; separate from this chain',
+    'failed_check_or_known_noncompliant':'Supplementary failure / known noncompliance',
+    'admission_rejected':'Submission review rejected',
+    'path_review_pending':'Path review pending; noncompliance not established',
+    'ledger_without_per_case_times':'Ledger lacks per-case timings; retain raw record',
+    'timing_contract_not_matched':'Performance-case identity unverified',
+    'measurement_settings_changed':'Timing settings differ',
+    'source_unavailable_for_screen':'Submitted source not located',
+    'missing_per_case_result':'Per-case results not located',
+    'incomplete_case_timings':'Per-case timing incomplete',
+    'valid_exploration_regression':'Qualified exploratory regression moved to branch',
 }
 
 
@@ -320,18 +320,18 @@ def render(rows,out,root):
             loc=next((x['location'] for x in r['view'].get('nodes',[]) if x['point']==a['point']),'mixed')
             known[p.get('source_sha256')]=dict(method=a['method'],color=a['color'],location=loc)
     css="body{margin:28px;background:#fff7e8;color:#1b2434;font:19px/1.65 'Microsoft YaHei',sans-serif}h1{font-size:34px;overflow-wrap:anywhere}h2{font-size:27px;line-height:1.35;margin:8px 0 20px;overflow-wrap:anywhere}a{color:#276980;text-decoration:none;overflow-wrap:anywhere;transition:color .15s,background .15s}a:hover{color:#164559;text-decoration:underline;text-underline-offset:5px}a:focus-visible{outline:3px solid #276980;outline-offset:4px;border-radius:4px}body>p>a{display:inline-block;padding:5px 12px;margin:3px 0;background:#eee7d9;border-radius:7px;font-weight:600}body>p>a:hover{background:#e2d8c6;text-decoration:none}.viewport{overflow:auto;border:1px solid #ded7c9}.viewport>svg{display:block;max-width:100%;height:auto}table{border-collapse:collapse;width:100%;font-size:17px}td,th{border-bottom:1px solid #d8d5c8;padding:10px;text-align:left;vertical-align:top}details{margin:20px 0}summary{cursor:pointer;font-weight:700}.cards{display:grid;grid-template-columns:minmax(0,1fr);gap:24px}.cards img{width:100%}.card{min-width:0;border:1px solid #ded7c9;border-radius:12px;padding:20px;background:#fffaf0}.card h2 a{display:block;color:#253e4c}.card h2 a:hover{color:#276980}.cards img{display:block}code{overflow-wrap:anywhere}@media(min-width:1200px){.cards{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:640px){body{margin:14px}.card{padding:12px}h1{font-size:28px}h2{font-size:23px}}"
-    cards=[];notes=['# CANN统一参考下的有效交付进展','','2026-11-17更新。主图是有效候选进展摘要；原始事件、失败与探索退步仍保留。原始送测FlagGems未通过时，允许起点画叉，后续无效／待审查候选不在主图画叉。',
-        '', '## 换算方法','',
-        '`重算加速比 = exp(mean(log(交付评测中的逐case CANN参考耗时 / 该历史版本逐case候选耗时)))`。',
-        '', '固定当前交付测量的CANN参考耗时。核对完整性能用例配置、seed、用例集合、预热时间、计时时间与试验次数后重算，不用两个总加速比相除，也不将缺失值补成0。_conj_physical仅归一化名称前缀。',
-        '', '**≈表示重算值，交付终点为CANN实测值。** 重算消除不同参考分母造成的跳变，但不消除历史设备负载、时钟、环境或计时波动；不是新的真机实验，也不证明跨时刻因果。不同正确性容差与超时设置仍记录在原始请求中，计时设置匹配不代表所有正确性合同完全一致。',
-        '', '## 主图筛选','',
-        '- 失败或已知不合规候选移入详情；静态筛查发现待审查入口但缺少对应完整审查的候选，也先不进主图，不能直接称其违规。',
-        '- 无profiling／有profiling对照组、重复基线、独立重生成，属于另一条线，不能作为本线连续迭代。',
-        '- 有效但未改善显示进展的探索点移入分支，并明确标为有效退步。该摘要是事后展示规则，不冒充原控制器逐轮保留决策。',
-        '- 固定交付终点始终保留，哪怕比某个历史重算点低；不改成绩、不人为压低原生基线、不保证曲线单调。',
-        '- 保留源码继承证明；筛选和换算不会自动补齐父版本关系。',
-        '', '| 算子 | 主图点数 | 起点 | 交付CANN实测 |','| --- | ---: | --- | ---: |']
+    cards=[];notes=['# Qualified progress under a common CANN reference','','Updated 2026-11-17. The main view summarizes qualified progress, retaining original events, failures, and regressions. Failed native starts may use crosses; later invalid/pending candidates stay in details.',
+        '', '## Conversion','',
+        '`recalculated_speedup = exp(mean(log(delivery_per_case_CANN_time / historical_per_case_candidate_time)))`.',
+        '', 'Fix the delivery CANN timings. Verify case configuration, seed, set, warmup, timing duration, and trials before recalculation. Do not divide aggregate scores or fill missing values with zero. _conj_physical normalizes name prefixes only.',
+        '', '**Approximate markers denote recalculation; delivery uses its original measured CANN score.** Fixed references remove denominator switches, not historical load/clock/environment/noise. No new hardware experiment or temporal causality is established. Preserve original accuracy/timeout settings separately from timing compatibility.',
+        '', '## Selection','',
+        '- Move failures/known noncompliance to details. Pending full path review also stays outside the main view without being labeled noncompliant.',
+        '- No-profiling/profiling controls, repeated baselines, and independent regeneration are distinct chains.',
+        '- Qualified non-improving exploration moves to explicitly labeled branches. This retrospective view does not impersonate original controller decisions.',
+        '- Always retain the fixed delivery endpoint, even below a historical recalculation. Preserve scores and native baselines without enforcing monotonicity.',
+        '- Preserve ancestry evidence; conversion/selection does not fill missing parents.',
+        '', '| Operator | Main-view nodes | Start | Measured delivery CANN |','| --- | ---: | --- | ---: |']
     for row in rows:
         op=row['operator'];folder=out/op
         for name in ['index.html','mainline.svg','mainline.png']:
@@ -347,51 +347,51 @@ def render(rows,out,root):
             for record in attribution_records:
                 title=record['method']+('*' if record['confidence']=='inferred' else '')
                 entries.append('<tr><td>'+html.escape(title)+'</td><td>'+html.escape(tooltip(record))+'</td><td>'+html.escape(record.get('outcome',record.get('scope','')))+'</td></tr>')
-            attribution_html='<details><summary>逐点方法来源与推断依据</summary><p>* 表示推断；依据区分历史上下文与事后源码差异。未加星的条目有明确记录。源码差异可说明修改机制，不自动证明 Agent 当时使用了哪种工具。</p><table><tr><th>方法</th><th>依据</th><th>结果／范围</th></tr>'+''.join(entries)+'</table><p><a href="method-attribution.json">来源记录</a></p></details>'
+            attribution_html='<details><summary>Per-node method sources and inference</summary><p>* denotes inference; distinguish historical context from retrospective source diffs. Unstarred entries have explicit records. Diffs reveal mechanisms but do not prove which tool the agent read.</p><table><tr><th>Method</th><th>Evidence</th><th>Result / scope</th></tr>'+''.join(entries)+'</table><p><a href="method-attribution.json">Attribution records</a></p></details>'
             if any(r['confidence']=='inferred' for r in row['attribution_review']):
                 (folder/'method-history.svg').write_text(svg(row,known,True),encoding='utf-8')
-                attribution_html=attribution_html.replace('</details>','<p><a href="method-history.svg">查看含推断标注的历史图</a></p></details>')
+                attribution_html=attribution_html.replace('</details>','<p><a href="method-history.svg">Historical view with inference markers</a></p></details>')
         (folder/'mainline.svg').write_text(chart,encoding='utf8');save(folder/'cann-view.json',row)
         main=[]
         for i,e in enumerate(row['display_events']):
-            score=('≈' if e.get('score_kind')=='rebased' else '')+f"{e['score']:.6f}×" if e['score'] is not None else '原生未通过'
+            score=('≈' if e.get('score_kind')=='rebased' else '')+f"{e['score']:.6f}×" if e['score'] is not None else 'Native failed'
             original_score=f"{e['raw_score']:.6f}× {e['raw_reference']}" if e.get('raw_score') is not None else str(e['status'])
             check_link=''
             if e.get('additional_check'):
                 raw=(root/e['additional_check']).read_bytes();name='additional-check-'+hashlib.sha256(raw).hexdigest()[:12]+'.json'
                 (folder/name).write_bytes(raw)
-                check_link=' · <a href="'+name+'">补查未通过：证据</a>'
-            location_names={'kernel':'设备kernel','host':'宿主侧','mixed':'两者都有','baseline':'原生起点','retest':'同实现复测'}
+                check_link=' · <a href="'+name+'">Failed supplementary checks: evidence</a>'
+            location_names={'kernel':'Device kernel','host':'Host','mixed':'Both','baseline':'Native start','retest':'Same-implementation repeat'}
             location=location_names[e['change_location']['location']]
             main.append('<tr><td>'+str(i)+'</td><td>'+score+'</td><td>'+html.escape(original_score)+check_link+'</td><td><code>'+e['source_sha256'][:12]+'</code></td><td>'+html.escape(e['stage'])+'</td><td>'+location+'</td></tr>')
         details=[]
         for x in row['excluded']+row['moved_exploration']:
             e=x['event'];value=e.get('raw_score',e.get('score'));ref=e.get('raw_reference',e['reference'])
-            details.append('<tr><td><code>'+e['source_sha256'][:12]+'</code></td><td>'+html.escape(REASONS.get(x['reason'],x['reason']))+'</td><td>'+('无有效分数' if value is None else f'{value:.6f}× '+ref)+'</td><td>'+html.escape(e['stage'])+'</td></tr>')
+            details.append('<tr><td><code>'+e['source_sha256'][:12]+'</code></td><td>'+html.escape(REASONS.get(x['reason'],x['reason']))+'</td><td>'+('No valid score' if value is None else f'{value:.6f}× '+ref)+'</td><td>'+html.escape(e['stage'])+'</td></tr>')
         transfer_html=''
         if row.get('method_transfer'):
             transfer=row['method_transfer']
             (folder/'method-transfer.json').write_bytes((root/transfer['evidence']).read_bytes())
-            transfer_html=(f'<h2>这段换了实现来源</h2><p><a href="../{transfer["donor"]}/index.html">{transfer["donor"]}</a>'
+            transfer_html=(f'<h2>Implementation source changed here</h2><p><a href="../{transfer["donor"]}/index.html">{transfer["donor"]}</a>'
                            f' → {html.escape(transfer["label"])} → {op}</p>'
-                           '<p>这条供体关系已有原始记录；它不是前一同名版本的直接修改。性能历史继续保留，源码继承按实际供体追溯。'
-                           '<a href="method-transfer.json">查看原始迁移记录</a></p>')
-        page=(f'<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{op} 有效交付进展</title><style>{css}</style>'
-              '<p><a href="../index.html">返回26项总览</a> · <a href="mainline.png">PNG</a> · <a href="mainline.svg">SVG</a> · <a href="cann-view.json">换算与筛选证据</a> · <a href="../recovery.html">本轮实验</a></p>'
+                           '<p>The donor relation is recorded explicitly; this is not a direct edit of the previous same-name version. Preserve performance history and follow the actual donor for ancestry.'
+                           '<a href="method-transfer.json">Original transfer record</a></p>')
+        page=(f'<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{op} qualified progress</title><style>{css}</style>'
+              '<p><a href="../index.html">26-operator overview</a> | <a href="mainline.png">PNG</a> | <a href="mainline.svg">SVG</a> | <a href="cann-view.json">Conversion/selection evidence</a> | <a href="../recovery.html">Current experiments</a></p>'
               '<div class="viewport">'+chart+'</div>'+transfer_html+attribution_html+
-              '<p>≈为固定CANN参考重算；交付点为原验收实测。本轮点是后续验证，尚未覆盖交付包。未显示的探索仍保留。</p>'
-              '<details><summary>主图数值：重算值与原始成绩</summary><p>节点形状按相邻展示版本的源码差异分类；灰点为原生起点或同实现复测。具体变化函数与源码SHA保存在换算与筛选证据的change_location字段。</p><table><tr><th>节点</th><th>CANN标尺</th><th>原始成绩</th><th>源码</th><th>批次</th><th>修改位置</th></tr>'+''.join(main)+'</table></details>'
-              '<details><summary>移入历史详情的记录（含待审查与有效退步）</summary><table><tr><th>源码</th><th>原因</th><th>原始成绩</th><th>批次</th></tr>'+''.join(details)+'</table></details>'
-              '<details><summary>原始探索图与全部证据</summary><p><a href="raw-mainline.svg">上版原始主线图</a> · <a href="history.svg">原始历史图</a> · <a href="trace.json">原始trace数据</a></p></details></html>')
+              '<p>Approximate markers denote fixed-CANN recalculation; delivery uses original acceptance. Current research points have not replaced delivery artifacts. Hidden exploration remains available.</p>'
+              '<details><summary>Main-view values: recalculated and raw scores</summary><p>Node shape classifies adjacent displayed source changes; gray marks native/repeat implementations. See change_location for functions and source SHA.</p><table><tr><th>Node</th><th>CANN scale</th><th>Raw score</th><th>Source</th><th>Batch</th><th>Change location</th></tr>'+''.join(main)+'</table></details>'
+              '<details><summary>Historical details, including pending review and qualified regressions</summary><table><tr><th>Source</th><th>Reason</th><th>Raw score</th><th>Batch</th></tr>'+''.join(details)+'</table></details>'
+              '<details><summary>Raw exploration and all evidence</summary><p><a href="raw-mainline.svg">Previous raw mainline</a> | <a href="history.svg">Raw history</a> | <a href="trace.json">Raw trace data</a></p></details></html>')
         (folder/'index.html').write_text(page,encoding='utf8')
-        cards.append(f'<div class="card"><a href="{op}/index.html" aria-label="{op} 轨迹详情">'+chart.replace('<svg ','<svg style="display:block;width:100%;height:auto" ',1)+'</a></div>')
-        first=row['display_events'][0];label='原生未通过' if first['score'] is None else f"≈{first['score']:.3f}×"
+        cards.append(f'<div class="card"><a href="{op}/index.html" aria-label="{op} trace details">'+chart.replace('<svg ','<svg style="display:block;width:100%;height:auto" ',1)+'</a></div>')
+        first=row['display_events'][0];label='Native failed' if first['score'] is None else f"≈{first['score']:.3f}×"
         notes.append(f'| [{op}]({op}/index.html) | {len(row["display_events"])} | {label} | {row["delivery"]["cann_score"]:.3f}× |')
     index=out/'index.html'
     if index.exists() and not (out/'raw-index.html').exists():(out/'raw-index.html').write_bytes(index.read_bytes())
-    recovery_link=' · <a href="recovery.html">本轮恢复与优化</a>' if (out/'recovery.html').exists() else ''
-    recovery_link+=' · <a href="attribution-share.svg">方法来源占比</a>'
-    index.write_text('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>26项有效交付进展</title><style>'+css+'</style><h1>26项有效交付进展 · CANN统一参考</h1><p>≈：历史耗时重算；交付终点：CANN实测。仅原生起点允许显示失败叉号。</p><p><a href="cann-view-method.md">换算公式与筛选说明</a> · <a href="cann-view.json">结构化证据</a>'+recovery_link+'</p><div class="cards">'+''.join(cards)+'</div></html>',encoding='utf8')
+    recovery_link=' | <a href="recovery.html">Current recovery/optimization</a>' if (out/'recovery.html').exists() else ''
+    recovery_link+=' | <a href="attribution-share.svg">Method-source share</a>'
+    index.write_text('<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>26-operator qualified progress</title><style>'+css+'</style><h1>26-operator qualified progress | common CANN reference</h1><p>Approximate historical recalculations; measured delivery endpoints. Only native starts may use failure crosses.</p><p><a href="cann-view-method.md">Conversion/selection method</a> | <a href="cann-view.json">Structured evidence</a>'+recovery_link+'</p><div class="cards">'+''.join(cards)+'</div></html>',encoding='utf8')
     (out/'cann-view-method.md').write_text('\n'.join(notes)+'\n',encoding='utf8')
 
 

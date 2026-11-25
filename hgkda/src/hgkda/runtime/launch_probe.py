@@ -1,4 +1,4 @@
-"""诊断实际候选冷／热调用的JIT路径与缓存状态；不改候选或正式计时合同。"""
+"""Inspect actual cold/warm JIT paths and cache state without changing candidate source or formal timing."""
 import argparse
 import hashlib
 import importlib.util
@@ -76,7 +76,7 @@ def main():
                 inputs=oracle.gen_inputs(case,'npu:0');torch.npu.synchronize()
                 before=len(calls);candidate.run(**inputs);torch.npu.synchronize()
                 hook_records.append(dict(case=a.case[0],jit_calls=calls[before:],callbacks=seen.copy()))
-                assert calls[before:] and seen==dict(enter=1,exit=1),'活动钩子没有通过普通Triton路径执行'
+                assert calls[before:] and seen==dict(enter=1,exit=1),'Active hook did not execute through the normal Triton path'
             finally:
                 enter.calls.remove(on_enter);leave.calls.remove(on_exit)
     finally:JITFunction.run=original
@@ -87,7 +87,7 @@ def main():
         runtime_hooks={k:dict(is_none=getattr(knobs,k,None) is None,type=type(getattr(knobs,k,None)).__name__,
                        callback_count=len(getattr(getattr(knobs,k,None),'calls',[])))
                        for k in ['launch_enter_hook','launch_exit_hook']},
-        scope='调用区间只计数JIT路径并读取缓存元数据；输入每次重新构造，非正式性能或因果耗时测量')
+        scope='Count JIT paths and read cache metadata only in the call window; inputs are rebuilt per call, and this is not formal performance or causal timing')
     a.output.write_text(json.dumps(output,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
     print(json.dumps(dict(status='completed',records=len(records),jit_calls=len(calls))))
 

@@ -1,4 +1,4 @@
-"""串行推进已审查IR与原IR验证，保存每项失败并继续其他算子。"""
+"""Advance reviewed and original IR validation serially, preserving failures while continuing other operators."""
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path

@@ -1,4 +1,4 @@
-"""复采冻结源码与IR组合的profiling及模拟器双分析。"""
+"""Recollect paired profiling and simulation for a frozen source/IR combination."""
 import argparse
 from collections import Counter
 import json

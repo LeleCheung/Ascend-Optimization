@@ -1,4 +1,4 @@
-"""核验真实runtime事件与引用字节；旧可变路径可按原SHA解析，不改写旧记录。"""
+"""Audit runtime events and referenced bytes; resolve legacy mutable paths by original SHA without rewriting records."""
 import argparse
 import hashlib
 import json
@@ -24,7 +24,7 @@ def audit(run):
     for folder in ['events','decisions','rounds']:
         for path in (trace/folder).rglob('*.json'):
             documents.append((path,json.loads(path.read_bytes())))
-    # V1早期引用仍可能指向工作区，先寻找已在动作边界保存的同SHA原件。
+    # Early V1 references may target workspace paths; first locate same-SHA artifacts captured at action boundaries.
     frozen={}
     for folder in ['sources','artifacts','evidence']:
         for path in (trace/folder).glob('*'):
@@ -50,8 +50,8 @@ def audit(run):
                 resolved.append(dict(original=item['path'],sha256=item['sha256'],
                     snapshot=frozen[item['sha256']].relative_to(run).as_posix()))
             elif raw is not None and path.name=='agent-events.jsonl':
-                # 早期记录没有长度。只在现存追加流的行边界寻找完全相同SHA，
-                # 不修改日志、不猜测内容；不能匹配就明确保留缺口。
+                # Legacy records lack prefix lengths. Search only line boundaries of existing append-only streams for an exact SHA;
+                # preserve logs without guessing content; retain an explicit gap when no match exists.
                 digest=hashlib.sha256();length=0;found=None
                 for line in raw.splitlines(keepends=True):
                     digest.update(line);length+=len(line)
@@ -64,7 +64,7 @@ def audit(run):
                 value=json.loads(raw);value.pop('output_sha256',None)
                 initial=(json.dumps(value,ensure_ascii=False,indent=2)+'\n').encode('utf8')
                 if hashlib.sha256(initial).hexdigest()==item['sha256']:
-                    checked[key]='verified_initial_metadata';reconstructed.append(dict(**item,method='去除后续追加的output_sha256并按原保存格式序列化，原SHA完全一致'))
+                    checked[key]='verified_initial_metadata';reconstructed.append(dict(**item,method='Remove later output_sha256 and serialize in original format to reproduce the exact SHA'))
                 else:
                     checked[key]='unresolved';missing.append(dict(document=document.relative_to(run).as_posix(),**item))
             else:
@@ -82,7 +82,7 @@ def audit(run):
         source_snapshots=len(list((trace/'sources').glob('*.py'))),
         same_sha_resolutions=resolved,unresolved=missing,open_actions=open_actions,orphan_finishes=orphan_ends,
         verified_legacy_log_prefixes=prefixes,verified_initial_metadata=reconstructed,
-        scope='验证事件闭合和引用字节身份；早期可变引用按已有同SHA快照解析。验证不证明模型因果归因或工具收益。')
+        scope='Verify event closure and referenced bytes; resolve legacy mutable references through existing same-SHA snapshots. This does not establish model causality or tool benefit.')
 
 
 def main():

@@ -20,7 +20,7 @@ def geometry(path):
         assert node.attrib.get('class') != 'measurement-transition', 'Remeasurement segment on trace'
         if node.tag.rsplit('}', 1)[-1] == 'text':
             assert not any(word in ''.join(node.itertext()) for word in
-                ('复测', '换计时', '换参考')), 'Remeasurement label on trace'
+                ('Repeat', 'Timing change', 'Reference change')), 'Remeasurement label on trace'
         if node.attrib.get('class') in kinds:
             numbers = [float(n) for n in re.findall(r'-?\d+(?:\.\d+)?', node.attrib['d'])]
             assert len(numbers) == 4
@@ -93,10 +93,10 @@ def main():
                 assert hashlib.sha256(source.read_bytes()).hexdigest() == figure['source_sha256']
                 assert path.read_bytes() == source.with_name('mainline.svg').read_bytes()
                 assert path.read_bytes() == (overview / figure['operator'] / 'mainline.svg').read_bytes()
-                assert '全用例几何平均' in path.read_text(encoding='utf8')
+                assert 'All-case geometric mean' in path.read_text(encoding='utf8')
             else:
                 assert figure['metric'] == 'fixed_case_cann_speedup' and figure['case']
-                assert '固定shape' in path.read_text(encoding='utf8')
+                assert 'Fixed shape' in path.read_text(encoding='utf8')
     result = dict(schema='hgkda.presentation-acceptance/v1', operator_figures=rows, fixed_case_figures=fixed,
         scope='Numerical, source-root, and SVG geometry checks; screenshot inspection is separately recorded.',
         historical_source_branches=[row['operator'] for row in rows if not row['source_ancestry_complete']])

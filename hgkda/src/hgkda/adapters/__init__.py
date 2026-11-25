@@ -1,1 +1,1 @@
-"""可选后端适配器；不在离线核心导入时连接服务。"""
+"""Optional backend adapters; importing the offline core does not connect to services."""

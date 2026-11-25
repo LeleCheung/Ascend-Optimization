@@ -1,4 +1,4 @@
-"""公开模拟器格式解析及逐核隔离；不启动采集器。"""
+"""Parse public simulator formats with per-core isolation, without starting collection."""
 import csv
 import hashlib
 import json

@@ -72,14 +72,14 @@ def import_replay(reports, replay, folder):
             assert {row['uuid'] for row in timings} == set(anchor)
             assert all(row['status'] == 'PASSED' and row['latency_ms'] > 0 for row in timings)
             conversion = rebase(latest, result)
-            conversion['scope'] = '共同CANN参考下的候选实测耗时换算；原始配对成绩单列保存。'
+            conversion['scope'] = 'Convert measured candidate times using a common CANN reference; keep original paired scores separately.'
             normalized = conversion['score']
             target = next(row for row in timings if row['uuid'] == item['target_case'])
         else:
             normalized = None
             target = None
             conversion = None
-        event.update(label='FlagGems' if index == 0 else '复测V' + str(index),
+        event.update(label='FlagGems' if index == 0 else 'Repeat V' + str(index),
             measurement_event_id='/'.join(result_path.relative_to(reports).parts[:2]),
             axis_label='FlagGems' if index == 0 else 'V' + str(index),
             source_sha256=item['sha256'], qualified=qualified, score=normalized,
@@ -100,11 +100,11 @@ def import_replay(reports, replay, folder):
     if data.get('target_case_scope'):
         data['historical_target_case_scope'] = data.pop('target_case_scope')
     data.update(events=events, metric='full_contract_cann_speedup',
-        scope='原生FlagGems到本轮最佳的固定源码统一profiler复测。逐case采用最后一份合格源码测量中的CANN参考耗时为共同锚点，'
-              '以各版实测候选耗时重算全合同性能几何平均。原始历史成绩、完整源码父链、方案迁移、失败和退步保留在详情。',
+        scope='Unified-profiler reevaluation from native FlagGems to current best, with fixed sources. Use per-case CANN times from the final qualified source measurement as common anchors; '
+              'recalculate full-contract geometric-mean performance from actual candidate timings. Keep original scores, ancestry, transfers, failures, and regressions in details.',
         replay_manifest=(replay / 'manifest.json').relative_to(reports).as_posix(),
         historical_presentation=saved.name)
-    data['history_links'] = [dict(label='完整续接记录：'+path.parent.name,
+    data['history_links'] = [dict(label='Full continuation: '+path.parent.name,
         href=path.relative_to(output).as_posix()) for path in sorted(output.glob('validated-*/continuation.json'))]
     write_report(data, output)
     return data

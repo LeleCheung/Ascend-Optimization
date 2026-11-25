@@ -1,4 +1,4 @@
-"""逐用例比较冻结候选的历史与新回归耗时，区分候选变化和参考变化。"""
+"""Compare historical and fresh frozen-candidate timings per case, separating candidate and reference changes."""
 import argparse
 import csv
 import hashlib
@@ -31,12 +31,12 @@ def main():
         path=args.run_directory/'operators'/job['operator']/'evaluation/result.json'
         if not path.exists():continue
         baseline=original[job['operator']]
-        assert job['source_sha256']==baseline['source']['sha256'],'只能比较同源码的回归'
+        assert job['source_sha256']==baseline['source']['sha256'],'Only same-source regressions can be compared'
         previous=read(args.repository/baseline['evidence']['cann']['artifact']['path'])
         current=read(path)
         old={v['uuid']:v for v in previous['per_workload'] if v['phase']=='timing'}
         new={v['uuid']:v for v in current['per_workload'] if v['phase']=='timing'}
-        assert set(old)==set(new),'性能用例身份变化'
+        assert set(old)==set(new),'Performance case identity changed'
         changes=[]
         for name,after in new.items():
             before=old[name]
@@ -58,7 +58,7 @@ def main():
                              historical_measurement=baseline['evidence']['cann'].get('measurement'),new_score=current['geo_mean'],
                              candidate_new_over_old=candidate,cann_new_over_old=reference,timing_cases=len(changes)))
     result=dict(rows=rows,cases=cases,
-                scope='相同冻结源码和性能用例；新旧耗时分别比较，不以加速比分数之比推断候选提速或确定原因')
+                scope='Same frozen source and performance cases; compare old/new timings separately, without inferring candidate improvement or cause from score ratios')
     args.output.write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
     if cases:
         with args.output.with_suffix('.csv').open('x',newline='',encoding='utf-8-sig') as output:

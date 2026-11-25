@@ -31,7 +31,7 @@ def normalized(value):
 
 
 def option_identity(value):
-    """编译缓存把选项tuple存为JSON数组；按相同选项值比较。"""
+    """Compilation caches serialize option tuples as JSON arrays; compare identical option values."""
     if isinstance(value, dict):
         if set(value) == {'__tuple__'}:
             return [option_identity(item) for item in value['__tuple__']]
@@ -173,7 +173,7 @@ def install(manifest_path):
         parsing_inputs[str(path.resolve())] = (item, path.with_suffix('.parsed-binding.json'))
 
     def parse(full_name, ext, context):
-        # 原生解析会重新命名SSA值。绑定实际解析输入与序列化后的stage，分别保存哈希。
+        # Native parsing renames SSA values. Bind actual parsing inputs and serialized stages, retaining both hashes.
         result = old_parse(full_name, ext, context)
         binding = parsing_inputs.get(str(Path(full_name).resolve()))
         if binding is not None:

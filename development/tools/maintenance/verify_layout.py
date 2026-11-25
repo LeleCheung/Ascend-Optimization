@@ -1,4 +1,4 @@
-"""核验三部分迁移的冻结原件、交付源码与运行边界。"""
+"""Verify frozen migration artifacts, delivered source identities, and public runtime boundaries."""
 import argparse
 import ast
 import hashlib
@@ -45,7 +45,7 @@ def main():
     assert 'development/tools/' not in node.value and 'development/experiments/' not in node.value,path
  result=dict(status='passed',immutable_files=len(mapping['immutable_files']),delivery_artifacts=count,
   operators=len(index['rows']),main_total=30,accepted=26,public_python_files=len(public_files),historically_unavailable=missing,
-  note='静态边界核验与隔离执行验证分别记录；历史缺失原件不伪造。')
+  note='Static boundary checks and isolated execution are recorded separately; missing historical originals remain missing.')
  a.output.parent.mkdir(parents=True,exist_ok=True);assert not a.output.exists()
  a.output.write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
  print(json.dumps(result,ensure_ascii=True))

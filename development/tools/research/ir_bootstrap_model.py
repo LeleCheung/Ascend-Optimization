@@ -1,4 +1,4 @@
-"""先冻结实际编译与原IR请求，再并行开展模型IR诊断。"""
+"""Freeze actual compilation/original-IR requests before parallel model IR diagnosis."""
 import argparse
 from pathlib import Path
 import subprocess

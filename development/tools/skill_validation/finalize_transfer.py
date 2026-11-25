@@ -1,4 +1,4 @@
-"""结束方法迁移试验，保存方法实体与全部正式结果；不改写候选或原始测量。"""
+"""Finalize method-transfer experiments with method artifacts and all formal results, preserving candidates and measurements."""
 import argparse
 from datetime import datetime,timezone
 import hashlib
@@ -15,10 +15,10 @@ def save(path,value):path.write_text(json.dumps(value,ensure_ascii=False,indent=
 
 
 def copy_verified_tree(source,target):
-    """失败后续做归档时保留已复制原件，只接受完全相同的树。"""
+    """On archive recovery, retain copied artifacts and require an identical tree."""
     files=lambda root:{p.relative_to(root).as_posix():sha(p) for p in root.rglob('*')
                       if p.is_file() and '__pycache__' not in p.parts}
-    if target.exists():assert files(source)==files(target),'已复制方法树与来源不同'
+    if target.exists():assert files(source)==files(target),'Copied method tree differs from its source'
     else:shutil.copytree(source,target,ignore=shutil.ignore_patterns('__pycache__'))
 
 
@@ -32,7 +32,7 @@ def main():
     a=p.parse_args();run=a.directory;config=read(run/'config.json')
     assert not (run/'summary.json').exists()
     calls=list((run/'agent-calls').iterdir())
-    assert calls and all((path/'model-usage.json').exists() for path in calls),'模型调用仍在运行或原件不完整'
+    assert calls and all((path/'model-usage.json').exists() for path in calls),'Model invocation is still running or artifacts are incomplete'
     records=[]
     for directory in sorted(run.glob('formal-*')):
         if not directory.is_dir():continue
@@ -75,9 +75,9 @@ def main():
         method_manifest_sha256=sha(run/'method-manifest.json'),generation_audit_sha256=sha(run/'generation-audit.json'),
         retained_existing_delivery_cann_score=a.retained_delivery_score,
         current_original_contract_accepted=current['accepted'],target_total=current['total'],
-        attribution=dict(candidate='CC／DeepSeek生成及修改全部候选代码',
-            methods='Codex分析、固化workflow／知识／工具并完成只读审查和评测调度'),
-        formal_requests_policy='每个新源码SHA一次完整请求，固定合同与计时；不按同源码复测挑高分')
+        attribution=dict(candidate='CC/DeepSeek generated and modified all candidate code',
+            methods='Codex analyzed evidence, maintained workflow/knowledge/tools, and performed read-only review and evaluation scheduling'),
+        formal_requests_policy='One full request per new source SHA with fixed contract/timing; do not select high scores from same-source repeats')
     if config['phase']=='frozen':value['temporary_codex_optimization_prompts']=0
     if a.failure_reason:value['failure_reason']=a.failure_reason
     save(run/'summary.json',value)

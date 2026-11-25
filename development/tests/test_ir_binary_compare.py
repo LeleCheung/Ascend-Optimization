@@ -1,6 +1,7 @@
 """Reject unexpected binary changes in fixed-source IR campaigns."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -29,6 +30,7 @@ class IRBinaryComparisonTest(unittest.TestCase):
             receipt = folder / 'compiler-receipts/one.jsonl'
             receipt.parent.mkdir()
             receipt.write_text('\n'.join(json.dumps(row) for row in rows), encoding='utf8')
+            save(folder / 'compiler-verification.json', dict(receipts=len(rows)))
             save(folder / 'result.json', dict(status='PASSED', num_passed=1, num_workloads=1,
                 per_workload=[dict(uuid='target', phase='timing', status='PASSED',
                     latency_ms=latency, reference_latency_ms=3)]))
@@ -55,6 +57,8 @@ class IRBinaryComparisonTest(unittest.TestCase):
                     rows = [json.loads(line) for line in receipt.read_text().splitlines()]
                     rows[1]['artifacts'][0]['sha256'] = hashlib.sha256(binary.read_bytes()).hexdigest()
                     receipt.write_text('\n'.join(json.dumps(row) for row in rows), encoding='utf8')
+                    cutoff = receipt.stat().st_mtime_ns + 1_000_000
+                    os.utime(run / 'evaluations/candidate/result.json', ns=(cutoff, cutoff))
                 with self.assertRaisesRegex(AssertionError, 'binary bytes changed' if tamper else 'unedited specialization'):
                     compare(run, 'candidate')
 

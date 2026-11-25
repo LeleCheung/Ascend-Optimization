@@ -1,4 +1,4 @@
-"""补充检查准入：新发现的语义问题不能被旧版较小测试集掩盖。"""
+"""Supplementary-check admission: older, smaller test sets cannot conceal newly discovered semantic issues."""
 
 def supplement_status(operator, result, source_sha256):
     if result.get('source_sha256') != source_sha256:

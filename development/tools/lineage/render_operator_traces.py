@@ -25,46 +25,46 @@ def sha(path):
 # sources, not estimates of each tool's independent causal contribution.
 SPECS = [
     dict(op="rad2deg_", key="rad2deg_-endurance-20261022-attempt-1/", date="2026-10-22",
-         title="启动路径修复后，继续扩大分块", note="先降低固定调用成本，再处理大输入的设备耗时。",
+         title='Larger tiles after launch-path repair', note='Reduce fixed call cost before large-input device time.',
          stages=[
-             ("修复原地与布局语义", "起点／源码检查", "建立完整正确的起点", "base"),
-             ("复用已编译启动入口", "来源：宿主耗时探测", "小输入从约65降至14 μs", "probe"),
-             ("大输入分块增至32768", "来源：分块对比实验", "大输入从约77降至28–31 μs", "probe"),
-             ("减少中间精度转换", "来源：源码＋类型对比", "完整评测确认小幅改善", "source"),
+             ('Repair in-place and layout semantics', 'Start / source review', 'Establish a correct complete start', "base"),
+             ('Reuse compiled launch entry', 'Evidence: host-time probe', 'Small inputs: about 65 -> 14 us', "probe"),
+             ('Large-input tiles: 32768', 'Evidence: tile comparison', 'Large inputs: about 77 -> 28-31 us', "probe"),
+             ('Reduce intermediate conversions', 'Evidence: source + type comparison', 'Small gain verified by full evaluation', "source"),
          ]),
     dict(op="uniform", key="uniform-endurance-20261022-attempt-2/", date="2026-10-22",
-         title="先优化随机数计算，再降低启动开销", note="性能瓶颈随优化迁移：设备计算 → 宿主启动。",
+         title='Optimize random computation, then launch cost', note='Bottleneck shifts from device computation to host launching.',
          stages=[
-             ("测量原始随机数实现", "起点／完整评测", "区分计算与状态读取成本", "base"),
-             ("向量化Philox＋状态读取", "来源：源码＋专项探测", "同时修复数值边界与布局", "probe"),
-             ("缓存已编译启动入口", "来源：宿主耗时探测", "保留每次随机状态更新", "probe"),
+             ('Measure original random implementation', 'Start / full evaluation', 'Separate compute and state-read costs', "base"),
+             ('Vectorize Philox + state reads', 'Evidence: source + targeted probe', 'Also repair numerical bounds and layout', "probe"),
+             ('Cache compiled launch entry', 'Evidence: host-time probe', 'Preserve each random-state update', "probe"),
          ]),
     dict(op="negative_", key="negative_-next25-20261029-v2-attempt-2/", date="2026-10-29",
-         title="分开解决小输入启动与大输入搬运", note="两次修改针对不同尺寸区间；保留完整评测结果。",
+         title='Separate small-input launch and large-input movement', note='Changes target different sizes; retain full results.',
          stages=[
-             ("固定连续与跨步版本", "起点／完整评测", "小输入约55 μs，大输入约152 μs", "base"),
-             ("直接启动已编译kernel", "来源：空kernel启动探测", "小输入降至约31–35 μs", "probe"),
-             ("扩大到每program 64 KiB", "来源：分块对比实验", "大输入降至约30–41 μs", "probe"),
+             ('Fix contiguous and strided versions', 'Start / full evaluation', 'Small inputs about 55 us; large about 152 us', "base"),
+             ('Directly launch compiled kernel', 'Evidence: empty-kernel launch probe', 'Small inputs: about 31-35 us', "probe"),
+             ('64 KiB per program', 'Evidence: tile comparison', 'Large inputs: about 30-41 us', "probe"),
          ]),
     dict(op="selu_", key="selu_-paired-pointwise-20261022-paired-hgkda/", date="2026-10-22",
-         title="从调用开销定位到宿主路径改写", note="该图保留当时的缓存实验，不等同于当前严格交付版本。",
+         title='From call cost to host-path rewrite', note='Historical cache experiments are distinct from current strict deliveries.',
          stages=[
-             ("固定已有分块实现", "起点／成对profiling背景", "分别观察小输入与大输入", "profile"),
-             ("预绑定参数＋对象缓存", "来源：宿主探测＋源码", "小输入约16–18降至9–10 μs", "probe"),
+             ('Fix existing tiled implementation', 'Start / paired-profiling background', 'Inspect small and large inputs separately', "profile"),
+             ('Prebind arguments + object cache', 'Evidence: host probe + source', 'Small inputs: about 16-18 -> 9-10 us', "probe"),
          ]),
     dict(op="log10_", key=None, date="2026-11-10",
-         title="预取退步后，结合等待与IR修订", note="第二次修改恢复性能；本段最终仍保留原起点。",
+         title='Revise prefetch regression using waits and IR', note='Second change recovers performance; retain original start for this segment.',
          stages=[
-             ("固定已生成版本", "来源：成对profiling", "检查搬运粒度与大输入差距", "profile"),
-             ("64个program＋双块预取", "来源：模拟器区域＋IR", "等待转移、搬运切碎，出现退步", "sim"),
-             ("改为循环携带缓冲", "来源：模拟器等待＋IR", "等待减少，性能部分恢复", "sim"),
+             ('Fix generated version', 'Evidence: paired profiling', 'Inspect movement granularity and large-input gap', "profile"),
+             ('64 programs + double prefetch', 'Evidence: simulator regions + IR', 'Shifted waits and fragmented movement regress', "sim"),
+             ('Use loop-carried buffers', 'Evidence: simulator waits + IR', 'Fewer waits; partial recovery', "sim"),
          ]),
     dict(op="native_group_norm", key="native_group_norm-next25-20261029-v2-attempt-1/", date="2026-10-29",
-         title="宿主开销假设下的两次尝试", note="两个提案均未改善；退步节点与分析过程一起保留。",
+         title='Two host-overhead experiments', note='Neither improved; retain regressions and analysis.',
          stages=[
-             ("测量融合归一化版本", "起点／成对profiling背景", "完整调用远高于小case设备耗时", "profile"),
-             ("合并分配与启动准备", "来源：宿主探测＋源码", "预期减少开销，实测未改善", "probe"),
-             ("减少参数＋选择启动入口", "来源：参数开销探测", "再次退步；模拟器贡献待核验", "probe"),
+             ('Measure fused normalization', 'Start / paired-profiling background', 'Full call far exceeds small-case device time', "profile"),
+             ('Combine allocation and launch preparation', 'Evidence: host probe + source', 'Expected lower overhead; no measured gain', "probe"),
+             ('Fewer arguments + launch selection', 'Evidence: argument-overhead probe', 'Further regression; simulator role unverified', "probe"),
          ]),
 ]
 
@@ -76,7 +76,7 @@ def data():
     series = []
     for spec in SPECS:
         s = dict(spec)
-        s["reference"] = "CANN" if not s["key"] else "PyTorch／ATen（本批KGS参考）"
+        s["reference"] = "CANN" if not s["key"] else 'PyTorch / ATen (batch KGS reference)'
         s["points"] = []
         if s["key"]:
             ledger = next(f for f in ledgers if s["key"] in f["path"] and "/runs/" in f["path"])
@@ -130,7 +130,7 @@ def svg(s):
              '<rect width="1600" height="900" fill="#fffaf0"/>',
              '<g font-family="Microsoft YaHei, Noto Sans CJK SC, Arial, sans-serif">',
              text(60, 66, s["op"], 45, 700), text(60, 118, s["title"], 32, 600),
-             text(60, 160, f'{s["date"]}  ·  相对{s["reference"]}  ·  每轮{pts[0]["passed"]}/{pts[0]["total"]}', 25),
+             text(60, 160, f'{s["date"]}  |  relative to {s["reference"]}  |  each round {pts[0]["passed"]}/{pts[0]["total"]}', 25),
              f'<path d="M120 {top} V{bottom} H1490" stroke="{INK}" stroke-width="2.5" fill="none"/>']
     for value in [0, limit / 2, limit]:
         yy = y(value)
@@ -159,7 +159,7 @@ def svg(s):
                   text(xx+16, 716, p["action"], 27, 700),
                   text(xx+16, 757, p["observation"], 22)]
     parts += [text(60, 840, s["note"], 28, 600),
-              text(60, 879, "纵轴：相对参考加速比（越高越好）  ·  百分比：较上一轮加速比的变化", 23), '</g></svg>']
+              text(60, 879, 'Y-axis: reference speedup (higher is better); percentages: speedup change from previous round', 23), '</g></svg>']
     return "\n".join(parts)
 
 
@@ -174,23 +174,23 @@ def main():
     for i, s in enumerate(series):
         op = html.escape(s["op"])
         buttons.append(f'<button onclick="show({i})">{op}</button>')
-        cards.append(f'<section class="chart" id="c{i}"><img src="{op}.svg" alt="{op} 优化轨迹"><div class="links"><a href="{op}.svg" download>下载 SVG</a><a href="{op}.png" download>下载 PNG</a></div></section>')
-    page = '''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>HG-KDA · 六算子优化轨迹</title>
+        cards.append(f'<section class="chart" id="c{i}"><img src="{op}.svg" alt="{op} trace"><div class="links"><a href="{op}.svg" download>Download SVG</a><a href="{op}.png" download>Download PNG</a></div></section>')
+    page = """<!doctype html><html lang="en"><meta charset="utf-8"><title>HG-KDA · Six operator traces</title>
 <style>*{box-sizing:border-box}body{margin:0;background:#f4f0e6;color:#17263a;font-family:"Microsoft YaHei",sans-serif}header{padding:28px 36px 18px}h1{font-size:32px;margin:0 0 12px}p{font-size:20px;margin:0 0 18px}nav{display:flex;flex-wrap:wrap;gap:8px}button,a{font:inherit;font-size:18px;color:#17263a}button{padding:10px 16px;border:1px solid #bcc2c6;background:white;border-radius:8px;cursor:pointer}main{padding:0 24px 24px}.chart{max-width:1600px;margin:0 auto 24px;background:white;border-radius:12px;overflow:hidden}.chart img{width:100%;display:block}.links{display:flex;gap:24px;padding:12px 24px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:20px}.grid .chart{margin:0}.grid .links{display:none}@media(max-width:1000px){.grid{grid-template-columns:1fr}}@media print{header,.links{display:none}.chart{break-after:page}}</style>
-<header><h1>分析信息 → 修改方法 → 性能变化</h1><p>首批6段真实实验。保留提升、退步与恢复；每段使用自己的参考与测试合同。</p><nav><button onclick="show(-1)">六图总览</button>BUTTONS</nav></header>
-<main class="grid">CARDS</main><script>function show(n){document.querySelector('main').classList.toggle('grid',n<0);document.querySelectorAll('.chart').forEach((c,i)=>c.style.display=n<0||i===n?'':'none');window.scrollTo(0,0)}</script></html>'''.replace('BUTTONS', ''.join(buttons)).replace('CARDS',''.join(cards))
+<header><h1>Evidence → Method → Performance</h1><p>First 6 measured segments。Retain gains、regressions and recovery；Each segment has its own reference and contract。</p><nav><button onclick="show(-1)">Six-chart overview</button>BUTTONS</nav></header>
+<main class="grid">CARDS</main><script>function show(n){document.querySelector('main').classList.toggle('grid',n<0);document.querySelectorAll('.chart').forEach((c,i)=>c.style.display=n<0||i===n?'':'none');window.scrollTo(0,0)}</script></html>""".replace('BUTTONS', ''.join(buttons)).replace('CARDS',''.join(cards))
     (OUT / "index.html").write_text(page, encoding="utf-8")
-    md = ["# 首批六算子真实优化轨迹", "", "先展示方法、分析信息与结果；不以独立因果贡献或超过历史最佳作为画图门槛。", "",
-          "打开[index.html](index.html)查看总览或单张；每张提供SVG、PNG。traces.json保存对应账本、源码身份、修改计划和原始评测信息。", "",
-          "每图是一段连续实验，不是该算子从首次优化到当前交付的完整生涯。百分比表示相邻两轮加速比的变化；历史候选不自动等同当前严格交付版本。", "",
-          "| 算子 | 本段成绩 | 图 |", "| --- | --- | --- |"]
+    md = ['# First six measured operator traces', "", 'Show methods, analysis, and outcomes; independent causal attribution or a historical-best score is not a plotting prerequisite.', "",
+          'Open [index.html](index.html) for overview or individual charts with SVG/PNG. traces.json retains ledgers, source identity, plans, and raw evaluation data.', "",
+          "Each chart is one continuous experiment, not an operator's complete history. Percentages compare consecutive speedups. Historical candidates are not automatically current strict deliveries.", "",
+          '| Operator | Segment scores | Chart |', "| --- | --- | --- |"]
     for s in series:
         scores = " → ".join(f'{p["score"]:.3f}×' for p in s["points"])
         md.append(f'| `{s["op"]}` | {scores} | [SVG]({s["op"]}.svg)／[PNG]({s["op"]}.png) |')
-    md += ["", "分析信息来源依据冻结的plan／conclusion及既有区域报告归纳；未将历史模型的机制判断自动升级为已证明因果。",
-           "SELU的成对profiling属于批次背景，本图修改方向直接来自宿主探测；本轮新的采集失败不改变已有测量节点的展示。",
-           "native_group_norm有partial模拟器材料，参与当前两次修改的具体贡献待核验。",
-           "log10结合成对指标、模拟器及IR；图显示双块预取失败和后续恢复，没有声称该轮净收益。", ""]
+    md += ["", 'Analysis sources summarize frozen plans/conclusions and region reports; historical model hypotheses are not automatically established causes.',
+           'SELU paired profiling is batch background; host probes directly guided these changes. New capture failures do not remove prior measured nodes.',
+           'Partial native_group_norm simulation exists; its contribution to these two changes remains unverified.',
+           'log10 combines paired metrics, simulation, and IR; double-prefetch failure and recovery do not establish net improvement.', ""]
     (OUT / "README.md").write_text("\n".join(md),encoding="utf-8")
     print(OUT)
 

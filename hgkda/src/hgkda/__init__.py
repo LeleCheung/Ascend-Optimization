@@ -1,3 +1,3 @@
-"""HG-KDA 离线诊断核心及可选执行适配器。"""
+"""HG-KDA offline diagnostic core and optional execution adapters."""
 
 __version__ = "0.1.0"

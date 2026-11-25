@@ -1,4 +1,4 @@
-"""指令清单按源码邻域聚合；有时间轴时计算逐流水区间并集与可观测空闲。"""
+"""Aggregate instructions by source regions; derive per-pipeline interval unions and observable idle time from timelines."""
 
 
 import argparse
@@ -46,7 +46,7 @@ def length(intervals):
 
 
 def complement(intervals, start, end):
-    if not finite(start) or not finite(end) or end<=start:raise ValueError('无效捕获范围')
+    if not finite(start) or not finite(end) or end<=start:raise ValueError('Invalid capture range')
     active=union((max(start,a),min(end,b)) for a,b in intervals)
     gaps=[];cursor=start
     for a,b in active:
@@ -80,12 +80,12 @@ def pc_key(value):
 
 
 def source_scopes(sources):
-    """只使用SHA核验且文件名精确匹配的源码，识别静态循环/条件/函数范围。"""
+    """Identify static loop, conditional, and function ranges using SHA-verified source with exact filename matching."""
     scopes={}
     for file,entry in (sources or {}).items():
         text=entry['text']
         if hashlib.sha256(text.encode('utf8')).hexdigest()!=entry['sha256']:
-            raise ValueError('热点区域源码SHA不匹配 '+file)
+            raise ValueError('Hotspot-region source SHA mismatch: '+file)
         spans=[]
         for node in ast.walk(ast.parse(text,filename=file)):
             if isinstance(node,(ast.For,ast.While)):
@@ -103,7 +103,7 @@ def region_key(instruction, width=8, scopes=None):
     line=source.get('line')
     if isinstance(line,int) and line>0 and source.get('file'):
         spans=[s for s in (scopes or {}).get(source['file'],[]) if s[2]<=line<=s[3]]
-        # 优先把循环中的搬入/计算/写回放在同一范围，避免按if分支再次割碎循环。
+        # Keep loads, computation, and stores within a loop together rather than splitting the loop again at each conditional.
         for kind in ['source_loop','source_conditional','source_function']:
             matches=[s for s in spans if s[0]==kind]
             if matches:return min(matches,key=lambda s:s[3]-s[2])
@@ -115,16 +115,16 @@ def region_key(instruction, width=8, scopes=None):
 
 
 def analyze(listing, trace=None, *, core=None, kernel=None, width=8, top=12, trace_unit='us', capture=None, sources=None):
-    if width<=0 or top<=0 or trace_unit not in {'us','ns','cycles','fraction'}:raise ValueError('无效分组或单位')
+    if width<=0 or top<=0 or trace_unit not in {'us','ns','cycles','fraction'}:raise ValueError('Invalid grouping or time unit')
     kernels=[k for k in listing.get('kernels',[]) if kernel is None or k['name']==kernel]
-    if not kernels:raise ValueError('没有匹配kernel')
-    if trace is not None and (len(kernels)!=1 or core is None):raise ValueError('trace必须绑定唯一kernel和具体硬件核')
+    if not kernels:raise ValueError('No matching kernel')
+    if trace is not None and (len(kernels)!=1 or core is None):raise ValueError('Trace must bind to one kernel and a specific hardware core')
     if trace is not None and isinstance(trace,dict) and 'hgkda_binding' in trace:
         binding=trace['hgkda_binding']
         expected=dict(source_sha256=listing.get('source_sha256'),case=listing.get('case'),
                       kernel=kernels[0]['name'],core=core,time_unit=trace_unit)
         if any(binding.get(key)!=value for key,value in expected.items()):
-            raise ValueError('时间轴与指令清单的源码、case、kernel、core或单位不同')
+            raise ValueError('Timeline and instruction listing disagree on source, case, kernel, core, or time unit')
     regions=[];lookup={};scopes=source_scopes(sources)
     for k in kernels:
         for c in k.get('cores',[]):
@@ -141,23 +141,23 @@ def analyze(listing, trace=None, *, core=None, kernel=None, width=8, top=12, tra
                          wait_instruction_time_sum_us=sum(m.get('running_time_us',0) for m in members if re.search(r'WAIT|BAR',m.get('instruction',''),re.I) and finite(m.get('running_time_us',0))),
                          pcs=[m.get('pc') for m in members],source_lines=sorted({(m.get('source') or {}).get('line',0) for m in members}),
                          contains_function_entry=any((m.get('source') or {}).get('code','').lstrip().startswith('def ') for m in members),
-                         interpretation=('SHA核验源码的静态AST范围；编译器调试位置决定归属，不重建动态循环次数或硬件关键路径。' if kind in {'source_loop','source_conditional','source_function'} else '源码邻域/PC邻域。')+'累计指令时间仅作关注度排序，各流水可重叠，非真实区域耗时或已证实因果')
+                         interpretation=('Static AST ranges from SHA-verified source; compiler debug locations determine membership, not dynamic iteration counts or hardware critical paths. ' if kind in {'source_loop','source_conditional','source_function'} else 'Source/PC neighborhood. ')+'Cumulative instruction time ranks regions for investigation; overlapping pipelines prevent interpreting it as elapsed region time or established causality')
                 regions.append(row)
                 for m in members:
                     pc=pc_key(m.get('pc'))
                     if pc is not None:lookup[pc]=identifier
-    timeline=dict(status='unsupported',reason='没有绑定的逐指令时间轴；不从汇总活跃比例反推空泡')
+    timeline=dict(status='unsupported',reason='No bound instruction timeline; aggregate activity ratios cannot reconstruct idle intervals')
     if trace is not None:
         events=trace.get('traceEvents',[]) if isinstance(trace,dict) else trace
         names={e.get('pid'):e.get('args',{}).get('name','unknown') for e in events if e.get('ph')=='M' and e.get('name')=='process_name'}
         valid=[e for e in events if e.get('ph')=='X' and finite(e.get('ts')) and finite(e.get('dur')) and e['dur']>0]
         hardware=[e for e in valid if names.get(e.get('pid')) in HARDWARE_PIPELINES]
         if not valid:
-            timeline=dict(status='unsupported',reason='无正时长完整事件')
+            timeline=dict(status='unsupported',reason='No complete events with positive duration')
         else:
             window_events=hardware or valid
             start,end=capture if capture is not None else (min(e['ts'] for e in window_events),max(e['ts']+e['dur'] for e in window_events))
-            if not finite(start) or not finite(end) or end<=start:raise ValueError('无效时间轴捕获窗口')
+            if not finite(start) or not finite(end) or end<=start:raise ValueError('Invalid timeline capture window')
             by_pipeline=defaultdict(list);waits=defaultdict(list);productive=defaultdict(list);by_region=defaultdict(list)
             outside=0
             for e in valid:
@@ -186,14 +186,14 @@ def analyze(listing, trace=None, *, core=None, kernel=None, width=8, top=12, tra
                 if row['id'] in by_region:
                     row.update(trace_interval_union=length(by_region[row['id']]),trace_time_unit=trace_unit)
             timeline=dict(status='completed',core=core,kernel=kernels[0]['name'],time_unit=trace_unit,capture_start=start,capture_end=end,capture_duration=end-start,
-                          capture_scope='显式窗口' if capture else '本核硬件流水首个至末个可见事件；无硬件泳道时使用全部事件并单列；不包含未知启动前后空闲',
+                          capture_scope='Explicit window' if capture else 'First through last visible hardware-pipeline event on this core; use all events and label the fallback when hardware lanes are absent. Unknown idle time outside the window is excluded.',
                           display_time_unit=trace.get('displayTimeUnit') if isinstance(trace,dict) else None,
                           pipelines=rows,outside_events=outside,
-                          interpretation='productive排除WAIT/BAR；wait_only排除与有效指令重叠的等待；productive+wait_only+idle=窗口。idle不是因果停顿，不重建关键路径；辅助trace泳道另标。Chrome ts/dur通常为微秒，displayTimeUnit仅显示单位，输入单位由调用者确认。')
+                          interpretation='productive excludes WAIT/BAR; wait_only excludes waits overlapping productive instructions; productive+wait_only+idle equals the window. Idle does not establish a causal stall or critical path. Auxiliary trace lanes are labeled separately. Chrome ts/dur usually uses microseconds; displayTimeUnit is display-only, and callers must confirm the input unit.')
     regions.sort(key=lambda r:(r.get('trace_interval_union',0),r['instruction_time_sum_us']),reverse=True)
     return dict(schema='hgkda-regions-v1',status='completed' if regions else 'empty',
                 source_sha256=listing.get('source_sha256'),case=listing.get('case'),
                 regions=regions[:top],total_regions=len(regions),timeline=timeline,
                 grouping=dict(source_line_window=width,pc_bytes=64,top=top,verified_source_files={file:entry['sha256'] for file,entry in (sources or {}).items()},
-                    policy='精确文件匹配时优先静态源码循环，其次条件/函数范围；无核验源码时保留邻域聚合'),
-                limitations=['静态源码范围不等同编译后基本块或动态关键路径；源码邻域回退仍需结合实际IR解释', '不同区域的区间也可能重叠，不累加为总耗时', '函数入口调试行号可能覆盖多段指令，已显式标记'])
+                    policy='Prefer static source loops, then conditional/function ranges with exact file matching; otherwise retain neighborhood aggregation'),
+                limitations=['Static source ranges are not compiled basic blocks or dynamic critical paths; interpret neighborhood fallbacks alongside actual IR', 'Region intervals may overlap and cannot be summed into total latency', 'Function-entry debug lines may cover several instruction regions and are explicitly labeled'])

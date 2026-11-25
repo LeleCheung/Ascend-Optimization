@@ -1,5 +1,5 @@
-// 参考实现：厂商 Uniform 与 Clamp 的同语义组合，修复低精度输出的半开区间边界。
-// PyTorch 仅承担分配、生成器状态与当前 stream；不计算目标设备算子。
+// Reference: vendor Uniform+Clamp composition preserves half-open bounds after low-precision rounding.
+// PyTorch handles allocation, generator state, and the current stream; vendor APIs perform device math.
 #include <torch/extension.h>
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/aten/NPUGeneratorImpl.h"
@@ -41,7 +41,7 @@ struct Descriptors {
     }
 };
 
-// 仅计算宿主标量参数，不读取或处理输入张量的数值。
+// Compute host scalar parameters only; do not read or process input tensor values.
 template<typename T> double adjacent16(double value,bool up) {
     T rounded(static_cast<float>(value));
     float number=static_cast<float>(rounded);

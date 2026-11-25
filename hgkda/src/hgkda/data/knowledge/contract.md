@@ -1,7 +1,15 @@
-# 候选与参考合同
+# Candidate and reference contract
 
-候选的全部设备计算、复制、归约、扫描、布局转换及回退路径严格使用 Triton。CANN 原生库及来源明确的 Ascend C 实现用于参考，不替代候选实现。Python/C++ 仅负责分配、元数据、参数、编译缓存、状态管理及 Triton 启动。
+Strict candidates use Triton for every device computation, copy, reduction, scan,
+layout conversion, and fallback. CANN libraries and identified Ascend C implementations
+are references. Python/C++ handles allocation, metadata, arguments, compilation caches,
+state, and launching only.
 
-保留 dtype、stride、offset、特殊值、原地/out 别名、当前设备和 stream 语义。只缓存编译结果和元数据，不缓存输入、输出、旧 stream 或运算结果。地址特化缓存必须区分对齐条件及设备。
+Preserve dtype, stride, offset, special values, in-place/out identity, current device,
+and stream semantics. Cache immutable metadata only, never tensor inputs/results or
+old streams. Do not hide host fallback or change tests to fit the candidate.
 
-静态扫描发现已知风险，不能证明全部路径合规。候选需要绑定源码与依赖的审查记录、完整 KGS 正确性/性能评测，以及算子所需的补充检查。默认一次正式评测；额外复测须有明确原因。历史混合后端成绩不计入严格 Triton 成果。
+Static screening identifies known risks; it does not establish whole-path compliance.
+Bind a source review, full KGS correctness/performance evaluation, and required supplementary
+checks to the candidate. Default to one formal evaluation; explain repeats. Historical
+mixed-backend scores are not strict Triton results.

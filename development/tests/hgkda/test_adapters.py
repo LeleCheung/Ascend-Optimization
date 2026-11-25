@@ -1,4 +1,4 @@
-"""验证冻结合同、候选审查和后端请求边界。"""
+"""Verify frozen contracts, candidate reviews, and backend request boundaries."""
 import hashlib
 import json
 from pathlib import Path

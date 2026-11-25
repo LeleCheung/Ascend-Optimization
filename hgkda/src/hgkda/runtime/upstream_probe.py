@@ -1,4 +1,4 @@
-"""核验设备进程加载的 FlagGems 目录和目标函数，不执行目标算子计算。"""
+"""Verify the device process loaded the intended FlagGems directory/function without executing target computation."""
 import argparse
 import hashlib
 import inspect
@@ -19,7 +19,7 @@ def main():
     function=inspect.unwrap(getattr(flag_gems,a.operator))
     module=sys.modules[function.__module__]
     path=Path(inspect.getsourcefile(function)).resolve()
-    assert package.is_relative_to(root) and path.is_relative_to(root),'加载到了其他FlagGems安装'
+    assert package.is_relative_to(root) and path.is_relative_to(root),'A different FlagGems installation was loaded'
     value=dict(package=str(package),operator=a.operator,module=function.__module__,
                source=path.relative_to(root).as_posix(),source_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
                vendor=flag_gems.vendor_name,device=flag_gems.device,

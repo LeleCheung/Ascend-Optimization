@@ -1,4 +1,4 @@
-"""验证知识准入与去重，不将缺失证据升级为成功结论。"""
+"""Verify knowledge admission/deduplication without promoting missing evidence to success."""
 import copy
 import hashlib
 import json
@@ -25,7 +25,7 @@ class KnowledgeTests(unittest.TestCase):
             values['feedback.json']['inputs']=[dict(sha256=digest),dict(sha256=sha('result.json'))]
             (root/'feedback.json').write_text(json.dumps(values['feedback.json']))
             record=dict(id='failed',operator_type='pointwise',action_id='prefetch',
-                scope=dict(operator='log10_',performance_threshold=.8),summary='正确性通过但性能未过线',status='observed_failure',
+                scope=dict(operator='log10_',performance_threshold=.8),summary='Correctness passed but performance missed the threshold',status='observed_failure',
                 evidence=dict(source='candidate.py',source_sha256=digest,formal_result='result.json',formal_result_sha256=sha('result.json'),
                     formal_request='request.json',backend_review='review.json',backend_review_sha256=sha('review.json'),
                     performance_feedback=dict(path='feedback.json',sha256=sha('feedback.json'))))
@@ -39,7 +39,7 @@ class KnowledgeTests(unittest.TestCase):
 
     def test_missing_evidence_downgrades_validation(self):
         record={'id':'sample','operator_type':'pointwise','action_id':'tile',
-                'scope':{'operator':'expm1_'},'summary':'待核验分块修改',
+                'scope':{'operator':'expm1_'},'summary':'Pending tile-change verification',
                 'status':'validated','evidence':{'source':'missing.py','formal_result':'missing.json'}}
         with tempfile.TemporaryDirectory() as temp:
             index=organize([record],root=Path(temp))
@@ -49,7 +49,7 @@ class KnowledgeTests(unittest.TestCase):
 
     def test_dedup_keeps_history(self):
         first={'id':'old','operator_type':'pointwise','action_id':'tile','scope':{'operator':'expm1_'},
-               'summary':'历史待验证假设','status':'draft','evidence':{'note':'unverified'},'updated_at':'2026-11-01'}
+               'summary':'Historical unverified hypothesis','status':'draft','evidence':{'note':'unverified'},'updated_at':'2026-11-01'}
         latest=copy.deepcopy(first);latest.update(id='new',updated_at='2026-11-03')
         result=organize([first,latest])
         self.assertEqual(result['active'][0]['id'],'new')

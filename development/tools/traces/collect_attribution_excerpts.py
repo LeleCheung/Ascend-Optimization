@@ -12,7 +12,7 @@ def main():
     root=Path('/data/hanle/ascend-optimization/runs')
     ops=['selu_','rad2deg_','log10_','uniform','negative_','native_group_norm','upsample_bilinear2d']
     records=[];profiles=[];visited=[]
-    pattern=re.compile(r'ascend-instructions|WAIT_FLAG|BAR\.ALL|instr_exe|regions\.json|simulator.{0,35}(?:json|hotspot|instruction)|模拟器',re.I)
+    pattern=re.compile('ascend-instructions|WAIT_FLAG|BAR\\.ALL|instr_exe|regions\\.json|simulator.{0,35}(?:json|hotspot|instruction)|\u6a21\u62df\u5668',re.I)
     for ledger in root.glob('*/kg-runs/*/stages/optimize/work/.ledger.json'):
         op=next((o for o in ops if ledger.parents[3].name.startswith(o+'-')),None)
         if not op:continue

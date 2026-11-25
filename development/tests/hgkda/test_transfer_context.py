@@ -1,4 +1,4 @@
-"""方法迁移上下文绑定当前源码、合同与冻结方法，避免借用旧候选采集。"""
+"""Method-transfer context binds current source/contract/frozen method without borrowing old-source captures."""
 import hashlib
 import importlib.util
 import json

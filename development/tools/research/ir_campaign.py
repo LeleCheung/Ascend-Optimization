@@ -1,7 +1,6 @@
 """Prepare source-frozen IR studies and run generic capture/evaluation stages."""
 import argparse
 import copy
-import fcntl
 import hashlib
 import json
 from pathlib import Path
@@ -112,6 +111,7 @@ def capture(run):
     shell += '\n'.join('export ' + key + '=' + shlex.quote(value) for key, value in environment.items())
     shell += '\nexec ' + shlex.join(command)
     save(run / 'status.json', dict(status='waiting_for_capture_lock', source_sha256=sha(source)))
+    import fcntl  # Linux-only device locking; offline analysis remains portable.
     with Path(config['lock']).open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         save(run / 'status.json', dict(status='capturing_target_ir', source_sha256=sha(source)))
@@ -265,6 +265,7 @@ def evaluate(run, invocation, baseline=False, resume=False):
     save(output / 'operation.json', dict(operation_id=operation, request_sha256=sha(output / 'request.json')))
     save(run / 'status.json', dict(status='waiting_for_formal_lock', invocation=invocation,
         source_sha256=config['source_sha256'], operation_id=operation))
+    import fcntl  # Linux-only device locking; offline analysis remains portable.
     with Path(config['lock']).open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         save(run / 'status.json', dict(status='evaluating', invocation=invocation,

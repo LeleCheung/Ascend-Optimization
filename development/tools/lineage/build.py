@@ -1,4 +1,4 @@
-"""复用已审查交付与原始 Git 对象，建立三类版本的可核验索引，不运行设备实验。"""
+"""Build a verifiable three-version index from reviewed deliveries and original Git objects, without device experiments."""
 import argparse
 import hashlib
 import json
@@ -62,10 +62,10 @@ def main():
     parser.add_argument('--repository', type=Path, default=Path.cwd())
     parser.add_argument('--archive-ref', default='archive/pre-release-20261103')
     parser.add_argument('--previous-table', type=Path, required=True,
-                        help='语雀原表解析得到的三组二维数组，只读历史报告字段')
+                        help='Three 2-D groups parsed from the original Yuque table; read historical report fields only')
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--resume', action='store_true', help='恢复中断整理，已保存原件必须逐字节相同')
-    parser.add_argument('--skill-validation', type=Path, help='已完成的代表算子实际生成试验原件目录')
+    parser.add_argument('--resume', action='store_true', help='Resume interrupted organization; retained originals must be byte-identical')
+    parser.add_argument('--skill-validation', type=Path, help='Artifact directory of the completed representative-operator generation experiment')
     args = parser.parse_args()
     repo = args.repository.resolve()
     output = args.output.resolve()
@@ -109,7 +109,7 @@ def main():
             request_id, request_raw = original(request_path, directory/'request.json')
             request = json.loads(request_raw)
             code = request['implementation']['sources'][0]['content'].encode()
-            # 源文件原件的字节摘要必须与正式请求直接相同。
+            # Original source byte digests must match the formal request directly.
             frozen_source = (output/directory.parent/'candidate.py').read_bytes()
             assert sha(frozen_source) == source_sha
             assert code.replace(b'\r\n', b'\n') == frozen_source.replace(b'\r\n', b'\n'), result_path
@@ -129,7 +129,7 @@ def main():
             'priority': 'operators/campaigns/cann-priority-20261102/delivery.json',
             'reviews': 'operators/campaigns/strict-triton-20261102/candidate-index.json',
         }.items():
-            # 旧批次文件名由实际 Git 树确认；不存在时不猜测同名文件。
+            # Confirm historical filenames from actual Git trees; do not guess missing files.
             if archive.path(path) not in archive.tree:
                 matches = [p for p in archive.tree if '/strict-triton-20261102/' in p
                            and p.endswith('/'+Path(path).name)]
@@ -161,20 +161,20 @@ def main():
                 review = inputs['reviews'].get(op, {})
                 versions['historical_nonconforming'] = dict(
                     status='archived_nonconforming', source=source_id,
-                    reason=('显式Ascend C设备路径' if selected else review.get('method', old['status'])),
+                    reason=('Explicit Ascend C device path' if selected else review.get('method', old['status'])),
                     isolation=old, measurements={'cann': measured},
-                    selection='既有CANN优先批次的正式选中版本；未遍历全历史候选比较',
+                    selection='Selected formal version from the prior CANN-first batch; not an exhaustive historical search',
                     included_in_strict_delivery=False)
             else:
                 versions['historical_nonconforming'] = dict(status='no_verified_record',
-                    reason='该算子在本次核验的历史选中版本中未发现不合规版本；不人为补齐三份源码')
+                    reason='No noncompliant version found among verified historical selections; do not fabricate three source versions')
             source = local(fixed['source'])
             evidence = {name: dict(value, artifact=local(value['artifact']))
                         for name, value in fixed['evidence'].items() if 'artifact' in value}
             versions['historical_strict_triton'] = dict(status='reviewed_historical',
                 source=source, review=local(fixed['review']), evidence=evidence,
                 accepted=fixed['accepted'], reference_kind=fixed['reference_kind'],
-                selection='拆分前最终交付中固定的历史最佳；不重新挑选同源码的最高复测分数')
+                selection='Historical best fixed by the pre-split delivery; do not select the highest same-source repeat score')
             if now.get('original_contract_accepted'):
                 versions['independent_entry_verified'] = dict(status='verified',
                     origin='existing_candidate_regression_or_codex_repair',
@@ -189,23 +189,23 @@ def main():
                              current_original_contract_accepted=now['original_contract_accepted']))
         for i, values in enumerate(previous[2][1:], 1):
             op = values[0]
-            versions = {name: dict(status='not_reaudited', reason='早期报告未纳入本轮30项合同及逐路径复核')
+            versions = {name: dict(status='not_reaudited', reason='Early report outside this 30-operator contract and path review')
                         for name in ['historical_nonconforming', 'historical_strict_triton', 'independent_entry_verified']}
             if op == 'narrow_copy':
                 p = 'operators/narrow_copy/candidates/contiguous-dma-hybrid-20261010.py'
                 record, raw = original(p, Path('historical_nonconforming')/op/'candidate.py')
                 assert b'aclrtMemcpyAsync' in raw
                 versions['historical_nonconforming'] = dict(status='archived_nonconforming',
-                    source=record, reason='小型连续输入调用CANN aclrtMemcpyAsync，其他路径使用Triton',
+                    source=record, reason='Small contiguous inputs use CANN aclrtMemcpyAsync; other paths use Triton',
                     included_in_strict_delivery=False, reported_pytorch_score=values[3],
-                    performance_binding='原语雀报告值；本轮未重新绑定该成绩的完整请求')
+                    performance_binding='Original Yuque score; full request not rebound in this audit')
             rows.append(dict(operator=op, group='early', order=i, versions=versions,
                 historical_report=dict(zip(previous[2][0], values)),
                 current_original_contract_accepted=None))
         result = dict(schema_version='hgkda.version-lineage/v1', date='2026-11-09',
             archive_commit=archive.commit, rows=rows, count=len(rows),
             current_original_contract_accepted=current['accepted'], target_count=current['total'],
-            scope='历史最佳指已有正式交付所选版本；保留原口径，不宣称已穷举所有历史实验。早期9项只保留报告，缺少现行审查时不划入严格Triton。',
+            scope='Historical best means the existing formal delivery selection, not an exhaustive search. Earlier nine operators retain reports and require current review before strict-Triton classification.',
             artifacts=artifacts)
         if args.skill_validation:
             experiment_root=args.skill_validation.resolve()

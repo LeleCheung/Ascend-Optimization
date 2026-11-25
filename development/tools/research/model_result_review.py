@@ -35,11 +35,11 @@ def main():
         retention={path.name: read(path) for path in sorted(gqa.glob('retention-*.json'))},
         selection=read(gqa / 'selection.json') if (gqa / 'selection.json').exists() else read(gqa / 'parent-selection.json'))
     save(workspace / 'complete-results.json', inputs)
-    prompt = '''这是同一夜间研究的只读结果回传。使用Read完整读取当前目录complete-results.json，里面保留GroupNorm三版、回填三版以及GQA原版／失败版／修复版的完整设备结果与已保留选择。禁止编辑任何候选、诊断或调度文件，本调用只有Read工具。
-用简明中文确认完整结果已收到：列出两项已验收IR目标shape的原／改耗时、全合同耗时几何变化；指出回填ir-003相对已保留ir-002的负结果。核对GQA修复版四项官方checker和真实耗时，计算case4相对原保留版改善；明确case1资源修复恢复原因果分块，三个非因果使用更宽KV分块。原始GQA失败版case4虽变快但case1编译失败；修复版完整通过。GQA后模拟器仍在采集，机制兑现按后续重放决定。说明物理UB估计和部分窗口的证据范围，不外推官方全20项。不得生成或修改目标实现，不引入新测试、ABBA或搜索预算。可提出一条供后续研究的机制建议，单列为建议。'''
+    prompt = """Read-only result handoff for the same overnight study. Read complete-results.json fully: three GroupNorm versions, three writeback versions, and original/failed/repaired GQA results with retained choices. Only Read is available; do not edit candidate, diagnosis, or scheduling files.
+Confirm receipt concisely in English. List original/modified target-shape timings for the two accepted IR cases and full-contract geometric-mean timing changes; identify writeback ir-003 as a negative result against retained ir-002. Verify repaired GQA official checkers and timings for all four cases; calculate case4 improvement against the retained original. Explain restored causal tiling for case1 resource repair and wider KV tiling for the three noncausal cases. Failed GQA improved case4 but failed case1 compilation; repaired GQA fully passed. Post-change simulation is pending; verify mechanisms with later replay. Preserve physical-UB estimate and partial-window scope without extrapolating to all 20 cases. No implementation edits, new tests, ABBA, or search budgets. Optionally state one separately labeled research hypothesis."""
     if args.gqa_only:
-        prompt = '''这是GQA续接的只读完整结果回传。用Read完整读取complete-results.json，其中包含原四项基线、全部新候选完整结果、后取证状态及保留选择。仅Read，禁止编辑任何文件。
-简明确认收到各版完整四项，按真实结果列出case4耗时及官方checker状态；从parent原始结果读取本轮起点，计算保留版相对本轮起点的目标变化，同时说明四项集合表现和负结果。实际源码／IR层与部分重放边界分别说明，完整20项官方验收留作后续。编译资源估计、浮点逐位等价及降低搬运的预测须与实际编译／checker／重放结果区分。可以提出一个后续假设，保持建议身份；本调用只回收完整结果。'''
+        prompt = """Read-only full-result handoff for GQA continuation. Read complete-results.json fully, including original four-case baseline, every new candidate, post-collection status, and retained selection. Only Read; edit nothing.
+Confirm receipt of full four-case results and list actual case4 timings/checker states. Read the starting point from parent results and calculate retained-target improvement; also report all-four behavior and negative results. Separate actual source/IR layer and partial-replay scope; full 20-case official acceptance remains future work. Distinguish resource estimates, bitwise-equivalence/movement predictions from actual compiler/checker/replay outcomes. Optionally state one hypothesis as a suggestion; this invocation only acknowledges full results."""
     (run / 'prompt.md').write_text(prompt, encoding='utf8')
     settings = read(root / 'gqa/model-settings.json')
     environment = dict(os.environ)

@@ -1,4 +1,4 @@
-"""验证性能未达标会继续优化，并选择拉低总体成绩的小输入。"""
+"""Below-threshold performance must continue optimization and include small cases that reduce the aggregate score."""
 import copy
 import json
 from pathlib import Path

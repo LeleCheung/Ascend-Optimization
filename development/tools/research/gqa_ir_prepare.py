@@ -79,14 +79,14 @@ def main():
     save(workspace / 'diagnosis.json', dict(source_sha256=sha(source),
         selected_layer='single_operator_ir', evidence=[], hypothesis='', change='', expected='', validation=''))
     save(workspace / 'codex-brief.json', dict(source_sha256=sha(source), author='Codex',
-        analysis='源分块QK的每条dot输出128KiB，但三维join、transpose、reshape实际使UB需求达到3146016B。'
-            '已查当前language.semantic.cat，实际断言can_reorder为真且仅支持rank1；当前PV要求key列顺序保持。'
-            '请在同一BCMLIR中研究有序二维拼接：直接构造最终256×256分数张量，'
-            '将两个256×128结果分别放在前后128列，消除三维交错和转置。'
-            '保持每个FP32值、顺序、两次QK、softmax、PV、全部ABI与属性。'
-            '由你选择并实际编辑IR，宿主先审查等价性与CPU编译，再集成完整原四项验收。'
-            'UB与L0C仍以真实编译结果为准；该分支尚无目标真机成绩，当前最佳006328.4468μs独立冻结。'
-            '原profiling与模拟器均为006历史背景，当前触发证据为015完整编译错误和源绑定实际IR。'))
+        analysis='Each source-tiled QK dot outputs 128 KiB, but 3-D join/transpose/reshape expands actual UB demand to 3146016 B.'
+            'Current language.semantic.cat requires can_reorder=true and rank 1; this PV requires key-column order preservation.'
+            'Investigate ordered 2-D concatenation in the same BCMLIR: directly construct final 256x256 scores, '
+            'place the two 256x128 results in the first/last 128 columns, and eliminate 3-D interleaving/transposition.'
+            'Preserve each FP32 value, order, both QK operations, softmax, PV, every ABI, and all attributes.'
+            'Choose and edit actual IR; the host reviews equivalence/CPU compilation before full original four-case acceptance.'
+            'Actual compilation determines UB/L0C usage. This branch has no target-device score; best 006 at 328.4468 us remains frozen separately.'
+            'Profiling/simulation are historical 006 background. Current triggers are the full 015 compiler error and source-bound actual IR.'))
     if a.host_brief:
         brief = read(a.host_brief)
         assert brief['source_sha256'] == sha(source)

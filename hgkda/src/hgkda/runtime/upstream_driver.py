@@ -1,4 +1,4 @@
-"""按明确文件运行未修改的上游测试，复用上游结果解析函数。"""
+"""Run unmodified upstream tests by explicit file selection and reuse the upstream result parser."""
 import argparse
 import json
 from pathlib import Path
@@ -22,7 +22,7 @@ def main():
         for name in c[key]:
             path=(repo/name).resolve();assert path.is_relative_to(repo/subdir) and path.is_file()
             paths.append(str(path.relative_to(repo/subdir)))
-        assert paths,'必须明确目标测试文件'
+        assert paths,'Explicit target test files are required'
         target=folder/(phase+'_result.json')
         command=[sys.executable,'-m','pytest',*paths,'-m',c.get('marker',operator),
                  '--record','json','--output',str(target),'--continue-on-collection-errors']

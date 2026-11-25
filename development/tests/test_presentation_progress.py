@@ -19,7 +19,7 @@ class PresentationProgressTest(unittest.TestCase):
         self.assertEqual(milestones(data)['displayed_indices'], [0, 1, 3])
         self.assertEqual(data, original)
         svg = render(data)
-        self.assertIn('固定shape 0.800', svg)
+        self.assertIn('Fixed shape 0.800', svg)
         self.assertIn('source-lineage', svg)
         self.assertNotIn('0.400×', svg)
 
@@ -57,7 +57,7 @@ class PresentationProgressTest(unittest.TestCase):
         selection = milestones(data)
         self.assertEqual(selection['displayed_indices'], [0, 1, 3])
         self.assertEqual(selection['detail_indices'], [2])
-        self.assertEqual(selection['axis_labels']['3'], '第2轮')
+        self.assertEqual(selection['axis_labels']['3'], 'Round 2')
         drawing = render(data)
         self.assertNotIn('same source replay', drawing)
         self.assertNotIn('measurement-transition', drawing)
@@ -76,7 +76,7 @@ class PresentationProgressTest(unittest.TestCase):
         original = copy.deepcopy(data)
         self.assertEqual(milestones(data)['displayed_indices'], [0, 1, 3])
         self.assertEqual(milestones(data)['detail_indices'], [2])
-        self.assertNotIn('同源码复测', render(data))
+        self.assertNotIn('Same-source repeat', render(data))
         self.assertEqual(data, original)
 
     def test_unmarked_source_remeasurement_retains_original_connection_proof(self):

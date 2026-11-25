@@ -1,4 +1,4 @@
-"""保留首次接口故障，重测原IR并继续已审查的IR候选。"""
+"""Retain the initial interface failure, validate original IR, then continue reviewed candidates."""
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path

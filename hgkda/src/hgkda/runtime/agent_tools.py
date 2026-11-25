@@ -1,4 +1,4 @@
-"""独立skill试验的有限工具桥：整理上下文或预检候选，不启动模型或KG。"""
+"""Limited tool bridge for isolated skill experiments: build context or preflight candidates without starting a model or KG."""
 import argparse
 import hashlib
 import json
@@ -37,7 +37,7 @@ def main():
     if args.action=='decision':
         from hgkda.runtime.trace import record_decision
         path=args.record or workspace/'diagnosis.json'
-        # 相对路径由模型工作区解释，文件不能来自其他实验目录。
+        # Resolve relative paths inside the model workspace; files cannot come from other experiments.
         path=((workspace/args.record) if args.record and not args.record.is_absolute() else path).resolve()
         assert path.is_relative_to(workspace.resolve()),'decision must be inside current workspace'
         report(record_decision(config,read(path)));return
@@ -53,28 +53,28 @@ def main():
     source=args.source.resolve()
     assert source.is_relative_to(workspace.resolve()) and source.suffix=='.py'
     if config.get('context_kind')=='operator_transfer' and source!=workspace.resolve()/'candidate.py':
-        report(dict(status='source_rejected',reason='只接受workspace/candidate.py算子实现；不运行起点或测试／探测脚本'));return
+        report(dict(status='source_rejected',reason='Only workspace/candidate.py operator implementations are accepted; starter, test, and probe scripts are not executed'));return
     text=source.read_bytes().decode('utf8');inspection=inspect_text(text)
     if inspection['issues']:
         report(dict(status='static_rejected',issues=inspection['issues']));return
-    # 本试验不接受未提供源码的二进制或动态外部执行依赖。
+    # This experiment rejects binary or dynamic external execution dependencies without supplied source.
     import ast
     for node in ast.walk(ast.parse(text)):
         if isinstance(node,ast.Import):names=[item.name for item in node.names]
         elif isinstance(node,ast.ImportFrom):names=[node.module or '']
         else:continue
         assert all(name.split('.')[0] in {'torch','torch_npu','triton','math','functools','typing','os'} for name in names),names
-    # os仅用于当前编译模式的环境元数据，不允许额外宿主执行或文件操作。
+    # os is allowed only for compilation-mode metadata, not additional host execution or file operations.
     for node in ast.walk(ast.parse(text)):
         if isinstance(node,ast.Attribute) and isinstance(node.value,ast.Name) and node.value.id=='os':
-            assert node.attr in {'environ','getenv'},'os仅允许读取环境模式元数据'
+            assert node.attr in {'environ','getenv'},'os may only read environment-mode metadata'
     digest=sha(source);attempt=run/'attempts'/digest
     if config.get('require_preflight_review'):
         from hgkda.gate import admit
         review=run/'source-reviews'/(digest+'.json')
         if not review.exists():
             pending=dict(status='awaiting_source_review',source_sha256=digest,source=str(source),
-                reason='设备操作前等待外部只读路径与地址边界审查；保持当前候选不变并返回')
+                reason='Await external read-only execution-path and address-boundary review before device actions; preserve current candidate and return')
             (workspace/'latest-preflight.json').write_text(json.dumps(pending,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
             report(pending);return
         admit(text,read(review))
@@ -85,7 +85,7 @@ def main():
     limit=config.get('maximum_preflight_sources',0)
     assert isinstance(limit,int) and limit>=0, 'maximum_preflight_sources must be a nonnegative integer'
     if limit:
-        assert len(list((run/'attempts').glob('*/preflight.json'))) < limit, '已达到本轮显式配置的设备预检数量限制'
+        assert len(list((run/'attempts').glob('*/preflight.json'))) < limit, 'The explicitly configured device-preflight limit for this round has been reached'
     attempt.mkdir(parents=True,exist_ok=False)
     frozen=attempt/'candidate.py';frozen.write_bytes(source.read_bytes())
     checks=config['job']['checks'];environment={
@@ -99,7 +99,7 @@ def main():
         shell+='exec '+shlex.join([config['device_python'],*map(str,command)])
         return execute(['docker','exec',config['container'],'bash','-c',shell],attempt/(label+'.log'),cwd=repo)
 
-    import fcntl  # 仅Linux设备执行阶段需要文件锁；离线上下文与帮助不依赖它。
+    import fcntl  # File locking is needed only for Linux device execution; offline context/help do not depend on it.
     with Path(config['lock']).open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX)
         code=device('compiled',[Path(__file__).with_name('capture_compiled.py'),'--source',frozen,
@@ -116,7 +116,7 @@ def main():
         supplementary=dict(passed=qualification['passed'],total=qualification['total']) if qualification else None,
         failed_cases=[dict(case=row['case'],error=row.get('error')) for row in (qualification or {}).get('cases',[]) if not row['passed']][:4],
         log_tail=(attempt/('supplementary.log' if qualification else 'compiled.log')).read_text(errors='replace')[-1800:] if code else '',
-        formal_evaluation='待宿主模型完成逐路径源码审查后执行一次KGS完整评测')
+        formal_evaluation='Run one full KGS evaluation after the host model completes execution-path source review')
     (attempt/'preflight.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
     (workspace/'latest-preflight.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
     report(result)

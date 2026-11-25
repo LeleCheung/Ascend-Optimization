@@ -1,4 +1,4 @@
-"""严格 Triton 路径的静态筛查与源码审查身份检查。"""
+"""Static screening and source-review identity checks for strict Triton paths."""
 import ast
 import hashlib
 
@@ -35,7 +35,7 @@ def inspect_text(text):
                 kernels.append(node.name)
                 for sub in ast.walk(node):
                     if isinstance(sub, ast.Call) and canonical(sub.func).startswith('torch.'):
-                        issues.append({'line': sub.lineno, 'call': canonical(sub.func), 'reason': '核内出现 PyTorch 调用'})
+                        issues.append({'line': sub.lineno, 'call': canonical(sub.func), 'reason': 'PyTorch call inside a kernel'})
                 return
             self.generic_visit(node)
 
@@ -50,22 +50,22 @@ def inspect_text(text):
                 if tail not in TORCH_METADATA and not tail.startswith(('npu.current_', 'cuda.current_')):
                     forbidden = True
             if forbidden:
-                issues.append({'line': node.lineno, 'call': name, 'reason': '宿主计算、搬运或外部执行入口需要拒绝或单独审查'})
+                issues.append({'line': node.lineno, 'call': name, 'reason': 'Host computation, data movement, or external execution requires rejection or separate review'})
             self.generic_visit(node)
     Visitor().visit(tree)
     return {'source_sha256': hashlib.sha256(text.encode('utf8')).hexdigest(), 'issues': issues,
             'triton_kernels': kernels, 'host_calls': sorted(calls), 'static_passed': not issues,
-            'admission': 'review_required', 'scope': '已知入口的 AST 筛查，不是完整路径证明'}
+            'admission': 'review_required', 'scope': 'AST screening of known entry points, not a complete execution-path proof'}
 
 
 def admit(text, review):
     result = inspect_text(text)
     if review.get('source_sha256') != result['source_sha256']:
-        raise ValueError('审查记录与提交源码不同')
+        raise ValueError('Review record belongs to different submitted source')
     if review.get('status') != 'reviewed_strict_triton' or not all(
             review.get(key) is True for key in ['all_branches_reviewed', 'dependencies_reviewed']):
-        raise ValueError('缺少严格 Triton 的完整调用路径审查')
+        raise ValueError('Missing full execution-path review for strict Triton')
     if result['issues']:
-        raise ValueError('候选存在需要处理的静态风险：' + str(result['issues']))
+        raise ValueError('Candidate has unresolved static risks: ' + str(result['issues']))
     result['admission'] = 'review_bound'
     return result

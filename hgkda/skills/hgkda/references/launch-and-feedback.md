@@ -1,21 +1,43 @@
-# 启动开销与性能反馈
+# Launch cost and performance feedback
 
-当多个小输入的完整调用时间相近，而大输入的设备工作量明显增加时，优先区分宿主调度与设备执行。完整调用、异步提交、设备事件跨度和硬件任务时间分别报告；设备事件跨度仍可能包含宿主发射间隔，不直接当作kernel本体时间。
+Similar full-call times across small inputs, despite increasing large-input device
+work, suggest separating host dispatch and device execution. Report full-call,
+asynchronous submission, device-event span, and task time separately. Event spans
+may contain host issue gaps and are not automatically kernel-only time.
 
-## Triton启动路径
+## Triton launch path
 
-普通 `kernel[grid](tensor, ...)` 每次经过参数绑定、设备／stream处理和运行时调度。可以验证缓存编译结果、packed metadata、函数句柄、网格与宿主参数模板，并直接调用当前编译版本生成的启动器。设备计算仍由该Triton产物执行。
+Ordinary `kernel[grid](tensor, ...)` performs argument binding, device/stream handling,
+and dispatch. Inspect whether compiled results, packed metadata, function handles,
+grids, and host templates can be cached and used with the actual generated launcher.
+Device work must still execute that Triton artifact.
 
-先检查实际编译对象与启动器接口，不能从其他后端猜测ABI。每次调用仍需核对dtype、shape、stride、alignment、设备及当前stream；不得缓存输入、输出、张量结果或旧stream。未对齐、尾块、非连续布局与调试／profiling模式保留经验证的普通Triton回退。首次调用不能重复执行原地计算。
+Inspect the current launcher ABI rather than guessing from other backends. Validate
+dtype, shape, stride, alignment, device, and current stream every call. Never cache
+input/output values or old streams. Keep verified ordinary-Triton fallbacks for
+misalignment, tails, noncontiguous layout, and debug/profiling modes. In-place cold
+starts execute once, without retrying an operation that may already have run.
 
-直接启动接口可能为每个显式 `tl.constexpr` 保留Python参数槽位。例如本机 `make_launcher` 将签名中的 `constexpr` 解析为 `O`；新增编译常量时须同步核对对应槽位，不能只照抄另一个kernel的参数个数。不得用猜测参数位置、捕获执行错误后重发等方式适配ABI，以免原地计算重复执行。
+Direct launchers may retain Python slots for explicit `tl.constexpr` arguments.
+The observed `make_launcher` maps these to `O`; verify added compile-time argument
+slots rather than copying another kernel's count. Do not guess ABI positions or
+catch/reissue failed in-place launches.
 
-历史 `selu_` 的启动器缓存实现相对CANN约1.039×，初次独立生成的普通调度版本为0.210×。本轮经启动路径、队列与分块优化，新生成版达到0.887×，完整36/36、双方各42/42补测及专项33/33通过；历史更快版本继续保留。各整体实现的观察不替代单变量归因；新实例须验证当前路径、正确性与完整性能。获取绑定源码和原件的方法记录用 `knowledge --operator selu_`，无需将历史最佳源码作为模型生成输出。
+Historical SELU launch caching reached about 1.039x CANN, while an independent ordinary
+launch start achieved 0.210x. Subsequent launch/queue/tiling work reached 0.887x, with
+36/36 formal, 42/42 checks on each side, and 33/33 targeted checks. The faster historical
+source remains retained. These implementation-level observations do not establish
+single-variable causality. Use `knowledge --operator selu_` for bound method evidence;
+do not present copied historical source as newly generated model output.
 
-## 性能驱动的继续优化
+## Continue using feedback
 
-1. 将完整正式结果与固定case清单按名称关联，检查dtype、shape和计时范围。
-2. 按 `-log(speedup)` 识别拉低几何平均的case，同时覆盖小输入与最大输入；不要只选绝对耗时最大的case。
-3. 读取源码、实际IR及同输入采集，提出一个明确机制和修改；没有匹配的专项经验时记录空检索，并补查可迁移方法。
-4. 对新源码做路径审查、补充检查及一次正式完整评测。性能未达标时把结果交回模型，继续修改；不能用“正确性通过后停止”代替优化终止条件。
-5. 比较不同源码在同合同下的成绩并保留最佳，不对同源码重复测量挑最高分。失败版保留，不覆盖已交付源码。
+1. Match full formal results to fixed case names, dtype, shape, and timing scope.
+2. Rank losses by `-log(speedup)`, covering small and largest inputs rather than only
+   the most expensive absolute timings.
+3. Read source, actual IR, and matching captures; select one mechanism. Record empty
+   knowledge retrieval and investigate transferable methods when no scoped record exists.
+4. Review new source, run required supplementary checks and one full evaluation, then
+   return full feedback. Correctness alone does not satisfy performance stop conditions.
+5. Compare same-contract source versions and retain the best. Preserve failures without
+   overwriting deliveries or selecting the highest same-source repeat.

@@ -1,4 +1,4 @@
-"""执行一个冻结输入的候选或CANN参考，保存候选实际编译产物。"""
+"""Execute one frozen input on the candidate or CANN reference and save actual compiled candidate artifacts."""
 import argparse
 import hashlib
 import importlib.util

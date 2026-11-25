@@ -1,4 +1,4 @@
-"""为当前生成候选与冻结CANN参考采集同输入指标；先从设备任务发现实际kernel。"""
+"""Capture same-input metrics for the generated candidate and frozen CANN reference after discovering actual device kernels."""
 import argparse
 import csv
 import hashlib
@@ -18,12 +18,12 @@ def save(path,value):path.write_text(json.dumps(value,ensure_ascii=False,indent=
 
 
 def resolve_reported_symbol(alias,log):
-    """从采集器实际报告的符号中消歧，不把运行时任务别名当作二进制符号。"""
+    """Disambiguate actual profiler-reported symbols instead of treating runtime task aliases as binary symbols."""
     reported=sorted(set(re.findall(r'Kernel (\S+) skipped: not selected via --kernel-name',log)))
     operation=alias.rsplit('_',1)[-1]
     matches=[name for name in reported if name.startswith(operation+'_')]
     if not alias.startswith('aclnn') or len(matches)!=1:
-        raise ValueError('任务别名无法与唯一实测二进制符号对应：'+str(dict(alias=alias,reported=reported)))
+        raise ValueError('Task alias cannot be mapped to one measured binary symbol: '+str(dict(alias=alias,reported=reported)))
     return matches[0]
 
 
@@ -53,8 +53,8 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument('--config',type=Path,required=True);p.add_argument('--source',type=Path,required=True)
     p.add_argument('--case',required=True);p.add_argument('--output',type=Path,required=True)
-    p.add_argument('--ir-manifest',type=Path,help='冻结IR计算资源，原算子源码仍按独立SHA标识')
-    p.add_argument('--resume',action='store_true',help='只补齐已有采集，已完成侧不重复采集')
+    p.add_argument('--ir-manifest',type=Path,help='Frozen IR compute resources; original operator source retains its own SHA identity')
+    p.add_argument('--resume',action='store_true',help='Resume incomplete captures only; completed sides are not recaptured')
     a=p.parse_args()
     import fcntl
     c=read(a.config);package=Path(c['package']);run=Path(c['run_directory'])
@@ -110,9 +110,9 @@ def main():
             assert read(trace)['source_sha256']==digest and read(trace)['side']==side
             discovery=read(trace);names=discovery['kernels'];assert names
             if len(names)>1:
-                # 两侧均保留完整调用中的所有任务；模拟器另行显式选定目标。
-                # 同一API可以多次调用同名TransData，但每次对应不同二进制；
-                # 不用别名猜映射，直接采集本次调用的全部实际二进制任务。
+                # Retain all tasks in the full call on both sides; select the simulator target explicitly and separately.
+                # One API may invoke identically named TransData tasks with different binaries.
+                # Capture all actual binary tasks from this call instead of guessing mappings from aliases.
                 all_profile=folder/'all-kernels'
                 compute_tasks,non_metric_tasks=partition_profile_tasks(discovery['tasks'])
                 task_count=len(compute_tasks)
@@ -121,7 +121,7 @@ def main():
                          '--launch-count='+str(task_count),'--warm-up=0','--aic-metrics=Roofline']
                 if not list(all_profile.rglob('OpBasicInfo*.csv')):device(side+'-all-kernels',command)
                 basics=sorted(all_profile.rglob('OpBasicInfo*.csv'))
-                assert len(basics)==task_count,'未完整采集同一API全部任务：'+str((len(basics),task_count))
+                assert len(basics)==task_count,'Not all tasks from the same API were captured: '+str((len(basics),task_count))
                 children=[]
                 for index,basic in enumerate(basics):
                     with basic.open() as stream:rows=list(csv.DictReader(stream))
@@ -139,7 +139,7 @@ def main():
                 save(folder/'collection.json',dict(status='completed',side=side,groups='Roofline',spec_sha256=sha(spec),
                     kernels=children,discovery_sha256=sha(trace),runtime_tasks=discovery['tasks'],
                     non_metric_tasks=non_metric_tasks,
-                    scope='AI-core任务逐项保存指标；SDMA任务保留发现trace与耗时，完整调用由正式评测覆盖。'))
+                    scope='Retain per-task AI-core metrics and discovery traces/durations for SDMA; formal evaluation covers the full call.'))
                 continue
             folder.mkdir(exist_ok=True);symbol=names[0]
             application=shlex.join([c['device_python'],str(Path(__file__).with_name('paired_driver.py')),'--spec',str(spec),'--side',side])
@@ -172,7 +172,7 @@ def main():
                 task_alias=names[0],symbol_resolution=resolution,
                 spec_sha256=sha(spec),command=command,discovery_sha256=sha(trace),
                 driver_sha256=sha(Path(__file__).with_name('paired_driver.py'))))
-    assert sha(source)==digest,'采集期间候选源码发生变化'
+    assert sha(source)==digest,'Candidate source changed during capture'
     comparison=a.output/'comparison.json';context=a.output/'context.json'
     subprocess.run([sys.executable,'-m','hgkda','compare','--directory',str(a.output),'--output',str(comparison)],check=True)
     subprocess.run([sys.executable,'-m','hgkda','context','--operator',c['operator'],'--source',str(source),

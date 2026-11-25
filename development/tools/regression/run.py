@@ -1,4 +1,4 @@
-"""串行执行独立 CLI 回归；每项只提交一次完整评测，未知任务不自动重发。"""
+"""Run independent CLI regression serially, with one full request per operator and no automatic replay of unresolved jobs."""
 import argparse
 from datetime import datetime, timezone
 import fcntl
@@ -68,12 +68,12 @@ def main():
     def call(label, argv, *, timeout=2100):
         log = run/(label+'.log')
         if log.exists():
-            raise RuntimeError('操作已有日志，须核验状态后才能恢复：'+label)
+            raise RuntimeError('Operation already has a log; verify state before resuming: '+label)
         with log.open('xb') as output:
             result = subprocess.run([str(x) for x in argv], stdout=output, stderr=subprocess.STDOUT,
                                     cwd=repo, timeout=timeout)
         if result.returncode:
-            raise RuntimeError(label+' 返回 '+str(result.returncode)+': '+log.read_text(errors='replace')[-1800:])
+            raise RuntimeError(label+' returned '+str(result.returncode)+': '+log.read_text(errors='replace')[-1800:])
 
     def cli(label, arguments):
         call(label, [sys.executable, '-m', 'hgkda', *arguments])
@@ -113,7 +113,7 @@ def main():
                 if str(run/'profiles').encode() in argv:
                     found.append(int(path.parent.name))
         if len(found) != 1:
-            raise RuntimeError('专用服务身份不唯一：'+str(found))
+            raise RuntimeError('Dedicated service identity is not unique: '+str(found))
         return found[0]
 
     with args.lock.open('a') as lock:
@@ -122,7 +122,7 @@ def main():
             state['status'] = 'starting'
             persist()
             with socket.socket() as probe:
-                assert probe.connect_ex(('127.0.0.1',args.port)) != 0, '端口已占用，禁止接管未知服务'
+                assert probe.connect_ex(('127.0.0.1',args.port)) != 0, 'Port is occupied; do not take over an unknown service'
             for record in plan['compatibility_files']:
                 path, archived = Path(record['path']), Path(record['archived'])
                 assert path.is_relative_to(repo/'project') and sha(archived) == record['sha256']
@@ -155,7 +155,7 @@ def main():
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             for _ in range(60):
                 if process.poll() is not None:
-                    raise RuntimeError('专用服务启动失败')
+                    raise RuntimeError('Dedicated service failed to start')
                 try:
                     with opener.open(server+'/status',timeout=2) as response:
                         status = json.load(response)
@@ -163,7 +163,7 @@ def main():
                 except Exception:
                     time.sleep(1)
             else:
-                raise RuntimeError('专用服务未就绪')
+                raise RuntimeError('Dedicated service is not ready')
             server_pid = owner_process()
             save(run/'service-identity.json',dict(pid=server_pid,
                  starttime=Path('/proc/'+str(server_pid)+'/stat').read_text().split()[21],
@@ -192,7 +192,7 @@ def main():
                     result_path = root/'evaluation/result.json'
                     if not result_path.exists():
                         if (root/'evaluation').exists():
-                            raise RuntimeError('已有提交目录但结果未知；必须查询原 operation_id，禁止重发')
+                            raise RuntimeError('Submission directory exists but result is unknown; query the original operation_id instead of resubmitting')
                         cli(op+'-evaluate',['kgs','evaluate','--server',server,'--request',job['request'],
                             '--review',job['review'],'--run-directory',root/'evaluation','--output',root/'evaluate.json'])
                     result = read(result_path)
@@ -214,7 +214,7 @@ def main():
                     print('ERROR',op,row['error'],flush=True)
                     if (root/'evaluation/transport-error.json').exists():
                         persist()
-                        raise RuntimeError('评测任务结果未知；暂停队列以避免设备任务重叠') from error
+                        raise RuntimeError('Evaluation result is unknown; pause the queue to avoid overlapping device jobs') from error
                 state['completed'] = sum(bool(v.get('terminal')) for v in state['operators'].values())
                 state['accepted'] = sum(bool(v.get('accepted')) for v in state['operators'].values())
                 persist()
@@ -226,7 +226,7 @@ def main():
             raise
         finally:
             if server_pid is not None:
-                # 只停止本轮明确身份的服务；未知在途任务保留服务及依赖以便查询。
+                # Stop only this batch's identified service; preserve services/dependencies for unresolved in-flight queries.
                 uncertain = any((run/'operators'/job['operator']/'evaluation/transport-error.json').exists()
                                 and not (run/'operators'/job['operator']/'evaluation/result.json').exists()
                                 for job in plan['jobs'])
@@ -235,7 +235,7 @@ def main():
                     os.kill(server_pid,signal.SIGTERM)
                     if process is not None:
                         process.wait(timeout=30)
-                    save(run/'service-stop.json',dict(pid=server_pid,stopped_at=now(),scope='本批专用服务'))
+                    save(run/'service-stop.json',dict(pid=server_pid,stopped_at=now(),scope='Dedicated service for this batch'))
                     for record in reversed(compatibility):
                         path = Path(record['path'])
                         if path.is_symlink() and path.resolve()==Path(record['archived']).resolve():

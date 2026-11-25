@@ -1,4 +1,4 @@
-"""准备算子迁移试验；复制固定起点原字节，不编写或改动候选实现。"""
+"""Prepare operator-transfer experiments by copying exact starting bytes without implementing candidate changes."""
 import argparse
 from datetime import datetime,timezone
 import hashlib
@@ -37,19 +37,19 @@ def main():
     shutil.copyfile(args.starter_source,workspace/'starter.py')
     save(workspace/'starter-provenance.json',dict(upstream=str(args.starter_source),
          upstream_sha256=sha(args.starter_source),starter_sha256=sha(workspace/'starter.py'),
-         operation='原字节复制；未添加入口或候选补丁，全部适配由生成模型完成',prior_best_source_provided=False))
-    # 当前宿主提供Edit；预备原始字节文件，避免模型为新建文件转向shell写入。
+         operation='Byte-exact copy without entry-point or candidate patches; the generating model owns all adaptation',prior_best_source_provided=False))
+    # The current host provides Edit; initialize original bytes so the model need not create the file through shell commands.
     shutil.copyfile(workspace/'starter.py',workspace/'candidate.py')
     save(workspace/'candidate-initialization.json',dict(kind='upstream_bytes_copy',
         source_sha256=sha(workspace/'starter.py'),candidate_sha256=sha(workspace/'candidate.py'),
-        implementation_changed=False,operation='仅原字节复制固定起点，未适配入口或改变实现'))
+        implementation_changed=False,operation='Byte-exact fixed starting source; no entry-point adaptation or implementation change'))
     catalog={name:[json.loads(line) for line in (leaf/(name+'.jsonl')).read_text().splitlines() if line.strip()]
              for name in ['correctness','timing']}
     save(workspace/'contract.json',dict(operator=args.operator,formal_cases=sum(len(r) for r in catalog.values()),
         supplementary_each=job['checks']['supplementary']['previous_total'],
         timing_cases=catalog['timing'],settings=job['settings'],reference=job['reference_kind'],
         layouts=sorted({str(r.get('inputs',{}).get('spec',{}).get('strided',False)) for r in catalog['correctness']}),
-        threshold=.8,public_entrypoint='run(A)',supplementary_requirements='原固定检查器全部通过，包括特殊值、别名、布局、stream和同shape对齐序列'))
+        threshold=.8,public_entrypoint='run(A)',supplementary_requirements='All fixed checkers must pass, including special values, aliasing, layout, streams, and same-shape aligned sequences'))
     shutil.copytree(package/'skills/hgkda',workspace/'skills/hgkda')
     (workspace/'.claude/skills').mkdir(parents=True)
     (workspace/'.claude/skills/hgkda').symlink_to(workspace/'skills/hgkda',target_is_directory=True)
@@ -57,7 +57,7 @@ def main():
                   for p in (package/folder).rglob('*') if p.is_file() and '__pycache__' not in p.parts]
     method_manifest=run/'method-manifest.json'
     save(method_manifest,dict(phase=args.phase,files=[dict(path=p.relative_to(package).as_posix(),sha256=sha(p))
-         for p in sorted(method_files)],policy='调用前核验方法身份；模型仅修改workspace候选与诊断'))
+         for p in sorted(method_files)],policy='Verify method identity before invocation; model edits only workspace candidate and diagnosis'))
     config=dict(repository=str(repo),package=str(package),run_directory=str(run),operator=args.operator,
         context_kind='operator_transfer',goal_kind='method_transfer_with_formal_feedback',phase=args.phase,
         method_manifest=str(method_manifest),active_source='candidate.py',

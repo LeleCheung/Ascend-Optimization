@@ -14,10 +14,10 @@ def main():
     counts=collections.Counter(a['primary'] for a in records)
     confirmed=collections.Counter(a['primary'] for a in records if a['confidence']=='confirmed')
     total=len(records)
-    names={'ir':'源码／IR分析','paired':'Profiling','knowledge':'知识／经验','sim':'模拟器'}
+    names={'ir':'Source / IR analysis','paired':'Profiling','knowledge':'Knowledge / experience','sim':'Simulator'}
     parts=[f'<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="820" viewBox="0 0 1400 820"><rect width="1400" height="820" fill="{BG}"/><g font-family="Microsoft YaHei,sans-serif">',
-           text(55,75,'69个修改节点：主来源占比',40),
-           text(55,130,'15个日志确认 · 54个推断；每个节点只计一个主来源',27)]
+           text(55,75,'Primary guidance across 69 change nodes',40),
+           text(55,130,'15 log-confirmed, 54 inferred; one primary source per node',27)]
     angle=-math.pi/2;cx,cy,r=355,440,225
     summary=[]
     for i,key in enumerate(names):
@@ -31,11 +31,11 @@ def main():
         angle=end
         yy=270+i*105
         parts.append(f'<rect x="680" y="{yy-24}" width="22" height="22" rx="4" fill="{COLORS[key]}"/>')
-        parts.append(text(720,yy,f'{names[key]}：{count}个 · {fraction:.1%}',31))
-        parts.append(text(720,yy+39,f'日志确认 {confirmed[key]} · 推断 {count-confirmed[key]}',25))
+        parts.append(text(720,yy,f'{names[key]}：{count} nodes | {fraction:.1%}',31))
+        parts.append(text(720,yy+39,f'Log-confirmed {confirmed[key]} | inferred {count-confirmed[key]}',25))
         summary.append(dict(category=key,count=count,percent=100*fraction,confirmed=confirmed[key],inferred=count-confirmed[key]))
-    parts.extend([text(55,745,'统计的是当前主图归因，不是工具调用频率或性能收益贡献。',27),
-                  text(55,787,'源码／IR的48项均为推断；模拟器0项不包含历史分支和GQA新实验。',27),'</g></svg>'])
+    parts.extend([text(55,745,'Counts describe current-chart attribution, not tool-call frequency or performance contribution.',27),
+                  text(55,787,'All 48 source/IR entries are inferred; zero simulator entries exclude historical branches and new GQA experiments.',27),'</g></svg>'])
     svg=out/'attribution-share.svg';svg.write_text('\n'.join(parts),encoding='utf-8')
     (out/'attribution-share.json').write_text(json.dumps({'total':total,'categories':summary},ensure_ascii=False,indent=2),encoding='utf-8')
     from playwright.sync_api import sync_playwright

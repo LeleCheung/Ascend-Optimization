@@ -1,4 +1,4 @@
-"""HG-KDA 统一命令行；标准输出始终为 JSON。"""
+"""HG-KDA command-line interface; standard output is always JSON."""
 from __future__ import annotations
 
 import argparse
@@ -13,12 +13,12 @@ from .artifacts import emit, envelope, identity, read_json, unwrap
 
 
 def parser():
-    root = argparse.ArgumentParser(description="HG-KDA：性能证据、机制诊断与评测适配")
+    root = argparse.ArgumentParser(description='HG-KDA: performance evidence, mechanism diagnosis, and evaluation adapters')
     root.add_argument("--version", action="version", version=__version__)
     commands = root.add_subparsers(dest="command", required=True)
     for name in ["doctor", "compare", "diagnose", "hotspots", "regions", "timeline", "roofline", "context", "knowledge"]:
         p = commands.add_parser(name)
-        p.add_argument("--output", type=Path, help="新 JSON 文件；已有文件不会覆盖")
+        p.add_argument("--output", type=Path, help='New JSON output file; existing files are never overwritten')
         if name == "compare":
             p.add_argument("--directory", type=Path, required=True)
         if name in {"diagnose", "roofline"}:
@@ -100,11 +100,11 @@ def dispatch(args):
     if cmd == "hotspots":
         from .hotspots import instruction_hotspots
         if args.top < 1:
-            raise ValueError("top 必须为正整数")
+            raise ValueError('top must be a positive integer')
         listing = read_json(args.listing)
         source = identity(args.source, kind="candidate_source")
         if listing.get("source_sha256") != source["sha256"]:
-            raise ValueError("指令清单与源码身份未绑定或不同")
+            raise ValueError('Instruction listing is unbound or belongs to different source')
         result = instruction_hotspots(listing, args.source.read_text(encoding="utf8"), count=args.top)
         return result, [identity(args.listing), source]
     if cmd in {"regions", "timeline"}:
@@ -116,7 +116,7 @@ def dispatch(args):
                 path = args.source_map.parent / entry["path"]
                 entry_id = identity(path)
                 if entry_id["sha256"] != entry["sha256"]:
-                    raise ValueError("源码映射哈希不符：" + file)
+                    raise ValueError('Source-map hash mismatch: ' + file)
                 sources[file] = dict(text=path.read_bytes().decode("utf8"), sha256=entry["sha256"])
                 inputs.append(entry_id)
         if cmd == "timeline":
@@ -126,7 +126,7 @@ def dispatch(args):
         if args.trace:
             inputs.append(identity(args.trace))
             if not read_json(args.trace).get('hgkda_binding'):
-                raise ValueError('导入时间轴须声明hgkda_binding，明确源码、case、kernel、core和时间单位')
+                raise ValueError('Imported timelines require hgkda_binding with source, case, kernel, core, and time unit')
         return analyze(read_json(args.listing), read_json(args.trace) if args.trace else None,
                        kernel=args.kernel, core=args.core, top=args.top,
                        sources=sources, trace_unit=args.trace_unit), inputs
@@ -155,10 +155,10 @@ def dispatch(args):
         audit = read_json(args.audit)
         rows = [r for r in audit.get('rows', []) if r.get('operator') == args.operator]
         if not audit.get('evidence_verified') or len(rows) != 1 or rows[0]['source_sha256'] != source['sha256']:
-            raise ValueError('正式审计与候选源码身份不同或未通过')
+            raise ValueError('Formal audit failed or belongs to different candidate source')
         result = read_json(args.result)
         if result.get('geo_mean') != rows[0].get('geo_mean'):
-            raise ValueError('正式结果与审计性能不同')
+            raise ValueError('Formal result and audited performance disagree')
         cases = [json.loads(line) for line in args.timing_cases.read_text(encoding='utf8').splitlines() if line.strip()]
         checks = rows[0].get('checks', {})
         checked = len(checks) >= 2 and all(r.get('status') == 'passed' for r in checks.values())
@@ -171,14 +171,14 @@ def dispatch(args):
             return call(args.server, "/status"), []
         if args.action == "operation":
             if not args.operation_id or not args.operation_id.isalnum():
-                raise ValueError("需要有效的 operation-id")
+                raise ValueError('A valid operation-id is required')
             return call(args.server, "/operations/" + args.operation_id), []
         if args.action == "upload":
             if not args.archive:
-                raise ValueError("upload 需要 --archive")
+                raise ValueError('upload requires --archive')
             return upload_bundle(args.server, args.archive), [identity(args.archive)]
         if not all([args.request, args.review, args.run_directory]):
-            raise ValueError("evaluate 需要 --request、--review 和新的 --run-directory")
+            raise ValueError('evaluate requires --request, --review, and a new --run-directory')
         return evaluate(args.server, args.request, args.review, args.run_directory), [identity(args.request), identity(args.review)]
     if cmd == "collect":
         from .adapters.msprof import collect
@@ -189,17 +189,17 @@ def dispatch(args):
     if cmd == "retrieve":
         from .curation import retrieve
         if args.max_chars <= 0:
-            raise ValueError("max-chars 必须为正整数")
+            raise ValueError('max-chars must be a positive integer')
         return retrieve(unwrap(read_json(args.index)), args.operator_type, read_json(args.scope),
                         max_chars=args.max_chars), [identity(args.index), identity(args.scope)]
-    raise ValueError("不支持的命令")
+    raise ValueError('Unsupported command')
 
 
 def main(argv=None):
     args = parser().parse_args(argv)
     try:
         if args.output and args.output.exists():
-            raise FileExistsError("输出已存在：" + str(args.output))
+            raise FileExistsError('Output already exists: ' + str(args.output))
         result, inputs = dispatch(args)
         text = emit(envelope(args.command, result, inputs), args.output)
         if args.output:

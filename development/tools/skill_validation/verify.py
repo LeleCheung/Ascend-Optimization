@@ -1,4 +1,4 @@
-"""异机离线核验单算子skill试验原件及正式结果；冻结依赖映射到既有回归归档。"""
+"""Verify skill artifacts and formal results offline across hosts, mapping frozen dependencies to the existing regression archive."""
 import argparse
 import copy
 import hashlib
@@ -17,7 +17,7 @@ def main():
     root = args.directory.resolve()
     repo = args.repository.resolve()
     if os.name=='nt':
-        # 原始厂商采集目录可能超过MAX_PATH；保留原路径和字节身份。
+        # Vendor capture paths may exceed MAX_PATH; preserve original paths and byte identities.
         def extended(path):
             return path if str(path).startswith('\\\\?\\') else Path('\\\\?\\'+str(path))
         root,repo=extended(root),extended(repo)
@@ -39,7 +39,7 @@ def main():
         path = PurePosixPath(value)
         if path.is_relative_to(original_root):
             return str(root.joinpath(*path.relative_to(original_root).parts))
-        assert path.is_relative_to(prior_root), '未声明的外部依赖：'+value
+        assert path.is_relative_to(prior_root), 'Undeclared external dependency: '+value
         return str((repo/'development/experiments/regressions/20261109/fixed-25').joinpath(*path.relative_to(prior_root).parts))
 
     audit = runpy.run_path(str(repo/'development/tools/regression/audit.py'))
@@ -60,14 +60,14 @@ def main():
         summary=read(root/'summary.json')
         assert len(formal)==summary['formal_requests']
         if summary.get('outcome','accepted')=='accepted':
-            assert formal,'成功实验必须有完整正式结果'
+            assert formal,'Successful experiments require complete formal results'
             selected=next(row for row in formal if row['source_sha256']==summary['source_sha256'])
             assert selected['full_passed'] and selected['accepted']
             assert selected['geo_mean']==summary['cann_score']
         else:
             assert summary['outcome']=='failed'
             assert summary.get('cann_score') is None and summary.get('accepted') is False
-            assert summary.get('failure_reason'),'失败归档必须说明终止原因'
+            assert summary.get('failure_reason'),'Failed archives must explain termination'
         provenance=read(root/'workspace/starter-provenance.json')
         digest=hashlib.sha256((root/'workspace/starter.py').read_bytes()).hexdigest()
         if provenance.get('kind')=='existing_generated_candidate':
@@ -94,16 +94,16 @@ def main():
             assert extra['passed']==extra['total']>0
         assert summary['cann_score']==selected['geo_mean']
     else:
-        assert len(formal) == 2, '本轮应保留一次入口失败与一次新源码正式验证'
+        assert len(formal) == 2, 'This run must retain one entry-point failure and one formal validation of new source'
         assert sum(row['full_passed'] for row in formal) == 1
         assert read(root/'offset-check-before.json')['passed'] == 3
         assert read(root/'offset-check-final.json')['passed'] == 9
         assert read(root/'entry-equivalence.json')['device_kernels_unchanged']
     value = dict(status='passed', files_verified=len(manifest['files']), formal=formal,
                  experiment_outcome=summary.get('outcome','accepted') if transfer else None,
-                 scope=('多算子方法迁移：原件、方法身份、起点、完整合同与贡献记录' if transfer else
-                        '启动路径恢复实验的原件、完整结果与专项补测' if recovery else
-                        '原件身份及两次不同源码的完整请求；不重复设备评测，不将入口失败作为性能样本'))
+                 scope=('Multi-operator method transfer: artifacts, method identity, start, full contract, and contributions' if transfer else
+                        'Launch-path recovery artifacts, full results, and targeted supplementary checks' if recovery else
+                        'Artifact identities and full requests for two distinct sources; no repeated device evaluation or timing sample from entry-point failure'))
     args.output.write_text(json.dumps(value, ensure_ascii=False, indent=2)+'\n', encoding='utf8')
     print(json.dumps(dict(status=value['status'], files_verified=value['files_verified'],
                           formal=[{k:r[k] for k in ['source_sha256','full_passed','geo_mean','accepted']} for r in formal])))

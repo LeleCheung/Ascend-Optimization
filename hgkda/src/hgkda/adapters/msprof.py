@@ -1,4 +1,4 @@
-"""显式命令采集适配；执行范围由配置给出，输出不写入仓库。"""
+"""Explicit-command capture adapter; configuration defines execution scope and outputs stay outside the repository."""
 import os
 from pathlib import Path
 import subprocess
@@ -10,16 +10,16 @@ def collect(config_path, output_directory):
     config = read_json(config_path)
     argv = config['argv']
     if not isinstance(argv, list) or not argv or not all(isinstance(v, str) for v in argv):
-        raise ValueError('argv 必须为非空字符串数组')
+        raise ValueError('argv must be a nonempty array of strings')
     if Path(argv[0]).name not in {'msprof', 'msprof.exe'} or len(argv) < 2 or argv[1] != 'op':
-        raise ValueError('采集入口必须是显式 msprof op 命令')
+        raise ValueError('Capture entry point must be an explicit msprof op command')
     source = identity(config['source'], kind='candidate_source')
     if source['sha256'] != config['source_sha256']:
-        raise ValueError('采集配置与源码不同')
+        raise ValueError('Capture configuration belongs to different source')
     output = Path(output_directory).resolve()
     output.mkdir(parents=True, exist_ok=False)
     if any(v.startswith('--output') for v in argv):
-        raise ValueError('output 由本适配器指定，配置中不得重复')
+        raise ValueError('The adapter supplies output; configuration must not duplicate it')
     argv = argv + ['--output=' + str(output / 'raw')]
     emit({'argv': argv, 'config': identity(config_path), 'source': source}, output / 'request.json')
     env = dict(os.environ)
@@ -29,6 +29,6 @@ def collect(config_path, output_directory):
                                  timeout=config.get('timeout_seconds', 600), check=False)
     result = {'status': 'completed' if process.returncode == 0 else 'failed', 'returncode': process.returncode,
               'source_sha256': source['sha256'], 'raw_directory': str(output / 'raw'),
-              'scope': '采集进程状态；原始报告仍需身份校验和解析，不等同完整证据已通过'}
+              'scope': 'Capture process status only; raw reports still require identity verification and parsing before evidence acceptance'}
     emit(result, output / 'collection-process.json')
     return result

@@ -1,4 +1,4 @@
-"""内部方法实验的核验与归档入口；设备和模型动作见hgkda.runtime。"""
+"""Internal method-experiment audit/archive entry point; device and model actions use hgkda.runtime."""
 import argparse,subprocess,sys
 from pathlib import Path
 COMMANDS={"prepare-history":"prepare_operator.py","audit":"audit_generation.py","finalize":"finalize_transfer.py","export":"export.py","verify":"verify.py"}

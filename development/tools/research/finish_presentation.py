@@ -86,7 +86,7 @@ def main():
         write_report(json.loads((directory / 'mainline-presentation.json').read_bytes()), directory)
     update_catalog(args.root, png=True)
     subprocess.run([sys.executable, '-m', 'development.tools.traces.check_presentation'], cwd=args.root, check=True)
-    subprocess.run([sys.executable, '-m', 'development.tools.traces.meeting_slides'], cwd=args.root, check=True)
+    subprocess.run([sys.executable, '-m', 'development.presentation_archive.traces.meeting_slides'], cwd=args.root, check=True)
     print(json.dumps(dict(status='ready_for_screenshot_review')), flush=True)
 
 

@@ -1,4 +1,4 @@
-"""按已记录SHA导出逐case正式耗时，用于统一参考重算；不运行实验。"""
+"""Export formal per-case timings by recorded SHA for fixed-reference recalculation without experiments."""
 import argparse
 import hashlib
 import json

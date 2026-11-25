@@ -1,4 +1,4 @@
-"""多kernel参考保留调用次数与原始分布，不把任务时间相加冒充完整耗时。"""
+"""Multi-kernel references retain call counts/distributions; task-time sums do not replace full-call latency."""
 import hashlib
 import importlib.util
 import json

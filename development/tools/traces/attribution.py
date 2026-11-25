@@ -45,7 +45,7 @@ def annotate(rows, root):
                             location=loc.get('location','mixed'),evidence=[])
                 if linked:
                     record['inference_basis']='recorded_plan'
-                    record['reason']='优化计划明确记载改法；结合其中的假设与测量推断主要判断来源。'
+                    record['reason']='The plan explicitly records the change; infer primary guidance from its hypotheses and measurements.'
                     record['plan_evidence']=linked
                     record['evidence'].append({'path':str(ledger_path.relative_to(root)).replace('\\','/'),'sha256':hashlib.sha256(ledger_path.read_bytes()).hexdigest()})
                     if sha[:8] in confirmed_plans:
@@ -54,13 +54,13 @@ def annotate(rows, root):
                         if sha.startswith('1df2d942'):record['secondary']=['knowledge','ir']
                 elif primary=='paired':
                     record['inference_basis']='historical_context'
-                    record['reason']='根据历史方法标签、实验批次和源码变化推断 Profiling 参与判断；包含专项计时，不能据此断言已采集成对硬件计数器。'
+                    record['reason']='Infer profiling participation from historical labels, batches, and source changes, including targeted timing; paired hardware counters are not thereby established.'
                 elif primary=='knowledge':
                     record['inference_basis']='historical_context'
-                    record['reason']='根据相近实现的结构复用与历史迁移记录推断知识／经验复用；不等同于确认调用了知识库检索。'
+                    record['reason']='Infer knowledge/experience reuse from structural similarity and transfer records, without claiming confirmed knowledge retrieval.'
                 else:
                     record['inference_basis']='retrospective_code'
-                    record['reason']='依据前后源码差异及版本说明推断修改机制，归为源码／IR分析；实际 Agent 当时的取证入口未完整记录，不表示已确认读取 IR 或排除其他工具。'
+                    record['reason']='Infer mechanism from source diffs/version notes as source/IR analysis. Actual tool inputs were incompletely recorded; IR reads or exclusion of other tools remain unresolved.'
                 source=root/loc['source_path']
                 record['evidence'].append({'path':str(source.relative_to(root)).replace('\\','/'),'sha256':hashlib.sha256(source.read_bytes()).hexdigest()})
                 record['changed_symbols']=loc.get('changed_symbols',{})
@@ -82,6 +82,6 @@ def annotate(rows, root):
 
 
 def tooltip(record):
-    label={'confirmed':'日志确认','inferred':'推断'}[record['confidence']]
-    names={'paired':'Profiling','sim':'模拟器','ir':'源码／IR','knowledge':'知识／经验'}
-    return label+'：'+record['reason']+'；主来源：'+names[record['primary']]+'；辅助来源：'+('、'.join(names[x] for x in record.get('secondary',[])) or '无单独确认')
+    label={'confirmed':'Log-confirmed','inferred':'Inferred'}[record['confidence']]
+    names={'paired':'Profiling','sim':'Simulator','ir':'Source / IR','knowledge':'Knowledge / experience'}
+    return label+'：'+record['reason']+'; primary: '+names[record['primary']]+'; auxiliary: '+('、'.join(names[x] for x in record.get('secondary',[])) or 'None separately confirmed')

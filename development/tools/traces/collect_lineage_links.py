@@ -1,4 +1,4 @@
-"""补取已有评测附近的版本来源与合同包；只读，不执行实验。"""
+"""Collect existing nearby evaluation provenance/contracts read-only, without experiments."""
 import argparse
 import hashlib
 import json

@@ -75,7 +75,7 @@ class GQAEvidenceModes(unittest.TestCase):
                 self.assertTrue((run / 'evidence-history/next' / name).exists())
             prompt = (run / 'next-prompt.md').read_text(encoding='utf8')
             self.assertNotIn('simulator-evidence.json', prompt)
-            self.assertIn('当前profiling、相关TTIR与BCMLIR', prompt)
+            self.assertIn('current profiling and related TTIR/BCMLIR', prompt)
 
     def test_source_mode_requires_ir_reads_and_does_not_require_repair_feedback(self):
         for missing_ir in [False, True]:

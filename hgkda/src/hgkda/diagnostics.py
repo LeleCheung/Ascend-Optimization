@@ -1,4 +1,4 @@
-"""按算子类型与硬件流水证据生成分阶段体检计划；不替代正式评测。"""
+"""Plan staged diagnostics from operator types and hardware-pipeline evidence; formal evaluation remains separate."""
 
 
 from __future__ import annotations
@@ -44,14 +44,14 @@ KNOWLEDGE = {kind: 'operators.md' for kind in set(TYPES.values())}
 
 
 METRICS = {
-    'aiv_mte2_ratio': ('data_movement', '检查连续性、块大小和重复读入'),
-    'aiv_mte3_ratio': ('data_movement', '检查输出搬运、写回粒度和临时结果'),
-    'aic_mte2_ratio': ('data_movement', '检查矩阵面板重复搬运、K 分块及计算重叠'),
-    'aic_mte1_ratio': ('data_movement', '检查片上矩阵面板搬运与复用'),
-    'aiv_vec_ratio': ('vector_compute', '检查超越函数、类型转换和归约指令'),
-    'aic_mac_ratio': ('cube_compute', '检查矩阵乘计算效率、tile 与累加路径'),
-    'aiv_scalar_ratio': ('control', '检查地址计算、循环和 program 覆盖'),
-    'aic_scalar_ratio': ('control', '检查矩阵乘循环、索引和核覆盖'),
+    'aiv_mte2_ratio': ('data_movement', 'Inspect contiguity, block size, and repeated input loads'),
+    'aiv_mte3_ratio': ('data_movement', 'Inspect output movement, write granularity, and temporary results'),
+    'aic_mte2_ratio': ('data_movement', 'Inspect repeated matrix-panel loads, K tiling, and compute overlap'),
+    'aic_mte1_ratio': ('data_movement', 'Inspect on-chip matrix-panel movement and reuse'),
+    'aiv_vec_ratio': ('vector_compute', 'Inspect transcendental functions, type conversions, and reduction instructions'),
+    'aic_mac_ratio': ('cube_compute', 'Inspect matrix-multiply efficiency, tiles, and accumulation paths'),
+    'aiv_scalar_ratio': ('control', 'Inspect address computation, loops, and program coverage'),
+    'aic_scalar_ratio': ('control', 'Inspect matrix-multiply loops, indexing, and core coverage'),
 }
 
 
@@ -73,7 +73,7 @@ def diagnose_case(case: dict, *, levels=('metrics',), capabilities=()) -> dict:
             hypotheses.append({'category': category, 'metric': name, 'value': value,
                                'threshold': threshold, 'confidence': 'medium',
                                'action': action,
-                               'interpretation': '流水活跃支持优先检查此方向，尚未证明其限制总耗时'})
+                               'interpretation': 'Pipeline activity prioritizes this investigation but does not establish a total-latency bottleneck'})
     profiles = case.get('profiles') or {}
     instruction = profiles.get('instruction')
     instruction_verified = (
@@ -89,39 +89,35 @@ def diagnose_case(case: dict, *, levels=('metrics',), capabilities=()) -> dict:
     needs_instruction = available and (complex_path or overlap or not hypotheses)
     requested, limitations = [], []
     if not available:
-        requested.append({'level': 'metrics', 'reason': '缺少有效的同候选流水指标'})
+        requested.append({'level': 'metrics', 'reason': 'Missing valid pipeline metrics for this candidate'})
     elif needs_instruction and not instruction_verified:
         if 'instruction' in levels:
             requested.append({'level': 'instruction',
-                              'reason': '复杂依赖或流水重叠需要指令、同步与源码热点证据区分'})
+                              'reason': 'Complex dependencies or pipeline overlap require instruction, synchronization, and source-region evidence to distinguish mechanisms'})
         else:
-            limitations.append('需要更细定位，但本次服务没有声明 instruction；保留未决机制')
+            limitations.append('Finer localization is needed, but this service does not declare instruction support; leave the mechanism unresolved')
     if instruction_verified:
-        limitations.append('指令附件已存在；热点与因果机制仍需分析，不自动把附件存在当作完成诊断')
+        limitations.append('Instruction attachments exist; hotspot regions and causal mechanisms still require analysis')
     elif isinstance(instruction, dict):
-        limitations.append('指令请求未完成或没有有效instruction_listing；设备计数/日志附件单独保留')
+        limitations.append('Instruction request is incomplete or lacks a valid instruction_listing; retain device counters/log attachments separately')
     if invalid:
-        limitations.append('指标超出合法比例范围或类型无效：' + ', '.join(invalid))
-    refs = [KNOWLEDGE[kind]] if kind in KNOWLEDGE else []
-    if 'data_movement' in evidence_categories or kind == 'copy':
-        refs.append('性能指标/搬运与执行路径.md')
-    if evidence_categories & {'vector_compute', 'cube_compute', 'control'}:
-        refs.append('性能指标/计算与控制.md')
-    if complex_path or overlap or needs_instruction or instruction_verified:
-        refs.append('性能指标/指令与同步.md')
+        limitations.append('Metric ratio is outside the valid range or has an invalid type: ' + ', '.join(invalid))
+    has_knowledge = (kind in KNOWLEDGE or bool(evidence_categories)
+                     or kind == 'copy' or complex_path or overlap
+                     or needs_instruction or instruction_verified)
     return {
         'schema_version': '1.0', 'operator': operator, 'operator_type': kind,
         'case_id': case.get('case_id'), 'axes': case.get('axes', {}),
         'stage': 'instruction_evidence' if instruction_verified else 'metrics' if available else 'collect_metrics',
         'hypotheses': hypotheses, 'requested_collections': requested,
         'execution_path_status': 'provided' if case.get('execution_path') else 'needs_reference_comparison',
-        'execution_path_action': '核对候选与参考的 kernel、DMA、临时张量和启动数；不由比例推断参考路径',
-        'knowledge': ['operators.md', 'evidence.md'] if refs else [],
+        'execution_path_action': 'Check candidate/reference kernels, DMA, temporary tensors, and launch counts; ratios alone do not identify the reference path',
+        'knowledge': ['operators.md', 'evidence.md'] if has_knowledge else [],
         'instruction_supported': 'instruction' in levels,
         'capabilities': list(capabilities),
-        'roofline': {'status': 'not_established', 'reason': '尚无同范围物理工作量和已验证硬件上限'},
+        'roofline': {'status': 'not_established', 'reason': 'Physical work and verified hardware limits for the same scope are unavailable'},
         'limitations': limitations,
-        'validation': '每项建议须落到源码变更，完整正确性通过后比较正式性能，最终默认一次完整正式评测；额外复测需有独立理由',
+        'validation': 'Implement suggestions as source changes, pass full correctness, then compare formal performance. Use one full formal evaluation by default; additional runs need an independent reason.',
     }
 
 

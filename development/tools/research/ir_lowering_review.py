@@ -1,4 +1,4 @@
-"""在CPU编译入口核对模型IR的低层产物，单列于真机完整评测。"""
+"""Inspect model IR lowering at the CPU compiler entry, separate from full hardware evaluation."""
 import argparse
 import ast
 import hashlib
@@ -74,7 +74,7 @@ def main():
     native_ir_init = compiler.IRSource.__init__
 
     def ir_init(instance, path, context, backend):
-        # 文件入口与AST入口采用相同的已安装方言注册集合。
+        # File and AST entry points use the same installed dialect registrations.
         compiler.buffer_ir.load_dialects(context)
         compiler.ascend_ir.load_dialects(context)
         compiler._flagprism.load_dialects(context)

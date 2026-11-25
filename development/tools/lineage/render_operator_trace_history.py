@@ -12,7 +12,7 @@ OUT = REPORTS / "operator-traces-history-20261116"
 OPS = ["rad2deg_", "uniform", "negative_", "selu_", "log10_", "native_group_norm"]
 COLORS = {"P": "#2368b1", "S": "#c55a18", "I": "#7852a6", "E": "#168358", "?": "#455269"}
 BANDS = {"P": "#e3eff8", "S": "#fbe8d6", "I": "#eee6f5", "E": "#e3f0df", "?": "#e7edf5"}
-NAMES = {"P": "成对分析", "S": "模拟器", "I": "源码／IR", "E": "专项探测", "?": "待核验"}
+NAMES = {"P": 'Paired analysis', "S": 'Simulator', "I": 'Source / IR', "E": 'Targeted probe', "?": 'Unverified'}
 
 
 def read(p):
@@ -36,47 +36,47 @@ def existing_series():
 
 def short_batch(path):
     for token, name, date in [
-        ("strict-night-20261102", "严格约束搜索", "2026-11-02"),
-        ("night-20261021-v3", "首批搜索", "2026-10-21"),
-        ("paired-pointwise-20261022", "成对分析批次", "2026-10-22"),
-        ("buffer-pointwise-20261022", "缓冲与分块批次", "2026-10-22"),
-        ("endurance-20261022", "持续优化", "2026-10-22"),
-        ("next25-20261029-v2", "新目标搜索 v2", "2026-10-29"),
-        ("next25-20261029", "新目标搜索", "2026-10-29"),
+        ("strict-night-20261102", 'Strict-constraint search', "2026-11-02"),
+        ("night-20261021-v3", 'First search', "2026-10-21"),
+        ("paired-pointwise-20261022", 'Paired-analysis batch', "2026-10-22"),
+        ("buffer-pointwise-20261022", 'Buffer/tiling batch', "2026-10-22"),
+        ("endurance-20261022", 'Continued optimization', "2026-10-22"),
+        ("next25-20261029-v2", 'New-target search v2', "2026-10-29"),
+        ("next25-20261029", 'New-target search', "2026-10-29"),
     ]:
         if token in path:
             if "uniform" in path and "endurance" in path:
-                name += " · 尝试2" if "attempt-2" in path else " · 尝试1"
+                name += ' | attempt 2' if "attempt-2" in path else ' | attempt 1'
             return name, date
-    return "历史搜索", "日期待核验"
+    return 'Historical search', 'Date unverified'
 
 
 def label_from_plan(r):
     p = r.get("plan") or {}
     s = (p.get("strategy", "") + " " + p.get("code_changes", "")).lower()
     if p.get("kind") == "baseline":
-        return "建立本批起点"
+        return 'Establish batch start'
     if "stream" in s and ("persistent" in s or "single-wave" in s):
-        return "固定program流式循环"
+        return 'Fixed-program streaming loop'
     if "two-pointer" in s:
-        return "双指针组织预取"
+        return 'Two-pointer prefetch'
     if "bf16" in s and "float16" in s:
-        return "BF16中间精度与分块"
+        return 'BF16 intermediates and tiling'
     if "counter" in s and "int32" in s:
-        return "稳定计数器整数类型"
+        return 'Stabilize counter integer types'
     if "philox" in s:
-        return "改写随机数计算"
+        return 'Rewrite random computation'
     if "quantize" in s or "dtype-bound" in s:
-        return "修复随机数边界量化"
+        return 'Repair random-bound quantization'
     if "multi-tile" in s or "unrolled" in s and "tiles" in s:
-        return "每program处理多块"
+        return 'Multiple tiles per program'
     if "closure" in s or "wrapper" in s or "bookkeeping" in s:
-        return "精简宿主调用路径"
+        return 'Simplify host calls'
     if "launch" in s:
-        return "调整启动与编译缓存"
+        return 'Adjust launch/compilation caches'
     if "tile" in s or "block" in s:
-        return "调整分块与数据处理"
-    return "修改方法待核验"
+        return 'Adjust tiling and data processing'
+    return 'Change unverified'
 
 
 def load_history():
@@ -91,14 +91,14 @@ def load_history():
             continue
         seen.add(ledger["sha256"])
         title, date = short_batch(ledger["path"])
-        batch = dict(operator=op, title=title, date=date, reference="本批KGS参考",
+        batch = dict(operator=op, title=title, date=date, reference='Batch KGS reference',
                      source=dict(path=ledger["path"], sha256=ledger["sha256"]), points=[])
         for r in ledger["rounds"]:
             e = r["evaluation"]
             point = dict(round=r["round"], score=e.get("geo_mean"), status=e.get("status"),
                          passed=e.get("num_passed"), total=e.get("num_workloads"),
                          source_sha256=r["source_sha256"], action=label_from_plan(r),
-                         evidence="?", evidence_detail="具体信息来源待核验", plan=r.get("plan"),
+                         evidence="?", evidence_detail='Specific evidence source unverified', plan=r.get("plan"),
                          profile=r.get("profile"), conclusion=r.get("conclusion"))
             if ledger["sha256"] in known_by_ledger:
                 k = next(p for p in known_by_ledger[ledger["sha256"]]["points"] if p["round"] == r["round"])
@@ -113,32 +113,32 @@ def load_history():
     # separate counters. Only actual formal summaries become performance dots.
     local = ROOT / "development/experiments/skill-validation"
     groups = [
-        ("log10_", "独立工作流开发", "2026-11-10", "20261110-log10-development", [
-            ("a4d38b964aa6", "合规Triton布局与数学", "I"),
-            ("a73e15786d68", "有限网格循环", "?"),
-            ("4eca306ca042", "缓存尚未实际命中", "E"),
-            ("2f90b7925721", "修复冷缓存登记", "E"),
-            ("0fefe838c58c", "缓存宿主发射计划", "E"),
-            ("4c184cdc36f4", "减少重复模式查询", "E"),
-            ("e62c6d636097", "双块预读尝试", "?"),
-            ("b2a52734c432", "热路径使用整数地址", "I"),
-            ("d519b459c915", "分离满块与尾块", "I"),
-            ("b64e7d8351df", "无掩码成对循环", "I"),
-            ("69699663ecc7", "相邻载荷与编译期循环", "I"),
-            ("8600ce070318", "输入dtype数学", "I"),
+        ("log10_", 'Independent workflow development', "2026-11-10", "20261110-log10-development", [
+            ("a4d38b964aa6", 'Compliant Triton layout and math', "I"),
+            ("a73e15786d68", 'Bounded-grid loop', "?"),
+            ("4eca306ca042", 'Cache not yet hit', "E"),
+            ("2f90b7925721", 'Repair cold-cache registration', "E"),
+            ("0fefe838c58c", 'Cache host dispatch plan', "E"),
+            ("4c184cdc36f4", 'Reduce repeated mode queries', "E"),
+            ("e62c6d636097", 'Double-prefetch experiment', "?"),
+            ("b2a52734c432", 'Integer addresses in hot path', "I"),
+            ("d519b459c915", 'Separate full/tail tiles', "I"),
+            ("b64e7d8351df", 'Unmasked paired loop', "I"),
+            ("69699663ecc7", 'Adjacent payloads + compile-time loops', "I"),
+            ("8600ce070318", 'Input-dtype math', "I"),
         ]),
-        ("log10_", "冻结方法重生成", "2026-11-10", "20261110-log10-frozen", [
-            ("40cfe1a83343", "冻结方法生成首版", "?"),
-            ("0261f02aee72", "按完整反馈继续优化", "?"),
-            ("b6b10ceb10e3", "继续改进启动与布局", "?"),
-            ("45c7380a8062", "分块与启动缓存命中", "E"),
+        ("log10_", 'Frozen-method regeneration', "2026-11-10", "20261110-log10-frozen", [
+            ("40cfe1a83343", 'First frozen-method version', "?"),
+            ("0261f02aee72", 'Continue using full feedback', "?"),
+            ("b6b10ceb10e3", 'Improve launching and layout', "?"),
+            ("45c7380a8062", 'Tiling and launch-cache hits', "E"),
         ]),
-        ("selu_", "独立工作流恢复", "2026-11-09", "20261109-selu-recovery", [
-            ("3cec1212c3b7", "独立生成起点", "P"),
-            ("c6255855aa16", "缓存编译启动器", "E"),
-            ("80bfefff4ff8", "raw stream与简化缓存键", "E"),
-            ("0fed8d43398d", "NoWait接口与扩大分块", "I"),
-            ("5e9e4d482620", "命中缓存后直接发射", "E"),
+        ("selu_", 'Independent workflow recovery', "2026-11-09", "20261109-selu-recovery", [
+            ("3cec1212c3b7", 'Independent generated start', "P"),
+            ("c6255855aa16", 'Cache compiled launcher', "E"),
+            ("80bfefff4ff8", 'Raw stream + simpler cache keys', "E"),
+            ("0fed8d43398d", 'NoWait interface + larger tiles', "I"),
+            ("5e9e4d482620", 'Direct dispatch on cache hit', "E"),
         ]),
     ]
     for op, title, date, folder, entries in groups:
@@ -163,7 +163,7 @@ def load_history():
             batch["activity"] = dict(model_calls=7, preflight_sources=4, formal_sources=4)
         result[op].append(batch)
     old_regions = next(s for s in known if s["op"] == "log10_")
-    batch = dict(operator="log10_", title="模拟器区域与等待修订", date="2026-11-10", reference="CANN",
+    batch = dict(operator="log10_", title='Simulator region/wait revision', date="2026-11-10", reference="CANN",
                  source=old_regions["report"], points=[])
     for p in old_regions["points"]:
         batch["points"].append(dict(**p, evidence="S" if p["kind"] == "sim" else "P", status="PASSED"))
@@ -205,7 +205,7 @@ def plot(b, x, y, width, height, compact=False):
     for i,p in enumerate(pts):
         if p["score"] is None:
             yy=y+height-35
-            out += [f'<path d="M{xs[i]-7} {yy-7} l14 14 m0 -14 l-14 14" stroke="#b14e24" stroke-width="3"/>',text(xs[i],yy-18,'未通过',18 if compact else 23,700,"middle","#b14e24")]
+            out += [f'<path d="M{xs[i]-7} {yy-7} l14 14 m0 -14 l-14 14" stroke="#b14e24" stroke-width="3"/>',text(xs[i],yy-18,'Failed',18 if compact else 23,700,"middle","#b14e24")]
             previous=None
         else:
             yy=sy(p["score"])
@@ -244,22 +244,22 @@ def svg_shell(parts):
 
 def single(b):
     pts=b['points'];n=len(pts)
-    parts=[text(54,52,'SEARCH TRAJECTORIES',22,800),text(54,116,b['operator'],49,800),text(54,165,f'{b["date"]} · {b["title"]} · 相对{b["reference"]}',27)]
+    parts=[text(54,52,'SEARCH TRAJECTORIES',22,800),text(54,116,b['operator'],49,800),text(54,165,f'{b["date"]} · {b["title"]} | relative to {b["reference"]}',27)]
     for i,key in enumerate(['P','S','I','E','?']):parts.append(pill(54+i*220,219,key))
     parts.append(plot(b,118,290,1405,410))
-    parts += [text(54,800,f'本批{n}条正式评测记录 · {b["performance_nodes"]}个性能点 · 失败与退步保留',27,800),
-              text(54,850,'底色与标签表示分析信息来源；未确认的来源标“待核验”。',25)]
+    parts += [text(54,800,f'Batch {n} formal evaluations | {b["performance_nodes"]} performance points; failures/regressions retained',27,800),
+              text(54,850,'Background and labels show evidence sources; unresolved sources are marked unverified.',25)]
     return svg_shell(parts)
 
 
 def primary(history,op):
-    preferred={'rad2deg_':'持续优化','uniform':'持续优化 · 尝试2','negative_':'新目标搜索 v2',
-               'selu_':'独立工作流恢复','log10_':'独立工作流开发','native_group_norm':'新目标搜索 v2'}
+    preferred={'rad2deg_':'Continued optimization','uniform':'Continued optimization | attempt 2','negative_':'New-target search v2',
+               'selu_':'Independent workflow recovery','log10_':'Independent workflow development','native_group_norm':'New-target search v2'}
     return next(b for b in history[op] if b['title']==preferred[op])
 
 
 def overview(history,ops,page):
-    parts=[text(54,52,'SEARCH TRAJECTORIES',22,800),text(54,116,f'真实优化轨迹 · 第{page}页',49,800)]
+    parts=[text(54,52,'SEARCH TRAJECTORIES',22,800),text(54,116,f' measured trace | page {page}',49,800)]
     for i,key in enumerate(['P','S','I','E','?']):parts.append(pill(58+i*220,190,key,21))
     for j,op in enumerate(ops):
         b=primary(history,op);xx=55+j*520
@@ -267,9 +267,9 @@ def overview(history,ops,page):
         parts.append(plot(b,xx+50,346,435,320,True))
         end=b['points'][-1]
         total=sum(len(batch['points']) for batch in history[op])
-        parts += [text(xx,739,f'本图{len(b["points"])}条 · 相对{b["reference"]}',20,700),
-                  text(xx,780,f'已收集{len(history[op])}批、{total}条评测',22,800)]
-    parts += [text(54,850,'所有批次可在HTML中切换；不同批次分别作图。',25)]
+        parts += [text(xx,739,f'This chart: {len(b["points"])} records | relative to {b["reference"]}',20,700),
+                  text(xx,780,f'Collected {len(history[op])} batches, {total} evaluations',22,800)]
+    parts += [text(54,850,'Switch all batches in HTML; each batch has its own chart.',25)]
     return svg_shell(parts)
 
 
@@ -288,28 +288,28 @@ def main():
         for b in bs:
             file=b['id']+'.svg';(OUT/file).write_text(single(b),encoding='utf-8')
             selected=' selected' if b['id']==default else ''
-            options.append(f'<option value="{b["id"]}"{selected}>{b["date"]} · {b["title"]} · {len(b["points"])}条</option>')
+            options.append(f'<option value="{b["id"]}"{selected}>{b["date"]} · {b["title"]} · {len(b["points"])} records</option>')
             rows=[]
             for p in b['points']:
-                score='未通过／无有效分数' if p['score'] is None else f'{p["score"]:.6f}×'
+                score='Failed / no valid score' if p['score'] is None else f'{p["score"]:.6f}×'
                 rows.append(f'<tr><td>R{p["round"]}</td><td>{score}</td><td>{html.escape(p["action"])}</td><td>{html.escape(p.get("information_source",p.get("evidence_detail",NAMES[p["evidence"]])))}</td></tr>')
             hide='' if b['id']==default else ' hidden'
-            figs.append(f'<div class="batch" id="{b["id"]}"{hide}><img src="{file}"><p class="downloads"><a href="{file}" download>SVG</a><a href="{b["id"]}.png" download>PNG</a></p><details><summary>逐轮修改与信息来源</summary><table><tr><th>评测</th><th>成绩</th><th>修改</th><th>信息来源</th></tr>{"".join(rows)}</table></details></div>')
-        cards.append(f'<section class="operator" id="op{i}" hidden><h2>{op}：已收集{count["batches"]}批、{count["evaluation_records"]}条正式评测记录</h2><select onchange="showBatch({i},this.value)">{"".join(options)}</select>{"".join(figs)}</section>')
+            figs.append(f'<div class="batch" id="{b["id"]}"{hide}><img src="{file}"><p class="downloads"><a href="{file}" download>SVG</a><a href="{b["id"]}.png" download>PNG</a></p><details><summary>Per-round changes and evidence</summary><table><tr><th>Evaluation</th><th>Score</th><th>Change</th><th>Evidence</th></tr>{"".join(rows)}</table></details></div>')
+        cards.append(f'<section class="operator" id="op{i}" hidden><h2>{op}: collected {count["batches"]} batches, {count["evaluation_records"]} formal evaluations</h2><select onchange="showBatch({i},this.value)">{"".join(options)}</select>{"".join(figs)}</section>')
     for page,ops in enumerate([['rad2deg_','uniform','log10_'],['selu_','negative_','native_group_norm']],1):
         (OUT/f'overview-{page}.svg').write_text(overview(history,ops,page),encoding='utf-8')
-    template='''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>六算子 · 多批次优化轨迹</title><style>
+    template="""<!doctype html><html lang="en"><meta charset="utf-8"><title>Six operators · Multi-batch traces</title><style>
 *{box-sizing:border-box}body{margin:0;background:#fff7e8;color:#1b2434;font-family:"Microsoft YaHei",sans-serif}header{padding:28px 40px}h1{font-size:34px;margin:0 0 16px}p{font-size:22px}nav{display:flex;flex-wrap:wrap;gap:10px}button,select,summary{font:inherit;font-size:20px;padding:10px 16px}button,select{background:#fffdf8;color:#1b2434;border:1px solid #aeb6be;border-radius:16px}button{cursor:pointer}main{max-width:1680px;margin:auto;padding:0 24px 40px}img{display:block;width:100%}.operator h2{font-size:28px}.operator select{margin-bottom:18px}.downloads{display:flex;gap:24px;margin:10px 30px}a{color:#2368b1}details{background:#fffdf8;margin:16px;padding:14px}table{border-collapse:collapse;width:100%;font-size:21px}td,th{border-bottom:1px solid #d9cdb9;padding:12px;text-align:left}summary{cursor:pointer}.cover p{margin:12px 28px} [hidden]{display:none!important}</style>
-<header><h1>真实优化轨迹：多批次视图</h1><p>模型调用、设备预检、正式评测分别计数；图中每个点对应正式评测结果。</p><nav><button onclick="showOp(-1)">三栏总览</button>NAV</nav></header><main><section id="covers"><div class="cover"><img src="overview-1.svg"><p><a href="overview-1.png" download>下载第一页PNG</a>　<a href="overview-1.svg" download>SVG</a></p></div><div class="cover"><img src="overview-2.svg"><p><a href="overview-2.png" download>下载第二页PNG</a>　<a href="overview-2.svg" download>SVG</a></p></div></section>CARDS</main><script>function showOp(n){document.getElementById('covers').hidden=n>=0;document.querySelectorAll('.operator').forEach((s,i)=>s.hidden=i!==n);window.scrollTo(0,0)}function showBatch(n,id){document.getElementById('op'+n).querySelectorAll('.batch').forEach(s=>s.hidden=s.id!==id)}</script></html>'''
+<header><h1>Measured traces：Multi-batch view</h1><p>Model calls、device preflights、and formal evaluations are counted separately；Each point is a formal result。</p><nav><button onclick="showOp(-1)">Three-column overview</button>NAV</nav></header><main><section id="covers"><div class="cover"><img src="overview-1.svg"><p><a href="overview-1.png" download>Download page 1 PNG</a>　<a href="overview-1.svg" download>SVG</a></p></div><div class="cover"><img src="overview-2.svg"><p><a href="overview-2.png" download>Download page 2 PNG</a>　<a href="overview-2.svg" download>SVG</a></p></div></section>CARDS</main><script>function showOp(n){document.getElementById('covers').hidden=n>=0;document.querySelectorAll('.operator').forEach((s,i)=>s.hidden=i!==n);window.scrollTo(0,0)}function showBatch(n,id){document.getElementById('op'+n).querySelectorAll('.batch').forEach(s=>s.hidden=s.id!==id)}</script></html>"""
     (OUT/'index.html').write_text(template.replace('NAV',''.join(nav)).replace('CARDS',''.join(cards)),encoding='utf-8')
-    lines=['# 六算子多批次轨迹','', '沿用原样式图的米色底、三栏总览、阶段底色、绿色轨迹和节点方法标签。新增本地独立工作流正式评测，不再仅截取2～4轮片段。', '', '[打开多批次页面](index.html)。按算子切换后，可选择所有已收集批次并展开逐轮表。', '', '| 算子 | 上版图节点 | 本版已收集批次 | 正式评测记录 | 有效性能点 |','| --- | ---: | ---: | ---: | ---: |']
+    lines=['# Six-operator multi-batch traces','', 'Retains the original beige background, three-column overview, phase shading, green traces, and method labels. Adds local independent-workflow formal evaluations beyond short 2-4-round excerpts.', '', '[Open multi-batch view](index.html). Select an operator, choose any collected batch, and expand per-round details.', '', '| Operator | Previous chart nodes | Collected batches | Formal evaluations | Valid performance points |','| --- | ---: | ---: | ---: | ---: |']
     previous={s['op']:len(s['points']) for s in existing_series()}
     for op,c in counts.items():lines.append(f'| `{op}` | {previous[op]} | {c["batches"]} | {c["evaluation_records"]} | {c["performance_nodes"]} |')
-    lines += ['', '以上为已收集记录，不声称穷尽全部历史；账本副本按SHA去重，重复代码在不同批次的正式评测保留。',
-              '模型的一次调用可能含多次编辑、编译和预检，不能都画成有效性能点。log10独立开发有24次模型调用、17份设备预检源码、12份正式性能结果；冻结阶段另有7次调用、4份正式结果。',
-              '不同参考、约束与阶段的批次各自成图；不跨批次连线。历史失败或不符合当前约束的版本仅用于过程展示，不替代当前交付记录。',
-              '信息来源不明的节点标“待核验”，有源码计划仍可展示修改。原件路径、SHA及评测摘要见traces.json。',
-              'SELU首轮目录还保留一份无有效分数的失败正式请求f3502fad5259；它没有被拼入后续恢复曲线，来源为development/experiments/skill-validation/20261109-selu/formal-f3502fad5259/summarize-final.json。','']
+    lines += ['', 'Collected records are not an exhaustive history; deduplicate ledger copies by SHA but retain same-source evaluations across batches.',
+              'A model call can include multiple edits, compilations, and preflights; only formal outcomes become performance points. Independent log10 development has 24 calls, 17 preflight sources, and 12 formal results; frozen generation adds 7 calls and 4 results.',
+              'Batches with different references, constraints, or stages use separate disconnected charts. Historical failures/out-of-contract versions do not replace current deliveries.',
+              'Unresolved guidance is marked unverified; source plans may still identify changes. See traces.json for original paths, SHA, and summaries.',
+              "SELU's first run also retains failed request f3502fad5259 without a valid score. It is separate from the recovery curve: development/experiments/skill-validation/20261109-selu/formal-f3502fad5259/summarize-final.json.",'']
     (OUT/'README.md').write_text('\n'.join(lines),encoding='utf-8')
     print(json.dumps(counts,ensure_ascii=False))
 

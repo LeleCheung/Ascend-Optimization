@@ -1,4 +1,4 @@
-"""统一输入身份、结果封装与不覆盖式输出。"""
+"""Normalize input identity, result envelopes, and non-overwriting output."""
 from __future__ import annotations
 
 import hashlib
@@ -36,6 +36,6 @@ def emit(value, output=None):
 def unwrap(value):
     if value.get("schema_version") == SCHEMA_VERSION:
         if value.get("status") != "completed":
-            raise ValueError("输入分析尚未完成")
+            raise ValueError('Input analysis is not complete')
         return value["result"]
     return value

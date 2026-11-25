@@ -1,4 +1,4 @@
-"""只读候选的热调用宿主栈诊断；独立于正式性能合同，不修改候选。"""
+"""Read-only warm-call host-stack diagnostics, separate from formal timing and without candidate changes."""
 import argparse
 import cProfile
 import hashlib
@@ -43,7 +43,7 @@ def main():
         profiler = cProfile.Profile()
         wall = []
         for _ in range(args.iterations):
-            # 输入构造、同步和计时器均在采样区间外；每次使用新输入。
+            # Input construction, synchronization, and timers stay outside the sampling window; use fresh inputs each time.
             inputs = oracle.gen_inputs(case, 'npu:0')
             torch.npu.synchronize()
             start = time.perf_counter_ns()
@@ -66,7 +66,7 @@ def main():
             launcher_classes=[dict(name=name,source=inspect.getsource(cls))
                 for name,cls in inspect.getmembers(driver,inspect.isclass)
                 if cls.__module__==driver.__name__ and 'Launcher' in name]),
-        scope='采样候选热调用的宿主函数栈；cProfile有额外开销，不作为正式加速比，也不把累计时间相加当作总时长')
+        scope='Sample warm-call host stacks; cProfile adds overhead, so this is not formal speedup and cumulative times are not additive elapsed time')
     args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2)+'\n', encoding='utf8')
     print(json.dumps(dict(status='completed', cases=len(records))))
 

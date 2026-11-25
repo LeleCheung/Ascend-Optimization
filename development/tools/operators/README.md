@@ -1,15 +1,21 @@
-# 算子专项工具
+# Operator-specific support
 
-通用分析与评测控制器位于`src/hgkda/`、`tools/skill_validation/`和`tools/regression/`。本目录按算子集中维护专项正确性检查与CANN参考适配，不创建每个算子独立的优化控制器。
+Generic analysis/runtime lives in `hgkda/src/hgkda/`; internal method/regression tools
+live in sibling directories. This directory holds targeted checks and native reference
+adapters, not separate per-operator optimization controllers.
 
-| 算子目录 | 工具与用途 |
+| Directory | Purpose |
 | --- | --- |
-| `selu_/` | 偏移视图、当前stream、指针与尾块检查 |
-| `log10_/` | 极小值、特殊值、数学边界及尾块检查 |
-| `negative_/` | 核验已有宿主缓存候选的实际Triton路径及动态输入；不生成候选 |
-| `uniform/` | 构建和核验原生Uniform＋Clamp同语义参考 |
-| `expm1_/` | 探测官方参考的精度模式与小值数学资格 |
+| `selu_/` | Offset views, current streams, pointers, and tails |
+| `log10_/` | Tiny/special values, numerical boundaries, and tails |
+| `negative_/` | Actual cached Triton artifacts and dynamic inputs |
+| `uniform/` | Native composed Uniform+Clamp reference |
+| `expm1_/` | Official precision modes and small-value qualification |
 
-SELU／log10补测仍可通过`python -m tools.skill_validation check-selu-offset`等统一动作调用。专项工具不会替代正式KGS合同。需要设备的命令仅在匹配的Linux／CANN环境及指定项目设备上执行。
+Checks are separate from full KGS acceptance. Run NPU actions only in the matching
+Linux/CANN environment on allocated project devices. Public CLI actions are listed
+by `python -m hgkda.runtime --help`; internal validation actions by
+`python -m development.tools.skill_validation --help`.
 
-直接拼接或替换候选的旧构建脚本已移至[历史工具](../archive/README.md)，后续候选及其启动封装均由CC／DeepSeek修改。
+Old direct candidate builders are in [archive](../archive/README.md). CC/DeepSeek owns
+future candidate and launch-wrapper changes.

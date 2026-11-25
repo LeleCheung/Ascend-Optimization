@@ -1,4 +1,4 @@
-"""生成 KGS 内容寻址合同包；按公开 operator-bundle/v1 规则规范化 tar 元数据。"""
+"""Build content-addressed KGS contract bundles with canonical tar metadata under operator-bundle/v1."""
 import hashlib
 import io
 from pathlib import Path
@@ -8,17 +8,17 @@ import tarfile
 def pack(directory, *, exclude=()):
     root = Path(directory).resolve()
     if not root.is_dir():
-        raise ValueError('合同目录不存在')
+        raise ValueError('Contract directory does not exist')
     paths = []
     for path in sorted(root.rglob('*')):
         if path.relative_to(root).as_posix() in exclude:
             continue
         if path.is_symlink():
-            raise ValueError('合同包不能包含符号链接')
+            raise ValueError('Contract bundles cannot contain symbolic links')
         if path.is_file() and '__pycache__' not in path.parts and path.suffix not in {'.pyc', '.pyo'}:
             paths.append(path)
     if not paths:
-        raise ValueError('合同包为空')
+        raise ValueError('Contract bundle is empty')
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode='w', format=tarfile.PAX_FORMAT) as archive:
         for path in paths:

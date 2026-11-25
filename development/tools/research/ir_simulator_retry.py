@@ -1,4 +1,4 @@
-"""保留失败采集，使用二进制身份核验的模拟器目标别名重新采集。"""
+"""Retain failed captures and recollect using a binary-verified simulator target alias."""
 import argparse
 from datetime import datetime, timezone
 import os
@@ -42,7 +42,7 @@ def main():
     with (out / 'simulator.log').open('x') as stream:
         process = subprocess.run(command, env=environment, stdout=stream, stderr=subprocess.STDOUT)
     save(out / 'simulator-process.json', dict(command=command, returncode=process.returncode))
-    # 有效的部分窗口独立解析；原始退出、时钟失败与完成状态继续保留。
+    # Parse valid partial windows separately; retain original exit, clock failures, and completion status.
     summary = summarize(config, out / 'simulator')
     save(out / 'status.json', dict(status='ir_evidence_collected', source_sha256=config['source_sha256'],
         ir_manifest_sha256=read(out / 'input-provenance.json')['manifest_sha256'],

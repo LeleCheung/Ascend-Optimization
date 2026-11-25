@@ -52,11 +52,11 @@ def main():
             declines.append(item)
         rows.append(dict(operator=row['operator'], gaps=gaps, declines=declines))
     (args.output/'inventory.json').write_text(json.dumps(dict(operators=rows), ensure_ascii=False, indent=2)+'\n', encoding='utf8')
-    text = ['# 轨迹接续与性能恢复清单', '',
-            '下降仅表示固定参考下的历史耗时差异，尚不等于同环境的代码负优化。新实验与历史记录分别保存。', '',
-            '| 算子 | 待补连接 | 下降段 |', '| --- | ---: | --- |']
+    text = ['# Trace continuation and performance recovery', '',
+            'Declines indicate fixed-reference historical timing differences, not established same-environment code regressions. Keep fresh experiments separate.', '',
+            '| Operator | Missing connections | Declining segment |', '| --- | ---: | --- |']
     for row in rows:
-        values = '；'.join(f"{d['start']['score']:.4f} → {d['end']['score']:.4f}×" for d in row['declines']) or '无'
+        values = '；'.join(f"{d['start']['score']:.4f} → {d['end']['score']:.4f}×" for d in row['declines']) or 'None'
         text.append(f"| {row['operator']} | {len(row['gaps'])} | {values} |")
     (args.output/'README.md').write_text('\n'.join(text)+'\n', encoding='utf8')
     print(json.dumps(dict(operators=len(rows), unresolved_connections=sum(len(r['gaps']) for r in rows),

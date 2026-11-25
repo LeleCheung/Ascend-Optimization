@@ -1,72 +1,69 @@
-# HG-KDA / Ascend-Optimization
+# HG-KDA
 
-HG-KDA 面向昇腾算子的性能诊断与严格 Triton 优化，将同输入候选与参考的 profiling、源码与实际 IR、Roofline 参考、指令热点及分类知识组织为可追溯的模型上下文，支持从性能差异到机制假设、代码修改和完整评测的优化流程。
+Hardware-Grounded Kernel Design Agent diagnoses Ascend operators using paired
+hardware profiling, source and compiled IR, instruction hotspot regions, pipeline
+timelines, and versioned knowledge. An agent skill guides the model; a standalone
+Python core computes evidence; optional adapters connect to collection and evaluation.
+Offline analysis uses the Python standard library. The host supplies the model.
 
-实现由 **skill、独立 Python 核心与可选后端适配器** 组成。模型由调用宿主提供，KernelGen（KG）可作为优化执行器；KernelGen Server（KGS）负责完整评测，msprof 负责设备采集。离线分析只依赖 Python 标准库。
+## Install
 
-算子级采集与解析由 MindStudio Ops Profiler（msOpProf）工具提供。当前验证环境使用 CANN 9.0.0 的 `msprof op` 和 `msprof op simulator` 命令；公开新版文档使用独立的 `msopprof` 命令。仿真模式调用 CANN 的 Ascend910B4 仿真库，HG-KDA分析其指令热点、源码区域及流水等待／可观测空闲。msOpProf工具层已开源，底层硬件仿真库的公开源码与周期精确性仍待核实；正式性能由真机评测给出。
+Requires Python 3.10 or newer. From this directory, preferably in a virtual environment:
 
-## 核心能力
+```sh
+git lfs pull
+python -m pip install .
+python -m hgkda doctor
+```
 
-| 能力 | 输出 |
+LFS supplies original example archives. Installation does not install KG/KGS,
+FlagGems, a model client, or the NPU stack. See [optional backends](docs/backends.md).
+
+## Offline examples
+
+Run from this directory and choose new output paths outside the repository:
+
+```sh
+hgkda compare --directory examples/paired-expm1/paired --output ../hgkda-output/compare.json
+hgkda context --operator expm1_ --source examples/paired-expm1/candidate.py --comparison ../hgkda-output/compare.json --output ../hgkda-output/context.json
+hgkda hotspots --listing examples/matmul-instructions/listing.json --source examples/matmul-instructions/candidate.py --output ../hgkda-output/hotspots.json
+hgkda regions --listing examples/matmul-instructions/listing.json --source-map examples/matmul-instructions/source-map.json --output ../hgkda-output/regions.json
+```
+
+These produce source-bound comparisons, model context, hotspot rankings, and source
+regions. Existing outputs are not overwritten. See [examples](docs/examples.md),
+[JSON envelope](schemas/result.schema.json), and [CLI reference](skills/hgkda/references/interface.md).
+
+## Capabilities and workflow
+
+| Capability | Output |
 | --- | --- |
-| 成对 profiling 对比 | 两侧指标分布、计数总和、候选/参考比值及平均搬运粒度 |
-| 分阶段诊断 | 基于算子特征和指标的机制假设、下一项取证或验证建议 |
-| 指令与区域分析 | 候选 kernel 热点、源码区域，以及有时间轴时的流水活动与等待 |
-| 数值参考 | 在工作量与采集口径匹配时计算 Roofline 参考，区分经验包络与物理峰值 |
-| 上下文与知识管理 | 绑定源码身份的证据上下文、分类知识、经验去重与按条件检索 |
-| 评测接入 | 严格 Triton 静态筛查、审查记录绑定与 KGS 完整评测 |
-| 上游验收 | 对显式外部FlagGems工作区验证导入来源，运行原生正确性测试与core benchmark |
-| 性能反馈 | 逐case几何平均损失、大小输入代表case，以及继续优化或达标决策 |
+| Paired profiling | Per-kernel distributions, counter totals, candidate/reference ratios, movement granularity |
+| Staged diagnosis | Mechanism hypotheses, missing evidence, and next investigations |
+| Instruction and region analysis | Hotspot rankings, source regions, execution/wait/idle intervals |
+| Roofline reference | Contract-matched work, traffic, empirical envelopes, and physical peaks |
+| Context and knowledge | Source-bound evidence, scoped retrieval, and validated deduplication |
+| Evaluation | Strict Triton screening, reviewed KGS requests, full results, and performance feedback |
+| Upstream acceptance | Explicit external FlagGems import checks, native correctness tests, and benchmarks |
 
-## 工作流
+Fix source and contract, collect paired evidence, inspect source/IR and simulator
+regions as needed, propose a testable change, review all candidate paths, evaluate
+the full contract, and feed the result back to the model. The host orchestrates rounds;
+the Python core does not independently generate or schedule optimization.
 
-固定源码与测试合同 → 成对采集与对照 → 按需检查源码/IR、数值参考和热点区域 → 模型提出可验证修改 → 严格 Triton 审查 → KGS 完整评测 → 性能反馈 → 继续优化或保留结果、更新知识。
+Load the [HG-KDA skill](skills/hgkda/SKILL.md) in a model host, or use its equivalent
+entry point: `python skills/hgkda/scripts/run_hgkda.py doctor`.
 
-skill 指导模型选择和调用工具；Python 核心计算与组织证据；模型负责解释机制并生成候选。模型调用与多轮优化由宿主或 KG 编排。
+## Runtime and measurement
 
-## 安装
+`python -m hgkda.runtime --help` exposes prepare, context, preflight, pair, simulate,
+generate, evaluate, and trace actions. Configuration and boundaries are documented
+in [public runtime](docs/runtime.md). The package works without `development/`.
 
-需要 Python 3.10 或更高版本。推荐在独立虚拟环境中安装；获取仓库后，在hgkda目录执行：
-
-    git lfs pull
-    python -m pip install .
-    python -m hgkda doctor
-
-Git LFS 用于获取示例合同包等原件。安装核心包不会安装 KG/KGS、FlagGems、模型客户端或 NPU 运行环境；设备采集与评测所需配置见 [可选后端](docs/backends.md)。
-
-## 快速示例
-
-以下命令分析仓库附带的真实历史采集，无需连接设备：
-
-    hgkda compare --directory examples/paired-expm1/paired --output ../hgkda-output/compare.json
-    hgkda context --operator expm1_ --source examples/paired-expm1/candidate.py --comparison ../hgkda-output/compare.json --output ../hgkda-output/context.json
-    hgkda hotspots --listing examples/matmul-instructions/listing.json --source examples/matmul-instructions/candidate.py --output ../hgkda-output/hotspots.json
-    hgkda regions --listing examples/matmul-instructions/listing.json --source-map examples/matmul-instructions/source-map.json --output ../hgkda-output/regions.json
-
-compare.json 保存成对指标，context.json 将证据与分类知识组织为模型上下文；hotspots.json 和 regions.json 分别展示指令热点与源码区域。输出保留输入身份，供模型或其他应用读取，公共封装见 [JSON 合同](schemas/result.schema.json)。
-
-已有输出文件不会覆盖，再次运行时使用新目录。更多示例与 KGS 评测方法见 [示例说明](examples/README.md)。
-
-## 使用 skill
-
-让支持 skill 的模型宿主加载 [HG-KDA skill](skills/hgkda/SKILL.md)，并使用安装了核心包的 Python 执行工具。统一脚本入口与 hgkda CLI 提供相同功能：
-
-    python skills/hgkda/scripts/run_hgkda.py doctor
-
-参数和输入格式见 [接口说明](skills/hgkda/references/interface.md)。工程结构与开发方法见 [公共运行接口](docs/runtime.md)。
-
-## 适用范围与评测约定
-
-- 当前设备侧实例与验证以 Ascend 910B 为主，msprof 报告格式和运行环境应与采集配置匹配。
-- 优化候选的全部设备计算和搬运使用 Triton；CANN 原生库或来源明确的 Ascend C 实现用于参考，PyTorch 与 CANN 参考成绩分别记录。
-- 正式性能采用 KGS 完整调用计时，并保留完整正确性和所需的附加语义检查；独立 profiling 与模拟器耗时单列。
-- 指标阈值形成待验证假设。经验吞吐包络与物理峰值分别解释，不累加可重叠的流水或指令时间作为总耗时。
-
-当前交付算子位于同级operators目录；以其index.json及各算子manifest.json为准。公开软件包不依赖内部开发档案。
-
-## 设备与模型宿主
-
-    python -m hgkda.runtime --help
-
-公共runtime提供prepare、context、preflight、pair、simulate、generate、evaluate等显式动作。详细配置见[公共运行接口](docs/runtime.md)，外部服务见[后端说明](docs/backends.md)。宿主负责多轮调度与审核。
+Validated collection uses Ascend 910B and CANN 9.0.0 `msprof op` / `msprof op simulator`.
+Newer MindStudio Ops Profiler documentation calls the standalone tool `msopprof`.
+The tool invokes the vendor simulation library; formal performance comes from real
+hardware. Strict candidates use Triton throughout; CANN/Ascend C and PyTorch references
+are recorded separately. Full-call KGS timing, hardware profiling, and simulator costs
+have separate scopes. Overlapping pipeline and instruction durations are not summed
+into latency. Delivery status lives in the sibling `operators/index.json`.

@@ -1,4 +1,4 @@
-"""核对模型工具记录能够解释候选源码变化，防止把外部补丁当作模型生成。"""
+"""Model tool records must explain source changes; external patches cannot be reported as model generation."""
 import hashlib
 import importlib.util
 import json

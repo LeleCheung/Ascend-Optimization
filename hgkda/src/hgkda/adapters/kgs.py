@@ -1,4 +1,4 @@
-"""通过 KGS 公开 HTTP 协议提交冻结请求；不导入其内部模块。"""
+"""Submit frozen requests through the public KGS HTTP protocol without importing its internals."""
 import hashlib
 import json
 from pathlib import Path
@@ -14,7 +14,7 @@ from ..gate import admit
 def call(server, endpoint, payload=None, *, timeout=45, method=None, operation_id=None, content_type='application/json'):
     url = urllib.parse.urlsplit(server)
     if url.scheme not in {'http', 'https'} or not url.hostname or url.username or url.password:
-        raise ValueError('KGS 地址必须是无内嵌凭据的 HTTP(S) URL')
+        raise ValueError('KGS address must be an HTTP(S) URL without embedded credentials')
     data = payload if isinstance(payload, bytes) else json.dumps(payload, allow_nan=False).encode('utf8') if payload is not None else None
     headers = {'Content-Type': content_type}
     if operation_id:
@@ -35,7 +35,7 @@ def upload_bundle(server, archive):
     result = call(server, '/operator-bundles/' + digest, raw, method='PUT', timeout=120,
                   content_type='application/vnd.kernelgen.operator-bundle.v1+tar')
     if result.get('bundle_id') != 'sha256:' + digest or result.get('sha256') != digest:
-        raise ValueError('服务返回的合同包身份不符')
+        raise ValueError('Service returned a different contract-bundle identity')
     return result
 
 
@@ -45,11 +45,11 @@ def evaluate(server, request_path, review_path, output_directory, *, timeout=192
     implementation = request['implementation']
     sources = implementation['sources']
     if len(sources) != 1 or implementation['entrypoint'] != sources[0]['path'] + '::run':
-        raise ValueError('本适配器只提交单文件自包含候选；多文件候选需逐依赖审查适配')
+        raise ValueError('This adapter submits only self-contained single-file candidates; multi-file candidates require dependency-by-dependency review and adapter support')
     admission = admit(sources[0]['content'], review)
     status = call(server, '/status')
     if status.get('status') != 'ok' or status.get('api_version') != request.get('api_version'):
-        raise ValueError('KGS 状态或协议版本与冻结请求不符')
+        raise ValueError('KGS status or protocol version differs from the frozen request')
     output = Path(output_directory)
     output.mkdir(parents=True, exist_ok=False)
     op_id = uuid.uuid4().hex
@@ -61,9 +61,9 @@ def evaluate(server, request_path, review_path, output_directory, *, timeout=192
         result = call(server, '/evaluate', request, timeout=timeout, operation_id=op_id)
     except Exception as error:
         emit({'operation_id': op_id, 'state': 'unknown', 'error': str(error),
-              'next_action': '使用 operation_id 查询服务状态，禁止自动重新提交'}, output / 'transport-error.json')
+              'next_action': 'Query service status using operation_id; do not resubmit automatically'}, output / 'transport-error.json')
         raise
     emit(result, output / 'result.json')
     return {'operation_id': op_id, 'source_sha256': admission['source_sha256'],
             'result_path': str(output / 'result.json'), 'evaluation': result,
-            'policy': '单次完整 KGS 请求；评测通过不自动改变发布验收统计'}
+            'policy': 'One full KGS request; evaluation success does not automatically change release acceptance statistics'}

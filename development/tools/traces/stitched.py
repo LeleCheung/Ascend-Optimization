@@ -1,4 +1,4 @@
-"""按源码身份和显式父版本记录连接历史；参考切换不计为优化收益。"""
+"""Connect history by source identity and explicit parents; reference switches are separate from optimization gains."""
 import argparse
 import ast
 import collections
@@ -28,19 +28,19 @@ def campaign(path):
 
 def reference(m,bundles,linkroot):
     p=m['result']['path'].lower(); name=(m.get('implementation',{}).get('name') or '').lower()
-    if '/pytorch/' in p or 'pytorch' in name:return 'PyTorch','显式PyTorch评测目录／请求名'
-    if '/cann/' in p or 'vs-cann' in name or 'strict-cann' in name:return 'CANN','显式CANN评测目录／请求名'
-    if '/cann-priority-' in p and '/comparisons/' in p:return 'CANN','CANN优先批次对照'
-    if '/original/' in p:return 'PyTorch','原参考评测目录'
+    if '/pytorch/' in p or 'pytorch' in name:return 'PyTorch','Explicit PyTorch evaluation directory/request name'
+    if '/cann/' in p or 'vs-cann' in name or 'strict-cann' in name:return 'CANN','Explicit CANN evaluation directory/request name'
+    if '/cann-priority-' in p and '/comparisons/' in p:return 'CANN','CANN-first batch comparison'
+    if '/original/' in p:return 'PyTorch','Original-reference evaluation directory'
     binding=m.get('contract',{}).get('binding') or {}
     bundle=bundles.get(binding.get('bundle_id'))
     if bundle:
         for member in bundle['members']:
             if member['member'].endswith('oracle.py'):
                 src=(linkroot/member['export']).read_text(encoding='utf8')
-                if '独立 PyTorch 参考' in src or ('import torch' in src and 'CANN' not in src and 'ctypes' not in src):
-                    return 'PyTorch','绑定合同包中的PyTorch oracle'
-    return '历史参考','尚未单独核对参考实现'
+                if 'Independent PyTorch reference' in src or ('import torch' in src and 'CANN' not in src and 'ctypes' not in src):
+                    return 'PyTorch','PyTorch oracle bound in contract archive'
+    return 'Historical reference','Reference implementation not separately verified'
 
 
 def order(m):
@@ -180,7 +180,7 @@ def build(row, evidence, linkroot, linkdata):
         for path in links.get(m['result']['path'],{}).get('documents',[]):
             if Path(path).name!='input-provenance.json':continue
             seed=docs[path]['data'].get('source_sha256') or docs[path]['data'].get('seed_sha256')
-            edge(seed,sha,'batch_input_to_selected',path,'批次输入到选中输出；包含批次内多次修改')
+            edge(seed,sha,'batch_input_to_selected',path,'Batch input to selected output; includes multiple internal edits')
             # Link the batch input to its first ledger round when the selected source identifies the ledger.
             for lid,items in groups.items():
                 if any(x.get('source_sha256')==sha for x in items):
@@ -208,7 +208,7 @@ def build(row, evidence, linkroot, linkdata):
         if order(m)[0]>'20261109':continue
         sha=m['sources'][0]['sha256'];ref,refnote=reference(m,bundles,linkroot)
         is_delivery=sha==delivery['sha256'] and m['measurement']['geo_mean']==delivery['cann_score']
-        if is_delivery:ref,refnote='CANN','当前保留交付合同'
+        if is_delivery:ref,refnote='CANN','Current retained delivery contract'
         ev=dict(id=digest(m['result']['path'].encode())[:16],source_sha256=sha,source_key=key(sha),
                 score=m['measurement']['geo_mean'] if m['measurement']['status']=='PASSED' else None,
                 status=m['measurement']['status'],reference=ref,reference_evidence=refnote,
@@ -233,7 +233,7 @@ def build(row, evidence, linkroot, linkdata):
         sort[4]='ledger-'+str(h['round']).zfill(4)
         ev=dict(id=h['ledger_sha256'][:10]+'-'+str(h['round']),source_sha256=sha,source_key=key(sha),
                 score=h['evaluation'].get('geo_mean') if h['evaluation'].get('status')=='PASSED' else None,
-                status=h['evaluation'].get('status'),reference=ref,reference_evidence='原始优化账本；初期PyTorch合同',
+                status=h['evaluation'].get('status'),reference=ref,reference_evidence='Original optimization ledger; initial PyTorch contract',
                 record=rec,is_delivery=False,is_baseline=False,stage=stage,sort=sort,
                 method=dict(note=h.get('plan',{}).get('strategy',''),evidence=path))
         events.append(ev)
@@ -329,16 +329,16 @@ def method_label(event, known):
     if event.get('recovery_method'):return event['recovery_method']
     if event['source_sha256'] in known:return known[event['source_sha256']]
     path=event['record']['result']['path'].lower();note=(event.get('method') or {}).get('note','')
-    choices=[('constexpr-layout','编译期布局特化'),('tiled-2d-launch','二维连续分块'),
-             ('integer-metadata','精简宿主元数据计算'),('fp32-q-accumulation','修复 Q 累加精度'),
-             ('cpp-host','精简 C++ 宿主路径'),('codex-disjoint','修复连续块交界'),
-             ('transfer-log10','迁移多块处理方法'),('full-tile-stream','完整块流式处理'),
-             ('half-tiles','低精度分块调整'),('launch-once','减少启动封装开销'),
-             ('restored-v1','核验严格 Triton 路径')]
+    choices=[('constexpr-layout','Compile-time layout specialization'),('tiled-2d-launch','2-D contiguous tiling'),
+             ('integer-metadata','Simplify host metadata math'),('fp32-q-accumulation','Repair Q accumulation precision'),
+             ('cpp-host','Simplify C++ host path'),('codex-disjoint','Repair contiguous-tile boundaries'),
+             ('transfer-log10','Transfer multi-tile method'),('full-tile-stream','Full-tile streaming'),
+             ('half-tiles','Adjust low-precision tiling'),('launch-once','Reduce launch-wrapper cost'),
+             ('restored-v1','Verify strict Triton paths')]
     for token,label in choices:
         if token in path:
             color='probe' if 'host-profile-guided' in note.lower() else 'ir'
-            return dict(method=label,color=color,location='host' if '宿主' in label or '启动' in label else 'mixed')
+            return dict(method=label,color=color,location='host' if 'Host' in label or 'Launch' in label else 'mixed')
     return None
 
 
@@ -365,13 +365,13 @@ def svg(row,known,all_history=False):
            '<defs>'+''.join(f'<marker id="method-{cat}" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto"><path d="M0 0L6 3L0 6Z" fill="{color}"/></marker>' for cat,color in COLORS.items())+'<marker id="arr" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#596170"/></marker></defs>',
            '<g font-family="Microsoft YaHei,Noto Sans CJK SC,sans-serif">',
            text(52,62,row['operator'],min(42, (w-650)/(len(row['operator'])*.58))),
-           text(52,112,('交付 ' if row.get('progress_view') else '')+f"{row['delivery']['cann_score']:.3f}× CANN",30,GREEN)]
+           text(52,112,('Delivery ' if row.get('progress_view') else '')+f"{row['delivery']['cann_score']:.3f}× CANN",30,GREEN)]
     used=['paired','knowledge','ir','sim']
-    names={'paired':'Profiling','knowledge':'知识／经验','sim':'模拟器','ir':'源码／IR分析'}
+    names={'paired':'Profiling','knowledge':'Knowledge / experience','sim':'Simulator','ir':'Source / IR analysis'}
     for k,cat in enumerate(used):
         x=w-520+(k%2)*255;ly=55+(k//2)*40
         parts += [f'<line x1="{x}" y1="{ly}" x2="{x+23}" y2="{ly}" stroke="{COLORS[cat]}" stroke-width="3"/>',text(x+32,ly+8,names[cat],23,COLORS[cat])]
-    for k,label in enumerate(['设备kernel','宿主侧','两者都有','起点']):
+    for k,label in enumerate(['Device kernel','Host','Mixed','Start']):
         x=w-520+(k%2)*255;ly=145+(k//2)*40
         if k==0:mark=f'<circle cx="{x+10}" cy="{ly}" r="8" fill="{GREEN}"/>'
         elif k==1:mark=f'<rect x="{x+2}" y="{ly-8}" width="16" height="16" fill="{GREEN}"/>'
@@ -387,7 +387,7 @@ def svg(row,known,all_history=False):
         for a,b,ref in spans:
             x1=xs[a]-48;x2=xs[b]+48
             parts += [f'<path d="M{x1} 194H{x2}" stroke="#c9c1ae" stroke-width="3"/>',text((x1+x2)/2,230,ref,25,anchor='middle')]
-    parts.append(text(52,320,'加速比'+('（对数刻度）' if log else ''),27))
+    parts.append(text(52,320,'Speedup'+('(log scale)' if log else ''),27))
     for tick in ticks:
         label=f'{tick:g}×' if log else f'{tick:.2f}×'
         parts += [f'<line x1="150" y1="{y(tick):.2f}" x2="{w-65}" y2="{y(tick):.2f}" stroke="#ded7c9"/>',text(125,y(tick)+9,label,25,anchor='end')]
@@ -413,10 +413,10 @@ def svg(row,known,all_history=False):
             # Chronological performance progression is drawn explicitly as a
             # scheme switch, never added to the source-ancestry edge graph.
             parts.append(f'<path class="method-switch" d="M{xs[i]:.2f} {ys[i]:.2f} L{xs[i+1]:.2f} {ys[i+1]:.2f}" stroke="#596170" stroke-width="2" fill="none"/>')
-            parts.append(text((xs[i]+xs[i+1])/2,(ys[i]+ys[i+1])/2-24,'方案切换',23,anchor='middle'))
+            parts.append(text((xs[i]+xs[i+1])/2,(ys[i]+ys[i+1])/2-24,'Method switch',23,anchor='middle'))
             continue
         parts.append(f'<path class="connection" d="M{xs[i]:.2f} {ys[i]:.2f} L{xs[i+1]:.2f} {ys[i+1]:.2f}" stroke="{color}" stroke-width="3.5" fill="none" {dash}/>')
-        if refchange:parts.append(text((xs[i]+xs[i+1])/2,285,'换参考',23,anchor='middle'))
+        if refchange:parts.append(text((xs[i]+xs[i+1])/2,285,'Reference change',23,anchor='middle'))
     if transfer:
         if transfer.get('attribution'):
             from .attribution import tooltip
@@ -424,7 +424,7 @@ def svg(row,known,all_history=False):
         target=next(i for i,e in enumerate(es) if e['source_sha256']==transfer_targets[-1])
         tx=xs[target];bx=max(410,min(w-410,tx-180));by=270
         parts += [f'<rect class="donor" x="{bx-300}" y="{by-32}" width="600" height="62" rx="12" fill="{BG}" stroke="{COLORS["knowledge"]}" stroke-width="2"/>',
-                  text(bx,by+8,transfer['donor']+' → 方法迁移',27,COLORS['knowledge'],anchor='middle')]
+                  text(bx,by+8,transfer['donor']+' -> method transfer',27,COLORS['knowledge'],anchor='middle')]
         for digest in transfer_targets:
             target=next(i for i,e in enumerate(es) if e['source_sha256']==digest);tx=xs[target]
             parts.append(f'<path class="donor-connection" d="M{bx} {by+30} Q{bx} {ys[target]} {tx-18} {ys[target]}" stroke="{COLORS["knowledge"]}" stroke-width="2.5" fill="none" marker-end="url(#arr)"/>')
@@ -435,7 +435,7 @@ def svg(row,known,all_history=False):
         # Validation and version selection remain in the evidence, rather than
         # being presented as optimization techniques in the figure.
         administrative = method and any(token in method['method'] for token in
-                                        ('核验严格', '恢复历史有效版本'))
+                                        ('Verify strict', 'Restore historically qualified version'))
         if method and not administrative:annotations.append((i,method))
     # Every mainline modification receives a visible label; no top-k truncation.
     for k,(i,m) in enumerate(annotations):
@@ -466,10 +466,10 @@ def svg(row,known,all_history=False):
         elif loc=='host':parts.append(f'<rect x="{x-9}" y="{yy-9}" width="18" height="18" fill="{GREEN}" stroke="{BG}" stroke-width="2"/>')
         elif loc=='mixed':parts.append(f'<path d="M{x} {yy-12}L{x+12} {yy}L{x} {yy+12}L{x-12} {yy}Z" fill="{GREEN}" stroke="{BG}" stroke-width="2"/>')
         else:parts.append(f'<circle cx="{x}" cy="{yy}" r="9" fill="{GREEN if loc=="kernel" else "#92908a"}" stroke="{BG}" stroke-width="2"/>')
-        label=(f"{e['score']:.4f}×" if e['score']<.01 else f"{e['score']:.3f}×") if e['score'] is not None else '未通过'
+        label=(f"{e['score']:.4f}×" if e['score']<.01 else f"{e['score']:.3f}×") if e['score'] is not None else 'Failed'
         if e.get('score_kind')=='rebased':label='≈'+label
         parts.append(text(x,yy+38 if i%2 else yy-23,label,27,anchor='middle'))
-        parts.append(text(x,1005,'FlagGems' if e['is_baseline'] else (f'V{i} · 交付' if e['is_delivery'] else f'V{i}'),25,anchor='middle'))
+        parts.append(text(x,1005,'FlagGems' if e['is_baseline'] else (f'V{i} | delivery ' if e['is_delivery'] else f'V{i}'),25,anchor='middle'))
         parts.append('</g>')
     parts+=['</g></svg>'];return '\n'.join(parts)
 
@@ -482,9 +482,9 @@ def render_rows(rows,out):
             p=r['points'][a['point']-1]
             location=next((x['location'] for x in r['view'].get('nodes',[]) if x['point']==a['point']),'mixed')
             known[p.get('source_sha256')]=dict(method=a['method'],color=a['color'],location=location)
-    cards=[];report=['# 26项源码接续轨迹','','每图从原始FlagGems送测记录出发，以当前交付测量结束。实线仅表示同源码／格式或入口适配等价，或显式父版本记录；虚线保留尚未核实的接续。换参考的连接单独标注，不称为性能提升。',
-        '', '连续编号是展示索引，不冒充完整模型轮数；主线优先选择可证的交付祖先，其余尝试保留在全部历史中。',
-        '', '| 算子 | 主线点 | 根到交付来历 | 同源码两侧参考 | 交付源码两侧参考 |','| --- | ---: | --- | --- | --- |']
+    cards=[];report=['# 26-operator source ancestry','','Each chart starts at native FlagGems submission and ends at current delivery. Solid links mean verified same-source/static equivalence or explicit parents; dashed links retain unverified relations. Mark reference changes separately from gains.',
+        '', 'Indices count displayed versions, not every model round. Prefer proven delivery ancestry; retain other attempts in full history.',
+        '', '| Operator | Main nodes | Root-to-delivery ancestry | Same-source dual reference | Delivery dual reference |','| --- | ---: | --- | --- | --- |']
     css="body{margin:30px;background:#fff7e8;color:#1b2434;font:20px/1.65 'Microsoft YaHei',sans-serif}h1{font-size:34px}a{color:#2368b1}.viewport{overflow:auto;border:1px solid #ded7c9}svg{display:block;max-width:none}table{border-collapse:collapse;width:100%;font-size:17px}td,th{border-bottom:1px solid #d8d5c8;padding:10px;text-align:left;vertical-align:top}code{overflow-wrap:anywhere}details{margin:18px 0}summary{cursor:pointer;font-weight:bold}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(520px,1fr));gap:24px}.cards img{width:100%}.card{border:1px solid #ded7c9;padding:12px}"
     for row in rows:
         op=row['operator'];dest=out/op;dest.mkdir(exist_ok=True)
@@ -493,34 +493,34 @@ def render_rows(rows,out):
         save(dest/'trace.json',row)
         table=[]
         for i,e in enumerate(row['display_events']):
-            m=method_label(e,known);label=m['method'] if m else ((e.get('method')or{}).get('note') or '方法记录待补')
+            m=method_label(e,known);label=m['method'] if m else ((e.get('method')or{}).get('note') or 'Method record incomplete')
             c=row['connections'][i-1] if i else None
-            relation='原始起点' if not c else {'same_source':'同源码／静态等价','recorded_lineage':'父版本记录可接','unresolved':'接续待核实'}[c['kind']]
-            if c and c['reference_change']:relation+='；参考切换'
-            table.append('<tr><td>'+str(i)+'</td><td>'+html.escape(e['stage'])+'</td><td>'+('未通过' if e['score'] is None else f"{e['score']:.6f}×")+' '+e['reference']+'</td><td><code>'+e['source_sha256'][:12]+'</code><br>'+relation+'</td><td>'+html.escape(label)+'</td></tr>')
-        status='已找到根到交付的版本来历' if row['full_lineage_verified'] else '已接通部分片段，虚线处仍待核实'
-        page=f'<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>{op} 源码接续</title><style>{css}</style><p><a href="../index.html">返回26项总览</a> · <a href="mainline.png">PNG</a> · <a href="mainline.svg">SVG</a> · <a href="trace.json">完整证据</a></p><h1>{op}</h1><p>{status}。横向滚动查看全部节点；换参考不算代码优化。</p><div class="viewport">'+svg(row,known)+'</div><p>颜色沿用已核验的方法来源；空心节点表示修改位置未单独归类。实心圆／方／菱形分别表示kernel内、宿主和混合修改。</p><details><summary>全部历史与分支（包含未进入交付主线的尝试）</summary><div class="viewport">'+svg(row,known,True)+'</div></details><table><tr><th>节点</th><th>批次</th><th>成绩与参考</th><th>源码与接续</th><th>方法记录</th></tr>'+''.join(table)+'</table></html>'
+            relation='Original start' if not c else {'same_source':'Same source / static equivalence','recorded_lineage':'Explicit parent connection','unresolved':'Connection unverified'}[c['kind']]
+            if c and c['reference_change']:relation+='; reference change'
+            table.append('<tr><td>'+str(i)+'</td><td>'+html.escape(e['stage'])+'</td><td>'+('Failed' if e['score'] is None else f"{e['score']:.6f}×")+' '+e['reference']+'</td><td><code>'+e['source_sha256'][:12]+'</code><br>'+relation+'</td><td>'+html.escape(label)+'</td></tr>')
+        status='Root-to-delivery ancestry located' if row['full_lineage_verified'] else 'Some segments connected; dashed links remain unverified'
+        page=f'<!doctype html><html lang="en"><meta charset="utf-8"><title>{op} source ancestry</title><style>{css}</style><p><a href="../index.html">26-operator overview</a> | <a href="mainline.png">PNG</a> | <a href="mainline.svg">SVG</a> | <a href="trace.json">Full evidence</a></p><h1>{op}</h1><p>{status}. Scroll for all nodes; reference changes are separate from code optimization.</p><div class="viewport">'+svg(row,known)+'</div><p>Colors retain verified guidance. Hollow nodes have unclassified change locations; circle/square/diamond denote kernel/host/mixed.</p><details><summary>All history and branches outside delivery ancestry</summary><div class="viewport">'+svg(row,known,True)+'</div></details><table><tr><th>Node</th><th>Batch</th><th>Score/reference</th><th>Source/ancestry</th><th>Method record</th></tr>'+''.join(table)+'</table></html>'
         (dest/'index.html').write_text(page,encoding='utf8')
-        cards.append(f'<div class="card"><h2><a href="{op}/index.html">{op}</a></h2><a href="{op}/index.html"><img src="{op}/mainline.svg"></a><p>交付 {row["delivery"]["cann_score"]:.3f}× CANN · {status}</p></div>')
-        report.append(f'| [{op}]({op}/index.html) | {len(row["display_events"])} | '+('已找到' if row['full_lineage_verified'] else '部分待接')+' | 有 | '+('有' if any(b['delivery_source'] for b in row['bridges']) else '最新交付仅CANN')+' |')
-    (out/'index.html').write_text('<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>26项源码接续轨迹</title><style>'+css+'</style><h1>26项：从 FlagGems 接到交付版</h1><p>实线：源码接续已核实。虚线：接续待核实或换参考；参考切换单独标注。</p><p><a href="README.md">核对结论</a> · <a href="reference-bridges.json">同源码换参考证据</a></p><div class="cards">'+''.join(cards)+'</div></html>',encoding='utf8')
+        cards.append(f'<div class="card"><h2><a href="{op}/index.html">{op}</a></h2><a href="{op}/index.html"><img src="{op}/mainline.svg"></a><p>Delivery {row["delivery"]["cann_score"]:.3f}× CANN · {status}</p></div>')
+        report.append(f'| [{op}]({op}/index.html) | {len(row["display_events"])} | '+('Located' if row['full_lineage_verified'] else 'Partially connected')+' | yes | '+('Yes' if any(b['delivery_source'] for b in row['bridges']) else 'Latest delivery: CANN only')+' |')
+    (out/'index.html').write_text('<!doctype html><html lang="en"><meta charset="utf-8"><title>26-operator source ancestry</title><style>'+css+'</style><h1>26 operators: FlagGems to delivery</h1><p>Solid: verified ancestry. Dashed: unverified links/reference switches, marked separately.</p><p><a href="README.md">Audit findings</a> | <a href="reference-bridges.json">Same-source reference evidence</a></p><div class="cards">'+''.join(cards)+'</div></html>',encoding='utf8')
     complete=[r['operator'] for r in rows if r['full_lineage_verified']]
     missing_bridge=[r['operator'] for r in rows if not any(b['delivery_source'] for b in r['bridges'])]
-    report+=['','## 参考切换影响多大','',
-             '26项都找到至少一个同源码的PyTorch／CANN双参考版本，其中22项就是当前交付源码。四项最新交付目前只找到CANN结果：'+ '、'.join('`'+x+'`' for x in missing_bridge)+'。这四项的较早版本仍有双参考记录。',
-             '', '| 同一份源码 | PyTorch参考 | CANN参考 |','| --- | ---: | ---: |']
+    report+=['','## Reference-switch effects','',
+             'All 26 have a same-source PyTorch/CANN pair; 22 use current delivery source. Four latest deliveries currently have only CANN results: '+ '、'.join('`'+x+'`' for x in missing_bridge)+'. Earlier versions of those four still have dual-reference records.',
+             '', '| Same source | PyTorch reference | CANN reference |','| --- | ---: | ---: |']
     for op in ('upsample_bilinear2d','transform_bias_rescale_qkv','log2_','_conj_physical','batch_norm_with_update_functional'):
         r=next(x for x in rows if x['operator']==op);b=next(x for x in r['bridges'] if x['delivery_source'])
         report.append(f"| `{op}` | {b['pytorch']['score']:.6f}× | {b['cann']['score']:.6f}× |")
-    report+=['','以上是相同源码的不同参考测量，包含各次测量波动；不是换代码产生的优化增益。源码接续可以成立，性能解释必须分段。历史PyTorch含CPU回退的已知限制继续保留，尤其不能把_conj_physical的大比值当作原生CANN收益。',
-             '', '## 距离完整交付路线','',
-             '26项原生送测与交付终点均定位；本轮按显式父版本、批次输入到选中输出以及静态等价源码，找到6项根到交付的主要版本来历：'+ '、'.join('`'+x+'`' for x in complete)+'。这不表示每次内部源码编辑都有独立性能点。',
-             '', '其余20项已有多个可连接片段，但至少一处来源接续尚未核实。图中虚线明确标注，完整JSON保留缺口；不因参考切换而把可证的同源码接续也判成缺失。',
-             '', '起点真实性也限制“26项都从很低性能开始”的表述：固定批次的26项原始起点中，9项正确性通过且历史加速比低于0.8，14项未完整通过，3项原历史参考下已不低于0.8。原生失败不能填为0分，原生已较快的不能改成低分。',
-             '', '当前图的主线折叠同源码同参考重复测量，但保留账本首轮及最终交付；有完整来历时优先展示交付祖先。其余尝试可展开查看，已知Ascend C混合历史分支保留在此前证据清单，不混入严格Triton主线。未知合规性的历史点不自动认证为严格Triton。',
-             '', '实际提交的父子版本记录位于`development/experiments/lineage/20261117/links-v2/`。补取426份来源文档、210个合同包身份和241份哈希匹配源码；19个引用源文件未在所查路径按原SHA找到，明确记录在links.json。没有新跑设备实验。',
-             '', '## 下一步','',
-             '先补20项的父版本引用／原始调用连接；不需要把26项全部重做。只有缺少所需参考下测量、或希望把所有点重画到同一性能标尺，才安排统一复测。历史重新测量应单列，不能冒充当年过程。',
+    report+=['','These are different-reference measurements of the same code, including measurement variation, not code optimization gains. Source ancestry may be valid while performance interpretation remains segmented. Preserve historical PyTorch CPU-fallback scope, especially for large _conj_physical ratios.',
+             '', '## Completeness','',
+             'Native starts/delivery endpoints were found for all 26. Explicit parents, batch input/output, and static equivalence establish six main root-to-delivery histories: '+ '、'.join('`'+x+'`' for x in complete)+'. This does not imply a separate score for each internal edit.',
+             '', 'The other 20 have connectable segments but at least one unresolved ancestry link, marked dashed and retained in JSON. Reference changes do not invalidate verified same-source connections.',
+             '', 'Among 26 fixed-batch native starts, nine passed correctness below 0.8, 14 failed full acceptance, and three were already at least 0.8 under historical references. Do not assign zero to failures or lower faster baselines.',
+             '', 'Main charts fold same-source/reference repeats while preserving first ledger rounds/delivery. Prefer proven ancestors. Keep other attempts expandable and known Ascend C mixed branches separate from strict ancestry. Unknown-compliance nodes are not automatically strict.',
+             '', 'Submitted parent records: `development/experiments/lineage/20261117/links-v2/`. Recovered 426 provenance documents, 210 contract identities, and 241 SHA-matched sources. Nineteen referenced source files were not located with original SHA; links.json records gaps. No new device experiments.',
+             '', '## Next steps','',
+             'Recover 20 missing parent/invocation links without rerunning all 26. Unified reevaluation is separate work when required reference timings/common scales are missing; do not present remeasurement as original history.',
              '', '```powershell','python -m development.tools.traces.stitched --output development/reports/operator-traces-stitched-20261117 --png','```','']
     (out/'README.md').write_text('\n'.join(report)+'\n',encoding='utf8')
 

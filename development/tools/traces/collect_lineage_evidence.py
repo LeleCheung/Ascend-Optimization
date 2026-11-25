@@ -1,4 +1,4 @@
-"""只读检索历史评测；导出源码身份、原件引用与基线原件，不运行候选。"""
+"""Search historical evaluations read-only; export source identities, artifact references, and baseline originals."""
 import argparse
 import hashlib
 import json

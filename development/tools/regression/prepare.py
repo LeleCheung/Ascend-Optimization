@@ -1,4 +1,4 @@
-"""从已验收快照准备独立回归；不启动历史控制器，不修改候选和合同。"""
+"""Prepare an independent regression from accepted snapshots without restarting historical controllers or changing source/contracts."""
 import argparse
 import ast
 import hashlib
@@ -38,7 +38,7 @@ def main():
         return old / Path(path).relative_to(original)
 
     def dependencies(path):
-        """枚举显式绝对路径依赖；只记录已归档的实际文件。"""
+        """Enumerate explicit absolute-path dependencies, recording only existing archived files."""
         for node in ast.walk(ast.parse(path.read_bytes())):
             if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
                 continue
@@ -96,7 +96,7 @@ def main():
             old_request = old_result.with_name(request_name)
             reconstructed = not old_request.exists()
             if reconstructed:
-                # KG 历史快照分别保存 solution、合同身份及计时参数，没有独立 HTTP 请求文件。
+                # Historical KG snapshots retain solutions, contract identities, and timing settings without a separate HTTP request file.
                 identity = json.loads((old_result.parent/'identity.json').read_bytes())
                 contract = json.loads((old_result.parent/'evaluation-contract.json').read_bytes())
                 solution = json.loads((old_result.parent/'solution.json').read_bytes())
@@ -111,7 +111,7 @@ def main():
             content = candidate.read_bytes().decode('utf8')
             assert old_content.replace('\r\n','\n') == content.replace('\r\n','\n')
             raw, digest = pack(Path(checks['cann_supplementary']['leaf']))
-            assert request['binding']['bundle_id'] == 'sha256:' + digest, '合同包与历史正式请求不同'
+            assert request['binding']['bundle_id'] == 'sha256:' + digest, 'Contract archive differs from historical formal request'
             (root/'operator.tar').write_bytes(raw)
             request['implementation']['sources'][0]['content'] = content
             save(root/'request.json', request)
@@ -131,7 +131,7 @@ def main():
     save(output/'plan.json', dict(schema_version='hgkda.regression/v1', repository=str(repo),
          index_sha256=sha(repo/'development/experiments/index.json'), expected=index['accepted'], jobs=jobs,
          errors=errors, compatibility_files=list(links.values()),
-         policy='固定候选与原测试合同；每项一次新KGS完整调用，两侧原补测独立执行；不覆盖历史结果'))
+         policy='Fixed candidates/contracts; one fresh full KGS call per operator and independent original supplementary checks; preserve historical results'))
     print(json.dumps(dict(prepared=len(jobs), expected=index['accepted'], errors=errors,
                          compatibility_files=list(links.values())), ensure_ascii=False))
     return bool(errors)

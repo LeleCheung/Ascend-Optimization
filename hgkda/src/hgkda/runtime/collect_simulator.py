@@ -1,4 +1,4 @@
-"""按已发现的候选符号采集单核模拟器，绑定区域时间轴并刷新实际模型上下文。"""
+"""Capture a single-core simulator using discovered candidate symbols, bind region timelines, and refresh actual model context."""
 import argparse
 import hashlib
 import json
@@ -56,28 +56,28 @@ def main():
     p.add_argument('--soc',required=True)
     p.add_argument('--simulator-library',type=Path,required=True)
     p.add_argument('--core-id',type=int,default=0)
-    p.add_argument('--kernel-name',help='多kernel调用中显式选择已发现的候选符号')
-    p.add_argument('--kernel-replay',type=Path,help='真机保存的目标launch输入；仅用于模拟器隔离阶段分析')
+    p.add_argument('--kernel-name',help='Explicitly select a discovered candidate symbol from a multi-kernel call')
+    p.add_argument('--kernel-replay',type=Path,help='Target launch inputs saved on hardware, used only for isolated simulator analysis')
     p.add_argument('--timeout-minutes',type=int,default=5)
     p.add_argument('--trace-unit',choices=['us','ns','cycles'],required=True,
-                   help='原始trace ts/dur单位，须依据工具格式确认，displayTimeUnit不是换算依据')
-    p.add_argument('--parse-only',action='store_true',help='仅解析该目录已完成的采集，不重新运行模拟器')
+                   help='Raw trace ts/dur unit, confirmed from the tool format; displayTimeUnit does not define conversion')
+    p.add_argument('--parse-only',action='store_true',help='Parse completed captures in this directory without rerunning the simulator')
     p.add_argument('--allow-postcapture-exit',action='store_true',
-                   help='仅允许目标同步及IR清单落盘之后的139退出；不接受超时或Python异常')
+                   help='Allow exit 139 only after target synchronization and IR-manifest persistence; reject timeouts and Python exceptions')
     a=p.parse_args()
-    if a.timeout_minutes<1:p.error('timeout-minutes必须为正数')
+    if a.timeout_minutes<1:p.error('timeout-minutes must be positive')
     import fcntl
     c=read(a.config);pair=a.paired_directory.resolve();out=a.output.resolve()
     spec=read(pair/'spec.json');source=Path(spec['source']);digest=sha(source)
     assert digest==spec['source_sha256']
-    assert digest==sha(Path(c['run_directory'])/'workspace/candidate.py'),'只采当前候选'
+    assert digest==sha(Path(c['run_directory'])/'workspace/candidate.py'),'Capture only the current candidate'
     discovery=read(pair/'candidate-discovery.json');names=discovery['kernels']
     kernel=select_kernel(names,a.kernel_name)
     from hgkda.gate import admit
     admit(source.read_text(encoding='utf8'),read(Path(c['run_directory'])/'source-reviews'/(digest+'.json')))
     if not a.parse_only:
         out.mkdir(parents=True,exist_ok=False)
-        # 真机和模拟器的编译产物可能不同；保留相同源码和case，分别写入独立目录。
+        # Hardware and simulator compiled artifacts may differ; keep the same source/case in separate directories.
         capture_spec=out/'spec.json'
         capture_values=dict(spec,ir_directory=str(out/'actual-ir'))
         if spec.get('ir_input'):
@@ -111,7 +111,7 @@ def main():
             TRITON_CACHE_DIR=str(out/'compiler-cache'),
             PYTHONPATH=c.get('device_pythonpath', ''))
         if spec.get('ir_input'):
-            # IR原采集采用编译器默认行号设置；保持同一编译环境身份。
+            # Preserve the original capture compiler-default line settings and compiler environment identity.
             environment.pop('TRITON_DISABLE_LINE_INFO')
         shell='source '+shlex.quote(str(Path(c['sdk'])/'set_env.sh'))+'\n'
         shell+='\n'.join('export '+k+'='+shlex.quote(v) for k,v in environment.items())+'\n'
@@ -142,9 +142,9 @@ def main():
         assert compiled['source_sha256']==digest and compiled['files']
         for item in compiled['files']:assert sha(manifest.parent/item['path'])==item['sha256']
         qualification.update(kernel_completed=True,completion_manifest_sha256=sha(manifest),
-            basis='独立空目录的IR清单在候选调用和torch.npu.synchronize成功返回后写入；当前驱动源码规定该顺序',
+            basis='An IR manifest in an isolated empty directory is written after the candidate call and torch.npu.synchronize return successfully, as ordered by the current driver source',
             driver_sha256=sha(Path(__file__).with_name('paired_driver.py')),
-            limitation='目标kernel已同步完成，但应用随后以139退出；保留退出异常，不表述为干净进程运行')
+            limitation='Target kernel synchronized successfully, but the application later exited with 139; retain the abnormal exit rather than describing a clean process run')
         save(out/'postcapture-exit-qualification.json',qualification)
     else:qualification['kernel_completed']=True
     from hgkda.simulator import parse, validate_time_unit
@@ -159,13 +159,13 @@ def main():
     reports=[]
     for core in listing['kernels'][0]['cores']:
         traces=list((out/'raw/kernel-000').glob('OPPROF_*/simulator/'+core['name']+'/trace.json'))
-        assert len(traces)==1,'时间轴原件不唯一'
+        assert len(traces)==1,'Original timeline is not unique'
         raw=read(traces[0]);trace=dict(raw) if isinstance(raw,dict) else dict(traceEvents=raw)
         unit_validation=validate_time_unit(raw,core['instructions'],a.trace_unit)
         trace['hgkda_binding']=dict(source_sha256=digest,case=spec['case'],kernel=kernel,
             core=core['name'],time_unit=a.trace_unit,raw_trace_sha256=sha(traces[0]),
             raw_trace=str(traces[0]),unit_validation=unit_validation,
-            scope='单次模拟器采集的单kernel、单硬件核文件；不是整卡trace')
+            scope='One kernel on one hardware core from one simulator capture, not a whole-device trace')
         target=out/(core['name']+'-bound-trace.json');save(target,trace)
         result=analyze(listing,trace,kernel=kernel,core=core['name'],trace_unit=a.trace_unit,
                        sources=verified_sources)
@@ -175,7 +175,7 @@ def main():
         reports.append(dict(core=core['name'],regions=str(out/(core['name']+'-regions.json')),
                            trace_sha256=sha(target),timeline_status=result['timeline']['status']))
     assert reports and all(row['timeline_status']=='completed' for row in reports)
-    # 多个AIV子核分别分析；不将它们混合为一条时间轴，主上下文明确选定其中一个。
+    # Analyze AIV subcores separately rather than mixing timelines; select one explicitly for the main context.
     selected=reports[0];context=out/'context.json'
     subprocess.run([sys.executable,'-m','hgkda','context','--operator',c['operator'],
         '--source',str(source),'--comparison',str(pair/'comparison.json'),'--listing',str(out/'listing.json'),

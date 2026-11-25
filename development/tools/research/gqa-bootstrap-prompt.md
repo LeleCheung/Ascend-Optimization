@@ -1,11 +1,26 @@
-加载skills/hgkda/SKILL.md。本任务建立CANNBench Level 4 GQA的严格Triton起点，合同见contract.json，语义和精度见task-description.md，官方数学参考见golden.py。只读写当前工作区，不访问其他实验和历史候选，不使用其他agent。
+Load skills/hgkda/SKILL.md. Establish a strict Triton start for CANNBench Level4 GQA.
+Read contract.json, task-description.md, and official golden.py. Read/write only this
+workspace; no historical candidates, other experiments, or other agents.
 
-candidate.py当前为空文件。实现公共入口run(query,key,value,scaleValue=-1.0,is_causal=False)，返回与query同shape、dtype的BSND张量。支持合同列出的全部4个官方case，不依赖case_id、输入值、测试seed或答案缓存；按真实shape/stride和参数处理。query head映射到对应KV head，保持KV共享，不物化重复KV。因果mask是右下角对齐，不能误用左上角。
+candidate.py is empty. Implement run(query,key,value,scaleValue=-1.0,is_causal=False),
+returning BSND with query shape/dtype. Support all four official cases using actual
+shape/stride/parameters, never case IDs, values, seeds, or cached answers. Map query
+heads to shared KV heads without materializing repeats. Causal masks align bottom-right.
 
-设备计算只用Triton。Python仅分配、元数据和kernel启动，禁止PyTorch matmul、softmax、索引计算或原生attention等设备计算替代候选。允许torch.empty。初次实现重视精度和UB约束，先建立可正确执行的起点，再研究性能；不得放宽合同MERE/MARE阈值，附加allclose不等于正式精度达标。
+All device work uses Triton; Python only allocates, handles metadata, and launches.
+torch.empty is allowed; PyTorch matmul/softmax/indexing/native attention cannot replace
+candidate work. Establish accuracy and valid UB before performance. Keep MERE/MARE
+thresholds; extra allclose is separate from official accuracy.
 
-可选择分块／在线softmax或其他等价结构。考虑低精度中间概率和归约对接近零结果的相对误差影响，优先以足够精度累加并说明选择；不要为了速度直接假定低精度中间态满足严格精度。
+Choose tiled/online-softmax or equivalent structure. Assess low-precision probability
+and reduction relative error near zero; use adequate accumulation precision and explain it.
 
-只修改candidate.py和diagnosis.json。开始写实现前，填写diagnosis.json（当前源码SHA为e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855），注明依据为官方合同及数学语义，记录假设、实现结构、预期和验证方法，并调用工具桥decision --record diagnosis.json。evidence的path可相对run，如workspace/task-description.md；category为knowledge、role为background。不要虚构已有profiling或模拟器。
+Edit only candidate.py and diagnosis.json. Before implementation register source SHA
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855, official semantics/contract,
+hypothesis, structure, expectations, and validation through bridge decision --record
+diagnosis.json. Evidence paths may be run-relative, e.g. workspace/task-description.md;
+category=knowledge, role=background. Do not invent profiling/simulation.
 
-本次只生成起点并交接。设备评测在宿主审查后执行，因此不要调用preflight或探测环境。生成完成后以短诊断说明数值、布局和UB策略即可。后续若收到编译或精度失败，再围绕失败修改。不要将官方golden复制为候选设备实现。
+Generate the start and hand off; hardware evaluation follows host review. Do not run
+preflight/environment probes. Briefly explain numerical/layout/UB choices in English.
+Repair actual compilation/accuracy feedback later. Do not copy golden device math.

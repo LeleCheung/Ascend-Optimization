@@ -1,4 +1,4 @@
-"""IR比较只能忽略调试位置，不能抹去类型、运算或常量差异。"""
+"""IR comparison may ignore debug locations, but must preserve types, operations, and constants."""
 import importlib.util
 from pathlib import Path
 import unittest

@@ -67,6 +67,7 @@ class FrozenIRWorkflowTest(unittest.TestCase):
         (workspace / 'ir/kernel.ttir').write_text('original', encoding='utf8')
         (workspace / 'frozen.py').write_text('frozen', encoding='utf8')
         save(workspace / 'profiling.json', {})
+        save(workspace / 'context.json', dict(evidence_mode='full'))
         digest = hashlib.sha256(b'frozen').hexdigest()
         save(workspace / 'diagnosis.json', dict(source_sha256=digest, selected_layer='single_operator_ir',
             hypothesis='keep original', change='no change', expected='same behavior', validation='identity',

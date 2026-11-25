@@ -9,8 +9,8 @@ from .selection import remeasurement_indices
 
 INK, GREEN, BG = "#1b2434", "#168358", "#fff7e8"
 COLORS = dict(paired="#2368b1", sim="#c55a18", knowledge="#7852a6", probe="#2368b1", ir="#596170", unknown="#596170")
-EVIDENCE_LABELS = dict(paired="Profiling", sim="模拟器", knowledge="知识库", probe="Profiling", ir="代码分析", unknown="待核验")
-LOCATION_LABELS = dict(device="kernel 内", host="宿主启动", mixed="混合", ir="IR层")
+EVIDENCE_LABELS = dict(paired="Profiling", sim='Simulator', knowledge='Knowledge', probe="Profiling", ir='Code analysis', unknown='Unverified')
+LOCATION_LABELS = dict(device='Device kernel', host='Host launch', mixed='Mixed', ir='IR')
 
 
 def node_shape(x, y, location, size=11):
@@ -52,7 +52,7 @@ def draw(index, view):
     coords = list(zip(xs, [y(p["score"]) if p.get("score") is not None else bottom+40 for p in points]))
     parts = ['<svg xmlns="http://www.w3.org/2000/svg" width="1600" height="900" viewBox="0 0 1600 900" role="img" aria-labelledby="title desc">',
              f'<title id="title">{html.escape(view["title"])}</title>',
-             '<desc id="desc">真实正式评测节点以直线连接，方法与信息来源通过箭头指向相应版本；完整修改与失败记录见HTML。</desc>',
+             '<desc id="desc">Measured formal nodes connected by straight lines; arrows identify method/evidence. HTML preserves full changes and failures.</desc>',
              '<defs>']
     for key, color in COLORS.items():
         parts.append(f'<marker id="arrow-{key}" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 1 L11 6 L0 11 Z" fill="{color}"/></marker>')
@@ -61,15 +61,15 @@ def draw(index, view):
               text(60, 66, view["title"], min(46, 1480 / max(1, sum(1 if ord(c)>127 else .57 for c in view['title']))))]
     delivery = view.get('delivery')
     if delivery:
-        parts += [text(62, 137, f"已交付  {delivery['score']:.3f}× CANN", 32, GREEN),
-                  text(62, 185, f"完整评测 {delivery['passed']}/{delivery['total']} · 性能验收线 0.8×", 25)]
+        parts += [text(62, 137, f"Delivered  {delivery['score']:.3f}× CANN", 32, GREEN),
+                  text(62, 185, f"Full evaluation {delivery['passed']}/{delivery['total']} | acceptance threshold 0.8x", 25)]
         if view.get('result_only'):
             parts += [text(800, 410, f"{delivery['score']:.3f}×", 90, GREEN, anchor='middle'),
-                      text(800, 490, '当前交付版本 · 相对 CANN', 36, anchor='middle'),
-                      text(800, 620, '优化过程尚未恢复，暂展示验收结果', 32, anchor='middle'),
+                      text(800, 490, 'Current delivery | relative to CANN', 36, anchor='middle'),
+                      text(800, 620, 'Optimization history unavailable; showing acceptance', 32, anchor='middle'),
                       '</g>', '</svg>']
             return '\n'.join(parts)
-        parts.append(text(62, 239, view.get('line_status', '下图：历史优化片段'), 25))
+        parts.append(text(62, 239, view.get('line_status', 'Below: historical optimization segment'), 25))
     # Only show evidence categories used in this plot. Preserve raw categories in JSON.
     used = {a['color'] for a in view['annotations']}
     legend = [k for k in ('paired', 'sim', 'knowledge', 'ir', 'unknown')
@@ -91,9 +91,9 @@ def draw(index, view):
             yy = y(tick)
             parts += [f'<line x1="120" y1="{yy}" x2="1510" y2="{yy}" stroke="#d8d5c8" stroke-width="1"/>',
                       text(105, yy+10, f"{tick:.0f}×" if high>=10 else f"{tick:.1f}×", 30, anchor="end")]
-        parts.append(text(62, 307, "加速比", 32))
+        parts.append(text(62, 307, 'Speedup', 32))
     else:
-        parts.append(text(62, 307, "加速比", 32))
+        parts.append(text(62, 307, 'Speedup', 32))
     segments, segment = [], []
     for xy, point in zip(coords, points):
         if point.get("score") is None:
@@ -108,8 +108,8 @@ def draw(index, view):
     for n, ((x, yy), point) in enumerate(zip(coords, points), 1):
         options = node_options.get(n, {})
         location = options.get("location", "device")
-        score_label = f"{point['score']:.6f}×" if point.get('score') is not None else "无有效分数"
-        parts.append(f'<g class="performance-node" data-evaluation="{point["id"]}" data-location="{location}"><title>{html.escape(point["method"])} | {score_label} | {str(point.get("source_sha256") or "未知")[:12]}</title>')
+        score_label = f"{point['score']:.6f}×" if point.get('score') is not None else 'No valid score'
+        parts.append(f'<g class="performance-node" data-evaluation="{point["id"]}" data-location="{location}"><title>{html.escape(point["method"])} | {score_label} | {str(point.get("source_sha256") or 'Unknown')[:12]}</title>')
         parts.append(node_shape(x, yy, location))
         # Labels on alternating sides keep the shallow rises and regressions visible.
         label_y = yy + (43 if n % 2 == 0 and not detail else -23)
@@ -117,7 +117,7 @@ def draw(index, view):
             label_y = yy - 25
         if detail and n > 1:
             label_y = yy + 38
-        parts.append(text(x, label_y, f"{point['score']:.3f}×" if point.get('score') is not None else "评测失败", 34 if detail else 30, anchor="middle"))
+        parts.append(text(x, label_y, f"{point['score']:.3f}×" if point.get('score') is not None else 'Evaluation failed', 34 if detail else 30, anchor="middle"))
         if not detail:
             parts.append(text(x, bottom + 45, n, 30, anchor="middle"))
         parts.append('</g>')
@@ -134,18 +134,18 @@ def draw(index, view):
                   f'<path d="M {ax} {ay} L {endx:.2f} {endy:.2f}" fill="none" stroke="{color}" stroke-width="2.8" marker-end="url(#arrow-{annotation["color"]})"/>', '</g>']
     if detail:
         case = points[0]["observation"]["case"]["inputs"]["spec"]
-        parts.append(text(62, 608, f"{case['dtype']} {case['shape']} · 流水等待取自模拟器单核窗口", 32))
-        rows = [("真机任务耗时", lambda o: f"{o['device_task_us']:.2f} μs"),
-                ("MTE2 仅等待", lambda o: f"{o['pipelines']['MTE2']['wait_only_ratio']:.2%}"),
-                ("Vector 仅等待", lambda o: f"{o['pipelines']['VECTOR']['wait_only_ratio']:.2%}")]
+        parts.append(text(62, 608, f"{case['dtype']} {case['shape']} | waits from a single-core simulator window", 32))
+        rows = [('Hardware task time', lambda o: f"{o['device_task_us']:.2f} μs"),
+                ('MTE2 wait-only', lambda o: f"{o['pipelines']['MTE2']['wait_only_ratio']:.2%}"),
+                ('Vector wait-only', lambda o: f"{o['pipelines']['VECTOR']['wait_only_ratio']:.2%}")]
         for r, (label, getter) in enumerate(rows):
             yy = 660 + 46*r
             parts.append(text(62, yy, label, 32))
             for x, p in zip(xs, points):
                 parts.append(text(x, yy, getter(p["observation"]), 34, anchor="middle"))
-        parts.append(text(62, 840, "修订后部分恢复，仍低于起点；保留原版本。", 36))
+        parts.append(text(62, 840, 'Partial recovery remains below start; retain original.', 36))
     else:
-        parts.append(text(810, 853, "优化步骤" if len(points)>1 else "已保存版本", 30, anchor="middle"))
+        parts.append(text(810, 853, 'Optimization step' if len(points)>1 else 'Saved version', 30, anchor="middle"))
         if view.get("gap"):
             parts.append(text(810, 640, view["gap"], 36, anchor="middle"))
     parts += ['</g>', '</svg>']
@@ -168,26 +168,26 @@ def render(index_path, output, root):
             path = reference["path"]
         relative = Path(os.path.relpath(root / path, output)).as_posix()
         return f'<a href="{html.escape(relative, quote=True)}" target="_blank">{html.escape(label)}</a>'
-    parts = ['<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
-             '<title>log10_ 连续优化 trace</title>', f'<style>{CSS}</style><main>',
-             f'<h1>{html.escape(index["operator"])} 连续优化 trace</h1>',
-             '<p>连续 trace 保存证据读取、源码变化、预检与正式结果；图是其中一条实验线的性能视图。</p>',
+    parts = ['<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
+             '<title>log10_ continuous optimization trace</title>', f'<style>{CSS}</style><main>',
+             f'<h1>{html.escape(index["operator"])} continuous optimization trace</h1>',
+             '<p>Continuous traces retain evidence reads, edits, preflights, and formal results; charts show one experimental sequence.</p>',
              '<nav>']
     for n, view in enumerate(visible_views):
-        parts.append(f'<button class="{"active" if n == 0 else ""}" data-tab="{view["id"]}">{"主线图" if n == 0 else "模拟器放大图"}</button>')
-    parts += ['<button data-tab="history">完整历史与连续记录</button>', '</nav>']
+        parts.append(f'<button class="{"active" if n == 0 else ""}" data-tab="{view["id"]}">{'Mainline' if n == 0 else 'Simulator detail'}</button>')
+    parts += ['<button data-tab="history">Full history and continuous records</button>', '</nav>']
     for n, view in enumerate(visible_views):
         svg = draw(index, view)
         (output / (view["id"] + ".svg")).write_text(svg, encoding="utf-8")
         parts += [f'<section id="{view["id"]}" {"hidden" if n else ""}><figure>{svg}</figure>',
-                  f'<p class="exports"><a href="{view["id"]}.svg">SVG</a><a href="{view["id"]}.png">PNG</a><a href="#detail-{view["session"]}" class="jump-history">展开本线记录</a></p>']
+                  f'<p class="exports"><a href="{view["id"]}.svg">SVG</a><a href="{view["id"]}.png">PNG</a><a href="#detail-{view["session"]}" class="jump-history">Expand sequence records</a></p>']
         if n == 1:
-            parts.append('<p class="note">这是另一条冻结生成版区域实验线，不能接到开发线 0.851× 之后。它展示预取退步、诊断与恢复；不宣称超过该实验起点。</p>')
+            parts.append('<p class="note">Separate frozen-generation region experiment, disconnected from development 0.851x. Shows prefetch regression, diagnosis, and recovery without claiming improvement over its start.</p>')
         parts.append('</section>')
-    parts += ['<section id="history" hidden><h2>历史入口</h2>',
-              f'<p>{link(index["history"]["html"], "打开全部28条正式评测图（7个批次）")}　{link(index_path.relative_to(root).as_posix(), "统一 trace 索引 JSON")}</p>',
-              '<p>本页先完成两条连续实验线。其他批次仍在原历史图中保留；没有把28个性能点伪装成一条连续源码继承线。</p>',
-              '<p class="note">顺序按模型调用编号和原始工具行号恢复；正式评测保留原UTC时间。缺失时间不补造，外层控制器事件按源码锚点展示，不声称已恢复所有动作的精确交错时刻。</p>']
+    parts += ['<section id="history" hidden><h2>History</h2>',
+              f'<p>{link(index["history"]["html"], 'All 28 formal evaluations (7 batches)')}　{link(index_path.relative_to(root).as_posix(), 'Unified trace index JSON')}</p>',
+              '<p>Two continuous sequences are presented. Other batches remain in historical charts; 28 points do not form one uninterrupted source chain.</p>',
+              '<p class="note">Order recovered from model-call numbers/tool lines; formal evaluations keep original UTC timestamps. Missing times remain missing; source anchors locate outer events without implying exact interleaving.</p>']
     evidence_by_id = {e["id"]: e for e in index["evidence"]}
     for session in index["sessions"]:
         imported = read(root / session["imported"]["path"])
@@ -195,56 +195,56 @@ def render(index_path, output, root):
         points = [p for p in index["evaluations"] if p["session_id"] == session["id"]]
         parts += [f'<h2 id="detail-{session["id"]}">{html.escape(session["title"])}</h2>',
                   '<div class="facts">' + ''.join(f'<span class="badge">{v} {k}</span>' for k, v in
-                      [("次模型调用", counts["model_calls"]), ("次源码修改", counts["source_transitions"]),
-                       ("份设备预检", counts["preflight_sources"]), ("次正式评测", counts["formal_evaluations"])]) + '</div>',
-                  '<p class="links">' + link(session["event_stream"], "连续事件 JSONL") + link(session["imported"], "版本与工具索引 JSON") + link(session["config"], "原始实验配置") + '</p>',
-                  '<details open><summary>正式性能节点：方法、版本关系与原件</summary><table><thead><tr><th>节点</th><th>方法／结果</th><th>版本关系</th><th>证据入口</th></tr></thead><tbody>']
+                      [(' model calls', counts["model_calls"]), (' source edits', counts["source_transitions"]),
+                       (' device preflights', counts["preflight_sources"]), (' formal evaluations', counts["formal_evaluations"])]) + '</div>',
+                  '<p class="links">' + link(session["event_stream"], 'Continuous events JSONL') + link(session["imported"], 'Version/tool index JSON') + link(session["config"], 'Original experiment configuration') + '</p>',
+                  '<details open><summary>Formal nodes: methods, ancestry, and artifacts</summary><table><thead><tr><th>Node</th><th>Method / result</th><th>Ancestry</th><th>Evidence</th></tr></thead><tbody>']
         for point in points:
             edge = next((e for e in index["measured_edges"] if e["target"] == point["id"]), None)
-            relation = (f"与上个已测版间有 {len(edge['transition_ids'])} 次保存的源码修改" if edge else "本实验首个正式点")
+            relation = (f"Since the previous measured version, {len(edge['transition_ids'])} saved source edits" if edge else 'First formal point in this experiment')
             parts.append(f'<tr><td>{point["number"]}<br><code>{point["source_sha256"][:12]}</code></td>'
                          f'<td>{html.escape(point["method"])}<br><b>{point["score"]:.6f}×</b> · {point["passed"]}/{point["total"]}<br>UTC {point["started_at"]}</td>'
-                         f'<td>{relation}<br>{html.escape(str(point["occurrence"]["call_id"] or "已提供的冻结起点"))}</td>'
-                         f'<td>{link(point["source"], "源码")} · {link(point["result"], "KGS结果")} · {link(point["request"], "合同请求")}</td></tr>')
-        parts += ['</tbody></table></details>', '<details><summary>关键箭头：修改所参考的信息与事后验证分开</summary><ul>']
+                         f'<td>{relation}<br>{html.escape(str(point["occurrence"]["call_id"] or 'Supplied frozen start'))}</td>'
+                         f'<td>{link(point["source"], 'Source')} · {link(point["result"], 'KGS result')} · {link(point["request"], 'Contract request')}</td></tr>')
+        parts += ['</tbody></table></details>', '<details><summary>Arrows: pre-change guidance separate from post-change verification</summary><ul>']
         for view in index["views"]:
             if view["session"] != session["id"]:
                 continue
             for annotation in view["annotations"]:
-                parts.append(f'<li><b>节点{annotation["point"]} · {html.escape(annotation["method"])}</b><ul>')
+                parts.append(f'<li><b>Node {annotation["point"]} · {html.escape(annotation["method"])}</b><ul>')
                 for eid in annotation["evidence"]:
                     e = evidence_by_id[eid]
                     parts.append(f'<li>{link(e["source"],e["category"])} · <code>{e["stage"]}</code>：{html.escape(e["note"])}</li>')
                 parts.append('</ul></li>')
-        parts += ['</ul></details>', '<details><summary>逐次模型调用：展开工具读取、修改与失败</summary>']
+        parts += ['</ul></details>', '<details><summary>Model calls: tool reads, edits, and failures</summary>']
         for call in imported["calls"]:
-            parts += [f'<details><summary>{call["invocation"]} · {call["edits"]} 次修改 · {call["tool_calls"]} 次工具调用 · {call["unsuccessful_tools"]} 次返回错误或无结果</summary>',
-                      f'<p><code>{str(call["input_sha256"] or "输入文件未知")[:24]} → {str(call["output_sha256"])[:24]}</code></p>',
-                      f'<p>{link(call["prompt"], "模型提示词")} · {link(call["source"], "原始工具日志（含结果）")}</p>',
-                      '<div class="events"><table><thead><tr><th>行号</th><th>动作</th><th>对象／描述</th></tr></thead><tbody>']
+            parts += [f'<details><summary>{call["invocation"]} · {call["edits"]} edits | {call["tool_calls"]} tool calls | {call["unsuccessful_tools"]} errors or missing results</summary>',
+                      f'<p><code>{str(call["input_sha256"] or 'Input file unknown')[:24]} → {str(call["output_sha256"])[:24]}</code></p>',
+                      f'<p>{link(call["prompt"], 'Model prompt')} · {link(call["source"], 'Original tool log (with results)')}</p>',
+                      '<div class="events"><table><thead><tr><th>Line</th><th>Action</th><th>Object / description</th></tr></thead><tbody>']
             for event in imported["events"]:
                 if event.get("call_id") != call["id"] or event["kind"] not in ("tool_call", "candidate_change"):
                     continue
                 line = event["source"]["line"]
                 if event["kind"] == "candidate_change":
-                    action = "源码修改"
-                    desc = str(event["input_sha256"] or "未知")[:12] + " → " + event["output_sha256"][:12]
+                    action = 'Source edit'
+                    desc = str(event["input_sha256"] or 'Unknown')[:12] + " → " + event["output_sha256"][:12]
                 else:
-                    action = event["tool"] + (" · 返回错误／无结果" if not event["success"] else "")
+                    action = event["tool"] + (' | error / no result' if not event["success"] else "")
                     desc = event.get("path") or event.get("description") or event["category"]
                 parts.append(f'<tr><td>{line}</td><td>{html.escape(action)}</td><td>{html.escape(desc)}</td></tr>')
             parts.append('</tbody></table></div></details>')
-        parts += ['</details>', '<details><summary>设备预检，包括没有正式分数的失败版本</summary><table><tr><th>源码</th><th>预检状态</th><th>原件</th></tr>']
+        parts += ['</details>', '<details><summary>Device preflight, including failures without formal scores</summary><table><tr><th>Source</th><th>Status</th><th>Artifact</th></tr>']
         for p in index["preflights"]:
             if p["session_id"] == session["id"]:
-                parts.append(f'<tr><td><code>{p["source_sha256"][:12]}</code></td><td>{p["status"]}</td><td>{link(p["source"],"源码")} · {link(p["result"],"预检结果")}</td></tr>')
+                parts.append(f'<tr><td><code>{p["source_sha256"][:12]}</code></td><td>{p["status"]}</td><td>{link(p["source"],'Source')} · {link(p["result"],'Preflight result')}</td></tr>')
         parts.append('</table></details>')
         if "observation" in points[0]:
-            parts.append('<details><summary>模拟器原件与口径限制</summary><ul>')
+            parts.append('<details><summary>Simulator originals and scope</summary><ul>')
             for p in points:
                 o = p["observation"]
-                parts.append(f'<li>节点{p["number"]}：{link(o["paired"],"真机成对指标")} · {link(o["simulator"],"热点区域／流水窗口")}<pre>{html.escape(json.dumps(o["qualification"],ensure_ascii=False,indent=2))}</pre></li>')
-            parts.append('</ul><p>各自单核窗口的等待比例不代表整卡关键路径；采集异常、真机与模拟器核数差异等限制保留在原报告。</p></details>')
+                parts.append(f'<li>Node {p["number"]}：{link(o["paired"],'Paired hardware metrics')} · {link(o["simulator"],'Hotspot regions / pipeline windows')}<pre>{html.escape(json.dumps(o["qualification"],ensure_ascii=False,indent=2))}</pre></li>')
+            parts.append('</ul><p>Single-core wait fractions are separate from a chip-wide critical path. Original reports preserve capture errors and hardware/simulator core-count differences.</p></details>')
     parts += ['</section></main>', '''<script>
 function show(id){document.querySelectorAll('main>section').forEach(s=>s.hidden=s.id!==id);document.querySelectorAll('button[data-tab]').forEach(b=>b.classList.toggle('active',b.dataset.tab===id));}
 document.querySelectorAll('button[data-tab]').forEach(b=>b.addEventListener('click',()=>show(b.dataset.tab)));

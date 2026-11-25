@@ -47,7 +47,7 @@ def bridge(run, invocation, action):
         assert all(actual[name] == initial[name] for name in editable if name != 'diagnosis.json'), 'IR edited before decision'
         assert diagnosis['source_sha256'] == actual['frozen.py']
         wording = json.dumps(diagnosis, ensure_ascii=False)
-        assert all(phrase not in wording for phrase in ['不' + '是', '不' + '等于', '不能' + '证明']), \
+        assert all(phrase not in wording for phrase in ['\u4e0d' + '\u662f', '\u4e0d' + '\u7b49\u4e8e', '\u4e0d\u80fd' + '\u8bc1\u660e']), \
             'Use affirmative concrete statements for evidence, scope and next actions; revise diagnosis wording'
         for name in ['hypothesis', 'change', 'expected', 'validation']:
             assert diagnosis.get(name), 'Diagnosis field required: ' + name
@@ -114,71 +114,71 @@ def generate(run, invocation):
         destination.write_bytes(original.read_bytes())
     bridge_prefix = shlex.join([sys.executable, str(Path(__file__).resolve()), '--run', str(run),
         '--invocation', invocation])
-    prompt = '''本轮对context.json标明的输入版本做单算子IR性能研究，保持frozen.py逐字节一致。
-默认从完整合格最佳继续；若context明确标注未保留探索版的修复分支，按该父版本修复，合格最佳仍为验收比较起点。
-你负责实际IR候选与数值／编译修复；Codex负责证据和调度。只在当前工作区读取，禁止调用其他agent。
-先读取context.json、profiling.json、hotspots.json、timeline.json、ir-inventory.json、frozen.py，
-再根据kernel符号、循环、拷贝与布局检查ir/中的实际TTIR。input文件为当前最佳的真实编译结果；
-存在lowered-inventory.json时读取其清单，按符号检查compiled-readonly/内实际ttadapter和bcmlir，
-核对疑似冗余是否在后端已消除；这些实际低层产物保持冻结，只编辑清单允许的TTIR。
-模拟器窗口的绝对时钟资质、观测范围和未报告泳道按材料解释。热点与等待／空闲均为核心输入。
-流水累计时间可重叠，热点排名用于定位候选机制；关键路径、设备波次与带宽结论须引用独立支持材料。
-前后窗口分别记录覆盖量与归一化范围，动态总次数的比较须核对执行覆盖；未报告泳道保持未知。
-每次性能结果约束对应的实际候选与测量范围；把更广的机制排除保留为待验证假设。
-目标为超过当前最佳；修复旧退步、单纯改编译选项、源码重写各有独立研究身份。
-选择当前IR中具体且有执行成本的编译缺陷。判断哪些计算或布局应由编译器优化，并给出可测预测。
-保留完整数学语义、特殊值、边界、别名及浮点精度要求；严禁根据测试数据拟合、缓存输出或调用外部计算。
-先只修改diagnosis.json，填写source_sha256、selected_layer=single_operator_ir、evidence、hypothesis、
-alternatives、change、expected、validation、layer_reason、simulator_incremental_judgment。
-layer_reason分别解释Triton表达能力、固定源码实验目的与IR控制点；同类意图可在源码表达时写清替代方向。
-expected逐项列出预测的指令、动态轮次、等待与资源变化，宿主后重放将分别核对兑现情况及偏差。
-evidence每项有path、category、role、finding，category取paired_profiling/simulator/source_ir，
-明确引用profiling、热点和流水的具体观察；记录你实际读取的材料。
-然后调用下列decision桥，成功后才编辑IR。只用Edit修改diagnosis.json和ir-inventory.json列出的ir/*.ttir；
-decision成功后diagnosis.json也保持原字节，实际编辑须与已登记机制一致。新增观察写入最终回复。
-若选择保持IR原样，登记判断后调用no-change桥并结束；该交接有效，宿主继续搜索。
-若登记后改变机制，保持本轮原件，交回宿主后另建调用重新登记，再由模型修改IR。
-源文件、清单、context和证据保持冻结。没有Write工具，不调用shell写文件。每次调用选择一个可独立验证的机制，
-可编辑同机制需要的多个特化，不能修改特化的函数ABI。原始IR可解析是起点，避免重复全文件读取。
-如果后端已消除了疑似冗余，解释观察并保持IR原样交接；如果存在可行改法，用小范围Edit落盘。
-完成一项修改后调用submit桥，返回awaiting_ir_review即保持文件不变并结束本次调用。
-语义、完整KGS和性能由宿主审查后运行，不能把文档、预检或建议当作收益结果。
-性能搜索无总轮数、token、cost或总耗时限制；本次交接是审查与完整评测边界。
-新诊断采用专业中文。工具命令：
-'''
-    prompt += '中文采用正向具体陈述；禁用短语按不+是、不+等于、不能+证明拼接，decision桥会校验措辞。\n'
+    prompt = """Research single-operator IR performance for the input identified by context.json; keep frozen.py byte-identical.
+Continue from the qualified best by default. If context explicitly marks an unretained repair branch, repair that parent while comparing acceptance to the retained best.
+You own actual IR changes and numerical/compiler repairs; Codex owns evidence and scheduling. Read only this workspace; do not invoke other agents.
+First read context.json, profiling.json, hotspots.json, timeline.json, ir-inventory.json, and frozen.py.
+Inspect actual TTIR in ir/ by kernel symbol, loops, copies, and layouts. Input files are actual compilation outputs of the current best.
+If lowered-inventory.json exists, inspect actual ttadapter/bcmlir in compiled-readonly/ by symbol.
+Check whether the backend already eliminated suspected redundancy. Keep these low-level artifacts frozen; edit only manifest-allowed TTIR.
+Respect simulator clock qualification, observation scope, and unreported lanes. Hotspot regions and wait/idle evidence are core inputs.
+Pipeline times can overlap. Hotspot rankings identify mechanisms; critical-path, device-wave, and bandwidth claims need independent evidence.
+Record coverage and normalization separately before/after. Verify execution coverage before comparing dynamic counts; unreported lanes remain unknown.
+Each score constrains its actual candidate and measurement scope; broader exclusions remain hypotheses.
+Target improvement beyond the best; repairing regressions, changing compiler options, and source rewrites retain separate identities.
+Choose a concrete costly compiler defect in current IR. State what computation/layout should be optimized and a measurable prediction.
+Preserve math, special values, boundaries, aliasing, and FP requirements. No fitting test data, output caching, or external compute.
+First edit only diagnosis.json: source_sha256, selected_layer=single_operator_ir, evidence, hypothesis,
+alternatives, change, expected, validation, layer_reason, simulator_incremental_judgment.
+layer_reason explains Triton expressibility, fixed-source experiment purpose, and IR control point; identify source alternatives when expressible.
+expected lists instruction, dynamic-count, wait, and resource changes; post-change host replay checks each prediction and discrepancy.
+Each evidence entry has path/category/role/finding; categories are paired_profiling/simulator/source_ir.
+Cite concrete profiling, hotspot-region, and pipeline observations actually read.
+Call the decision bridge below successfully before IR edits. Use only Edit on diagnosis.json and manifest-listed ir/*.ttir.
+After registration keep diagnosis.json byte-identical and edit only the registered mechanism. Put new observations in the final reply.
+For unchanged IR register the decision, call no-change, and end; the host continues searching.
+If the mechanism changes after registration, preserve this invocation and request a new registered invocation.
+Source, manifests, context, and evidence stay frozen. No Write tool or shell file writes. Choose one independently verifiable mechanism per invocation.
+Edit multiple specializations if required by that mechanism, preserving function ABI. Avoid repeated complete reads of parsable original IR.
+If backend elimination already occurred, explain and hand off unchanged. Otherwise apply focused edits.
+After one change call submit; at awaiting_ir_review preserve files and end the invocation.
+The host reviews semantics and runs full KGS/performance; documentation, preflight, or suggestions are not performance results.
+No total round/token/cost/time search limit; this handoff is a review/full-evaluation boundary.
+Write new diagnoses in English. Tool commands:
+"""
+    prompt += 'Use affirmative, concrete English for observations, scope, and next actions. Historical wording checks remain for replay compatibility.\n'
     prompt += bridge_prefix + ' decision\n' + bridge_prefix + ' submit\n' + bridge_prefix + ' no-change\n'
     if editable_stage == 'bcmlir':
-        prompt = prompt.replace('实际TTIR', '实际BCMLIR')
-        prompt = prompt.replace('只编辑清单允许的TTIR', '只编辑清单允许的BCMLIR')
+        prompt = prompt.replace('actual TTIR', 'actual BCMLIR')
+        prompt = prompt.replace('edit only manifest-allowed TTIR', 'edit only manifest-allowed BCMLIR')
         prompt = prompt.replace('ir/*.ttir', 'ir/*.bcmlir')
     if editable_stage == 'hivm':
-        prompt = prompt.replace('实际TTIR', '实际HIVM')
-        prompt = prompt.replace('只编辑清单允许的TTIR', '只编辑清单允许的HIVM')
+        prompt = prompt.replace('actual TTIR', 'actual HIVM')
+        prompt = prompt.replace('edit only manifest-allowed TTIR', 'edit only manifest-allowed HIVM')
         prompt = prompt.replace('ir/*.ttir', 'ir/*.mlir')
-        prompt += ('\n本次编辑编译器实际导出的HIVM，原输入已通过独立后端续编译与实测二进制关联。'
-                   '严格审查显式buffer地址、别名、跨迭代生存期、事件配对和跨核同步；'
-                   '保持函数ABI及未涉及的核心原样。所有修改由宿主逐项审查，再编译和真机评测。\n')
+        prompt += ('\nEdit actual compiler-exported HIVM; original input is bound to measured binary through independent backend continuation.'
+                   'Review explicit buffer addresses, aliases, cross-iteration lifetimes, event pairing, and cross-core synchronization strictly; '
+                   'preserve function ABI and unrelated cores. The host reviews each change before compilation/hardware evaluation.\n')
     if context.get('evidence_mode') == 'compile-repair':
-        prompt = prompt.replace('input文件为当前最佳的真实编译结果',
-            'input文件为当前探索分支真实编译失败的产物；保留最佳的历史材料单独标识')
-        prompt = prompt.replace('category取paired_profiling/simulator/source_ir',
-            'category取evaluation/source_ir/paired_profiling/simulator')
-        prompt += ('\n当前为明确未保留源码分支的编译修复研究。先读取feedback.json和codex-brief.json，'
-            '当前目标IR已实际编译失败，profiling/hotspots/timeline均标为历史版本材料。'
-            '修改前证据必须包含evaluation与source_ir，按实际来源记录历史材料；'
-            '当前源码保持逐字节冻结，编译修复、同源码IR性能收益与超过保留最佳分别验收。'
-            '本调用只提交IR，CPU编译与完整原四项真机检查随后由宿主执行。\n')
+        prompt = prompt.replace('Input files are actual compilation outputs of the current best',
+            'Input files are actual compiler failures from the exploratory branch; historical retained-best material is separately identified')
+        prompt = prompt.replace('categories are paired_profiling/simulator/source_ir',
+            'categories are evaluation/source_ir/paired_profiling/simulator')
+        prompt += ('\nThis invocation repairs compilation of an explicitly unretained source branch. Read feedback.json and codex-brief.json first. '
+            'Target IR actually failed compilation; profiling/hotspots/timeline are historical-version material.'
+            'Pre-change evidence must include evaluation and source_ir; record historical sources accurately. '
+            'Keep current source byte-identical; compilation repair, same-source IR gain, and improvement beyond retained best are separate acceptance questions.'
+            'This invocation submits IR only; the host runs CPU compilation and original four-case hardware checks afterward.\n')
     if (workspace / 'feedback.json').exists():
-        prompt += '先读取feedback.json中的实际正式与补测结果，保留源码和IR身份，针对反馈选择下一步。\n'
+        prompt += 'First read actual formal/supplementary results in feedback.json, preserve source/IR identities, then choose the next action.\n'
     if (workspace / 'codex-brief.json').exists():
-        prompt += '读取codex-brief.json中的宿主证据分析与候选方向，核对实际IR后由你选择具体实现；记录Codex的分析贡献。\n'
+        prompt += "Read host evidence analysis and directions in codex-brief.json, inspect actual IR, and choose implementation yourself; record Codex's analysis contribution.\n"
         requested = read(workspace / 'codex-brief.json').get('requested_mechanism')
         if requested:
-            prompt += ('本调用限定检验下述机制，具体实现由你决定；若证据或语义审查阻止实施，'
-                       '登记原因后按no-change交接，其他机制留给独立调用：\n' + requested + '\n')
+            prompt += ('This invocation tests the following mechanism; you choose implementation. If evidence/semantics prevents it, '
+                       'register the reason and hand off via no-change; leave other mechanisms for separate invocations:\n' + requested + '\n')
     if (workspace / 'validation-policy.json').exists():
-        prompt += '读取validation-policy.json；复用固定完整合同及既有补测，针对已登记具体风险复用现有诊断。ABBA按测量疑点选用，SHA由工具自动记录，候选作者专注机制和实现。\n'
+        prompt += 'Read validation-policy.json; reuse fixed full contracts, checks, and existing diagnostics for registered risks. Use ABBA only for measurement ambiguity. Tools record SHA automatically; candidate authors focus on mechanism/implementation.\n'
     (call / 'prompt.md').write_text(prompt, encoding='utf8')
     settings = read(run / 'model-settings.json')
     environment = dict(os.environ)

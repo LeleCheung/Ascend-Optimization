@@ -1,4 +1,4 @@
-"""通过显式SSH主机和解释器运行本地Python文件，不保存机器配置。"""
+"""Run a local Python file using an explicit SSH host/interpreter without storing machine configuration."""
 import argparse
 from pathlib import Path
 import shlex
@@ -9,13 +9,13 @@ import uuid
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('script', type=Path, help='本地Python文件；-表示从标准输入读取')
-    parser.add_argument('--host', required=True, help='已配置的SSH主机或别名')
-    parser.add_argument('--python', required=True, dest='interpreter', help='远程Python解释器路径')
+    parser.add_argument('script', type=Path, help='Local Python file; - reads standard input')
+    parser.add_argument('--host', required=True, help='Configured SSH host or alias')
+    parser.add_argument('--python', required=True, dest='interpreter', help='Remote Python interpreter path')
     parser.add_argument('--timeout', type=int, default=60)
     args = parser.parse_args(argv)
     if args.host.startswith('-') or args.timeout <= 0:
-        parser.error('主机不能以连字符开头，timeout必须为正数')
+        parser.error('Host must not start with a hyphen and timeout must be positive')
     marker = '__HGKDA_REMOTE_COMPLETE_'+uuid.uuid4().hex+'__'
     raw = sys.stdin.buffer.read() if str(args.script) == '-' else args.script.read_bytes()
     payload = raw+('\nprint('+repr('\n'+marker)+')\n').encode('utf8')

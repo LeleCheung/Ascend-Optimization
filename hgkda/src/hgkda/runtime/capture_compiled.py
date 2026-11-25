@@ -1,4 +1,4 @@
-"""从候选实际调用捕获Triton编译产物，并检查候选未调用ATen计算。"""
+"""Capture Triton artifacts from actual candidate calls and check that ATen computation was not invoked."""
 import argparse
 import hashlib
 import importlib.util
@@ -41,7 +41,7 @@ def main():
                      'aten.transpose','aten.permute','aten.squeeze','aten.unsqueeze',
                      'aten.resize_','aten.resize_as_'}
             if '.'.join(name.split('.')[:2]) not in allowed:
-                raise RuntimeError('候选调用了非元数据ATen入口：'+name)
+                raise RuntimeError('Candidate invoked a non-metadata ATen entry point: '+name)
             return function(*args,**(kwargs or {}))
 
     candidate=imported('_capture_candidate',args.source)
@@ -86,10 +86,10 @@ def main():
             rows.append(dict(case=case['name'],passed=True,aten_operations=mode.operations))
     finally:
         JITFunction.run=original
-    assert entries,'没有捕获实际编译产物'
+    assert entries,'No actual compiled artifacts were captured'
     result=dict(status='verified',source_sha256=sha(args.source),checker_sha256=sha(__file__),
                 cases=rows,entries=list(entries.values()),passed=len(rows),total=len(rows),
-                scope='实际候选调用的编译产物及ATen路径检查；与逐路径源码审查、完整语义测试共同使用')
+                scope='Artifacts from actual candidate calls and ATen-path checks; use alongside execution-path review and full semantic tests')
     (args.output/'verification.json').write_text(json.dumps(result,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
     print(json.dumps(dict(status=result['status'],cases=len(rows),kernels=sorted({key[0] for key in entries}))))
 

@@ -59,7 +59,7 @@ def import_case(root, run):
         qualified = old['score'] is not None and old['status'] == 'PASSED'
         point = next((r for r in measured['per_workload'] if r['uuid'] == target and r['phase'] == 'timing'), None)
         method = method_label(old, {})
-        event = dict(label='FlagGems' if old['is_baseline'] else '历史交付',
+        event = dict(label='FlagGems' if old['is_baseline'] else 'Historical delivery',
             qualified=qualified, score=rebase(latest, measured)['score'] if qualified else None,
             source_sha256=old['source_sha256'], measurement_event_id=old['id'],
             raw_geo_mean=measured.get('geo_mean'), score_is_rebased=True,
@@ -77,7 +77,7 @@ def import_case(root, run):
         point = next(r for r in measured['per_workload'] if r['uuid'] == target and r['phase'] == 'timing')
         transition = name == 'unchanged-ir'
         event_id = str(run.relative_to(reports)) + '/' + name
-        event = dict(label='同实现测量' if transition else invocation, qualified=True,
+        event = dict(label='Same-implementation measurement' if transition else invocation, qualified=True,
             score=rebase(latest, measured)['score'], raw_geo_mean=measured['geo_mean'],
             score_is_rebased=transition, source_sha256=selection['source_sha256'],
             parent_source_sha256=selection['source_sha256'],
@@ -93,21 +93,21 @@ def import_case(root, run):
             event.update(**selection['presentation'], selection=(run / 'selection.json').relative_to(reports).as_posix(),
                 simulator_replay=selection['simulator_replay'])
             event['recorded_method'] = event['method']
-            event['method'] = event['method'].replace('目标shape耗时', '固定shape ')
+            event['method'] = event['method'].replace('Target-shape time', 'Fixed shape ')
             if selection.get('ir_lineage'):
                 event.update(parent_ir_sha256=selection['implementation_parent_ir_sha256'],
                     comparison_ir_sha256=selection['original_ir_sha256'], ir_lineage=selection['ir_lineage'])
         events.append(event)
         parent_id = event_id
-    scope = ('全合同按最新逐case CANN参考统一重算；原始交付成绩冻结于详情。'
-        '同实现测量均隐藏；跨时间与计时实现的测量变化保留，IR真实增量采用本轮固定合同比较。'
-        '目标shape收益与全合同耗时几何变化分别记录于selection.json。')
+    scope = ('Recalculate full contracts with latest per-case CANN anchors; historical delivery scores remain frozen in details.'
+        "Hide same-implementation measurements; retain temporal/timer variation. Actual IR increments use this run's fixed contract."
+        'selection.json separately records target-shape gains and full-contract geometric-mean timing changes.')
     data = dict(operator=op, metric='kgs_full_contract_geo_mean', events=events, scope=scope,
         delivery_frozen=row['delivery'], original_lineage=row,
         cann_anchor=dict(cases=anchors, result=str(candidate_dir / 'result.json')),
-        optimization_loop='模拟器热点／流水 → 选择修改层 → 真机验收 → 持续重放',
-        history_links=[dict(label='原生到交付完整历史', href='../operator-traces-stitched-20261117/' + op + '/delivery-history.html'),
-            dict(label='本轮IR验收', href='../' + (run / 'selection.json').relative_to(reports).as_posix())])
+        optimization_loop='Simulator regions/timing -> layer selection -> hardware acceptance -> continuous replay',
+        history_links=[dict(label='Native-to-delivery history', href='../operator-traces-stitched-20261117/' + op + '/delivery-history.html'),
+            dict(label='Current IR acceptance', href='../' + (run / 'selection.json').relative_to(reports).as_posix())])
     output = reports / (op + '-simulator-20261120')
     write_report(data, output)
     fixed = copy.deepcopy(data)

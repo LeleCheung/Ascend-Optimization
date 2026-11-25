@@ -1,4 +1,4 @@
-"""读取msprof op simulator的公开CSV与逐核trace格式，不依赖KG/KGS。"""
+"""Read public msprof op simulator CSV and per-core trace formats without KG/KGS dependencies."""
 import csv
 import json
 import math
@@ -8,7 +8,7 @@ from statistics import median
 
 
 def validate_time_unit(trace, instructions, unit):
-    """用同核、同PC的CSV累计时间／cycles交叉核验trace单位，不读取显示单位。"""
+    """Cross-check trace units against cumulative CSV time/cycles for the same core and PC, ignoring display units."""
     events=trace.get('traceEvents',[]) if isinstance(trace,dict) else trace
     names={e.get('pid'):e.get('args',{}).get('name') for e in events if e.get('ph')=='M' and e.get('name')=='process_name'}
     durations={};intervals={}
@@ -18,8 +18,8 @@ def validate_time_unit(trace, instructions, unit):
         key=pc(args['pc_addr']);durations[key]=durations.get(key,0)+duration
         start=number(event.get('ts'))
         if start is not None:intervals.setdefault(key,[]).append((start,start+duration))
-    # CSV运行时间合并同PC重叠执行区间；cycles则保留累计执行周期。
-    # 无时间戳的旧离线样本仍使用时长和。
+    # CSV runtime merges overlapping intervals for a PC; cycles retain cumulative execution cycles.
+    # Legacy offline samples without timestamps still use summed durations.
     if unit!='cycles':
         for key,spans in intervals.items():
             merged=[]
@@ -30,37 +30,37 @@ def validate_time_unit(trace, instructions, unit):
     ratios=[];excluded_sync=[];scalar_ratios=[]
     for row in instructions:
         reference=row.get('cycles' if unit=='cycles' else 'running_time_us')
-        # 同步指令的CSV累计等待可能包含入队时间，trace则呈现实际等待区间。
-        # 它们保留在热点及时间轴分析中，但不作为时间单位校准依据。
+        # CSV synchronization waits may include queue time; traces show actual wait intervals.
+        # Retain them for hotspot-region and timeline analysis, but exclude them from time-unit calibration.
         if re.fullmatch(r'BAR|SET_FLAG|WAIT_FLAG',row.get('instruction',''),re.I):
             excluded_sync.append(row['pc']);continue
         if unit!='cycles' and (not reference or reference<.1):continue
         if reference and row['pc'] in durations:
             ratio=durations[row['pc']]/reference
-            # SCALAR逐周期指令在CSV和trace中可能分别采用周期换算与纳秒量化。
-            # 用Vector/MTE等独立交叉核验单位；Scalar差异完整保留，不冒充精确一致。
+            # SCALAR single-cycle instructions may use cycle conversion in CSV and nanosecond quantization in traces.
+            # Cross-check units with independent Vector/MTE instructions; retain Scalar differences instead of claiming exact agreement.
             if unit!='cycles' and row.get('pipeline','').upper() in {'SCALAR','SCALARLDST','FLOWCTRL'}:
                 scalar_ratios.append(ratio)
             else:ratios.append(ratio)
     expected=1000 if unit=='ns' else 1
     matching=sum(abs(value/expected-1)<.05 for value in ratios)
     if len(ratios)<3 or matching/len(ratios)<.8:
-        raise ValueError('trace单位无法由同PC的CSV核验：'+str(dict(unit=unit,compared=len(ratios),
+        raise ValueError('Trace unit cannot be verified against same-PC CSV records: '+str(dict(unit=unit,compared=len(ratios),
             median_ratio=median(ratios) if ratios else None,expected_ratio=expected)))
     return dict(status='verified',unit=unit,compared_pcs=len(ratios),matching_pcs=matching,
                 median_ratio=median(ratios),expected_ratio=expected,
                 excluded_sync_pcs=excluded_sync,
                 scalar_comparison=dict(compared_pcs=len(scalar_ratios),median_ratio=median(scalar_ratios) if scalar_ratios else None,
                     matching_pcs=sum(abs(value/expected-1)<.05 for value in scalar_ratios),
-                    scope='保留Scalar时间口径／量化差异，未用于校准单位；时间轴使用工具报告区间'),
-                method='同PC的非Scalar、非同步指令trace区间并集对照CSV运行时间（cycles使用时长和）；排除同步等待口径及不足0.1us的舍入项')
+                    scope='Retain Scalar timing-scope/quantization differences without using them for unit calibration; timelines use tool-reported intervals'),
+                method='Compare same-PC non-Scalar, non-synchronization trace interval unions with CSV runtime (sum durations for cycles); exclude synchronization-scope differences and rounding items below 0.1 us')
 
 
 def pc(value):
     try:
         return hex(int(str(value),0))
     except (TypeError,ValueError):
-        raise ValueError('无效指令地址：'+str(value)) from None
+        raise ValueError('Invalid instruction address: '+str(value)) from None
 
 
 def number(value, integer=False):
@@ -72,10 +72,10 @@ def number(value, integer=False):
 
 
 def parse(directory, kernel, source, digest, case):
-    """只读取指定kernel目录；原始逐核文件由采集器绑定，不混合多个核。"""
+    """Read only the selected kernel directory; bind original per-core files without mixing cores."""
     roots=list(Path(directory).glob('OPPROF_*/simulator'))
     if len(roots)!=1:
-        raise ValueError('模拟器报告目录缺失或不唯一')
+        raise ValueError('Simulator report directory is missing or not unique')
     source=Path(source);lines=source.read_text(encoding='utf8').splitlines();cores=[]
     for path in sorted(roots[0].glob('*/*_instr_exe.csv')):
         raw=json.loads(path.with_name('trace.json').read_bytes())
@@ -108,10 +108,10 @@ def parse(directory, kernel, source, digest, case):
                     item['source_stack']=locations
                 rows.append(item)
         if not rows:
-            raise ValueError('模拟器指令CSV为空：'+str(path))
+            raise ValueError('Simulator instruction CSV is empty: '+str(path))
         cores.append(dict(name=path.parent.name,instructions=rows,listed_instruction_count=len(rows),
                           mapped_instruction_count=sum('source' in r for r in rows)))
     if not cores:
-        raise ValueError('没有逐核指令CSV')
+        raise ValueError('No per-core instruction CSV')
     return dict(profiler='msprof-op-simulator',source_sha256=digest,case=case,
                 parser='hgkda public simulator CSV/trace adapter',kernels=[dict(name=kernel,cores=cores)])

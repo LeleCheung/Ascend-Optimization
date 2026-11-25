@@ -1,43 +1,84 @@
 ---
 name: hgkda
-description: 诊断与优化昇腾算子的性能；对同输入候选和参考比较 profiling，结合实际源码、IR、数值参考及指令热点生成可验证的严格 Triton 优化方案，并通过可选 KGS 后端评测。
+description: Diagnose NPU operator performance with paired profiling, bound source/IR, numerical references, and simulator hotspot regions; guide testable strict Triton optimization and full optional KGS evaluation.
 ---
 
-# HG-KDA 算子性能诊断
+# HG-KDA operator diagnosis and optimization
 
-使用独立 Python 核心整理证据，由调用宿主的模型解释机制并生成候选。无需启动 KG 即可离线分析；KG 可作为可选优化执行器，KGS 提供完整评测，msprof 提供设备采集。
+Use the standalone Python core to compute evidence. The calling host supplies the
+model that explains mechanisms and generates candidates. KG is optional; KGS provides
+full evaluation; msprof provides device collection.
 
-本项目采用诊断与实现分工：Codex分析瓶颈并更新workflow、skill、知识库及分析／调度工具；CC／DeepSeek依据这些记录生成和修改候选。Codex不得直接修改候选kernel及其启动封装、缓存或回退路径，也不得通过控制脚本代写补丁。正式性能反馈须交回CC／DeepSeek继续优化，并记录Codex方法贡献及模型生成轨迹。
+Codex maintains diagnosis, workflow, skills, knowledge, analysis, and scheduling.
+CC/DeepSeek writes all target candidate code, including launch wrappers and fallbacks.
+Do not implement candidate patches indirectly in control scripts. Preserve model
+inputs/outputs, method versions, source SHA, and formal evidence.
 
-## 开始
+## Start
 
-在hgkda目录执行 python -m pip install .，然后执行 python skills/hgkda/scripts/run_hgkda.py doctor。所有命令输出稳定 JSON，--output 指向新文件，禁止覆盖已有证据。完整参数见 [接口说明](references/interface.md)。
+Install with `python -m pip install .` from `hgkda/`, then run
+`python skills/hgkda/scripts/run_hgkda.py doctor`. Outputs use stable JSON envelopes;
+`--output` requires a new file. See [interfaces](references/interface.md).
 
-先固定算子、输入、源码 SHA、测试合同、参考来源与设备。历史结果不能替代当前输入的证据；缺少实际 IR 或模拟器信息时保留未知项。
+Fix operator, input, source SHA, contract, reference provenance, and device. Historical
+captures are not current-source evidence. If the starting candidate contains non-Triton
+device code, ask CC/DeepSeek for a minimal compliant replacement before collection.
+Run path/address preflight first, then collect actual IR and paired profiling for that
+candidate. Preflight covers the submitted implementation, not every device action of
+exploratory test scripts. Missing IR/simulation remains explicitly unknown.
 
-若原始起点在目标设备调用了非Triton回退，先由CC／DeepSeek生成最小合规候选，经只读路径及地址边界审查后预检；再为该候选采集实际IR和成对profiling。此时初始采集缺失是明确的阶段状态，不要求运行不合规起点或借用其他源码的采集。预检工具只接收候选实现，不用它执行任意探测或对照测试脚本。
+## Staged workflow
 
-## 分阶段分析
+1. **Establish facts.** `compare --directory <paired>` preserves distributions, valid
+   counter totals, ratios, and average transfer granularity. Do not fill missing data.
+2. **Build context.** `context --operator <name> --source <candidate.py> --comparison
+   <comparison.json>` binds identity and separates evidence, hypotheses, and knowledge.
+   Include actual IR, Roofline, and instruction listings only when bound and available.
+3. **Resolve ambiguity.** Rank instructions with `hotspots`, then inspect source regions
+   with `regions`. Bound instruction timelines identify execution, explicit waits, and
+   observed idle on one source/case/kernel/core. Provide these via `context --regions`.
+   Examine data movement, compute, writeback, and IR; a high-cost instruction alone
+   does not establish cause. After simulation is introduced, inspect both hotspot and
+   pipeline evidence after each complete candidate, recording when either has no new
+   diagnostic role. Keep immutable captures and raw formats. If common-core timing
+   exists but absolute units remain unresolved, use `timeline` for normalized fractions,
+   preserving `relative_only` and partial-window scope; never invent missing timing.
+4. **Design a discriminating experiment.** Record evidence, hypothesis, alternatives,
+   change, expected observations, validation, and unresolved questions. Prefer one
+   mechanism per experiment and verify generated-code behavior.
+5. **Validate and continue.** Review every candidate path, run the full KGS contract and
+   supplementary checks, then return full results to the model. Default to performance
+   first without invented call/time/token/cost budgets. Meeting the threshold does not
+   stop optimization unless requested. Choose representative loss cases and continue
+   after failures; one model return or transport error is not a stopping rule. Preserve
+   negative results and deduplicate validated knowledge by scope.
 
-1. **对照事实**：compare --directory <paired> 聚合两侧流水、搬运及冲突指标，保留缺失数量、分布及计数总和；计算候选/参考比值和平均搬运粒度。
-2. **形成上下文**：context --operator <name> --source <candidate.py> --comparison <comparison.json> 核对源码身份，组织对照证据、规则假设与分类知识。已有绑定的实际 IR、Roofline 或指令清单时，通过可选参数一并传入。
-3. **按需深入**：使用 hotspots 定位候选指令，再用 regions 查看源码循环或邻域。已有逐指令时间轴时，按相同源码、case、kernel和硬件核绑定，区分有效指令、仅等待和可观测空闲；通过context的`--regions`传入模型。围绕区域内的搬入、计算、写回及IR提出可验证机制，不直接把最慢指令当作原因。没有时间轴时不得从流水汇总比例虚构空泡，接口与边界见[接口说明](references/interface.md)。
-   进入模拟器分析阶段后，分别检查热点与流水两项证据。格式或采集问题保留为待修复事项，继续核查原始数据与采集范围。绝对时钟单位尚待独立核验、同核公共时间轴已经具备时，可用`timeline`计算窗口归一化的执行／显式等待／可观测空闲比例，并声明`relative_only`与部分窗口范围。缺少时间轴时继续补采。模型在性能决策中分别说明热点和流水证据的作用，也允许明确记录某项证据暂无额外区分作用。
-4. **提出实验**：模型输出证据、机制假设、具体修改、预期指标变化、验证方法及未决问题。选择能区分机制的最小实验；性能收益仍由完整评测确认。
-5. **验证反馈**：先检查全部候选调用路径，再通过 KGS 完整正确性/性能评测和必要补充检查。默认性能优先，不设总轮数、工具调用次数、耗时、token或cost预算；验收达标仅表示候选可保留，不自动结束搜索。根据逐case损失和新证据继续提出修改，保留已验证最佳；短期无收益时换假设或优化层次。一次模型返回或交接评测不是任务结束，宿主应继续调度。成本照常记录，但不作为停止依据；仅用户明确指定预算或停止时遵循相应条件。记录失败及未采纳方案，已验证经验按算子类型、指标口径和适用条件去重更新。
+Before a concrete edit, submit a `runtime decision` binding current source, evidence,
+mechanism, and expectation. Tool reads are not automatic proof of decisive guidance.
+See [continuous trace](references/trace.md). Keep failed and unchanged rounds as well
+as successful ones; do not reconstruct missing historical pre-change decisions.
 
-进行新优化实验时，按[连续trace与决策记录](references/trace.md)在具体修改前调用`runtime decision`或模型工具桥的`decision`，绑定当前源码、引用证据、假设与预期；不将工具读取记录自动当作因果贡献。生成、预检与正式评测入口会保存版本及结果引用，失败和无修改调用也保留。缺少决策记录时标记未知，不事后补写成修改前归因。
+For similar fixed latency across small pointwise inputs, inspect the actual launch
+path and feedback before changing device tiling. See [launch and feedback](references/launch-and-feedback.md).
+When `knowledge` reports `retrieval.empty`, state the method source and distinguish
+general constraints from retrieved operator-specific evidence.
 
-逐元素算子的小输入普遍出现固定延迟时，阅读[启动开销与性能反馈](references/launch-and-feedback.md)，先核对宿主调用路径和代表输入，避免只优化大输入的设备分块。`knowledge` 返回的 `retrieval.empty` 为真时，明确补查方法来源，不把通用约束视作已检索到专项经验。
+## Contracts
 
-## 硬约束
+Strict candidates use Triton for all device computation, copies, and fallbacks.
+CANN/Ascend C is reference-only. Preserve strides, offsets, dtypes, in-place/out identity,
+special values, current device, and streams. Never cache tensor data/results or old streams.
 
-准备向FlagGems提交算子时，按[上游验收](references/upstream-validation.md)调用外部仓库的原生正确性测试与benchmark。使用python -m hgkda.runtime upstream-test；上游验收与KGS、HG-KDA补测分别报告。
+Use same-environment microbenchmarks as empirical envelopes, separate from physical
+peaks. Overlapping pipeline durations cannot be added into total latency. Simulator
+time is not formal hardware timing. Default to one full evaluation per source; explain
+additional repeats rather than replacing full acceptance with local benchmarks.
 
-候选的所有设备计算与搬运严格使用 Triton，包含快路径、慢路径和回退。CANN/Ascend C 仅作参考，禁止原生 DMA 或 PyTorch 目标算子替代候选。保留 stride、offset、dtype、原地/out 别名、特殊值、当前设备和 stream；不缓存张量结果或旧 stream。
+For upstream delivery, also run native tests/benchmarks in an explicit external pinned
+FlagGems workspace using `runtime upstream-test`; report all three layers separately.
+See [upstream validation](references/upstream-validation.md).
 
-活跃阈值是排查优先级，不是瓶颈证明。经验 microbenchmark 包络不是物理峰值。流水时间可能重叠；模拟器指令时间不可相加为正式耗时。默认一次完整正式评测，不以局部测试替代完整调用。
-
-使用 knowledge --operator <name> 获取版本化知识。接口与后端配置见 [接口说明](references/interface.md)；事实、假设、建议必须分别呈现。
-
-公开设备与模型动作通过python -m hgkda.runtime调用；算子合同、参考与专项检查从operators交付包读取。不得依赖内部development目录中的脚本或数据作为运行必需输入。
+Read versioned knowledge with `knowledge --operator <name>`. Keep facts, hypotheses,
+and validated findings distinct. All device/model entry points are packaged in
+`python -m hgkda.runtime`; delivery contracts/checks come from `operators/`. Installed
+operation must not require internal `development/` tools.

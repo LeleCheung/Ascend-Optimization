@@ -1,4 +1,4 @@
-"""保留失败模拟器原件，显式登记原因后延长单次采集防挂死时限。"""
+"""Retain failed simulator originals; register the reason before extending one capture's timeout."""
 import argparse
 from datetime import datetime, timezone
 import os

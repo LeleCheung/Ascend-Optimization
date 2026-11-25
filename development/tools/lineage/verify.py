@@ -1,4 +1,4 @@
-"""离线复核三类版本原件、源码身份和汇报范围；不运行设备或模型。"""
+"""Audit three-version artifacts, source identity, and report scope offline without device/model execution."""
 import argparse
 import hashlib
 import json

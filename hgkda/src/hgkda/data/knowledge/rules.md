@@ -1,11 +1,18 @@
-# 指标与优化方向
+# Metrics and optimization hypotheses
 
-当前规则是版本化的经验启发式，不是自动学习的硬件定律。
+These thresholds are versioned heuristics, not learned universal laws.
 
-- MTE 活跃比例 ≥ 0.7：检查连续性、搬运粒度、重复读写、分块与计算重叠。
-- Vector/Cube 活跃比例 ≥ 0.7：检查实际运算、类型转换、归约、计算效率与流水组织。
-- Scalar 活跃比例 ≥ 0.5：检查控制、索引、动态除法与每 program 覆盖的数据量。
+- MTE activity >= 0.7: investigate contiguity, movement granularity, repeated traffic,
+  tiling, and compute overlap.
+- Vector/Cube activity >= 0.7: inspect actual instructions, conversions, reductions,
+  effective work, and pipeline organization.
+- Scalar activity >= 0.5: inspect control, addresses, dynamic loops, and program coverage.
 
-多个方向同时活跃时追加执行路径、IR 或指令证据。达到阈值只提高排查优先级，不直接判定总耗时由该组件限制。低于阈值也不排除瓶颈。
+When several pipelines are active, inspect the execution path, IR, and instructions.
+Crossing a threshold prioritizes investigation; it does not establish the latency bottleneck.
+A lower value does not rule one out.
 
-知识条目包含适用算子/形状/精度、指标口径、方法、失败条件、源码与结果身份。新经验先标记待验证，完整复验后经审查合并同条件重复项；冲突记录保留适用范围，不覆盖失败证据。
+Knowledge records include operator type, shape/precision, metric scope, action,
+validation, failures, provenance, and source identity. New experience starts as draft;
+validate and deduplicate it before promotion. Conflicting records retain their scope
+and counterexamples rather than replacing failure evidence.

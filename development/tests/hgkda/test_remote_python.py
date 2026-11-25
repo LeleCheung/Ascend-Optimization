@@ -1,4 +1,4 @@
-"""远程控制只有在脚本完整执行后才成功，不以SSH零退出码替代完成证明。"""
+"""Remote execution succeeds only after the complete script runs, not merely a zero SSH exit code."""
 import contextlib
 import importlib.util
 import io

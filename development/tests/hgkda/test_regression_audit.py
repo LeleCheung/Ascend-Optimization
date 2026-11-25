@@ -1,4 +1,4 @@
-"""验证全量回归不会接受遗漏的用例或不能由原始耗时重建的分数。"""
+"""Full-regression audit rejects missing cases or scores not reconstructible from raw timings."""
 import copy
 from pathlib import Path
 import runpy
@@ -23,7 +23,7 @@ class RegressionAuditTests(unittest.TestCase):
         value = inspect_formal(self.result,self.expected)
         self.assertTrue(value['full_passed'])
         self.assertEqual(value['geo_mean'],1.)
-        # 算术平均为1.25，不能替代几何平均。
+        # Arithmetic mean 1.25 cannot replace the geometric mean.
         wrong = copy.deepcopy(self.result)
         wrong['geo_mean'] = 1.25
         with self.assertRaises(AssertionError):inspect_formal(wrong,self.expected)

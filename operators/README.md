@@ -1,15 +1,30 @@
-# 算子交付与版本
+# Operator deliveries and versions
 
-[index.json](index.json)列出30项主线与9项历史记录；当前主线26项达标。按该索引进入各算子的manifest.json，再由selected字段定位当前选用源码。未闭环候选不作为已验收交付。
+[index.json](index.json) records 30 main-line operators and nine earlier records.
+**26 main-line operators are accepted.** Follow each manifest's `selected` field to
+the exact retained source; incomplete candidates are not accepted deliveries.
 
-每个算子按三类保存：historical_noncompliant（历史不符合当前约束）、historical_strict（历史严格Triton）、independent_strict（独立入口严格Triton）。第三类区分retained与generated：既有候选回归不等于模型重新生成。缺失类别明确记录，不补造源码或成绩。
+Version classes are `historical_noncompliant`, `historical_strict`, and
+`independent_strict`. The last distinguishes retained delivery regression from
+model-generated candidates. Missing originals remain explicitly unavailable.
 
-- versions：候选原字节及绑定的审查；selected指向明确选用的版本。
-- contracts：正式正确性／计时用例、参考与精度要求。relocation.json记录旧合同包和参考路径调整。
-- references：PyTorch／CANN补测参考，必要原生库随目录提供。
-- checks：算子补充检查与专项检查；这些是外部验收能力，不依赖development。
-- evidence：选定版本的完整结果与必要来源记录；原始请求中的历史绝对路径仅供追溯，新运行由公开prepare入口生成配置。
+| Directory | Purpose |
+| --- | --- |
+| `versions/` | Original candidate bytes and bound reviews |
+| `contracts/` | Formal cases, references, precision and timing requirements |
+| `references/` | Supplementary PyTorch/CANN references and native resources |
+| `checks/` | Delivered supplementary and operator-specific validation |
+| `evidence/` | Full results and provenance for selected versions |
 
-CANN原生二进制绑定[原评测环境](environment.lock.yaml)，不能假定跨Python ABI或CANN版本通用。路径迁移保持候选、输入用例及容差不变；新参考目录重新打包会产生新包哈希，旧成绩仍绑定旧合同。运行和重新测量须采用新输出目录。
+`relocation.json` explains contract/reference moves. Historical absolute request
+paths are provenance; runtime preparation creates new current configuration.
+Keep hash-bound resources unchanged during engineering/language cleanup.
 
-调用与配置见[公共运行接口](../hgkda/docs/runtime.md)。无需下载内部完整实验档案即可使用公开包及所选算子；native库通过Git LFS保存。早期9项只保留历史材料，不启动新设备实验。
+Native CANN libraries depend on [environment.lock.yaml](environment.lock.yaml) and
+are not assumed portable across Python ABIs or CANN versions. Repacked references
+receive new bundle hashes; historical scores stay bound to original contracts.
+Use a new output directory for every run.
+
+See the [public runtime guide](../hgkda/docs/runtime.md). Public execution requires
+the package, selected delivery, and configured external services. Git LFS supplies
+native assets. Earlier operators remain historical records, not new experiment targets.

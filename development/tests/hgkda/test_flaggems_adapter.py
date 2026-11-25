@@ -1,4 +1,4 @@
-"""上游验收必须包含实际用例、有效计时和正确源码身份。"""
+"""Upstream acceptance requires actual cases, valid timing, and correct source identity."""
 import hashlib
 import sys
 import types

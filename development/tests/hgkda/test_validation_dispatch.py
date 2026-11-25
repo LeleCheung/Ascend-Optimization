@@ -1,4 +1,4 @@
-"""验证调度保留参数边界、失败状态，且帮助或错误动作不触发模型／设备操作。"""
+"""Dispatch preserves argument boundaries/failures; help and invalid actions must not trigger models or devices."""
 import contextlib
 import importlib.util
 import io

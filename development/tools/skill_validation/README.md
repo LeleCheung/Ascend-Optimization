@@ -1,7 +1,12 @@
-# 内部方法验证工具
+# Internal method validation
 
-本目录维护prepare-history、audit、finalize、export、verify。它们负责上游起点实验、方法快照、生成来源和档案核验，不是对外skill运行依赖。
+`prepare-history`, `audit`, `finalize`, `export`, and `verify` manage upstream starts,
+method snapshots, model-generation provenance, and archive integrity. These tools
+are not public skill runtime dependencies.
 
-设备采集、上下文、模型调用、候选预检与正式评测已提取至已安装的hgkda.runtime。执行python -m hgkda.runtime --help查看公共动作。
+Device capture, context, model calls, preflight, and evaluation use the installed
+`python -m hgkda.runtime --help` interface. Internal actions are listed by
+`python -m development.tools.skill_validation --help`.
 
-历史experiment快照仍保留旧路径及SHA，不能改写原件。迁移映射见development/manifests/three-part-migration-20261111.json。
+Historical snapshots keep original paths/SHA. Resolve them through
+`development/manifests/three-part-migration-20261111.json` without rewriting originals.

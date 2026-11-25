@@ -1,4 +1,4 @@
-"""只读统计仓库与依赖边界，输出紧凑的工程整理清单。"""
+"""Read-only inventory of repository contents and dependency boundaries."""
 from __future__ import annotations
 import argparse
 from collections import Counter

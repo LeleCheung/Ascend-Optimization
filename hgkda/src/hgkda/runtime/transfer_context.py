@@ -1,4 +1,4 @@
-"""为多算子方法迁移整理当前源码、分类知识、合同与已绑定的实际采集。"""
+"""Build method-transfer context from current source, typed knowledge, contracts, and bound captures."""
 import hashlib
 import json
 import math
@@ -14,14 +14,14 @@ def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
 def profile_frames(rows,iterations):
-    """保留原始秒数，并显式给出每次算子调用的微秒数，避免单位与分母混淆。"""
+    """Keep raw seconds and explicit microseconds per operator call to avoid unit/denominator confusion."""
     assert iterations>0
     return [dict(row,self_us_per_op=row['self_seconds']*1e6/iterations,
                  inclusive_us_per_op=row['cumulative_seconds']*1e6/iterations) for row in rows]
 
 
 def compact_regions(data):
-    """保留判断所需的区域和区间统计；PC及空闲区间原件按需读取。"""
+    """Keep region/interval statistics needed for decisions; read original PCs and idle intervals on demand."""
     if not data:return None
     timeline=dict(data['timeline'])
     if 'pipelines' in timeline:
@@ -34,11 +34,11 @@ def compact_regions(data):
         rows.append(item)
     return dict(source_sha256=data.get('source_sha256'),case=data.get('case'),regions=rows,
         total_regions=data['total_regions'],timeline=timeline,limitations=data['limitations'],
-        compact_policy='最多8区域，每区域8个PC；每流水最多8个空闲区间，完整原件见绑定context')
+        compact_policy='At most 8 regions with 8 PCs each and 8 idle intervals per pipeline; see bound context for complete originals')
 
 
 def retire_previous(workspace,digest):
-    """保留上一源码的反馈原件，避免把它冒充当前源码的采集或成绩。"""
+    """Retain feedback from prior source without presenting it as current-source captures or scores."""
     for name in ['paired-context-pointer.json','performance-feedback.json','next-performance-feedback.json','latest-preflight.json','launch-probe.json','host-profile.json','compiler-comparison.json']:
         path=workspace/name
         if not path.exists():continue
@@ -55,7 +55,7 @@ def build(config):
     run=Path(config['run_directory']);workspace=run/'workspace'
     source=workspace/config.get('active_source','starter.py');digest=sha(source)
     operator=config['job']['operator'];library=knowledge(operator,hypotheses=True)
-    # 模型只需可执行方法与来源摘要；完整历史路径和嵌套验证原件由宿主保管。
+    # The model needs actionable methods and provenance summaries; the host retains complete historical paths and nested verification originals.
     visible=[{k:record[k] for k in ['id','operators','types','status','signal','mechanism','action','constraints',
               'match','application','source_sha256'] if k in record} for record in library['mechanisms']]
     for name in ['knowledge.json','contract.json','reference-qualification.json']:
@@ -87,7 +87,7 @@ def build(config):
     pointer=workspace/'paired-context-pointer.json'
     if pointer.exists():
         item=read(pointer)
-        assert item['source_sha256']==digest,'成对采集不属于当前源码'
+        assert item['source_sha256']==digest,'Paired capture does not belong to current source'
         context=Path(item['context']);assert sha(context)==item['sha256']
         full=unwrap(read(context));facts=full['facts']['paired']
         selected=[row for row in facts['differences'] if any(word in row['metric'] for word in
@@ -102,8 +102,8 @@ def build(config):
             transfer_granularity=facts['derived_differences'],execution_groups=facts['execution_groups'],
             hypotheses=full['hypotheses'],limitations=facts['limitations'],
             full_context_sha256=item['sha256'],
-            scope='保留变化最大的32项指标及完整搬运粒度；实际IR另列，不重复嵌入源码和历史知识')
-        # 完整上下文中的深入取证必须真正进入模型输入，不能仅生成文件而不传递。
+            scope='Keep the 32 most changed metrics and full transfer granularity; list actual IR separately without duplicating source and historical knowledge')
+        # Detailed evidence from full context must reach model input, not merely be written to an unused file.
         deep=full['facts']
         for index,item in enumerate(deep.get('compiled_ir',[])):
             path=Path(item['path']);assert sha(path)==item['sha256']
@@ -121,21 +121,21 @@ def build(config):
     runtime=workspace/'runtime-api.json'
     runtime_text=None
     if runtime.exists():
-        api=read(runtime);lines=['# 当前运行时接口事实','',f'原件SHA256：{sha(runtime)}','']
+        api=read(runtime);lines=['# Current runtime interface facts','',f'Original SHA256: {sha(runtime)}','']
         for item in api['sources']:
-            lines.extend([f"## {item['module']}",f"来源：{item['path']}；SHA256：{item['sha256']}",'```python'])
+            lines.extend([f"## {item['module']}",f"Source: {item['path']}；SHA256：{item['sha256']}",'```python'])
             lines.extend(f"{row['line']}: {row['text']}" for row in item['excerpts'])
             lines.extend(['```',''])
         for item in api.get('launcher_classes',[]):lines.extend([f"## {item['name']}",'```python',item['source'],'```'])
         for name,item in api.get('runtime_hooks',{}).items():
-            lines.extend([f'## {name}',f"类型：{item['type']}；活动回调数：{item.get('callback_count','unknown')}"])
+            lines.extend([f'## {name}',f"Type: {item['type']}; active callbacks: {item.get('callback_count','unknown')}"])
             if item.get('class_source'):lines.extend(['```python',item['class_source'],'```'])
         runtime_text=workspace/'runtime-api-excerpts.md'
         runtime_text.write_text('\n'.join(lines)+'\n',encoding='utf8')
     launch=None
     probe=workspace/'launch-probe.json'
     if probe.exists():
-        document=read(probe);assert document['source_sha256']==digest,'启动诊断不属于当前源码'
+        document=read(probe);assert document['source_sha256']==digest,'Launch diagnostics do not belong to current source'
         launch=dict(source_sha256=digest,artifact_sha256=sha(probe),
             calls=[dict(case=r['case'],iteration=r['iteration'],jit_calls=r['jit_calls'],
                         candidate_dict_sizes=r['state']['candidate_dict_sizes']) for r in document['records']],
@@ -144,12 +144,12 @@ def build(config):
     host=None
     profile=workspace/'host-profile.json'
     if profile.exists():
-        document=read(profile);assert document['source_sha256']==digest,'宿主栈采样不属于当前源码'
+        document=read(profile);assert document['source_sha256']==digest,'Host-stack sample does not belong to current source'
         host=dict(source_sha256=digest,artifact_sha256=sha(profile),path=profile.name,
             records=[dict(case=row['case'],iterations=row['iterations'],
                 top_cumulative=profile_frames(row['top_cumulative'][:16],row['iterations']),
                 top_self=profile_frames(row['top_self'][:16],row['iterations'])) for row in document['records']],
-            units='self_us_per_op与inclusive_us_per_op按采样迭代数归一化；原始seconds为全部迭代累计，父子inclusive不可相加；有采样开销，不等于正式耗时分解',
+            units='self_us_per_op and inclusive_us_per_op are normalized by sampled iterations; raw seconds accumulate all iterations. Parent/child inclusive times cannot be added; sampling overhead prevents a formal latency breakdown.',
             scope=document['scope'])
     compiler=None
     path=workspace/'compiler-comparison.json'
@@ -165,14 +165,14 @@ def build(config):
         runtime_api=dict(path=runtime_text.name,sha256=sha(runtime_text),raw_json=runtime.name,raw_sha256=sha(runtime)) if runtime_text else None,
         method_manifest_sha256=sha(Path(config['method_manifest'])),
         interpretation_rules=[
-          '起点来源见starter-provenance.json；从已有候选改进与从上游重新生成分别报告，候选全部修改由CC／DeepSeek完成。',
-          '区域累计指令时间只用于排序；同核同窗口的productive、wait_only、idle互斥，空闲不自动等于因果停顿。',
-          '不以单条最慢指令直接选修改；结合周围搬入、计算、写回及实际IR，提出可测量的区域机制假设。',
-          '原始FlagGems起点可能含目标设备不合规回退，初次采集缺失不代表已验证其Triton路径。',
-          '正式性能只采用KGS完整合同；profiling或设备任务时间与完整调用分别记录。',
-          '缺少实际IR、Roofline或组件指标时保留未知，不根据源码虚构测量。',
-          '采集流水和搬运计数全为零时保留采集覆盖未知，不能据此断言硬件空闲或没有开销。',
-          '不得把全任务工作量除以逐核平均时间；计数与时间的聚合范围必须一致。',
-          '预检通过是交接审查的边界，正式性能未达标须依据反馈继续生成候选。'])
+          'See starter-provenance.json for origin; distinguish improving an existing candidate from fresh upstream generation. CC/DeepSeek makes all candidate changes.',
+          'Cumulative region instruction time is for ranking only; productive, wait_only, and idle are disjoint for the same core/window. Idle does not establish causal stalls.',
+          'Do not choose edits from one slow instruction alone; combine surrounding loads, compute, stores, and actual IR into a measurable region-level mechanism hypothesis.',
+          'The original FlagGems starter may have noncompliant device fallbacks; missing initial captures do not validate its Triton path.',
+          'Use only the full KGS contract for formal performance; record profiling/device-task time separately from full-call latency.',
+          'Keep actual IR, Roofline, and component metrics unknown when absent; do not invent measurements from source.',
+          'All-zero pipeline/movement counters leave capture coverage unknown; they do not establish idle hardware or zero overhead.',
+          'Do not divide whole-task work by per-core mean time; counts and durations must have matching aggregation scopes.',
+          'Preflight success is a review handoff; continue candidate generation from feedback when formal performance is below target.'])
     (workspace/'context-brief.json').write_text(json.dumps(value,ensure_ascii=False,indent=2)+'\n',encoding='utf8')
     return value

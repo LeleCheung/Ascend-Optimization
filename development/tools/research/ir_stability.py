@@ -1,4 +1,4 @@
-"""使用KGS原计时实现交错复测固定case，原完整合同成绩独立保存。"""
+"""Use original KGS timing for interleaved fixed-case comparisons; keep full-contract scores separate."""
 import argparse
 from datetime import datetime, timezone
 import fcntl

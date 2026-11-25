@@ -1,4 +1,4 @@
-"""在调用区间采集真实设备任务名称；输入生成在采集区间外。"""
+"""Capture actual device task names within the call window; generate inputs outside that window."""
 import argparse
 import hashlib
 import importlib.util
@@ -31,7 +31,7 @@ def main():
     trace=a.output.with_name(a.output.stem+'-trace.json');prof.export_chrome_trace(str(trace))
     document=json.loads(trace.read_bytes());events=document.get('traceEvents',[]) if isinstance(document,dict) else document
     tasks=[r for r in events if r.get('ph')=='X' and r.get('args',{}).get('Task Type')]
-    assert tasks,'未找到真实设备任务'
+    assert tasks,'No actual device task found'
     result=dict(source_sha256=spec['source_sha256'],side=a.side,kernels=sorted({r['name'] for r in tasks}),
         tasks=[dict(name=r['name'],duration_us=r['dur'],task_type=r['args']['Task Type']) for r in tasks],
         trace=dict(path=str(trace),sha256=hashlib.sha256(trace.read_bytes()).hexdigest()))

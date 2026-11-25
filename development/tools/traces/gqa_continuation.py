@@ -200,21 +200,21 @@ def main():
         apply_attribution_review(events, args.attribution_review.resolve())
     previous.update(events=events, cann_anchor_us=anchor, source_lineage=lineages,
         source_events_without_measurement=unmeasured,
-        optimization_loop='Profiling／模拟器取证 → 选择修改层 → 模型修改 → 真机验证 → 重放核对',
-        scope=previous['scope'] + ' 本批新增事件按真实源码父链保存；前期最佳作为独立分支共同起点，'
-              '完整合格但退步的探索及同实现测量归入详情。原始成绩与原版图冻结。')
+        optimization_loop='Profiling/simulator evidence -> choose layer -> model edit -> hardware validation -> replay',
+        scope=previous['scope'] + ' New events retain actual source parents; earlier best is an independent shared start. '
+              'Qualified regressions and same-implementation measurements stay in details. Raw scores and prior figures remain frozen.')
     previous['axis_max'] = max(.2, round(anchor/selected['target_latency_us']*1.2 + .025, 1))
     previous['history_links'] = [
-        dict(href='../'+campaign.name+'/README.md', label='本次全部结果与机制分析'),
+        dict(href='../'+campaign.name+'/README.md', label='All results and mechanism analysis'),
         dict(href='../'+campaign.name+'/gqa/selection.json' if selection_path.exists() else
-                  '../'+campaign.name+'/gqa/parent-selection.json', label='当前源码保留选择'),
-        dict(href='../'+args.previous_curve.parent.name+'/index.html', label='此前冻结曲线')]
+                  '../'+campaign.name+'/gqa/parent-selection.json', label='Retained source selection'),
+        dict(href='../'+args.previous_curve.parent.name+'/index.html', label='Earlier frozen curve')]
     extra_links = campaign / 'presentation-history-links.json'
     if extra_links.exists():
         previous['history_links'].extend(read(extra_links))
     if ir_records:
         previous['history_links'].append(dict(href='../' + campaign.name + '/manual-ir-progress.json',
-                                             label='固定源码IR进展与身份'))
+                                             label='Fixed-source IR progress and identity'))
     write_report(previous, output)
     rendered = read(output / 'mainline-presentation.json')
     displayed = [rendered['events'][index]

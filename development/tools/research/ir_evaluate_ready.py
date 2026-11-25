@@ -1,4 +1,4 @@
-"""评测已完成宿主审查及CPU编译的IR，完整通过后采集双分析。"""
+"""Evaluate host-reviewed, CPU-compiled IR; collect dual analysis after full acceptance."""
 import argparse
 from pathlib import Path
 import subprocess

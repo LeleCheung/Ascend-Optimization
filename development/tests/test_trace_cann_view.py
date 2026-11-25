@@ -1,4 +1,4 @@
-"""验证固定参考重算的数学口径和用例完整性，避免凭总分换算。"""
+"""Verify fixed-reference score reconstruction and case completeness without converting aggregate scores."""
 import copy
 import math
 import unittest

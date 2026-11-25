@@ -1,4 +1,4 @@
-"""在独立目录单线程编译 CANN Uniform＋Clamp 参考桥；不启动 NPU 任务。"""
+"""Compile a CANN Uniform+Clamp reference bridge serially in an independent directory without NPU tasks."""
 import argparse
 import hashlib
 import json

@@ -1,8 +1,8 @@
-"""筛选候选内核的逐硬件核指令热点。"""
+"""Select instruction hotspots per hardware core for candidate kernels."""
 import ast
 
 def instruction_hotspots(listing, source, *, count=12):
-    """只汇总源码中 jit 函数对应的指令热点，避免将输入构建 kernel 当作候选。"""
+    """Aggregate only instructions mapped to source JIT functions, excluding input-construction kernels."""
     symbols = {n.name for n in ast.walk(ast.parse(source)) if isinstance(n, ast.FunctionDef)
                and any('jit' in ast.unparse(d) for d in n.decorator_list)}
     selected = []
@@ -18,5 +18,5 @@ def instruction_hotspots(listing, source, *, count=12):
                              'listed_instruction_count': core.get('listed_instruction_count'),
                              'mapped_instruction_count': core.get('mapped_instruction_count'),
                              'hotspots': top})
-    return {'scope': '模拟器单指令观测，不能相加为真机总耗时', 'kernels': selected,
+    return {'scope': 'Simulator instruction observations cannot be summed into whole-call device latency', 'kernels': selected,
             'status': 'matched' if selected else 'no_candidate_kernel_match'}

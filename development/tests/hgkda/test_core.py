@@ -1,4 +1,4 @@
-"""验证统计范围、身份约束与时间重叠处理。"""
+"""Verify statistical scope, identity constraints, and interval overlap."""
 import copy
 import hashlib
 import json
@@ -38,7 +38,7 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(result['hypotheses'], [])
         result = diagnose_case({'operator': 'amin', 'metrics': {'aiv_mte2_ratio': .8}})
         self.assertEqual(result['hypotheses'][0]['category'], 'data_movement')
-        self.assertIn('尚未证明', result['hypotheses'][0]['interpretation'])
+        self.assertIn('does not establish', result['hypotheses'][0]['interpretation'])
 
     def test_zero_denominator_and_missing_counter(self):
         import shutil

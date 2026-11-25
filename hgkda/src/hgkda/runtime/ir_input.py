@@ -1,4 +1,4 @@
-"""冻结IR复采资源，同时保留原算子源码身份。"""
+"""Freeze IR recapture resources while preserving original operator-source identity."""
 import hashlib
 import importlib.util
 import json
@@ -39,7 +39,7 @@ def freeze(manifest_path, destination, source, runtime_path=None, analysis_targe
         selected_runtime = Path(runtime_path).resolve()
         (destination / runtime.name).write_bytes(selected_runtime.read_bytes())
         resources[runtime.name] = sha(selected_runtime)
-    # 复采独立保存缓存与收据；原评测清单和全部计算资源按哈希留存。
+    # Save recapture caches/receipts separately; retain the original evaluation manifest and all compute resources by hash.
     manifest = dict(original, cache_root=str(destination / 'compiler-state'),
         receipt_directory=str(destination / 'compiler-receipts'))
     if analysis_target_alias is not None:
